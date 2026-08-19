@@ -8,6 +8,10 @@ const manifestRelativePath = "architecture/manifest.json";
 const workspaceRoots = ["apps", "packages"];
 const sourceExtensions = new Set([".cjs", ".cts", ".js", ".mjs", ".mts", ".ts", ".tsx"]);
 
+export function normalizeArchitecturePath(path) {
+  return path.replaceAll("\\", "/");
+}
+
 export async function loadArchitectureManifest(repositoryRoot) {
   const manifestPath = join(repositoryRoot, manifestRelativePath);
   const contents = await readFile(manifestPath, "utf8");
@@ -52,18 +56,19 @@ export async function checkArchitecture(repositoryRoot, manifest) {
     if (entriesByName.has(entry.name)) {
       errors.push(`Architecture manifest contains duplicate package ${entry.name}`);
     }
-    if (entriesByPath.has(entry.path)) {
+    const normalizedEntryPath = normalizeArchitecturePath(entry.path);
+    if (entriesByPath.has(normalizedEntryPath)) {
       errors.push(`Architecture manifest contains duplicate path ${entry.path}`);
     }
     entriesByName.set(entry.name, entry);
-    entriesByPath.set(entry.path, entry);
+    entriesByPath.set(normalizedEntryPath, entry);
   }
 
   const workspacePackages = await discoverWorkspacePackages(repositoryRoot);
   const checkedPackages = workspacePackages.map((workspacePackage) => workspacePackage.name);
 
   for (const workspacePackage of workspacePackages) {
-    const relativePath = relative(repositoryRoot, workspacePackage.path);
+    const relativePath = normalizeArchitecturePath(relative(repositoryRoot, workspacePackage.path));
     const entry = entriesByPath.get(relativePath);
     if (!entry) {
       errors.push(`Package ${workspacePackage.name} is not covered by the architecture manifest`);
@@ -127,7 +132,7 @@ export async function checkPluginPhaseBoundaries(repositoryRoot, workspacePackag
       ? createPackageExportedSurfaceResolver(sourceByFile)
       : (sourceFile) => parseExportedSurface(sourceByFile.get(sourceFile) ?? "", sourceFile);
     for (const sourceFile of sourceFiles) {
-      const sourcePath = relative(repositoryRoot, sourceFile);
+      const sourcePath = normalizeArchitecturePath(relative(repositoryRoot, sourceFile));
       const exportedSurface = exportedSurfaceFor(sourceFile);
       const exportedNames = exportedSurface.names;
 
@@ -813,7 +818,7 @@ export async function checkSourceProviderCommandIsolation(repositoryRoot) {
   const sourceFiles = (await findSourceFiles(engineSource)).filter((sourceFile) => /provider(?:s)?\.[cm]?[jt]sx?$/u.test(basename(sourceFile)));
   for (const sourceFile of sourceFiles) {
     const source = await readFile(sourceFile, "utf8");
-    const sourcePath = relative(repositoryRoot, sourceFile);
+    const sourcePath = normalizeArchitecturePath(relative(repositoryRoot, sourceFile));
     for (const specifier of findImportSpecifiers(source)) {
       const rootSpecifier = specifier.startsWith("@") ? specifier.split("/").slice(0, 2).join("/") : specifier.split("/")[0];
       if (commandExecutionModules.has(specifier) || (rootSpecifier !== undefined && commandExecutionModules.has(rootSpecifier))) {
@@ -911,7 +916,7 @@ async function checkSourceImports(
   for (const sourceFile of sourceFiles) {
     const source = await readFile(sourceFile, "utf8");
     for (const specifier of findImportSpecifiers(source)) {
-      const sourcePath = relative(repositoryRoot, sourceFile);
+      const sourcePath = normalizeArchitecturePath(relative(repositoryRoot, sourceFile));
       if (specifier.startsWith(".")) {
         const targetPackage = findOwningPackage(
           resolve(dirname(sourceFile), specifier),

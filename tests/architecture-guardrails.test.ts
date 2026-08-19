@@ -6,11 +6,17 @@ import { describe, expect, it } from "vitest";
 import {
   checkArchitecture,
   loadArchitectureManifest,
+  normalizeArchitecturePath,
 } from "../scripts/check-architecture.mjs";
 
 const repositoryRoot = join(import.meta.dirname, "..");
 
 describe("architecture guardrails", { timeout: 15_000 }, () => {
+  it("normalizes Windows package paths to the manifest path format", () => {
+    expect(normalizeArchitecturePath("packages\\contracts")).toBe("packages/contracts");
+    expect(normalizeArchitecturePath("apps/urdira")).toBe("apps/urdira");
+  });
+
   it("covers every declared package and application entry point", async () => {
     const manifest = await loadArchitectureManifest(repositoryRoot);
     const result = await checkArchitecture(repositoryRoot, manifest);

@@ -17,6 +17,8 @@ export type ArchitectureCheckResult = {
   checkedPackages: string[];
 };
 
+export declare function normalizeArchitecturePath(path: string): string;
+
 export declare function loadArchitectureManifest(
   repositoryRoot: string,
 ): Promise<ArchitectureManifest>;
