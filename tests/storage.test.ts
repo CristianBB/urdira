@@ -1216,6 +1216,22 @@ describe("Phase 4 durable storage", () => {
     });
   });
 
+  it("flushes each newly installed CAS file on Windows instead of fsyncing its directory", async () => {
+    await withStorage(async (root) => {
+      const flushedFiles: string[] = [];
+      const cas = new ContentAddressedStore(join(root, "windows-cas"), undefined, {
+        platform: "win32",
+        sync_directory: async () => { throw new Error("Windows must not use the POSIX directory fsync path"); },
+        sync_file: async (path) => { flushedFiles.push(path); },
+      });
+      const bytes = new TextEncoder().encode("Windows CAS durability");
+      const [first, duplicate] = await cas.putMany([{ bytes }, { bytes }]);
+
+      expect(first?.content_hash).toBe(duplicate?.content_hash);
+      expect(flushedFiles).toEqual([cas.objectPath(first!.content_hash)]);
+    });
+  });
+
   it("coalesces putMany's directory fsyncs: once per directory that received a fresh link, none for already-durable duplicates", async () => {
     await withStorage(async (root) => {
       const syncedDirectories: string[] = [];

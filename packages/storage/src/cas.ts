@@ -19,6 +19,8 @@ export type CasMetadataBatchWriter = (entries: readonly { readonly blob: Content
 
 export interface CasFilesystemHooks {
   readonly sync_directory?: (directory: string) => Promise<void>;
+  readonly sync_file?: (path: string) => Promise<void>;
+  readonly platform?: NodeJS.Platform;
 }
 
 export interface CasPutManyEntry {
@@ -27,7 +29,7 @@ export interface CasPutManyEntry {
 }
 
 // Bounded concurrency for `putMany`'s per-blob filesystem work (temp-file
-// write+fsync, link, directory fsync): each blob's own write/fsync/link
+// write+fsync, link, namespace flush): each blob's own write/fsync/link
 // sequence is unchanged from `put` (see `putMany` below for why that
 // ordering is still exactly preserved per blob), so this only lets multiple
 // blobs' independent fsync syscalls be in flight at once instead of strictly
@@ -64,12 +66,16 @@ export class ContentAddressedStore {
   private readonly writeMetadata: CasMetadataWriter | undefined;
   private readonly writeMetadataBatch: CasMetadataBatchWriter | undefined;
   private readonly syncDirectoryHook: (directory: string) => Promise<void>;
+  private readonly syncFileHook: (path: string) => Promise<void>;
+  private readonly platform: NodeJS.Platform;
 
   constructor(rootDir: string, writeMetadata?: CasMetadataWriter, hooks: CasFilesystemHooks = {}, writeMetadataBatch?: CasMetadataBatchWriter) {
     this.rootDir = rootDir;
     this.writeMetadata = writeMetadata;
     this.writeMetadataBatch = writeMetadataBatch;
     this.syncDirectoryHook = hooks.sync_directory ?? ((directory) => this.syncDirectory(directory));
+    this.syncFileHook = hooks.sync_file ?? ((path) => this.syncFile(path));
+    this.platform = hooks.platform ?? process.platform;
   }
 
   async put(bytes: Uint8Array, options: CasPutOptions = {}): Promise<ContentBlob> {
@@ -80,7 +86,8 @@ export class ContentAddressedStore {
   /**
    * Writes many blobs, each through the exact same durable per-blob sequence
    * `put` uses (private temp file -> write -> fsync the file -> atomically
-   * link into place -> fsync the containing directory -- see the class doc
+   * link into place -> durably flush the installed namespace entry -- see
+   * the class doc
    * above and docs/decisions/05-storage-projection-architecture.md's
    * "Content-addressed storage" section for why that per-blob ordering is
    * required), but with two differences that only change *when* work
@@ -96,7 +103,7 @@ export class ContentAddressedStore {
    *    blobs (duplicate content within one call) safely race the same way
    *    concurrent `put` calls already would (whichever links first wins,
    *    the other observes EEXIST and verifies the winner's bytes).
-   *    Directory fsyncs are additionally coalesced: every blob that
+   *    POSIX directory fsyncs are additionally coalesced: every blob that
    *    actually created a new directory entry (a fresh `link`, not an
    *    EEXIST hit against already-durable content) contributes its
    *    destination directory to a per-batch set, deduplicated and fsync'd
@@ -107,10 +114,10 @@ export class ContentAddressedStore {
    * 2. The installation-catalog metadata write (`writeMetadata`, one row
    *    per blob) is coalesced into a single batched call
    *    (`writeMetadataBatch`, when the caller supplied one) after every
-   *    blob's file and directory fsync has completed, instead of one
+   *    blob's file and namespace flush has completed, instead of one
    *    metadata write per blob interleaved with its own fsyncs. This is
    *    still ordered correctly with respect to durability: every blob's
-   *    bytes are fsync'd (file and directory) *before* any metadata row
+   *    bytes and installed namespace entry are flushed *before* any metadata row
    *    referencing it is written, exactly as `put` guarantees for a single
    *    blob -- only the metadata commit itself is now one write covering
    *    the whole batch instead of N separate commits.
@@ -159,17 +166,33 @@ export class ContentAddressedStore {
       await unlink(temporary).catch(() => undefined);
       return isNew;
     });
-    // Coalesced directory durability: only directories that received at
-    // least one fresh link this batch need fsyncing, and each needs it only
-    // once regardless of how many of this batch's blobs landed in it.
-    const dirtyDirectories = [...new Set(prepared.filter((_item, index) => linkedNew[index]).map((item) => dirname(item.destination)))];
-    await mapWithConcurrency(dirtyDirectories, DEFAULT_PUT_CONCURRENCY, async (directory) => {
-      try {
-        await timed("cas_dir_fsync", () => this.syncDirectoryHook(directory));
-      } catch (error) {
-        throw new StorageError("storage:cas_directory_sync_failed", "The CAS directory could not be durably synchronized.", { directory, cause: error instanceof Error ? error.message : String(error) });
-      }
-    });
+    const freshDestinations = [...new Set(prepared.filter((_item, index) => linkedNew[index]).map((item) => item.destination))];
+    if (this.platform === "win32") {
+      // Node opens Windows directories without the FILE_FLAG_BACKUP_SEMANTICS
+      // handle required for FlushFileBuffers, so FileHandle.sync() returns
+      // EPERM. Reopen each newly installed hard link with write access and
+      // flush that file handle instead; Windows associates the link metadata
+      // with the file and FlushFileBuffers durably commits its cached metadata.
+      await mapWithConcurrency(freshDestinations, DEFAULT_PUT_CONCURRENCY, async (path) => {
+        try {
+          await timed("cas_file_fsync", () => this.syncFileHook(path));
+        } catch (error) {
+          throw new StorageError("storage:cas_directory_sync_failed", "The installed CAS object could not be durably synchronized.", { directory: dirname(path), cause: error instanceof Error ? error.message : String(error) });
+        }
+      });
+    } else {
+      // Coalesced directory durability: only directories that received at
+      // least one fresh link this batch need fsyncing, and each needs it only
+      // once regardless of how many of this batch's blobs landed in it.
+      const dirtyDirectories = [...new Set(freshDestinations.map((destination) => dirname(destination)))];
+      await mapWithConcurrency(dirtyDirectories, DEFAULT_PUT_CONCURRENCY, async (directory) => {
+        try {
+          await timed("cas_dir_fsync", () => this.syncDirectoryHook(directory));
+        } catch (error) {
+          throw new StorageError("storage:cas_directory_sync_failed", "The CAS directory could not be durably synchronized.", { directory, cause: error instanceof Error ? error.message : String(error) });
+        }
+      });
+    }
     const blobs = prepared.map((item): ContentBlob => ({
       content_blob_id: item.actualHash,
       content_hash: item.actualHash,
@@ -232,6 +255,11 @@ export class ContentAddressedStore {
   private async syncDirectory(directory: string): Promise<void> {
     const directoryHandle = await open(directory, "r");
     try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+  }
+
+  private async syncFile(path: string): Promise<void> {
+    const fileHandle = await open(path, "r+");
+    try { await fileHandle.sync(); } finally { await fileHandle.close(); }
   }
 }
 
