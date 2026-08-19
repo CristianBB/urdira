@@ -1,7 +1,8 @@
 # Configuration, Security, and Lifecycle
 
 Status: **Approved**  
-Last updated: 2026-08-08  
+Last updated: 2026-08-19
+
 Depends on: Workspace, storage, and semantic-search specifications
 
 ## Decision objective
@@ -18,6 +19,7 @@ Define repository boundaries, exclusions, local-data handling, symlink behavior,
 - Plugin installation and activation are administrative local operations outside the read-only agent MCP surface.
 - Upgrade, downgrade, and explicit rollback use the same candidate plan and atomic publication pipeline; failure preserves the previous published tuple.
 - Plugin resolution uses only explicitly available local packages and never performs implicit network downloads.
+- The dependency-free npm bootstrap may prepare the exact matching Urdira runtime only through an explicit administrative dry-run and confirmation. It uses the fixed public npm registry, an exact runtime package version, a clean npm user configuration, a versioned staging root, and a closed reviewed install-script policy. It is not a general package installer and cannot accept another package name, version, registry, lifecycle-script approval, npm argument, or workspace-controlled input.
 - Embedding profiles and every vector-producing asset or runtime are core-owned. Additional models are installed as integrity-verified data-only Urdira model packs, never as language-plugin payloads, and model-pack selection is versioned workspace configuration. A pack contains no executable code in any form and may only reference embedding runtime components already shipped with the exact Urdira engine version. Installation performs parsing, integrity and compatibility validation, and local asset persistence; it never invokes pack-provided commands or callbacks.
 - A logical model pack is one deterministic canonical manifest plus its complete content-addressed asset set. The manifest commits to every asset's digest, exact decoded byte length, media type, and semantic role. Every declared asset is mandatory for that pack identity. Asset bytes are stored once in Urdira's local content-addressed store and may be shared by multiple installed packs without changing either pack identity.
 - Offline and online installation are delivery variants of the same logical pack. An offline bundle carries the canonical manifest and every required blob. An explicitly requested online installation obtains the same digest-addressed blobs from non-authoritative delivery locators held outside the canonical manifest. URLs, mirror order, credentials, headers, archive layout, compression, and transport metadata never participate in pack or asset identity.
@@ -103,7 +105,9 @@ The initial release provides no bespoke application-level database or CAS encryp
 
 ## Network and model-pack installation
 
-Indexing, plugins, query execution, embeddings, pagination, startup, repair verification, and retained replay perform no network access. The only network-capable core action is an explicit administrative model-pack download. Plugin installation uses an explicit local package or offline bundle in the initial release and never resolves dependencies online.
+Indexing, plugins, query execution, embeddings, pagination, daemon startup, repair verification, and retained replay perform no network access. Network-capable core actions are limited to an explicit administrative model-pack download and the one-time preparation of the exact engine-matched npm runtime by the dependency-free bootstrap. Plugin installation uses an explicit local package or offline bundle in the initial release and never resolves dependencies online.
+
+Runtime preparation is available only before the composed runtime starts. The bootstrap prints the exact target directory, package coordinate, registry, reviewed lifecycle scripts, known upstream deprecation notices, and network effect during dry-run. Interactive confirmation or the exact documented non-interactive confirmation flag authorizes that one plan. It invokes npm without user or workspace configuration, credentials, arbitrary environment-provided arguments, shell evaluation, or lifecycle-script wildcards. Output is captured and classified: a new or changed warning fails preparation, while the specifically disclosed upstream notice may be recorded without replaying npm's raw warning stream. Installation occurs in an unpredictable same-filesystem staging directory and becomes active through atomic rename only after the runtime entry point, package version, lockfile, and installed dependency tree validate. Failure leaves the previous runtime untouched and removes or quarantines staging for bounded cleanup.
 
 Online model-pack installation accepts an exact authorized manifest digest plus explicit HTTPS locators for the manifest and missing blobs. `file` locators are allowed for offline administration; plain HTTP, arbitrary schemes, embedded credentials, cross-origin credential forwarding, and repository-relative URLs are rejected. Redirects are disabled by default and, when enabled by installation policy, are limited to HTTPS, five hops, and no credential forwarding across origins.
 
@@ -137,7 +141,7 @@ Best-effort overwrite is not offered as secure erasure because SSD wear leveling
 
 ## Administrative operations
 
-Plugin install/activate/upgrade/downgrade/rollback/remove, model-pack install/repair/remove, workspace register/relocate/suspend/remove/purge, migration, backup/restore, retention pins, and emergency cache eviction are administrative operations outside MCP. Every request identifies exact targets and shows a dry-run plan before a destructive or executable-state transition.
+Runtime prepare/remove, plugin install/activate/upgrade/downgrade/rollback/remove, model-pack install/repair/remove, workspace register/relocate/suspend/remove/purge, migration, backup/restore, retention pins, and emergency cache eviction are administrative operations outside MCP. Destructive or executable-state transitions identify exact targets and require a dry-run preview plus confirmation; direct workspace registration/configuration uses its interactive detection proposal, and idempotent daemon stop executes directly.
 
 Long operations persist an operation identity, state, exact authorized input digests, progress counters, cancellation state, staged objects, and issues. Cancellation is safe at documented barriers and never rolls back an already committed snapshot or installation; it stops future phases and cleans unreachable staging through GC.
 

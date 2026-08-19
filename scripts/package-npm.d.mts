@@ -16,4 +16,4 @@ export function createPublishManifest(source: Record<string, unknown>, versions:
 export function validatePublishManifest(manifest: PublishManifest, versions: ReadonlyMap<string, string>): string[];
 export function publicationOrder(packages: readonly { readonly name: string; readonly manifest: PublishManifest }[]): string[];
 export function buildNpmPackages(options?: { readonly outputRoot?: string; readonly build?: boolean }): Promise<unknown>;
-export function smokeInstallNpmPackages(packages: readonly unknown[]): Promise<{ readonly version: string; readonly help: true }>;
+export function smokeInstallNpmPackages(packages: readonly unknown[]): Promise<{ readonly version: string; readonly help: true; readonly bootstrap_warning_free: true }>;

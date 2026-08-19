@@ -101,15 +101,15 @@ describe("MCP index status v2", () => {
 });
 
 describe("workspace administration CLI", () => {
-  test("parses add and configure as explicit two-phase commands", () => {
+  test("parses direct workspace commands with optional preview/confirmation flags", () => {
     expect(parseCliArgs(["workspace", "add", "/tmp/project", "--dry-run", "--json"]).name).toBe("workspace-add");
-    expect(parseCliArgs(["workspace", "configure", "workspace-1", "--dry-run", "--confirm", "--proposal-id", "proposal-1"]).name).toBe("workspace-configure");
-    expect(parseCliArgs(["workspace", "purge", "workspace-1", "--dry-run", "--confirm"]).name).toBe("workspace-purge");
+    expect(parseCliArgs(["workspace", "configure", "workspace-1", "--confirm", "--proposal-id", "proposal-1"]).name).toBe("workspace-configure");
+    expect(parseCliArgs(["workspace", "purge", "workspace-1", "--confirm"]).name).toBe("workspace-purge");
   });
 
   test("passes the exact proposal id to the confirmed configure call", async () => {
     const calls: Array<{ call: string; payload: unknown }> = [];
-    const result = await runCli(["workspace", "configure", "workspace-1", "--dry-run", "--confirm", "--proposal-id", "proposal-1", "--json"], {
+    const result = await runCli(["workspace", "configure", "workspace-1", "--confirm", "--proposal-id", "proposal-1", "--json"], {
       client: { call: async (call, payload) => { calls.push({ call, payload }); return { outcome: "success", payload: { applied: true } }; } },
       preview_admin: async () => ({ proposal_id: "proposal-1", digest: "sha256:proposal" }),
     });
@@ -135,7 +135,7 @@ describe("workspace administration CLI", () => {
       { technology_id: "typescript", compatible_plugin_ids: ["core/typescript"] },
       { technology_id: "javascript", compatible_plugin_ids: ["core/javascript", "core/typescript"] },
     ] };
-    const result = await runCli(["workspace", "add", "/tmp/project", "--dry-run", "--confirm", "--json"], {
+    const result = await runCli(["workspace", "add", "/tmp/project", "--confirm", "--json"], {
       client: { call: async (call, payload) => { calls.push({ call, payload }); return { outcome: "success", payload: { workspace_id: "workspace-1" } }; } },
       preview_admin: async () => preview,
     });
@@ -150,7 +150,7 @@ describe("workspace administration CLI", () => {
   test("lets an explicit --payload override the default non-interactive plugin selection", async () => {
     const calls: Array<{ call: string; payload: unknown }> = [];
     const preview = { proposal_id: "proposal-1", technologies: [{ technology_id: "typescript", compatible_plugin_ids: ["core/typescript"] }] };
-    const result = await runCli(["workspace", "add", "/tmp/project", "--dry-run", "--confirm", "--payload", JSON.stringify({ selected_technology_ids: ["typescript"], selected_plugin_ids: ["core/custom"] }), "--json"], {
+    const result = await runCli(["workspace", "add", "/tmp/project", "--confirm", "--payload", JSON.stringify({ selected_technology_ids: ["typescript"], selected_plugin_ids: ["core/custom"] }), "--json"], {
       client: { call: async (call, payload) => { calls.push({ call, payload }); return { outcome: "success", payload: { workspace_id: "workspace-1" } }; } },
       preview_admin: async () => preview,
     });

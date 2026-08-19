@@ -36,6 +36,7 @@
     { "path": "packages/cli" },
     { "path": "packages/testkit" },
     { "path": "tsconfig.tests.json" },
-    { "path": "apps/urdira" }
+    { "path": "apps/urdira" },
+    { "path": "apps/bootstrap" }
   ]
 }

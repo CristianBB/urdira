@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing signed release tag to publish (for example v0.1.0)
+        description: Existing signed release tag to publish (for example v0.1.1)
         required: true
         type: string
 
@@ -48,9 +48,23 @@ jobs:
           node --input-type=module <<'NODE' > release/npm/publish-list.txt
           import { readFileSync } from "node:fs";
           const manifest = JSON.parse(readFileSync("release/npm/manifest.json", "utf8"));
-          const byName = new Map(manifest.packages.map((entry) => [entry.name, entry.tarball]));
-          for (const name of manifest.publish_order) console.log(byName.get(name));
+          const byName = new Map(manifest.packages.map((entry) => [entry.name, entry]));
+          for (const name of manifest.publish_order) {
+            const entry = byName.get(name);
+            console.log([entry.name, entry.version, entry.tarball, entry.integrity].join("\t"));
+          }
           NODE
-          while IFS= read -r tarball; do
+          while IFS=$'\t' read -r name version tarball expected_integrity; do
+            coordinate="${name}@${version}"
+            existing_integrity="$(npm view "$coordinate" dist.integrity --json 2>/dev/null || true)"
+            existing_integrity="${existing_integrity//\"/}"
+            if [[ -n "$existing_integrity" && "$existing_integrity" != "null" ]]; then
+              if [[ "$existing_integrity" != "$expected_integrity" ]]; then
+                echo "::error::$coordinate already exists with different integrity"
+                exit 1
+              fi
+              echo "Skipping $coordinate: exact package integrity is already published."
+              continue
+            fi
             npm publish "release/npm/tarballs/$tarball" --access public --provenance
           done < release/npm/publish-list.txt

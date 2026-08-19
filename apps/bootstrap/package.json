@@ -1,5 +1,5 @@
 {
-  "name": "@urdira/mcp",
+  "name": "urdira",
   "version": "0.1.1",
   "private": true,
   "type": "module",
@@ -7,6 +7,9 @@
     "dist"
   ],
   "main": "./dist/index.js",
+  "bin": {
+    "urdira": "./dist/cli.js"
+  },
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
@@ -14,14 +17,8 @@
       "import": "./dist/index.js"
     }
   },
+  "sideEffects": false,
   "scripts": {
     "build": "tsc --build"
-  },
-  "sideEffects": false,
-  "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0",
-    "@urdira/contracts": "workspace:*",
-    "@urdira/daemon": "workspace:*",
-    "@urdira/engine": "workspace:*"
   }
 }

@@ -122,11 +122,18 @@
       "responsibilities": ["synthetic-workers", "conformance-fixtures", "test-helpers"]
     },
     {
-      "name": "urdira",
+      "name": "@urdira/runtime",
       "path": "apps/urdira",
       "layer": 7,
       "dependencies": ["@urdira/cli", "@urdira/contracts", "@urdira/daemon", "@urdira/embedding-local", "@urdira/engine", "@urdira/mcp", "@urdira/plugin-javascript-typescript", "@urdira/plugin-sdk"],
       "responsibilities": ["composed-production-entry-point"]
+    },
+    {
+      "name": "urdira",
+      "path": "apps/bootstrap",
+      "layer": 8,
+      "dependencies": [],
+      "responsibilities": ["dependency-free-distribution-bootstrap", "confirmed-runtime-preparation"]
     }
   ],
   "coverage": [
@@ -140,6 +147,7 @@
     { "area": "mcp-adapter", "owner": "@urdira/mcp" },
     { "area": "cli", "owner": "@urdira/cli" },
     { "area": "testkit", "owner": "@urdira/testkit" },
-    { "area": "composed-application", "owner": "urdira" }
+    { "area": "composed-application", "owner": "@urdira/runtime" },
+    { "area": "distribution-bootstrap", "owner": "urdira" }
   ]
 }

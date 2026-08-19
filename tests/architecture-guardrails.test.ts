@@ -500,6 +500,13 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 30
     expect(workflow).toContain("pnpm preflight:windows");
   });
 
+  it("publishes patch releases idempotently without overwriting existing package versions", async () => {
+    const workflow = await readFile(join(repositoryRoot, ".github/workflows/publish.yml"), "utf8");
+    expect(workflow).toContain("npm view");
+    expect(workflow).toContain("dist.integrity");
+    expect(workflow).toContain("already exists with different integrity");
+  });
+
   it("uses a bounded CI test profile and keeps the native watcher out of unrelated workers", async () => {
     const vitestConfiguration = await readFile(join(repositoryRoot, "vitest.config.ts"), "utf8");
     expect(vitestConfiguration).toContain('process.env["CI"]');

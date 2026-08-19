@@ -278,7 +278,7 @@ async function seedFixtureFiles(workspaceRoot: string): Promise<void> {
 describe("Daemon admin commands: core:reindex, core:repair, core:garbage_collect", () => {
   it("core:reindex, core:repair, core:garbage_collect and core:configuration_set fall through to core:unknown_call without a workspace_registry", async () => {
     // Permanent regression guard for the exact empirically observed symptom
-    // described in the task ("urdira reindex <id> --dry-run --confirm --json
+    // described in the task ("urdira reindex <id> --confirm --json
     // returns exactly core:unknown_call"): with no `workspace_registry`
     // supplied, all four admin calls that need one still fall through to the
     // generic `runtimeCalls` lookup and surface `core:unknown_call`, proving

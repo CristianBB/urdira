@@ -19,7 +19,11 @@ import {
 const execFileAsync = promisify(execFile);
 const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-const packagePath = (name) => name === "urdira" ? join("apps", "urdira") : join("packages", name.replace(/^@[^/]+\//u, ""));
+const packagePath = (name) => name === "urdira"
+  ? join("apps", "bootstrap")
+  : name === "@urdira/runtime"
+    ? join("apps", "urdira")
+    : join("packages", name.replace(/^@[^/]+\//u, ""));
 const packageNodePath = (name) => name.startsWith("@") ? join("node_modules", ...name.split("/")) : join("node_modules", name);
 const unix = (value) => value.split(sep).join("/");
 const compareNames = (left, right) => left < right ? -1 : left > right ? 1 : 0;
@@ -299,7 +303,7 @@ export async function stageProductionTree({ rootDir = SCRIPT_ROOT, stageRoot, ta
   const appSource = join(rootDir, "apps", "urdira", "dist");
   await copyBuildPayload(appSource, join(stageRoot, "dist"));
   const productionVersions = new Map(await Promise.all(PRODUCTION_PACKAGE_NAMES.map(async (name) => [name, (await readJson(join(rootDir, packagePath(name), "package.json"))).version])));
-  await writeJson(join(stageRoot, "package.json"), { name: "urdira", version: productionVersions.get("urdira"), type: "module", license: "MIT", engines: { node: ">=24.18.1" }, main: "./dist/index.js", bin: { urdira: "./bin/urdira.mjs" }, dependencies: Object.fromEntries(PRODUCTION_PACKAGE_NAMES.filter((name) => name !== "urdira").map((name) => [name, productionVersions.get(name)])) });
+  await writeJson(join(stageRoot, "package.json"), { name: "urdira", version: productionVersions.get("@urdira/runtime"), type: "module", license: "MIT", engines: { node: ">=24.18.1" }, main: "./dist/index.js", bin: { urdira: "./bin/urdira.mjs" }, dependencies: Object.fromEntries(PRODUCTION_PACKAGE_NAMES.filter((name) => name !== "urdira" && name !== "@urdira/runtime").map((name) => [name, productionVersions.get(name)])) });
   await cp(join(rootDir, "README.md"), join(stageRoot, "README.md"));
   await cp(join(rootDir, "LICENSE"), join(stageRoot, "LICENSE"));
   await mkdir(join(stageRoot, "bin"), { recursive: true });
@@ -330,14 +334,14 @@ export async function buildRelease({ rootDir = SCRIPT_ROOT, outputDir = join(roo
   // The repository root also references the test project. Release builds must
   // compile only the production project graph; the test tsconfig intentionally
   // has source-only imports that are not a distributable package input.
-  if (build) await execFileAsync("pnpm", ["exec", "tsc", "--build", "--force", "packages/contracts", "packages/canonical", "packages/security", "packages/storage", "packages/plugin-sdk", "packages/plugin-javascript-typescript", "packages/engine", "packages/daemon", "packages/mcp", "packages/cli", "apps/urdira"], { cwd: rootDir, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
+  if (build) await execFileAsync("pnpm", ["exec", "tsc", "--build", "--force", "packages/contracts", "packages/canonical", "packages/security", "packages/storage", "packages/plugin-sdk", "packages/plugin-javascript-typescript", "packages/engine", "packages/embedding-local", "packages/daemon", "packages/mcp", "packages/cli", "apps/urdira", "apps/bootstrap"], { cwd: rootDir, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
   const metadata = buildReleaseMetadata({ gitCommit: await gitCommit(rootDir), lockfileDigest: await lockfileDigest(rootDir) });
   const archives = [];
   const inspections = {};
   for (const targetId of targets) {
     const stageRoot = join(outputDir, "staging", targetId);
     const staged = await stageProductionTree({ rootDir, stageRoot, targetId, metadata });
-    const archive = await writeDeterministicArchive(stageRoot, join(outputDir, `urdira-${targetId}-0.1.0.tar.gz`));
+    const archive = await writeDeterministicArchive(stageRoot, join(outputDir, `urdira-${targetId}-0.1.1.tar.gz`));
     archives.push({ target: targetId, ...archive });
     inspections[targetId] = staged.inspection;
   }

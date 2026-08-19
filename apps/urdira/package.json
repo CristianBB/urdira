@@ -1,15 +1,12 @@
 {
-  "name": "urdira",
-  "version": "0.1.0",
+  "name": "@urdira/runtime",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "files": [
     "dist"
   ],
   "main": "./dist/index.js",
-  "bin": {
-    "urdira": "./dist/cli.js"
-  },
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {

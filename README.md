@@ -36,15 +36,41 @@ remain available; unsupported operations fail explicitly.
 
 ## Install
 
-Urdira 0.1.0 requires Node.js `>=24.18.1`.
+Urdira 0.1.1 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
+requires npm `>=11.16.0`, which supplies the strict install-script policy. Check
+with `npm --version`; if necessary, update the npm paired with the active Node
+installation before preparing the runtime:
 
-Once the first release is published:
+```bash
+npm install --global npm@11.16.0
+```
+
+Install the dependency-free bootstrap:
 
 ```bash
 npm install --global urdira
 urdira --version
 urdira --help
 ```
+
+The bootstrap has no npm dependency closure, so the global installation does
+not trigger native lifecycle scripts or transitive deprecation warnings.
+Before the first real CLI or MCP command, review and prepare the exact matching
+runtime:
+
+```bash
+urdira runtime prepare --dry-run
+urdira runtime prepare --confirm
+```
+
+The dry-run names the target directory, fixed npm registry, exact runtime and
+minimum npm versions, and the reviewed install scripts for ONNX Runtime, Sharp, Parcel
+Watcher, and protobuf. It also discloses the current upstream
+`boolean@3.2.0` deprecation inherited by Transformers.js. Preparation captures
+that acknowledged npm notice, rejects any new warning, validates the installed
+runtime, and activates it atomically. An interactive terminal offers the same
+confirmation before its first runtime command; non-interactive and MCP starts
+never install anything implicitly.
 
 The first confirmed configuration that enables semantic search may download
 the declared open embedding model. The CLI reports that action. Urdira does
@@ -56,23 +82,32 @@ replay.
 Preview registration before changing local Urdira state:
 
 ```bash
-urdira workspace add /absolute/path/to/project --dry-run --json
+urdira workspace add /absolute/path/to/project
 ```
 
-Review the detected technologies and compatible plugins, then apply the same
-operation explicitly:
+The CLI shows the detected technologies and compatible plugins and asks for
+confirmation interactively. To inspect the proposal without applying it, use:
 
 ```bash
-urdira workspace add /absolute/path/to/project --dry-run --confirm
+urdira workspace add /absolute/path/to/project --dry-run
 urdira status --json
 urdira index --json
 ```
 
 Administrative commands use a preview/confirmation contract. Removing a
 workspace leaves a recoverable tombstone for 24 hours. A later
-`urdira workspace purge <workspaceId> --dry-run --confirm` is refused while a
+`urdira workspace purge <workspaceId> --confirm` is refused while a
 snapshot lease, pin, query, candidate, recovery operation, backup, migration,
 or cross-workspace reference still needs its database.
+
+Daemon shutdown is direct and never starts a missing daemon:
+
+```bash
+urdira daemon stop
+```
+
+Use `urdira daemon stop --dry-run` only when you want to inspect the proposal.
+The command returns `already_stopped` when no daemon is running.
 
 ### MCP configuration
 
@@ -202,7 +237,8 @@ hygiene. Release steps and external prerequisites are documented in
 filenames, a real staged-file round trip, Windows path and IPC adapters,
 CRLF-sensitive Git fixtures, storage path decoding, and publication hygiene.
 
-The production package graph is `urdira` plus public `@urdira/*` packages.
+The production package graph is the dependency-free `urdira` bootstrap,
+`@urdira/runtime`, and its public `@urdira/*` dependency closure.
 `@urdira/testkit`, fixtures, source, development configuration, benchmark raw
 transcripts, and historical implementation plans are excluded from published
 packages.

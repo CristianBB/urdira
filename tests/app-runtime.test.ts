@@ -1,4 +1,4 @@
-import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -90,7 +90,7 @@ async function queryAfterStagedPublication(client: DaemonClient, workspaceId: st
 
 describe("Urdira application runner", () => {
   it("publishes stable version and help output without starting the daemon", () => {
-    expect(URDIRA_VERSION).toBe("0.1.0");
+    expect(URDIRA_VERSION).toBe("0.1.1");
     expect(urdiraHelp()).toContain("urdira mcp");
     expect(urdiraHelp()).toContain("explicit workspace scope");
   });
@@ -128,6 +128,74 @@ describe("Urdira application runner", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("stops an absent daemon directly without starting one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-stop-direct-"));
+    try {
+      const result = await runUrdira(["daemon", "stop"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-app-stop-direct",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+      });
+      expect(result.exit_code).toBe(0);
+      expect(result.data).toMatchObject({ command: "stop", result: { state: "already_stopped" } });
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an already-stopped daemon without starting one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-stop-idempotent-"));
+    try {
+      const result = await runUrdira(["daemon", "stop"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-app-stop-idempotent",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+      });
+      expect(result.exit_code).toBe(0);
+      expect(result.data).toMatchObject({ command: "stop", result: { state: "already_stopped" } });
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns promptly after requesting shutdown from an existing daemon", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-stop-existing-"));
+    let runtime: DaemonRuntime | undefined = await DaemonRuntime.start({
+      data_root: root,
+      engine_build_id: "build-app-stop-existing",
+      scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+    });
+    try {
+      const endpoint = runtime.endpoint;
+      const result = await runUrdira(["daemon", "stop"], { endpoint });
+      expect(result.exit_code).toBe(0);
+      expect(result.data).toMatchObject({ command: "stop", result: { state: "stopping" } });
+
+      const deadline = Date.now() + 10_000;
+      let stopped = false;
+      while (!stopped && Date.now() < deadline) {
+        try {
+          await new DaemonClient(endpoint).call("core:status", {});
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+        } catch {
+          stopped = true;
+        }
+      }
+      expect(stopped).toBe(true);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+      runtime = undefined;
+    } finally {
+      if (runtime) await runtime.stop({ force: true });
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 // Exercises the REAL production `WorkspaceScanPluginProvider`

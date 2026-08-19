@@ -78,7 +78,7 @@ function output(data: unknown, json: boolean, notice = ""): string {
   const body = json ? `${JSON.stringify(data)}\n` : typeof data === "string" ? `${data}\n` : `${JSON.stringify(data)}\n`;
   return json ? body : `${notice}${body}`;
 }
-// Both the interactive confirm path and the `--dry-run --confirm` scripted path confirm the
+// Both the interactive confirm path and the `--confirm` scripted path confirm the
 // same detection preview, so they must derive the same default plugin/technology selection from
 // it -- the full set of technologies (and their compatible plugins) the daemon's
 // `core:workspace_preview` proposed, exactly what an interactive "yes" would confirm.
@@ -113,8 +113,9 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
   }
   if ((MUTATING_COMMANDS as readonly string[]).includes(command.name)) {
     const mutationName = command.name as (typeof MUTATING_COMMANDS)[number];
+    const directCommand = mutationName === "stop";
     const preview = dependencies.preview_admin ? await dependencies.preview_admin(command) : { command: mutationName, call: adminCall[mutationName], args: command.args, values: command.options.values };
-    if (!command.options.dry_run && dependencies.prompt && (mutationName === "workspace-add" || mutationName === "workspace-configure")) {
+    if (!command.options.dry_run && !command.options.confirm && dependencies.prompt && (mutationName === "workspace-add" || mutationName === "workspace-configure")) {
       const technologyAnswer = await dependencies.prompt(`Confirm detected technologies for ${mutationName}?`);
       const pluginAnswer = await dependencies.prompt("Confirm compatible plugins and start observation?");
       const accepted = (value: string | boolean): boolean => value === true || (typeof value === "string" && ["y", "yes", "si", "sí"].includes(value.trim().toLocaleLowerCase("en-US")));
@@ -128,10 +129,10 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
       const data = { dry_run: false, confirmed: true, interactive: true, command: mutationName, preview, result: resultPayload };
       return { exit_code: "outcome" in (result as object) && (result as { readonly outcome: string }).outcome !== "success" ? 1 : 0, data, stdout: output(data, command.options.json, semanticModelNotice(resultPayload)) };
     }
-    if (!command.options.dry_run) throw new CliError("cli:dry_run_required", `Administrative command ${command.name} requires --dry-run.`);
-    if (!command.options.confirm) { const data = { dry_run: true, confirmed: false, command: mutationName, preview }; return { exit_code: 0, data, stdout: output(data, command.options.json) }; }
-    // A scripted `--dry-run --confirm` run never visits the interactive branch above (it requires
-    // `!dry_run`), so without this it silently registered plugin-less workspaces: `workspace-add`
+    if (!directCommand && !command.options.dry_run && !command.options.confirm) throw new CliError("cli:dry_run_required", `Administrative command ${command.name} requires either --dry-run to preview or --confirm to execute.`);
+    if (!command.options.confirm && (!directCommand || command.options.dry_run)) { const data = { dry_run: true, confirmed: false, command: mutationName, preview }; return { exit_code: 0, data, stdout: output(data, command.options.json) }; }
+    // A scripted `--confirm` run never visits the interactive branch above, so without this it
+    // silently registered plugin-less workspaces: `workspace-add`
     // defaults to the same full preview-derived selection the interactive path would confirm,
     // unless the caller passes an explicit `--payload` with its own `selected_plugin_ids`/`selected_technology_ids`.
     const explicitSelection = mutationName === "workspace-add" && command.options.payload !== null && typeof command.options.payload === "object" ? command.options.payload as { readonly selected_technology_ids?: unknown; readonly selected_plugin_ids?: unknown } : undefined;

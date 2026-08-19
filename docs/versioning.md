@@ -1,7 +1,7 @@
 # Versioning Policy
 
 Status: Approved (policy set by the project owner, 2026-08-13)
-Last updated: 2026-08-13
+Last updated: 2026-08-19
 
 This document defines when a version number in this repository takes a major,
 minor, or patch bump, and what a bump of the JS/TS analyzer plugin version

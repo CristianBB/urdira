@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import type { ArtifactWorkItem, ReplacementScope, SnapshotCapabilityStateEntry } from "@urdira/contracts";
-import { runCli, type CliCommand, type CliResult } from "@urdira/cli";
+import { parseCliArgs, runCli, type CliCommand, type CliResult } from "@urdira/cli";
 import { createPersistentWorkspaceRegistry, DaemonClient, DaemonRuntime, EndpointDescriptorStore, daemonPaths, type DaemonRuntimeOptions, type SemanticProviderDescriptor } from "@urdira/daemon";
 import {
   candidateTargetRegistryFromSnapshot,
@@ -54,10 +54,10 @@ export interface UrdiraRunOptions {
   readonly prompt?: (question: string) => Promise<string | boolean>;
 }
 
-export const URDIRA_VERSION = "0.1.0";
+export const URDIRA_VERSION = "0.1.1";
 
 export function urdiraHelp(): string {
-  return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace add <path> --dry-run [--confirm]\n  urdira workspace configure <id> --dry-run [--confirm]\n  urdira workspace remove <id> --dry-run [--confirm]\n  urdira workspace purge <id> --dry-run [--confirm]\n  urdira agent status --client all\n  urdira mcp\n\nRun administrative commands with --dry-run first. Source-reading MCP calls always require explicit workspace scope.\n`;
+  return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace add <path> [--dry-run]\n  urdira workspace configure <id> [--dry-run]\n  urdira workspace remove <id> [--dry-run|--confirm]\n  urdira workspace purge <id> [--dry-run|--confirm]\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n\nWorkspace add/configure and daemon stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;
 }
 
 export interface UrdiraMcpRunOptions {
@@ -1072,10 +1072,10 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   };
 }
 
-async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string): Promise<{ readonly endpoint: string; readonly runtime?: DaemonRuntime }> {
+async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, startIfMissing = true): Promise<{ readonly endpoint: string; readonly runtime?: DaemonRuntime } | undefined> {
   if (endpoint !== undefined) return { endpoint };
-  const daemonOptions = options ?? (await defaultDaemonOptions());
-  const paths = await daemonPaths(daemonOptions.data_root);
+  const dataRoot = options?.data_root ?? process.env["URDIRA_DATA_ROOT"] ?? join(homedir(), ".urdira");
+  const paths = await daemonPaths(dataRoot);
   const descriptor = await new EndpointDescriptorStore(paths).read();
   if (descriptor) {
     try {
@@ -1083,17 +1083,27 @@ async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string):
       if (response.outcome === "success") return { endpoint: descriptor.endpoint };
     } catch { /* A stale descriptor is replaced by the coordinated starter below. */ }
   }
+  if (!startIfMissing) return undefined;
+  const daemonOptions = options ?? (await defaultDaemonOptions(dataRoot));
   const runtime = await DaemonRuntime.start(daemonOptions);
   return { endpoint: runtime.endpoint, runtime };
 }
 
 export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunOptions): Promise<CliResult> {
-  const daemon = await resolveDaemon(options.daemon, options.endpoint);
+  // Parse before daemon resolution. Invalid commands must never start the
+  // expensive composed runtime merely to discover a local CLI error, and a
+  // stop request must not create the daemon it intends to stop.
+  const command = parseCliArgs(argv);
+  const daemon = command.name === "stop"
+    ? await resolveDaemon(options.daemon, options.endpoint, false)
+    : await resolveDaemon(options.daemon, options.endpoint);
   const prompt = options.prompt ?? (process.stdin.isTTY && process.stdout.isTTY ? async (question: string) => {
     const readline = createInterface({ input: process.stdin, output: process.stdout });
     try { return await readline.question(`${question} [y/N] `); } finally { readline.close(); }
   } : undefined);
-  const client = new DaemonClient(daemon.endpoint);
+  const client = daemon === undefined
+    ? { call: async () => ({ outcome: "success", payload: { state: "already_stopped" } }) }
+    : new DaemonClient(daemon.endpoint);
   try {
     return await runCli(argv, {
       client,
@@ -1105,11 +1115,12 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
       read_stdin: async () => { const chunks: Buffer[] = []; for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk)); return Buffer.concat(chunks).toString("utf8"); },
     });
   }
-  finally { if (daemon.runtime) await daemon.runtime.stop({ force: false }); }
+  finally { if (daemon?.runtime) await daemon.runtime.stop({ force: false }); }
 }
 
 export async function runUrdiraMcp(options: UrdiraMcpRunOptions): Promise<{ readonly close: () => Promise<void> }> {
   const daemon = await resolveDaemon(options.daemon, options.endpoint);
+  if (daemon === undefined) throw new Error("MCP daemon resolution unexpectedly returned no endpoint.");
   try {
     const clientOptions = options.request_timeout_ms === undefined ? {} : { request_timeout_ms: options.request_timeout_ms };
     const handle = serveUrdiraStdio({ client: new DaemonClient(daemon.endpoint, clientOptions) satisfies UrdiraMcpClient }, {
