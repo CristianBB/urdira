@@ -56,6 +56,7 @@ export function createPublishManifest(source, versions) {
     description: descriptions[source.name],
     type: "module",
     license: "MIT",
+    repository: { type: "git", url: "https://github.com/CristianBB/urdira" },
     keywords: ["code-intelligence", "coding-agents", "mcp", "typescript"],
     engines: { node: ">=24.18.1" },
     publishConfig: { access: "public" },
