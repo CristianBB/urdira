@@ -497,6 +497,17 @@ describe("architecture guardrails", { timeout: 15_000 }, () => {
     expect(workflow).toContain("ubuntu-latest, macos-latest, windows-latest");
   });
 
+  it("builds every workspace package imported by application tests in a clean checkout", async () => {
+    const rootManifest = JSON.parse(
+      await readFile(join(repositoryRoot, "package.json"), "utf8"),
+    ) as { scripts: Record<string, string> };
+
+    for (const scriptName of ["test", "test:coverage"]) {
+      expect(rootManifest.scripts[scriptName]).toContain("pnpm --filter @urdira/cli build");
+      expect(rootManifest.scripts[scriptName]).toContain("pnpm --filter @urdira/mcp build");
+    }
+  });
+
   it("pins the supported runtime and provides strict package skeletons", async () => {
     await expect(readFile(join(repositoryRoot, ".nvmrc"), "utf8")).resolves.toBe("24.18.1\n");
 

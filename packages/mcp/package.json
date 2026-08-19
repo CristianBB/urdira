@@ -14,6 +14,9 @@
       "import": "./dist/index.js"
     }
   },
+  "scripts": {
+    "build": "tsc --build"
+  },
   "sideEffects": false,
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
