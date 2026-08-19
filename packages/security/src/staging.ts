@@ -90,6 +90,11 @@ export function stagingOperationEntryName(operationId: string): string {
   return `operation-${digestBytes(new TextEncoder().encode(operationId)).slice("sha256:".length)}`;
 }
 
+export function stagingFileEntryName(path: string): string {
+  validateStagedPath(path);
+  return `file-${digestBytes(new TextEncoder().encode(path)).slice("sha256:".length)}`;
+}
+
 function fsyncDirectory(path: string): void {
   const descriptor = openSync(path, "r");
   try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
@@ -196,7 +201,7 @@ export class FileStagingStore implements StagingStore {
         validateStagedPath(file.path);
         if (paths.includes(file.path)) throw new SecurityError("security:package_duplicate_path", `Staged path ${file.path} is duplicated.`);
         paths.push(file.path);
-        const destination = join(operationPath, file.path);
+        const destination = join(operationPath, stagingFileEntryName(file.path));
         await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
         const temporary = `${destination}.tmp-${process.pid}-${Date.now()}-${paths.length}`;
         const handle = await open(temporary, "wx", 0o600);
@@ -205,7 +210,7 @@ export class FileStagingStore implements StagingStore {
         await rename(temporary, destination);
         this.syncNamespace(dirname(destination), destination);
       }
-      const firstInstalledFile = paths[0] ? join(operationPath, paths[0]) : undefined;
+      const firstInstalledFile = paths[0] ? join(operationPath, stagingFileEntryName(paths[0])) : undefined;
       this.syncNamespace(operationPath, firstInstalledFile);
       this.syncNamespace(this.stagingRoot, firstInstalledFile);
       await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { state: "staged", paths } } });
@@ -227,14 +232,14 @@ export class FileStagingStore implements StagingStore {
     const operation = catalog.operations[operationId];
     if (!operation || operation.state !== "staged") throw new SecurityError("security:staging_recovery_required", `Staging operation ${operationId} is not safely committable.`);
     const stagedPath = this.operationPath(this.stagingRoot, operationId);
-    const stagedFile = operation.paths[0] ? join(stagedPath, operation.paths[0]) : undefined;
+    const stagedFile = operation.paths[0] ? join(stagedPath, stagingFileEntryName(operation.paths[0])) : undefined;
     this.syncNamespace(stagedPath, stagedFile);
     this.syncNamespace(this.stagingRoot, stagedFile);
     await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { ...operation, state: "publishing" } } });
     await this.fault("staging.commit.after_marker");
     const publishedPath = this.operationPath(this.publishedRoot, operationId);
     await rename(stagedPath, publishedPath);
-    this.syncNamespace(this.publishedRoot, operation.paths[0] ? join(publishedPath, operation.paths[0]) : undefined);
+    this.syncNamespace(this.publishedRoot, operation.paths[0] ? join(publishedPath, stagingFileEntryName(operation.paths[0])) : undefined);
     await this.fault("staging.commit.after_rename");
     await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { ...operation, state: "committed" } } });
   }
@@ -244,13 +249,13 @@ export class FileStagingStore implements StagingStore {
     const operation = catalog.operations[operationId];
     if (!operation || operation.state !== "staged") throw new SecurityError("security:staging_recovery_required", `Staging operation ${operationId} is not safely publishable.`);
     const stagedPath = this.operationPath(this.stagingRoot, operationId);
-    const stagedFile = operation.paths[0] ? join(stagedPath, operation.paths[0]) : undefined;
+    const stagedFile = operation.paths[0] ? join(stagedPath, stagingFileEntryName(operation.paths[0])) : undefined;
     this.syncNamespace(stagedPath, stagedFile);
     this.syncNamespace(this.stagingRoot, stagedFile);
     await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { ...operation, state: "publishing", publication } } });
     const publishedPath = this.operationPath(this.publishedRoot, operationId);
     await rename(stagedPath, publishedPath);
-    this.syncNamespace(this.publishedRoot, operation.paths[0] ? join(publishedPath, operation.paths[0]) : undefined);
+    this.syncNamespace(this.publishedRoot, operation.paths[0] ? join(publishedPath, stagingFileEntryName(operation.paths[0])) : undefined);
     await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { ...operation, state: "committed", publication } } });
   }
 
@@ -262,7 +267,7 @@ export class FileStagingStore implements StagingStore {
   async readPublishedFile(operationId: string, path: string): Promise<Uint8Array | undefined> {
     validateOperationId(operationId);
     validateStagedPath(path);
-    try { return new Uint8Array(await readFile(join(this.operationPath(this.publishedRoot, operationId), path))); } catch { return undefined; }
+    try { return new Uint8Array(await readFile(join(this.operationPath(this.publishedRoot, operationId), stagingFileEntryName(path)))); } catch { return undefined; }
   }
 
   async recover(operationId: string): Promise<RecoveryResult> {

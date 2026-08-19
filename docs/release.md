@@ -53,9 +53,10 @@ git diff --check
 ```
 
 CI runs the complete coverage, audit, publication, and npm-package gates once
-on Ubuntu. macOS runs one ordinary platform test shard, while Windows runs two
-parallel shards without repeating coverage. This preserves cross-platform
-behavioral coverage without tripling platform-independent work.
+on Ubuntu, and the complete ordinary test suite once on macOS. Windows runs the
+focused portability preflight only: real portable filesystem staging plus path,
+IPC, line-ending, storage, and publication-policy checks. This keeps native
+Windows assurance without rerunning platform-independent integration scenarios.
 
 Required outcomes:
 

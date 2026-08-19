@@ -176,7 +176,9 @@ A coding agent can discover workspaces, issue explicitly scoped queries, paginat
 The daemon never loads the native ONNX binding. A persistent neural query host
 owns it, and each semantic maintenance reconciliation runs in a one-shot child
 that opens and closes storage before returning its result. IPC is correlated
-and bounded; abort cooperates for two seconds, then escalates to `SIGTERM` and
-`SIGKILL` one second later. Query-host crashes reject in-flight work and are
+and bounded; abort cooperates for two seconds on POSIX and ten seconds on
+Windows, then escalates to `SIGTERM` and `SIGKILL` one second later. The longer
+Windows grace preserves the child's committed-progress counters across slower
+process IPC and shutdown. Query-host crashes reject in-flight work and are
 restarted lazily, with a three-crashes-per-sixty-seconds circuit breaker and a
 sixty-second cooldown. Shutdown drains or terminates every semantic child.

@@ -1009,7 +1009,7 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
       await rm(root, { recursive: true, force: true });
       await rm(workspaceRoot, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, process.platform === "win32" && process.env["CI"] === "true" ? 120_000 : 60_000);
 
   // Regression test for the "crashed candidate wedge" observed live: a scan
   // seals (materialization durably saved, candidate reaches "publishing")

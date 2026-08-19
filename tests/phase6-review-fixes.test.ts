@@ -7,6 +7,7 @@ import {
   AdministrativeModelPackDownloader,
   assertAllowedExternalRoot,
   FileStagingStore,
+  stagingFileEntryName,
   stagingOperationEntryName,
   ModelPackLifecycleManager,
   PluginPackageLifecycleManager,
@@ -621,10 +622,10 @@ describe("Phase 6 review regressions", () => {
     const manager = new PluginPackageLifecycleManager(store);
     const installed = await manager.install(manifest, new Map([["worker.js", replacement]]));
     const operationDirectory = (await readdir(join(root, "published")))[0]!;
-    await writeFile(join(root, "published", operationDirectory, "worker.js"), Buffer.from("corrupt"));
+    await writeFile(join(root, "published", operationDirectory, stagingFileEntryName("worker.js")), Buffer.from("corrupt"));
     await manager.repair("plugin:repair", "1.0.0", manifest, new Map([["worker.js", replacement]]));
     const repairDirectory = (await readdir(join(root, "published"))).find((entry) => entry !== operationDirectory)!;
-    expect(await readFile(join(root, "published", repairDirectory, "worker.js"))).toEqual(replacement);
+    expect(await readFile(join(root, "published", repairDirectory, stagingFileEntryName("worker.js")))).toEqual(replacement);
     expect(installed.state).toBe("installed");
   });
 
@@ -668,7 +669,7 @@ describe("Phase 6 review regressions", () => {
     await rename(join(root, "staging", operationEntry), join(root, "published", operationEntry));
     const recovered = await new FileStagingStore(root).recoverAll();
     expect(recovered).toEqual([{ operation_id: "operation", state: "committed", removed_paths: [] }]);
-    expect(await readFile(join(root, "published", operationEntry, "blob"))).toEqual(Buffer.from([2]));
+    expect(await readFile(join(root, "published", operationEntry, stagingFileEntryName("blob")))).toEqual(Buffer.from([2]));
   });
 
   it("recovers a commit crash after atomic rename without losing publication", async () => {
@@ -677,7 +678,7 @@ describe("Phase 6 review regressions", () => {
     await faulted.stage("commit-fault", [{ path: "blob", bytes: new Uint8Array([3]) }]);
     await expect(faulted.commit("commit-fault")).rejects.toThrow("injected-commit-fault");
     expect(await new FileStagingStore(root).recoverAll()).toEqual([{ operation_id: "commit-fault", state: "committed", removed_paths: [] }]);
-    expect(await readFile(join(root, "published", stagingOperationEntryName("commit-fault"), "blob"))).toEqual(Buffer.from([3]));
+    expect(await readFile(join(root, "published", stagingOperationEntryName("commit-fault"), stagingFileEntryName("blob")))).toEqual(Buffer.from([3]));
   });
 
   it("recovers a staged-file power loss before publication", async () => {
@@ -708,7 +709,7 @@ describe("Phase 6 review regressions", () => {
     await store.commit("operation");
 
     expect(flushedFiles).toContain(join(root, "catalog.json"));
-    expect(flushedFiles).toContain(join(root, "published", stagingOperationEntryName("operation"), "blob"));
+    expect(flushedFiles).toContain(join(root, "published", stagingOperationEntryName("operation"), stagingFileEntryName("blob")));
   });
 
   it("uses UTF-8 byte spans and redacts PEM content without leaking multibyte secrets", () => {

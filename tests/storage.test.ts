@@ -307,7 +307,7 @@ describe("Phase 4 durable storage", () => {
       expect(await recovered.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM candidate_fact_deltas WHERE fact_delta_id = 'delta-old'")).toEqual({ count: 1 });
       await expect(recovered.database.run("INSERT INTO candidate_fact_deltas (fact_delta_id, workspace_id, candidate_generation_id, delta_digest, accepted_at, delta_payload) VALUES (?, ?, ?, ?, ?, ?)", ["delta-orphan", workspace.workspace_id, "missing-candidate", "digest", "2026-08-09T00:00:00.000000000Z", new Uint8Array([3])])).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR" });
       await recovered.close();
-    } finally { await recoveredStorage.close(); await rm(root, { recursive: true, force: true }); }
+    } finally { await recoveredStorage.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   });
 
   it("opens SQLite with durable publication settings and strict tables", async () => {

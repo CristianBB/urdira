@@ -35,7 +35,7 @@ interface ProcessResult { readonly kind: "result"; readonly result: ReconcileSem
 interface ProcessFailure { readonly kind: "error"; readonly error: ProcessError }
 type ProcessMessage = ProcessResult | ProcessFailure;
 
-const ABORT_GRACE_MS = 2_000;
+const ABORT_GRACE_MS = process.platform === "win32" ? 10_000 : 2_000;
 const KILL_GRACE_MS = 1_000;
 
 export function semanticProcessEntryPath(name: string, packageUrl = import.meta.resolve("@urdira/daemon")): string {

@@ -497,6 +497,7 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 30
     expect(workflow).toContain("ubuntu-latest");
     expect(workflow).toContain("macos-latest");
     expect(workflow).toContain("windows-latest");
+    expect(workflow).toContain("pnpm preflight:windows");
   });
 
   it("uses a bounded CI test profile and keeps the native watcher out of unrelated workers", async () => {

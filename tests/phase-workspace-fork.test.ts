@@ -380,8 +380,8 @@ async function startHarness(options: Partial<DaemonRuntimeOptions> = {}): Promis
 
 async function stopHarness(harness: Harness): Promise<void> {
   await harness.runtime.stop();
-  await rm(harness.dataRoot, { recursive: true, force: true });
-  for (const root of harness.workspaceRoots) await rm(root, { recursive: true, force: true });
+  await rm(harness.dataRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  for (const root of harness.workspaceRoots) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 async function addWorkspaceAndWait(harness: Harness, root: string): Promise<{ readonly workspace_id: string; readonly status: string }> {

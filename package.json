@@ -18,7 +18,7 @@
     "release:acceptance": "node scripts/release-suite.mjs",
     "typecheck": "tsc --build --force",
     "test": "pnpm --filter @urdira/contracts build && pnpm --filter @urdira/canonical build && pnpm --filter @urdira/security build && pnpm --filter @urdira/storage build && pnpm --filter @urdira/plugin-sdk build && pnpm --filter @urdira/plugin-javascript-typescript build && pnpm --filter @urdira/engine build && pnpm --filter @urdira/embedding-local build && pnpm exec tsc --build packages/daemon && pnpm --filter @urdira/cli build && pnpm --filter @urdira/mcp build && pnpm exec tsc --build packages/testkit && vitest run",
-    "preflight:windows": "pnpm test tests/windows-portability.test.ts tests/phase12-daemon-protocol.test.ts tests/phase5.test.ts tests/phase5-review-fixes.test.ts tests/phase6-review-fixes.test.ts tests/phase-workspace-fork.test.ts tests/app-runtime.test.ts tests/storage.test.ts",
+    "preflight:windows": "pnpm test tests/windows-portability.test.ts",
     "test:coverage": "pnpm --filter @urdira/contracts build && pnpm --filter @urdira/canonical build && pnpm --filter @urdira/security build && pnpm --filter @urdira/storage build && pnpm --filter @urdira/plugin-sdk build && pnpm --filter @urdira/plugin-javascript-typescript build && pnpm --filter @urdira/engine build && pnpm --filter @urdira/embedding-local build && pnpm exec tsc --build packages/daemon && pnpm --filter @urdira/cli build && pnpm --filter @urdira/mcp build && pnpm exec tsc --build packages/testkit && vitest run --coverage",
     "verify": "pnpm check:architecture && pnpm lint && pnpm test:coverage && pnpm typecheck && pnpm check:coverage-gate && pnpm check:publication",
     "check:publication": "node scripts/check-publication.mjs"

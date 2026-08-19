@@ -199,8 +199,8 @@ hygiene. Release steps and external prerequisites are documented in
 [docs/release.md](docs/release.md).
 
 `pnpm preflight:windows` is the focused cross-platform gate for portable
-filenames, Windows path and IPC adapters, CRLF-sensitive Git fixtures, storage
-recovery, and the integration suites that exercise those boundaries.
+filenames, a real staged-file round trip, Windows path and IPC adapters,
+CRLF-sensitive Git fixtures, storage path decoding, and publication hygiene.
 
 The production package graph is `urdira` plus public `@urdira/*` packages.
 `@urdira/testkit`, fixtures, source, development configuration, benchmark raw

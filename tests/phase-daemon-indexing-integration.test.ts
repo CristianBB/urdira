@@ -256,7 +256,18 @@ async function pollUntilReady(client: DaemonClient, workspaceId: string, timeout
       // Now fetch the full single-workspace detail, which includes
       // `current_snapshot_id` (only available once queryable).
       const detail = await client.call("core:index_status", { workspace_ids: [workspaceId] });
-      if (detail.outcome !== "success") throw new Error(`core:index_status (detail) did not succeed: ${JSON.stringify(detail)}`);
+      if (detail.outcome !== "success") {
+        // A periodic reconciliation sweep can begin after the all-workspaces
+        // status read and before this detail read. The detail contract then
+        // correctly reports the transient workspace as unavailable, so retry
+        // the pair of reads instead of turning a valid state transition into
+        // a flaky test failure.
+        if (detail.error?.code === "core:index_unavailable") {
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+          continue;
+        }
+        throw new Error(`core:index_status (detail) did not succeed: ${JSON.stringify(detail)}`);
+      }
       const detailPayload = detail.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> };
       const detailWorkspace = detailPayload.workspaces[0];
       if (detailWorkspace === undefined) throw new Error("core:index_status (detail) returned no workspace entry.");
