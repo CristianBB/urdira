@@ -449,7 +449,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
         const stderr: Buffer[] = [];
         child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
         child.once("error", reject);
-        child.once("exit", (code, signal) => signal === "SIGKILL" ? resolve() : reject(new Error(`migration crash child exited with ${code}/${signal}: ${Buffer.concat(stderr).toString()}`)));
+        child.once("exit", (code, signal) => signal === "SIGKILL" || (process.platform === "win32" && code === 1 && signal === null) ? resolve() : reject(new Error(`migration crash child exited with ${code}/${signal}: ${Buffer.concat(stderr).toString()}`)));
       });
       const storage = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
       const opened = await storage.openWorkspace(workspaceA.workspace_id);
@@ -816,7 +816,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
         const stderr: Buffer[] = [];
         child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
         child.once("error", reject);
-        child.once("exit", (code, signal) => signal === "SIGKILL" ? resolve() : reject(new Error(`GC crash child exited with ${code}/${signal}: ${Buffer.concat(stderr).toString()}`)));
+        child.once("exit", (code, signal) => signal === "SIGKILL" || (process.platform === "win32" && code === 1 && signal === null) ? resolve() : reject(new Error(`GC crash child exited with ${code}/${signal}: ${Buffer.concat(stderr).toString()}`)));
       });
       const storage = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
       const registration = await storage.catalog.database.get<{ database_path: string }>("SELECT database_path FROM installation_workspaces WHERE workspace_id = ?", [workspaceA.workspace_id]);

@@ -10,7 +10,6 @@ export interface PublishManifest {
   readonly [key: string]: unknown;
 }
 
-export const REPOSITORY_URL: string;
 export const ROOT: string;
 export function productionPackageVersions(): Promise<Map<string, string>>;
 export function createPublishManifest(source: Record<string, unknown>, versions: ReadonlyMap<string, string>): PublishManifest;

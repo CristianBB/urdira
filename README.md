@@ -184,6 +184,7 @@ This is a strict TypeScript ESM workspace using pnpm `11.20.0` and Node
 ```bash
 corepack enable
 pnpm install --frozen-lockfile
+pnpm preflight:windows
 pnpm verify
 pnpm audit --prod
 pnpm package:npm:smoke
@@ -196,6 +197,10 @@ coverage and critical branch thresholds, typechecking, generated-contract
 consistency, documentation links, local-path leaks, and public-repository
 hygiene. Release steps and external prerequisites are documented in
 [docs/release.md](docs/release.md).
+
+`pnpm preflight:windows` is the focused cross-platform gate for portable
+filenames, Windows path and IPC adapters, CRLF-sensitive Git fixtures, storage
+recovery, and the integration suites that exercise those boundaries.
 
 The production package graph is `urdira` plus public `@urdira/*` packages.
 `@urdira/testkit`, fixtures, source, development configuration, benchmark raw

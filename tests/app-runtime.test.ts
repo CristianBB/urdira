@@ -226,6 +226,7 @@ describe("Urdira application runner: real multi-file JavaScript/TypeScript works
       runtime = await DaemonRuntime.start(await withHashEmbeddingsProvider(() => defaultDaemonOptions(dataRoot)));
       const client = new DaemonClient(runtime.endpoint);
 
+      const firstStartedAt = performance.now();
       const added = await client.call("core:workspace_add", {
         args: [workspaceRoot],
         confirmed: true,
@@ -235,7 +236,6 @@ describe("Urdira application runner: real multi-file JavaScript/TypeScript works
       expect(added.outcome).toBe("success");
       const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
 
-      const firstStartedAt = performance.now();
       const first = await pollUntilReady(client, workspaceId);
       const firstMs = performance.now() - firstStartedAt;
       expect(first.workspace_status).toBe("ready");

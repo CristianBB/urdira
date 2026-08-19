@@ -141,6 +141,11 @@ Plugin install/activate/upgrade/downgrade/rollback/remove, model-pack install/re
 
 Long operations persist an operation identity, state, exact authorized input digests, progress counters, cancellation state, staged objects, and issues. Cancellation is safe at documented barriers and never rolls back an already committed snapshot or installation; it stops future phases and cleans unreachable staging through GC.
 
+Persisted logical operation identities are not physical path components.
+Filesystem staging maps them deterministically to digest-derived portable entry
+names, preventing path traversal, reserved-character failures, and disclosure
+of logical identifiers through directory names.
+
 Plugin changes use the approved candidate pipeline. Model-pack changes use their approved atomic installation transaction. Migration uses shadow-copy verification. Failures preserve the old active state. Administrative retries are idempotent only when the exact request and input digests match; another request creates a new occurrence.
 
 Retention-policy decreases, workspace purge, package removal, and model-pack removal release roots but do not directly delete shared bytes. Cleanup reports what became collectible and what remains retained, including the exact root reasons.

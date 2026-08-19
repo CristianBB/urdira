@@ -494,13 +494,15 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 30
     expect(workflow).toContain("pnpm verify");
     expect(workflow).toContain("pnpm audit --prod");
     expect(workflow).toContain("pnpm package:npm:smoke");
-    expect(workflow).toContain("ubuntu-latest, macos-latest, windows-latest");
+    expect(workflow).toContain("ubuntu-latest");
+    expect(workflow).toContain("macos-latest");
+    expect(workflow).toContain("windows-latest");
   });
 
   it("uses a bounded CI test profile and keeps the native watcher out of unrelated workers", async () => {
     const vitestConfiguration = await readFile(join(repositoryRoot, "vitest.config.ts"), "utf8");
     expect(vitestConfiguration).toContain('process.env["CI"]');
-    expect(vitestConfiguration).toContain("maxWorkers: isWindowsCi ? 1 : isCi ? 2 : undefined");
+    expect(vitestConfiguration).toContain("maxWorkers: isCi ? 2 : undefined");
     expect(vitestConfiguration).toContain("testTimeout: isWindowsCi ? 120_000 : isCi ? 30_000 : 5_000");
 
     const watcherSource = await readFile(join(repositoryRoot, "packages/engine/src/watchers.ts"), "utf8");

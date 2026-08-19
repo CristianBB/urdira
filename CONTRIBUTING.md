@@ -36,7 +36,9 @@ derive the implementation design and tests from it.
    supported capability, command, or limitation changes.
 6. Update the authoritative architecture and protocol documents in the same
    change whenever the behavior is normative.
-7. Run targeted verification followed by `pnpm verify`.
+7. Run targeted verification followed by `pnpm preflight:windows` when the
+   change touches filesystem, Git, IPC, process, storage, or packaging
+   behavior, then run `pnpm verify`.
 
 ## E2E codebase fixtures
 

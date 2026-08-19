@@ -327,6 +327,11 @@ function commitAll(root: string): string {
   git_(root, "init", "-q");
   git_(root, "config", "user.email", "fork-test@example.com");
   git_(root, "config", "user.name", "fork-test");
+  // The fixture's byte identity must not depend on the host Git client's
+  // checkout conversion policy. Production correctly treats CRLF and LF as
+  // different source bytes; these fork tests intentionally need identical
+  // donor and worktree bytes.
+  git_(root, "config", "core.autocrlf", "false");
   git_(root, "add", "-A");
   git_(root, "commit", "-q", "-m", "fork-test commit");
   return git_(root, "rev-parse", "HEAD");

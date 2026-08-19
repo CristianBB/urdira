@@ -43,6 +43,7 @@ Use the pinned runtime from `.nvmrc` and a clean checkout:
 ```bash
 corepack enable
 pnpm install --frozen-lockfile
+pnpm preflight:windows
 pnpm verify
 pnpm audit --prod
 pnpm package:npm:smoke
@@ -50,6 +51,11 @@ pnpm package:release
 pnpm release:acceptance
 git diff --check
 ```
+
+CI runs the complete coverage, audit, publication, and npm-package gates once
+on Ubuntu. macOS runs one ordinary platform test shard, while Windows runs two
+parallel shards without repeating coverage. This preserves cross-platform
+behavioral coverage without tripling platform-independent work.
 
 Required outcomes:
 

@@ -198,7 +198,7 @@ describe("Phase 12 bounded UCE and daemon startup state", () => {
       handler: async (requestValue) => (requestValue.call === "core:find_records" ? { record: { body: "x".repeat(20_000) } } : { ok: true }),
     });
     await server.listen();
-    const socket = connect(endpoint);
+    const socket = connect(normalizeLocalIpcEndpoint(endpoint));
     const decoder = new LengthPrefixedDecoder();
     const responses: UceResponse[] = [];
     socket.on("data", (chunk) => responses.push(...decoder.push(chunk).filter((frame): frame is UceResponse => "outcome" in frame)));

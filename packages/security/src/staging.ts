@@ -2,6 +2,7 @@ import { SecurityError } from "./errors.js";
 import { mkdir, readdir, readFile, rename, rm, writeFile, open, lstat } from "node:fs/promises";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { digestBytes } from "@urdira/canonical";
 
 export interface StagedFile { readonly path: string; readonly bytes: Uint8Array; }
 export interface RecoveryResult { readonly state: "discarded" | "committed"; readonly removed_paths: readonly string[]; }
@@ -82,6 +83,11 @@ function validateOperationId(operationId: string): void {
 
 function validateStagedPath(path: string): void {
   if (!path || path.includes("..") || path.startsWith("/") || path.includes("\\")) throw new SecurityError("security:path_invalid", `Staged path ${path} is invalid.`);
+}
+
+export function stagingOperationEntryName(operationId: string): string {
+  validateOperationId(operationId);
+  return `operation-${digestBytes(new TextEncoder().encode(operationId)).slice("sha256:".length)}`;
 }
 
 function fsyncDirectory(path: string): void {
@@ -173,8 +179,7 @@ export class FileStagingStore implements StagingStore {
   readStateSync(): unknown { return this.readCatalogSync().state; }
 
   private operationPath(root: string, operationId: string): string {
-    validateOperationId(operationId);
-    const path = join(root, operationId);
+    const path = join(root, stagingOperationEntryName(operationId));
     if (relative(this.root, path).startsWith("..")) throw new SecurityError("security:path_invalid", "Staging path escapes its root.");
     return path;
   }
@@ -289,8 +294,9 @@ export class FileStagingStore implements StagingStore {
       if (result.state === "discarded") delete remainingOperations[operationId];
     }
     await this.ensureRoot();
-    for (const entry of await readdir(this.stagingRoot, { withFileTypes: true })) if (entry.isDirectory() && !remainingOperations[entry.name]) await rm(join(this.stagingRoot, entry.name), { recursive: true, force: true });
-    for (const entry of await readdir(this.publishedRoot, { withFileTypes: true })) if (entry.isDirectory() && !remainingOperations[entry.name]) await rm(join(this.publishedRoot, entry.name), { recursive: true, force: true });
+    const retainedEntryNames = new Set(Object.keys(remainingOperations).map(stagingOperationEntryName));
+    for (const entry of await readdir(this.stagingRoot, { withFileTypes: true })) if (entry.isDirectory() && !retainedEntryNames.has(entry.name)) await rm(join(this.stagingRoot, entry.name), { recursive: true, force: true });
+    for (const entry of await readdir(this.publishedRoot, { withFileTypes: true })) if (entry.isDirectory() && !retainedEntryNames.has(entry.name)) await rm(join(this.publishedRoot, entry.name), { recursive: true, force: true });
     return results.sort((left, right) => left.operation_id.localeCompare(right.operation_id));
   }
 }

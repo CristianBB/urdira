@@ -8,6 +8,11 @@ const execFileAsync = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const forbiddenRoots = [".claude/", ".codex/", ".cursor/", ".entire/", ".opencode/", ".superpowers/", "docs/implementation/"];
 const publicTextExtensions = new Set([".md", ".json", ".mjs", ".js", ".ts", ".tsx", ".yml", ".yaml", ".toml", ".txt"]);
+const localProjectPathPatterns = [
+  /(?:\/Users\/|\/home\/)[^/\s]+\/(?:Projects|Proyectos)\//u,
+  /[A-Za-z]:[\\/]Users[\\/][^\\/\s]+[\\/](?:Projects|Proyectos|source)[\\/]/u,
+  /file:\/\/\/(?:Users|home)\/[^/\s]+\//u,
+];
 
 async function exists(path) {
   try { await access(path); return true; } catch { return false; }
@@ -22,7 +27,7 @@ for (const path of files) {
   if (forbiddenRoots.some((prefix) => path.startsWith(prefix))) errors.push(`${path}: internal workflow material must not be published`);
   if (!publicTextExtensions.has(extname(path)) && !["LICENSE", ".gitignore", ".nvmrc"].includes(path)) continue;
   const text = await readFile(resolve(root, path), "utf8");
-  if (/\/Users\/(?:Cristian|cristian)\//u.test(text)) errors.push(`${path}: contains a local macOS user path`);
+  if (localProjectPathPatterns.some((pattern) => pattern.test(text))) errors.push(`${path}: contains a local user project path`);
   if ((path.startsWith("docs/") || path.startsWith("release/benchmarks/")) && /file:\/\//u.test(text)) errors.push(`${path}: contains a local file URI`);
   if ((path.startsWith("docs/") || path.startsWith("release/benchmarks/")) && /\/private\/tmp\//u.test(text)) errors.push(`${path}: contains a private temporary path`);
   if (path !== "scripts/check-publication.mjs" && /\burdira-engine\b/u.test(text)) errors.push(`${path}: contains the superseded package name urdira-engine`);

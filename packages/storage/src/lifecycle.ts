@@ -413,6 +413,17 @@ async function syncNamespace(directory: string, installedFile: string): Promise<
 }
 async function removeTree(path: string): Promise<void> { await rm(path, { recursive: true, force: true }); }
 
+export function storageFilesystemEntryName(prefix: string, logicalId: string): string {
+  if (!/^[a-z][a-z0-9-]*$/.test(prefix) || logicalId.length === 0) throw new StorageError("storage:path_invalid", "Physical storage entry inputs are invalid.");
+  return `${prefix}-${digestBytes(new TextEncoder().encode(logicalId)).slice("sha256:".length)}`;
+}
+
+export function casHashFromStorageRelativePath(relativePath: string): string | undefined {
+  const components = relativePath.split(/[\\/]/);
+  const hex = components.length === 3 ? components.join("") : "";
+  return /^[0-9a-f]{64}$/.test(hex) ? `sha256:${hex}` : undefined;
+}
+
 export class WorkspaceLifecycleRepository {
   constructor(private readonly database: SqliteDatabase, private readonly workspaceId: string, private readonly faults: FaultInjector = noFaults, private readonly blobs?: BlobStore, private readonly rootDir?: string) {}
 
@@ -1156,10 +1167,11 @@ export class StorageMaintenance {
     const running = await this.database.all<{ migration_id: string; to_version: number }>("SELECT migration_id, to_version FROM storage_migrations WHERE workspace_id = ? AND state = 'running' AND to_version = ? ORDER BY started_at", [this.workspaceId, targetVersion]);
     for (const attempt of running) await this.database.run("UPDATE storage_migrations SET state = 'aborted', completed_at = ? WHERE migration_id = ? AND state = 'running'", [new Date().toISOString(), attempt.migration_id]);
     const migrationId = `migration:${currentVersion}:${targetVersion}:${randomUUID()}`;
-    const backupPath = join(this.rootDir, "backups", migrationId);
+    const migrationEntryName = storageFilesystemEntryName("migration", migrationId);
+    const backupPath = join(this.rootDir, "backups", migrationEntryName);
     await this.createBackup(backupPath);
     const migrationStartedAt = new Date().toISOString();
-    const shadowPath = join(this.rootDir, "migrations", `${migrationId}.sqlite`);
+    const shadowPath = join(this.rootDir, "migrations", `${migrationEntryName}.sqlite`);
     const recoveryPath = `${this.database.filename}.migration-recovery-${randomUUID()}`;
     const initialPayload = encodeCanonical({ migration_id: migrationId, from_version: currentVersion, to_version: targetVersion, backup_path: backupPath, shadow_database_path: shadowPath, recovery_path: recoveryPath });
     await this.database.run("INSERT INTO storage_migrations (migration_id, workspace_id, from_version, to_version, state, backup_path, started_at, completed_at, migration_payload, shadow_database_path, shadow_database_digest) VALUES (?, ?, ?, ?, 'running', ?, ?, NULL, ?, ?, NULL)", [migrationId, this.workspaceId, currentVersion, targetVersion, backupPath, migrationStartedAt, initialPayload, shadowPath]);
@@ -1610,8 +1622,8 @@ export class StorageMaintenance {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) await walk(path);
         else if (entry.isFile()) {
-          const relativePath = relative(root, path).split("/");
-          if (relativePath.length === 3) result.push(`sha256:${relativePath.join("")}`);
+          const contentHash = casHashFromStorageRelativePath(relative(root, path));
+          if (contentHash) result.push(contentHash);
         }
       }
     };

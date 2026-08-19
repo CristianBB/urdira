@@ -8,7 +8,6 @@ import { promisify } from "node:util";
 import { PRODUCTION_PACKAGE_NAMES } from "./release-contract.mjs";
 
 const execFileAsync = promisify(execFile);
-export const REPOSITORY_URL = "https://github.com/CristianBB/urdira";
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const packageDirectory = (name) => name === "urdira" ? join(ROOT, "apps", "urdira") : join(ROOT, "packages", name.slice("@urdira/".length));
@@ -46,17 +45,12 @@ export function createPublishManifest(source, versions) {
     if (String(value).startsWith("workspace:")) throw new Error(`${source.name} has a non-production workspace dependency on ${name}.`);
     return [name, value];
   }));
-  const directory = source.name === "urdira" ? "apps/urdira" : `packages/${source.name.slice("@urdira/".length)}`;
   return {
     name: source.name,
     version: source.version,
     description: descriptions[source.name],
     type: "module",
     license: "MIT",
-    author: "Cristian BB",
-    repository: { type: "git", url: `git+${REPOSITORY_URL}.git`, directory },
-    homepage: REPOSITORY_URL,
-    bugs: { url: `${REPOSITORY_URL}/issues` },
     keywords: ["code-intelligence", "coding-agents", "mcp", "typescript"],
     engines: { node: ">=24.18.1" },
     publishConfig: { access: "public" },
@@ -105,7 +99,7 @@ export function publicationOrder(packages) {
 
 async function packageReadme(manifest) {
   if (manifest.name === "urdira") return readFile(join(ROOT, "README.md"), "utf8");
-  return `# ${manifest.name}\n\n${manifest.description}\n\nThis package is part of [Urdira](${REPOSITORY_URL}). Most users should install the top-level \`urdira\` package instead of depending on this package directly.\n\n## License\n\nMIT\n`;
+  return `# ${manifest.name}\n\n${manifest.description}\n\nThis package is part of Urdira. Most users should install the top-level \`urdira\` package instead of depending on this package directly.\n\n## License\n\nMIT\n`;
 }
 
 async function stagePackage(name, versions, stageRoot) {

@@ -125,6 +125,8 @@ Storage format has an independent monotonic version. Startup first opens databas
 
 Small additive migrations run in one transaction after an automatic verified backup. Rewrite migrations create a shadow database, copy and decode every reachable logical object through approved lossless adapters, recompute indexes and projections, verify all logical digests and snapshot manifests, fsync, then atomically swap files. The old database remains a recovery checkpoint until the new one has reopened and passed verification.
 
+Logical migration and administrative operation IDs are never used directly as filesystem entry names. Physical staging, backup, and shadow entries use deterministic digest-derived names containing only portable filename characters, while SQLite and canonical payloads retain the complete logical ID.
+
 A migration may change tables, indexes, compression, sharding, and cache encoding. It cannot change logical IDs, canonical bytes, digests, validity intervals, result order, or retained interpretation. If any required decoder or adapter is missing, startup remains read-only and reports `core:index_contract_unsupported`.
 
 ## Integrity, repair, backup, and rebuild
