@@ -1,9 +1,16 @@
 import { createServer, connect, type Server, type Socket } from "node:net";
+import { createHash } from "node:crypto";
 import { DaemonError } from "./errors.js";
 
 export const UCE_PROTOCOL_VERSION = 1;
 export const UCE_DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+export function normalizeLocalIpcEndpoint(endpoint: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform !== "win32" || endpoint.startsWith("\\\\.\\pipe\\")) return endpoint;
+  const digest = createHash("sha256").update(endpoint).digest("hex");
+  return `\\\\.\\pipe\\urdira-${digest}`;
+}
 
 export interface UceRequest {
   readonly protocol_version: number;
@@ -132,7 +139,7 @@ export class LocalIpcServer {
     this.maxFrameBytes = options.max_frame_bytes ?? UCE_DEFAULT_MAX_FRAME_BYTES;
     this.server = createServer((socket) => this.handleSocket(socket));
   }
-  async listen(): Promise<void> { await new Promise<void>((resolve, reject) => { this.server.once("error", reject); this.server.listen(this.options.endpoint, () => { this.server.removeListener("error", reject); resolve(); }); }); }
+  async listen(): Promise<void> { await new Promise<void>((resolve, reject) => { this.server.once("error", reject); this.server.listen(normalizeLocalIpcEndpoint(this.options.endpoint), () => { this.server.removeListener("error", reject); resolve(); }); }); }
   async close(): Promise<void> { for (const controller of this.controllers.values()) controller.abort(); await new Promise<void>((resolve) => this.server.close(() => resolve())); }
   private handleSocket(socket: Socket): void {
     const decoder = new LengthPrefixedDecoder(this.maxFrameBytes);
@@ -226,7 +233,7 @@ export class LocalIpcClient {
     const cancellationId = `${requestId}:cancel`;
     const deadline = new Date(Date.now() + (this.options.request_timeout_ms ?? 30_000)).toISOString();
     return new Promise<UceResponse>((resolve, reject) => {
-      const socket = connect(this.options.endpoint);
+      const socket = connect(normalizeLocalIpcEndpoint(this.options.endpoint));
       const decoder = new LengthPrefixedDecoder(max);
       let settled = false; let requestSent = false; let cancelRequested = options.signal?.aborted ?? false;
       let cancelTimeout: (() => void) | undefined;

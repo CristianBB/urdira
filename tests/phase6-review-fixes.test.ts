@@ -693,6 +693,22 @@ describe("Phase 6 review regressions", () => {
     expect(new FileStagingStore(root).readStateSync!()).toEqual({ marker: "durable" });
   });
 
+  it("flushes installed files instead of opening directories on Windows", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-phase6-windows-staging-"));
+    const flushedFiles: string[] = [];
+    const store = new FileStagingStore(root, {
+      platform: "win32",
+      sync_directory: () => { throw new Error("Windows must not use the POSIX directory fsync path"); },
+      sync_file: (path) => { flushedFiles.push(path); },
+    });
+
+    await store.stage("operation", [{ path: "blob", bytes: new Uint8Array([5]) }]);
+    await store.commit("operation");
+
+    expect(flushedFiles).toContain(join(root, "catalog.json"));
+    expect(flushedFiles).toContain(join(root, "published", "operation", "blob"));
+  });
+
   it("uses UTF-8 byte spans and redacts PEM content without leaking multibyte secrets", () => {
     const text = "prefix TOKEN=é秘密 suffix";
     const bytes = Buffer.from(text, "utf8");

@@ -405,8 +405,12 @@ function collectContentHashes(value: unknown, hashes: Set<string>): void {
 }
 async function statPath(path: string): Promise<void> { await import("node:fs/promises").then(({ stat }) => stat(path)).then(() => undefined); }
 async function pathExists(path: string): Promise<boolean> { try { await statPath(path); return true; } catch { return false; } }
-async function syncFile(path: string): Promise<void> { const handle = await openFile(path, "r"); try { await handle.sync(); } finally { await handle.close(); } }
+async function syncFile(path: string): Promise<void> { const handle = await openFile(path, process.platform === "win32" ? "r+" : "r"); try { await handle.sync(); } finally { await handle.close(); } }
 async function syncDirectory(path: string): Promise<void> { const handle = await openFile(path, "r"); try { await handle.sync(); } finally { await handle.close(); } }
+async function syncNamespace(directory: string, installedFile: string): Promise<void> {
+  if (process.platform === "win32") await syncFile(installedFile);
+  else await syncDirectory(directory);
+}
 async function removeTree(path: string): Promise<void> { await rm(path, { recursive: true, force: true }); }
 
 export class WorkspaceLifecycleRepository {
@@ -1033,11 +1037,11 @@ export class StorageMaintenance {
       await writeFile(join(staging, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
       await syncFile(join(staging, "manifest.json"));
       await this.verifyBackupDirectory(staging);
-      await syncDirectory(staging);
+      await syncNamespace(staging, join(staging, "manifest.json"));
       await this.faults.hit("backup.before_publish");
       try { await statPath(destination); throw new StorageError("storage:backup_target_exists", `Backup destination ${destination} already exists.`); } catch (error) { if (!isMissing(error)) throw error; }
       await rename(staging, destination);
-      await syncDirectory(dirname(resolve(destination)));
+      await syncNamespace(dirname(resolve(destination)), join(resolve(destination), "manifest.json"));
       await this.faults.hit("backup.after_publish");
       await this.database.run("UPDATE backup_barriers SET state = 'completed', completed_at = ? WHERE backup_id = ?", [new Date().toISOString(), backupId]);
     } catch (error) {
@@ -1074,9 +1078,9 @@ export class StorageMaintenance {
       }
       await this.verifyBackupDirectory(staging, join(resolve(destination), "workspace.sqlite"));
       try { await statPath(destination); throw new StorageError("storage:restore_target_exists", `Restore destination ${destination} already exists.`); } catch (error) { if (!isMissing(error)) throw error; }
-      await syncDirectory(staging);
+      await syncNamespace(staging, join(staging, "manifest.json"));
       await rename(staging, destination);
-      await syncDirectory(dirname(resolve(destination)));
+      await syncNamespace(dirname(resolve(destination)), join(resolve(destination), "manifest.json"));
       await this.verifyBackupDirectory(resolve(destination), join(resolve(destination), "workspace.sqlite"));
     } catch (error) {
       await removeTree(staging);

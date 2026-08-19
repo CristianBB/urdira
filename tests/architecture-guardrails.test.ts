@@ -500,8 +500,8 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 30
   it("uses a bounded CI test profile and keeps the native watcher out of unrelated workers", async () => {
     const vitestConfiguration = await readFile(join(repositoryRoot, "vitest.config.ts"), "utf8");
     expect(vitestConfiguration).toContain('process.env["CI"]');
-    expect(vitestConfiguration).toContain("maxWorkers: isCi ? 2 : undefined");
-    expect(vitestConfiguration).toContain("testTimeout: isCi ? 30_000 : 5_000");
+    expect(vitestConfiguration).toContain("maxWorkers: isWindowsCi ? 1 : isCi ? 2 : undefined");
+    expect(vitestConfiguration).toContain("testTimeout: isWindowsCi ? 120_000 : isCi ? 30_000 : 5_000");
 
     const watcherSource = await readFile(join(repositoryRoot, "packages/engine/src/watchers.ts"), "utf8");
     expect(watcherSource).toContain('import type * as parcelWatcher from "@parcel/watcher"');
@@ -521,6 +521,7 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 30
   });
 
   it("pins the supported runtime and provides strict package skeletons", async () => {
+    await expect(readFile(join(repositoryRoot, ".gitattributes"), "utf8")).resolves.toContain("* text=auto eol=lf");
     await expect(readFile(join(repositoryRoot, ".nvmrc"), "utf8")).resolves.toBe("24.18.1\n");
 
     const tsconfig = JSON.parse(await readFile(join(repositoryRoot, "tsconfig.json"), "utf8")) as {

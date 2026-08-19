@@ -1,4 +1,5 @@
 import { fork, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import type { ReconcileSemanticProjectionResult, ResolvedSemanticProvider, SemanticGeneratedVector, GenerateVectorInput } from "@urdira/engine";
 import type { SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
 
@@ -16,7 +17,7 @@ export interface SemanticProcessRun {
 }
 
 export async function ensureSemanticAssetsInProcess(descriptor: SemanticProviderDescriptor): Promise<unknown> {
-  const child = fork(entryUrl("semantic-maintenance-process.js"), [], { execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"], serialization: "advanced" });
+  const child = fork(semanticProcessEntryPath("semantic-maintenance-process.js"), [], { execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"], serialization: "advanced" });
   child.stderr?.on("data", (chunk) => { process.stderr.write(`[urdira semantic child] ${String(chunk)}`); });
   return new Promise((resolve, reject) => {
     child.on("message", (message: { readonly kind: string; readonly notice?: unknown; readonly error?: ProcessError }) => {
@@ -37,8 +38,8 @@ type ProcessMessage = ProcessResult | ProcessFailure;
 const ABORT_GRACE_MS = 2_000;
 const KILL_GRACE_MS = 1_000;
 
-function entryUrl(name: string): string {
-  return new URL(name, import.meta.resolve("@urdira/daemon")).pathname;
+export function semanticProcessEntryPath(name: string, packageUrl = import.meta.resolve("@urdira/daemon")): string {
+  return fileURLToPath(new URL(name, packageUrl));
 }
 
 function asError(error: ProcessError): Error {
@@ -49,7 +50,7 @@ function asError(error: ProcessError): Error {
 }
 
 export function runSemanticReconcileInProcess(job: SemanticProcessJob): SemanticProcessRun {
-  const child = fork(entryUrl("semantic-maintenance-process.js"), [], { execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"], serialization: "advanced" });
+  const child = fork(semanticProcessEntryPath("semantic-maintenance-process.js"), [], { execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"], serialization: "advanced" });
   child.stderr?.on("data", (chunk) => { process.stderr.write(`[urdira semantic child] ${String(chunk)}`); });
   let settled = false;
   let aborted = false;
@@ -120,7 +121,7 @@ export async function startNeuralSemanticProviderHost(descriptor: SemanticProvid
   const rejectPending = (error: Error): void => { for (const item of pending.values()) item.reject(error); pending.clear(); };
   let restart: Promise<NeuralHostReply> | undefined;
   const spawn = (): Promise<NeuralHostReply> => {
-    const processChild = fork(entryUrl("semantic-neural-process.js"), [], { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
+    const processChild = fork(semanticProcessEntryPath("semantic-neural-process.js"), [], { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
     child = processChild;
     processChild.on("message", (message: NeuralHostReply) => {
       if (message.kind === "ready") return;

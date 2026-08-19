@@ -6,7 +6,13 @@ import { dirname, join, relative, resolve } from "node:path";
 export interface StagedFile { readonly path: string; readonly bytes: Uint8Array; }
 export interface RecoveryResult { readonly state: "discarded" | "committed"; readonly removed_paths: readonly string[]; }
 export interface StagingPublication { readonly kind: string; readonly value: unknown; }
-export interface FileStagingStoreOptions { readonly fault_injector?: (point: string) => void | Promise<void>; readonly fault_injector_sync?: (point: string) => void; }
+export interface FileStagingStoreOptions {
+  readonly fault_injector?: (point: string) => void | Promise<void>;
+  readonly fault_injector_sync?: (point: string) => void;
+  readonly platform?: NodeJS.Platform;
+  readonly sync_directory?: (directory: string) => void;
+  readonly sync_file?: (path: string) => void;
+}
 export interface StagingStore { stage(operationId: string, files: readonly StagedFile[]): Promise<void>; markInterrupted(operationId: string): Promise<void>; commit(operationId: string): Promise<void>; publish?(operationId: string, publication: StagingPublication): Promise<void>; listPublications?(): Promise<readonly StagingPublication[]>; readPublishedFile?(operationId: string, path: string): Promise<Uint8Array | undefined>; persistStateSync?(state: unknown): void; readState?(): Promise<unknown>; readStateSync?(): unknown; recover(operationId: string): Promise<RecoveryResult>; recoverAll?(): Promise<readonly (RecoveryResult & { readonly operation_id: string })[]>; }
 
 export class InMemoryStagingStore implements StagingStore {
@@ -83,12 +89,20 @@ function fsyncDirectory(path: string): void {
   try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
 }
 
+function fsyncFile(path: string): void {
+  const descriptor = openSync(path, "r+");
+  try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
+
 export class FileStagingStore implements StagingStore {
   private readonly root: string;
   private readonly stagingRoot: string;
   private readonly publishedRoot: string;
   private readonly catalogPath: string;
   private readonly options: FileStagingStoreOptions;
+  private readonly platform: NodeJS.Platform;
+  private readonly syncDirectoryHook: (directory: string) => void;
+  private readonly syncFileHook: (path: string) => void;
 
   constructor(root: string, options: FileStagingStoreOptions = {}) {
     this.root = resolve(root);
@@ -96,9 +110,20 @@ export class FileStagingStore implements StagingStore {
     this.publishedRoot = join(this.root, "published");
     this.catalogPath = join(this.root, "catalog.json");
     this.options = options;
+    this.platform = options.platform ?? process.platform;
+    this.syncDirectoryHook = options.sync_directory ?? fsyncDirectory;
+    this.syncFileHook = options.sync_file ?? fsyncFile;
   }
 
   private async fault(point: string): Promise<void> { await this.options.fault_injector?.(point); }
+
+  private syncNamespace(directory: string, installedFile?: string): void {
+    if (this.platform === "win32") {
+      if (installedFile) this.syncFileHook(installedFile);
+      return;
+    }
+    this.syncDirectoryHook(directory);
+  }
 
   private async ensureRoot(): Promise<void> {
     await mkdir(this.stagingRoot, { recursive: true, mode: 0o700 });
@@ -118,7 +143,7 @@ export class FileStagingStore implements StagingStore {
     const handle = await open(temporary, "wx", 0o600);
     try { await handle.writeFile(JSON.stringify(catalog)); await handle.sync(); } finally { await handle.close(); }
     await rename(temporary, this.catalogPath);
-    fsyncDirectory(dirname(this.catalogPath));
+    this.syncNamespace(dirname(this.catalogPath), this.catalogPath);
   }
 
   private readCatalogSync(): StagingCatalog {
@@ -135,7 +160,7 @@ export class FileStagingStore implements StagingStore {
     try { writeFileSync(descriptor, JSON.stringify(catalog)); fsyncSync(descriptor); } finally { closeSync(descriptor); }
     renameSync(temporary, this.catalogPath);
     this.options.fault_injector_sync?.("staging.catalog.before_directory_fsync");
-    fsyncDirectory(dirname(this.catalogPath));
+    this.syncNamespace(dirname(this.catalogPath), this.catalogPath);
     this.options.fault_injector_sync?.("staging.catalog.after_directory_fsync");
   }
 
@@ -173,10 +198,11 @@ export class FileStagingStore implements StagingStore {
         try { await handle.writeFile(file.bytes); await handle.sync(); } finally { await handle.close(); }
         await this.fault("staging.stage.after_file_sync");
         await rename(temporary, destination);
-        fsyncDirectory(dirname(destination));
+        this.syncNamespace(dirname(destination), destination);
       }
-      fsyncDirectory(operationPath);
-      fsyncDirectory(this.stagingRoot);
+      const firstInstalledFile = paths[0] ? join(operationPath, paths[0]) : undefined;
+      this.syncNamespace(operationPath, firstInstalledFile);
+      this.syncNamespace(this.stagingRoot, firstInstalledFile);
       await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { state: "staged", paths } } });
     } catch (error) {
       await rm(operationPath, { recursive: true, force: true });
@@ -195,12 +221,15 @@ export class FileStagingStore implements StagingStore {
     const catalog = await this.readCatalog();
     const operation = catalog.operations[operationId];
     if (!operation || operation.state !== "staged") throw new SecurityError("security:staging_recovery_required", `Staging operation ${operationId} is not safely committable.`);
-    fsyncDirectory(this.operationPath(this.stagingRoot, operationId));
-    fsyncDirectory(this.stagingRoot);
+    const stagedPath = this.operationPath(this.stagingRoot, operationId);
+    const stagedFile = operation.paths[0] ? join(stagedPath, operation.paths[0]) : undefined;
+    this.syncNamespace(stagedPath, stagedFile);
+    this.syncNamespace(this.stagingRoot, stagedFile);
     await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { ...operation, state: "publishing" } } });
     await this.fault("staging.commit.after_marker");
-    await rename(this.operationPath(this.stagingRoot, operationId), this.operationPath(this.publishedRoot, operationId));
-    fsyncDirectory(this.publishedRoot);
+    const publishedPath = this.operationPath(this.publishedRoot, operationId);
+    await rename(stagedPath, publishedPath);
+    this.syncNamespace(this.publishedRoot, operation.paths[0] ? join(publishedPath, operation.paths[0]) : undefined);
     await this.fault("staging.commit.after_rename");
     await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { ...operation, state: "committed" } } });
   }
@@ -209,11 +238,14 @@ export class FileStagingStore implements StagingStore {
     const catalog = await this.readCatalog();
     const operation = catalog.operations[operationId];
     if (!operation || operation.state !== "staged") throw new SecurityError("security:staging_recovery_required", `Staging operation ${operationId} is not safely publishable.`);
-    fsyncDirectory(this.operationPath(this.stagingRoot, operationId));
-    fsyncDirectory(this.stagingRoot);
+    const stagedPath = this.operationPath(this.stagingRoot, operationId);
+    const stagedFile = operation.paths[0] ? join(stagedPath, operation.paths[0]) : undefined;
+    this.syncNamespace(stagedPath, stagedFile);
+    this.syncNamespace(this.stagingRoot, stagedFile);
     await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { ...operation, state: "publishing", publication } } });
-    await rename(this.operationPath(this.stagingRoot, operationId), this.operationPath(this.publishedRoot, operationId));
-    fsyncDirectory(this.publishedRoot);
+    const publishedPath = this.operationPath(this.publishedRoot, operationId);
+    await rename(stagedPath, publishedPath);
+    this.syncNamespace(this.publishedRoot, operation.paths[0] ? join(publishedPath, operation.paths[0]) : undefined);
     await this.writeCatalog({ ...catalog, operations: { ...catalog.operations, [operationId]: { ...operation, state: "committed", publication } } });
   }
 

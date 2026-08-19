@@ -5,6 +5,7 @@ export {
   LengthPrefixedDecoder,
   LocalIpcClient,
   LocalIpcServer,
+  normalizeLocalIpcEndpoint,
   decodeUceFrame,
   encodeUceFrame,
   type LocalIpcClientOptions,

@@ -158,8 +158,10 @@ describe("Phase 6 security contracts", () => {
     await mkdir(join(root, "src"));
     await writeFile(join(root, "src", "readme.txt"), "ordinary text");
     expect((await inspectInclusionPath(root, "src/readme.txt", { include: [], exclude: [], allow_external_root: false }, { enabled: false, patterns: [] })).included).toBe(true);
-    await symlink("/dev/null", join(root, "src", "device")).catch(() => undefined);
-    expect((await inspectInclusionPath(root, "src/device", { include: ["src/device"], exclude: [], allow_external_root: true, allowed_external_roots: ["/dev"], follow_symlinks: true }, { enabled: false, patterns: [] })).reason_code).toBe("security:path_invalid");
+    if (process.platform !== "win32") {
+      await symlink("/dev/null", join(root, "src", "device"));
+      expect((await inspectInclusionPath(root, "src/device", { include: ["src/device"], exclude: [], allow_external_root: true, allowed_external_roots: ["/dev"], follow_symlinks: true }, { enabled: false, patterns: [] })).reason_code).toBe("security:path_invalid");
+    }
   });
 
   it("keeps mandatory exclusions stronger than includes and git ignores", () => {
@@ -271,7 +273,7 @@ describe("Phase 6 security contracts", () => {
     await expect(manager.install(second, new Map([["worker.js", secondBytes]]))).rejects.toThrow("security:package_coordinate_collision");
   });
 
-  it("creates owner-only mutable storage roots", async () => {
+  it.skipIf(process.platform === "win32")("creates owner-only mutable storage roots with POSIX modes", async () => {
     const root = await mkdtemp(join(tmpdir(), "urdira-phase6-storage-"));
     const capabilities = await ensureOwnerOnlyDirectory(join(root, "data"));
     expect(capabilities.owner_only).toBe(true);

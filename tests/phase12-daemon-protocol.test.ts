@@ -10,6 +10,7 @@ import {
   ProcessLock,
   LocalIpcClient,
   LocalIpcServer,
+  normalizeLocalIpcEndpoint,
   daemonPaths,
   encodeUceFrame,
   LengthPrefixedDecoder,
@@ -28,6 +29,12 @@ function request(overrides: Partial<UceRequest> = {}): UceRequest {
 }
 
 describe("Phase 12 bounded UCE and daemon startup state", () => {
+  it("maps filesystem socket paths to deterministic Windows named pipes", () => {
+    const endpoint = normalizeLocalIpcEndpoint("C:\\Users\\runner\\urdira.sock", "win32");
+    expect(endpoint).toMatch(/^\\\\\.\\pipe\\urdira-[0-9a-f]{64}$/);
+    expect(normalizeLocalIpcEndpoint("C:\\Users\\runner\\urdira.sock", "win32")).toBe(endpoint);
+  });
+
   it("round-trips a bounded length-prefixed request and rejects oversized frames", () => {
     const encoded = encodeUceFrame(request(), 4_096);
     expect(encoded.readUInt32BE(0)).toBe(encoded.byteLength - 4);
@@ -91,7 +98,7 @@ describe("Phase 12 bounded UCE and daemon startup state", () => {
     const server = new LocalIpcServer({ endpoint, handler: async (requestValue, context) => { if (requestValue.request_id === "duplicate") { duplicateCalls++; return { done: true }; } await new Promise<void>((resolve) => context.signal.addEventListener("abort", () => resolve(), { once: true })); return { done: true }; } });
     await server.listen();
     await expect(new LocalIpcClient({ endpoint, request_timeout_ms: 10 }).request("core:wait", {})).rejects.toMatchObject({ code: "core:ipc_timeout" });
-    const socket = connect(endpoint); const decoder = new LengthPrefixedDecoder(); const responses: unknown[] = [];
+    const socket = connect(normalizeLocalIpcEndpoint(endpoint)); const decoder = new LengthPrefixedDecoder(); const responses: unknown[] = [];
     socket.on("data", (chunk) => responses.push(...decoder.push(chunk).filter((frame) => "outcome" in frame)));
     await new Promise<void>((resolve) => socket.once("connect", resolve));
     const duplicateRequest = request({ request_id: "duplicate", call: "core:echo", deadline_at: "2099-01-01T00:00:00.000Z" });

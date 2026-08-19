@@ -49,7 +49,7 @@ The daemon separates four scheduler pools: source observation, structural analys
 
 ## Startup, discovery, and single instance
 
-The data root contains a fixed endpoint descriptor and an operating-system lock file. Startup acquires an exclusive non-advisory process lock where available, creates a random boot ID, binds the local endpoint, writes a descriptor containing only protocol versions, endpoint identity, process ID, boot ID, and start time, then marks readiness after catalog and current-snapshot verification.
+The data root contains a fixed endpoint descriptor and an operating-system lock file. POSIX hosts bind an owner-restricted local socket under that root; Windows derives a deterministic named-pipe identity from the same endpoint path so no filesystem socket is attempted. Startup acquires an exclusive non-advisory process lock where available, creates a random boot ID, binds the local endpoint, writes a descriptor containing only protocol versions, endpoint identity, process ID, boot ID, and start time, then marks readiness after catalog and current-snapshot verification.
 
 A second process first connects and performs the handshake. If the existing daemon responds, the second exits successfully and reports its endpoint. If the descriptor exists but connection fails, the process verifies the OS lock and process identity; it may replace stale endpoint metadata only after acquiring the lock. PID reuse or descriptor age alone never authorizes takeover.
 

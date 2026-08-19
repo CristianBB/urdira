@@ -230,6 +230,14 @@ const resolvePluginProvider: NonNullable<DaemonRuntimeOptions["resolve_plugin_pr
 // backstops for something genuinely stuck.
 const DAEMON_CLIENT_OPTIONS = { request_timeout_ms: 120_000 };
 
+async function pollUntil(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Condition did not become true within ${timeoutMs} ms.`);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+}
+
 async function pollUntilReady(client: DaemonClient, workspaceId: string, timeoutMs = 120_000): Promise<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> {
   const deadline = Date.now() + timeoutMs;
   let last: { readonly workspace_id: string; readonly workspace_status: string } | undefined;
@@ -498,10 +506,9 @@ describe("Daemon periodic reconciliation sweep (Bug B backstop)", () => {
       const callsAtReady = resolveCalls.length;
       expect(callsAtReady).toBeGreaterThan(0);
 
-      // Wait for several sweep intervals with no disk change and no
-      // `core:reindex`/watcher activity of any kind.
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 900));
-
+      // Wait for a completed sweep instead of assuming a loaded CI host will
+      // schedule one within a fixed wall-clock delay.
+      await pollUntil(() => resolveCalls.length > callsAtReady, process.platform === "win32" ? 30_000 : 10_000);
       expect(resolveCalls.length).toBeGreaterThan(callsAtReady);
       // Every sweep-triggered scan was a genuine no-op: the workspace
       // settles back to `ready` (possibly caught mid-sweep as transiently

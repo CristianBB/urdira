@@ -212,5 +212,5 @@ describe("runSemanticReconcileInThread", () => {
         expect(rows[0]?.count).toBe(totalDocuments);
       } finally { await afterResume.close(); }
     });
-  }, 45_000);
+  }, process.platform === "win32" && process.env["CI"] === "true" ? 120_000 : 45_000);
 });

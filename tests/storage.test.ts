@@ -1208,7 +1208,7 @@ describe("Phase 4 durable storage", () => {
 
   it("surfaces CAS directory fsync failures and detects corruption", async () => {
     await withStorage(async (root, storage) => {
-      const failing = new ContentAddressedStore(join(root, "fault-cas"), undefined, { sync_directory: async () => { throw new Error("fsync fault"); } });
+      const failing = new ContentAddressedStore(join(root, "fault-cas"), undefined, { platform: "linux", sync_directory: async () => { throw new Error("fsync fault"); } });
       await expect(failing.put(new TextEncoder().encode("durability fault"))).rejects.toMatchObject({ code: "storage:cas_directory_sync_failed" });
       const blob = await storage.cas.put(new TextEncoder().encode("will corrupt"));
       await writeFile(storage.cas.objectPath(blob.content_hash), new TextEncoder().encode("corrupt"));
@@ -1235,7 +1235,7 @@ describe("Phase 4 durable storage", () => {
   it("coalesces putMany's directory fsyncs: once per directory that received a fresh link, none for already-durable duplicates", async () => {
     await withStorage(async (root) => {
       const syncedDirectories: string[] = [];
-      const counted = new ContentAddressedStore(join(root, "counted-cas"), undefined, { sync_directory: async (directory) => { syncedDirectories.push(directory); } });
+      const counted = new ContentAddressedStore(join(root, "counted-cas"), undefined, { platform: "linux", sync_directory: async (directory) => { syncedDirectories.push(directory); } });
       const first = new TextEncoder().encode("putMany fresh blob one");
       const second = new TextEncoder().encode("putMany fresh blob two");
       // Five entries: two distinct new blobs, `first` repeated three times
