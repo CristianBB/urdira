@@ -1,0 +1,56 @@
+name: Publish npm release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing signed release tag to publish (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: npm-production
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+      - name: Require an exact release tag
+        shell: bash
+        run: test "$(git describe --exact-match --tags HEAD)" = "${{ inputs.release_tag }}"
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify release source
+        run: pnpm verify && pnpm audit --prod
+      - name: Build and smoke-test npm packages
+        run: pnpm package:npm:smoke
+      - name: Publish in dependency order with provenance
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE' > release/npm/publish-list.txt
+          import { readFileSync } from "node:fs";
+          const manifest = JSON.parse(readFileSync("release/npm/manifest.json", "utf8"));
+          const byName = new Map(manifest.packages.map((entry) => [entry.name, entry.tarball]));
+          for (const name of manifest.publish_order) console.log(byName.get(name));
+          NODE
+          while IFS= read -r tarball; do
+            npm publish "release/npm/tarballs/$tarball" --access public --provenance
+          done < release/npm/publish-list.txt

@@ -1,0 +1,47 @@
+{
+  "authority_kind": "mechanically-transcribed-normative-v9",
+  "generated_from": [
+    "docs/protocol/public-query-contract.md",
+    "docs/protocol/core-operation-error-codes.md",
+    "docs/diagnostics/core-diagnostic-codes.md",
+    "docs/indexing/core-candidate-issue-codes.md"
+  ],
+  "query": {
+    "minimum_stages": 1,
+    "minimum_outputs": 1,
+    "registered_operators": [
+      "source.operation",
+      "source.registry",
+      "set.union",
+      "set.intersection",
+      "set.difference",
+      "expand.relations",
+      "expand.operation",
+      "filter",
+      "join",
+      "deduplicate",
+      "select",
+      "bind.record_selector",
+      "bind.subject_record_selector"
+    ]
+  },
+  "model_fields": [
+    { "model": "RecordEnvelope", "field": "payload", "presence": "required", "logical_type": "JsonValue", "description": "Data validated by the registered kind schema.", "source": "decisions/01-universal-data-model.md" },
+    { "model": "EntityRecord", "field": "payload", "presence": "required", "logical_type": "JsonValue", "description": "Data validated by the registered kind schema.", "source": "decisions/01-universal-data-model.md" },
+    { "model": "RelationRecord", "field": "payload", "presence": "required", "logical_type": "JsonValue", "description": "Data validated by the registered kind schema.", "source": "decisions/01-universal-data-model.md" },
+    { "model": "FactRecord", "field": "payload", "presence": "required", "logical_type": "JsonValue", "description": "Data validated by the registered kind schema.", "source": "decisions/01-universal-data-model.md" },
+    { "model": "EvidenceRecord", "field": "payload", "presence": "required", "logical_type": "JsonValue", "description": "Data validated by the registered kind schema.", "source": "decisions/01-universal-data-model.md" },
+    { "model": "DiagnosticRecord", "field": "payload", "presence": "required", "logical_type": "JsonValue", "description": "Data validated by the registered kind schema.", "source": "decisions/01-universal-data-model.md" }
+  ],
+  "payload_properties": {
+    "core:duplicate_comparison_participant.snapshot_ids": { "type": "array", "minItems": 1, "description": "The exact snapshot identifiers associated with the duplicated comparison participant." },
+    "core:invalid_definition_instance_selector.definition_ids": { "type": "array", "minItems": 1, "description": "The non-empty selected definition identifiers that belong to unsupported definition families." },
+    "core:invalid_definition_instance_selector.definition_types": { "type": "array", "minItems": 1, "description": "The non-empty selected definition families that are not record kind, facet, or language." },
+    "core:index_contract_unsupported.registry_snapshot_ids": { "type": "array", "minItems": 1, "description": "Required exact retained registries whose reachable state needs the contract." },
+    "core:index_integrity_failed.snapshot_ids": { "type": "array", "minItems": 1, "description": "Required exact snapshots whose mandatory state is affected." },
+    "core:required_delta_missing.replacement_scope_ids": { "type": "array", "minItems": 1, "description": "The non-empty replacement scopes for which no accepted delta was received." },
+    "core:work_manifest_inconsistent.work_item_ids": { "type": "array", "minItems": 1, "description": "The non-empty work-item identifiers covered by the inconsistent frozen manifest." },
+    "core:source_observation_conflict.source_observation_ids": { "type": "array", "minItems": 2, "description": "The at-least-two accepted observation identifiers that contradict one another." },
+    "core:ambiguous_target.candidate_entity_ids": { "type": "array", "minItems": 2, "description": "Required deduplicated array containing at least two candidate entities." }
+  }
+}

@@ -1,0 +1,35 @@
+# Plugin Upgrade Relock
+
+Status: **Approved**
+Last updated: 2026-08-13
+Depends on: [Configuration, Security, and Lifecycle](09-configuration-security-lifecycle.md), [Language plugin contract](02-language-plugin-contract.md)
+
+## Decision objective
+
+Stop `PluginResolver.resolve` (`packages/plugin-sdk/src/resolution.ts`) from permanently bricking every existing workspace the moment a plugin is rebuilt, while preserving its existing fail-closed behavior for a genuinely tampered, foreign, or malformed lock.
+
+## Context
+
+`resolve`'s `preserveExistingLock` either returned a preserved lock or `undefined`; `undefined` always meant hard failure (`PLUGIN_VERSION_CONFLICT`, `existing_lock_invalid: true`), whether the supplied lock was tampered/foreign (a real security concern) or simply authentic-but-stale because the installed packages moved on since it was written (the ordinary result of a plugin rebuild). Every published workspace persists its resolution lock keyed by a deterministic `resolution_lock_id`, so any edit to the bundled JavaScript/TypeScript analyzer changed `analysis_digest` for every workspace's locked package at once, made every stored lock unpreservable, and hard-failed every subsequent scan at `prepareJavascriptTypescriptRegistry` (`apps/urdira/src/index.ts`) -- contradicting decision 09's "Upgrade, downgrade, and explicit rollback use the same candidate plan and atomic publication pipeline" clause, which requires an upgrade to flow through normal resolution, not a permanent dead end.
+
+Falling back to fresh resolution alone was not sufficient. Three other invariants had to hold simultaneously: `control_plane_state` rows are immutable per `state_key` (`assertPublicationImmutableRows`, `packages/storage/src/publication-authority.ts`), so republishing a *changed* lock payload under the same deterministic id throws `storage:publication_conflict` -- a changed resolution needs a new id. An incremental rescan only reanalyzes artifacts the source diff actually touched; under a changed analyzer, an untouched file would keep records the OLD analyzer produced, silently going stale forever. And a zero-file-change rescan short-circuits to `status: "equivalent"` before it ever reaches publication, so a plugin upgrade with no source edits would never take effect at all.
+
+## Decision
+
+- `preserveExistingLock` now returns one of three kinds instead of a lock-or-`undefined`: `"preserved"` (authentic and still matches the environment -- returned verbatim, `created_at` included, unchanged from before), `"invalid"` (not authentic: malformed, unknown fields, a throwing getter, wrong `workspace_id`, a tampered `lock_digest`, duplicate `plugin_id`s, or a namespace collision within the lock itself -- `resolve` still hard-fails closed on this, byte-for-byte the same behavior as before), or `"stale"` (authentic but no longer matches the currently installed packages/input -- an unsupported contract version, a package whose digests moved, a dependency/capability/pin mismatch, or a cycle). `resolve` now falls through to fresh graph resolution on `"stale"` instead of hard-failing. The ok-shaped `PluginResolutionResult` gained an additive `preserved_existing_lock?: boolean` field so callers can distinguish a preserved lock from a freshly solved one without re-deriving it.
+- `resolution_lock_id` is salted by a fingerprint of the resolution input (resolver version, supported contract versions, requirements, pins, and every discovered package's identity/version/digests), not a pure function of `workspace_id` alone. `registry_snapshot_id`/`configuration_revision_id` are already derived from the resolution lock id, so both cascade automatically whenever the fingerprint -- and therefore the lock -- changes, letting `assertPublicationImmutableRows` write fresh rows instead of conflicting with the previous generation's. A legacy unsalted `lock:${workspace_id}` id keeps working for as long as it stays preservable; only a genuine change mints a new, salted id.
+- A rescan whose target resolution lock id differs from the workspace's currently published one forces full re-analysis (`changed_artifact_ids: undefined`, identical to a first scan) and forces a new candidate generation even over a byte-identical tree (`force_candidate` on `CandidateIndexer.stageSourceBatch`, `packages/engine/src/candidate-indexer.ts`), bypassing the equivalent-tree short-circuit. The candidate id itself also folds in the target lock id, since the observation batch id is content-derived and repeats for an identical tree.
+- An `A -> B -> A` plugin revert reuses the previously persisted lock row for `A` verbatim (`created_at` included) rather than freshly re-freezing an equivalent one, by replaying resolution against that row when the fingerprint returns to a previously seen value.
+- `CandidateMaterialization` identity is salted by its owning candidate: `CandidateMaterializer.seal` (`packages/engine/src/candidate-materialization.ts`) now folds the optional `candidate_generation_id` into the sealed `semanticPayload`, so both `candidate_materialization_id` and `materialization_digest` are unique per candidate rather than pure functions of analysis content. Without this, an upgrade generation over an unchanged tree reproduces byte-identical analysis output and therefore the same materialization id/digest as the previous candidate's already-published row, which collides with the `candidate_materializations` table's `UNIQUE (workspace_id, materialization_digest)` constraint and its immutable `candidate_generation_id` column, throwing `storage:publication_conflict`. A resumed candidate still re-seals to the identical id and digest, since it re-derives from the same `candidate_generation_id`. Pre-change persisted rows (payloads without the field) remain valid and verifiable, since the digest contract covers only the fields present in the payload.
+
+## Consequences
+
+- A plugin upgrade costs one full-analysis generation per affected workspace, the first time each workspace is next scanned after the upgrade -- unavoidable, since the analyzer's own output for every file is potentially different.
+- Legacy unsalted lock ids persist on disk for as long as they remain preservable; they never need proactive migration.
+- There is no automatic rescan on daemon start when a plugin changes underneath an idle workspace -- the stale lock is only detected (and relocked) on that workspace's next scan, whether triggered by a file change or an explicit reindex. Automatically rescanning every activated workspace on daemon start is a possible follow-up, not implemented here.
+
+## Non-goals
+
+- No change to how a tampered, foreign, or otherwise inauthentic lock is handled -- `resolve` still hard-fails closed on all of those, with the identical `PLUGIN_VERSION_CONFLICT` / `existing_lock_invalid: true` shape existing callers already assert on.
+- No change to how a plugin's OWN declared version/dependency requirements are solved; this only changes what happens to a previously *locked* resolution when the environment underneath it moves.
+- No proactive relocking of idle, never-rescanned workspaces.

@@ -1,0 +1,36 @@
+{
+  "valid": [
+    { "type": { "type_kind": "null" }, "value": null },
+    { "type": { "type_kind": "boolean" }, "value": true },
+    { "type": { "type_kind": "safe_integer", "minimum": -2, "maximum": 2 }, "value": -2 },
+    { "type": { "type_kind": "big_integer", "minimum": "bigint:-2", "maximum": "bigint:2" }, "value": "bigint:-2" },
+    { "type": { "type_kind": "float64", "minimum": -2, "maximum": 2 }, "value": 1.5 },
+    { "type": { "type_kind": "exact_decimal", "scale_policy": "significant", "minimum": "decimal:1.20", "maximum": "decimal:2.00" }, "value": "decimal:1.20" },
+    { "type": { "type_kind": "text", "minimum_code_point_count": 1, "maximum_code_point_count": 3 }, "value": "abc" },
+    { "type": { "type_kind": "bytes", "minimum_byte_length": 1, "maximum_byte_length": 2 }, "value": "base64url:AA" },
+    { "type": { "type_kind": "timestamp", "earliest": "2026-08-08T00:00:00.000000000Z", "latest": "2026-08-09T00:00:00.000000000Z" }, "value": "2026-08-08T00:00:00.000000000Z" },
+    { "type": { "type_kind": "digest", "allowed_hash_algorithms": ["sha256"] }, "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "type": { "type_kind": "enum", "values": ["a", "b"] }, "value": "b" },
+    { "type": { "type_kind": "sequence", "element_type": { "type_kind": "text" } }, "value": ["a", "a"] },
+    { "type": { "type_kind": "set", "element_type": { "type_kind": "text" } }, "value": ["a", "b"] },
+    { "type": { "type_kind": "ordered_set", "element_type": { "type_kind": "text" }, "comparator_id": "core:visible_source_state_order", "comparator_version": 1 }, "value": ["a", "b"] },
+    { "type": { "type_kind": "map", "value_type": { "type_kind": "safe_integer" } }, "value": { "a": 1 } },
+    { "type": { "type_kind": "record", "fields": [{ "field_name": "value", "description": "A value.", "presence": "required", "value_type": { "type_kind": "text" } }] }, "value": { "value": "x" } },
+    { "type": { "type_kind": "union", "discriminator_field": "kind", "discriminator_description": "Variant.", "variants": [{ "discriminator_value": "a", "description": "A.", "fields": [] }] }, "value": { "kind": "a" } }
+  ],
+  "invalid": [
+    { "type": { "type_kind": "safe_integer", "minimum": -2, "maximum": 2 }, "value": 3 },
+    { "type": { "type_kind": "big_integer", "minimum": "bigint:-2", "maximum": "bigint:2" }, "value": "bigint:3" },
+    { "type": { "type_kind": "float64" }, "value": "1.5" },
+    { "type": { "type_kind": "exact_decimal", "scale_policy": "insignificant" }, "value": "decimal:1.20" },
+    { "type": { "type_kind": "text", "maximum_code_point_count": 2 }, "value": "abc" },
+    { "type": { "type_kind": "bytes", "maximum_byte_length": 1 }, "value": "base64url:AAAA" },
+    { "type": { "type_kind": "timestamp" }, "value": "2026-02-30T00:00:00.000000000Z" },
+    { "type": { "type_kind": "digest", "allowed_hash_algorithms": ["sha256"] }, "value": "sha256:aa" },
+    { "type": { "type_kind": "enum", "values": ["a", "b"] }, "value": "c" },
+    { "type": { "type_kind": "set", "element_type": { "type_kind": "text" } }, "value": ["a", "a"] },
+    { "type": { "type_kind": "map", "value_type": { "type_kind": "safe_integer" } }, "value": { "a": "1" } },
+    { "type": { "type_kind": "record", "fields": [{ "field_name": "value", "description": "A value.", "presence": "required", "value_type": { "type_kind": "text" } }] }, "value": { "value": "x", "extra": true } },
+    { "type": { "type_kind": "union", "discriminator_field": "kind", "discriminator_description": "Variant.", "variants": [{ "discriminator_value": "a", "description": "A.", "fields": [] }] }, "value": { "kind": "b" } }
+  ]
+}

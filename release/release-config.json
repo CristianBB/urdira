@@ -1,0 +1,50 @@
+{
+  "release_schema_version": 1,
+  "engine_version": "0.1.0",
+  "runtime": {
+    "node": "24.18.1",
+    "pnpm": "11.20.0",
+    "sqlite": "node:sqlite",
+    "watcher": "@parcel/watcher@2.6.0",
+    "semantic_runtime": "@huggingface/transformers@4.2.0",
+    "sandbox_contract": "plugin-sdk:restricted-node@1"
+  },
+  "targets": [
+    { "id": "darwin-arm64", "os": "darwin", "architecture": "arm64", "minimum_os": "13.0", "watcher_package": "@parcel/watcher-darwin-arm64@2.6.0" },
+    { "id": "darwin-x64", "os": "darwin", "architecture": "x64", "minimum_os": "13.0", "watcher_package": "@parcel/watcher-darwin-x64@2.6.0" },
+    { "id": "linux-arm64-gnu", "os": "linux", "architecture": "arm64", "libc": "glibc", "minimum_libc": "2.31", "watcher_package": "@parcel/watcher-linux-arm64-glibc@2.6.0" },
+    { "id": "linux-x64-gnu", "os": "linux", "architecture": "x64", "libc": "glibc", "minimum_libc": "2.31", "watcher_package": "@parcel/watcher-linux-x64-glibc@2.6.0" },
+    { "id": "win32-x64", "os": "win32", "architecture": "x64", "minimum_os": "10.0.19041", "watcher_package": "@parcel/watcher-win32-x64@2.6.0" }
+  ],
+  "production_packages": [
+    "urdira",
+    "@urdira/cli",
+    "@urdira/mcp",
+    "@urdira/daemon",
+    "@urdira/engine",
+    "@urdira/embedding-local",
+    "@urdira/storage",
+    "@urdira/security",
+    "@urdira/plugin-sdk",
+    "@urdira/plugin-javascript-typescript",
+    "@urdira/canonical",
+    "@urdira/contracts"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "@huggingface/transformers": "4.2.0",
+    "@parcel/watcher": "2.6.0",
+    "adm-zip": "0.6.0",
+    "isomorphic-git": "1.40.5",
+    "sharp": "0.35.3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10",
+    "eslint": "9.39.5"
+  },
+  "semantic_model": {
+    "model_id": "Xenova/all-MiniLM-L6-v2",
+    "acquisition": "configure_time_download",
+    "bundled_assets": false
+  },
+  "gates": ["unit", "contract", "integration", "e2e", "crash", "corruption", "security", "watcher", "benchmark", "package_inspection"]
+}

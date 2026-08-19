@@ -1,0 +1,12 @@
+[package]
+name = "library-lending"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "library_lending"
+path = "src/lib.rs"
+
+[[bin]]
+name = "library-lending"
+path = "src/main.rs"

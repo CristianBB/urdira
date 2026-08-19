@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "useUnknownInCatchVariables": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noEmitOnError": true,
+    "moduleDetection": "force",
+    "types": ["node", "vitest/globals"]
+  },
+  "files": [],
+  "references": [
+    { "path": "packages/contracts" },
+    { "path": "packages/canonical" },
+    { "path": "packages/security" },
+    { "path": "packages/storage" },
+    { "path": "packages/plugin-sdk" },
+    { "path": "packages/plugin-javascript-typescript" },
+    { "path": "packages/engine" },
+    { "path": "packages/embedding-local" },
+    { "path": "packages/daemon" },
+    { "path": "packages/mcp" },
+    { "path": "packages/cli" },
+    { "path": "packages/testkit" },
+    { "path": "tsconfig.tests.json" },
+    { "path": "apps/urdira" }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "@urdira-fixture/task-planner-javascript",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.18.1" },
+  "scripts": { "test": "node --test test/task-service.spec.js" }
+}

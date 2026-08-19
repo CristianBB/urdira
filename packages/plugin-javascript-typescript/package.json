@@ -1,0 +1,26 @@
+{
+  "name": "@urdira/plugin-javascript-typescript",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@urdira/contracts": "workspace:*",
+    "@urdira/plugin-sdk": "workspace:*",
+    "typescript": "7.0.2"
+  }
+}

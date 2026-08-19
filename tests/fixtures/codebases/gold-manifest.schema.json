@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urdira.dev/test-fixtures/gold-manifest.schema.json",
+  "title": "Urdira E2E codebase gold manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "fixture", "artifacts", "subjects", "relations", "operation_cases"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "language", "project_root"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "language": { "type": "string", "minLength": 1 },
+        "project_root": { "type": "string", "minLength": 1 }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "subjects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/subject" }
+    },
+    "relations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/relation" }
+    },
+    "operation_cases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operationCase" }
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "anchor"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "anchor": { "type": "string", "minLength": 1 }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "universal_kind", "source"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "universal_kind": { "type": "string", "pattern": "^core:[a-z0-9_]+$" },
+        "facets": { "type": "array", "items": { "type": "string", "pattern": "^core:[a-z0-9_]+$" }, "uniqueItems": true },
+        "semantic_roles": { "type": "array", "items": { "type": "string", "pattern": "^core:[a-z0-9_]+$" }, "uniqueItems": true },
+        "source": { "$ref": "#/$defs/source" }
+      }
+    },
+    "participant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "subject_id"],
+      "properties": {
+        "role": { "type": "string", "minLength": 1 },
+        "subject_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification", "source"],
+      "properties": {
+        "classification": { "enum": ["confirmed", "possible"] },
+        "source": { "$ref": "#/$defs/source" }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "universal_kind", "participants", "evidence"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "universal_kind": { "type": "string", "pattern": "^core:[a-z0-9_]+$" },
+        "participants": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/participant" } },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "expectedStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["confirmed", "possible"],
+      "properties": {
+        "confirmed": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "possible": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+      }
+    },
+    "operationCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "operation_id", "arguments", "required_capabilities", "expected"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "operation_id": { "type": "string", "pattern": "^core:[a-z0-9_]+$" },
+        "arguments": { "type": "object" },
+        "required_capabilities": { "type": "array", "items": { "type": "string", "pattern": "^core:[a-z0-9_]+$" }, "uniqueItems": true },
+        "expected": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["streams", "completeness"],
+          "properties": {
+            "streams": { "type": "object", "additionalProperties": { "$ref": "#/$defs/expectedStream" } },
+            "completeness": { "enum": ["complete", "incomplete", "unsupported"] }
+          }
+        }
+      }
+    }
+  }
+}

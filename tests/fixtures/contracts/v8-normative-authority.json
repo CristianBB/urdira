@@ -1,0 +1,23 @@
+{
+  "authority_kind": "mechanically-transcribed-normative-v8",
+  "record_payload_logical_type": "JsonValue",
+  "record_payload_models": [
+    "RecordEnvelope",
+    "EntityRecord",
+    "RelationRecord",
+    "FactRecord",
+    "EvidenceRecord",
+    "DiagnosticRecord"
+  ],
+  "schema_field_name_pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+  "query_pipeline_stage_fields": [
+    "stage_id",
+    "operator",
+    "inputs",
+    "arguments"
+  ],
+  "query_stage_output_fields": [
+    "stage_id",
+    "output"
+  ]
+}

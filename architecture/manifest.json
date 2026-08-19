@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "packages": [
+    {
+      "name": "@urdira/contracts",
+      "path": "packages/contracts",
+      "layer": 0,
+      "dependencies": [],
+      "responsibilities": ["schema-ir", "registries", "public-contracts"]
+    },
+    {
+      "name": "@urdira/canonical",
+      "path": "packages/canonical",
+      "layer": 1,
+      "dependencies": ["@urdira/contracts"],
+      "responsibilities": ["canonical-encoding", "digests", "comparators"]
+    },
+    {
+      "name": "@urdira/security",
+      "path": "packages/security",
+      "layer": 2,
+      "dependencies": ["@urdira/contracts", "@urdira/canonical"],
+      "responsibilities": ["configuration-security", "source-boundaries", "secret-redaction", "package-model-pack-lifecycle", "administrative-download"]
+    },
+    {
+      "name": "@urdira/storage",
+      "path": "packages/storage",
+      "layer": 2,
+      "dependencies": ["@urdira/contracts", "@urdira/canonical"],
+      "responsibilities": ["catalog", "workspace-databases", "content-addressed-storage"]
+    },
+    {
+      "name": "@urdira/engine",
+      "path": "packages/engine",
+      "layer": 3,
+      "dependencies": [
+        "@urdira/contracts",
+        "@urdira/canonical",
+        "@urdira/storage",
+        "@urdira/plugin-sdk",
+        "@urdira/security"
+      ],
+      "responsibilities": [
+        "configuration",
+        "workspaces",
+        "projections",
+        "candidate-indexing",
+        "semantic-retrieval",
+        "query-pipelines"
+      ]
+    },
+    {
+      "name": "@urdira/plugin-sdk",
+      "path": "packages/plugin-sdk",
+      "layer": 1,
+      "dependencies": ["@urdira/contracts"],
+      "responsibilities": [
+        "plugin-contracts",
+        "worker-envelopes",
+        "context-access",
+        "registration",
+        "resolution",
+        "budgets",
+        "quarantine"
+      ]
+    },
+    {
+      "name": "@urdira/plugin-javascript-typescript",
+      "path": "packages/plugin-javascript-typescript",
+      "layer": 2,
+      "dependencies": ["@urdira/contracts", "@urdira/plugin-sdk"],
+      "responsibilities": ["javascript-typescript-analysis", "typescript-project-discovery", "language-plugin-runtime"]
+    },
+    {
+      "name": "@urdira/embedding-local",
+      "path": "packages/embedding-local",
+      "layer": 4,
+      "dependencies": [
+        "@urdira/contracts",
+        "@urdira/canonical",
+        "@urdira/engine"
+      ],
+      "responsibilities": ["local-open-model-embedding-provider"]
+    },
+    {
+      "name": "@urdira/daemon",
+      "path": "packages/daemon",
+      "layer": 5,
+      "dependencies": [
+        "@urdira/contracts",
+        "@urdira/embedding-local",
+        "@urdira/engine",
+        "@urdira/plugin-sdk",
+        "@urdira/storage"
+      ],
+      "responsibilities": ["private-ipc", "scheduling", "recovery", "quotas"]
+    },
+    {
+      "name": "@urdira/mcp",
+      "path": "packages/mcp",
+      "layer": 6,
+      "dependencies": ["@urdira/contracts", "@urdira/daemon", "@urdira/engine"],
+      "responsibilities": ["mcp-tools", "protocol-errors", "stdio-serving"]
+    },
+    {
+      "name": "@urdira/cli",
+      "path": "packages/cli",
+      "layer": 6,
+      "dependencies": ["@urdira/contracts", "@urdira/daemon"],
+      "responsibilities": ["command-line-interface", "human-readable-output"]
+    },
+    {
+      "name": "@urdira/testkit",
+      "path": "packages/testkit",
+      "layer": 6,
+      "dependencies": [
+        "@urdira/contracts",
+        "@urdira/daemon",
+        "@urdira/engine",
+        "@urdira/plugin-sdk"
+      ],
+      "responsibilities": ["synthetic-workers", "conformance-fixtures", "test-helpers"]
+    },
+    {
+      "name": "urdira",
+      "path": "apps/urdira",
+      "layer": 7,
+      "dependencies": ["@urdira/cli", "@urdira/contracts", "@urdira/daemon", "@urdira/embedding-local", "@urdira/engine", "@urdira/mcp", "@urdira/plugin-javascript-typescript", "@urdira/plugin-sdk"],
+      "responsibilities": ["composed-production-entry-point"]
+    }
+  ],
+  "coverage": [
+    { "area": "contracts", "owner": "@urdira/contracts" },
+    { "area": "canonical-encoding", "owner": "@urdira/canonical" },
+    { "area": "configuration-security", "owner": "@urdira/security" },
+    { "area": "durable-storage", "owner": "@urdira/storage" },
+    { "area": "core-engine", "owner": "@urdira/engine" },
+    { "area": "plugin-sdk", "owner": "@urdira/plugin-sdk" },
+    { "area": "daemon", "owner": "@urdira/daemon" },
+    { "area": "mcp-adapter", "owner": "@urdira/mcp" },
+    { "area": "cli", "owner": "@urdira/cli" },
+    { "area": "testkit", "owner": "@urdira/testkit" },
+    { "area": "composed-application", "owner": "urdira" }
+  ]
+}

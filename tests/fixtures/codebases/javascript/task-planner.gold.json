@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "fixture": {
+    "id": "javascript-task-planner",
+    "language": "javascript",
+    "project_root": "javascript/task-planner"
+  },
+  "artifacts": [
+    "package.json",
+    "jsconfig.json",
+    "src/domain/errors.js",
+    "src/domain/task.js",
+    "src/repository/in-memory-task-repository.js",
+    "src/repository/task-repository.js",
+    "src/services/task-service.js",
+    "src/index.js",
+    "src/main.js",
+    "test/task-service.spec.js"
+  ],
+  "subjects": [
+    { "id": "type:task", "name": "Task", "universal_kind": "core:type", "source": { "path": "src/domain/task.js", "anchor": "@typedef {object} Task" } },
+    { "id": "type:task-repository", "name": "TaskRepository", "universal_kind": "core:type", "source": { "path": "src/repository/task-repository.js", "anchor": "export class TaskRepository" } },
+    { "id": "type:in-memory-task-repository", "name": "InMemoryTaskRepository", "universal_kind": "core:type", "source": { "path": "src/repository/in-memory-task-repository.js", "anchor": "export class InMemoryTaskRepository" } },
+    { "id": "type:task-service", "name": "TaskService", "universal_kind": "core:type", "source": { "path": "src/services/task-service.js", "anchor": "export class TaskService" } },
+    { "id": "callable:repo-create", "name": "create", "universal_kind": "core:callable", "source": { "path": "src/repository/task-repository.js", "anchor": "create(_id, _input)" } },
+    { "id": "callable:repo-find-by-id", "name": "findById", "universal_kind": "core:callable", "source": { "path": "src/repository/task-repository.js", "anchor": "findById(_id)" } },
+    { "id": "callable:repo-list-by-status", "name": "listByStatus", "universal_kind": "core:callable", "source": { "path": "src/repository/task-repository.js", "anchor": "listByStatus(_status)" } },
+    { "id": "callable:repo-save", "name": "save", "universal_kind": "core:callable", "source": { "path": "src/repository/task-repository.js", "anchor": "save(_task)" } },
+    { "id": "callable:service-create-task", "name": "createTask", "universal_kind": "core:callable", "source": { "path": "src/services/task-service.js", "anchor": "createTask(input)" } },
+    { "id": "callable:service-start-task", "name": "startTask", "universal_kind": "core:callable", "source": { "path": "src/services/task-service.js", "anchor": "startTask(taskId)" } },
+    { "id": "callable:service-complete-task", "name": "completeTask", "universal_kind": "core:callable", "source": { "path": "src/services/task-service.js", "anchor": "completeTask(taskId)" } },
+    { "id": "callable:service-get-open-tasks", "name": "getOpenTasks", "universal_kind": "core:callable", "source": { "path": "src/services/task-service.js", "anchor": "getOpenTasks()" } },
+    { "id": "callable:service-transition", "name": "transition", "universal_kind": "core:callable", "source": { "path": "src/services/task-service.js", "anchor": "transition(taskId, expected, next)" } },
+    { "id": "container:main", "name": "task-planner entry module", "universal_kind": "core:container", "source": { "path": "src/main.js", "anchor": "const repository = new InMemoryTaskRepository();" } },
+    { "id": "container:task-service-tests", "name": "task service tests", "universal_kind": "core:container", "source": { "path": "test/task-service.spec.js", "anchor": "const createService = () => new TaskService(new InMemoryTaskRepository());" } }
+  ],
+  "relations": [
+    { "id": "implements-task-repository", "universal_kind": "core:implements", "participants": [{ "role": "implementer", "subject_id": "type:in-memory-task-repository" }, { "role": "contract", "subject_id": "type:task-repository" }], "evidence": { "classification": "confirmed", "source": { "path": "src/repository/in-memory-task-repository.js", "anchor": "extends TaskRepository" } } },
+    { "id": "start-calls-transition", "universal_kind": "core:call", "participants": [{ "role": "caller", "subject_id": "callable:service-start-task" }, { "role": "target", "subject_id": "callable:service-transition" }], "evidence": { "classification": "confirmed", "source": { "path": "src/services/task-service.js", "anchor": "return this.transition(taskId, \"todo\", \"in_progress\");" } } },
+    { "id": "complete-calls-transition", "universal_kind": "core:call", "participants": [{ "role": "caller", "subject_id": "callable:service-complete-task" }, { "role": "target", "subject_id": "callable:service-transition" }], "evidence": { "classification": "confirmed", "source": { "path": "src/services/task-service.js", "anchor": "return this.transition(taskId, \"in_progress\", \"done\");" } } },
+    { "id": "transition-calls-find", "universal_kind": "core:call", "participants": [{ "role": "caller", "subject_id": "callable:service-transition" }, { "role": "target", "subject_id": "callable:repo-find-by-id" }], "evidence": { "classification": "confirmed", "source": { "path": "src/services/task-service.js", "anchor": "const task = this.repository.findById(taskId);" } } },
+    { "id": "transition-calls-save", "universal_kind": "core:call", "participants": [{ "role": "caller", "subject_id": "callable:service-transition" }, { "role": "target", "subject_id": "callable:repo-save" }], "evidence": { "classification": "confirmed", "source": { "path": "src/services/task-service.js", "anchor": "this.repository.save(updated);" } } },
+    { "id": "tests-cover-task-service", "universal_kind": "core:covers", "participants": [{ "role": "test", "subject_id": "container:task-service-tests" }, { "role": "covered", "subject_id": "type:task-service" }], "evidence": { "classification": "confirmed", "source": { "path": "test/task-service.spec.js", "anchor": "test(\"moves a task through its allowed lifecycle\", () => {" } } }
+  ],
+  "operation_cases": [
+    { "id": "find-task-service-types", "operation_id": "core:find_records", "arguments": { "selector": { "record_categories": ["entity"], "kind_selector": { "universal_kinds": ["core:type"] }, "filter": { "languages": ["javascript"] } } }, "required_capabilities": ["core:symbol_declarations"], "expected": { "streams": { "records": { "confirmed": ["type:task-service", "type:task-repository", "type:in-memory-task-repository"], "possible": [] } }, "completeness": "complete" } },
+    { "id": "resolve-task-service", "operation_id": "core:resolve_symbol", "arguments": { "reference": "TaskService", "resolution_scope": "exports" }, "required_capabilities": ["core:symbol_resolution"], "expected": { "streams": { "declarations": { "confirmed": ["type:task-service"], "possible": [] }, "candidates": { "confirmed": [], "possible": [] } }, "completeness": "complete" } },
+    { "id": "outline-task-service", "operation_id": "core:get_outline", "arguments": { "container": { "subject_type": "entity", "entity_id": "fixture:type:task-service" }, "depth": 1 }, "required_capabilities": ["core:syntax_structure"], "expected": { "streams": { "members": { "confirmed": ["callable:service-create-task", "callable:service-start-task", "callable:service-complete-task", "callable:service-get-open-tasks"], "possible": [] } }, "completeness": "complete" } }
+  ]
+}

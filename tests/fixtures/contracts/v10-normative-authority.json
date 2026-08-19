@@ -1,0 +1,69 @@
+{
+  "authority_kind": "mechanically-transcribed-normative-v10",
+  "generated_from": [
+    "docs/protocol/public-query-contract.md",
+    "docs/decisions/03-query-algebra-public-api.md",
+    "docs/decisions/01-universal-data-model.md"
+  ],
+  "forbidden_description_patterns": ["has the closed value described by", "value is present only when this registered condition holds"],
+  "operations": [
+    { "operation_id": "core:discover_definitions", "arguments": { "matcher": { "text": "x", "mode": "exact" } } },
+    { "operation_id": "core:find_records", "arguments": { "selector": { "record_categories": ["entity"] } } },
+    { "operation_id": "core:resolve_symbol", "arguments": { "reference": "x" } },
+    { "operation_id": "core:get_outline", "arguments": { "container": { "subject_type": "artifact", "artifact_id": "art-1" } } },
+    { "operation_id": "core:find_references", "arguments": { "target": { "subject_type": "symbol", "name": "x" } } },
+    { "operation_id": "core:expand_relations", "arguments": { "subjects": [{ "subject_type": "entity", "entity_id": "ent-1" }], "direction": "outbound", "relations": {} } },
+    { "operation_id": "core:find_paths", "arguments": { "sources": [{ "subject_type": "entity", "entity_id": "ent-1" }], "targets": [{ "subject_type": "entity", "entity_id": "ent-2" }], "relations": {}, "max_depth": 1 } },
+    { "operation_id": "core:find_artifacts", "arguments": {} },
+    { "operation_id": "core:search_text", "arguments": { "pattern": "x" } },
+    { "operation_id": "core:search_semantic", "arguments": { "query_text": "x", "query_class": "natural_text" } },
+    { "operation_id": "core:search_hybrid", "arguments": { "query_text": "x", "query_class": "natural_text" } },
+    { "operation_id": "core:get_source", "arguments": { "subjects": [{ "subject_type": "entity", "entity_id": "ent-1" }], "source": { "mode": "signature", "max_characters_per_snippet": 1, "max_total_characters": 1, "context_lines": 0 } } },
+    { "operation_id": "core:analyze_impact", "arguments": { "target": { "subject_type": "entity", "entity_id": "ent-1" }, "change": { "change_type": "delete" } } },
+    { "operation_id": "core:find_related_tests", "arguments": { "subjects": [{ "subject_type": "entity", "entity_id": "ent-1" }] } },
+    { "operation_id": "core:inspect_architecture", "arguments": { "views": ["entry_points"] } },
+    { "operation_id": "core:compare", "arguments": { "comparison_kinds": ["added"] } },
+    { "operation_id": "core:build_context", "arguments": { "task": "x", "facets": ["definitions"] } },
+    { "operation_id": "core:index_status", "arguments": {} }
+  ],
+  "model_fields": [
+    { "model": "ModelPackManifest", "field": "manifest_schema_version", "logical_type": "PositiveInteger", "description": "Positive core bootstrap-schema version used to decode and validate the complete closed manifest before any asset is opened. Unknown versions are rejected; fields from another version are never ignored." },
+    { "model": "ModelPackManifest", "field": "model_pack_id", "logical_type": "NamespacedIdentifier", "description": "Stable canonical namespaced pack identifier whose uniqueness is enforced within an installation. It conveys no authenticated publisher ownership." },
+    { "model": "ModelPackManifest", "field": "model_pack_version", "logical_type": "SemVer", "description": "Exact normalized SemVer 2.0.0 version permanently bound to one canonical manifest digest. Build metadata is preserved as part of the exact coordinate even though SemVer precedence ignores it." },
+    { "model": "ModelPackManifest", "field": "embedding_profiles", "logical_type": "Sequence<EmbeddingProfile>", "description": "Non-empty duplicate-free ordered set of complete `EmbeddingProfile` definitions, canonically ordered by `embedding_profile_id`. Each stored `profile_digest` is recomputed before installation may continue." },
+    { "model": "ModelPackManifest", "field": "assets", "logical_type": "Sequence<ModelPackAssetEntry>", "description": "Non-empty complete ordered set of `ModelPackAssetEntry` values. Every declared entry is mandatory and canonical ordering follows the asset-entry contract below." },
+    { "model": "ModelPackManifest", "field": "required_runtime_components", "logical_type": "Sequence<ModelPackRuntimeRequirement>", "description": "Non-empty complete ordered set of `ModelPackRuntimeRequirement` values needed to render, segment, generate, and infer for every embedded profile. Requirements can only select components already shipped with the target Urdira engine." },
+    { "model": "ModelPackManifest", "field": "manifest_digest", "logical_type": "Digest", "description": "Digest of exactly the six preceding fields under `core:model_pack_manifest_digest`; the digest field itself and all delivery metadata are omitted. Urdira recomputes it before collision checks or asset acquisition." },
+    { "model": "Snapshot", "field": "source_state_digest", "logical_type": "Digest", "description": "Digest of visible artifacts, versions, and tombstones." },
+    { "model": "Snapshot", "field": "canonical_record_set_digest", "logical_type": "Digest", "description": "Digest of the complete visible canonical record set." },
+    { "model": "Snapshot", "field": "capability_state_digest", "logical_type": "Digest", "description": "Digest of snapshot-wide capability coverage and limitations." },
+    { "model": "Snapshot", "field": "snapshot_digest", "logical_type": "Digest", "description": "UCE digest governed by `core:snapshot_digest`; its positive field list and referenced set digests are authoritative in the core digest-field registry." },
+    { "model": "ArtifactVersion", "field": "analysis_metadata_digest", "logical_type": "Digest", "description": "Digest of non-content metadata capable of affecting analysis." },
+    { "model": "IntentRecipeDefinition", "field": "recipe_digest", "logical_type": "Digest", "description": "Complete `IntentRecipeDefinition` in declared field order with `recipe_digest` absent. Stage order is topological and semantic; capability, ranking, guard, and pagination-stream collections use their registered canonical identifier order." }
+  ],
+  "payload_fields": [
+    { "code": "core:budget_invalid", "field": "budget_field", "description": "The canonical request pointer naming the budget whose supplied value is outside the operation's advertised bounds." },
+    { "code": "core:budget_invalid", "field": "provided", "description": "The supplied numeric budget value that failed the selected operation's bounds." },
+    { "code": "core:freshness_wait_timeout", "field": "pending_observation_counts", "description": "The non-negative pending observation count for each workspace, in the same order as workspace_ids." },
+    { "code": "core:freshness_wait_timeout", "field": "waited_ms", "description": "The elapsed non-negative wait in milliseconds before the freshness boundary expired." },
+    { "code": "core:freshness_wait_timeout", "field": "retry_after_ms", "description": "The optional non-negative server estimate in milliseconds before another freshness attempt may make progress." },
+    { "code": "core:embedding_profile_incompatible", "field": "incompatibility_reasons", "description": "The non-empty closed set of embedding-profile dimensions that failed hard compatibility checks." }
+  ],
+  "pipeline": {
+    "operator_arity": {
+      "source.operation": { "minimum_inputs": 0, "maximum_inputs": 0 },
+      "source.registry": { "minimum_inputs": 0, "maximum_inputs": 0 },
+      "set.union": { "minimum_inputs": 2 },
+      "set.intersection": { "minimum_inputs": 2 },
+      "set.difference": { "exact_inputs": 2 },
+      "expand.relations": { "exact_inputs": 1 },
+      "expand.operation": { "exact_inputs": 1 },
+      "filter": { "exact_inputs": 1 },
+      "join": { "exact_inputs": 2 },
+      "deduplicate": { "minimum_inputs": 1 },
+      "bind.record_selector": { "exact_inputs": 1, "input_output": "definition_set", "recipe_only": true },
+      "bind.subject_record_selector": { "exact_inputs": 1, "recipe_only": true },
+      "select": { "minimum_inputs": 1 }
+    }
+  }
+}

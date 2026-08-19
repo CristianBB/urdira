@@ -1,0 +1,217 @@
+{
+  "version": 1,
+  "minimum_repository_line_percent": 90,
+  "critical_branch_percent": 100,
+  "coverage_report": "coverage/coverage-final.json",
+  "coverage_scope": ["repository"],
+  "coverage_scope_notes": "Task 3 candidate digest and the semantic publication-authority region are enforceable 100% branch-gated behavior regions; repository line coverage remains a separate regression floor.",
+  "critical_branch_modules": ["packages/storage/src/faults.ts", "packages/storage/src/candidate-digest.ts"],
+  "critical_branch_regions": [{ "module": "packages/storage/src/publication-authority.ts", "start_line": 55, "end_line": 771 }],
+  "required_modules": [
+    {
+      "module": "packages/storage/src/lifecycle.ts",
+      "tests": ["tests/phase5.test.ts", "tests/phase5-review-fixes.test.ts"],
+      "required_behaviors": ["appendManifestSegment", "hydrateManifest", "expireExecutions", "migrate", "repair", "collect"]
+    },
+    {
+      "module": "packages/storage/src/projections.ts",
+      "tests": ["tests/phase5.test.ts", "tests/phase5-review-fixes.test.ts"],
+      "required_behaviors": ["putGraphEdge", "putLexicalDocument", "putDependency", "putMetric", "putVector", "exactVectorSearch"]
+    },
+    {
+      "module": "packages/storage/src/storage.ts",
+      "tests": ["tests/phase5.test.ts", "tests/phase5-review-fixes.test.ts", "tests/phase9-publication.test.ts"],
+      "required_behaviors": ["createDurableStorage", "openWorkspace", "publish", "publishCandidate", "candidate_publication.after_commit_ack"]
+    },
+    {
+      "module": "packages/storage/src/publication-authority.ts",
+      "tests": ["tests/phase9-publication.test.ts"],
+      "required_behaviors": ["buildPublicationTransactionCommands", "translateCompatibilityPublication", "checkedPublicationCommand", "publicationFaultCommand", "Compatibility publication", "Candidate publication requires"]
+    },
+    {
+      "module": "packages/storage/src/candidates.ts",
+      "tests": ["tests/phase9-publication.test.ts"],
+      "required_behaviors": ["acceptDelta", "transition", "selectManifest", "saveMaterialization", "listRecoverable", "getPublication", "candidate_digest_conflict"]
+    },
+    {
+      "module": "packages/storage/src/projection-occurrences.ts",
+      "tests": ["tests/phase9-publication.test.ts"],
+      "required_behaviors": ["WorkspaceProjectionOccurrenceRepository", "putDependency", "listByOwner", "dependencies"]
+    },
+    {
+      "module": "packages/storage/src/faults.ts",
+      "tests": ["tests/phase5.test.ts", "tests/phase5-review-fixes.test.ts"],
+      "required_behaviors": ["createFaultInjector", "storage:fault_injected"]
+    },
+    {
+      "module": "packages/engine/src/errors.ts",
+      "tests": ["tests/phase7-workspaces.test.ts", "tests/phase7-indexing.test.ts"],
+      "required_behaviors": ["engine:workspace_provider_mismatch", "engine:source_index_result_invalid"]
+    },
+    {
+      "module": "packages/engine/src/workspaces.ts",
+      "tests": ["tests/phase7-workspaces.test.ts"],
+      "required_behaviors": ["WorkspaceRegistry", "full_authoritative", "codebase_id"]
+    },
+    {
+      "module": "packages/engine/src/source-provider.ts",
+      "tests": ["tests/phase7-providers.test.ts"],
+      "required_behaviors": ["describe", "enumerate", "read", "watch", "reconcile"]
+    },
+    {
+      "module": "packages/engine/src/directory-provider.ts",
+      "tests": ["tests/phase7-providers.test.ts"],
+      "required_behaviors": ["DirectorySourceProvider", "coverage_completeness", "deletion_authority", "watermark"]
+    },
+    {
+      "module": "packages/engine/src/git-providers.ts",
+      "tests": ["tests/phase7-providers.test.ts"],
+      "required_behaviors": ["GitWorktreeSourceProvider", "GitReferenceSourceProvider", "administrative_state_fingerprint"]
+    },
+    {
+      "module": "packages/engine/src/watchers.ts",
+      "tests": ["tests/phase7-reconciliation.test.ts"],
+      "required_behaviors": ["ParcelWatcherAdapter", "DeterministicFakeWatcher", "source_barrier"]
+    },
+    {
+      "module": "packages/engine/src/reconciliation.ts",
+      "tests": ["tests/phase7-reconciliation.test.ts"],
+      "required_behaviors": ["ReconciliationCoordinator", "FreshnessBarrier", "checkpoint", "degraded"]
+    },
+    {
+      "module": "packages/engine/src/source-batch-digest.ts",
+      "tests": ["tests/phase7-indexing.test.ts"],
+      "required_behaviors": ["sourceObservationBatchDigest", "batch_digest"]
+    },
+    {
+      "module": "packages/engine/src/source-indexer.ts",
+      "tests": ["tests/phase7-indexing.test.ts"],
+      "required_behaviors": ["GenericSourceIndexer", "engine:source_index_result_invalid", "degraded"]
+    },
+    {
+      "module": "packages/engine/src/candidate-planning.ts",
+      "tests": ["tests/phase9-planning.test.ts"],
+      "required_behaviors": ["CandidatePlanner", "transitive dependency", "empty lookup", "conservatively invalidates", "frozen manifest", "execution DAG"]
+    },
+    {
+      "module": "packages/engine/src/fact-delta.ts",
+      "tests": ["tests/phase9-deltas.test.ts"],
+      "required_behaviors": ["FactDelta acceptance", "base record-set digest", "staged manifest entries", "dependencies", "proposal outside", "base issue scope", "transitive inputs from the accepted manifest", "id reuse", "canonical empty record-set digest", "closure identity or content", "empty structured dependency source reference", "registered facets and bodies", "declared accepted-delta adapter", "unknown FactDelta source-reference discriminator", "duplicate replacement scope", "extra replacement scope", "identity mismatch", "target registry identity mismatch", "analysis context mismatch"]
+    },
+    {
+      "module": "packages/engine/src/candidate-execution.ts",
+      "tests": ["tests/phase9-execution.test.ts"],
+      "required_behaviors": ["Phase 9 candidate execution", "exact worker shape", "equal-depth work", "visible staged acceptance", "cancellation", "closed worker failures", "projection success shape", "projection closed outcome", "close workers", "duplicate projection IDs", "duplicate projection keys", "undeclared source IDs", "whole-candidate validation barrier", "projection sources against accepted staged entries", "validated staged entries", "accepted manifest", "rolls back accepted output", "attempts manifest rollback", "discards only the manifest associated with the cancelled accepted delta", "typescript-shaped", "rust-shaped", "mismatched projection kind", "source set without the owner version"]
+    },
+    {
+      "module": "packages/engine/src/candidate-materialization.ts",
+      "tests": ["tests/phase9-materialization.test.ts"],
+      "required_behaviors": ["CandidateMaterializer", "reuses identical records", "absence barrier", "dependency, lookup, and projection source bindings", "generation-neutral candidate materialization", "truthful generation-neutral CandidateMaterialization", "immutable templates", "materialization digest", "operational identities part of the semantic digest", "complete artifact authority", "invalid content digest", "complete authority collection", "validity generations", "mismatched projection kind", "distinct changed projection occurrence", "invalid bounded", "consumer_type", "operation", "invalidation_scope", "SDK binding contract", "rejects malformed %s"]
+    },
+    {
+      "module": "packages/storage/src/source-index.ts",
+      "tests": ["tests/phase7-indexing.test.ts"],
+      "required_behaviors": ["source_index_state", "source_index.before_commit", "observation_batch_id"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/errors.ts",
+      "tests": ["tests/phase8-registry.test.ts", "tests/phase8-context.test.ts", "tests/phase8-runtime.test.ts"],
+      "required_behaviors": ["PluginSdkError", "plugin-sdk:worker_protocol_invalid"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/canonical.ts",
+      "tests": ["tests/phase8-context.test.ts", "tests/phase8-runtime.test.ts"],
+      "required_behaviors": ["canonicalSha256", "canonicalizes duplicate concurrent reads"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/semver.ts",
+      "tests": ["tests/phase8-registry.test.ts"],
+      "required_behaviors": ["parseSemVer", "normalizeVersionRequirement", "satisfiesVersionRequirement"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/packages.ts",
+      "tests": ["tests/phase8-registry.test.ts"],
+      "required_behaviors": ["PluginPackageDiscovery", "closed bundles", "collision_candidates"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/resolution.ts",
+      "tests": ["tests/phase8-registry.test.ts"],
+      "required_behaviors": ["PluginResolver", "backtracks across the whole graph", "lock_digest"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/registry.ts",
+      "tests": ["tests/phase8-registry.test.ts"],
+      "required_behaviors": ["PluginRegistryAssembler", "LANGUAGE_DEFINITION_CONFLICT", "NAMESPACE_CONFLICT"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/analysis-context.ts",
+      "tests": ["tests/phase8-context.test.ts", "tests/phase8-conformance.test.ts"],
+      "required_behaviors": ["createPluginAnalysisSession", "only five context operations", "staged prerequisite"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/access-manifest.ts",
+      "tests": ["tests/phase8-context.test.ts", "tests/phase8-conformance.test.ts"],
+      "required_behaviors": ["automatic plugin access manifest capture", "empty lookups", "manifest_digest"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/invalidation.ts",
+      "tests": ["tests/phase8-context.test.ts"],
+      "required_behaviors": ["PluginLookupInvalidationBinder", "empty lookup", "transitive artifact"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/protocol.ts",
+      "tests": ["tests/phase8-runtime.test.ts", "tests/phase8-conformance.test.ts"],
+      "required_behaviors": ["ClosedWorkerProtocol", "workerRequestDigest", "closed protocol"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/supervisor.ts",
+      "tests": ["tests/phase8-runtime.test.ts", "tests/phase8-conformance.test.ts"],
+      "required_behaviors": ["SupervisedPluginRuntime", "WorkerProcessCrash", "exact build"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/sandbox.ts",
+      "tests": ["tests/phase8-runtime.test.ts", "tests/architecture-guardrails.test.ts"],
+      "required_behaviors": ["RestrictedNodeSandbox", "RestrictedNodeProcessPort", "restricted typed Node"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/port-boundary.ts",
+      "tests": ["tests/phase8-context.test.ts", "tests/phase8-runtime.test.ts"],
+      "required_behaviors": ["materializes a stateful", "safe boundary"]
+    },
+    {
+      "module": "packages/plugin-sdk/src/index.ts",
+      "tests": ["tests/phase8-registry.test.ts", "tests/phase8-context.test.ts", "tests/phase8-runtime.test.ts"],
+      "required_behaviors": ["PluginRegistryAssembler", "createPluginAnalysisSession", "SupervisedPluginRuntime", "RestrictedNodeSandbox"]
+    },
+    {
+      "module": "packages/testkit/src/synthetic-workers.ts",
+      "tests": ["tests/phase8-conformance.test.ts"],
+      "required_behaviors": ["TypeScript-shaped", "Rust-shaped", "generic_script", "language branch independence"]
+    },
+    {
+      "module": "packages/engine/src/semantic-documents.ts",
+      "tests": ["tests/phase10-semantic.test.ts"],
+      "required_behaviors": ["buildSemanticDocument", "generic_source", "plugin_enrichment", "source_content_digest"]
+    },
+    {
+      "module": "packages/engine/src/semantic-runtime.ts",
+      "tests": ["tests/phase10-semantic.test.ts"],
+      "required_behaviors": ["DeterministicSemanticRuntime", "canonicalVectorBytes", "SemanticRuntimeRegistry", "injected ONNX port"]
+    },
+    {
+      "module": "packages/engine/src/semantic-retrieval.ts",
+      "tests": ["tests/phase10-semantic.test.ts"],
+      "required_behaviors": ["exactVectorScan", "filtered vector scan", "fuses lanes", "exact rational comparisons", "without exposing distances"]
+    },
+    {
+      "module": "packages/engine/src/semantic-updater.ts",
+      "tests": ["tests/phase10-semantic.test.ts"],
+      "required_behaviors": ["SemanticUpdater", "multiple profile lanes", "partial coverage", "immutable materializations", "failed update"]
+    },
+    {
+      "module": "packages/engine/src/semantic-selection.ts",
+      "tests": ["tests/phase10-semantic.test.ts"],
+      "required_behaviors": ["selectBundledProfile", "frozen evaluation gates"]
+    }
+  ]
+}

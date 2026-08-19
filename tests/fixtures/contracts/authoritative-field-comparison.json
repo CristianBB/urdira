@@ -1,0 +1,32 @@
+{
+  "fields": [
+    {
+      "model": "Codebase",
+      "field": "codebase_id",
+      "logical_type": "Identifier",
+      "description": "`Codebase.codebase_id` is the random stable identity of one optional grouping; `display_name` is mutable presentation metadata and `vcs_identity` is an optional matching hint, never identity authority.",
+      "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
+    },
+    {
+      "operation": "core:discover_definitions",
+      "field": "matcher",
+      "logical_type": "DefinitionMatcher",
+      "description": "Exact, lexical, semantic, or hybrid definition discovery input.",
+      "source": "protocol/public-query-contract.md"
+    },
+    {
+      "operation": "core:search_semantic",
+      "field": "query_class",
+      "logical_type": "natural_text | identifier | source_code | mixed",
+      "description": "Structural input class used for profile compatibility.",
+      "source": "protocol/public-query-contract.md"
+    },
+    {
+      "model": "PackageFileEntry",
+      "field": "executable",
+      "logical_type": "Boolean",
+      "description": "Whether the package file is executable when materialized.",
+      "source": "serialization/core-canonical-schemas.md"
+    }
+  ]
+}

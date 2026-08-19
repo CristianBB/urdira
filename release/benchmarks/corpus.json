@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "corpus_id": "core:generic-code-benchmark",
+  "entries": [
+    { "id": "typescript", "content_class": "source_code", "language_ids": ["typescript"], "text": "export function resolve(value: string): string { return value.trim(); }" },
+    { "id": "rust", "content_class": "source_code", "language_ids": ["rust"], "text": "pub fn resolve(value: &str) -> String { value.trim().to_owned() }" },
+    { "id": "prose", "content_class": "prose", "language_ids": [], "text": "A deterministic source index gives coding agents stable evidence." },
+    {
+      "id": "excalidraw-c5a50d2",
+      "content_class": "real_project",
+      "language_ids": ["typescript", "javascript", "json"],
+      "repository": "excalidraw/excalidraw",
+      "commit": "c5a50d2",
+      "text": "{\"kind\":\"restore-metadata\",\"version\":1,\"source\":\"import\"}",
+      "mutation_trace": "restore-metadata-follow-up-v2",
+      "task_protocol": "two_instruction_edit_requery",
+      "arms": ["baseline", "source-only", "structural"],
+      "cache_states": ["cold", "warm"],
+      "notes": "The second instruction arrives after the first instruction's edits and requires fresh discovery of the newly created restore-metadata JSON fixture; the mutation stays localized to one non-plugin source file. The historical three-sample/two-arm table is pre-source-first evidence; the current campaign requires ten successful samples per arm and cache phase."
+    },
+    {
+      "id": "vite-c0f2fc6",
+      "content_class": "real_project",
+      "language_ids": ["typescript", "javascript", "json", "css", "html"],
+      "repository": "vitejs/vite",
+      "commit": "c0f2fc607ee97ee4499337b04826420c00654065",
+      "text": "opt-in Vite dev-server serverRequest plugin hook with finish close error lifecycle telemetry",
+      "mutation_trace": "server-request-hook-three-iteration-v1",
+      "task_protocol": "three_instruction_same_session",
+      "arms": ["baseline", "codebase-memory", "urdira"],
+      "cache_states": ["cold", "warm"],
+      "notes": "The benchmark compares ordinary shell discovery, the local codebase-memory MCP graph, and Urdira MCP on the same frozen Vite monorepo. The acceptance grader records tests, contract/lifecycle evidence, documentation, and completed_successfully; six smoke groups gate the 60-run campaign."
+    }
+  ]
+}

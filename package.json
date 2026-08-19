@@ -1,0 +1,41 @@
+{
+  "name": "urdira",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.20.0",
+  "engines": {
+    "node": ">=24.18.1",
+    "pnpm": ">=11.20.0"
+  },
+  "scripts": {
+    "check:architecture": "node scripts/check-architecture.mjs",
+    "check:coverage-gate": "node scripts/check-coverage-gate.mjs",
+    "lint": "eslint .",
+    "package:npm": "node scripts/package-npm.mjs",
+    "package:npm:smoke": "node scripts/package-npm.mjs --smoke",
+    "package:release": "node scripts/package-release.mjs",
+    "release:acceptance": "node scripts/release-suite.mjs",
+    "typecheck": "tsc --build --force",
+    "test": "pnpm --filter @urdira/contracts build && pnpm --filter @urdira/canonical build && pnpm --filter @urdira/security build && pnpm --filter @urdira/storage build && pnpm --filter @urdira/plugin-sdk build && pnpm --filter @urdira/plugin-javascript-typescript build && pnpm --filter @urdira/engine build && pnpm --filter @urdira/embedding-local build && pnpm exec tsc --build packages/daemon && pnpm exec tsc --build packages/testkit && vitest run",
+    "test:coverage": "pnpm --filter @urdira/contracts build && pnpm --filter @urdira/canonical build && pnpm --filter @urdira/security build && pnpm --filter @urdira/storage build && pnpm --filter @urdira/plugin-sdk build && pnpm --filter @urdira/plugin-javascript-typescript build && pnpm --filter @urdira/engine build && pnpm --filter @urdira/embedding-local build && pnpm exec tsc --build packages/daemon && pnpm exec tsc --build packages/testkit && vitest run --coverage",
+    "verify": "pnpm check:architecture && pnpm lint && pnpm test:coverage && pnpm typecheck && pnpm check:coverage-gate && pnpm check:publication",
+    "check:publication": "node scripts/check-publication.mjs"
+  },
+  "devDependencies": {
+    "@babel/core": "7.29.7",
+    "@babel/eslint-parser": "7.29.7",
+    "@babel/plugin-syntax-typescript": "7.29.7",
+    "@eslint/js": "9.39.5",
+    "@types/node": "24.13.3",
+    "@urdira/canonical": "workspace:*",
+    "@urdira/contracts": "workspace:*",
+    "@urdira/plugin-sdk": "workspace:*",
+    "@urdira/security": "workspace:*",
+    "@vitest/coverage-v8": "4.1.10",
+    "eslint": "9.39.5",
+    "isomorphic-git": "1.40.5",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@urdira/engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@parcel/watcher": "2.6.0",
+    "@urdira/canonical": "workspace:*",
+    "@urdira/contracts": "workspace:*",
+    "@urdira/plugin-sdk": "workspace:*",
+    "@urdira/security": "workspace:*",
+    "@urdira/storage": "workspace:*",
+    "isomorphic-git": "1.40.5"
+  }
+}

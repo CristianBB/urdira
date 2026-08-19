@@ -1,0 +1,16 @@
+{
+  "models": [
+    {
+      "name": "AnalysisConfiguration",
+      "fields": ["configuration_schema_id", "configuration_schema_version", "normalized_configuration"]
+    },
+    {
+      "name": "ArtifactChange",
+      "fields": ["artifact_change_id", "workspace_id", "artifact_id", "change_kind", "previous_artifact_version_id", "new_artifact_version_id", "previous_tombstone_id", "new_tombstone_id", "cause_references", "lineage_evidence_record_ids"]
+    },
+    {
+      "name": "ModelAssetManifest",
+      "fields": ["schema_version", "model_provider_id", "model_id", "model_revision", "architecture_id", "model_format", "configuration_asset_digests", "weight_asset_digests", "model_identity_digest"]
+    }
+  ]
+}

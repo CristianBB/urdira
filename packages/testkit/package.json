@@ -1,0 +1,24 @@
+{
+  "name": "@urdira/testkit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@urdira/contracts": "workspace:*",
+    "@urdira/daemon": "workspace:*",
+    "@urdira/engine": "workspace:*",
+    "@urdira/plugin-sdk": "workspace:*"
+  }
+}

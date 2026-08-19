@@ -1,0 +1,629 @@
+{
+  "report_version": 1,
+  "generated_at": "2026-08-19T09:35:47.749Z",
+  "task": "server-request",
+  "benchmark_scope": {
+    "repository_shape": "large TypeScript monorepo (Vite)",
+    "change_shape": "highly localized development-server hook with nearby tests and API docs",
+    "discovery_shape": "precise symbols and lifecycle paths rather than broad architecture exploration",
+    "iteration_shape": "three agent instructions/resumes per run",
+    "evidence_shape": "bounded source files, focused tests, and concise documentation",
+    "interpretation": "This measures code-intelligence overhead for a large-repository, localized-change workload; it is not a universal ranking for every coding task."
+  },
+  "source_audit": {
+    "sha256": "sha256:d9b8fc64d898ab24766c3aacef8b7e609c3f9db859bf2ceba69223f5d69899ac",
+    "retention": "External raw campaign evidence; not committed because it contains host-local paths and transcripts."
+  },
+  "campaign": {
+    "campaign_id": "vite-agent-2026-08-18T22:03:41.943Z",
+    "repository": "vitejs/vite",
+    "commit": "c0f2fc607ee97ee4499337b04826420c00654065",
+    "model": "gpt-5.6-luna",
+    "samples_per_arm_phase": 10,
+    "arms": [
+      "baseline",
+      "codebase-memory",
+      "urdira"
+    ],
+    "phases": [
+      "cold",
+      "warm"
+    ],
+    "total_expected_runs": 60,
+    "successful_runs": 60,
+    "failed_runs": 0
+  },
+  "smoke_gate": {
+    "source_audit_sha256": "sha256:bdcf01e05c4352a5f8bf62becd6694281335f2a771a7896ff0bf3a7958583b66",
+    "expected_runs": 6,
+    "successful_runs": 6,
+    "failed_runs": 0,
+    "passed": true
+  },
+  "groups": {
+    "baseline:cold": {
+      "count": 10,
+      "expected": 10,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 304486,
+          "p95": 359999,
+          "mean": 315760
+        },
+        "total_tokens": {
+          "median": 4617789,
+          "p95": 6088327,
+          "mean": 4679719.7
+        },
+        "estimated_cost_usd": {
+          "median": 9.470832,
+          "p95": 12.478118,
+          "mean": 9.613037199999999
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 12,
+          "p95": 13,
+          "mean": 11.8
+        },
+        "mcp_calls": {
+          "median": 0,
+          "p95": 0,
+          "mean": 0
+        },
+        "command_actions": {
+          "median": 25,
+          "p95": 31,
+          "mean": 26.3
+        },
+        "file_change_batches": {
+          "median": 8,
+          "p95": 11,
+          "mean": 7.5
+        },
+        "cached_input_tokens": {
+          "median": 4368384,
+          "p95": 5795072,
+          "mean": 4412441.6
+        },
+        "uncached_input_tokens": {
+          "median": 213518,
+          "p95": 264948,
+          "mean": 225011.8
+        }
+      }
+    },
+    "baseline:warm": {
+      "count": 10,
+      "expected": 10,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 316840,
+          "p95": 425670,
+          "mean": 332493.1
+        },
+        "total_tokens": {
+          "median": 5345154,
+          "p95": 6958091,
+          "mean": 5025128.1
+        },
+        "estimated_cost_usd": {
+          "median": 10.964502,
+          "p95": 14.193292,
+          "mean": 10.309269599999999
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 13,
+          "p95": 15,
+          "mean": 12.9
+        },
+        "mcp_calls": {
+          "median": 0,
+          "p95": 0,
+          "mean": 0
+        },
+        "command_actions": {
+          "median": 25,
+          "p95": 33,
+          "mean": 26.8
+        },
+        "file_change_batches": {
+          "median": 7,
+          "p95": 14,
+          "mean": 8.8
+        },
+        "cached_input_tokens": {
+          "median": 5070080,
+          "p95": 6653952,
+          "mean": 4736844.8
+        },
+        "uncached_input_tokens": {
+          "median": 250266,
+          "p95": 285101,
+          "mean": 245114.4
+        }
+      }
+    },
+    "codebase-memory:cold": {
+      "count": 10,
+      "expected": 10,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 328833,
+          "p95": 484100,
+          "mean": 352988.9
+        },
+        "total_tokens": {
+          "median": 9088834,
+          "p95": 14148137,
+          "mean": 9197366.8
+        },
+        "estimated_cost_usd": {
+          "median": 18.44006,
+          "p95": 28.631242,
+          "mean": 18.6586982
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 13,
+          "p95": 16,
+          "mean": 13.1
+        },
+        "mcp_calls": {
+          "median": 25,
+          "p95": 27,
+          "mean": 25
+        },
+        "command_actions": {
+          "median": 22,
+          "p95": 31,
+          "mean": 22.2
+        },
+        "file_change_batches": {
+          "median": 8,
+          "p95": 10,
+          "mean": 8.1
+        },
+        "cached_input_tokens": {
+          "median": 8565248,
+          "p95": 13657856,
+          "mean": 8747699.2
+        },
+        "uncached_input_tokens": {
+          "median": 388702,
+          "p95": 479854,
+          "mean": 405673.5
+        }
+      }
+    },
+    "codebase-memory:warm": {
+      "count": 10,
+      "expected": 10,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 337085,
+          "p95": 428706,
+          "mean": 345421.6
+        },
+        "total_tokens": {
+          "median": 8077144,
+          "p95": 11103260,
+          "mean": 8498414.8
+        },
+        "estimated_cost_usd": {
+          "median": 16.412084,
+          "p95": 22.526422,
+          "mean": 17.265571400000002
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 13,
+          "p95": 14,
+          "mean": 12.7
+        },
+        "mcp_calls": {
+          "median": 23,
+          "p95": 31,
+          "mean": 24.8
+        },
+        "command_actions": {
+          "median": 22,
+          "p95": 34,
+          "mean": 23.5
+        },
+        "file_change_batches": {
+          "median": 7,
+          "p95": 12,
+          "mean": 7.6
+        },
+        "cached_input_tokens": {
+          "median": 7687936,
+          "p95": 10621184,
+          "mean": 8059980.8
+        },
+        "uncached_input_tokens": {
+          "median": 361481,
+          "p95": 592599,
+          "mean": 393643.7
+        }
+      }
+    },
+    "urdira:cold": {
+      "count": 10,
+      "expected": 10,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 333134,
+          "p95": 394915,
+          "mean": 336747.5
+        },
+        "total_tokens": {
+          "median": 4039842,
+          "p95": 6189958,
+          "mean": 4591747.7
+        },
+        "estimated_cost_usd": {
+          "median": 8.313648,
+          "p95": 12.651878,
+          "mean": 9.442212399999999
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 13,
+          "p95": 15,
+          "mean": 13.1
+        },
+        "mcp_calls": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "command_actions": {
+          "median": 23,
+          "p95": 36,
+          "mean": 24.9
+        },
+        "file_change_batches": {
+          "median": 5,
+          "p95": 10,
+          "mean": 6.3
+        },
+        "cached_input_tokens": {
+          "median": 3749120,
+          "p95": 5909760,
+          "mean": 4326297.6
+        },
+        "uncached_input_tokens": {
+          "median": 227619,
+          "p95": 251728,
+          "mean": 222330.6
+        }
+      }
+    },
+    "urdira:warm": {
+      "count": 10,
+      "expected": 10,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 291578,
+          "p95": 473942,
+          "mean": 326034.6
+        },
+        "total_tokens": {
+          "median": 3910996,
+          "p95": 7175803,
+          "mean": 4539219.3
+        },
+        "estimated_cost_usd": {
+          "median": 8.100374,
+          "p95": 14.666168,
+          "mean": 9.3398334
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 11,
+          "p95": 14,
+          "mean": 11.2
+        },
+        "mcp_calls": {
+          "median": 3,
+          "p95": 3,
+          "mean": 2.9
+        },
+        "command_actions": {
+          "median": 23,
+          "p95": 33,
+          "mean": 24.7
+        },
+        "file_change_batches": {
+          "median": 6,
+          "p95": 12,
+          "mean": 7.4
+        },
+        "cached_input_tokens": {
+          "median": 3663360,
+          "p95": 6820864,
+          "mean": 4260352
+        },
+        "uncached_input_tokens": {
+          "median": 227476,
+          "p95": 302512,
+          "mean": 235301.5
+        }
+      }
+    }
+  },
+  "overall": {
+    "baseline": {
+      "count": 20,
+      "expected": 20,
+      "success_rate": 1,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 316840,
+          "p95": 379403,
+          "mean": 324126.55
+        },
+        "total_tokens": {
+          "median": 5005196,
+          "p95": 6420306,
+          "mean": 4852423.9
+        },
+        "estimated_cost_usd": {
+          "median": 10.287628,
+          "p95": 13.102722,
+          "mean": 9.961153400000002
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 12,
+          "p95": 15,
+          "mean": 12.35
+        },
+        "mcp_calls": {
+          "median": 0,
+          "p95": 0,
+          "mean": 0
+        },
+        "command_actions": {
+          "median": 25,
+          "p95": 33,
+          "mean": 26.55
+        },
+        "file_change_batches": {
+          "median": 8,
+          "p95": 12,
+          "mean": 8.15
+        },
+        "cached_input_tokens": {
+          "median": 4745472,
+          "p95": 6091520,
+          "mean": 4574643.2
+        },
+        "uncached_input_tokens": {
+          "median": 237641,
+          "p95": 278563,
+          "mean": 235063.1
+        }
+      }
+    },
+    "codebase-memory": {
+      "count": 20,
+      "expected": 20,
+      "success_rate": 1,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 335019,
+          "p95": 428706,
+          "mean": 349205.25
+        },
+        "total_tokens": {
+          "median": 8752731,
+          "p95": 12814976,
+          "mean": 8847890.8
+        },
+        "estimated_cost_usd": {
+          "median": 17.752014,
+          "p95": 25.92916,
+          "mean": 17.962134799999994
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 13,
+          "p95": 15,
+          "mean": 12.9
+        },
+        "mcp_calls": {
+          "median": 25,
+          "p95": 31,
+          "mean": 24.9
+        },
+        "command_actions": {
+          "median": 22,
+          "p95": 32,
+          "mean": 22.85
+        },
+        "file_change_batches": {
+          "median": 8,
+          "p95": 11,
+          "mean": 7.85
+        },
+        "cached_input_tokens": {
+          "median": 8119040,
+          "p95": 12345344,
+          "mean": 8403840
+        },
+        "uncached_input_tokens": {
+          "median": 379342,
+          "p95": 479854,
+          "mean": 399658.6
+        }
+      }
+    },
+    "urdira": {
+      "count": 20,
+      "expected": 20,
+      "success_rate": 1,
+      "metrics": {
+        "elapsed_ms": {
+          "median": 315959,
+          "p95": 397699,
+          "mean": 331391.05
+        },
+        "total_tokens": {
+          "median": 4021554,
+          "p95": 6693084,
+          "mean": 4565483.5
+        },
+        "estimated_cost_usd": {
+          "median": 8.27292,
+          "p95": 13.761186,
+          "mean": 9.391022900000001
+        },
+        "outer_turns": {
+          "median": 3,
+          "p95": 3,
+          "mean": 3
+        },
+        "observable_agent_iterations": {
+          "median": 11,
+          "p95": 15,
+          "mean": 12.15
+        },
+        "mcp_calls": {
+          "median": 3,
+          "p95": 3,
+          "mean": 2.95
+        },
+        "command_actions": {
+          "median": 23,
+          "p95": 34,
+          "mean": 24.8
+        },
+        "file_change_batches": {
+          "median": 6,
+          "p95": 11,
+          "mean": 6.85
+        },
+        "cached_input_tokens": {
+          "median": 3749120,
+          "p95": 6345216,
+          "mean": 4293324.8
+        },
+        "uncached_input_tokens": {
+          "median": 227619,
+          "p95": 285365,
+          "mean": 228816.05
+        }
+      }
+    }
+  },
+  "failed_runs": [],
+  "host_warnings": [
+    {
+      "run_id": "vite-urdira-warm-1",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-2",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-3",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-4",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-5",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-cold-6",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-6",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-7",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-8",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-9",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    },
+    {
+      "run_id": "vite-urdira-warm-10",
+      "codes": [
+        "projection_source_mismatch"
+      ]
+    }
+  ],
+  "cleanup": {
+    "remaining_data_roots": [],
+    "remaining_worktrees": [],
+    "clean": true
+  },
+  "cost_note": "Estimated cost uses the campaign rates: input USD 2/M tokens; output and reasoning USD 8/M tokens. It is not a provider invoice."
+}

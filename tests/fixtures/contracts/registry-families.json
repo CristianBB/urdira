@@ -1,0 +1,7 @@
+{
+  "operations": ["core:discover_definitions", "core:find_records", "core:index_status"],
+  "comparators": ["core:operation_id_order", "core:recipe_id_order", "core:namespace_owner_order"],
+  "errors": ["core:request_invalid", "core:cursor_invalid", "core:index_integrity_failed"],
+  "diagnostics": ["core:parse_failed", "core:unresolved_symbol", "core:embedding_generation_failed"],
+  "candidateIssues": ["core:invalidation_plan_incomplete", "core:analyzer_failed", "core:atomic_publication_failed"]
+}

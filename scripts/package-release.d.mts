@@ -1,0 +1,6 @@
+export interface ReleaseArchive { readonly path: string; readonly digest: string; readonly byte_length: number; }
+export function inspectProductionTree(root: string): Promise<{ readonly files: readonly string[]; readonly forbidden: readonly { readonly relative_path: string }[]; readonly symlinks: readonly string[] }>;
+export function inspectReleaseArchive(path: string): Promise<{ readonly files: readonly string[]; readonly forbidden: readonly string[]; readonly symlinks: readonly string[]; readonly errors: readonly string[]; readonly checksum_failures: readonly string[]; readonly platform?: Record<string, unknown>; }>;
+export function writeDeterministicArchive(root: string, destination: string): Promise<ReleaseArchive>;
+export function stageProductionTree(input: { rootDir: string; stageRoot: string; targetId: string; metadata: Record<string, unknown> }): Promise<Record<string, unknown>>;
+export function buildRelease(options?: { rootDir?: string; outputDir?: string; targets?: readonly string[]; clean?: boolean; build?: boolean }): Promise<{ readonly metadata: Record<string, unknown>; readonly archives: readonly ReleaseArchive[]; readonly inspection: Record<string, unknown>; readonly output_dir: string }>;

@@ -1,0 +1,66 @@
+{
+  "authority_kind": "mechanically-transcribed-normative-v7",
+  "generated_from": [
+    "docs/decisions/01-universal-data-model.md",
+    "docs/protocol/public-query-contract.md",
+    "docs/protocol/core-intent-recipes.md",
+    "docs/diagnostics/core-diagnostic-codes.md",
+    "docs/indexing/core-candidate-issue-codes.md",
+    "docs/protocol/core-operation-error-codes.md"
+  ],
+  "record_envelope_fields": [
+    "record_id", "category", "kind", "universal_kind", "facets", "schema_version",
+    "workspace_id", "owner_artifact_id", "owner_artifact_version_id", "primary_source_span",
+    "valid_from_generation", "valid_to_generation", "producer_id", "producer_version",
+    "analysis_digest", "analysis_configuration_digest", "artifact_dependency_digest",
+    "payload", "record_digest"
+  ],
+  "record_variants": {
+    "EntityRecord": { "category": "entity" },
+    "RelationRecord": { "category": "relation" },
+    "FactRecord": { "category": "fact" },
+    "EvidenceRecord": { "category": "evidence" },
+    "DiagnosticRecord": { "category": "diagnostic" }
+  },
+  "union_variants": {
+    "CanonicalTypeExpression": {
+      "record": { "required": ["type_kind", "fields"], "forbidden": ["element_type", "variants", "discriminator_field"] },
+      "sequence": { "required": ["type_kind", "element_type"], "forbidden": ["fields", "variants", "discriminator_field"] }
+    },
+    "QueryExpression": {
+      "operation": { "required": ["expression_type", "operation", "arguments"], "forbidden": ["stages", "outputs", "recipe_id"] },
+      "pipeline": { "required": ["expression_type", "stages", "outputs"], "forbidden": ["operation", "arguments", "recipe_id"] },
+      "recipe": { "required": ["expression_type", "recipe_id", "arguments"], "forbidden": ["operation", "stages", "outputs"] }
+    }
+  },
+  "operation_arrays": {
+    "core:expand_relations.subjects": { "minItems": 1 },
+    "core:find_paths.sources": { "minItems": 1 },
+    "core:find_paths.targets": { "minItems": 1 },
+    "core:get_source.subjects": { "minItems": 1 },
+    "core:find_related_tests.subjects": { "minItems": 1 },
+    "core:inspect_architecture.views": { "minItems": 1, "enum": ["entry_points", "boundaries", "public_surfaces", "cycles", "extension_points", "layers"] },
+    "core:compare.comparison_kinds": { "minItems": 1, "enum": ["added", "removed", "changed", "moved", "correlated"] },
+    "core:build_context.facets": { "minItems": 1, "enum": ["definitions", "implementations", "callers", "callees", "dependencies", "contracts", "effects", "tests", "configuration", "analogues", "extension_points"] }
+  },
+  "recipe_bindings": {
+    "core:trace_behavior": [
+      ["$/max_depth", "trace", "/max_depth"], ["$/filter", "trace", "/filter"]
+    ],
+    "core:find_relevant_tests": [
+      ["$/relationship_scope", "tests", "/relationship_scope"], ["$/include_fixtures", "tests", "/include_fixtures"], ["$/filter", "tests", "/filter"]
+    ],
+    "core:explain_architecture_slice": [
+      ["$/views", "architecture", "/views"], ["$/max_relation_depth", "architecture", "/max_relation_depth"], ["$/filter", "architecture", "/filter"]
+    ],
+    "core:compare_workspaces": [
+      ["$/filter", "compare", "/filter"]
+    ]
+  },
+  "payload_constraints": {
+    "core:undeclared_input.undeclared_ids": { "type": "array", "minItems": 1 },
+    "core:unsupported_construct.missing_capabilities": { "type": "array", "minItems": 1 },
+    "core:embedding_generation_failed.embedding_segment_projection_ids": { "type": "array", "minItems": 1 },
+    "core:embedding_profile_incompatible.incompatibility_reasons": { "enum": ["language", "content_class", "query_class", "dimensions", "encoding", "distance_metric", "generator_lock", "materialization"] }
+  }
+}
