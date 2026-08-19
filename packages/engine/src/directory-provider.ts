@@ -190,6 +190,10 @@ function unavailable(error: unknown): never {
   throw error;
 }
 
+export function sameCanonicalArtifactPath(left: string, right: string): boolean {
+  return canonicalizePath(left) === canonicalizePath(right);
+}
+
 // One capture inspects the same bytes twice (inclusion check + post-read boundary
 // check); memoizing on the byte buffer halves the full-content decode work.
 const mediaTypeMemo = new WeakMap<Uint8Array, { path: string; result: string }>();
@@ -467,7 +471,8 @@ export class DirectorySourceProvider implements SourceProvider {
     const approvedExternal = (this.#inclusion.allowed_external_roots ?? [])
       .map(canonicalizePath)
       .some((root) => isWithinRoot(root, boundary.target_path));
-    const traversedSymlink = boundary.link_stat.is_symbolic_link || resolve(this.#root, uri) !== boundary.target_path;
+    const traversedSymlink = boundary.link_stat.is_symbolic_link
+      || !sameCanonicalArtifactPath(resolve(this.#root, uri), boundary.target_path);
     return evaluateInclusion({
       normalized_path: uri,
       is_symlink: traversedSymlink,

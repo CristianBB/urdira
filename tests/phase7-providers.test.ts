@@ -20,6 +20,7 @@ import {
   type GitObjectPort,
   type ProviderObservation,
 } from "../packages/engine/src/index.js";
+import { sameCanonicalArtifactPath } from "../packages/engine/src/directory-provider.js";
 
 const temporaryRoots: string[] = [];
 const instant = "2026-08-09T12:00:00.000Z";
@@ -138,6 +139,10 @@ const completeScope = [{
 const boundProvider = { workspace_id: "workspace:one", source_provider_binding_id: "binding:one" } as const;
 
 describe("Phase 7 five-call source providers", () => {
+  it("treats native and portable separators as the same canonical artifact path", () => {
+    expect(sameCanonicalArtifactPath("C:\\Users\\RunnerAdmin\\workspace\\src\\task.ts", "C:/Users/RunnerAdmin/workspace/src/task.ts")).toBe(true);
+  });
+
   it("exposes exactly the five protocol calls", async () => {
     const root = await temporaryDirectory();
     const providers = [
