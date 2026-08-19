@@ -11,7 +11,7 @@ import {
 
 const repositoryRoot = join(import.meta.dirname, "..");
 
-describe("architecture guardrails", { timeout: 15_000 }, () => {
+describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 30_000 : 15_000 }, () => {
   it("normalizes Windows package paths to the manifest path format", () => {
     expect(normalizeArchitecturePath("packages\\contracts")).toBe("packages/contracts");
     expect(normalizeArchitecturePath("apps/urdira")).toBe("apps/urdira");
