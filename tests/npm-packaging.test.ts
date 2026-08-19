@@ -10,7 +10,7 @@ describe("public npm package graph", () => {
     expect([...versions.keys()]).toEqual(PRODUCTION_PACKAGE_NAMES);
     expect(versions.get("urdira")).toBe("0.2.0");
     expect(versions.get("@urdira/runtime")).toBe("0.2.0");
-    expect(versions.get("@urdira/plugin-javascript-typescript")).toBe("0.3.1");
+    expect(versions.get("@urdira/plugin-javascript-typescript")).toBe("0.3.2");
     expect(versions.has("@urdira/testkit")).toBe(false);
 
     const packages = [];

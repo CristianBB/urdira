@@ -51,9 +51,11 @@ export const JAVASCRIPT_TYPESCRIPT_NAMESPACE = "jsts" as const;
 // instead of being silently dropped. MINOR: the analyzer's OUTPUT changed
 // (more call edges now exist, changing `core:call_relationships` coverage
 // and any query built on it) -- same bump class as 0.1.0 -> 0.2.0.
-// 0.3.0 -> 0.3.1: packaging-only release for the dependency-free Urdira
+// 0.3.1 -> 0.3.2: dependency refresh for the Urdira 0.2.0 release; analyzer
+// semantics remain unchanged, but the package identity must not reuse the
+// published 0.3.1 tarball with stale core dependency pins.
 // bootstrap and sanitized public metadata; analyzer output is unchanged.
-export const JAVASCRIPT_TYPESCRIPT_VERSION = "0.3.1" as const;
+export const JAVASCRIPT_TYPESCRIPT_VERSION = "0.3.2" as const;
 export const TYPESCRIPT_COMPILER_VERSION = TYPESCRIPT_VERSION;
 
 /** Ordered structural publication stages for the bundled analyzer. */
