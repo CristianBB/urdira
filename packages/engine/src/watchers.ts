@@ -1,4 +1,4 @@
-import * as parcelWatcher from "@parcel/watcher";
+import type * as parcelWatcher from "@parcel/watcher";
 import { EngineError } from "./errors.js";
 
 export type WatcherEventClass =
@@ -236,7 +236,7 @@ const MAX_CONSECUTIVE_REARM_ATTEMPTS = 5;
 
 export class ParcelWatcherAdapter {
   readonly #binding: WatcherBinding;
-  readonly #backend: ParcelWatcherBackend;
+  readonly #backend: ParcelWatcherBackend | undefined;
   readonly #watcherOptions: parcelWatcher.Options | undefined;
   readonly #onError: ((error: Error) => void) | undefined;
   #sequence = 0;
@@ -244,7 +244,7 @@ export class ParcelWatcherAdapter {
 
   constructor(binding: WatcherBinding, options: ParcelWatcherAdapterOptions = {}) {
     this.#binding = binding;
-    this.#backend = options.backend ?? parcelWatcher;
+    this.#backend = options.backend;
     this.#watcherOptions = options.watcher_options;
     this.#onError = options.on_error;
   }
@@ -260,10 +260,12 @@ export class ParcelWatcherAdapter {
   async subscribe(handler: WatcherBatchHandler): Promise<WatcherSubscription> {
     let stopped = false;
     let active: { unsubscribe(): Promise<void> } | undefined;
+    let backend = this.#backend;
     let consecutiveErrors = 0;
     const arm = async (): Promise<void> => {
       if (stopped) return;
-      const subscription = await this.#backend.subscribe(this.#binding.root, (error, events) => {
+      backend ??= await import("@parcel/watcher");
+      const subscription = await backend.subscribe(this.#binding.root, (error, events) => {
         if (error) {
           consecutiveErrors += 1;
           // Unconditional and loud, independent of whether a caller wired

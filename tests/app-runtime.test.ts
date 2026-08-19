@@ -45,7 +45,14 @@ async function pollUntilReady(client: DaemonClient, workspaceId: string, timeout
     last = workspace;
     if (workspace.workspace_status === "ready" || workspace.workspace_status === "degraded") {
       const detail = await client.call("core:index_status", { workspace_ids: [workspaceId] });
-      if (detail.outcome !== "success") throw new Error(`core:index_status (detail) did not succeed: ${JSON.stringify(detail)}`);
+      if (detail.outcome !== "success") {
+        const indexState = detail.error?.details?.["index_state"];
+        if (detail.error?.code === "core:index_unavailable" && indexState === "indexing") {
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+          continue;
+        }
+        throw new Error(`core:index_status (detail) did not succeed: ${JSON.stringify(detail)}`);
+      }
       const detailPayload = detail.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> };
       const detailWorkspace = detailPayload.workspaces[0];
       if (detailWorkspace === undefined) throw new Error("core:index_status (detail) returned no workspace entry.");

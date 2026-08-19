@@ -497,6 +497,18 @@ describe("architecture guardrails", { timeout: 15_000 }, () => {
     expect(workflow).toContain("ubuntu-latest, macos-latest, windows-latest");
   });
 
+  it("uses a bounded CI test profile and keeps the native watcher out of unrelated workers", async () => {
+    const vitestConfiguration = await readFile(join(repositoryRoot, "vitest.config.ts"), "utf8");
+    expect(vitestConfiguration).toContain('process.env["CI"]');
+    expect(vitestConfiguration).toContain("maxWorkers: isCi ? 2 : undefined");
+    expect(vitestConfiguration).toContain("testTimeout: isCi ? 30_000 : 5_000");
+
+    const watcherSource = await readFile(join(repositoryRoot, "packages/engine/src/watchers.ts"), "utf8");
+    expect(watcherSource).toContain('import type * as parcelWatcher from "@parcel/watcher"');
+    expect(watcherSource).toContain('await import("@parcel/watcher")');
+    expect(watcherSource).not.toContain('import * as parcelWatcher from "@parcel/watcher"');
+  });
+
   it("builds every workspace package imported by application tests in a clean checkout", async () => {
     const rootManifest = JSON.parse(
       await readFile(join(repositoryRoot, "package.json"), "utf8"),
