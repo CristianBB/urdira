@@ -1,3 +1,4 @@
+import { readFile, rm } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import {
   classifyWorkspaceConfigurationImpact,
@@ -123,10 +124,26 @@ describe("workspace administration CLI", () => {
     const result = await runCli(["workspace", "add", "/tmp/project"], {
       client: { call: async (call) => { calls.push(call); return { outcome: "success", payload: { workspace_id: "workspace-1" } }; } },
       preview_admin: async () => ({ proposal_id: "proposal-1", technologies: ["typescript"] }),
-      prompt: async (question) => question.includes("confirm") ? "yes" : "yes",
+      prompt: async (question) => question.includes("Configure Urdira") ? "no" : "yes",
     });
     expect(result.exit_code).toBe(0);
     expect(calls).toEqual(["core:workspace_add"]);
+  });
+
+  test("offers native agent installation after interactive workspace registration", async () => {
+    const home = `/tmp/urdira-interactive-agent-${process.pid}`;
+    try {
+      const result = await runCli(["workspace", "add", "/tmp/project"], {
+        client: { call: async (call) => call === "core:workspace_add" ? { outcome: "success", payload: { workspace_id: "workspace-1" } } : { outcome: "success", payload: {} } },
+        preview_admin: async () => ({ proposal_id: "proposal-1", technologies: [{ technology_id: "typescript", compatible_plugin_ids: ["core/typescript"] }] }),
+        home_directory: home,
+        prompt: async (question) => question.includes("Configure Urdira") ? "codex, cursor" : "yes",
+      });
+      expect(result.exit_code).toBe(0);
+      expect(result.data).toMatchObject({ agent_integrations: { installed: [{ client: "codex", changed: true }, { client: "cursor", changed: true }], unknown: [] } });
+      await expect(readFile(`${home}/.cursor/hooks.json`, "utf8")).resolves.toContain("--client cursor");
+      await expect(readFile(`${home}/.codex/hooks.json`, "utf8")).resolves.toContain("--client codex");
+    } finally { await rm(home, { recursive: true, force: true }); }
   });
 
   test("defaults the non-interactive add path to the full preview-derived plugin selection", async () => {

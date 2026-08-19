@@ -45,6 +45,57 @@ describe("coding-agent bridge", () => {
     expect(calls.some((call) => call.name === "core:query" && JSON.stringify(call.payload).includes("core:search_text"))).toBe(true);
   });
 
+  it("bridges Cursor Grep and Search Files through preToolUse", async () => {
+    const bridge = { call: async (name: string) => name === "core:index_status" ? { outcome: "success", payload: { workspaces: [{ workspace_id: "ws-1", freshness_status: "current" }] } } : { outcome: "success", payload: { streams: { matches: [{ body: { path: "src/a.ts", text: "foo" }, evidence: [{ line: 1 }] }] } } } };
+    const grep = await runAgentHook({ client: "cursor", tool_name: "Grep", cwd: "/workspace", tool_input: { pattern: "foo" }, max_output: 1000 }, bridge);
+    expect(grep).toMatchObject({ permission: "deny", agent_message: "src/a.ts:1:foo" });
+    const files = await runAgentHook({ client: "cursor", tool_name: "Search Files", cwd: "/workspace", tool_input: { query: "src/**/*.ts" }, max_output: 1000 }, { call: async (name: string) => name === "core:index_status" ? { outcome: "success", payload: { workspaces: [{ workspace_id: "ws-1", freshness_status: "current" }] } } : { outcome: "success", payload: { streams: { artifacts: [{ body: { path: "src/a.ts" } }] } } } });
+    expect(files).toMatchObject({ permission: "deny", agent_message: "src/a.ts" });
+    const semanticBridge = { call: async (name: string) => name === "core:index_status" ? { outcome: "success", payload: { workspaces: [{ workspace_id: "ws-1", freshness_status: "current" }] } } : { outcome: "success", payload: { streams: { candidates: [{ body: { path: "src/a.ts" } }] } } } };
+    await expect(runAgentHook({ client: "cursor", tool_name: "Codebase", cwd: "/workspace", tool_input: { query: "foo" } }, semanticBridge)).resolves.toMatchObject({ permission: "deny", agent_message: "src/a.ts" });
+  });
+
+  it("installs and removes a Cursor hook", async () => {
+    const home = `/tmp/urdira-cursor-agent-test-${process.pid}`;
+    try {
+      const installed = await installAgent("cursor", { dry_run: false, confirm: true, home });
+      expect(installed.changed).toBe(true);
+      const hooks = JSON.parse(await readFile(`${home}/.cursor/hooks.json`, "utf8"));
+      expect(hooks.version).toBe(1);
+      expect(hooks.hooks.preToolUse[0]).toMatchObject({ matcher: "^(Grep|Search Files|Codebase)$", command: expect.stringContaining("--client cursor") });
+      const removed = await uninstallAgent("cursor", { dry_run: false, confirm: true, home });
+      expect(removed.changed).toBe(true);
+      expect(JSON.parse(await readFile(`${home}/.cursor/hooks.json`, "utf8")).hooks.preToolUse).toEqual([]);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  it("installs and removes the supported MCP clients without touching unrelated servers", async () => {
+    const home = `/tmp/urdira-mcp-agents-${process.pid}`;
+    const workspace = `${home}/workspace`;
+    try {
+      const vscode = await installAgent("vscode", { dry_run: false, confirm: true, home });
+      expect(vscode.changed).toBe(true);
+      expect(await readFile(`${home}/.copilot/hooks/urdira.json`, "utf8")).toContain("--client vscode");
+      const cline = await installAgent("cline", { dry_run: false, confirm: true, home });
+      expect(cline.changed).toBe(true);
+      const clineConfig = JSON.parse(await readFile(`${home}/.cline/data/settings/cline_mcp_settings.json`, "utf8"));
+      expect(clineConfig.mcpServers.urdira).toMatchObject({ command: "urdira", args: ["mcp"] });
+      const roo = await installAgent("roo", { dry_run: false, confirm: true, home, workspace });
+      expect(roo.changed).toBe(true);
+      expect(JSON.parse(await readFile(`${workspace}/.roo/mcp.json`, "utf8"))).toHaveProperty("mcpServers.urdira");
+      const desktop = await installAgent("claude-desktop", { dry_run: false, confirm: true, home });
+      expect(desktop.changed).toBe(true);
+      const desktopPath = process.platform === "darwin" ? `${home}/Library/Application Support/Claude/claude_desktop_config.json` : process.platform === "win32" ? `${home}/AppData/Roaming/Claude/claude_desktop_config.json` : `${home}/.config/Claude/claude_desktop_config.json`;
+      expect(JSON.parse(await readFile(desktopPath, "utf8"))).toHaveProperty("mcpServers.urdira");
+      await uninstallAgent("vscode", { dry_run: false, confirm: true, home });
+      await uninstallAgent("cline", { dry_run: false, confirm: true, home });
+      await uninstallAgent("roo", { dry_run: false, confirm: true, home, workspace });
+      await uninstallAgent("claude-desktop", { dry_run: false, confirm: true, home });
+      expect(JSON.parse(await readFile(`${home}/.cline/data/settings/cline_mcp_settings.json`, "utf8"))).toEqual({ mcpServers: {} });
+      expect(JSON.parse(await readFile(`${workspace}/.roo/mcp.json`, "utf8"))).toEqual({ mcpServers: {} });
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
   it("keeps multi-query discovery inside a child context and returns only a bounded digest", async () => {
     let childCalls = 0;
     const bridge = { call: async () => ({ outcome: "success", payload: { streams: { matches: [{ path: "src/a.ts", line: 4 }] } } }) };

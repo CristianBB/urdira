@@ -1,10 +1,13 @@
-// @ts-nocheck -- this module is an adapter boundary over three evolving host hook schemas.
+// @ts-nocheck -- this module is an adapter boundary over evolving host hook schemas.
 import { mkdir, readFile, writeFile, rename, copyFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export type AgentClient = "claude-code" | "codex" | "opencode";
-export type AgentSearchOperation = "grep" | "glob";
+/** Clients that can be configured by the CLI. The first five expose a native
+ * pre-tool hook; the remaining clients are configured through their supported
+ * local MCP settings file. */
+export type AgentClient = "claude-code" | "codex" | "opencode" | "cursor" | "vscode" | "cline" | "roo" | "claude-desktop";
+export type AgentSearchOperation = "grep" | "glob" | "semantic";
 export type AgentFallbackReason = "unregistered_workspace" | "stale_index" | "unsupported_input" | "scope_mismatch" | "timeout" | "output_overflow" | "semantic_difference" | "bridge_error";
 export interface AgentSearchRequest { readonly client: AgentClient; readonly operation: AgentSearchOperation; readonly working_directory: string; readonly native_arguments: Readonly<Record<string, unknown>>; readonly host_output_limit: number; }
 export interface AgentSearchDecision { readonly decision: "serve" | "fallback"; readonly fallback_reason?: AgentFallbackReason; readonly output?: string; readonly raw?: unknown; }
@@ -17,7 +20,7 @@ export interface DiscoveryChildContext {
 export interface AgentBridgeClient { readonly call: (call: string, payload: unknown) => Promise<{ readonly outcome: string; readonly payload?: unknown; readonly error?: unknown }>; }
 
 const MANAGED = "urdira-managed-agent-integration-v1";
-const CLIENTS: readonly AgentClient[] = ["claude-code", "codex", "opencode"];
+const CLIENTS: readonly AgentClient[] = ["claude-code", "codex", "opencode", "cursor", "vscode", "cline", "roo", "claude-desktop"];
 
 export function normalizeAgentClient(value: string | undefined): AgentClient | "all" {
   if (value === "all") return "all";
@@ -90,6 +93,12 @@ function operationRequest(workspace: { readonly workspace_id: string }, request:
   const glob = stringValue(args["glob"]) ?? (request.operation === "glob" ? stringValue(args["pattern"]) : undefined);
   if (path !== undefined && request.operation === "grep") filter.paths = [path];
   if (glob !== undefined) filter.paths = [glob];
+  if (request.operation === "semantic") return {
+    api_version: 1,
+    scope: { scope_type: "single_workspace", workspace_id: workspace.workspace_id },
+    expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: stringValue(args.query_text) ?? stringValue(args.query) ?? stringValue(args.pattern) ?? "", query_class: args.query_class === "identifier" || args.query_class === "source_code" || args.query_class === "mixed" ? args.query_class : "natural_text", filter } },
+    options: { freshness: "current", wait_timeout_ms: 0, coverage_requirement: "require_complete", evidence: { mode: "none" }, diagnostics: { mode: "none" }, snippets: { mode: "none" }, registry: { mode: "none" }, response_budget: { max_items: limitValue(request.host_output_limit, 1000), max_characters: request.host_output_limit } },
+  };
   if (request.operation === "glob") return {
     api_version: 1,
     scope: { scope_type: "single_workspace", workspace_id: workspace.workspace_id },
@@ -109,12 +118,12 @@ function operationRequest(workspace: { readonly workspace_id: string }, request:
 function renderQueryPayload(payload: unknown, operation: AgentSearchOperation, maxCharacters: number): string | undefined {
   const root = record(payload);
   const streams = record(root.streams);
-  const stream = Array.isArray(streams.matches) ? streams.matches : Array.isArray(streams.artifacts) ? streams.artifacts : [];
+  const stream = operation === "glob" && Array.isArray(streams.artifacts) ? streams.artifacts : operation === "semantic" && Array.isArray(streams.candidates) ? streams.candidates : Array.isArray(streams.matches) ? streams.matches : [];
   const lines: string[] = [];
   for (const value of stream) {
     const item = record(value); const subject = record(item.subject); const body = record(item.body);
     const path = stringValue(body.path) ?? stringValue(subject.path) ?? stringValue(item.path);
-    if (operation === "glob") { if (path !== undefined) lines.push(path); continue; }
+    if (operation === "glob" || operation === "semantic") { if (path !== undefined) lines.push(path); continue; }
     const evidence = Array.isArray(item.evidence) ? item.evidence : [];
     const firstEvidence = record(evidence[0]);
     const line = typeof firstEvidence.line === "number" ? firstEvidence.line : typeof item.line === "number" ? item.line : undefined;
@@ -131,6 +140,10 @@ export async function translateAgentSearch(request: AgentSearchRequest, client: 
   if (request.operation === "glob") {
     const pattern = stringValue(args.glob) ?? stringValue(args.pattern);
     if (pattern === undefined || !safeGlob(pattern) || args.absolute === true) return { decision: "fallback", fallback_reason: "unsupported_input" };
+  } else if (request.operation === "semantic") {
+    const query = stringValue(args.query_text) ?? stringValue(args.query) ?? stringValue(args.pattern);
+    const queryClass = args.query_class;
+    if (query === undefined || query.length > 1024 || (queryClass !== undefined && queryClass !== "natural_text" && queryClass !== "identifier" && queryClass !== "source_code" && queryClass !== "mixed")) return { decision: "fallback", fallback_reason: "unsupported_input" };
   } else {
     const pattern = stringValue(args.pattern);
     if (pattern === undefined || !safePattern(pattern, args.syntax === "regex" ? "safe_regex" : "literal") || args.multiline === true && args.syntax !== "regex") return { decision: "fallback", fallback_reason: "unsupported_input" };
@@ -153,6 +166,7 @@ export async function translateAgentSearch(request: AgentSearchRequest, client: 
 
 export function renderHookResponse(client: AgentClient, decision: AgentSearchDecision): unknown {
   if (client === "opencode") return decision.decision === "serve" ? { output: decision.output ?? "" } : { fallback: true, reason: decision.fallback_reason };
+  if (client === "cursor") return decision.decision === "serve" ? { permission: "deny", user_message: decision.output ?? "", agent_message: decision.output ?? "" } : { permission: "allow" };
   if (decision.decision === "serve") return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: decision.output ?? "" } };
   // Claude Code's current PreToolUse contract treats allow as a transparent
   // pass-through; do not inject a fallback explanation into the model's
@@ -171,6 +185,20 @@ export async function runAgentHook(payload: unknown, client: AgentBridgeClient, 
     if (parsed === undefined) return renderHookResponse(clientName, { decision: "fallback", fallback_reason: "unsupported_input" });
     operation = parsed.operation; nativeArguments = parsed.args;
   }
+  if (clientName === "cursor" || clientName === "vscode") {
+    const nativeOperation = operationName.replace(/[^a-z]/g, "");
+    if (nativeOperation === "codebase" || nativeOperation === "codesearch" || nativeOperation === "semanticsearch") operation = "semantic";
+    else if (nativeOperation === "searchfiles" || nativeOperation === "listdirectory" || nativeOperation === "glob" || nativeOperation === "filesearch") operation = "glob";
+    else if (nativeOperation !== "grep" && nativeOperation !== "glob" && nativeOperation !== "search") return renderHookResponse(clientName, { decision: "fallback", fallback_reason: "unsupported_input" });
+    const cursorArgs = { ...nativeArguments };
+    if (cursorArgs.pattern === undefined) cursorArgs.pattern = cursorArgs.query ?? cursorArgs.search_term ?? cursorArgs.file_pattern;
+    if (operation === "semantic" && cursorArgs.query_text === undefined) cursorArgs.query_text = cursorArgs.query ?? cursorArgs.search_term ?? cursorArgs.pattern;
+    if (cursorArgs.path === undefined) cursorArgs.path = cursorArgs.directory ?? cursorArgs.folder;
+    if (cursorArgs.glob === undefined) cursorArgs.glob = cursorArgs.include_pattern ?? cursorArgs.file_glob;
+    if (cursorArgs.syntax === undefined && typeof cursorArgs.is_regex === "boolean") cursorArgs.syntax = cursorArgs.is_regex ? "regex" : "literal";
+    if (cursorArgs.case_sensitive === undefined && typeof cursorArgs.caseSensitive === "boolean") cursorArgs.case_sensitive = cursorArgs.caseSensitive;
+    nativeArguments = cursorArgs;
+  }
   const request: AgentSearchRequest = { client: clientName, operation, working_directory: stringValue(root.cwd) ?? stringValue(root.working_directory) ?? process.cwd(), native_arguments: nativeArguments, host_output_limit: limitValue(root.max_output ?? root.output_limit) };
   return renderHookResponse(clientName, await translateAgentSearch(request, client));
 }
@@ -182,9 +210,31 @@ async function backupJson(path: string): Promise<void> { try { await copyFile(pa
 async function removeManagedFile(path: string, dryRun: boolean): Promise<void> { try { if (!(await readFile(path, "utf8")).includes(MANAGED)) return; if (!dryRun) await unlink(path); } catch { /* absent */ } }
 function managedCommand(client: AgentClient): string { return `urdira agent hook --client ${client}`; }
 
+function mcpServer(): Readonly<Record<string, unknown>> {
+  return { command: "urdira", args: ["mcp"], env: { URDIRA_MANAGED_AGENT_INTEGRATION: MANAGED } };
+}
+function mcpConfigPath(client: AgentClient, root: string): string | undefined {
+  if (client === "cline") return join(root, ".cline", "data", "settings", "cline_mcp_settings.json");
+  if (client === "roo") return join(root, ".roo", "mcp.json");
+  if (client === "claude-desktop") {
+    if (process.platform === "win32") return join(root, "AppData", "Roaming", "Claude", "claude_desktop_config.json");
+    if (process.platform === "darwin") return join(root, "Library", "Application Support", "Claude", "claude_desktop_config.json");
+    return join(root, ".config", "Claude", "claude_desktop_config.json");
+  }
+  return undefined;
+}
+function configFiles(client: AgentClient, root: string): string[] {
+  if (client === "claude-code") return [join(root, ".claude", "settings.json"), join(root, ".claude", "agents", "urdira-discovery.md")];
+  if (client === "codex") return [join(root, ".codex", "hooks.json"), join(root, ".codex", "agents", "urdira_explorer.toml"), join(root, ".codex", "skills", "urdira-discovery", "SKILL.md")];
+  if (client === "cursor") return [join(root, ".cursor", "hooks.json")];
+  if (client === "vscode") return [join(root, ".copilot", "hooks", "urdira.json")];
+  if (client === "opencode") return [join(root, ".config", "opencode", "tools", "grep.ts"), join(root, ".config", "opencode", "tools", "glob.ts"), join(root, ".config", "opencode", "agents", "urdira-discovery.md")];
+  const mcp = mcpConfigPath(client, root); return mcp === undefined ? [] : [mcp];
+}
+
 export interface AgentInstallResult { readonly client: AgentClient; readonly changed: boolean; readonly files: ReadonlyArray<string>; readonly conflicts: ReadonlyArray<string>; readonly dry_run: boolean; }
 
-export async function installAgent(client: AgentClient, options: { readonly dry_run: boolean; readonly confirm: boolean; readonly home?: string }): Promise<AgentInstallResult> {
+export async function installAgent(client: AgentClient, options: { readonly dry_run: boolean; readonly confirm: boolean; readonly home?: string; readonly workspace?: string }): Promise<AgentInstallResult> {
   const root = options.home ?? homedir(); const files: string[] = []; const conflicts: string[] = [];
   if (client === "claude-code") {
     const path = join(root, ".claude", "settings.json"); const settings = await readJson(path); const hooks = record(settings.hooks); const pre = Array.isArray(hooks.PreToolUse) ? [...hooks.PreToolUse] : [];
@@ -195,23 +245,50 @@ export async function installAgent(client: AgentClient, options: { readonly dry_
     if (!pre.some((entry) => JSON.stringify(entry).includes(MANAGED))) pre.push({ matcher: "^(Grep|Glob|Bash)$", hooks: [{ type: "command", command: `${managedCommand(client)} # ${MANAGED}`, timeout: 30 }] });
     files.push(path); const agentPath = join(root, ".codex", "agents", "urdira_explorer.toml"); files.push(agentPath); const skillPath = join(root, ".codex", "skills", "urdira-discovery", "SKILL.md"); files.push(skillPath);
     if (!options.dry_run) { if (!options.confirm) throw new Error("--confirm is required to install agent hooks"); await backupJson(path); await writeJson(path, { ...settings, hooks: { ...hooks, PreToolUse: pre } }); await mkdir(dirname(agentPath), { recursive: true }); await writeFile(agentPath, `# ${MANAGED}\nname = "urdira_explorer"\ndescription = "Read-only bounded repository discovery via Urdira."\n`, { mode: 0o600 }); await mkdir(dirname(skillPath), { recursive: true }); await writeFile(skillPath, `<!-- ${MANAGED} -->\nDelegate multi-step repository discovery to the urdira_explorer agent and return only its bounded digest.\n`, { mode: 0o600 }); }
-  } else {
+  } else if (client === "cursor") {
+    const path = join(root, ".cursor", "hooks.json"); const settings = await readJson(path); const hooks = record(settings.hooks); const pre = Array.isArray(hooks.preToolUse) ? [...hooks.preToolUse] : [];
+    if (!pre.some((entry) => JSON.stringify(entry).includes(MANAGED))) pre.push({ matcher: "^(Grep|Search Files|Codebase)$", command: `${managedCommand(client)} # ${MANAGED}`, timeout: 30 });
+    files.push(path);
+    if (!options.dry_run) { if (!options.confirm) throw new Error("--confirm is required to install agent hooks"); await backupJson(path); await writeJson(path, { version: typeof settings.version === "number" ? settings.version : 1, ...settings, hooks: { ...hooks, preToolUse: pre } }); }
+  } else if (client === "vscode") {
+    const path = join(root, ".copilot", "hooks", "urdira.json");
+    const settings = await readJson(path); const hooks = record(settings.hooks); const pre = Array.isArray(hooks.PreToolUse) ? [...hooks.PreToolUse] : [];
+    if (!pre.some((entry) => JSON.stringify(entry).includes(MANAGED))) pre.push({ matcher: "^(Grep|Search Files|Codebase|codebase_search|grep_search)$", type: "command", command: `${managedCommand(client)} # ${MANAGED}`, timeout: 30 });
+    files.push(path);
+    if (!options.dry_run) { if (!options.confirm) throw new Error("--confirm is required to install agent hooks"); await backupJson(path); await writeJson(path, { ...settings, hooks: { ...hooks, PreToolUse: pre } }); }
+  } else if (client === "opencode") {
     const toolDir = join(root, ".config", "opencode", "tools"); const agentPath = join(root, ".config", "opencode", "agents", "urdira-discovery.md");
     for (const operation of ["grep", "glob"] as const) { const path = join(toolDir, `${operation}.ts`); files.push(path); try { const existing = await readFile(path, "utf8"); if (!existing.includes(MANAGED)) conflicts.push(path); } catch { /* new file */ } if (!options.dry_run && conflicts.length === 0) { await mkdir(toolDir, { recursive: true }); await writeFile(path, `// ${MANAGED}\nimport { tool } from "@opencode-ai/plugin";\nexport default tool({ description: "Urdira ${operation}", args: { pattern: tool.schema.string() }, async execute(args) { const payload = JSON.stringify({ operation: "${operation}", ...args }); const proc = Bun.spawn(["urdira", "agent", "hook", "--client", "opencode", "--payload", payload], { stdout: "pipe" }); return await new Response(proc.stdout).text(); } });\n`, { mode: 0o600 }); } }
     files.push(agentPath); if (!options.dry_run && conflicts.length === 0) { await mkdir(dirname(agentPath), { recursive: true }); await writeFile(agentPath, `<!-- ${MANAGED} -->\nUse Urdira discovery for read-heavy repository exploration and return only a bounded digest.\n`, { mode: 0o600 }); }
+  } else {
+    const path = mcpConfigPath(client, client === "roo" && options.workspace !== undefined ? options.workspace : root);
+    if (path === undefined) throw new Error(`No local MCP configuration path is defined for ${client}`);
+    const settings = await readJson(path); const servers = record(settings.mcpServers); const existing = servers.urdira;
+    if (existing !== undefined && !JSON.stringify(existing).includes(MANAGED)) conflicts.push(path);
+    files.push(path);
+    if (!options.dry_run && conflicts.length === 0) { if (!options.confirm) throw new Error("--confirm is required to install agent integrations"); await backupJson(path); await writeJson(path, { ...settings, mcpServers: { ...servers, urdira: mcpServer() } }); }
   }
   return { client, changed: !options.dry_run && conflicts.length === 0, files, conflicts, dry_run: options.dry_run };
 }
 
-export async function uninstallAgent(client: AgentClient, options: { readonly dry_run: boolean; readonly confirm: boolean; readonly home?: string }): Promise<AgentInstallResult> {
-  const root = options.home ?? homedir(); const files = client === "claude-code" ? [join(root, ".claude", "settings.json"), join(root, ".claude", "agents", "urdira-discovery.md")] : client === "codex" ? [join(root, ".codex", "hooks.json"), join(root, ".codex", "agents", "urdira_explorer.toml"), join(root, ".codex", "skills", "urdira-discovery", "SKILL.md")] : [join(root, ".config", "opencode", "tools", "grep.ts"), join(root, ".config", "opencode", "tools", "glob.ts"), join(root, ".config", "opencode", "agents", "urdira-discovery.md")];
+export async function uninstallAgent(client: AgentClient, options: { readonly dry_run: boolean; readonly confirm: boolean; readonly home?: string; readonly workspace?: string }): Promise<AgentInstallResult> {
+  const root = options.home ?? homedir(); const files = client === "roo" && options.workspace !== undefined ? [mcpConfigPath(client, options.workspace)!] : configFiles(client, root);
   if (!options.dry_run && !options.confirm) throw new Error("--confirm is required to uninstall agent hooks");
-  for (const path of files) { if (client === "claude-code" || client === "codex") { const settings = await readJson(path); const hooks = record(settings.hooks); const pre = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse.filter((entry) => !JSON.stringify(entry).includes(MANAGED)) : []; if (path.endsWith("settings.json") || path.endsWith("hooks.json")) { if (!options.dry_run) { await backupJson(path); await writeJson(path, { ...settings, hooks: { ...hooks, PreToolUse: pre } }); } } else await removeManagedFile(path, options.dry_run); } else await removeManagedFile(path, options.dry_run); }
+  for (const path of files) {
+    if (client === "claude-code" || client === "codex" || client === "cursor" || client === "vscode") {
+      const settings = await readJson(path); const hooks = record(settings.hooks); const hookName = client === "cursor" ? "preToolUse" : "PreToolUse"; const pre = Array.isArray(hooks[hookName]) ? hooks[hookName].filter((entry) => !JSON.stringify(entry).includes(MANAGED)) : [];
+      if (!options.dry_run) { await backupJson(path); await writeJson(path, { ...settings, hooks: { ...hooks, [hookName]: pre } }); }
+    } else if (client === "opencode") await removeManagedFile(path, options.dry_run);
+    else {
+      const settings = await readJson(path); const servers = record(settings.mcpServers); const existing = record(servers.urdira);
+      if (JSON.stringify(existing).includes(MANAGED) && !options.dry_run) { await backupJson(path); const nextServers = { ...servers }; delete nextServers.urdira; await writeJson(path, { ...settings, mcpServers: nextServers }); }
+    }
+  }
   return { client, changed: !options.dry_run, files, conflicts: [], dry_run: options.dry_run };
 }
 
-export async function agentStatus(client: AgentClient, options: { readonly home?: string } = {}): Promise<unknown> {
-  const root = options.home ?? homedir(); const files = client === "claude-code" ? [join(root, ".claude", "settings.json"), join(root, ".claude", "agents", "urdira-discovery.md")] : client === "codex" ? [join(root, ".codex", "hooks.json"), join(root, ".codex", "agents", "urdira_explorer.toml")] : [join(root, ".config", "opencode", "tools", "grep.ts"), join(root, ".config", "opencode", "tools", "glob.ts")];
+export async function agentStatus(client: AgentClient, options: { readonly home?: string; readonly workspace?: string } = {}): Promise<unknown> {
+  const root = options.home ?? homedir(); const files = client === "roo" && options.workspace !== undefined ? [mcpConfigPath(client, options.workspace)!] : configFiles(client, root);
   const installed: string[] = []; for (const path of files) { try { if ((await readFile(path, "utf8")).includes(MANAGED)) installed.push(path); } catch { /* absent */ } }
   return { client, installed: installed.length > 0, files, managed_files: installed };
 }

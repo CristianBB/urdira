@@ -341,7 +341,7 @@ export async function buildRelease({ rootDir = SCRIPT_ROOT, outputDir = join(roo
   for (const targetId of targets) {
     const stageRoot = join(outputDir, "staging", targetId);
     const staged = await stageProductionTree({ rootDir, stageRoot, targetId, metadata });
-    const archive = await writeDeterministicArchive(stageRoot, join(outputDir, `urdira-${targetId}-0.1.1.tar.gz`));
+    const archive = await writeDeterministicArchive(stageRoot, join(outputDir, `urdira-${targetId}-${metadata.engine_version}.tar.gz`));
     archives.push({ target: targetId, ...archive });
     inspections[targetId] = staged.inspection;
   }

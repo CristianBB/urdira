@@ -16,7 +16,23 @@ export interface CliDependencies { readonly client: CliDaemonClient; readonly pr
 export interface CliResult { readonly exit_code: number; readonly data: unknown; readonly stdout: string; }
 
 const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "payload", "proposal-id", "workspace", "path", "value", "engine-build-id", "client", "scope"]);
-const READ_ONLY_OPTIONS: Readonly<Record<(typeof READ_ONLY_COMMANDS)[number], ReadonlySet<string>>> = { status: new Set(["json"]), query: new Set(["json", "payload", "workspace"]), index: new Set(["json", "workspace"]), "agent-status": new Set(["json", "client"]) };
+const READ_ONLY_OPTIONS: Readonly<Record<(typeof READ_ONLY_COMMANDS)[number], ReadonlySet<string>>> = { status: new Set(["json"]), query: new Set(["json", "payload", "workspace"]), index: new Set(["json", "workspace"]), "agent-status": new Set(["json", "client", "workspace"]) };
+const INTERACTIVE_AGENT_CLIENTS: readonly AgentClient[] = ["claude-code", "codex", "opencode", "cursor", "vscode", "cline", "roo", "claude-desktop"];
+function interactiveAgentSelection(value: string | boolean): { readonly native: ReadonlyArray<AgentClient>; readonly unknown: ReadonlyArray<string> } {
+  if (value === true) return { native: INTERACTIVE_AGENT_CLIENTS, unknown: [] };
+  const text = typeof value === "string" ? value.trim().toLocaleLowerCase("en-US") : "";
+  if (text === "" || ["n", "no", "none", "ninguno", "ninguna"].includes(text)) return { native: [], unknown: [] };
+  if (["y", "yes", "si", "sí", "all", "todos", "todas"].includes(text)) return { native: INTERACTIVE_AGENT_CLIENTS, unknown: [] };
+  const aliases: Readonly<Record<string, AgentClient>> = { claude: "claude-code", "claude-code": "claude-code", codex: "codex", opencode: "opencode", cursor: "cursor", "cursor-agent": "cursor", vscode: "vscode", "vs-code": "vscode", "copilot": "vscode", "github-copilot": "vscode", cline: "cline", roo: "roo", "roo-code": "roo", "claude-desktop": "claude-desktop", "claude-desktop-app": "claude-desktop" };
+  const native: AgentClient[] = []; const unknown: string[] = [];
+  for (const token of text.split(/[\s,;]+/u).filter(Boolean)) { const client = aliases[token]; if (client === undefined) unknown.push(token); else native.push(client); }
+  return { native: [...new Set(native)], unknown: [...new Set(unknown)] };
+}
+async function configureInteractiveAgents(answer: string | boolean, home: string | undefined, workspace: string | undefined): Promise<unknown> {
+  const selection = interactiveAgentSelection(answer);
+  const installed = await Promise.all(selection.native.map(async (client) => { try { return await installAgent(client, { dry_run: false, confirm: true, ...(home === undefined ? {} : { home }), ...(workspace === undefined ? {} : { workspace }) }); } catch (error) { return { client, changed: false, error: error instanceof Error ? error.message : String(error) }; } }));
+  return { installed, unknown: selection.unknown };
+}
 function parsePayload(value: string): unknown { try { return JSON.parse(value); } catch { throw new CliError("cli:payload_invalid", "--payload must contain valid JSON."); } }
 
 export function parseCliArgs(argv: ReadonlyArray<string>): CliCommand {
@@ -100,15 +116,15 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
       const data = await runAgentHook(payload, dependencies.client, requested === "all" ? undefined : requested);
       return { exit_code: 0, data, stdout: output(data, command.options.json) };
     }
-    const clients: readonly AgentClient[] = requested === "all" ? ["claude-code", "codex", "opencode"] : [requested];
+    const clients: readonly AgentClient[] = requested === "all" ? ["claude-code", "codex", "opencode", "cursor", "vscode", "cline", "roo", "claude-desktop"] : [requested];
     if (command.name === "agent-status") {
-      const data = await Promise.all(clients.map((client) => agentStatus(client, dependencies.home_directory === undefined ? {} : { home: dependencies.home_directory })));
+      const data = await Promise.all(clients.map((client) => agentStatus(client, { ...(dependencies.home_directory === undefined ? {} : { home: dependencies.home_directory }), ...(command.options.values["workspace"] === undefined ? {} : { workspace: command.options.values["workspace"] }) })));
       const result = { clients: data };
       return { exit_code: 0, data: result, stdout: output(result, command.options.json) };
     }
     if (command.options.dry_run === command.options.confirm) throw new CliError("cli:dry_run_required", "Use exactly one of --dry-run or --confirm for agent installation changes.");
     const operation = command.name === "agent-install" ? installAgent : uninstallAgent;
-    const data = await Promise.all(clients.map((client) => operation(client, { dry_run: command.options.dry_run, confirm: command.options.confirm, ...(dependencies.home_directory === undefined ? {} : { home: dependencies.home_directory }) })));
+    const data = await Promise.all(clients.map((client) => operation(client, { dry_run: command.options.dry_run, confirm: command.options.confirm, ...(dependencies.home_directory === undefined ? {} : { home: dependencies.home_directory }), ...(command.options.values["workspace"] === undefined ? {} : { workspace: command.options.values["workspace"] }) })));
     return { exit_code: 0, data: { clients: data }, stdout: output({ clients: data }, command.options.json) };
   }
   if ((MUTATING_COMMANDS as readonly string[]).includes(command.name)) {
@@ -126,7 +142,9 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
       const selection = pluginSelectionFromPreview(preview);
       const result = dependencies.execute_admin ? await dependencies.execute_admin(command, preview) : await dependencies.client.call(adminCall[mutationName], { args: command.args, values: command.options.values, ...(command.options.proposal_id === undefined ? {} : { proposal_id: command.options.proposal_id }), ...(command.options.payload === undefined ? {} : { payload: command.options.payload }), selected_technology_ids: selection.selected_technology_ids, selected_plugin_ids: selection.selected_plugin_ids, confirmed: true, preview });
       const resultPayload = "outcome" in (result as object) ? (result as { readonly payload?: unknown; readonly error?: unknown }).payload ?? (result as { readonly error?: unknown }).error ?? result : result;
-      const data = { dry_run: false, confirmed: true, interactive: true, command: mutationName, preview, result: resultPayload };
+      const integrationAnswer = mutationName === "workspace-add" ? await dependencies.prompt("Configure Urdira in an agent now? Enter yes/all, or a comma-separated list (claude-code, codex, opencode, cursor, vscode/copilot, cline, roo, claude-desktop). Enter no to skip.") : undefined;
+      const agent_integrations = integrationAnswer === undefined ? undefined : await configureInteractiveAgents(integrationAnswer, dependencies.home_directory, command.args[0]);
+      const data = { dry_run: false, confirmed: true, interactive: true, command: mutationName, preview, result: resultPayload, ...(agent_integrations === undefined ? {} : { agent_integrations }) };
       return { exit_code: "outcome" in (result as object) && (result as { readonly outcome: string }).outcome !== "success" ? 1 : 0, data, stdout: output(data, command.options.json, semanticModelNotice(resultPayload)) };
     }
     if (!directCommand && !command.options.dry_run && !command.options.confirm) throw new CliError("cli:dry_run_required", `Administrative command ${command.name} requires either --dry-run to preview or --confirm to execute.`);

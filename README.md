@@ -36,7 +36,7 @@ remain available; unsupported operations fail explicitly.
 
 ## Install
 
-Urdira 0.1.1 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
+Urdira 0.2.0 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
 requires npm `>=11.16.0`, which supplies the strict install-script policy. Check
 with `npm --version`; if necessary, update the npm paired with the active Node
 installation before preparing the runtime:
@@ -94,6 +94,15 @@ urdira status --json
 urdira index --json
 ```
 
+After an interactive registration succeeds, Urdira asks which coding-agent
+integrations to install. Answer `yes`/`all` for every supported installer, or
+enter a comma-separated subset: `claude-code`, `codex`, `opencode`, `cursor`,
+`vscode`/`copilot`, `cline`, `roo`, and `claude-desktop`. Answer `no` to skip
+this optional step. The non-interactive `--confirm` path does not modify agent
+configuration; use `urdira agent install --client <name> --confirm` (and
+`--workspace /path` for a Roo project configuration) when you want to configure
+one explicitly.
+
 Administrative commands use a preview/confirmation contract. Removing a
 workspace leaves a recoverable tombstone for 24 hours. A later
 `urdira workspace purge <workspaceId> --confirm` is refused while a
@@ -111,7 +120,9 @@ The command returns `already_stopped` when no daemon is running.
 
 ### MCP configuration
 
-Configure an MCP-capable coding agent to launch one stdio server:
+Urdira exposes one local stdio MCP server. The process starts or shares the
+per-user daemon; workspace scope stays in tool arguments and is never stored as
+connection state. Most MCP clients use this entry:
 
 ```json
 {
@@ -124,8 +135,89 @@ Configure an MCP-capable coding agent to launch one stdio server:
 }
 ```
 
-The MCP process starts or shares the per-user daemon. Workspace scope stays in
-tool arguments and is never stored as connection state.
+#### Cursor
+
+For Cursor, save the entry above in `.cursor/mcp.json` at the project root, or
+in `~/.cursor/mcp.json` to make it available to every project. Then enable the
+server from Cursor's MCP settings. Cursor Agent CLI reads the same files, so no
+second installation is needed. See the [Cursor MCP documentation](https://docs.cursor.com/context/model-context-protocol).
+
+#### VS Code and GitHub Copilot
+
+VS Code uses a different top-level key. Create `.vscode/mcp.json` in the
+workspace (or add the server from the user profile) with:
+
+```json
+{
+  "servers": {
+    "urdira": {
+      "type": "stdio",
+      "command": "urdira",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Open Chat and trust the local server when VS Code asks. The same configuration
+is available to GitHub Copilot Chat. For a one-command setup, use
+`urdira agent install --client vscode --confirm`; it installs the native
+Copilot/VS Code hook as well. See [VS Code MCP server configuration](https://code.visualstudio.com/docs/agent-customization/mcp-servers).
+
+#### Cline and Roo Code
+
+Both extensions support local stdio MCP servers. `urdira agent install`
+configures Cline's `cline_mcp_settings.json` and Roo Code's `.roo/mcp.json`
+directly (Roo uses the workspace passed to `workspace add`). See the [Cline MCP guide](https://github.com/cline/cline/blob/main/docs/mcp/mcp-overview.mdx)
+and [Roo Code MCP guide](https://roocodeinc.github.io/Roo-Code/features/mcp/using-mcp-in-roo/).
+
+#### Claude Desktop
+
+`urdira agent install --client claude-desktop --confirm` writes the supported
+per-user Claude Desktop local-server configuration for the current OS. The
+command is still `urdira mcp`; Claude Desktop does not need a separate Urdira
+package. See [Claude's local MCP server guide](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop).
+
+The MCP integration is available to all of these clients. The optional
+`urdira agent install` search bridge is a separate native optimization. It
+translates supported lexical, file-discovery, and semantic calls to Urdira and always
+falls back to the client's native tool when the request cannot be translated or
+the index is not current:
+
+| Client | Urdira MCP | Native `urdira agent` bridge |
+|---|---:|---:|
+| Cursor / Cursor Agent CLI | Yes | Yes |
+| VS Code / GitHub Copilot | Yes | Yes |
+| Cline | Yes | No |
+| Roo Code | Yes | No |
+| Claude Desktop | Yes | No |
+| Claude Code | Yes | Yes |
+| Codex | Yes | Yes |
+| OpenCode | Yes | Yes |
+
+All integrations are opt-in and idempotent. The same command writes the
+native hook or MCP configuration appropriate for the selected client:
+
+```bash
+urdira agent install --client claude-code --confirm
+urdira agent install --client codex --confirm
+urdira agent install --client opencode --confirm
+urdira agent install --client cursor --confirm
+urdira agent install --client vscode --confirm
+urdira agent install --client cline --confirm
+urdira agent install --client roo --workspace /absolute/path/to/project --confirm
+urdira agent install --client claude-desktop --confirm
+```
+
+Cursor uses its user-level `~/.cursor/hooks.json` and its `preToolUse` hook to
+bridge `Grep`, `Search Files`, and `Codebase` to Urdira's lexical, artifact, and
+semantic lanes respectively. If a lane is unavailable, incomplete, or the
+request is unsupported, the hook allows Cursor's native tool to run; it never
+approximates semantic search as lexical search. See the [Cursor hooks documentation](https://docs.cursor.com/hooks).
+VS Code/Copilot uses the user-level `~/.copilot/hooks/urdira.json` and the same
+fail-open behavior. Cline, Roo Code, and Claude Desktop receive their local
+`mcpServers.urdira` entry from the installer; they do not require copying JSON
+by hand.
 
 ### Public MCP tools
 

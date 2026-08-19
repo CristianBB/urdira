@@ -54,7 +54,7 @@ export interface UrdiraRunOptions {
   readonly prompt?: (question: string) => Promise<string | boolean>;
 }
 
-export const URDIRA_VERSION = "0.1.1";
+export const URDIRA_VERSION = "0.2.0";
 
 export function urdiraHelp(): string {
   return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace add <path> [--dry-run]\n  urdira workspace configure <id> [--dry-run]\n  urdira workspace remove <id> [--dry-run|--confirm]\n  urdira workspace purge <id> [--dry-run|--confirm]\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n\nWorkspace add/configure and daemon stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;

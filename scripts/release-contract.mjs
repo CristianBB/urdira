@@ -72,7 +72,7 @@ export function buildReleaseMetadata({ gitCommit, lockfileDigest, generatedAt = 
   if (!gitCommit || !lockfileDigest) throw new Error("Release metadata requires git commit and lockfile digest.");
   return stable({
     release_schema_version: 1,
-    engine_version: "0.1.1",
+    engine_version: "0.2.0",
     generated_at: generatedAt,
     git_commit: gitCommit,
     lockfile_digest: lockfileDigest,

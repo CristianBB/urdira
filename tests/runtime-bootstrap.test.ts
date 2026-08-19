@@ -18,9 +18,9 @@ const knownDeprecation = "npm warn deprecated boolean@3.2.0: Package no longer s
 
 describe("dependency-free runtime bootstrap", () => {
   it("binds one bootstrap release to one exact runtime and reviewed script closure", () => {
-    expect(BOOTSTRAP_VERSION).toBe("0.1.1");
+    expect(BOOTSTRAP_VERSION).toBe("0.2.0");
     expect(RUNTIME_PACKAGE_NAME).toBe("@urdira/runtime");
-    expect(RUNTIME_VERSION).toBe("0.1.1");
+    expect(RUNTIME_VERSION).toBe("0.2.0");
     expect(RUNTIME_INSTALL_SCRIPT_APPROVALS).toEqual({
       "onnxruntime-node@1.24.3": true,
       "sharp@0.35.3": true,
@@ -31,7 +31,7 @@ describe("dependency-free runtime bootstrap", () => {
     const plan = createRuntimePreparationPlan("/var/lib/urdira");
     expect(plan).toMatchObject({
       package_name: "@urdira/runtime",
-      package_version: "0.1.1",
+      package_version: "0.2.0",
       minimum_npm_version: "11.16.0",
       registry: "https://registry.npmjs.org/",
       known_upstream_notices: ["boolean@3.2.0 is deprecated through @huggingface/transformers@4.2.0 -> onnxruntime-node@1.24.3 -> global-agent@3.0.0."],
@@ -66,7 +66,7 @@ describe("dependency-free runtime bootstrap", () => {
       install: async ({ staging_root }) => {
         const privateManifest = JSON.parse(await readFile(join(staging_root, "package.json"), "utf8"));
         expect(privateManifest).toMatchObject({
-          dependencies: { "@urdira/runtime": "0.1.1" },
+          dependencies: { "@urdira/runtime": "0.2.0" },
           overrides: { "adm-zip": "0.6.0", sharp: "0.35.3" },
           allowScripts: RUNTIME_INSTALL_SCRIPT_APPROVALS,
         });

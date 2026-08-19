@@ -184,7 +184,7 @@ export async function smokeInstallNpmPackages(packed) {
     const cli = join(npmRoot, "urdira", "dist", "cli.js");
     const version = await execFileAsync(process.execPath, [cli, "--version"], { cwd: bootstrapRoot });
     const help = await execFileAsync(process.execPath, [cli, "--help"], { cwd: bootstrapRoot });
-    if (version.stdout.trim() !== "0.1.1" || !help.stdout.includes("runtime prepare")) throw new Error("Dependency-free bootstrap smoke check failed.");
+    if (version.stdout.trim() !== bootstrap.version || !help.stdout.includes("runtime prepare")) throw new Error("Dependency-free bootstrap smoke check failed.");
   } finally {
     await rm(bootstrapRoot, { recursive: true, force: true });
   }
@@ -210,7 +210,8 @@ export async function smokeInstallNpmPackages(packed) {
     const runtimeCli = join(smokeRoot, "node_modules", "@urdira", "runtime", "dist", "cli.js");
     const version = await execFileAsync(process.execPath, [runtimeCli, "--version"], { cwd: smokeRoot });
     const help = await execFileAsync(process.execPath, [runtimeCli, "--help"], { cwd: smokeRoot });
-    if (version.stdout.trim() !== "0.1.1" || !help.stdout.includes("urdira mcp")) throw new Error("Installed runtime CLI smoke check failed.");
+    const runtimePackage = packed.find((entry) => entry.name === "@urdira/runtime");
+    if (runtimePackage === undefined || version.stdout.trim() !== runtimePackage.version || !help.stdout.includes("urdira mcp")) throw new Error("Installed runtime CLI smoke check failed.");
     return { version: version.stdout.trim(), help: true, bootstrap_warning_free: true };
   } finally {
     await rm(smokeRoot, { recursive: true, force: true });
