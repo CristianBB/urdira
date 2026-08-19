@@ -57,6 +57,11 @@ jobs:
           while IFS=$'\t' read -r name version tarball expected_integrity; do
             coordinate="${name}@${version}"
             existing_integrity="$(npm view "$coordinate" dist.integrity --json 2>/dev/null || true)"
+            # npm CLI emits a JSON error object on stdout for a missing version;
+            # that means "not published yet", not an integrity conflict.
+            if [[ "$existing_integrity" == *'"error"'* ]]; then
+              existing_integrity=""
+            fi
             existing_integrity="${existing_integrity//\"/}"
             if [[ -n "$existing_integrity" && "$existing_integrity" != "null" ]]; then
               if [[ "$existing_integrity" != "$expected_integrity" ]]; then
