@@ -336,4 +336,19 @@ describe("workspace watcher lifecycle", () => {
     ]);
     await manager.stop("workspace-1");
   });
+
+  test("splits authoritative delete and rename presence into ordered generations", async () => {
+    const watcher = new DeterministicFakeWatcher({ workspace_id: "workspace-1", source_provider_binding_id: "binding-1", source_provider: "core:directory_source_provider", source_provider_version: "1", ordering_domain: "fs:1", root: "/tmp/project", authoritative_delete_events: true });
+    const reconciled: { readonly changedUris: readonly string[] | undefined; readonly deletes: readonly string[] }[] = [];
+    const manager = new WorkspaceWatcherManager({ on_reconcile: async (_workspaceId, changedUris, _reason, deletes = []) => { reconciled.push({ changedUris, deletes: deletes.map((event) => event.normalized_uri) }); } });
+    await manager.start({ workspace_id: "workspace-1", watcher });
+    watcher.emit([{ event_class: "absence", normalized_uri: "src/old.ts" }, { event_class: "presence", normalized_uri: "src/new.ts" }]);
+    await watcher.idle();
+    await manager.idle();
+    expect(reconciled).toEqual([
+      { changedUris: [], deletes: ["src/old.ts"] },
+      { changedUris: ["src/new.ts"], deletes: [] },
+    ]);
+    await manager.stop("workspace-1");
+  });
 });

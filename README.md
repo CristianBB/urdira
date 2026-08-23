@@ -24,8 +24,10 @@ Core properties:
 - exact owner artifact, version, source span, evidence, and completeness data;
 - near-real-time working-tree updates backed by authoritative reconciliation;
 - changed-file watcher updates use a safe targeted capture when possible, with
-  complete reconciliation retained as the fallback for deletes, renames, and
-  ambiguous events;
+  complete reconciliation retained as a fallback only for lost or ambiguous
+  events;
+- registered physical delete events are applied directly; renames publish the
+  absence and new presence in consecutive generations;
 - deterministic ordering with no hidden approximate fallback;
 - concurrent workspaces, Git worktrees, detached checkouts, clones, ordinary
   directories, and read-only Git references; and

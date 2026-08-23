@@ -99,6 +99,9 @@ export interface SourceIndexApplyResult {
   readonly error_code?: string;
   /** Internal signal used to complete a fragmented scan without a false no-op. */
   readonly changed?: boolean;
+  /** Watch-driven authoritative absence provenance for candidate planning. */
+  readonly watch_absences?: readonly { readonly artifact_id: string; readonly normalized_uri: string; readonly source_observation_id: string }[];
+  readonly observation_batch_id?: string;
 }
 
 export interface SourceIndexWorkspacePort {
@@ -816,7 +819,13 @@ export class GenericSourceIndexer {
     const commitInput: SourceIndexCommitInput = { expected_state_revision: priorState?.state_revision ?? 0, state, batch, observations, artifacts: [], contents: [], version_closures: versionClosures, versions: [], tombstone_closures: [], tombstones };
     if (this.workspace.publishCandidate) await this.workspace.publishCandidate({ source_index: commitInput });
     else await this.workspace.sourceIndex.commit(commitInput);
-    return { status: tombstones.length > 0 ? "published" : "equivalent", generation: committedGeneration, checkpoint_id: state.checkpoint_id };
+    return {
+      status: tombstones.length > 0 ? "published" : "equivalent",
+      generation: committedGeneration,
+      checkpoint_id: state.checkpoint_id,
+      observation_batch_id: batchId,
+      watch_absences: unique.map(({ event, observation }) => ({ artifact_id: observation.artifact_id, normalized_uri: event.normalized_uri, source_observation_id: observation.source_observation_id })),
+    };
   }
 
   private storedObservation(value: ProviderObservation, batch: SourceObservationBatchRecord): SourceObservationRecord {

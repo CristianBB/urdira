@@ -530,6 +530,45 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
     }
   }, 60_000);
 
+  it("publishes an authoritative delete without a full source walk, then handles the rename presence in the successor generation", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-authoritative-rename";
+    const prepared = await prepareRegistry(workspaceId);
+    const plugin = buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`);
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-authoritative-rename-root-"));
+    await cp(fixtureRoot, workspaceRoot, { recursive: true });
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-authoritative-rename-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: workspaceRoot, display_root: workspaceRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const scanOptions = { root: workspaceRoot, database: asStorageDatabase(opened), workspace_id: workspaceId, plugin, inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false }, now: () => now };
+        const first = await runFullWorkspaceScan(scanOptions);
+        expect(first.status).toBe("published");
+        await writeFile(join(workspaceRoot, "rename-old.ts"), "export class RenameOld {}");
+        const withOld = await runFullWorkspaceScan({ ...scanOptions, changed_uris: ["rename-old.ts"] });
+        expect(withOld.status).toBe("published");
+        await rm(join(workspaceRoot, "rename-old.ts"));
+        const deleteEvent = { workspace_id: workspaceId, source_provider_binding_id: "provider:filesystem", source_provider: "core:directory_source_provider", source_provider_version: "1", ordering_domain: `workspace:${workspaceId}`, provider_sequence: "delete:1", event_class: "absence" as const, normalized_uri: "rename-old.ts", authority: "authoritative_delete" as const };
+        const deleted = await runFullWorkspaceScan({ ...scanOptions, changed_uris: [], authoritative_delete_events: [deleteEvent] });
+        expect(deleted.status).toBe("published");
+        expect(deleted.generation).toBe(withOld.generation + 1);
+        const deletedAbsences = await opened.sourceIndex.currentAbsencesSlim("provider:filesystem");
+        expect(deletedAbsences.some((absence) => absence.artifact.normalized_uri === "rename-old.ts")).toBe(true);
+        await writeFile(join(workspaceRoot, "rename-new.ts"), "export class RenameNew {}");
+        const renamed = await runFullWorkspaceScan({ ...scanOptions, changed_uris: ["rename-new.ts"] });
+        expect(renamed.status).toBe("published");
+        expect(renamed.generation).toBe(deleted.generation + 1);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it("publishes the first structural snapshot after an equivalent source-only catalog already exists", async () => {
     const workspaceId = "workspace:workspace-indexing-session-source-first-recovery";
     const prepared = await prepareRegistry(workspaceId);

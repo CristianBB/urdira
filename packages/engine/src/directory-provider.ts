@@ -359,7 +359,7 @@ export class DirectorySourceProvider implements SourceProvider {
    * as partial fragments and a final empty complete fragment so the core can
    * apply deletion authority without constructing a giant response payload.
    */
-  async enumerateNativeBatches(request: SourceProviderRequestEnvelope, options?: { readonly changed_uris?: readonly string[] }): Promise<NativeDirectoryEnumeration> {
+  async enumerateNativeBatches(request: SourceProviderRequestEnvelope, options?: { readonly changed_uris?: readonly string[]; readonly allow_empty_incremental?: boolean }): Promise<NativeDirectoryEnumeration> {
     let capture: Capture | undefined;
     let budgetMaxObservations = 0;
     let incremental = false;
@@ -379,6 +379,10 @@ export class DirectorySourceProvider implements SourceProvider {
           // remains authoritative and safe.
           capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
         }
+      } else if (options?.allow_empty_incremental === true) {
+        const emptyFingerprint = digestFields([]);
+        capture = { files: [], start_fingerprint: emptyFingerprint, end_fingerprint: emptyFingerprint, stable: true };
+        incremental = true;
       } else {
         capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
       }

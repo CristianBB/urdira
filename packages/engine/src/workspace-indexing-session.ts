@@ -35,8 +35,9 @@ import type { MaterializationAcceptedFactDelta } from "./fact-delta.js";
 import type { FactDeltaBatch } from "@urdira/contracts";
 import { GenericSourceIndexer, type SourceIndexApplyResult } from "./source-indexer.js";
 import { sourceProviderRequestDigest } from "./source-provider.js";
-import type { SourceCandidateBase, SourceCandidateBaseAbsence, SourceCandidateBaseOccurrence, SourceCandidateObservationSet, SourceCandidatePresentObservation } from "./source-candidate-planning.js";
+import type { SourceCandidateAbsenceObservation, SourceCandidateBase, SourceCandidateBaseAbsence, SourceCandidateBaseOccurrence, SourceCandidateObservationSet, SourceCandidatePresentObservation } from "./source-candidate-planning.js";
 import { createWorkspaceCandidatePort } from "./workspace-indexing-port.js";
+import type { WatcherHint } from "./watchers.js";
 
 /**
  * A single cataloged source file, ready to hand to a language plugin for analysis.
@@ -147,6 +148,8 @@ export interface RunFullWorkspaceScanInput {
   readonly on_stage_published?: (stage: PluginStructuralStageDeclaration, result: CandidateRunResult) => void | Promise<void>;
   /** Safe watcher hints for narrowing analysis; omitted means a full reconcile. */
   readonly changed_uris?: readonly string[];
+  /** Concrete watcher deletions already proven authoritative by the backend. */
+  readonly authoritative_delete_events?: readonly WatcherHint[];
   /** Cancels a superseded generation before analysis or publication. */
   readonly signal?: AbortSignal;
 }
@@ -203,6 +206,7 @@ export interface RunSourceOnlyWorkspaceScanInput {
   readonly io_concurrency?: number;
   /** Safe watcher hints; missing/unsafe paths fall back to full reconciliation. */
   readonly changed_uris?: readonly string[];
+  readonly authoritative_delete_events?: readonly WatcherHint[];
   readonly signal?: AbortSignal;
 }
 
@@ -228,10 +232,20 @@ export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceSc
     now,
   });
   const scope = { scope_type: "source_root" as const, source_provider_binding_id: bindingId, source_provider: provider.component_id, normalized_scope_key: "" };
+  const current = await input.database.repositories.snapshots.getCurrent();
+  const authoritativeDeletes = input.authoritative_delete_events ?? [];
+  const watchResult = authoritativeDeletes.length === 0 ? undefined : await new GenericSourceIndexer(input.database).apply({
+    response: authoritativeWatchResponse({ workspaceId, bindingId, componentId: provider.component_id, componentVersion: provider.component_version, events: authoritativeDeletes, now }),
+    supports_authoritative_delete_events: true,
+    publication_current_generation: current?.current_generation ?? 0,
+  });
   const enumeration = await provider.enumerateNativeBatches(providerRequest({
     call: "enumerate", workspaceId, bindingId, componentId: provider.component_id, componentVersion: provider.component_version,
     payload: { coverage_scopes: [scope] }, ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }), now,
-  }), { ...(input.changed_uris === undefined ? {} : { changed_uris: input.changed_uris }) });
+  }), {
+    ...(input.changed_uris === undefined ? {} : { changed_uris: input.changed_uris }),
+    ...(watchResult !== undefined && watchResult.status !== "degraded" && (input.changed_uris?.length ?? 0) === 0 ? { allow_empty_incremental: true } : {}),
+  });
   if (input.signal?.aborted) throw new EngineError("core:operation_cancelled", "Workspace source scan generation was superseded.");
   const response = enumeration.response;
   if (response.outcome !== "success") throw new EngineError("engine:workspace_scan_enumeration_failed", `Directory enumeration for ${input.root} did not succeed (outcome ${response.outcome}).`);
@@ -245,7 +259,6 @@ export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceSc
       provider_version_token: observation.provider_version_token,
     }, ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }), now,
   }));
-  const current = await input.database.repositories.snapshots.getCurrent();
   const result = await new GenericSourceIndexer(input.database).apply({
     response,
     native_batches: enumeration.batches,
@@ -257,7 +270,7 @@ export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceSc
   if (result.status !== "published" && result.status !== "equivalent") throw new EngineError("engine:workspace_scan_source_index_degraded", `Source cataloging of ${input.root} did not complete (status ${result.status}, error ${result.error_code ?? "none"}).`);
   const state = await input.database.sourceIndex.getState();
   const occurrences = await input.database.sourceIndex.currentOccurrencesSlim(bindingId);
-  if (state === undefined || occurrences.length === 0) throw new EngineError("engine:workspace_scan_empty", `No eligible source files were found under ${input.root}.`);
+  if (state === undefined || (occurrences.length === 0 && (watchResult?.watch_absences?.length ?? 0) === 0)) throw new EngineError("engine:workspace_scan_empty", `No eligible source files were found under ${input.root}.`);
   return { status: "source_ready", source_snapshot_id: `source-snapshot:${state.current_generation}`, generation: state.current_generation };
 }
 
@@ -354,7 +367,7 @@ const DEFAULT_SCAN_MAX_DURATION_MS = 600_000;
 const DEFAULT_SCAN_MAX_RESPONSE_BYTES = 64_000_000;
 
 function providerRequest(options: {
-  readonly call: "enumerate" | "read";
+  readonly call: "enumerate" | "read" | "watch";
   readonly workspaceId: string;
   readonly bindingId: string;
   readonly componentId: string;
@@ -381,6 +394,36 @@ function providerRequest(options: {
     payload: options.payload,
   };
   return { ...base, request_digest: sourceProviderRequestDigest(base) };
+}
+
+function authoritativeWatchResponse(options: {
+  readonly workspaceId: string;
+  readonly bindingId: string;
+  readonly componentId: string;
+  readonly componentVersion: string;
+  readonly events: readonly WatcherHint[];
+  readonly now: () => string;
+}): SourceProviderRequestEnvelope & { readonly outcome: "success"; readonly payload: JsonValue } {
+  const payload = {
+    events: options.events.map((event) => ({
+      ordering_domain: options.bindingId,
+      event_class: "deleted",
+      normalized_uri: event.normalized_uri,
+      authority: "authoritative_delete",
+      ...(event.provider_sequence === undefined ? {} : { provider_sequence: event.provider_sequence }),
+    })),
+    watermark: options.events.at(-1)?.provider_sequence ?? `watch:${options.now()}`,
+  } as unknown as JsonValue;
+  const request = providerRequest({
+    call: "watch",
+    workspaceId: options.workspaceId,
+    bindingId: options.bindingId,
+    componentId: options.componentId,
+    componentVersion: options.componentVersion,
+    payload,
+    now: options.now,
+  });
+  return { ...request, outcome: "success", payload };
 }
 
 /**
@@ -492,7 +535,22 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // fat, canonically-decoded read to buy here -- hence the "Slim" typed-column
   // read (`packages/storage/src/source-index.ts`) rather than `currentOccurrences`/
   // `currentAbsences`.
+  const provider = new DirectorySourceProvider({
+    root: input.root,
+    workspace_id: workspaceId,
+    source_provider_binding_id: bindingId,
+    ...(input.inclusion_rules === undefined ? {} : { inclusion_rules: input.inclusion_rules }),
+    ...(input.gitignore_rules === undefined ? {} : { gitignore_rules: input.gitignore_rules }),
+    ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }),
+    now,
+  });
   const currentState = await timed("prior_state_current", () => database.repositories.snapshots.getCurrent());
+  const authoritativeDeletes = input.authoritative_delete_events ?? [];
+  const watchResult = authoritativeDeletes.length === 0 ? undefined : await timed("source_watch", () => new GenericSourceIndexer(database).apply({
+    response: authoritativeWatchResponse({ workspaceId, bindingId, componentId: provider.component_id, componentVersion: provider.component_version, events: authoritativeDeletes, now }),
+    supports_authoritative_delete_events: true,
+    publication_current_generation: currentState?.current_generation ?? 0,
+  }));
   // Incremental source capture is safe only when the analyzer lock is the
   // same as the published one. A lock change requires a full source context
   // and full plugin re-analysis even if the tree bytes are unchanged.
@@ -525,18 +583,9 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   let observations: SourceCandidateObservationSet;
   let incrementalSourceCapture = preparedScan?.observations.coverage_completeness === "partial";
   if (preparedScan === undefined) {
-  const provider = new DirectorySourceProvider({
-    root: input.root,
-    workspace_id: workspaceId,
-    source_provider_binding_id: bindingId,
-    ...(input.inclusion_rules === undefined ? {} : { inclusion_rules: input.inclusion_rules }),
-    ...(input.gitignore_rules === undefined ? {} : { gitignore_rules: input.gitignore_rules }),
-    ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }),
-    now,
-  });
-
   const scope = { scope_type: "source_root" as const, source_provider_binding_id: bindingId, source_provider: provider.component_id, normalized_scope_key: "" };
-  const incrementalRequested = input.changed_uris !== undefined && input.changed_uris.length > 0 && currentState !== undefined && !lockChanged;
+  const watchOnly = watchResult !== undefined && watchResult.status !== "degraded" && (input.changed_uris?.length ?? 0) === 0;
+  const incrementalRequested = watchOnly || (input.changed_uris !== undefined && input.changed_uris.length > 0 && currentState !== undefined && !lockChanged);
   const enumeration = await timed("enumerate", async () => { throwIfCancelled(); return provider.enumerateNativeBatches(providerRequest({
     call: "enumerate",
     workspaceId,
@@ -546,7 +595,10 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     payload: { coverage_scopes: [scope] },
     ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }),
     now,
-  }), incrementalRequested ? { changed_uris: input.changed_uris } : undefined); });
+  }), incrementalRequested ? {
+    ...(input.changed_uris === undefined ? {} : { changed_uris: input.changed_uris }),
+    ...(watchOnly ? { allow_empty_incremental: true } : {}),
+  } : undefined); });
   incrementalSourceCapture = enumeration.incremental;
   const enumerateResponse = enumeration.response;
   if (enumerateResponse.outcome !== "success") {
@@ -609,9 +661,10 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   stageTimings["source_ready_ms"] = Math.round(performance.now() - scanStartedAt);
 
   const occurrences = await database.sourceIndex.currentOccurrencesSlim(bindingId);
+  const watchAbsences = watchResult?.watch_absences ?? [];
   stageTimings["enumerated_artifact_count"] = enumeratedArtifactCount;
   stageTimings["cataloged_artifact_count"] = occurrences.length;
-  if (occurrences.length === 0) throw new EngineError("engine:workspace_scan_empty", `No eligible source files were found under ${input.root}.`);
+  if (occurrences.length === 0 && watchAbsences.length === 0) throw new EngineError("engine:workspace_scan_empty", `No eligible source files were found under ${input.root}.`);
 
   scannedArtifacts = [];
   const nativeContentRefs = input.plugin.supports_native_content_refs === true;
@@ -626,7 +679,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     byte_length: occurrence.version.byte_length,
   })));
   const decoder = nativeContentRefs ? undefined : new TextDecoder("utf-8", { fatal: true });
-  const presentObservations: SourceCandidatePresentObservation[] = [];
+  const presentObservations: (SourceCandidatePresentObservation | SourceCandidateAbsenceObservation)[] = [];
   for (const occurrence of occurrences) {
     presentObservations.push({
       observed_state: "present",
@@ -656,6 +709,15 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
       byte_length: occurrence.version.byte_length,
     });
   }
+  for (const absence of watchAbsences) {
+    presentObservations.push({
+      observed_state: "deleted",
+      source_observation_id: absence.source_observation_id,
+      artifact_id: absence.artifact_id,
+      normalized_uri: absence.normalized_uri,
+      authority: "authoritative_delete",
+    });
+  }
   // `seal` (below) only ever needs these three fields, computed here from
   // data that is already fully known before `plugin.analyze` runs, so that
   // `scannedArtifacts` itself (and the source text each entry carries) can be
@@ -665,17 +727,17 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     outcome: "success",
     stable: true,
     workspace_id: workspaceId,
-    observation_batch_id: completedEnumerationBatch?.batch.observation_batch_id ?? "",
+    observation_batch_id: watchResult?.observation_batch_id ?? sourceIndexResult.observation_batch_id ?? completedEnumerationBatch?.batch.observation_batch_id ?? "",
     source_provider_binding_id: bindingId,
     source_provider: provider.component_id,
     source_provider_version: provider.component_version,
     watermark: (enumerateResponse.payload as { readonly watermark?: string }).watermark ?? "",
     completed_at: completedEnumerationBatch?.batch.completed_at ?? now(),
-    observation_mode: "scan",
+    observation_mode: watchAbsences.length > 0 ? "watch" : "scan",
     coverage_completeness: enumeration.incremental ? "partial" : "complete",
-    deletion_authority: enumeration.incremental ? "none" : "authoritative",
+    deletion_authority: watchAbsences.length > 0 || !enumeration.incremental ? "authoritative" : "none",
     coverage_scopes: [{ scope_type: "source_root", normalized_scope_key: "" }],
-    supports_authoritative_delete_events: false,
+    supports_authoritative_delete_events: watchAbsences.length > 0 || (sourceIndexResult.watch_absences?.length ?? 0) > 0,
     observations: presentObservations,
   };
   } else {

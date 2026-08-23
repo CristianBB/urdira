@@ -1056,6 +1056,7 @@ async function startWorkspaceWatcher(manager: WorkspaceWatcherManager, workspace
         source_provider: workspace.provider.source_provider,
         source_provider_version: workspace.provider.source_provider_version,
         ordering_domain: `workspace:${workspace.workspace_id}`,
+        authoritative_delete_events: true,
         // `ParcelWatcherAdapter` already logs every watcher error loudly and
         // unconditionally on its own (see its doc comment) and re-arms a
         // fresh subscription; `on_error` here is this daemon's own hook for
@@ -1471,27 +1472,55 @@ export class DaemonRuntime {
       // coalesced requests carried no hint (an unsafe/full-rescan reason, or
       // a caller that predates hinting) and the follow-up scan must not
       // narrow anything; otherwise `uris` is the union of every coalesced
-      // request's changed URIs. Previously (Phase 4) a request that arrived
+      // request's changed URIs. Authoritative absences have a second queue
+      // for successor presences so a delete/create (rename) publishes the
+      // tombstone generation before the replacement is captured. Previously
+      // (Phase 4) a request that arrived
       // while a scan was in flight was simply dropped; now that `on_reconcile`
       // fires for every ordinary watch batch (not only the unsafe ones), a
       // dropped request could mean a real edit is never rescanned at all, so
       // it is coalesced into exactly one guaranteed follow-up scan instead.
-      const pendingScans = new Map<string, { full: boolean; uris: Set<string> }>();
-      const scheduleWorkspaceScan = (workspaceId: string, changedUris?: readonly string[]): void => {
+      const activeAuthoritativeDeletePhases = new Map<string, Set<string>>();
+      const pendingScans = new Map<string, {
+        full: boolean;
+        uris: Set<string>;
+        authoritativeDeletes: Map<string, import("@urdira/engine").WatcherHint>;
+        presencesAfterDeletes: Set<string>;
+      }>();
+      const scheduleWorkspaceScan = (workspaceId: string, changedUris?: readonly string[], authoritativeDeletes: readonly import("@urdira/engine").WatcherHint[] = []): void => {
         const registry = options.workspace_registry;
         const resolvePluginProvider = options.resolve_plugin_provider;
         const durableStorage = indexingStorage;
         if (!registry || !resolvePluginProvider || !durableStorage) return;
         if (scanInFlight.has(workspaceId)) {
-          const pending = pendingScans.get(workspaceId) ?? { full: false, uris: new Set<string>() };
-          if (changedUris === undefined) pending.full = true;
-          else for (const uri of changedUris) pending.uris.add(uri);
+          const pending = pendingScans.get(workspaceId) ?? {
+            full: false,
+            uris: new Set<string>(),
+            authoritativeDeletes: new Map<string, import("@urdira/engine").WatcherHint>(),
+            presencesAfterDeletes: new Set<string>(),
+          };
+          if (changedUris === undefined) {
+            // Unsafe/lost coverage supersedes narrower work and does not
+            // carry a delete hint into the full reconciliation.
+            pending.full = true;
+            pending.uris.clear();
+            pending.authoritativeDeletes.clear();
+            pending.presencesAfterDeletes.clear();
+          } else if (pending.authoritativeDeletes.size > 0 || authoritativeDeletes.length > 0 || activeAuthoritativeDeletePhases.has(workspaceId)) {
+            for (const uri of changedUris) pending.presencesAfterDeletes.add(uri);
+          } else {
+            for (const uri of changedUris) pending.uris.add(uri);
+          }
+          for (const event of authoritativeDeletes) pending.authoritativeDeletes.set(event.normalized_uri, event);
           pendingScans.set(workspaceId, pending);
           // A concrete changed-path generation supersedes work that has not
           // reached publication. Periodic/full reconciliation hints are not
           // cancellation signals: aborting those on every sweep tick would
           // starve a workspace whose sweep interval is shorter than a scan.
-          if (changedUris !== undefined) scanControllers.get(workspaceId)?.abort();
+          // Keep an authoritative-delete scan alive so its tombstone can be
+          // published before a queued successor presence.
+          const initialScan = registry.get(workspaceId)?.current_snapshot_id === undefined;
+          if (changedUris !== undefined && changedUris.length > 0 && !initialScan && pending.authoritativeDeletes.size === 0 && !activeAuthoritativeDeletePhases.has(workspaceId)) scanControllers.get(workspaceId)?.abort();
           return;
         }
         scanInFlight.add(workspaceId);
@@ -1500,6 +1529,7 @@ export class DaemonRuntime {
         const scanGeneration = (scanGenerations.get(workspaceId) ?? 0) + 1;
         scanGenerations.set(workspaceId, scanGeneration);
         const requestedUris = changedUris === undefined ? undefined : [...new Set(changedUris)];
+        if (authoritativeDeletes.length > 0) activeAuthoritativeDeletePhases.set(workspaceId, new Set(authoritativeDeletes.map((event) => event.normalized_uri)));
         // Pre-empt a stale in-flight threaded lexical build (see
         // `lexicalThreadRuns`'s doc comment above) as early as possible --
         // before this scan is even admitted to the scheduler -- rather than
@@ -1545,6 +1575,7 @@ export class DaemonRuntime {
                       ...(options.scan_budget === undefined ? {} : { scan_budget: options.scan_budget }),
                       ...(options.scan_io_concurrency === undefined ? {} : { io_concurrency: options.scan_io_concurrency }),
                       ...(requestedUris === undefined ? {} : { changed_uris: requestedUris }),
+                      ...(authoritativeDeletes.length === 0 ? {} : { authoritative_delete_events: authoritativeDeletes }),
                       signal: scanController.signal,
                     });
                     console.error(`[urdira] source catalog ready for ${workspaceId}; no compatible language plugin is active`);
@@ -1587,6 +1618,7 @@ export class DaemonRuntime {
                     ...(options.scan_budget === undefined ? {} : { scan_budget: options.scan_budget }),
                     ...(options.scan_io_concurrency === undefined ? {} : { io_concurrency: options.scan_io_concurrency }),
                     ...(requestedUris === undefined ? {} : { changed_uris: requestedUris }),
+                    ...(authoritativeDeletes.length === 0 ? {} : { authoritative_delete_events: authoritativeDeletes }),
                     signal: scanController.signal,
                     on_stage_published: (stage, stageResult) => {
                       if (stage.ordinal < stage.stage_count) registry.markStructuralStagePublished(workspaceId, stageResult.snapshot_id);
@@ -1643,6 +1675,7 @@ export class DaemonRuntime {
               } finally {
                 scanInFlight.delete(workspaceId);
                 if (scanControllers.get(workspaceId) === scanController) scanControllers.delete(workspaceId);
+                activeAuthoritativeDeletePhases.delete(workspaceId);
                 // Run exactly one coalesced follow-up scan for every hint that
                 // arrived while this scan was in flight, instead of dropping
                 // them (see `pendingScans` above). The scan that just finished
@@ -1659,7 +1692,24 @@ export class DaemonRuntime {
                 if (pending) {
                   pendingScans.delete(workspaceId);
                   try { registry.beginReconciliation(workspaceId); } catch { /* the workspace was removed while this scan ran */ }
-                  scheduleWorkspaceScan(workspaceId, pending.full ? undefined : [...pending.uris]);
+                  if (pending.full) {
+                    scheduleWorkspaceScan(workspaceId, undefined);
+                  } else if (pending.authoritativeDeletes.size > 0) {
+                    // Preserve a second generation for rename/recreate
+                    // batches even when both callbacks arrived while the
+                    // first scan was still running.
+                    if (pending.presencesAfterDeletes.size > 0) {
+                      pendingScans.set(workspaceId, {
+                        full: false,
+                        uris: new Set(pending.presencesAfterDeletes),
+                        authoritativeDeletes: new Map(),
+                        presencesAfterDeletes: new Set(),
+                      });
+                    }
+                    scheduleWorkspaceScan(workspaceId, [], [...pending.authoritativeDeletes.values()]);
+                  } else {
+                    scheduleWorkspaceScan(workspaceId, [...pending.uris]);
+                  }
                 }
               }
             },
@@ -1669,6 +1719,7 @@ export class DaemonRuntime {
           // stopping): the workspace stays "indexing"; a future
           // reconciliation attempt (watcher event or `workspace add`) retries.
           scanInFlight.delete(workspaceId);
+          activeAuthoritativeDeletePhases.delete(workspaceId);
         }
       };
       // D5: post-ready lexical maintenance (`reconcileLexicalProjection`,
@@ -1919,8 +1970,8 @@ export class DaemonRuntime {
         for (const workspaceId of warmableWorkspaceIds) submitSemanticMaintenance(workspaceId);
       }
       const watcherManager = options.workspace_registry ? new WorkspaceWatcherManager({
-        on_reconcile: async (workspaceId, changedUris) => {
-          try { options.workspace_registry?.beginReconciliation(workspaceId); scheduleWorkspaceScan(workspaceId, changedUris); } catch { /* removed workspaces are ignored */ }
+        on_reconcile: async (workspaceId, changedUris, _reason, authoritativeDeletes = []) => {
+          try { options.workspace_registry?.beginReconciliation(workspaceId); scheduleWorkspaceScan(workspaceId, changedUris, authoritativeDeletes); } catch { /* removed workspaces are ignored */ }
         },
       }) : undefined;
       server = new LocalIpcServer({ endpoint: paths.endpoint, ...(options.max_frame_bytes === undefined ? {} : { max_frame_bytes: options.max_frame_bytes }), handler: async (request, context) => {

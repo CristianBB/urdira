@@ -141,16 +141,21 @@ The campaign measurements above are full-readiness measurements and predate the
 changed-file source-capture path. The implementation now consumes watcher
 `changed_uris` in the directory provider: an existing, stable, eligible file is
 captured and streamed as one partial source batch, while the source index keeps
-the prior generation and disables deletion authority. The candidate planner
-diffs that batch against the existing catalog, and the plugin receives only the
-targeted artifact set. Missing paths, deletes, renames, directories, excluded
-files, and unstable boundaries deliberately fall back to complete
-reconciliation; those hints also retain full plugin analysis so no dependency
-closure is silently skipped.
+the prior generation and disables deletion authority. Registered physical
+delete events now use the existing authoritative watch path without a source
+walk. Delete/create batches are split into two ordered publications for
+renames. The candidate planner diffs the partial batch against the existing
+catalog, and the plugin receives only the targeted artifact set. Missing or
+unknown delete targets, directories, excluded files, lost ordering, overflow,
+provider reset, and unstable boundaries remain the reduced set of cases that
+fall back to complete reconciliation.
 
 Focused evidence: `tests/phase7-providers.test.ts` verifies one-file capture and
-complete fallback after deletion; the rescan integration in
+complete fallback after deletion; `tests/phase15-workspace-control.test.ts`
+verifies ordered authoritative delete/presence delivery; the rescan integration
+in
 `tests/phase-workspace-indexing-session.test.ts` verifies a new-file update and
-observes one analyzed artifact. These are correctness/regression measurements,
+an authoritative delete without a full source walk, followed by the rename
+presence in the next generation. These are correctness/regression measurements,
 not a new VS Code readiness benchmark. A fresh large-repository campaign is
 still required to quantify the absolute one-file latency and memory reduction.

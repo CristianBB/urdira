@@ -163,6 +163,13 @@ describe("Phase 7 physical watcher adapters", () => {
     expect(deletion).not.toHaveProperty("deletion_authority");
   });
 
+  it("accepts registered physical delete authority for a trusted watcher binding", () => {
+    const adapter = new ParcelWatcherAdapter({ ...directoryBinding, authoritative_delete_events: true });
+    const deletion = adapter.normalize_events([{ type: "delete", path: "/repo/gone.ts" }]).events[0];
+
+    expect(deletion).toMatchObject({ event_class: "absence", authority: "authoritative_delete" });
+  });
+
   it("provides deterministic duplicate, reordered, overflow, reset, and administrative fixtures", async () => {
     const watcher = new DeterministicFakeWatcher(gitBinding);
     const received: WatcherHint[] = [];

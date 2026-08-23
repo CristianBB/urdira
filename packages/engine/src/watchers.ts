@@ -23,6 +23,8 @@ export interface WatcherBinding {
   readonly root: string;
   readonly case_sensitive?: boolean;
   readonly mutable_watched?: boolean;
+  /** The backend guarantees a concrete delete event for this binding. */
+  readonly authoritative_delete_events?: boolean;
 }
 
 export interface PhysicalWatcherEvent {
@@ -39,7 +41,7 @@ export interface WatcherHint {
   readonly provider_sequence: string;
   readonly event_class: WatcherEventClass;
   readonly normalized_uri: string;
-  readonly authority: "hint";
+  readonly authority: "hint" | "authoritative_delete";
 }
 
 export interface WatcherHintBatch {
@@ -77,7 +79,7 @@ export interface WorkspaceWatcherManagerOptions {
    * generation so analysis and publication can be cancelled/coalesced; unsafe
    * events deliberately widen to a full reconcile.
    */
-  readonly on_reconcile?: (workspaceId: string, changedUris: readonly string[] | undefined, reason: WatcherReconcileReason) => void | Promise<void>;
+  readonly on_reconcile?: (workspaceId: string, changedUris: readonly string[] | undefined, reason: WatcherReconcileReason, authoritativeDeletes?: readonly WatcherHint[]) => void | Promise<void>;
   readonly on_configuration_change?: (workspaceId: string) => void | Promise<void>;
 }
 
@@ -144,7 +146,22 @@ export class WorkspaceWatcherManager {
           // scan and the false "indexing" flicker without touching the
           // deliberate branch-switch-detection semantics of the unsafe path
           // above, which this change does not alter.
-          const changedUris = [...new Set(batch.events.map((event) => event.normalized_uri).filter((uri) => uri.length > 0 && uri !== ".git" && !uri.startsWith(".git/")))];
+          const authoritativeDeletes = batch.events.filter((event) => event.authority === "authoritative_delete" && event.event_class === "absence");
+          const deletedUris = new Set(authoritativeDeletes.map((event) => event.normalized_uri));
+          const changedUris = [...new Set(batch.events
+            .filter((event) => !authoritativeDeletes.includes(event)
+              // A stale modify for a path that was just deleted must not
+              // turn the trusted absence back into a targeted capture (the
+              // path is expected to be missing). A same-path presence is a
+              // genuine delete/recreate and remains a successor generation.
+              && !(deletedUris.has(event.normalized_uri) && event.event_class === "modify"))
+            .map((event) => event.normalized_uri)
+            .filter((uri) => uri.length > 0 && uri !== ".git" && !uri.startsWith(".git/")))];
+          // Publish an authoritative absence first. A same-batch create is
+          // deliberately queued as a follow-up presence so a rename closes
+          // the old lifecycle in one generation and reopens the new path in
+          // the next, rather than coalescing both transitions.
+          if (authoritativeDeletes.length > 0) await this.options.on_reconcile?.(binding.workspace_id, [], "changed", authoritativeDeletes);
           if (changedUris.length > 0) await this.options.on_reconcile?.(binding.workspace_id, changedUris, "changed");
         }
       });
@@ -363,7 +380,7 @@ export class ParcelWatcherAdapter {
       provider_sequence: String(++this.#sequence),
       event_class: kind,
       normalized_uri: uri,
-      authority: "hint",
+      authority: kind === "absence" && this.#binding.authoritative_delete_events === true ? "authoritative_delete" : "hint",
     };
   }
 
@@ -446,7 +463,7 @@ export class DeterministicFakeWatcher {
       provider_sequence: String(++this.#sequence),
       event_class: kind,
       normalized_uri: uri,
-      authority: "hint",
+      authority: kind === "absence" && this.#binding.authoritative_delete_events === true ? "authoritative_delete" : "hint",
     };
   }
 
