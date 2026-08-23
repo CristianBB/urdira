@@ -406,11 +406,13 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   const throwIfCancelled = (): void => { if (input.signal?.aborted) throw new EngineError("core:operation_cancelled", "Workspace scan generation was superseded."); };
   throwIfCancelled();
   const stageTimings: Record<string, number> = {};
+  const debugTiming = process.env["URDIRA_DEBUG_TIMING"] === "1";
   const timed = async <T>(stage: string, action: () => Promise<T>): Promise<T> => {
     const startedAt = performance.now();
     try { return await action(); } finally { stageTimings[stage] = Math.round((stageTimings[stage] ?? 0) + (performance.now() - startedAt)); }
   };
   const logStageTimings = (status: string): void => {
+    if (!debugTiming) return;
     stageTimings["total"] = Math.round(performance.now() - scanStartedAt);
     console.error(`[urdira] scan timings ${workspaceId} status=${status} ms=${JSON.stringify(stageTimings)}`);
   };
@@ -679,11 +681,11 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
       scannedArtifacts = preparedScan.source_artifacts.map((artifact) => ({ ...artifact }));
       stageTimings["captured_native_refs_ms"] = 0;
     } else {
-      console.error(`[urdira] captured bytes verify start workspace=${workspaceId} artifacts=${preparedScan.source_artifacts.length}`);
+      if (debugTiming) console.error(`[urdira] captured bytes verify start workspace=${workspaceId} artifacts=${preparedScan.source_artifacts.length}`);
       const capturedVerifyStartedAt = performance.now();
       const verifiedBytes = await preparedScan.captured_byte_lease.verify(database);
       stageTimings["captured_verify_ms"] = Math.round(performance.now() - capturedVerifyStartedAt);
-      console.error(`[urdira] captured bytes verify complete workspace=${workspaceId} ms=${stageTimings["captured_verify_ms"]}`);
+      if (debugTiming) console.error(`[urdira] captured bytes verify complete workspace=${workspaceId} ms=${stageTimings["captured_verify_ms"]}`);
       const decoder = new TextDecoder("utf-8", { fatal: true });
       const capturedHydrationStartedAt = performance.now();
       scannedArtifacts = preparedScan.source_artifacts.map((artifact) => {
@@ -692,7 +694,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         return { ...artifact, text: decoder.decode(bytes) };
       });
       stageTimings["captured_hydration_ms"] = Math.round(performance.now() - capturedHydrationStartedAt);
-      console.error(`[urdira] captured bytes hydration complete workspace=${workspaceId} ms=${stageTimings["captured_hydration_ms"]}`);
+      if (debugTiming) console.error(`[urdira] captured bytes hydration complete workspace=${workspaceId} ms=${stageTimings["captured_hydration_ms"]}`);
     }
     observations = preparedScan.observations;
     stageTimings["source_ready_ms"] = Math.round(performance.now() - scanStartedAt);

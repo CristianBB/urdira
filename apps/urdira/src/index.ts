@@ -60,13 +60,14 @@ export interface UrdiraRunOptions {
 }
 
 export const URDIRA_VERSION = "0.2.2";
+const debugTimingEnabled = (): boolean => process.env["URDIRA_DEBUG_TIMING"] === "1";
 
 function urdiraHelpLegacy(): string {
   return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace add <path> [--dry-run]\n  urdira workspace configure <id> [--dry-run]\n  urdira workspace remove <id> [--dry-run|--confirm]\n  urdira workspace purge <id> [--dry-run|--confirm]\n  urdira daemon start\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n\nWorkspace add/configure and daemon start/stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;
 }
 
 export function urdiraHelp(): string {
-  return `${urdiraHelpLegacy()}  urdira migrate --to-data-format 3 --reindex [--confirm]\n`;
+  return `${urdiraHelpLegacy()}\nDiagnostic option:\n  append --debug-timing to enable internal scan, analysis, CAS, SQLite and publication timings.\n\n  urdira migrate --to-data-format 3 --reindex [--confirm]\n`;
 }
 
 export interface UrdiraMcpRunOptions {
@@ -433,7 +434,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       if (changedArtifactIds !== undefined && !sourceArtifacts.some((artifact) => changedArtifactIds.has(artifact.artifact_id))) {
         if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
         else await worker.terminate();
-        console.error(`[urdira] analyze timings ${workspace_id} owners=0 ms=${JSON.stringify({ closure: 0, worker_wait: 0, acceptance: 0, skipped: "no_plugin_artifact_changes" })}`);
+        if (debugTimingEnabled()) console.error(`[urdira] analyze timings ${workspace_id} owners=0 ms=${JSON.stringify({ closure: 0, worker_wait: 0, acceptance: 0, skipped: "no_plugin_artifact_changes" })}`);
         return {
           accepted_deltas: accepted,
           capability_state_entries: completeStageEntries(),
@@ -752,7 +753,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // deltas already retain the analyzer's structured facts and may occupy
       // gigabytes on a repository-sized first scan.
       for (const entry of shardResults) accepted.push(entry.delta);
-      console.error(`[urdira] analyze timings ${workspace_id} owners=${planCount} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(performance.now() - workerStartedAt), acceptance: Math.round(performance.now() - acceptanceStartedAt), shards: shardCount, plan_mode: largeWorkspace ? "stream" : "materialized" })}`);
+      if (debugTimingEnabled()) console.error(`[urdira] analyze timings ${workspace_id} owners=${planCount} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(performance.now() - workerStartedAt), acceptance: Math.round(performance.now() - acceptanceStartedAt), shards: shardCount, plan_mode: largeWorkspace ? "stream" : "materialized" })}`);
       // Summarize claims in place. `flatMap` here used to briefly duplicate
       // every completeness claim while the accepted deltas were still live,
       // which was enough to push large TypeScript workspaces over V8's heap
@@ -1234,6 +1235,10 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
   // expensive composed runtime merely to discover a local CLI error, and a
   // stop request must not create the daemon it intends to stop.
   const command = parseCliArgs(argv);
+  if (command.options.debug_timing) {
+    process.env["URDIRA_DEBUG_TIMING"] = "1";
+    process.env["URDIRA_STORAGE_DEBUG_TIMING"] = "1";
+  }
   const previewOnlyLifecycle = (command.name === "start" || command.name === "stop") && command.options.dry_run;
   const daemon = command.name === "stop" || previewOnlyLifecycle
     ? await resolveDaemon(options.daemon, options.endpoint, false, options.on_startup_progress)

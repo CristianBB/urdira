@@ -120,6 +120,13 @@ Neither layer offers general shell execution, build/test execution, source editi
 
 CLI syntax and local lifecycle admission are validated before daemon resolution. `daemon start` and `daemon stop` are direct idempotent commands and do not require `--dry-run` or `--confirm`: start attaches to an existing compatible daemon or launches a detached one, while stop never starts a missing daemon and otherwise returns `already_stopped`. A human start renders the normative `locking`, `catalog_verification`, `workspace_recovery`, `provider_reconciliation`, and `ready` phases immediately on stderr while preserving machine-readable stdout. `workspace add` prints its detected technology, confidence, evidence, and compatible-plugin proposal before asking two explicit interactive confirmations; `workspace configure` instead identifies its exact workspace target and configuration because it does not perform technology detection. `--dry-run` remains an optional preview, while destructive administrative operations retain explicit `--confirm`.
 
+The composed runtime also accepts the opt-in `--debug-timing` diagnostic flag on
+runtime commands. It propagates `URDIRA_DEBUG_TIMING` and
+`URDIRA_STORAGE_DEBUG_TIMING` to the detached daemon and its worker threads so
+scan, analysis, CAS, SQLite, and publication timings are available without
+changing the default quiet path. A running daemon must be restarted with the
+flag before a client can collect a new timing sample.
+
 ## Distribution
 
 The first public entry package is the dependency-free `urdira` npm bootstrap, supported on Node.js `>=24.18.1`. `npm install --global urdira` therefore installs no transitive runtime package and emits no Urdira-owned deprecation or unreviewed-lifecycle-script warning. The composed application is published separately as the exact-versioned internal `@urdira/runtime` package, whose public dependency closure remains under `@urdira/*`. `@urdira/testkit`, source fixtures, benchmark transcripts, and development configuration are excluded. Scoped packages use public access, exact internal package versions, the MIT license, and the same repository provenance. The JavaScript/TypeScript analyzer keeps its independently governed package version instead of being rewritten to the application version.

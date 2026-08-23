@@ -1057,7 +1057,7 @@ async function copyDonorAndPublish(options: WorkspaceForkOptions, context: ForkC
     fail(`verify() (${verifyMode}) failed after fork publication`);
   }
 
-  console.error(`[urdira] workspace fork succeeded for ${workspaceId} donor=${donor.workspace_id} ms=${JSON.stringify(context.timings)}`);
+  if (process.env["URDIRA_DEBUG_TIMING"] === "1") console.error(`[urdira] workspace fork succeeded for ${workspaceId} donor=${donor.workspace_id} ms=${JSON.stringify(context.timings)}`);
   return { status: "forked", donor_workspace_id: donor.workspace_id, snapshot_id: ids.snapshotId, generation, projection_patch_count: projectionPatchCount };
 }
 

@@ -15,8 +15,6 @@
  * dependency or changing behavior when the flag is unset.
  */
 
-const ENABLED = process.env["URDIRA_STORAGE_DEBUG_TIMING"] === "1";
-
 interface Bucket {
   ms: number;
   count: number;
@@ -25,12 +23,15 @@ interface Bucket {
 const buckets = new Map<string, Bucket>();
 
 export function timingEnabled(): boolean {
-  return ENABLED;
+  // Read the flag at call time rather than module load time. The composed CLI
+  // parses --debug-timing before creating a daemon/runtime, while this module
+  // can already have been imported by the application entrypoint.
+  return process.env["URDIRA_STORAGE_DEBUG_TIMING"] === "1";
 }
 
 /** Times `action` under `bucket` when instrumentation is enabled; otherwise runs it unmeasured. */
 export async function timed<T>(bucket: string, action: () => Promise<T>): Promise<T> {
-  if (!ENABLED) return action();
+  if (!timingEnabled()) return action();
   const startedAt = performance.now();
   try {
     return await action();
@@ -44,7 +45,7 @@ export async function timed<T>(bucket: string, action: () => Promise<T>): Promis
 
 /** Synchronous counterpart of {@link timed} for builders with no await points. */
 export function timedSync<T>(bucket: string, action: () => T): T {
-  if (!ENABLED) return action();
+  if (!timingEnabled()) return action();
   const startedAt = performance.now();
   try {
     return action();

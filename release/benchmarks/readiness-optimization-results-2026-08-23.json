@@ -1,0 +1,99 @@
+{
+  "generated_at": "2026-08-23T15:37:09.908Z",
+  "node": "v24.18.1",
+  "rows": 5000,
+  "files": 160,
+  "experiments": {
+    "pack_small_files": {
+      "sequential_ms": 819,
+      "batched_ms": 572,
+      "speedup": 1.43,
+      "batched_fsyncs": 128
+    },
+    "duplicate_staging": {
+      "duplicate_ms": 623,
+      "deduped_ms": 150,
+      "duplicate_fsyncs": 32,
+      "deduped_fsyncs": 32
+    },
+    "sqlite_inserts": {
+      "rows": 5000,
+      "variants": {
+        "500": {
+          "samples_ms": [
+            8,
+            9
+          ],
+          "median_ms": 9
+        },
+        "2000": {
+          "samples_ms": [
+            9,
+            9
+          ],
+          "median_ms": 9
+        },
+        "8000": {
+          "samples_ms": [
+            11,
+            11
+          ],
+          "median_ms": 11
+        },
+        "transaction": {
+          "samples_ms": [
+            15,
+            13
+          ],
+          "median_ms": 15
+        }
+      }
+    },
+    "deferred_secondary_indexes": {
+      "rows": 5000,
+      "eager": {
+        "insert_ms": 9,
+        "secondary_index_ms": 0,
+        "total_ms": 9
+      },
+      "deferred": {
+        "insert_ms": 7,
+        "secondary_index_ms": 1,
+        "total_ms": 8
+      }
+    },
+    "parallel_tsconfig_packages": {
+      "files": 160,
+      "packages": 8,
+      "serial_ms": 1575,
+      "parallel_ms": 546,
+      "speedup": 2.88
+    },
+    "digest_reuse": {
+      "first_build_ms": 74,
+      "second_digest_reuse_ms": 2,
+      "speedup": 37
+    },
+    "staging_comparison": {
+      "rows": 5000,
+      "append_only": {
+        "write_ms": 7,
+        "read_ms": 0,
+        "bytes": 172780,
+        "rows": 5000
+      },
+      "sqlite": {
+        "write_ms": 7,
+        "read_ms": 0,
+        "rows": 5000
+      },
+      "redis": {
+        "available": true,
+        "write_ms": 9,
+        "read_ms": 5,
+        "rows": 5000
+      }
+    }
+  },
+  "total_ms": 4807
+}

@@ -6,6 +6,8 @@ const client: CliDaemonClient = { call: vi.fn(async (call) => ({ outcome: "succe
 describe("Phase 12 closed CLI", () => {
   it("parses read-only commands and rejects unknown options", () => {
     expect(parseCliArgs(["status", "--json"])).toMatchObject({ name: "status", options: { json: true, dry_run: false, confirm: false } });
+    expect(parseCliArgs(["index", "--debug-timing"])).toMatchObject({ name: "index", options: { debug_timing: true } });
+    expect(parseCliArgs(["daemon", "start", "--debug-timing"])).toMatchObject({ name: "start", options: { debug_timing: true } });
     expect(() => parseCliArgs(["status", "--shell=rm -rf"])).toThrowError(CliError);
   });
 

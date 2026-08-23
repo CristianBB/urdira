@@ -133,7 +133,7 @@ const finalInstruction = `Perform the final handoff review for the same task. Ch
 let host;
 let hostMetrics;
 if (arm === "urdira-typescript") {
-  host = spawn(nodeBin, [fileURLToPath(import.meta.url), "--host", "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--phase", phase, "--sample", String(sample), "--commit", commit, "--worktree", worktree, "--data-root", effectiveDataRoot], { cwd: root, env: { ...process.env, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_SEMANTIC_INDEX: "0", URDIRA_ANALYSIS_WORKERS: "1", URDIRA_ANALYSIS_POOL_MAX: "1", URDIRA_STRUCTURAL_CONCURRENCY: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+  host = spawn(nodeBin, [fileURLToPath(import.meta.url), "--host", "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--phase", phase, "--sample", String(sample), "--commit", commit, "--worktree", worktree, "--data-root", effectiveDataRoot], { cwd: root, env: { ...process.env, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_SEMANTIC_INDEX: "0", URDIRA_ANALYSIS_WORKERS: "1", URDIRA_ANALYSIS_POOL_MAX: "1", URDIRA_STRUCTURAL_CONCURRENCY: "1", ...(arm === "urdira-typescript" ? { URDIRA_DEBUG_TIMING: "1", URDIRA_STORAGE_DEBUG_TIMING: "1" } : {}) }, stdio: ["ignore", "pipe", "pipe"] });
   hostMetrics = startHostMetrics(host, effectiveDataRoot);
   host.stdout.on("data", (chunk) => appendFileSync(hostLog, chunk));
   host.stderr.pipe((await import("node:fs")).createWriteStream(hostLog));

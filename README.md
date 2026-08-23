@@ -124,6 +124,13 @@ urdira daemon stop
 process output is written to `~/.urdira/daemon.log`. `daemon stop` returns
 `already_stopped` when no daemon is running.
 
+For a diagnostic run, append `--debug-timing` to the command (most commonly
+`urdira daemon start --debug-timing`). This enables scan, plugin-analysis,
+CAS, SQLite, and publication timing lines in the daemon log and propagates the
+switch to SQLite worker threads. Timing output is opt-in and disabled by
+default; restart an already-running daemon with the flag before collecting a
+new timing sample.
+
 ### MCP configuration
 
 Urdira exposes one local stdio MCP server. The process starts or shares the

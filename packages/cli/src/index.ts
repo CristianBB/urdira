@@ -9,14 +9,18 @@ const ALL_COMMANDS = new Set<CliCommandName>([...READ_ONLY_COMMANDS, ...MUTATING
 export class CliError extends Error {
   constructor(readonly code: "cli:command_invalid" | "cli:option_invalid" | "cli:payload_invalid" | "cli:dry_run_required" | "cli:confirmation_required", message: string) { super(`${code}: ${message}`); this.name = "CliError"; }
 }
-export interface CliOptions { readonly json: boolean; readonly dry_run: boolean; readonly confirm: boolean; readonly payload?: unknown; readonly proposal_id?: string; readonly values: Readonly<Record<string, string>>; }
+export interface CliOptions { readonly json: boolean; readonly dry_run: boolean; readonly confirm: boolean; readonly debug_timing: boolean; readonly payload?: unknown; readonly proposal_id?: string; readonly values: Readonly<Record<string, string>>; }
 export interface CliCommand { readonly name: CliCommandName; readonly args: ReadonlyArray<string>; readonly options: CliOptions; }
 export interface CliDaemonClient { readonly call: (call: string, payload: unknown) => Promise<{ readonly outcome: string; readonly payload?: unknown; readonly error?: unknown }>; }
 export interface CliDependencies { readonly client: CliDaemonClient; readonly preview_admin?: (command: CliCommand) => Promise<unknown>; readonly execute_admin?: (command: CliCommand, preview: unknown) => Promise<unknown>; readonly prompt?: (question: string) => Promise<string | boolean>; readonly read_stdin?: () => Promise<string>; readonly home_directory?: string; }
 export interface CliResult { readonly exit_code: number; readonly data: unknown; readonly stdout: string; }
 
-const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "payload", "proposal-id", "workspace", "path", "value", "engine-build-id", "client", "scope"]);
-const READ_ONLY_OPTIONS: Readonly<Record<(typeof READ_ONLY_COMMANDS)[number], ReadonlySet<string>>> = { status: new Set(["json"]), query: new Set(["json", "payload", "workspace"]), index: new Set(["json", "workspace"]), "agent-status": new Set(["json", "client", "workspace"]) };
+const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "payload", "proposal-id", "workspace", "path", "value", "engine-build-id", "client", "scope"]);
+// --debug-timing is a process/runtime diagnostic switch, not part of any
+// request payload. It is therefore accepted uniformly on read-only commands
+// as well as lifecycle/admin commands; the app entrypoint consumes it before
+// creating a daemon or client.
+const READ_ONLY_OPTIONS: Readonly<Record<(typeof READ_ONLY_COMMANDS)[number], ReadonlySet<string>>> = { status: new Set(["json", "debug-timing"]), query: new Set(["json", "payload", "workspace", "debug-timing"]), index: new Set(["json", "workspace", "debug-timing"]), "agent-status": new Set(["json", "client", "workspace", "debug-timing"]) };
 const INTERACTIVE_AGENT_CLIENTS: readonly AgentClient[] = ["claude-code", "codex", "opencode", "cursor", "vscode", "cline", "roo", "claude-desktop"];
 function interactiveAgentSelection(value: string | boolean): { readonly native: ReadonlyArray<AgentClient>; readonly unknown: ReadonlyArray<string> } {
   if (value === true) return { native: INTERACTIVE_AGENT_CLIENTS, unknown: [] };
@@ -48,7 +52,7 @@ export function parseCliArgs(argv: ReadonlyArray<string>): CliCommand {
     if (normalized) { rawName = normalized; tokens = tokens.slice(1); }
   }
   if (!rawName || !ALL_COMMANDS.has(rawName as CliCommandName)) throw new CliError("cli:command_invalid", `Command ${rawName ?? ""} is not registered.`);
-  const args: string[] = []; const values: Record<string, string> = {}; let json = false; let dryRun = false; let confirm = false; let payload: unknown; let proposalId: string | undefined;
+  const args: string[] = []; const values: Record<string, string> = {}; let json = false; let dryRun = false; let confirm = false; let debugTiming = false; let payload: unknown; let proposalId: string | undefined;
   for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index]!;
     if (!token.startsWith("--")) { args.push(token); continue; }
@@ -58,11 +62,12 @@ export function parseCliArgs(argv: ReadonlyArray<string>): CliCommand {
     if (name === "json") { if (inline !== undefined) throw new CliError("cli:option_invalid", "--json does not take a value."); json = true; continue; }
     if (name === "dry-run") { if (inline !== undefined) throw new CliError("cli:option_invalid", "--dry-run does not take a value."); dryRun = true; continue; }
     if (name === "confirm") { if (inline !== undefined) throw new CliError("cli:option_invalid", "--confirm does not take a value."); confirm = true; continue; }
+    if (name === "debug-timing") { if (inline !== undefined) throw new CliError("cli:option_invalid", "--debug-timing does not take a value."); debugTiming = true; continue; }
     const value = inline ?? tokens[++index]; if (value === undefined || value.startsWith("--")) throw new CliError("cli:option_invalid", `Option --${name} requires a value.`);
     if (name === "payload") payload = parsePayload(value); else if (name === "proposal-id") proposalId = value; else values[name] = value;
   }
   if ((rawName === "status" || rawName === "index") && args.length > 0) throw new CliError("cli:command_invalid", `${rawName} does not accept positional arguments.`);
-  return { name: rawName as CliCommandName, args, options: { json, dry_run: dryRun, confirm, ...(payload === undefined ? {} : { payload }), ...(proposalId === undefined ? {} : { proposal_id: proposalId }), values } };
+  return { name: rawName as CliCommandName, args, options: { json, dry_run: dryRun, confirm, debug_timing: debugTiming, ...(payload === undefined ? {} : { payload }), ...(proposalId === undefined ? {} : { proposal_id: proposalId }), values } };
 }
 
 const adminCall: Readonly<Record<(typeof MUTATING_COMMANDS)[number], string>> = { start: "core:daemon_start", stop: "core:daemon_stop", restart: "core:daemon_restart", "workspace-add": "core:workspace_add", "workspace-remove": "core:workspace_remove", "workspace-purge": "core:workspace_purge", "workspace-configure": "core:workspace_configure", "config-set": "core:configuration_set", repair: "core:repair", gc: "core:garbage_collect", reindex: "core:reindex" };

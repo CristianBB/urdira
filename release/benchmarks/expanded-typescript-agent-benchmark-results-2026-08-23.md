@@ -81,3 +81,38 @@ The Urdira host records every published frontier transition. `readiness_ms` is t
 | prisma | mongo-value-set-transform | 113133 | 36621 | 110521 | 54064 | 16369 | 47611 | 15929 | 2529232 |
 | vscode | language-registry-change-notification | 469194 | 40647 | 455390 | 157019 | 83763 | 276244 | 79129 | 4483904 |
 | vscode | language-provider-registration-idempotence | 472613 | 40844 | 460429 | 158595 | 83394 | 268516 | 78837 | 4550176 |
+
+## Readiness optimization experiments (2026-08-23)
+
+The internal timings are now opt-in from the executable CLI: append
+`--debug-timing` to `urdira daemon start`, `index`, `query`, `status`, or
+`mcp`. The flag propagates to the daemon child and SQLite worker threads;
+without it, the storage timing buckets remain disabled. The raw controlled
+experiment output is in
+[`readiness-optimization-results-2026-08-23.json`](readiness-optimization-results-2026-08-23.json)
+and the harness is
+[`readiness-optimization-benchmark.mjs`](readiness-optimization-benchmark.mjs).
+
+The harness used 5,000 rows and 160 TypeScript files on Node `v24.18.1`.
+These are microbenchmarks, not replacement end-to-end readiness claims:
+
+| Hypothesis | Observed result | Decision |
+|---|---:|---|
+| Pack small CAS files / grouped fsync | 819 ms sequential vs 572 ms batched (1.43x); one directory flush per batch | Keep the existing batched path; a new archive format is not justified by this sample. |
+| Avoid duplicate staging/publication | 623 ms for 128 duplicate entries vs 150 ms after input digest de-duplication (4.15x); CAS fsync count stayed at 32 | Add de-duplication before CAS/staging command construction; this is the clearest low-risk write-path win. |
+| Larger SQLite/prepared inserts | chunk 500: 9 ms; 2,000: 9 ms; 8,000: 11 ms; one materialized transaction: 15 ms | Keep prepared statements and bounded chunks; do not increase the chunk cap blindly. The current 30k-parameter bound is already near the useful knee. |
+| Defer secondary indexes | 9 ms eager vs 8 ms deferred (1 ms index build) | Defer non-critical indexes, but expect only a small benefit at this scale; validate on VS Code-sized tables before making it default. |
+| Parallel independent packages/tsconfig | 1,575 ms serial vs 546 ms with eight worker jobs (2.88x) | Prioritize bounded parallelism across independent projects; cap workers by CPU/RSS and never parallelize same-workspace publication writers. |
+| Reuse exact analysis by digest | 74 ms first build vs 2 ms second worker (37x) | Keep the durable digest cache and make its shared installation scope explicit; this directly attacks repeated workspace readiness. |
+| Append-only staging vs SQLite / Redis control | append-only 7/0 ms write/read; SQLite 7/0 ms; Redis 9/5 ms for 5,000 rows | Append-only is a useful transient queue only if followed by a durable, transactional promotion. Redis adds a network/process hop and is not an improvement for this local write path. |
+
+The end-to-end measurements above still identify readiness—not query
+execution—as the dominant bottleneck on large repositories: VS Code spends
+157–159 s in source cataloging, 83–84 s in plugin analysis, 77–80 s sealing,
+and roughly 108–113 s in publication/storage before structural readiness at
+469–473 s. The experiments therefore support three concrete next changes:
+digest de-duplication before CAS and publication, bounded project-level
+parallelism, and broader cross-workspace digest-cache reuse. Redis should not
+be introduced as the indexing buffer unless a separate multi-process or
+remote-ingester requirement appears; it would add operational and durability
+cost without addressing the measured TypeScript/publication stages.

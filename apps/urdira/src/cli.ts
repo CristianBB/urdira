@@ -13,6 +13,16 @@ const endpoint = process.env["URDIRA_ENDPOINT"];
 const argv = process.argv.slice(2);
 const INTERNAL_DAEMON_CHILD = "URDIRA_INTERNAL_DAEMON_CHILD";
 
+// Diagnostic timings are intentionally opt-in and process-scoped. Set the
+// environment before any daemon/runtime is composed so worker threads inherit
+// the storage flag; the child used by `daemon start` receives the same env.
+// Storage timingEnabled() reads this dynamically for library callers that set
+// the flag after module import.
+if (argv.includes("--debug-timing")) {
+  process.env["URDIRA_DEBUG_TIMING"] = "1";
+  process.env["URDIRA_STORAGE_DEBUG_TIMING"] = "1";
+}
+
 const startupMessages: Readonly<Record<DaemonStartupPhase, string>> = {
   locking: "acquiring the per-user daemon lock",
   catalog_verification: "verifying the catalog and persisted state",
