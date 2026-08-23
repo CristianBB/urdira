@@ -520,7 +520,7 @@ export class DirectorySourceProvider implements SourceProvider {
     })();
     return {
       artifact_id: input.artifact_id,
-      provider_version_token: before.token,
+      provider_version_token: input.provider_version_token,
       content_hash: input.observed_content_hash,
       byte_length: before.target_stat.size,
       metadata_digest: before.metadata_digest,
