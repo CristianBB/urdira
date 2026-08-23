@@ -1,9 +1,10 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { computeDigest } from "@urdira/canonical";
 import { createDurableStorage, createFaultInjector, WorkspaceLifecycleRepository } from "../packages/storage/src/index.js";
+import { casObjectRelativeParts } from "../packages/storage/src/cas.js";
 
 async function withStorage(test: (root: string, storage: Awaited<ReturnType<typeof createDurableStorage>>) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "urdira-phase5-test-"));
@@ -109,11 +110,38 @@ describe("Phase 5 projections and lifecycle", () => {
       expect((await opened.maintenance.verify()).ok).toBe(true);
       const restored = join(root, "restored");
       await opened.maintenance.restoreBackup(backup, restored);
-      expect(new Uint8Array(await readFile(join(restored, "cas", "sha256", blob.content_hash.slice(7, 9), blob.content_hash.slice(9, 11), blob.content_hash.slice(11))))).toEqual(new TextEncoder().encode("reachable"));
+      expect(new Uint8Array(await readFile(join(restored, "cas", ...casObjectRelativeParts(blob.content_hash))))).toEqual(new TextEncoder().encode("reachable"));
       const first = await opened.maintenance.collect({ now: "2026-08-09T00:00:00.000000000Z", batch_size: 1 });
       const second = await opened.maintenance.collect({ now: "2026-08-09T00:00:00.000000000Z", batch_size: 1, epoch_id: first.epoch_id });
       expect(second.epoch_id).toBe(first.epoch_id);
       expect(second.deleted_hashes).not.toContain(blob.content_hash);
+      await opened.close();
+    });
+  });
+
+  it("restores a backup archive written under the pre-flattening two-level CAS layout", async () => {
+    await withStorage(async (root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      await seedSnapshot(opened, "snapshot-1");
+      const blob = await storage.cas.put(new TextEncoder().encode("legacy-layout-backup"));
+      await opened.lifecycle.pinCasObject(blob.content_hash);
+      const backup = join(root, "legacy-backup");
+      await opened.maintenance.createBackup(backup);
+      // Downgrade the freshly created backup's `cas/` tree to the
+      // pre-flattening two-level shard layout, simulating an archive written
+      // before the shard flattening (task 22 follow-up): content is
+      // digest-verified either way, so restoring by hash must still succeed
+      // through the legacy-path probe in `resolveCasObjectPathInBackup`.
+      const hex = blob.content_hash.slice("sha256:".length);
+      const legacyDirectory = join(backup, "cas", "sha256", hex.slice(0, 2), hex.slice(2, 4));
+      await mkdir(legacyDirectory, { recursive: true });
+      await rename(join(backup, "cas", ...casObjectRelativeParts(blob.content_hash)), join(legacyDirectory, hex.slice(4)));
+      await rm(join(backup, "cas", ".layout"), { force: true });
+      expect((await opened.maintenance.verify()).ok).toBe(true);
+      const restored = join(root, "legacy-restored");
+      await opened.maintenance.restoreBackup(backup, restored);
+      expect(new Uint8Array(await readFile(join(restored, "cas", ...casObjectRelativeParts(blob.content_hash))))).toEqual(new TextEncoder().encode("legacy-layout-backup"));
       await opened.close();
     });
   });

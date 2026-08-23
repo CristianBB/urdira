@@ -15,6 +15,7 @@ import { validateFactDeltaBatch, type FactDeltaBatch } from "@urdira/contracts";
 import type { BlobStore } from "./cas.js";
 import { resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
+import type { RecordOpenMemoEntry } from "./publication-authority.js";
 import type { SqliteCommand, SqliteDatabase, SqliteValue } from "./sqlite.js";
 import { flattenRelationalValue, hydrateRelationalValue, relationalValueCommandsForTable, type RelationalValueRow } from "./relational-values.js";
 export { canonicalFrozenCandidateBaseTuple, frozenCandidateBaseTupleDigest, normalizeObservationBatchIds, sameFrozenCandidateBaseTuple } from "./candidate-digest.js";
@@ -70,6 +71,20 @@ export interface CandidatePublicationInput {
   readonly publication_stage_ordinal?: number;
   readonly publication_stage_count?: number;
   readonly template_sets: CandidateTemplateSets;
+  /**
+   * (3c) Carries the seal-built record-open id/digest memo, keyed by object
+   * identity of each `template_sets.record_opens` entry, straight into
+   * publish. `CandidateMaterializer.seal()` (`@urdira/engine`) computes each
+   * open's id/digest directly from the source record while sealing;
+   * `buildCandidatePublicationPlan` uses this as a lookup instead of
+   * re-deriving it by `JSON.parse`ing and re-hashing `record_without_validity`
+   * a second time in the very same process. Optional and covering exactly
+   * `template_sets.record_opens` (verified before use, by object identity,
+   * in `buildCandidatePublicationPlan`) -- absent or mismatched falls back
+   * to the unchanged recompute path unconditionally (fork path, recovery
+   * replay, and any caller that doesn't thread it through).
+   */
+  readonly record_open_memo?: ReadonlyMap<unknown, RecordOpenMemoEntry>;
 }
 
 export interface CandidatePublicationResult {
@@ -492,16 +507,32 @@ export class WorkspaceCandidateRepository {
 
   async saveMaterialization(candidateId: string, materialization: CandidateMaterialization, templateSets: CandidateTemplateSets = { source_transitions: [], record_opens: [], record_closures: [], identity_assignments: [], artifact_dependencies: [], lookup_dependencies: [], lookup_revalidations: [] }): Promise<CandidateInsertResult> {
     assertWorkspace(this.workspaceId, materialization.workspace_id);
-    await this.requireCandidate(candidateId);
-    const contractText = JSON.stringify(materialization);
-    const existing = await this.database.get<{ materialization_digest: string; materialization_contract_text: string }>("SELECT materialization_digest, materialization_contract_text FROM candidate_materializations WHERE workspace_id = ? AND candidate_materialization_id = ?", [this.workspaceId, materialization.candidate_materialization_id]);
-    if (existing) {
-      if (existing.materialization_digest !== materialization.materialization_digest || existing.materialization_contract_text !== contractText) conflict("materialization", materialization.candidate_materialization_id);
-    } else {
-      await this.database.run("INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_contract_text) VALUES (?, ?, ?, ?, ?, ?)", [materialization.candidate_materialization_id, materialization.workspace_id, candidateId, materialization.materialization_digest, now(), contractText]);
-      await this.database.run("UPDATE candidate_state SET candidate_materialization_id = ? WHERE workspace_id = ? AND candidate_generation_id = ?", [materialization.candidate_materialization_id, this.workspaceId, candidateId]);
-    }
+    // Reset first (nothing meaningful has accumulated in the shared bucket
+    // map yet for this handoff) so `candidate_seal_persist`, timed below,
+    // survives into the snapshot the log line reads at the end -- resetting
+    // AFTER the timed work, as this used to, would wipe it before it's ever
+    // read.
     if (timingEnabled()) resetTimings();
+    // `candidate_seal_persist`: the durable persist of the sealed candidate
+    // materialization -- the engine's seal() output finishing its trip to
+    // storage -- covering the existing-row lookup (idempotent replay check)
+    // and, on first write, the insert plus the candidate_state pointer
+    // update. This is the storage-side half of the "seal handoff" the
+    // engine's own `publish_handoff_post`/`publish_handoff_pre` spans
+    // (`workspace-indexing-session.ts`/`candidate-indexer.ts`) bracket from
+    // the caller's side.
+    const { existing } = await timed("candidate_seal_persist", async () => {
+      await this.requireCandidate(candidateId);
+      const contractText = JSON.stringify(materialization);
+      const existingRow = await this.database.get<{ materialization_digest: string; materialization_contract_text: string }>("SELECT materialization_digest, materialization_contract_text FROM candidate_materializations WHERE workspace_id = ? AND candidate_materialization_id = ?", [this.workspaceId, materialization.candidate_materialization_id]);
+      if (existingRow) {
+        if (existingRow.materialization_digest !== materialization.materialization_digest || existingRow.materialization_contract_text !== contractText) conflict("materialization", materialization.candidate_materialization_id);
+      } else {
+        await this.database.run("INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_contract_text) VALUES (?, ?, ?, ?, ?, ?)", [materialization.candidate_materialization_id, materialization.workspace_id, candidateId, materialization.materialization_digest, now(), contractText]);
+        await this.database.run("UPDATE candidate_state SET candidate_materialization_id = ? WHERE workspace_id = ? AND candidate_generation_id = ?", [materialization.candidate_materialization_id, this.workspaceId, candidateId]);
+      }
+      return { existing: existingRow };
+    });
     if (timingEnabled()) console.error(`[urdira] storage timings save_materialization workspace:${this.workspaceId} ms=${JSON.stringify(snapshotTimings())}`);
     return existing ? "already_present" : "inserted";
   }

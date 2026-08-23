@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ArtifactWorkItem, ReplacementScope, SnapshotCapabilityStateEntry } from "@urdira/contracts";
 import {
   PluginPackageDiscovery,
@@ -940,4 +940,454 @@ describe("Daemon core:index_status surfaces a failed scan as stale (P0 publicati
       await rm(dataRoot, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+// FIXED (was P0: pinned the flap, deliberately unfixed). `workspaceReadiness`
+// (`packages/daemon/src/runtime.ts`) used to open the workspace database
+// through `DurableStorage.openWorkspace`, which performs writes on EVERY
+// call (schema/identity bookkeeping, catalog lease acquisition) -- those
+// writes queued behind a concurrent long-running write transaction on the
+// same SQLite database (e.g. a real publish mid-transaction) and hit
+// SQLITE_BUSY past the busy timeout, which the catch mapped to
+// `source_ready: false` / `source_availability: "unavailable"` for the
+// transaction's entire duration, even though the workspace's
+// already-published snapshot was untouched and perfectly servable.
+//
+// The fix (`DurableStorage.openWorkspaceReadOnly`) opens the connection
+// read-only instead, performing no writes at all. This test empirically
+// confirms the flap is not merely papered over by a fallback: a WAL reader
+// snapshots the database's last committed state and is never blocked by --
+// and never blocks -- an in-progress writer holding `BEGIN IMMEDIATE`, so
+// `workspaceReadiness`'s `try` block succeeds outright here and its catch
+// (and the last-known-good fallback inside it, see the SEPARATE
+// "write-free readiness reads" describe block below for a direct proof of
+// that no-writes property) is never even reached. `warnSpy` therefore stays
+// uncalled throughout -- there is no error to warn about.
+describe("Daemon readiness poll under a concurrent write transaction (FIXED: read-only reads eliminate the flap)", () => {
+  it("keeps reporting source_availability \"available\" and never warns while a write transaction holds the workspace database", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-readiness-busy-flap-data-"));
+    let seedStorage: DurableStorage | undefined;
+    let txnStorage: DurableStorage | undefined;
+    let txnDatabase: WorkspaceDatabase | undefined;
+    let runtime: DaemonRuntime | undefined;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const registry = new WorkspaceRegistry({ create_id: (kind) => `${kind}:readiness-busy-flap` });
+      const registered = registry.register({
+        display_root: "/readiness-busy-flap",
+        provider: { source_provider_binding_id: "binding:readiness-busy-flap", source_provider: "core:directory_source_provider", source_provider_version: "1", provider_role: "primary", binding_identity: "identity:readiness-busy-flap", configuration_digest: "digest:readiness-busy-flap" },
+        description: { provider_kind: "core:directory_source_provider", immutable_binding_identity: "identity:readiness-busy-flap", features: "{}", source_state_fingerprint: "fingerprint:readiness-busy-flap" },
+      });
+      registry.beginReconciliation(registered.workspace_id);
+      registry.markReady(registered.workspace_id, "snapshot:readiness-busy-flap", "ready");
+
+      seedStorage = await createDurableStorage({ rootDir: dataRoot });
+      await seedStorage.catalog.registerWorkspace({ workspace_id: registered.workspace_id, canonical_root: registered.canonical_root, display_root: registered.display_root, source_provider_bindings: [registered.provider], status: "registered", registered_at: registered.registered_at });
+      const seededDatabase = await seedStorage.openWorkspace(registered.workspace_id);
+      try {
+        await seedEmptyReadyWorkspace(seededDatabase, registered.workspace_id);
+        // `seedEmptyReadyWorkspace` deliberately leaves `source_index_state`
+        // empty (see its own doc comment -- `core:index_status`'s freshness
+        // fields don't need it). `workspaceReadiness`'s `source_ready` DOES:
+        // it is derived entirely from `sourceIndex.getState()` returning a
+        // row, so without this insert `source_ready` would already read
+        // false before the transaction below ever starts, and this test
+        // would not be able to show a flap at all.
+        await seededDatabase.database.run(
+          "INSERT INTO source_index_state (workspace_id, current_generation, state_revision, checkpoint_id, provider_watermarks, source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          [registered.workspace_id, 1, 1, "checkpoint:readiness-busy-flap", "[]", "source-digest:readiness-busy-flap", now],
+        );
+      } finally {
+        await seededDatabase.close();
+      }
+      await seedStorage.close();
+      seedStorage = undefined;
+
+      // Start the daemon -- and let its own startup recovery sweep (which
+      // opens/closes EVERY registered workspace database once, see
+      // `DurableStorageOptions.skip_startup_recovery`'s doc comment) finish
+      // -- BEFORE anything holds a write transaction on this workspace's
+      // database, so that unrelated sweep never races the transaction held
+      // below. `busy_timeout_ms: 200` (vs the 5000ms production default) is
+      // what keeps this test fast: the daemon's readiness poll still retries
+      // against the held transaction exactly like production, just against a
+      // much shorter ceiling.
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-readiness-busy-flap",
+        workspace_registry: registry as unknown as NonNullable<DaemonRuntimeOptions["workspace_registry"]>,
+        // Never actually invoked: the workspace is pre-marked "ready" above
+        // and no scan is ever scheduled for it in this test.
+        resolve_plugin_provider: async () => undefined,
+        lexical_index: false,
+        semantic_index: false,
+        busy_timeout_ms: 200,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      await runtime.debugFlushPendingWarms();
+
+      const client = new DaemonClient(runtime.endpoint);
+      type StatusPayload = { readonly workspaces: ReadonlyArray<{ readonly source_ready: boolean; readonly source_availability: string }> };
+      const status = async (): Promise<StatusPayload["workspaces"][number] | undefined> => {
+        const response = await client.call("core:index_status", { workspace_ids: [registered.workspace_id] });
+        if (response.outcome !== "success") throw new Error(`core:index_status did not succeed: ${JSON.stringify(response)}`);
+        return (response.payload as StatusPayload).workspaces[0];
+      };
+
+      const before = await status();
+      expect(before?.source_ready).toBe(true);
+      expect(before?.source_availability).toBe("available");
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // Hold a real write transaction on the workspace's OWN SQLite database
+      // through a SECOND, independent `DurableStorage` handle (the same
+      // second-handle-over-the-same-`dataRoot` pattern
+      // `pollUntilSemanticGenerationCurrent` above uses for reads -- see its
+      // doc comment for why that is safe). `BEGIN IMMEDIATE` takes SQLite's
+      // write lock immediately -- this used to be what made the daemon's own
+      // concurrent `openWorkspace` (its schema/identity bookkeeping writes)
+      // hit SQLITE_BUSY, exactly like a real long-running publish
+      // transaction would; `workspaceReadiness` no longer opens a write
+      // connection at all, so this no longer matters to it.
+      txnStorage = await createDurableStorage({ rootDir: dataRoot });
+      txnDatabase = await txnStorage.openWorkspace(registered.workspace_id);
+      await txnDatabase.database.exec("BEGIN IMMEDIATE");
+
+      const duringTransaction = await status();
+      expect(duringTransaction?.source_ready).toBe(true);
+      expect(duringTransaction?.source_availability).toBe("available");
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // A second poll while the transaction is still held: still no flap,
+      // still no warning -- the read-only connection never contends with
+      // the held write lock no matter how many times it is polled.
+      const stillDuringTransaction = await status();
+      expect(stillDuringTransaction?.source_ready).toBe(true);
+      expect(stillDuringTransaction?.source_availability).toBe("available");
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // Releasing the transaction changes nothing observable -- there was
+      // never a flap to recover from.
+      await txnDatabase.database.exec("ROLLBACK");
+      await txnDatabase.close();
+      txnDatabase = undefined;
+      await txnStorage.close();
+      txnStorage = undefined;
+
+      const after = await status();
+      expect(after?.source_ready).toBe(true);
+      expect(after?.source_availability).toBe("available");
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      if (txnDatabase) await (txnDatabase as WorkspaceDatabase).close().catch(() => undefined);
+      await txnStorage?.close().catch(() => undefined);
+      await runtime?.stop().catch(() => undefined);
+      await seedStorage?.close().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // The last-known-good fallback (Task B) is NOT exercised by the scenario
+  // above -- read-only reads never fail against a held write transaction in
+  // the first place, so there is nothing to fall back from. This variant
+  // instead pins the one case that must still report unavailable even with
+  // the fallback in place: a workspace whose database file is genuinely
+  // missing (the daemon's in-memory registry still thinks it is registered,
+  // but its durable database file is gone -- the same signal an entirely
+  // unregistered workspace would give `openWorkspaceReadOnly`, see that
+  // method's own "workspace_not_found" branch). There is no "last known"
+  // reading that means anything to fall back to for a workspace whose data
+  // is actually gone.
+  it("reports source_availability \"unavailable\" for a workspace whose database file is missing, even though it had a prior successful poll", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-readiness-missing-db-data-"));
+    let seedStorage: DurableStorage | undefined;
+    let runtime: DaemonRuntime | undefined;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const registry = new WorkspaceRegistry({ create_id: (kind) => `${kind}:readiness-missing-db` });
+      const registered = registry.register({
+        display_root: "/readiness-missing-db",
+        provider: { source_provider_binding_id: "binding:readiness-missing-db", source_provider: "core:directory_source_provider", source_provider_version: "1", provider_role: "primary", binding_identity: "identity:readiness-missing-db", configuration_digest: "digest:readiness-missing-db" },
+        description: { provider_kind: "core:directory_source_provider", immutable_binding_identity: "identity:readiness-missing-db", features: "{}", source_state_fingerprint: "fingerprint:readiness-missing-db" },
+      });
+      registry.beginReconciliation(registered.workspace_id);
+      registry.markReady(registered.workspace_id, "snapshot:readiness-missing-db", "ready");
+
+      seedStorage = await createDurableStorage({ rootDir: dataRoot });
+      const catalogRegistration = await seedStorage.catalog.registerWorkspace({ workspace_id: registered.workspace_id, canonical_root: registered.canonical_root, display_root: registered.display_root, source_provider_bindings: [registered.provider], status: "registered", registered_at: registered.registered_at });
+      const seededDatabase = await seedStorage.openWorkspace(registered.workspace_id);
+      try {
+        await seedEmptyReadyWorkspace(seededDatabase, registered.workspace_id);
+        await seededDatabase.database.run(
+          "INSERT INTO source_index_state (workspace_id, current_generation, state_revision, checkpoint_id, provider_watermarks, source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          [registered.workspace_id, 1, 1, "checkpoint:readiness-missing-db", "[]", "source-digest:readiness-missing-db", now],
+        );
+      } finally {
+        await seededDatabase.close();
+      }
+      await seedStorage.close();
+      seedStorage = undefined;
+
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-readiness-missing-db",
+        workspace_registry: registry as unknown as NonNullable<DaemonRuntimeOptions["workspace_registry"]>,
+        resolve_plugin_provider: async () => undefined,
+        lexical_index: false,
+        semantic_index: false,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      await runtime.debugFlushPendingWarms();
+
+      const client = new DaemonClient(runtime.endpoint);
+      type StatusPayload = { readonly workspaces: ReadonlyArray<{ readonly source_ready: boolean; readonly source_availability: string }> };
+      const status = async (): Promise<StatusPayload["workspaces"][number] | undefined> => {
+        const response = await client.call("core:index_status", { workspace_ids: [registered.workspace_id] });
+        if (response.outcome !== "success") throw new Error(`core:index_status did not succeed: ${JSON.stringify(response)}`);
+        return (response.payload as StatusPayload).workspaces[0];
+      };
+
+      const before = await status();
+      expect(before?.source_ready).toBe(true);
+      expect(before?.source_availability).toBe("available");
+
+      // Delete the workspace's own database file (and WAL/SHM sidecars) out
+      // from under the still-registered (catalog + in-memory registry)
+      // workspace, simulating a crash-mid-registration/relocation state
+      // where the catalog row survives but the durable database does not.
+      for (const suffix of ["", "-wal", "-shm"]) {
+        await rm(`${catalogRegistration.database_path}${suffix}`, { force: true });
+      }
+
+      const after = await status();
+      expect(after?.source_ready).toBe(false);
+      expect(after?.source_availability).toBe("unavailable");
+      // `openWorkspaceReadOnly` maps this to `storage:workspace_not_found` --
+      // confirm the warning reflects that specific code, not a generic
+      // busy/transient failure.
+      expect(warnSpy).toHaveBeenCalled();
+      const warnedLine = String(warnSpy.mock.calls.at(-1)?.[0] ?? "");
+      expect(warnedLine).toContain("code=storage:workspace_not_found");
+      expect(warnedLine).toContain(registered.workspace_id);
+    } finally {
+      warnSpy.mockRestore();
+      await runtime?.stop().catch(() => undefined);
+      await seedStorage?.close().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+// Storage-level proof of `DurableStorage.openWorkspaceReadOnly`'s own two
+// claims (`packages/storage/src/storage.ts`): it performs no writes on open
+// (no catalog lease row, unlike `openWorkspace`), and it never contends with
+// a held write transaction (no SQLITE_BUSY). The daemon-level describe block
+// above already proves the end-to-end consequence for `core:index_status`;
+// this isolates the storage method itself.
+describe("DurableStorage.openWorkspaceReadOnly: no writes, no SQLITE_BUSY", () => {
+  it("reads successfully while a write transaction is held, without acquiring a catalog lease", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-readonly-open-data-"));
+    let seedStorage: DurableStorage | undefined;
+    let txnStorage: DurableStorage | undefined;
+    let txnDatabase: WorkspaceDatabase | undefined;
+    let readStorage: DurableStorage | undefined;
+    let readDatabase: WorkspaceDatabase | undefined;
+    try {
+      const workspaceId = "workspace:readonly-open-proof";
+      seedStorage = await createDurableStorage({ rootDir: dataRoot });
+      const registration = await seedStorage.catalog.registerWorkspace({
+        workspace_id: workspaceId,
+        canonical_root: "/readonly-open-proof",
+        display_root: "/readonly-open-proof",
+        source_provider_bindings: [{ source_provider_binding_id: "binding:readonly-open-proof", source_provider: "core:directory_source_provider", source_provider_version: "1", provider_role: "primary", binding_identity: "identity:readonly-open-proof", configuration_digest: "digest:readonly-open-proof" }],
+        status: "registered",
+        registered_at: now,
+      });
+      const seededDatabase = await seedStorage.openWorkspace(workspaceId);
+      try {
+        await seedEmptyReadyWorkspace(seededDatabase, workspaceId);
+        await seededDatabase.database.run(
+          "INSERT INTO source_index_state (workspace_id, current_generation, state_revision, checkpoint_id, provider_watermarks, source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          [workspaceId, 1, 1, "checkpoint:readonly-open-proof", "[]", "source-digest:readonly-open-proof", now],
+        );
+      } finally {
+        await seededDatabase.close();
+      }
+
+      // Hold a real write transaction through a second, independent handle
+      // -- same pattern as the daemon-level describe block above.
+      txnStorage = await createDurableStorage({ rootDir: dataRoot });
+      txnDatabase = await txnStorage.openWorkspace(workspaceId);
+      await txnDatabase.database.exec("BEGIN IMMEDIATE");
+
+      const leaseCountBefore = await seedStorage.catalog.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM installation_workspace_leases WHERE workspace_id = ?", [workspaceId]);
+      // Exactly one lease row: `txnDatabase`'s own `openWorkspace` handle
+      // above. This is the baseline the assertion below diffs against.
+      expect(leaseCountBefore?.count).toBe(1);
+
+      // A THIRD, independent handle opens the SAME workspace read-only
+      // while the write transaction from the second handle is still held.
+      // `busyTimeoutMs: 200` (well under the default 5000ms) makes a
+      // regression that reintroduces a write on this path fail fast instead
+      // of merely fail slow. `skip_startup_recovery: true` is unrelated to
+      // what this test isolates: without it, `createDurableStorage`'s own
+      // one-time startup sweep (`recoverMigrations`/`recoverWorkspaceGcEpochs`,
+      // see that option's doc comment) would itself write-open every
+      // registered workspace's database -- including this one, still under
+      // the held transaction -- and hit SQLITE_BUSY on its own, unrelated to
+      // `openWorkspaceReadOnly`. The daemon never hits this in practice: its
+      // one `DurableStorage` instance runs that sweep once at startup, long
+      // before any transaction a readiness poll might race.
+      readStorage = await createDurableStorage({ rootDir: dataRoot, busyTimeoutMs: 200, skip_startup_recovery: true });
+      readDatabase = await readStorage.openWorkspaceReadOnly(workspaceId);
+      const state = await readDatabase.sourceIndex.getState();
+      expect(state?.current_generation).toBe(1);
+      const snapshot = await readDatabase.repositories.snapshots.get(`snapshot:${workspaceId}`);
+      expect(snapshot?.snapshot_id).toBe(`snapshot:${workspaceId}`);
+
+      // No new lease row: `openWorkspaceReadOnly` never calls
+      // `acquireWorkspaceLease`.
+      const leaseCountAfter = await seedStorage.catalog.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM installation_workspace_leases WHERE workspace_id = ?", [workspaceId]);
+      expect(leaseCountAfter?.count).toBe(1);
+
+      // A write attempted through the read-only handle fails at the SQLite
+      // layer -- it is genuinely read-only, not merely "polite".
+      await expect(readDatabase.database.run("UPDATE source_index_state SET current_generation = 99 WHERE workspace_id = ?", [workspaceId])).rejects.toThrow();
+
+      await readDatabase.close();
+      readDatabase = undefined;
+      // Closing the read-only handle releases no lease (its release hook is
+      // a no-op) -- the lease count is unchanged.
+      const leaseCountAfterClose = await seedStorage.catalog.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM installation_workspace_leases WHERE workspace_id = ?", [workspaceId]);
+      expect(leaseCountAfterClose?.count).toBe(1);
+
+      await txnDatabase.database.exec("ROLLBACK");
+
+      // A registration-window/missing-database edge: `openWorkspaceReadOnly`
+      // reports `storage:workspace_not_found` for an id the catalog never
+      // registered, exactly like `openWorkspace` does.
+      await expect(readStorage.openWorkspaceReadOnly("workspace:never-registered")).rejects.toMatchObject({ code: "storage:workspace_not_found" });
+      void registration;
+    } finally {
+      if (readDatabase) await (readDatabase as WorkspaceDatabase).close().catch(() => undefined);
+      await readStorage?.close().catch(() => undefined);
+      if (txnDatabase) await (txnDatabase as WorkspaceDatabase).close().catch(() => undefined);
+      await txnStorage?.close().catch(() => undefined);
+      await seedStorage?.close().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+// Task C: honest completeness during catalog (`core:index_status`,
+// `packages/daemon/src/runtime.ts`'s `workspaceReadiness`). Confirms the
+// live finding behind it: `WorkspaceSourceIndexRepository.getState()`
+// (`packages/storage/src/source-index.ts`) returns a row from the source
+// catalog's FIRST reconciliation fragment onward, not only once its
+// completion fragment lands (`stateCommands` in `source-index.ts` runs on
+// EVERY `commit`, partial or complete) -- so `source_ready`/
+// `source_availability: "available"` can go true well before a scan
+// finishes, and reporting `source_completeness: "complete"` for that entire
+// window (the pre-fix behavior) was dishonest. This drives a REAL second
+// scan of an already-`ready` workspace and blocks it inside
+// `resolve_plugin_provider` (before it touches the source index at all, so
+// the source state visible throughout is the FIRST scan's already-published
+// row) to observe the mid-scan labels through the real daemon IPC surface,
+// then releases it to observe the post-scan labels.
+describe("Daemon core:index_status source completeness during a scan (Task C: honest mid-catalog labels)", () => {
+  it("reports source_completeness \"partial\"/build_state \"building\" while a scan is in flight, and \"complete\"/\"idle\" once it settles", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-source-completeness-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-source-completeness-workspace-"));
+    let runtime: DaemonRuntime | undefined;
+    try {
+      await seedFixtureFiles(workspaceRoot);
+
+      // Blocks the SECOND scan (the first must complete normally so the
+      // workspace reaches "ready" and has a real published source
+      // generation to hold steady during the second scan's block window).
+      let gateEngaged = false;
+      let releaseGate: (() => void) | undefined;
+      const gatedResolvePluginProvider: NonNullable<DaemonRuntimeOptions["resolve_plugin_provider"]> = async (workspace, database) => {
+        if (gateEngaged) await new Promise<void>((resolve) => { releaseGate = resolve; });
+        return resolvePluginProvider(workspace, database);
+      };
+
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-source-completeness",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        plugin_catalog: [{ ...bundledPluginCatalogEntry, capability_declarations: JAVASCRIPT_TYPESCRIPT_CAPABILITIES }],
+        resolve_plugin_provider: gatedResolvePluginProvider,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint);
+
+      const added = await client.call("core:workspace_add", {
+        args: [workspaceRoot],
+        confirmed: false,
+        selected_technology_ids: ["typescript"],
+        selected_plugin_ids: [JAVASCRIPT_TYPESCRIPT_PLUGIN_ID],
+      });
+      expect(added.outcome).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+
+      const firstReindex = await client.call("core:reindex", { args: [workspaceId] });
+      expect(firstReindex.outcome).toBe("success");
+      const firstReady = await pollUntilReady(client, workspaceId);
+      expect(firstReady.workspace_status).toBe("ready");
+
+      type SourceStatus = { readonly source_ready: boolean; readonly source_availability: string; readonly source_completeness: string; readonly source_freshness: string; readonly source_build_state: string };
+      const sourceStatus = async (): Promise<SourceStatus | undefined> => {
+        const response = await client.call("core:index_status", { workspace_ids: [workspaceId] });
+        if (response.outcome !== "success") throw new Error(`core:index_status did not succeed: ${JSON.stringify(response)}`);
+        return (response.payload as { readonly workspaces: readonly SourceStatus[] }).workspaces[0];
+      };
+
+      const settled = await sourceStatus();
+      expect(settled?.source_ready).toBe(true);
+      expect(settled?.source_completeness).toBe("complete");
+      expect(settled?.source_freshness).toBe("equivalent");
+      expect(settled?.source_build_state).toBe("idle");
+
+      // Change the content so the second scan is not a no-op re-run, then
+      // force it while holding it inside the gate.
+      await writeFile(join(workspaceRoot, "extra.ts"), "export class CompletenessLabelMarker {}\n", "utf8");
+      gateEngaged = true;
+      const secondReindex = client.call("core:reindex", { args: [workspaceId] });
+
+      const gateDeadline = Date.now() + 10_000;
+      while (releaseGate === undefined) {
+        if (Date.now() > gateDeadline) throw new Error("gated resolve_plugin_provider was never reached by the second scan.");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+      }
+
+      const midScan = await sourceStatus();
+      // `source_ready` stays true: the source index state committed by the
+      // FIRST scan is still readable and untouched (the second scan is
+      // blocked before it reads or writes anything). Only the labels
+      // change, honestly reflecting that a scan is in flight.
+      expect(midScan?.source_ready).toBe(true);
+      expect(midScan?.source_availability).toBe("available");
+      expect(midScan?.source_completeness).toBe("partial");
+      expect(midScan?.source_freshness).toBe("changes_pending");
+      expect(midScan?.source_build_state).toBe("building");
+
+      releaseGate();
+      const secondResponse = await secondReindex;
+      expect(secondResponse.outcome).toBe("success");
+      const secondReady = await pollUntilReady(client, workspaceId);
+      expect(secondReady.workspace_status).toBe("ready");
+
+      const afterScan = await sourceStatus();
+      expect(afterScan?.source_ready).toBe(true);
+      expect(afterScan?.source_completeness).toBe("complete");
+      expect(afterScan?.source_freshness).toBe("equivalent");
+      expect(afterScan?.source_build_state).toBe("idle");
+    } finally {
+      await runtime?.stop().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

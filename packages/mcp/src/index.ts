@@ -419,10 +419,10 @@ const buildContextFacetContract = operationDefinition("core:build_context")?.arg
 if (buildContextFacetContract === undefined) throw new Error("core:build_context must register its facets argument contract");
 
 const toolDescriptions: Readonly<Record<UrdiraMcpToolName, string>> = {
-  urdira_query: "Execute one public Urdira v3 query, or continue a previous query using its signed cursor. Urdira never infers a workspace: first call urdira_index_status with workspace_root to resolve a workspace_id, then pass it as scope.workspace_id here. expression selects exactly one registered operation, recipe, or binding-oriented pipeline. Source-safe operations can run at source_ready; structural and semantic operations wait for their registered frontier. Important closed-contract guardrails: get_outline.container accepts only an artifact or entity selector, never a symbol selector; resolve the symbol first and pass one exact returned entity_id. get_source source.mode must be signature, relevant, or body; never none. search_text pipeline outputs are only matches and subjects, never artifacts, even when result_projection is artifact. Results render as compact, grep-like plain text by default.",
-  urdira_context: `Execute the registered context recipe for one complete coding task in a single call. api_version: 3 is a required top-level field, alongside scope and task; do not omit it or nest it under options. All execution overrides belong under the single top-level options object: options.freshness, options.snippets, and options.response_budget; never place those three fields beside task. Every freshness object requires mode, required_frontier, and timeout_ms together. Provide optional seeds and facets; receive subjects, relations, snippets, provenance, completeness and freshness together. Facets use this exact closed contract: ${buildContextFacetContract}. public_surfaces is an architecture view, not a context facet. This is the agent-friendly wrapper around core:build_context; use urdira_query for custom v3 pipelines.`,
+  urdira_query: "Execute one public Urdira v3 query, or continue a previous query using its signed cursor. Urdira never infers a workspace: first call urdira_index_status with workspace_root to resolve a workspace_id, then pass it as scope.workspace_id here. expression selects exactly one registered operation, recipe, or binding-oriented pipeline. Source-safe operations (find_artifacts, search_text, get_source) can run at source_ready, with results honestly labeled partial while indexing is still running; structural and semantic operations wait for their registered frontier. Important closed-contract guardrails: get_outline.container accepts only an artifact or entity selector, never a symbol selector; resolve the symbol first and pass one exact returned entity_id. get_source source.mode must be signature, relevant, or body; never none. search_text pipeline outputs are only matches and subjects, never artifacts, even when result_projection is artifact. Results render as compact, grep-like plain text by default.",
+  urdira_context: `Execute the registered context recipe for one complete coding task in a single call. api_version: 3 is a required top-level field, alongside scope and task; do not omit it or nest it under options. All execution overrides belong under the single top-level options object: options.freshness, options.snippets, and options.response_budget; never place those three fields beside task. Every freshness object requires mode, required_frontier, and timeout_ms together. Provide optional seeds and facets; receive subjects, relations, snippets, provenance, completeness and freshness together. Facets use this exact closed contract: ${buildContextFacetContract}. public_surfaces is an architecture view, not a context facet. This is the agent-friendly wrapper around core:build_context; use urdira_query for custom v3 pipelines. Becomes available once structural indexing completes; while indexing is still running it returns a compact degradation notice naming the source/syntax-frontier tools available right now instead of an error.`,
   urdira_analyze_change: "Analyze the impact of one explicit hypothetical code change -- a rename, signature change, deletion, or move -- in one already-indexed Urdira workspace. This tool is read-only: it never modifies files. Resolve workspace_id first with urdira_index_status(workspace_root=...). target identifies the exact symbol, entity, or artifact the change applies to, typically obtained from a prior resolve_symbol or search_text call; change describes the hypothetical edit itself. The response reports what will break, what must be updated, what may be affected, which tests to run, and any uncertain dynamic usage, each backed by evidence and, on request, source snippets. options is optional and defaults to agent-friendly evidence, diagnostics, snippet, and response-budget settings; override only what you need. Equivalent to calling urdira_query with expression.operation core:analyze_impact. Results render as compact plain text by default.",
-  urdira_build_context: "Build a deterministic, evidence-aware bundle of context for one scoped coding task in an already-indexed Urdira workspace. Resolve workspace_id first with urdira_index_status(workspace_root=...). task is a short natural-language statement of the work to do; seeds are optional starting subjects (entities, symbols, or artifacts), typically obtained from a prior resolve_symbol or search_text call; facets narrow which kinds of context to gather, such as callers, tests, or architecture. The response returns ranked, evidenced result subjects with source snippets sized to fit the response budget -- useful for grounding an edit in one call instead of chaining several individual queries by hand. options is optional and defaults to agent-friendly evidence, diagnostics, snippet, and response-budget settings. Equivalent to calling urdira_query with expression.operation core:build_context. Results render as compact plain text by default.",
+  urdira_build_context: "Build a deterministic, evidence-aware bundle of context for one scoped coding task in an already-indexed Urdira workspace. Resolve workspace_id first with urdira_index_status(workspace_root=...). task is a short natural-language statement of the work to do; seeds are optional starting subjects (entities, symbols, or artifacts), typically obtained from a prior resolve_symbol or search_text call; facets narrow which kinds of context to gather, such as callers, tests, or architecture. The response returns ranked, evidenced result subjects with source snippets sized to fit the response budget -- useful for grounding an edit in one call instead of chaining several individual queries by hand. options is optional and defaults to agent-friendly evidence, diagnostics, snippet, and response-budget settings. Equivalent to calling urdira_query with expression.operation core:build_context. Waits for the structural frontier by default; if still indexing when the wait ends, returns a compact degradation notice naming source/syntax-frontier tools available now instead of an error. Results render as compact plain text by default.",
   urdira_index_status: "Read Urdira Index Status v3. Every field is optional. Call with workspace_root set to the exact repository root to resolve or register it, then copy the returned query_scope object byte-for-byte into every query; never retype, abbreviate, normalize, or synthesize its opaque workspace_id. source_ready, structural_stage_1_ready, structural_ready, and semantic_ready are independent readiness frontiers. Use operation_availability to choose operations that are actually available; disabled or unscheduled stages are reported as non-retryable. Renders as compact actionable lines per workspace; no MCP outputSchema is advertised for client compatibility.",
 };
 
@@ -1244,6 +1244,83 @@ function deadlineForPayload(call: string, payload: JsonRecord): string {
   return new Date(Date.now() + wait + IPC_EXECUTION_MARGIN_MS).toISOString();
 }
 
+// --- core:build_context graceful degradation --------------------------------
+//
+// urdira_context/urdira_build_context default to waiting for the structural
+// frontier (see `queryRequestFromIntent` above) so a caller gets the complete
+// facets contract in one call. On a from-zero index that wait can still hit
+// its boundary while the workspace is honestly still indexing --
+// `core:freshness_wait_timeout` (the wait ran out) or `core:coverage_incomplete`
+// (nothing is scheduled yet for the requested frontier). Returning the bare
+// JSON error there left an agent with nothing actionable except retrying
+// blind. Render a compact plain-text degradation notice instead -- the same
+// style as `renderIndexStatusText`/`renderQueryPageText` below, not a JSON
+// dump -- naming the source/syntax-frontier operations
+// (`operationFrontiers`, packages/contracts/src/registries.ts) that are
+// already usable so the agent can keep working immediately instead of
+// stalling on the wait.
+const CONTEXT_DEGRADATION_ERROR_CODES: ReadonlySet<string> = new Set(["core:coverage_incomplete", "core:freshness_wait_timeout"]);
+
+const SOURCE_SYNTAX_OPERATION_CATALOG: ReadonlyArray<{ readonly operation: string; readonly frontier: "source" | "syntax"; readonly description: string }> = [
+  { operation: "core:find_artifacts", frontier: "source", description: "List artifacts by path, language, or kind filter." },
+  { operation: "core:search_text", frontier: "source", description: "Literal or regex text search across the workspace." },
+  { operation: "core:get_source", frontier: "source", description: "Fetch source snippets for a known artifact, symbol, or entity." },
+  { operation: "core:discover_definitions", frontier: "syntax", description: "List definitions matching a name or kind." },
+  { operation: "core:find_records", frontier: "syntax", description: "List structural records by kind or facet." },
+  { operation: "core:get_outline", frontier: "syntax", description: "Outline the declarations inside one artifact or entity." },
+];
+
+function isBuildContextOperationPayload(payload: JsonRecord): boolean {
+  return isRecord(payload["expression"]) && payload["expression"]["operation"] === "core:build_context";
+}
+
+/** Best-effort: a second short-deadline `core:index_status` lookup for the phase/stage detail a degradation notice benefits from. Never blocks the degradation on its own failure. */
+async function fetchWorkspaceStatusForDegradation(client: UrdiraMcpClient, workspaceId: string, requestOptions: LocalIpcRequestOptions): Promise<JsonRecord | undefined> {
+  try {
+    const response = await client.call("core:index_status", indexStatusPayload({ workspace_ids: [workspaceId] }), { ...requestOptions, deadline_at: new Date(Date.now() + 5_000).toISOString() });
+    const payload = response.outcome === "success" && isRecord(response.payload) ? response.payload : undefined;
+    const workspaces = payload !== undefined && Array.isArray(payload["workspaces"]) ? payload["workspaces"] : undefined;
+    const workspace = workspaces?.find((entry) => isRecord(entry) && entry["workspace_id"] === workspaceId);
+    return isRecord(workspace) ? workspace : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function renderContextDegradationText(errorCode: string, errorMessage: string, errorDetails: Readonly<Record<string, unknown>>, workspace: JsonRecord | undefined): string {
+  const startupPhase = firstNonEmptyString(workspace?.["startup_phase"]);
+  const structuralStageOrdinal = typeof workspace?.["structural_stage_ordinal"] === "number" ? workspace["structural_stage_ordinal"] : undefined;
+  const waitedMs = typeof errorDetails["waited_ms"] === "number" ? errorDetails["waited_ms"] : undefined;
+  const retryAfterMs = typeof workspace?.["retry_after_ms"] === "number" ? workspace["retry_after_ms"] : typeof errorDetails["retry_after_ms"] === "number" ? errorDetails["retry_after_ms"] : undefined;
+  const detailParts = [
+    startupPhase !== undefined ? `phase=${startupPhase}` : undefined,
+    structuralStageOrdinal !== undefined ? `structural_stage_ordinal=${structuralStageOrdinal}` : undefined,
+    waitedMs !== undefined ? `waited_ms=${waitedMs}` : undefined,
+    retryAfterMs !== undefined ? `retry_after_ms=${retryAfterMs}` : undefined,
+  ].filter((value): value is string => value !== undefined);
+
+  const syntaxReady = workspace?.["structural_stage_1_ready"] === true || workspace?.["syntax_ready"] === true;
+  const lines = [
+    `indexing: the workspace is still indexing, so urdira_context (structural frontier) is not ready yet (${errorCode}: ${errorMessage})`,
+    ...(detailParts.length > 0 ? [detailParts.join(", ")] : []),
+    "",
+    "use these now instead of waiting:",
+    ...SOURCE_SYNTAX_OPERATION_CATALOG.filter((entry) => entry.frontier === "source").map((entry) => `  ${entry.operation.replace(/^core:/, "")} (source, ready now) - ${entry.description}`),
+    ...SOURCE_SYNTAX_OPERATION_CATALOG.filter((entry) => entry.frontier === "syntax").map((entry) => `  ${entry.operation.replace(/^core:/, "")} (syntax, ${syntaxReady ? "ready now" : "ready once syntax indexing completes"}) - ${entry.description}`),
+    "",
+    "results from these are honestly labeled partial while indexing runs; urdira_context becomes available once structural indexing completes.",
+  ];
+  return lines.join("\n");
+}
+
+async function buildContextDegradationResult(client: UrdiraMcpClient, payload: JsonRecord, error: NonNullable<IpcResponse["error"]>, requestOptions: LocalIpcRequestOptions): Promise<CallToolResult | undefined> {
+  const scope = isRecord(payload["scope"]) ? payload["scope"] as JsonRecord : undefined;
+  const workspaceId = scope !== undefined && scope["scope_type"] === "single_workspace" && typeof scope["workspace_id"] === "string" ? scope["workspace_id"] : undefined;
+  if (workspaceId === undefined) return undefined;
+  const workspace = await fetchWorkspaceStatusForDegradation(client, workspaceId, requestOptions);
+  return { content: [{ type: "text", text: renderContextDegradationText(error.code, error.message, error.details ?? {}, workspace) }] };
+}
+
 async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { client: UrdiraMcpClient }, context: UrdiraMcpToolContext = {}): Promise<CallToolResult> {
   const raw = requireRecord(input, "tool arguments");
   const canonical = canonicalKeys(raw);
@@ -1260,6 +1337,10 @@ async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { c
     deadline_at: deadlineForPayload(call, payload),
   };
   const response = await dependencies.client.call(call, payload, requestOptions);
+  if (response.outcome === "error" && render !== "json" && response.error !== undefined && CONTEXT_DEGRADATION_ERROR_CODES.has(response.error.code) && isBuildContextOperationPayload(payload)) {
+    const degraded = await buildContextDegradationResult(dependencies.client, payload, response.error, requestOptions);
+    if (degraded !== undefined) return degraded;
+  }
   const scopeKind = isRecord(payload["scope"]) && payload["scope"]["scope_type"] === "comparison" ? "comparison" : "single_workspace";
   const responseBudget = extractResponseBudget(call, payload);
   const pageKind: "query" | "index_status" = call === "core:index_status" ? "index_status" : "query";

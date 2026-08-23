@@ -44,8 +44,8 @@ describe("Windows portability preflight", () => {
 
   it("decodes CAS paths with POSIX or Windows separators", () => {
     const hex = "b".repeat(64);
-    expect(casHashFromStorageRelativePath(`${hex.slice(0, 2)}/${hex.slice(2, 4)}/${hex.slice(4)}`)).toBe(`sha256:${hex}`);
-    expect(casHashFromStorageRelativePath(`${hex.slice(0, 2)}\\${hex.slice(2, 4)}\\${hex.slice(4)}`)).toBe(`sha256:${hex}`);
+    expect(casHashFromStorageRelativePath(`${hex.slice(0, 2)}/${hex.slice(2)}`)).toBe(`sha256:${hex}`);
+    expect(casHashFromStorageRelativePath(`${hex.slice(0, 2)}\\${hex.slice(2)}`)).toBe(`sha256:${hex}`);
   });
 
   it("normalizes local IPC and child-process paths through platform adapters", () => {

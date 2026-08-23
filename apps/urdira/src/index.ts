@@ -576,7 +576,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // (VS Code crossed 10 GiB before this cap). Keep one checker for a large
       // corpus; the requests remain bounded and correctness is unchanged.
       const sourceByteLength = sourceArtifacts.reduce((total, artifact) => total + artifact.byte_length, 0);
-      const largeWorkspace = sourceArtifacts.length >= 4_096 || sourceByteLength >= 128 * 1024 * 1024;
+      const largeWorkspace = sourceArtifacts.length >= largeWorkspaceArtifactThreshold() || sourceByteLength >= 128 * 1024 * 1024;
       type AnalysisPlan = {
         readonly planIndex: number;
         readonly workItem: ArtifactWorkItem & { readonly candidate_generation_id: string; readonly base_snapshot_id?: string };
@@ -646,7 +646,19 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // worker backpressure without retaining a corpus-sized plan graph.
       const plans: readonly AnalysisPlan[] | undefined = largeWorkspace ? undefined : affectedOwners.map(buildPlan);
       const planCount = plans?.length ?? affectedOwners.length;
-      const shardCount = Math.max(1, Math.min(largeWorkspace ? 1 : analysisWorkerShardCount, planCount || 1));
+      // `URDIRA_ANALYSIS_LARGE_SHARDS` (default 1 -- today's exact behavior)
+      // only widens the large-workspace stream when this scan is actually
+      // running bounded-syntax analysis (`dependencyGraph !== undefined`,
+      // the same condition `buildPlan` uses to set `bounded_syntax: true`
+      // above). Bounded syntax keeps no per-worker TypeScript checker/program
+      // graph, only per-owner syntax state, so a few extra workers are
+      // memory-safe the way duplicating a full checker never was (see the
+      // `largeWorkspace` comment above). If a large workspace somehow still
+      // falls back to full-checker analysis (`dependencyGraph === undefined`),
+      // the multi-checker OOM risk that comment describes is back, so this
+      // forces 1 regardless of the env var.
+      const effectiveLargeShardCount = largeWorkspace && dependencyGraph !== undefined ? analysisLargeWorkspaceShardCount() : 1;
+      const shardCount = Math.max(1, Math.min(largeWorkspace ? effectiveLargeShardCount : analysisWorkerShardCount, planCount || 1));
       const shards = plans === undefined ? [] : Array.from({ length: shardCount }, (_, shard) => plans.filter((_, index) => index % shardCount === shard));
       const acceptanceStartedAt = performance.now();
       const pendingNativeBatches: { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[] = [];
@@ -724,12 +736,19 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       };
       const workerStartedAt = performance.now();
       let shardResults: readonly { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[] = [];
+      // Populated only by the large-workspace stream branches below, for the
+      // `shards_used`/`demotions`/`per_shard_completed` timing fields -- the
+      // materialized (ordinary-workspace) branch already reports its own
+      // shard count via the pre-existing `shards` field.
+      let largeStreamTelemetry: { readonly shards_used: number; readonly demotions: number; readonly per_shard_completed: readonly number[] } | undefined;
       if (plans !== undefined) {
         shardResults = (await Promise.all(shards.map((shard, shardIndex) => invokeShard(shard, shardIndex)))).flat().sort((left, right) => left.plan_index - right.plan_index);
-      } else if (affectedOwners.length > 0) {
-        // Large workspaces use a single bounded owner stream. At most one
-        // request envelope, one worker response, and one accepted delta are
-        // live at each step; no corpus-sized `plans` or `shards` array exists.
+      } else if (affectedOwners.length > 0 && shardCount <= 1) {
+        // Large workspaces default to a single bounded owner stream. At most
+        // one request envelope, one worker response, and one accepted delta
+        // are live at each step; no corpus-sized `plans` or `shards` array
+        // exists. (`shardCount > 1` -- `URDIRA_ANALYSIS_LARGE_SHARDS` -- takes
+        // the K-shard stream branch below instead.)
         let currentPlan = buildPlan(affectedOwners[0]!, 0);
         let pending = worker.invoke(currentPlan.request);
         pending.catch(() => undefined);
@@ -749,6 +768,148 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
           else await worker.terminate();
           closureWorkerRetained = false;
         }
+        largeStreamTelemetry = { shards_used: 1, demotions: 0, per_shard_completed: [affectedOwners.length] };
+      } else if (affectedOwners.length > 0) {
+        // K-shard bounded-syntax stream (`URDIRA_ANALYSIS_LARGE_SHARDS`, K =
+        // `shardCount` here, already clamped to [1, 4] and to `bounded_syntax`
+        // applicability -- see `effectiveLargeShardCount` above). Each shard
+        // is its own worker running the SAME one-plan-at-a-time discipline as
+        // the single-shard stream above. Unlike that path, extra shards here
+        // never re-issue `analyze_closure`: bounded-syntax `analyze_artifact`
+        // does not consult a per-worker `JsTsAnalysisSession` (see
+        // `packages/plugin-javascript-typescript/src/worker.ts`'s
+        // `analyze_artifact` handling -- large corpora never enter that
+        // session), so the ONE `dependencyGraph` already fetched above is a
+        // plain returned object every shard's `buildPlan` call can narrow
+        // against directly, with nothing to warm per worker.
+        //
+        // Owners are claimed via a single shared, strictly-increasing cursor
+        // over `affectedOwners` (already in plan_index order) rather than a
+        // static `planIndex % shardCount` partition. A static partition
+        // cannot survive demotion without deadlocking: handing a demoted
+        // shard's leftover HIGH-plan_index owners to a survivor's own queue
+        // can force that survivor to submit a high plan_index before a lower
+        // one (still unclaimed, from the demoted shard) has been claimed by
+        // anyone -- and the reorder buffer's "block until my submission
+        // drains" rule then waits forever on a submission nobody will ever
+        // make. (An earlier version of this code did exactly that and hung.)
+        // Claiming strictly in ascending order sidesteps this: the item at
+        // `nextAcceptIndex` is always already claimed -- in flight or done --
+        // by construction, so the buffer can never block on unclaimed work.
+        // Demoting a shard is then just "stop claiming"; nothing to hand off.
+        let claimCursor = 0;
+        const claimNext = (): { readonly planIndex: number; readonly owner: WorkspaceScanSourceArtifact } | undefined => {
+          if (claimCursor >= affectedOwners.length) return undefined;
+          const planIndex = claimCursor;
+          claimCursor += 1;
+          return { planIndex, owner: affectedOwners[planIndex]! };
+        };
+        const demotedShards = new Set<number>();
+        const rssBudgetKib = analysisLargeShardRssBudgetKib();
+        let activeShardCount = shardCount;
+        let demotions = 0;
+        const completedByShard = new Array<number>(shardCount).fill(0);
+        let globalCompleted = 0;
+        // Demotes `victim`: it stops claiming new owners (checked at the top
+        // of its own loop, below) but any already-claimed/in-flight item is
+        // left to finish and be consumed normally -- never killed. Shard 0 is
+        // never a demotion victim (`activeShardCount - 1 >= 1` whenever this
+        // is called), so claiming always continues to completion.
+        const demote = (victim: number, rssKib: number): void => {
+          if (demotedShards.has(victim)) return;
+          activeShardCount -= 1;
+          demotedShards.add(victim);
+          demotions += 1;
+          console.error(`[urdira] analysis shard demotion workspace=${workspace_id} shards=${activeShardCount} rss_kib=${rssKib} budget_kib=${rssBudgetKib}`);
+        };
+        // Pre-spawn budget gate: check RSS before admitting each extra shard
+        // beyond the mandatory first one. A shard rejected here never claims
+        // anything and its `runLane` below returns before acquiring a worker.
+        for (let candidateShard = 1; candidateShard < shardCount; candidateShard += 1) {
+          const rssKib = Math.round(process.memoryUsage().rss / 1024);
+          if (rssKib > rssBudgetKib) demote(candidateShard, rssKib);
+        }
+        // Reorder buffer: shards complete out of plan_index order, but
+        // `acceptance.accept`/the accumulator/`pendingNativeBatches` (fed
+        // inside `consumePlanResponse`) must see deltas in the same
+        // plan_index order a single-shard scan would produce. Each shard
+        // blocks on `acceptInOrder` until ITS OWN submitted index has
+        // actually drained before claiming its next plan -- so only shards
+        // strictly ahead of `nextAcceptIndex` can be holding a
+        // completed-but-unaccepted response at any moment, bounding this
+        // buffer to at most `activeShardCount - 1` entries (see the claim-
+        // cursor comment above for why this can never deadlock).
+        const pendingResponses = new Map<number, { readonly response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } }; readonly plan: AnalysisPlan }>();
+        const acceptWaiters = new Map<number, () => void>();
+        let nextAcceptIndex = 0;
+        let draining = false;
+        let drainError: unknown;
+        const tryDrain = (): void => {
+          if (draining || drainError !== undefined) return;
+          draining = true;
+          void (async () => {
+            try {
+              while (pendingResponses.has(nextAcceptIndex)) {
+                const { response, plan } = pendingResponses.get(nextAcceptIndex)!;
+                pendingResponses.delete(nextAcceptIndex);
+                accepted.push(await consumePlanResponse(response, plan));
+                const resolve = acceptWaiters.get(nextAcceptIndex);
+                acceptWaiters.delete(nextAcceptIndex);
+                nextAcceptIndex += 1;
+                resolve?.();
+              }
+            } catch (error) {
+              drainError = error;
+              for (const resolve of acceptWaiters.values()) resolve();
+              acceptWaiters.clear();
+            } finally {
+              draining = false;
+            }
+          })();
+        };
+        const acceptInOrder = (planIndex: number, response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } }, plan: AnalysisPlan): Promise<void> => {
+          if (drainError !== undefined) return Promise.reject(drainError as Error);
+          pendingResponses.set(planIndex, { response, plan });
+          const wait = new Promise<void>((resolve) => { acceptWaiters.set(planIndex, resolve); });
+          tryDrain();
+          return wait.then(() => { if (drainError !== undefined) throw drainError as Error; });
+        };
+        const runLane = async (shardIndex: number): Promise<void> => {
+          if (demotedShards.has(shardIndex)) return; // demoted before a worker was ever spawned
+          const shardKey = `${workspace_id}:shard:${shardIndex}`;
+          const ownsClosureWorker = shardIndex === 0;
+          const shardWorker = ownsClosureWorker
+            ? worker
+            : analysisWorkerPool !== undefined
+              ? analysisWorkerPool.acquire(shardKey, workerDescriptor, workerDescriptorDigest)
+              : (analysisThreadEnabled() ? createJavascriptTypescriptThreadTransport(workerDescriptor) : createJavascriptTypescriptWorker(workerDescriptor));
+          try {
+            for (;;) {
+              if (demotedShards.has(shardIndex)) break; // demoted mid-scan: finish nothing new
+              const entry = claimNext();
+              if (entry === undefined) break;
+              const plan = buildPlan(entry.owner, entry.planIndex);
+              const response = await shardWorker.invoke(plan.request) as { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } };
+              await acceptInOrder(entry.planIndex, response, plan);
+              completedByShard[shardIndex] = (completedByShard[shardIndex] ?? 0) + 1;
+              globalCompleted += 1;
+              if (globalCompleted % 100 === 0 || globalCompleted === affectedOwners.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=${shardIndex} completed=${globalCompleted}/${affectedOwners.length}`);
+              if (globalCompleted % 64 === 0 && activeShardCount > 1) {
+                const rssKib = Math.round(process.memoryUsage().rss / 1024);
+                if (rssKib > rssBudgetKib) demote(activeShardCount - 1, rssKib);
+              }
+            }
+          } finally {
+            if (ownsClosureWorker) {
+              if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
+              else await shardWorker.terminate();
+              closureWorkerRetained = false;
+            } else if (analysisWorkerPool !== undefined) analysisWorkerPool.release(shardKey);
+            else await shardWorker.terminate();
+          }
+        };
+        await Promise.all(Array.from({ length: shardCount }, (_, shardIndex) => runLane(shardIndex)));
+        largeStreamTelemetry = { shards_used: shardCount - demotedShards.size, demotions, per_shard_completed: completedByShard };
       }
       if ((plans === undefined ? affectedOwners.length : plans.length) === 0 && closureWorkerRetained) {
         if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
@@ -761,7 +922,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // gigabytes on a repository-sized first scan.
       for (const entry of shardResults) accepted.push(entry.delta);
       await flushNativeBatches(true);
-      if (debugTimingEnabled()) console.error(`[urdira] analyze timings ${workspace_id} owners=${planCount} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(performance.now() - workerStartedAt), acceptance: Math.round(performance.now() - acceptanceStartedAt), shards: shardCount, plan_mode: largeWorkspace ? "stream" : "materialized" })}`);
+      if (debugTimingEnabled()) console.error(`[urdira] analyze timings ${workspace_id} owners=${planCount} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(performance.now() - workerStartedAt), acceptance: Math.round(performance.now() - acceptanceStartedAt), shards: shardCount, plan_mode: largeWorkspace ? "stream" : "materialized", ...(largeStreamTelemetry === undefined ? {} : largeStreamTelemetry) })}`);
       // Summarize claims in place. `flatMap` here used to briefly duplicate
       // every completeness claim while the accepted deltas were still live,
       // which was enough to push large TypeScript workspaces over V8's heap
@@ -1100,6 +1261,34 @@ function analysisWorkerShardCount(): number {
   return positiveIntegerEnv("URDIRA_ANALYSIS_WORKERS") ?? 2;
 }
 
+/** Extra analysis worker shards for the LARGE-workspace bounded-syntax
+ * stream (`URDIRA_ANALYSIS_LARGE_SHARDS`), clamped to [1, 4]. Default 1 --
+ * today's single-worker large-workspace behavior, unchanged unless a caller
+ * opts in. See the `effectiveLargeShardCount` comment in `analyze` for why
+ * more than one shard is memory-safe here despite the checker-duplication
+ * cap `largeWorkspace` otherwise enforces. */
+function analysisLargeWorkspaceShardCount(): number {
+  return Math.max(1, Math.min(4, positiveIntegerEnv("URDIRA_ANALYSIS_LARGE_SHARDS") ?? 1));
+}
+
+/** RSS budget (KiB) for admitting/keeping extra large-workspace analysis
+ * shards (`URDIRA_ANALYSIS_RSS_BUDGET_KIB`). Default 4,300,000 KiB (~700MiB
+ * margin under the whole-campaign 5,000,000 KiB RSS guard -- past large-repo
+ * runs finished with only ~634-740MiB margin to spare, see
+ * `project_urdira_agent_benchmark_2026-08-14` in the session memory).
+ * Crossing it demotes shards toward 1 rather than throwing. */
+function analysisLargeShardRssBudgetKib(): number {
+  return positiveIntegerEnv("URDIRA_ANALYSIS_RSS_BUDGET_KIB") ?? 4_300_000;
+}
+
+/** Test-only seam: lets a small fixture workspace exercise the large-
+ * workspace (bounded-syntax, streamed) analysis path without a 4096-file
+ * fixture. `URDIRA_LARGE_WORKSPACE_ARTIFACT_THRESHOLD`, default 4096 --
+ * today's hardcoded threshold. */
+function largeWorkspaceArtifactThreshold(): number {
+  return positiveIntegerEnv("URDIRA_LARGE_WORKSPACE_ARTIFACT_THRESHOLD") ?? 4_096;
+}
+
 /** Idle time after a scan releases a pooled worker before it is proactively
  * evicted. Default 300000ms (5 minutes). */
 function analysisPoolIdleTtlMs(): number {
@@ -1152,11 +1341,19 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   // daemon process's lifetime (subject to idle-TTL/LRU/descriptor-change
   // eviction -- see `AnalysisWorkerPool`'s doc comment). `undefined` when
   // `URDIRA_ANALYSIS_POOL=0` restores today's per-scan create/terminate.
+  //
+  // `max_active` must admit whichever scan needs the most concurrent
+  // leases: the ordinary sharded path (`workerShards`) or a large-workspace
+  // K-shard stream (`URDIRA_ANALYSIS_LARGE_SHARDS`, clamped to [1, 4] --
+  // see `analysisLargeWorkspaceShardCount`). `acquire` throws once leases
+  // hit this cap, so undersizing it here would turn a memory-safe extra
+  // shard into a hard scan failure instead of the intended graceful
+  // demotion path.
   const analysisWorkerPool = analysisPoolEnabled()
     ? new AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>({
       create: (descriptor) => analysisThreadEnabled() ? createJavascriptTypescriptThreadTransport(descriptor) : createJavascriptTypescriptWorker(descriptor),
       max_entries: analysisPoolMaxEntries(),
-      max_active: workerShards,
+      max_active: Math.max(workerShards, analysisLargeWorkspaceShardCount()),
       idle_ttl_ms: analysisPoolIdleTtlMs(),
     })
     : undefined;

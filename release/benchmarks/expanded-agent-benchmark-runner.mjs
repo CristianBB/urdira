@@ -347,6 +347,7 @@ async function hostMain() {
   const deadline = Date.now() + benchmarkTimeoutMs;
   let ready = false;
   let previousFrontier;
+  let sourceReadySinceTs;
   while (Date.now() < deadline) {
     const status = await client.call("core:index_status", { api_version: 3, workspace_ids: [] });
     const entry = status.payload?.workspaces?.find((candidate) => candidate.display_root === worktree.split("/").at(-1));
@@ -362,6 +363,7 @@ async function hostMain() {
       structural_stage_ordinal: Number(entry?.structural_stage_ordinal ?? 0),
       structural_completeness: entry?.structural_completeness ?? null,
       structural_availability: entry?.structural_availability ?? null,
+      source_completeness: entry?.source_completeness ?? null,
       freshness_status: entry?.freshness_status ?? null,
       workspace_status: entry?.workspace_status ?? null,
       startup_phase: entry?.startup_phase ?? null,
@@ -374,12 +376,26 @@ async function hostMain() {
     // Preserve the campaign's phase contract. A `warm` sample starts only
     // after the complete structural snapshot is current/equivalent; releasing
     // at the first transient source frontier moves indexing work into the
-    // measured agent turn and, on large repositories, can make source
-    // availability flap while the agent is querying. Non-warm phases retain
-    // the earliest durable source frontier.
+    // measured agent turn. Do not change this gate -- it is what keeps warm
+    // runs comparable across campaigns.
     const warmReady = entry?.structural_ready === true && ["current", "equivalent"].includes(entry?.freshness_status);
-    const sourceReady = entry?.source_ready === true && entry?.freshness_status !== "failed";
-    if (phase === "warm" ? warmReady : sourceReady) { ready = true; break; }
+    // Non-warm ("cold") phases used to release at the very first
+    // `source_ready` poll and then re-derive their own defensive
+    // "durable source frontier" language here, because `source_ready` could
+    // flap true/false while the daemon's readiness reads raced its own
+    // in-flight publish writes. That race is now fixed at the root (readiness
+    // reads are read-only against the WAL snapshot instead of racing the
+    // writer), and `core:index_status`/query results are honestly labeled
+    // `source_completeness: "partial"` while the source catalog is still
+    // settling rather than silently claiming completeness. Cold release
+    // still waits for `source_ready` to hold across two consecutive polls
+    // (>=1000ms apart, given the 500ms poll cadence below) purely as cheap
+    // insurance against ordinary poll-timing jitter, not because the
+    // frontier itself is distrusted.
+    const sourceReadyNow = entry?.source_ready === true && entry?.freshness_status !== "failed";
+    sourceReadySinceTs = sourceReadyNow ? (sourceReadySinceTs ?? Date.now()) : undefined;
+    const sourceReadyStable = sourceReadySinceTs !== undefined && Date.now() - sourceReadySinceTs >= 1000;
+    if (phase === "warm" ? warmReady : sourceReadyStable) { ready = true; break; }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   if (!ready) throw new Error(`Timed out waiting for the Urdira ${phase === "warm" ? "current structural" : "source_ready"} frontier`);

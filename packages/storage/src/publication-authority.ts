@@ -378,9 +378,23 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
     // (after `assertPublicationImmutableRows`) rather than being fused into
     // this same pass.
     const useStreamingPublication = recordOpens.length >= STREAMING_PUBLICATION_RECORD_THRESHOLD || projectionOpens.length >= STREAMING_PUBLICATION_RECORD_THRESHOLD;
-    const { memo: recordOpenMemo, parsedByEntry: recordOpenParsedByEntry } = timedSync("publish_record_open_memo", () => useStreamingPublication
-      ? { memo: memoizeRecordOpens(recordOpens), parsedByEntry: undefined }
-      : parseRecordOpens(recordOpens));
+    // (3c) `input.record_open_memo`, when it covers every entry of
+    // `recordOpens` by object identity, IS the exact id/digest this loop
+    // would otherwise re-derive by JSON.parse-ing and re-hashing
+    // `record_without_validity` -- `CandidateMaterializer.seal()` computed it
+    // from the same source record, in this same process, moments ago. Using
+    // it turns the dominant cost of a from-zero index's publish (measured:
+    // ~27.5s over ~1M records) into a coverage check plus a Map lookup.
+    // `verifyTemplateSetAgainstDescriptor` above (and every other digest
+    // verification in this function) still independently recomputes its own
+    // digest from `recordOpens` regardless of this memo -- decision 13 stays
+    // intact; only the redundant per-record parse/hash is skipped.
+    const trustedRecordOpenMemo = suppliedRecordOpenMemo(recordOpens, input.record_open_memo);
+    const { memo: recordOpenMemo, parsedByEntry: recordOpenParsedByEntry } = await timed("publish_record_open_memo", async () => trustedRecordOpenMemo !== undefined
+      ? { memo: trustedRecordOpenMemo, parsedByEntry: undefined }
+      : useStreamingPublication
+        ? { memo: await memoizeRecordOpens(recordOpens), parsedByEntry: undefined }
+        : await parseRecordOpens(recordOpens));
     const snapshotDigests = await timed("publish_snapshot_digest_fields", () => computeSnapshotDigestFields(database, workspaceId, current, generation, recordOpens, recordClosures, recordOpenMemo, recordSetDigestCorpus, artifactDependencies, projectionSetDigestCorpus));
     const manifestDescriptors = timedSync("publish_manifest_descriptors", () => buildManifestDescriptors(sourceTransitions, recordOpens, recordClosures, identityAssignments, projectionOpens, projectionClosures, { sourceTransitions: sourceTransitionsDigest, recordOpens: recordOpensDigest, recordClosures: recordClosuresDigest, identityAssignments: identityAssignmentsDigest }));
     const sourceWatermarks = JSON.stringify({ watermarks: materialization.source_observation_watermarks, source_observation_batch_ids: normalizedExpectedObservations });
@@ -456,7 +470,19 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
       ...projectionClosureCommandList,
       ...projectionFaultCommands,
     ];
-    const canonicalStream = useStreamingPublication ? (): Iterable<TransactionCommand> => (function* (): Generator<TransactionCommand> {
+    // `coalesceAdjacentRuns` wraps the WHOLE composed stream (not each
+    // sub-generator individually) so adjacency is judged across their real,
+    // final concatenation order -- exactly what reaches the worker -- rather
+    // than resetting at each `yield*` boundary for no reason. It is a no-op
+    // pass-through wherever adjacency doesn't hold (e.g. every
+    // `checkedPublicationCommand`-bracketed single row in `dependencyCommands`,
+    // which transaction_checkpoint/assert_transaction_changes already isolate
+    // from its neighbors) and only ever produces `run_batch` where genuinely
+    // adjacent same-SQL `run` commands exist (record_facets inside
+    // `recordOpenCommandStream`, the closure UPDATEs in
+    // `recordClosureCommandStream`, and projection_occurrence_dependencies
+    // inside `projectionCommandStream`, below).
+    const canonicalStream = useStreamingPublication ? (): Iterable<TransactionCommand> => coalesceAdjacentRuns((function* (): Generator<TransactionCommand> {
       yield* candidateMaterializationCommands;
       yield* dependencyCommands;
       const rebuildInitialCanonicalIndexes = current === undefined && recordOpens.length >= STREAMING_PUBLICATION_RECORD_THRESHOLD;
@@ -466,12 +492,12 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
       yield* identityCommandStream(identityAssignments, workspaceId, generation);
       if (rebuildInitialCanonicalIndexes) yield { kind: "exec", sql: INITIAL_CANONICAL_INDEX_BUILD_SQL };
       yield* canonicalFaultCommands;
-    })() : undefined;
-    const projectionsStream = useStreamingPublication ? (): Iterable<TransactionCommand> => (function* (): Generator<TransactionCommand> {
+    })()) : undefined;
+    const projectionsStream = useStreamingPublication ? (): Iterable<TransactionCommand> => coalesceAdjacentRuns((function* (): Generator<TransactionCommand> {
       yield* projectionCommandStream(projectionOpens, workspaceId, generation);
       yield* projectionClosureCommandStream(projectionClosures, workspaceId, generation);
       yield* projectionFaultCommands;
-    })() : undefined;
+    })()) : undefined;
     const manifestCommands: TransactionCommand[] = [
       ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [generationManifestId, workspaceId, candidateId, generation, snapshotId, input.frozen_base.snapshot_id ?? null, manifest.registry_snapshot_id, manifest.publication_kind, publishedAt, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, manifest.manifest_digest] }),
     ];
@@ -979,9 +1005,46 @@ function recordOpenMemoEntry(entry: unknown, memo: ReadonlyMap<unknown, RecordOp
  * already-in-memory `record_without_validity` string, which is cheap
  * (no canonical encoding or hashing) relative to what this memo eliminates.
  */
-function memoizeRecordOpens(opens: readonly unknown[]): ReadonlyMap<unknown, RecordOpenMemoEntry> {
-  const memo = new Map<unknown, RecordOpenMemoEntry>();
+/**
+ * (3c) Trusts a seal-supplied memo only when it has an entry for every
+ * `recordOpens` template object it's checked against (by reference) -- the
+ * exact array `CandidateMaterializer.seal()` built the memo from, in the
+ * same process, moments earlier (`workspace-indexing-session.ts` threads
+ * `sealed.record_open_memo` straight through `template_sets.record_opens`
+ * without cloning). A memo from a different call (fork path, a recovery
+ * replay that reloaded `record_opens` from storage, or simply omitted) won't
+ * have every entry and is rejected wholesale here, falling back to nothing
+ * -- never a partial/wrong substitution, only a lost optimization.
+ */
+function suppliedRecordOpenMemo(opens: readonly unknown[], supplied: ReadonlyMap<unknown, RecordOpenMemoEntry> | undefined): ReadonlyMap<unknown, RecordOpenMemoEntry> | undefined {
+  if (supplied === undefined) return undefined;
   for (const entry of opens) {
+    if (!entry || typeof entry !== "object") continue;
+    if (typeof (entry as Record<string, unknown>)["record_without_validity"] !== "string") continue;
+    if (!supplied.has(entry)) return undefined;
+  }
+  return supplied;
+}
+
+// (3b) Every long, purely-synchronous loop below that scales with record
+// count (~1M on a from-zero index of a large repository) yields the event
+// loop periodically instead of blocking it for the loop's entire duration --
+// status-poll and other daemon RPCs get a turn every `COOPERATIVE_YIELD_INTERVAL`
+// entries. The interval is large enough that the yield overhead itself stays
+// well under 1% of the loop's own cost (a `setImmediate` round trip is
+// microseconds; the per-record work it's interleaved with is not).
+const COOPERATIVE_YIELD_INTERVAL = 25_000;
+
+function cooperativeYield(): Promise<void> {
+  return new Promise<void>((resolve) => { setImmediate(resolve); });
+}
+
+async function memoizeRecordOpens(opens: readonly unknown[]): Promise<ReadonlyMap<unknown, RecordOpenMemoEntry>> {
+  const memo = new Map<unknown, RecordOpenMemoEntry>();
+  let index = 0;
+  for (const entry of opens) {
+    index += 1;
+    if (index % COOPERATIVE_YIELD_INTERVAL === 0) await cooperativeYield();
     if (!entry || typeof entry !== "object") continue;
     const raw = (entry as Record<string, unknown>)["record_without_validity"];
     if (typeof raw !== "string") continue;
@@ -1026,10 +1089,13 @@ function memoizeRecordOpens(opens: readonly unknown[]): ReadonlyMap<unknown, Rec
  * intact while still eliminating the double `JSON.parse` this file used to
  * pay per record open.
  */
-function parseRecordOpens(opens: readonly unknown[]): { readonly memo: ReadonlyMap<unknown, RecordOpenMemoEntry>; readonly parsedByEntry: ReadonlyMap<unknown, Record<string, unknown>> } {
+async function parseRecordOpens(opens: readonly unknown[]): Promise<{ readonly memo: ReadonlyMap<unknown, RecordOpenMemoEntry>; readonly parsedByEntry: ReadonlyMap<unknown, Record<string, unknown>> }> {
   const memo = new Map<unknown, RecordOpenMemoEntry>();
   const parsedByEntry = new Map<unknown, Record<string, unknown>>();
+  let index = 0;
   for (const entry of opens) {
+    index += 1;
+    if (index % COOPERATIVE_YIELD_INTERVAL === 0) await cooperativeYield();
     if (!entry || typeof entry !== "object") continue;
     const raw = (entry as Record<string, unknown>)["record_without_validity"];
     if (typeof raw !== "string") continue;
@@ -1406,13 +1472,19 @@ export async function computeSnapshotDigestFields(database: SqliteDatabase, work
         ? []
         : await database.all<{ record_id: string; record_digest: string }>("SELECT record_id, record_digest FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)", [workspaceId, oldGeneration, oldGeneration]);
     const visible = new Map(oldVisible.map((row) => [row.record_id, row.record_digest] as const));
+    let closureIndex = 0;
     for (const entry of recordClosures) {
+      closureIndex += 1;
+      if (closureIndex % COOPERATIVE_YIELD_INTERVAL === 0) await cooperativeYield();
       if (!entry || typeof entry !== "object") continue;
       const recordId = (entry as Record<string, unknown>)["record_id"];
       if (typeof recordId === "string") visible.delete(recordId);
     }
-    const memo = recordOpenMemo ?? memoizeRecordOpens(recordOpens);
+    const memo = recordOpenMemo ?? await memoizeRecordOpens(recordOpens);
+    let openIndex = 0;
     for (const entry of recordOpens) {
+      openIndex += 1;
+      if (openIndex % COOPERATIVE_YIELD_INTERVAL === 0) await cooperativeYield();
       const opened = recordOpenMemoEntry(entry, memo);
       if (!opened) continue;
       visible.set(opened.recordId, opened.recordDigest);
@@ -1664,13 +1736,26 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
   }
   const recordCount = await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM record_occurrences WHERE workspace_id = ?", [workspaceId]);
   if (recordCount?.count !== 0) {
+    // (3b) This branch only runs on a resumed/retried or otherwise non-fresh
+    // publish (a real first publish takes the `recordCount?.count === 0`
+    // fast path above and skips this whole block) -- but when it does run
+    // over a repository-sized `recordOpens`, it's still ~1M synchronous
+    // iterations with no other await in between; yield periodically so a
+    // resumed large-workspace publish doesn't starve the daemon event loop
+    // either.
     const recordIds: string[] = [];
+    let recordIdIndex = 0;
     for (const entry of recordOpens) {
+      recordIdIndex += 1;
+      if (recordIdIndex % COOPERATIVE_YIELD_INTERVAL === 0) await cooperativeYield();
       const opened = recordOpenMemoEntry(entry, recordOpenMemo);
       if (opened) recordIds.push(opened.recordId);
     }
     const existingRecords = await fetchExistingRowsById(database, "record_occurrences", workspaceId, "record_id", recordIds);
+    let recordCheckIndex = 0;
     for (const entry of recordOpens) {
+      recordCheckIndex += 1;
+      if (recordCheckIndex % COOPERATIVE_YIELD_INTERVAL === 0) await cooperativeYield();
       const opened = recordOpenMemoEntry(entry, recordOpenMemo);
       if (!opened) continue;
       const id = opened.recordId;
@@ -1941,6 +2026,78 @@ CREATE INDEX identity_assignments_record_idx ON identity_assignments(workspace_i
 // enter the transaction worker. This keeps the high-cardinality publication
 // path bounded without retaining or inspecting a corpus-sized command list.
 const STREAMING_OCCURRENCE_BATCH_MAX_ROWS = 512;
+
+// Rows per `run_batch` command `coalesceAdjacentRuns` emits (below). Chosen
+// against the same per-chunk data-volume target `SqliteWorkerAdapter.PARAMS_PER_CHUNK`
+// already sizes chunks to (packages/storage/src/sqlite.ts: ~2000 commands x
+// ~14 params/command ~= 28,000 params/chunk), not an arbitrary constant: at
+// this file's highest-arity coalesced site (artifact_dependencies, ~12
+// params/row), 2048 rows is ~24,576 flattened params -- comfortably under
+// one chunk's existing budget without needing arity-aware sizing. Lower-arity
+// sites (record_facets, 5 params/row; projection_occurrence_dependencies, 5
+// params/row) never come close to the cap and just get fewer, larger batches.
+const RUN_BATCH_MAX_ROWS = 2_048;
+
+/**
+ * Coalesces ADJACENT `run` commands that share byte-identical SQL text into
+ * `run_batch` commands (packages/storage/src/sqlite.ts) of up to
+ * `RUN_BATCH_MAX_ROWS` rows each. Pure transport optimization: same rows,
+ * same order, same constraint failures -- only how many worker round trips
+ * and per-command dispatch/`postMessage` envelopes it costs to run them.
+ *
+ * Deliberately adjacency-only, never a cross-gap dedup or reorder: a `run`
+ * command only ever joins the group immediately preceding it, and every
+ * other command (`transaction_checkpoint`, `assert_transaction_changes`,
+ * `fault`, `exec`, `get`, `all`, `staged_fact_delta_batch`, or a `run` whose
+ * SQL text differs from the pending group's) flushes the pending group
+ * first and passes through untouched, in the exact order it arrived --
+ * `assert_transaction_changes`'s change-count bracketing of a checkpoint
+ * still sees the same total, and command order across distinct SQL
+ * statements is exactly preserved. Two adjacent `run` commands sharing SQL
+ * text always share parameter arity too (the SQL text's placeholder count
+ * fixes it), so `params.length` mismatch inside one pending group would
+ * indicate a producer bug, not legitimate variation -- checked defensively
+ * rather than assumed silently. A group of exactly one row is emitted as a
+ * plain `run`, not a size-1 `run_batch`.
+ */
+export function* coalesceAdjacentRuns(commands: Iterable<SqliteCommand>): Generator<SqliteCommand> {
+  let pendingSql: string | undefined;
+  let pendingParams: SqliteValue[] = [];
+  let pendingArity = 0;
+  let pendingRows = 0;
+
+  function* flushPending(): Generator<SqliteCommand> {
+    if (pendingRows === 0) return;
+    yield pendingRows === 1
+      ? { kind: "run", sql: pendingSql!, params: pendingParams }
+      : { kind: "run_batch", sql: pendingSql!, rows: pendingRows, params_flat: pendingParams };
+    pendingSql = undefined;
+    pendingParams = [];
+    pendingArity = 0;
+    pendingRows = 0;
+  }
+
+  for (const command of commands) {
+    if (command.kind === "run") {
+      const params = command.params ?? [];
+      if (pendingRows > 0 && pendingSql === command.sql && pendingRows < RUN_BATCH_MAX_ROWS) {
+        if (params.length !== pendingArity) throw new StorageError("storage:publication_invalid", `Adjacent run commands sharing SQL text carry different parameter counts (expected ${pendingArity}, got ${params.length}): "${command.sql}".`);
+        pendingParams.push(...params);
+        pendingRows += 1;
+        continue;
+      }
+      yield* flushPending();
+      pendingSql = command.sql;
+      pendingParams = [...params];
+      pendingArity = params.length;
+      pendingRows = 1;
+      continue;
+    }
+    yield* flushPending();
+    yield command;
+  }
+  yield* flushPending();
+}
 const RECORD_OCCURRENCE_INSERT_SQL = "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES ";
 const RECORD_OCCURRENCE_INSERT_SUFFIX = " ON CONFLICT(record_id) DO NOTHING";
 const RECORD_OCCURRENCE_PLACEHOLDER = `(${Array.from({ length: 16 }, () => "?").join(", ")}, NULL, ${Array.from({ length: 7 }, () => "?").join(", ")})`;

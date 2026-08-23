@@ -87,6 +87,56 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect((payload as { options: { freshness: unknown; required_frontier: unknown; wait_timeout_ms: unknown } }).options).toMatchObject({ freshness: "wait_for_current", required_frontier: "structural", wait_timeout_ms: 30_000 });
   });
 
+  it("degrades a timed-out urdira_context wait into a compact plain-text notice naming source/syntax tools available now", async () => {
+    const call = vi.fn(async (name: string) => {
+      if (name === "core:query") {
+        return {
+          protocol_version: 1,
+          request_id: "request-1",
+          outcome: "error",
+          error: {
+            code: "core:freshness_wait_timeout",
+            message: "Required structural frontier for workspace workspace-1 did not become current within 30000 milliseconds.",
+            details: { workspace_ids: ["workspace-1"], waited_ms: 30_000, pending_observation_counts: [1], retry_after_ms: 1000 },
+          },
+        } satisfies IpcResponse;
+      }
+      return success({
+        workspaces: [{
+          workspace_id: "workspace-1",
+          display_root: "project",
+          workspace_status: "indexing",
+          startup_phase: "publishing_structural",
+          freshness_status: "changes_pending",
+          source_ready: true,
+          syntax_ready: true,
+          structural_stage_1_ready: true,
+          structural_ready: false,
+          semantic_ready: false,
+          structural_stage_ordinal: 2,
+          retry_after_ms: 1000,
+        }],
+      });
+    });
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_context");
+    const result = await definition.invoke({ api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, task: "trace the request path", facets: ["definitions"] });
+    expect(call.mock.calls.map(([name]) => name)).toEqual(["core:query", "core:index_status"]);
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent).toBeUndefined();
+    const block = result.content.find((entry): entry is { type: "text"; text: string } => entry.type === "text")!;
+    // Plain compact text -- matching renderIndexStatusText/renderQueryPageText's
+    // style -- not a JSON error dump.
+    expect(() => JSON.parse(block.text)).toThrow();
+    expect(block.text).toContain("core:freshness_wait_timeout");
+    expect(block.text).toContain("phase=publishing_structural");
+    expect(block.text).toContain("structural_stage_ordinal=2");
+    expect(block.text).toContain("retry_after_ms=1000");
+    expect(block.text).toContain("search_text");
+    expect(block.text).toContain("get_source");
+    expect(block.text).toContain("find_artifacts");
+    expect(block.text).toContain("discover_definitions");
+  });
+
   it("caps MCP query pages below the local IPC frame and leaves continuation available", async () => {
     let payload: unknown;
     const definition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async (_call, value) => { payload = value; return success({ result_sets: [] }); }) } }), "urdira_query");

@@ -20,6 +20,7 @@ import type {
   SourceObservationRecord,
 } from "@urdira/storage";
 import { mapWithConcurrency } from "./concurrency.js";
+import { record, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import type { DirectorySourceByteStream, EncodedObservationBatch, ProviderObservation } from "./directory-provider.js";
 import { EngineError } from "./errors.js";
 import { sourceObservationBatchDigest } from "./source-batch-digest.js";
@@ -344,7 +345,11 @@ function parseBatch(response: SourceProviderResponseEnvelope, preParsed?: unknow
   if (!opaqueScope && observations.some((observation) => !scopes.some((scope) => scopeContainsUri(scope, observation.normalized_uri)))) {
     throw new EngineError("engine:source_index_result_invalid", "Observation URI lies outside its advertised coverage scopes.");
   }
-  if (sourceObservationBatchDigest({
+  // Wrapped under `source_batch_digest_verify` (see `debug-timing.ts`): this
+  // recomputes a Merkle-radix digest over every observation in the batch
+  // purely to prove the provider's response wasn't tampered with in transit,
+  // so its cost scales with batch size independent of any storage write.
+  if (timedSync("source_batch_digest_verify", () => sourceObservationBatchDigest({
     workspace_id: batch.workspace_id,
     source_provider_binding_id: batch.source_provider_binding_id,
     source_provider: batch.source_provider,
@@ -358,7 +363,7 @@ function parseBatch(response: SourceProviderResponseEnvelope, preParsed?: unknow
     provider_cursor_after: requiredText(batch.provider_cursor_after, "Batch cursor after"),
     observation_count: batch.observation_count,
     unavailable_count: batch.unavailable_count,
-  }, observations) !== batch.batch_digest) {
+  }, observations)) !== batch.batch_digest) {
     throw new EngineError("engine:source_index_result_invalid", "Observation batch digest does not match its canonical contents.");
   }
   const start = requiredString(payload["capture_start_fingerprint"], "Capture start fingerprint");
@@ -456,7 +461,22 @@ export class GenericSourceIndexer {
     let final: SourceIndexApplyResult | undefined;
     const seenUris = new Set<string>();
     let acceptedPartial = false;
-    for await (const encoded of input.native_batches!) {
+    // Manual iteration (rather than `for await...of`) so the wait for each
+    // batch -- the provider's own enumeration/encoding work in
+    // `directory-provider.ts`, deliberately not instrumented there directly
+    // -- can be measured at this, the consumption site, separately from the
+    // loop body's own already-timed spans (`source_batch_digest_verify`,
+    // `source_provider_read`). Summed across a scan's thousands of batches,
+    // `source_provider_batch_wait` is what's left of `source_catalog`'s wall
+    // time once those per-batch buckets and storage's own `source_catalog`
+    // timing line are subtracted out.
+    const nativeBatchIterator = input.native_batches![Symbol.asyncIterator]();
+    for (;;) {
+      const batchWaitStartedAt = timingEnabled() ? performance.now() : 0;
+      const step = await nativeBatchIterator.next();
+      if (timingEnabled()) record("source_provider_batch_wait", performance.now() - batchWaitStartedAt);
+      if (step.done) break;
+      const encoded = step.value;
       const batch = encoded.batch as SourceObservationBatchRecord;
       if (batch.workspace_id !== input.response.workspace_id || batch.source_provider_binding_id !== input.response.source_provider_binding_id
         || batch.source_provider !== input.response.component_id || batch.source_provider_version !== input.response.component_version) {
@@ -466,7 +486,12 @@ export class GenericSourceIndexer {
         throw new EngineError("engine:source_index_result_invalid", "Native observation batch count or URI uniqueness is invalid.");
       }
       const observations = encoded.observations.map((observation) => parseObservation(observation, batch));
-      if (sourceObservationBatchDigest({
+      // See the identical `source_batch_digest_verify` note in `parseBatch`,
+      // above -- this is the native-batch path's counterpart, taken on every
+      // real (non-JSON-envelope) directory scan, so it's the one that
+      // actually accumulates wall time across a full-repo scan's thousands
+      // of native batches.
+      if (timedSync("source_batch_digest_verify", () => sourceObservationBatchDigest({
         workspace_id: batch.workspace_id,
         source_provider_binding_id: batch.source_provider_binding_id,
         source_provider: batch.source_provider,
@@ -480,7 +505,7 @@ export class GenericSourceIndexer {
         provider_cursor_after: batch.provider_cursor_after ?? "",
         observation_count: batch.observation_count,
         unavailable_count: batch.unavailable_count,
-      }, observations) !== batch.batch_digest) throw new EngineError("engine:source_index_result_invalid", "Native observation batch digest does not match its logical contents.");
+      }, observations)) !== batch.batch_digest) throw new EngineError("engine:source_index_result_invalid", "Native observation batch digest does not match its logical contents.");
       const scopes = parseCoverageScopes(batch);
       const reusable = input.read_stream !== undefined && input.allow_partial !== true
         ? new Map((await (this.workspace.sourceIndex.currentOccurrencesForIndex
@@ -591,7 +616,14 @@ export class GenericSourceIndexer {
           const existing = reusable?.get(observation.normalized_uri);
           const equivalent = existing?.version.content_hash === observation.observed_content_hash
             && existing.version.analysis_metadata_digest === observation.observed_metadata_digest;
-          const stream = await readStream(observation, equivalent ? { reuse_existing: true } : undefined);
+          // `source_provider_read` times the provider round-trip itself
+          // (boundary re-check: `lstat`/`stat` on the native path -- the
+          // returned `stream.chunks` is a lazy generator that CAS only
+          // consumes later, inside its own `commitInternal`/CAS-put timing,
+          // so this bucket deliberately does NOT include the actual file
+          // read for the native path; it does for the legacy `read` branch
+          // below, which returns fully-read bytes).
+          const stream = await timed("source_provider_read", () => readStream(observation, equivalent ? { reuse_existing: true } : undefined));
           if (stream.artifact_id !== observation.artifact_id || stream.provider_version_token !== observation.provider_version_token
             || stream.content_hash !== observation.observed_content_hash || stream.byte_length < 0
             || stream.metadata_digest !== observation.observed_metadata_digest) {
@@ -601,7 +633,10 @@ export class GenericSourceIndexer {
           if (!equivalent && stream.reused_existing === true) throw new EngineError("engine:source_index_read_invalid", "Native source provider reused content for a changed occurrence.");
           return { kind: "value", read: { observation, stream } };
         }
-        const response = await read!(observation);
+        // Legacy in-process path: `read` returns fully-read bytes, so unlike
+        // the native `readStream` branch above, this bucket captures the
+        // complete provider file read here.
+        const response = await timed("source_provider_read", () => read!(observation));
         const outcome = validateEnvelope(response, this.workspace.workspaceId);
         if (outcome !== "success") return { kind: "undefined" };
         if (response.call !== "read" || response.source_provider_binding_id !== observation.source_provider_binding_id
@@ -692,64 +727,72 @@ export class GenericSourceIndexer {
     const tombstones: ArtifactTombstoneRecord[] = [];
     let changed = false;
 
-    for (const read of reads) {
-      const existing = planned.present.get(read.observation.normalized_uri);
-      const priorAbsence = planned.absent.get(read.observation.normalized_uri);
-      const priorArtifact = existing?.artifact ?? priorAbsence?.artifact;
-      if (priorArtifact !== undefined && priorArtifact.artifact_id !== read.observation.artifact_id) {
-        throw new EngineError("engine:source_index_result_invalid", "Provider observation artifact identity changed for an existing source address.");
-      }
-      const equivalent = existing?.version.content_hash === read.observation.observed_content_hash
-        && existing.version.analysis_metadata_digest === read.observation.observed_metadata_digest;
-      const artifact = priorArtifact ?? this.newArtifact(batch, read.observation);
-      if (priorArtifact === undefined) artifacts.push(artifact);
-      const observation = this.storedObservation(read.observation, batch);
-      observations.push(observation);
-      if (equivalent) continue;
-      changed = true;
-      if (existing) versionClosures.push({ ...existing.version, valid_to_generation: generation });
-      const byteLength = read.bytes?.byteLength ?? read.stream?.byte_length;
-      if (byteLength === undefined) throw new EngineError("engine:source_index_read_invalid", "Validated source read has no byte length.");
-      const contentBlobId = stableId("content", { content_hash: read.observation.observed_content_hash, byte_length: byteLength });
-      const version: ArtifactVersionInput = {
-        artifact_version_id: stableId("artifact-version", { artifact_id: artifact.artifact_id, observation_id: observation.source_observation_id, content_hash: read.observation.observed_content_hash }),
-        workspace_id: batch.workspace_id,
-        artifact_id: artifact.artifact_id,
-        content_blob_id: contentBlobId,
-        content_hash: read.observation.observed_content_hash,
-        byte_length: byteLength,
-        encoding: read.text === undefined && read.stream?.media_type === "application/octet-stream" ? "binary" : "utf-8",
-        ...(read.text === undefined && read.stream?.media_type === "application/octet-stream" ? {} : { language_hint: "text" }),
-        analysis_metadata_digest: read.observation.observed_metadata_digest,
-        created_from_observation_id: observation.source_observation_id,
-        valid_from_generation: generation,
-      };
-      if (read.bytes !== undefined) contents.push({ content_blob_id: contentBlobId, bytes: read.bytes, media_type: read.text === undefined ? "application/octet-stream" : "text/plain; charset=utf-8" });
-      else if (read.stream !== undefined) {
-        if (read.stream.reused_existing === true || read.stream.chunks === undefined) throw new EngineError("engine:source_index_read_invalid", "A changed source occurrence cannot reuse an existing CAS blob.");
-        contentStreams.push({ content_blob_id: contentBlobId, stream: read.stream.chunks, content_hash: read.stream.content_hash, byte_length: read.stream.byte_length, media_type: read.stream.media_type, ...(read.stream.after_read === undefined ? {} : { after_read: read.stream.after_read }) });
-      }
-      versions.push(version);
-      if (priorAbsence) {
-        const closingChange = stableId("artifact-change", { kind: priorAbsence.tombstone.absence_kind === "excluded" ? "reincluded" : "recreated", batch_id: batch.observation_batch_id, artifact_id: artifact.artifact_id });
-        tombstoneClosures.push({ ...priorAbsence.tombstone, valid_to_generation: generation, closing_artifact_change_id: closingChange, replacement_artifact_version_id: version.artifact_version_id });
-        planned.absent.delete(read.observation.normalized_uri);
-      }
-      planned.present.set(read.observation.normalized_uri, { artifact, version });
-    }
-
-    if (mayDelete) {
-      const observedUris = completeObservedUris ?? new Set(reads.map((read) => read.observation.normalized_uri));
-      for (const [uri, occurrence] of [...planned.present]) {
-        if (observedUris.has(uri) || !scopes.some((scope) => scopeContainsUri(scope, uri))) continue;
+    // `source_fragment_assemble` times this fragment's whole in-memory row
+    // build: per-observation artifact/version/tombstone-closure construction
+    // (including the `stableId` content-addressed ID hashes below) plus the
+    // authoritative-deletion reconciliation loop, i.e. everything this method
+    // does BEFORE handing `commitInput` to `commitInternal` (whose own SQL/CAS
+    // work is separately timed by `@urdira/storage`'s `debug-timing.ts`).
+    timedSync("source_fragment_assemble", () => {
+      for (const read of reads) {
+        const existing = planned.present.get(read.observation.normalized_uri);
+        const priorAbsence = planned.absent.get(read.observation.normalized_uri);
+        const priorArtifact = existing?.artifact ?? priorAbsence?.artifact;
+        if (priorArtifact !== undefined && priorArtifact.artifact_id !== read.observation.artifact_id) {
+          throw new EngineError("engine:source_index_result_invalid", "Provider observation artifact identity changed for an existing source address.");
+        }
+        const equivalent = existing?.version.content_hash === read.observation.observed_content_hash
+          && existing.version.analysis_metadata_digest === read.observation.observed_metadata_digest;
+        const artifact = priorArtifact ?? this.newArtifact(batch, read.observation);
+        if (priorArtifact === undefined) artifacts.push(artifact);
+        const observation = this.storedObservation(read.observation, batch);
+        observations.push(observation);
+        if (equivalent) continue;
         changed = true;
-        versionClosures.push({ ...occurrence.version, valid_to_generation: generation });
-        const tombstone = this.newTombstone(occurrence, batch, generation, "deleted", { cause_type: "artifact_version", cause_id: occurrence.version.artifact_version_id });
-        tombstones.push(tombstone);
-        planned.present.delete(uri);
-        planned.absent.set(uri, { artifact: occurrence.artifact, tombstone });
+        if (existing) versionClosures.push({ ...existing.version, valid_to_generation: generation });
+        const byteLength = read.bytes?.byteLength ?? read.stream?.byte_length;
+        if (byteLength === undefined) throw new EngineError("engine:source_index_read_invalid", "Validated source read has no byte length.");
+        const contentBlobId = stableId("content", { content_hash: read.observation.observed_content_hash, byte_length: byteLength });
+        const version: ArtifactVersionInput = {
+          artifact_version_id: stableId("artifact-version", { artifact_id: artifact.artifact_id, observation_id: observation.source_observation_id, content_hash: read.observation.observed_content_hash }),
+          workspace_id: batch.workspace_id,
+          artifact_id: artifact.artifact_id,
+          content_blob_id: contentBlobId,
+          content_hash: read.observation.observed_content_hash,
+          byte_length: byteLength,
+          encoding: read.text === undefined && read.stream?.media_type === "application/octet-stream" ? "binary" : "utf-8",
+          ...(read.text === undefined && read.stream?.media_type === "application/octet-stream" ? {} : { language_hint: "text" }),
+          analysis_metadata_digest: read.observation.observed_metadata_digest,
+          created_from_observation_id: observation.source_observation_id,
+          valid_from_generation: generation,
+        };
+        if (read.bytes !== undefined) contents.push({ content_blob_id: contentBlobId, bytes: read.bytes, media_type: read.text === undefined ? "application/octet-stream" : "text/plain; charset=utf-8" });
+        else if (read.stream !== undefined) {
+          if (read.stream.reused_existing === true || read.stream.chunks === undefined) throw new EngineError("engine:source_index_read_invalid", "A changed source occurrence cannot reuse an existing CAS blob.");
+          contentStreams.push({ content_blob_id: contentBlobId, stream: read.stream.chunks, content_hash: read.stream.content_hash, byte_length: read.stream.byte_length, media_type: read.stream.media_type, ...(read.stream.after_read === undefined ? {} : { after_read: read.stream.after_read }) });
+        }
+        versions.push(version);
+        if (priorAbsence) {
+          const closingChange = stableId("artifact-change", { kind: priorAbsence.tombstone.absence_kind === "excluded" ? "reincluded" : "recreated", batch_id: batch.observation_batch_id, artifact_id: artifact.artifact_id });
+          tombstoneClosures.push({ ...priorAbsence.tombstone, valid_to_generation: generation, closing_artifact_change_id: closingChange, replacement_artifact_version_id: version.artifact_version_id });
+          planned.absent.delete(read.observation.normalized_uri);
+        }
+        planned.present.set(read.observation.normalized_uri, { artifact, version });
       }
-    }
+
+      if (mayDelete) {
+        const observedUris = completeObservedUris ?? new Set(reads.map((read) => read.observation.normalized_uri));
+        for (const [uri, occurrence] of [...planned.present]) {
+          if (observedUris.has(uri) || !scopes.some((scope) => scopeContainsUri(scope, uri))) continue;
+          changed = true;
+          versionClosures.push({ ...occurrence.version, valid_to_generation: generation });
+          const tombstone = this.newTombstone(occurrence, batch, generation, "deleted", { cause_type: "artifact_version", cause_id: occurrence.version.artifact_version_id });
+          tombstones.push(tombstone);
+          planned.present.delete(uri);
+          planned.absent.set(uri, { artifact: occurrence.artifact, tombstone });
+        }
+      }
+    });
 
     changed ||= stagedChanges;
     // Fragment rows are stamped for the pending generation but the source

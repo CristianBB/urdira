@@ -4,7 +4,7 @@ import { LogicalDigestWriter } from "@urdira/canonical";
 import type { CandidateMaterialization, CandidateProjectionTemplate, IndexCandidate, ProjectionWorkItem, ProposedRecord } from "@urdira/contracts";
 import { canonicalBytes, digestBytes } from "@urdira/canonical";
 import { canonicalSha256 as pluginCanonicalSha256 } from "@urdira/plugin-sdk";
-import { CandidateMaterializer, compactAcceptedFactDelta, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
+import { CandidateMaterializer, CandidateRecordTemplateAccumulator, compactAcceptedFactDelta, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
 
 const candidate = (): IndexCandidate => ({ candidate_generation_id: "candidate:materialization", workspace_id: "workspace:1", target_registry_snapshot_id: "registry:target", target_configuration_revision_id: "config:target", trigger_kind: "source_change", state: "ready", source_observation_batch_ids: [], issue_ids: [], created_at: "2026-08-10T00:00:00.000Z" });
 
@@ -338,6 +338,90 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
       expect(descriptor.comparator_version).toBe("1");
       expect(descriptor.element_schema_version).toBe("1");
     }
+  });
+
+  // (3a) MUST-ADD determinism test: `CandidateRecordTemplateAccumulator` is
+  // an additive incremental twin of `recordTemplates`'s no-prior-authority
+  // fast branch -- `seal()` uses it only when it applies cleanly, falling
+  // back to the untouched one-shot path otherwise. Feeds the SAME two
+  // compacted deltas one at a time, in the OPPOSITE order from
+  // `accepted_deltas` itself (exercising `matchesAcceptedDeltas`'s
+  // order-independence), and asserts the resulting sealed materialization is
+  // byte-identical -- ids, digests, template arrays, and descriptors -- to
+  // sealing the identical input in one shot without an accumulator.
+  it("(3a) CandidateRecordTemplateAccumulator produces a byte-identical seal to the one-shot fast path, fed deltas out of order", () => {
+    const rawA = acceptedDelta([record("acc-a", "body-a")], { owner_artifact_id: "artifact:a", owner_artifact_version_id: "version:a" });
+    const rawB = acceptedDelta([record("acc-b", "body-b")], { owner_artifact_id: "artifact:b", owner_artifact_version_id: "version:b" });
+    const compactA = compactAcceptedFactDelta({ ...rawA, delta: { ...rawA.delta, fact_delta_id: "delta:acc-a", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] } } as unknown as AcceptedFactDelta);
+    const compactB = compactAcceptedFactDelta({ ...rawB, delta: { ...rawB.delta, fact_delta_id: "delta:acc-b", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] } } as unknown as AcceptedFactDelta);
+
+    const oneShot = new CandidateMaterializer().seal(input({ accepted_deltas: [compactA, compactB] }));
+
+    const accumulator = new CandidateRecordTemplateAccumulator("workspace:1", false);
+    accumulator.accept(compactB);
+    accumulator.accept(compactA);
+    const viaAccumulator = new CandidateMaterializer().seal(input({ accepted_deltas: [compactA, compactB] }), accumulator);
+
+    expect(viaAccumulator.materialization).toEqual(oneShot.materialization);
+    expect(viaAccumulator.record_opens).toEqual(oneShot.record_opens);
+    expect(viaAccumulator.record_closures).toEqual(oneShot.record_closures);
+    expect(viaAccumulator.identity_assignments).toEqual(oneShot.identity_assignments);
+    expect(viaAccumulator.reused_record_ids).toEqual(oneShot.reused_record_ids);
+    expect(viaAccumulator.record_dependencies).toEqual(oneShot.record_dependencies);
+    expect(viaAccumulator.lookup_bindings).toEqual(oneShot.lookup_bindings);
+    expect(viaAccumulator.absence_barrier_keys).toEqual(oneShot.absence_barrier_keys);
+    const sortedMemo = (memo: ReadonlyMap<unknown, { recordId: string; recordDigest: string }>): readonly { recordId: string; recordDigest: string }[] => [...memo.values()].sort((left, right) => left.recordId.localeCompare(right.recordId));
+    expect(sortedMemo(viaAccumulator.record_open_memo)).toEqual(sortedMemo(oneShot.record_open_memo));
+  });
+
+  // Same determinism gate, at the scale that actually exercises the packed
+  // identity encoding (>= PACKED_IDENTITY_THRESHOLD, see "retains large
+  // initial identity sets" above) and split across two deltas -- the fast
+  // path's dominant real-world case (a from-zero repository scan). Packed
+  // identity order is never re-sorted by an explicit key at seal time; it
+  // relies on `desired` (or, here, the accumulator's `finish()`) already
+  // being in global `proposal_record_key` order, which is exactly the
+  // property under test.
+  it("(3a) accumulator matches one-shot seal at packed-identity scale, split across deltas", () => {
+    const recordsA = Array.from({ length: 6_000 }, (_unused, index) => record(`acc-packed-a-${index}`, `body-a-${index}`));
+    const recordsB = Array.from({ length: 5_000 }, (_unused, index) => record(`acc-packed-b-${index}`, `body-b-${index}`));
+    const rawA = acceptedDelta(recordsA, { owner_artifact_id: "artifact:packed-a", owner_artifact_version_id: "version:packed-a" });
+    const rawB = acceptedDelta(recordsB, { owner_artifact_id: "artifact:packed-b", owner_artifact_version_id: "version:packed-b" });
+    const compactA = compactAcceptedFactDelta({ ...rawA, delta: { ...rawA.delta, fact_delta_id: "delta:packed-a", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] } } as unknown as AcceptedFactDelta);
+    const compactB = compactAcceptedFactDelta({ ...rawB, delta: { ...rawB.delta, fact_delta_id: "delta:packed-b", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] } } as unknown as AcceptedFactDelta);
+
+    const oneShot = new CandidateMaterializer().seal(input({ accepted_deltas: [compactA, compactB] }));
+    expect(oneShot.identity_assignments).toHaveLength(recordsA.length + recordsB.length);
+    expect(oneShot.identity_assignments[0]).toSatisfy((entry: unknown) => Array.isArray(entry) && entry[0] === "urdira:created-identity:v1");
+
+    const accumulator = new CandidateRecordTemplateAccumulator("workspace:1", false);
+    accumulator.accept(compactA);
+    accumulator.accept(compactB);
+    const viaAccumulator = new CandidateMaterializer().seal(input({ accepted_deltas: [compactA, compactB] }), accumulator);
+
+    expect(viaAccumulator.identity_assignments).toEqual(oneShot.identity_assignments);
+    expect(viaAccumulator.record_opens).toEqual(oneShot.record_opens);
+    expect(viaAccumulator.materialization).toEqual(oneShot.materialization);
+  });
+
+  // A candidate that turns out ineligible mid-stream (any record is a
+  // generic, non-compacted `ProposedRecord`) must disqualify the accumulator
+  // and fall back to the untouched general path -- never a partial or wrong
+  // result. Feeds one compacted and one generic delta.
+  it("(3a) a generic (non-compacted) record disqualifies the accumulator; seal() falls back to the unchanged general path", () => {
+    const compactSource = acceptedDelta([record("acc-mixed-compact", "body")], { owner_artifact_id: "artifact:mixed-a", owner_artifact_version_id: "version:mixed-a" });
+    const compact = compactAcceptedFactDelta({ ...compactSource, delta: { ...compactSource.delta, fact_delta_id: "delta:mixed-compact", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] } } as unknown as AcceptedFactDelta);
+    const generic = acceptedDelta([record("acc-mixed-generic", "body")], { owner_artifact_id: "artifact:mixed-b", owner_artifact_version_id: "version:mixed-b" });
+
+    const oneShot = new CandidateMaterializer().seal(input({ accepted_deltas: [compact, generic] }));
+
+    const accumulator = new CandidateRecordTemplateAccumulator("workspace:1", false);
+    accumulator.accept(compact);
+    accumulator.accept(generic);
+    expect(accumulator.isDisqualified).toBe(true);
+    const viaAccumulator = new CandidateMaterializer().seal(input({ accepted_deltas: [compact, generic] }), accumulator);
+
+    expect(viaAccumulator).toEqual(oneShot);
   });
 
   // Decision 05 (content-derived record identity): ProposedRecord carries no

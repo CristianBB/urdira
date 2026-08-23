@@ -45,7 +45,11 @@ async function filesFromPayload(payload: unknown, casRoot?: string, options: { r
       // `readFile` already returns a Buffer (a Uint8Array view). Keep that
       // native view; wrapping it in `new Uint8Array(...)` would copy every
       // source before the single UTF-8 decode below.
-      const bytes = await readFile(join(casRoot!, "sha256", hex.slice(0, 2), hex.slice(2, 4), hex.slice(4)));
+      // Single-level shard layout (`sha256/<2-hex>/<62-hex>`): must mirror
+      // `casObjectRelativeParts` in `packages/storage/src/cas.ts` exactly.
+      // This package cannot import that helper (layer 2 cannot depend on
+      // `@urdira/storage`, `architecture/manifest.json`).
+      const bytes = await readFile(join(casRoot!, "sha256", hex.slice(0, 2), hex.slice(2)));
       if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== hash) throw new Error(`Worker CAS source ${hash} failed digest verification.`);
       text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     }

@@ -21,8 +21,13 @@ publication.
 The v3 index-status response derives these booleans; they are not independent
 stored flags:
 
-- `source_ready`: source availability is `available`, completeness is
-  `complete`, and freshness is `equivalent` to current source.
+- `source_ready`: source availability is `available` (a source-index state
+  exists). This can be true while completeness is `partial` and freshness is
+  `changes_pending`: the catalog writes its state row from the FIRST
+  reconciliation fragment of a scan, not only once the scan's completion
+  fragment lands, so `source_ready` can go true well before a large scan's
+  catalog work finishes. Completeness reaches `complete` and freshness
+  reaches `equivalent` only once no scan is reconciling this workspace.
 - `structural_ready`: structural availability and completeness are complete,
   and the structural snapshot is based on the current source snapshot.
 - `semantic_ready`: semantic availability and completeness are complete, and

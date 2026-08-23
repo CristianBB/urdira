@@ -1,18 +1,23 @@
 /**
- * Opt-in, near-zero-overhead wall-clock instrumentation for the storage
- * package's write-path hotspots (CAS blob writes, installation-catalog CAS
- * metadata, source cataloging, candidate publication). Disabled by default;
- * enabled by setting `URDIRA_STORAGE_DEBUG_TIMING=1`, in which case
- * `[urdira] storage timings ...` lines are emitted to stderr from the call
- * sites that consume `snapshotTimings`/`resetTimings` (see
- * `packages/storage/src/source-index.ts` and `packages/storage/src/storage.ts`).
+ * Local, minimal counterpart to `@urdira/storage`'s
+ * `packages/storage/src/debug-timing.ts` (same shape, same
+ * `URDIRA_STORAGE_DEBUG_TIMING=1` gate), not imported from it -- `debug-timing.ts`
+ * is not part of `@urdira/storage`'s `exports` map (only `.` is), so there is
+ * no clean import path into it from `@urdira/engine` even though engine is a
+ * higher architecture layer that may otherwise depend on storage
+ * (`architecture/manifest.json`). `packages/daemon/src/runtime.ts` carries the
+ * same local counterpart for the identical reason (see its
+ * `readinessTimingEnabled` comment).
  *
- * This exists to attribute wall time within a scan's `source_catalog` and
- * `publish` stages (already timed at the stage level by
- * `packages/engine/src/workspace-indexing-session.ts`) to specific
- * sub-operations -- per-blob filesystem fsyncs, installation-catalog
- * metadata commits, and SQLite transaction wall time -- without adding any
- * dependency or changing behavior when the flag is unset.
+ * Exists to attribute wall time spent inside `GenericSourceIndexer.apply`
+ * (`packages/engine/src/source-indexer.ts`) that is NOT already inside one of
+ * `@urdira/storage`'s own `commitInternal` buckets (CAS put loop, SQL,
+ * metadata, directory fsync) -- specifically the provider read round-trip
+ * per observation, per-batch digest verification, and per-fragment row/stream
+ * assembly -- so a `URDIRA_STORAGE_DEBUG_TIMING=1` run's storage timing lines
+ * and these engine timing lines can be summed against the `source_catalog`
+ * stage total logged by `workspace-indexing-session.ts` to find any remaining
+ * unattributed time.
  */
 
 interface Bucket {
@@ -23,9 +28,9 @@ interface Bucket {
 const buckets = new Map<string, Bucket>();
 
 export function timingEnabled(): boolean {
-  // Read the flag at call time rather than module load time. The composed CLI
-  // parses --debug-timing before creating a daemon/runtime, while this module
-  // can already have been imported by the application entrypoint.
+  // Read the flag at call time, matching storage's debug-timing.ts: the
+  // composed CLI parses --debug-timing before creating a daemon/runtime,
+  // while this module can already have been imported by the entrypoint.
   return process.env["URDIRA_STORAGE_DEBUG_TIMING"] === "1";
 }
 
@@ -43,7 +48,7 @@ export async function timed<T>(bucket: string, action: () => Promise<T>): Promis
   }
 }
 
-/** Synchronous counterpart of {@link timed} for builders with no await points. */
+/** Synchronous counterpart of {@link timed} for call sites with no await points. */
 export function timedSync<T>(bucket: string, action: () => T): T {
   if (!timingEnabled()) return action();
   const startedAt = performance.now();
@@ -59,8 +64,8 @@ export function timedSync<T>(bucket: string, action: () => T): T {
 
 /**
  * Adds an already-measured duration (in ms) to `bucket`. For spans that
- * cross an await boundary `timed`/`timedSync` can't wrap directly -- e.g.
- * time spent queued before a callback starts running -- the caller takes
+ * cross an await boundary `timed`/`timedSync` can't wrap directly -- e.g. a
+ * handoff between two independently-invoked callbacks -- the caller takes
  * its own `performance.now()` reading at each end of the span (itself
  * gated on {@link timingEnabled} so it costs nothing when the flag is off)
  * and reports the difference here.

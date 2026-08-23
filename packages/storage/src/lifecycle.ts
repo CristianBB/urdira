@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, relative, resolve } from "node:path";
 import { computeDigest, computeDigestOverArrayPayload, computeDigestOverMapPayloadWithArrayField, decodeCanonical, digestBytes, digestLogicalValue, encodeCanonical } from "@urdira/canonical";
 import type { ProjectionSetDigestEntry, RetentionLease, SnapshotExpirationMarker, SnapshotRetentionPin, SourceReference } from "@urdira/contracts";
-import type { ContentAddressedStore, BlobStore } from "./cas.js";
+import { casObjectRelativeParts, writeCasLayoutMarker, type ContentAddressedStore, type BlobStore } from "./cas.js";
 import { StorageError } from "./errors.js";
 import { noFaults, type FaultInjector } from "./faults.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteValue } from "./sqlite.js";
@@ -392,14 +392,52 @@ async function syncNamespace(directory: string, installedFile: string): Promise<
 }
 async function removeTree(path: string): Promise<void> { await rm(path, { recursive: true, force: true }); }
 
+/**
+ * Pre-flattening (two-level shard) CAS relative path segments, kept only to
+ * probe backup archives written before the single-level shard layout
+ * (`casObjectRelativeParts` in `./cas.js`). Never used to write a path.
+ */
+function legacyCasObjectRelativeParts(contentHash: string): readonly [string, string, string, string] {
+  const hex = contentHash.slice("sha256:".length);
+  return ["sha256", hex.slice(0, 2), hex.slice(2, 4), hex.slice(4)];
+}
+
+/**
+ * Resolves a CAS object's actual path inside a backup/restore directory's
+ * `cas/` tree. Backup archives are immutable, read-only content, and one
+ * predating the shard flattening still has its objects at the legacy
+ * two-level path, so the new-layout path is preferred and the legacy path is
+ * probed only when it is missing. Every caller of the resolved path
+ * digest-verifies the bytes against `contentHash`, so reading an old-layout
+ * backup by content hash is safe either way.
+ */
+async function resolveCasObjectPathInBackup(backupDirectory: string, contentHash: string): Promise<string> {
+  const primary = join(backupDirectory, "cas", ...casObjectRelativeParts(contentHash));
+  if (await pathExists(primary)) return primary;
+  return join(backupDirectory, "cas", ...legacyCasObjectRelativeParts(contentHash));
+}
+
+async function readCasObjectFromBackup(backupDirectory: string, contentHash: string): Promise<Uint8Array> {
+  return new Uint8Array(await readFile(await resolveCasObjectPathInBackup(backupDirectory, contentHash)));
+}
+
 export function storageFilesystemEntryName(prefix: string, logicalId: string): string {
   if (!/^[a-z][a-z0-9-]*$/.test(prefix) || logicalId.length === 0) throw new StorageError("storage:path_invalid", "Physical storage entry inputs are invalid.");
   return `${prefix}-${digestBytes(new TextEncoder().encode(logicalId)).slice("sha256:".length)}`;
 }
 
+/**
+ * Parses a `<2-hex-char shard>/<62-hex-char rest>` path relative to the
+ * `cas/sha256` root back into its content hash. Only the current
+ * single-level shard layout is accepted here: `listCasHashes` below only
+ * ever walks a root that `DurableStorage.open`'s layout-marker check has
+ * already verified is current (`storage.ts`'s `enforceCasLayoutMarker`), so
+ * there is no live single-level-shard root that could still hold a
+ * two-level path.
+ */
 export function casHashFromStorageRelativePath(relativePath: string): string | undefined {
   const components = relativePath.split(/[\\/]/);
-  const hex = components.length === 3 ? components.join("") : "";
+  const hex = components.length === 2 ? components.join("") : "";
   return /^[0-9a-f]{64}$/.test(hex) ? `sha256:${hex}` : undefined;
 }
 
@@ -818,8 +856,7 @@ export class StorageMaintenance {
   async repair(request: RepairRequest): Promise<RepairResult> {
     if (request.component_kind === "cas") {
       if (!request.backup_directory) throw new StorageError("storage:repair_source_missing", "Exact CAS repair requires a verified backup directory.");
-      const source = join(request.backup_directory, "cas", "sha256", request.component_id.slice(7, 9), request.component_id.slice(9, 11), request.component_id.slice(11));
-      const payload = new Uint8Array(await readFile(source));
+      const payload = await readCasObjectFromBackup(request.backup_directory, request.component_id);
       if (digestBytes(payload) !== request.component_id) throw new StorageError("storage:repair_source_corrupt", `Backup object ${request.component_id} failed verification.`);
       await this.cas.put(payload, { content_hash: request.component_id });
       await this.cas.read(request.component_id);
@@ -884,8 +921,7 @@ export class StorageMaintenance {
         if (!row) throw new StorageError("storage:repair_component_missing", `Vector projection ${request.component_id} is missing from the verified backup.`);
         const shard = await backupDb.get<{ shard_id: string; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string; byte_length: number; content_hash: string; storage_reference: string; created_at: string }>("SELECT shard_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at FROM vector_shards WHERE workspace_id = ? AND shard_id = ?", [this.workspaceId, row.shard_id]);
         if (!shard) throw new StorageError("storage:repair_component_missing", `Vector shard ${row.shard_id} is missing from the verified backup.`);
-        const shardPath = join(request.backup_directory, "cas", "sha256", shard.content_hash.slice(7, 9), shard.content_hash.slice(9, 11), shard.content_hash.slice(11));
-        const shardBytes = new Uint8Array(await readFile(shardPath));
+        const shardBytes = await readCasObjectFromBackup(request.backup_directory, shard.content_hash);
         if (digestBytes(shardBytes) !== shard.content_hash) throw new StorageError("storage:repair_source_corrupt", `Backup vector shard ${shard.content_hash} failed verification.`);
         await unlink(this.cas.objectPath(shard.content_hash)).catch((error) => { if (!isMissing(error)) throw error; });
         await this.cas.put(shardBytes, { content_hash: shard.content_hash });
@@ -980,9 +1016,10 @@ export class StorageMaintenance {
       const executionIds = await this.database.all<{ query_execution_id: string }>("SELECT query_execution_id FROM query_executions WHERE workspace_id = ? ORDER BY query_execution_id", [this.workspaceId]);
       const manifest: { workspace_id: string; database_file: string; database_digest: string; catalog_file: string; catalog_digest: string; content_hashes: string[]; execution_ids: string[] } = { workspace_id: this.workspaceId, database_file: "workspace.sqlite", database_digest: digestBytes(databaseBytes), catalog_file: "catalog.sqlite", catalog_digest: digestBytes(catalogBytes), content_hashes: [...hashes].sort(), execution_ids: executionIds.map((row) => row.query_execution_id) };
       await mkdir(join(staging, "cas"), { recursive: true });
+      await writeCasLayoutMarker(join(staging, "cas"));
       for (const contentHash of manifest.content_hashes) {
         const source = this.cas.objectPath(contentHash);
-        const target = join(staging, "cas", "sha256", contentHash.slice(7, 9), contentHash.slice(9, 11), contentHash.slice(11));
+        const target = join(staging, "cas", ...casObjectRelativeParts(contentHash));
         await mkdir(dirname(target), { recursive: true });
         await copyFile(source, target);
         await syncFile(target);
@@ -1011,13 +1048,14 @@ export class StorageMaintenance {
     try {
       await this.verifyBackupDirectory(source);
       await mkdir(join(staging, "cas"), { recursive: true });
+      await writeCasLayoutMarker(join(staging, "cas"));
       await copyFile(join(source, manifest.database_file), join(staging, "workspace.sqlite"));
       await syncFile(join(staging, "workspace.sqlite"));
       if (manifest.catalog_file) { await copyFile(join(source, manifest.catalog_file), join(staging, "catalog.sqlite")); await syncFile(join(staging, "catalog.sqlite")); }
       for (const contentHash of manifest.content_hashes) {
-        const target = join(staging, "cas", "sha256", contentHash.slice(7, 9), contentHash.slice(9, 11), contentHash.slice(11));
+        const target = join(staging, "cas", ...casObjectRelativeParts(contentHash));
         await mkdir(dirname(target), { recursive: true });
-        await copyFile(join(source, "cas", "sha256", contentHash.slice(7, 9), contentHash.slice(9, 11), contentHash.slice(11)), target);
+        await copyFile(await resolveCasObjectPathInBackup(source, contentHash), target);
         await syncFile(target);
       }
       await copyFile(join(source, "manifest.json"), join(staging, "manifest.json"));
@@ -1076,8 +1114,8 @@ export class StorageMaintenance {
       } finally { await catalog.close(); }
     }
     for (const contentHash of manifest.content_hashes) {
-      const content = await readFile(join(directory, "cas", "sha256", contentHash.slice(7, 9), contentHash.slice(9, 11), contentHash.slice(11)));
-      if (digestBytes(new Uint8Array(content)) !== contentHash) throw new StorageError("storage:backup_corrupt", `Backup CAS object ${contentHash} failed verification.`);
+      const content = await readCasObjectFromBackup(directory, contentHash);
+      if (digestBytes(content) !== contentHash) throw new StorageError("storage:backup_corrupt", `Backup CAS object ${contentHash} failed verification.`);
     }
   }
 

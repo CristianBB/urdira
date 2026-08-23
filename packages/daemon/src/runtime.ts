@@ -58,6 +58,16 @@ export interface DaemonRuntimeOptions {
   /** Maximum concurrent CAS writes during source ingestion (default 16). */
   readonly cas_put_concurrency?: number;
   /**
+   * SQLite busy-wait ceiling for `indexingStorage`'s connections (default
+   * 5000, see `DurableStorageOptions.busyTimeoutMs`). Test-only seam: lets a
+   * regression test shrink the window `workspaceReadiness`'s `openWorkspace`
+   * call blocks on SQLITE_BUSY against a concurrent long-running write
+   * transaction, so the test observes the flap without waiting out a real
+   * 5s default. Not read from any environment variable by the composing
+   * application today.
+   */
+  readonly busy_timeout_ms?: number;
+  /**
    * Whether a successful workspace scan submits a post-ready lexical
    * maintenance job (see `scheduleWorkspaceScan`'s `submitLexicalMaintenance`
    * below, and `reconcileLexicalProjection`, `@urdira/engine`'s
@@ -599,6 +609,71 @@ interface WorkspaceReadiness {
   readonly retry_after_ms?: number;
 }
 
+// Rate-limits the warning below to at most one line per workspace per
+// `READINESS_WARN_INTERVAL_MS`: `workspaceReadiness` is polled roughly every
+// 500ms per workspace (`core:index_status`, query admission), so logging
+// every DB failure unratelimited would spam stderr for the full duration of
+// any transient condition -- the canonical case being SQLITE_BUSY from
+// `openWorkspace`'s own writes (schema/identity bookkeeping, lease
+// acquisition) colliding with a concurrent long-running publish write
+// transaction.
+const READINESS_WARN_INTERVAL_MS = 10_000;
+const lastReadinessWarnAt = new Map<string, number>();
+function warnReadinessDbFailure(workspaceId: string, error: unknown, servingLastKnown: boolean): void {
+  const now = Date.now();
+  const last = lastReadinessWarnAt.get(workspaceId);
+  if (last !== undefined && now - last < READINESS_WARN_INTERVAL_MS) return;
+  lastReadinessWarnAt.set(workspaceId, now);
+  const outcome = servingLastKnown
+    ? "serving the last-known readiness snapshot until the next successful poll"
+    : "reporting source_ready=false until the next successful poll";
+  console.warn(`[urdira] workspaceReadiness could not read source state for workspace ${workspaceId} (code=${scanFailureErrorCode(error)}) -- ${outcome}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+}
+
+/**
+ * Last-known-good readiness inputs, keyed by workspace id: updated on every
+ * successful `workspaceReadiness` DB read, consulted only from the catch
+ * branch below for any failure that is NOT `storage:workspace_not_found`
+ * (see that branch's comment). Module-level like `lastReadinessWarnAt`
+ * above -- `workspaceReadiness` is a free function shared by every
+ * `DaemonRuntime` instance in this process, so there is no natural
+ * per-instance home for it without threading a cache handle through every
+ * call site. Evicted alongside `lastReadinessWarnAt` on `core:workspace_remove`
+ * (see that handler) so a removed workspace cannot keep serving a stale
+ * snapshot forever.
+ */
+interface LastKnownSourceState {
+  readonly sourceState: Awaited<ReturnType<WorkspaceDatabase["sourceIndex"]["getState"]>>;
+  readonly structuralGeneration: number | undefined;
+  readonly structuralStageId: string | undefined;
+  readonly structuralStageOrdinal: number | undefined;
+  readonly structuralStageCount: number | undefined;
+}
+const lastKnownSourceState = new Map<string, LastKnownSourceState>();
+
+// Local, minimal counterpart to `@urdira/storage`'s `debug-timing.ts`
+// (checked via the same `URDIRA_STORAGE_DEBUG_TIMING=1` flag, but not
+// imported from it -- `debug-timing.ts` is not part of `@urdira/storage`'s
+// `exports` map, only `.` is, so there is no clean import path into it from
+// here). Exists purely so a later VS Code timing run can see readiness-poll
+// DB-section latency (`workspaceReadiness`'s `openWorkspace`...`close` span)
+// alongside storage's own timing lines; reports a running total every
+// `READINESS_TIMING_REPORT_INTERVAL` polls instead of per-poll, to stay
+// near-zero overhead when enabled and silent (no line at all) otherwise.
+function readinessTimingEnabled(): boolean {
+  return process.env["URDIRA_STORAGE_DEBUG_TIMING"] === "1";
+}
+const READINESS_TIMING_REPORT_INTERVAL = 100;
+let readinessPollCount = 0;
+let readinessPollMsTotal = 0;
+function recordReadinessPollMs(ms: number): void {
+  readinessPollCount += 1;
+  readinessPollMsTotal += ms;
+  if (readinessPollCount % READINESS_TIMING_REPORT_INTERVAL === 0) {
+    console.error(`[urdira] readiness_poll db_section_ms_total=${Math.round(readinessPollMsTotal)} count=${readinessPollCount} avg_ms=${(readinessPollMsTotal / readinessPollCount).toFixed(1)}`);
+  }
+}
+
 /**
  * Derives v3 readiness from durable source state, the published structural
  * snapshot, and the asynchronous semantic marker. The booleans deliberately
@@ -620,7 +695,15 @@ async function workspaceReadiness(
   let structuralStageCount: number | undefined;
   try {
     if (storage === undefined) throw new Error("storage unavailable");
-    const database = await storage.openWorkspace(workspace.workspace_id);
+    const dbSectionStartedAt = readinessTimingEnabled() ? performance.now() : undefined;
+    // Read-only: never contends with a held publish write transaction on
+    // this workspace's own database (see `openWorkspaceReadOnly`'s doc
+    // comment). This used to be `storage.openWorkspace`, whose own writes
+    // (schema/identity bookkeeping, lease acquisition) queue behind a
+    // long-running publish transaction and hit SQLITE_BUSY past the busy
+    // timeout -- that was "the flap": `source_ready` flipping false for the
+    // whole duration of every publish transaction.
+    const database = await storage.openWorkspaceReadOnly(workspace.workspace_id);
     try {
       sourceState = await database.sourceIndex.getState();
       if (workspace.current_snapshot_id !== undefined) {
@@ -634,9 +717,47 @@ async function workspaceReadiness(
       }
     } finally {
       await database.close().catch(() => undefined);
+      if (dbSectionStartedAt !== undefined) recordReadinessPollMs(performance.now() - dbSectionStartedAt);
     }
-  } catch {
-    sourceState = undefined;
+    // Remember this successful read: the catch branch below falls back to
+    // it for any transient failure that is not a genuine "workspace
+    // unregistered/missing" (see that branch's comment).
+    lastKnownSourceState.set(workspace.workspace_id, { sourceState, structuralGeneration, structuralStageId, structuralStageOrdinal, structuralStageCount });
+  } catch (error) {
+    if (scanFailureErrorCode(error) === "storage:workspace_not_found") {
+      // Genuinely unregistered, or its database file is missing (crash
+      // mid-registration): there is no last-known reading that means
+      // anything here, and nothing to protect against flapping -- report
+      // unavailable, exactly as before.
+      sourceState = undefined;
+      structuralGeneration = undefined;
+      structuralStageId = undefined;
+      structuralStageOrdinal = undefined;
+      structuralStageCount = undefined;
+      warnReadinessDbFailure(workspace.workspace_id, error, false);
+    } else {
+      // Any other failure (SQLITE_BUSY, a transient SQL error against a
+      // database mid-registration, a worker hiccup, ...) is presumed
+      // transient: serve the last successfully computed readiness instead
+      // of flapping `source_ready` false underneath every in-flight
+      // query/status poll -- monotone availability, once a workspace has
+      // been seen ready a single failed poll must not make it regress.
+      const lastKnown = lastKnownSourceState.get(workspace.workspace_id);
+      if (lastKnown) {
+        sourceState = lastKnown.sourceState;
+        structuralGeneration = lastKnown.structuralGeneration;
+        structuralStageId = lastKnown.structuralStageId;
+        structuralStageOrdinal = lastKnown.structuralStageOrdinal;
+        structuralStageCount = lastKnown.structuralStageCount;
+      } else {
+        sourceState = undefined;
+        structuralGeneration = undefined;
+        structuralStageId = undefined;
+        structuralStageOrdinal = undefined;
+        structuralStageCount = undefined;
+      }
+      warnReadinessDbFailure(workspace.workspace_id, error, lastKnown !== undefined);
+    }
   }
 
   const source = sourceState;
@@ -663,6 +784,18 @@ async function workspaceReadiness(
     ? []
     : [structuralStale ? "core:source_snapshot_changed" : scanRunning ? "core:analysis_in_progress" : structuralUnsupported ? "core:plugin_unavailable" : "core:structural_snapshot_unavailable"];
   const semanticReasonCodes = semanticReady ? [] : [structuralUnsupported ? "core:plugin_unavailable" : structuralReady ? "core:semantic_indexing_in_progress" : "core:structural_required"];
+  // `sourceIndex.getState()` returns a row from the workspace's FIRST
+  // catalog fragment onward, not only after the completion fragment: every
+  // batch (partial or complete) writes/updates the `source_index_state` row
+  // (`stateCommands` in `source-index.ts`), it just leaves `current_generation`
+  // pinned to the prior value until the completion fragment (see the comment
+  // above `committedGeneration` in `source-indexer.ts`) advances it. So
+  // `sourceAvailable` alone does not mean "the catalog scan finished" -- a
+  // scan can be running for a long time (a large repo's `176s` catalog, in
+  // the trace that motivated this) while `sourceAvailable` has already been
+  // true since its first fragment landed (`41s` in that same trace). Label
+  // that window honestly instead of claiming "complete"/"equivalent".
+  const sourceCatalogSettling = sourceAvailable && scanRunning && !structuralReady;
   return {
     source_ready: sourceReady,
     syntax_ready: syntaxReady,
@@ -672,9 +805,9 @@ async function workspaceReadiness(
     ...(sourceSnapshotId === undefined ? {} : { source_snapshot_id: sourceSnapshotId }),
     ...(workspace.current_snapshot_id === undefined ? {} : { structural_snapshot_id: workspace.current_snapshot_id, ...(sourceSnapshotId === undefined ? {} : { structural_source_snapshot_id: sourceSnapshotId }) }),
     source_availability: sourceAvailable ? "available" : "unavailable",
-    source_completeness: sourceAvailable ? "complete" : "unknown",
-    source_freshness: sourceAvailable ? "equivalent" : "degraded",
-    source_build_state: sourceAvailable ? "idle" : workspace.status === "indexing" ? "building" : "not_started",
+    source_completeness: sourceAvailable ? (sourceCatalogSettling ? "partial" : "complete") : "unknown",
+    source_freshness: sourceAvailable ? (sourceCatalogSettling ? "changes_pending" : "equivalent") : "degraded",
+    source_build_state: sourceAvailable ? (sourceCatalogSettling ? "building" : "idle") : workspace.status === "indexing" ? "building" : "not_started",
     structural_availability: structuralReady || structuralStageId !== undefined ? "available" : "unavailable",
     structural_completeness: structuralReady ? "complete" : structuralStageId !== undefined ? "partial" : structuralUnsupported ? "unsupported" : "unknown",
     structural_freshness: structuralReady ? "equivalent" : structuralStale ? "changes_pending" : "degraded",
@@ -1198,7 +1331,7 @@ export class DaemonRuntime {
       // (e.g. tests exercising only the registry/IPC surface) keep today's
       // registry-only, fire-and-forget `beginReconciliation` behavior.
       indexingStorage = options.workspace_registry && options.resolve_plugin_provider
-        ? await createDurableStorage({ rootDir: options.data_root, ...(options.cas_put_concurrency === undefined ? {} : { cas_put_concurrency: options.cas_put_concurrency }) })
+        ? await createDurableStorage({ rootDir: options.data_root, ...(options.cas_put_concurrency === undefined ? {} : { cas_put_concurrency: options.cas_put_concurrency }), ...(options.busy_timeout_ms === undefined ? {} : { busyTimeoutMs: options.busy_timeout_ms }) })
         : undefined;
       // `core:query`/`core:query_continue` reuse `indexingStorage` to open
       // (and cache, per `acquireWorkspaceQueryEngine` above) the target
@@ -2186,6 +2319,14 @@ export class DaemonRuntime {
           const removed = options.workspace_registry.remove(workspace.workspace_id);
           await watcherManager?.stop(removed.workspace_id);
           await indexingStorage?.catalog.markWorkspaceRemoved({ ...removed, source_provider_bindings: [removed.provider] });
+          // Evict `workspaceReadiness`'s module-level caches (rate-limit
+          // timestamp, last-known-good snapshot) so a removed workspace id
+          // cannot keep serving a stale readiness snapshot forever, and a
+          // later re-add of the SAME id (a fresh registration can mint an
+          // identical id if the caller controls `create_id`) starts cold
+          // instead of inheriting a dead workspace's last reading.
+          lastReadinessWarnAt.delete(removed.workspace_id);
+          lastKnownSourceState.delete(removed.workspace_id);
           // Evict and close any cached `core:query` handle so a removed
           // workspace does not keep an open `WorkspaceDatabase` around for
           // the rest of this runtime's lifetime (see `acquireWorkspaceQueryEngine`).

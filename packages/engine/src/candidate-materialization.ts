@@ -24,6 +24,7 @@ import type { SourceCandidatePlan } from "./source-candidate-planning.js";
 import type { MaterializationAcceptedFactDelta, MaterializationProposedRecord, BaseCandidateRecord } from "./fact-delta.js";
 import type { BaseCandidateProjection } from "./candidate-planning.js";
 import type { ProviderWatermark, SnapshotCapabilityStateEntry, CandidateWorkManifest } from "@urdira/contracts";
+import { timedSync } from "./debug-timing.js";
 
 export interface CandidateMaterializationInput {
   readonly candidate: IndexCandidate;
@@ -78,6 +79,23 @@ export interface ValidatedProjectionReplacementSet {
   readonly projection_set_digest: string;
 }
 
+/**
+ * The per-record id/digest pair `storage/publication-authority.ts`'s
+ * `memoizeRecordOpens`/`parseRecordOpens` would otherwise re-derive by
+ * `JSON.parse`ing and re-hashing `record_without_validity` (see decision 11
+ * and that file's own doc comments). `recordTemplates`/
+ * `CandidateRecordTemplateAccumulator` below already compute both values
+ * directly from the source record on every open -- this type just carries
+ * them out-of-band so publish can look them up instead of recomputing them
+ * (3c). Structurally identical to storage's own internal `RecordOpenMemoEntry`;
+ * kept as a separate declaration rather than an import so this package does
+ * not need to depend on `@urdira/storage`'s internals for a two-field shape.
+ */
+export interface CandidateRecordOpenMemoEntry {
+  readonly recordId: string;
+  readonly recordDigest: string;
+}
+
 export interface SealedCandidateMaterialization {
   readonly materialization: CandidateMaterialization;
   readonly reused_record_ids: readonly string[];
@@ -91,6 +109,8 @@ export interface SealedCandidateMaterialization {
   readonly projection_dependencies: readonly CandidateProjectionDependencyTemplate[];
   readonly reused_projection_record_ids: readonly string[];
   readonly absence_barrier_keys: readonly string[];
+  /** Keyed by object identity of each entry in `record_opens` (3c). */
+  readonly record_open_memo: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>;
 }
 
 function freeze<T>(value: T): T {
@@ -310,7 +330,10 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
   readonly closures: readonly CandidateRecordClosureTemplate[];
   readonly identities: readonly CandidateIdentityAssignmentTemplate[];
   readonly proposal_record_ids: ReadonlyMap<string, string>;
+  /** 3c: id/digest of every pushed open, keyed by that exact template object. */
+  readonly record_open_memo: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>;
 } {
+  const recordOpenMemo = new Map<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>();
   const desired = scopeRecords(input);
   const workspaceId = input.candidate.workspace_id;
   const noPriorRecordAuthority = input.base_records.length === 0
@@ -332,7 +355,9 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
       const recordContentDigest = recordDigest(record);
       const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
       if (retainEveryProposalId || dependencyProposalKeys.has(record.proposal_record_key)) proposalRecordIds.set(record.proposal_record_key, recordId);
-      opens.push({ record_without_validity: record.canonical_record, open_reason_code: "core:record_created", owner_artifact_id: owner.owner_artifact_id, owner_artifact_version_id: owner.owner_artifact_version_id, cause_references: causes(owner.owner_artifact_id), record_id_hint: recordId, record_digest_hint: recordContentDigest } as CandidateRecordOpenTemplate);
+      const openTemplate = { record_without_validity: record.canonical_record, open_reason_code: "core:record_created", owner_artifact_id: owner.owner_artifact_id, owner_artifact_version_id: owner.owner_artifact_version_id, cause_references: causes(owner.owner_artifact_id), record_id_hint: recordId, record_digest_hint: recordContentDigest } as CandidateRecordOpenTemplate;
+      opens.push(openTemplate);
+      recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
       if (packIdentities) {
         identities.push([
           PACKED_CREATED_IDENTITY_MARKER,
@@ -364,6 +389,7 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
       closures: [],
       identities: packIdentities ? identities : sortOwned(identities, (entry) => entry.identity_assignment_id),
       proposal_record_ids: proposalRecordIds,
+      record_open_memo: recordOpenMemo,
     };
   }
   const base = matchingBaseRecords(input);
@@ -460,7 +486,9 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
     // `record_without_validity` carries the canonical JSON of exactly the digest
     // input above, so storage (`memoizeRecordOpens`, publication-authority.ts)
     // re-derives the identical id byte-for-byte from the template alone.
-    opens.push({ record_without_validity: hasSalt ? canonicalJson(digestInput) : isMaterializationProposedRecord(record) ? record.canonical_record : canonicalJson(record), open_reason_code: previous === undefined ? "core:record_created" : "core:record_replaced", ...(previous === undefined ? {} : { previous_record_id: previous.record_id }), owner_artifact_id: owner.owner_artifact_id, owner_artifact_version_id: owner.owner_artifact_version_id, cause_references: causes(owner.owner_artifact_id), record_id_hint: newRecordId, record_digest_hint: newRecordDigest } as CandidateRecordOpenTemplate);
+    const openTemplate = { record_without_validity: hasSalt ? canonicalJson(digestInput) : isMaterializationProposedRecord(record) ? record.canonical_record : canonicalJson(record), open_reason_code: previous === undefined ? "core:record_created" : "core:record_replaced", ...(previous === undefined ? {} : { previous_record_id: previous.record_id }), owner_artifact_id: owner.owner_artifact_id, owner_artifact_version_id: owner.owner_artifact_version_id, cause_references: causes(owner.owner_artifact_id), record_id_hint: newRecordId, record_digest_hint: newRecordDigest } as CandidateRecordOpenTemplate;
+    opens.push(openTemplate);
+    recordOpenMemo.set(openTemplate, { recordId: newRecordId, recordDigest: newRecordDigest });
     if (previous?.identity_type !== undefined && previous.identity_id !== undefined) identities.push({
       identity_assignment_id: digest({ record_id: newRecordId, identity_key: record.identity_key }),
       workspace_id: workspaceId,
@@ -513,7 +541,7 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
     }
   }
 
-  return { reused: sorted(reused, (entry) => entry), opens: sorted(opens, (entry) => String((entry as unknown as Record<string, unknown>)["record_id_hint"] ?? entry.record_without_validity)), closures: sorted(closures, (entry) => entry.record_id), identities: sorted(identities, (entry) => entry.identity_assignment_id), proposal_record_ids: proposalRecordIds };
+  return { reused: sorted(reused, (entry) => entry), opens: sorted(opens, (entry) => String((entry as unknown as Record<string, unknown>)["record_id_hint"] ?? entry.record_without_validity)), closures: sorted(closures, (entry) => entry.record_id), identities: sorted(identities, (entry) => entry.identity_assignment_id), proposal_record_ids: proposalRecordIds, record_open_memo: recordOpenMemo };
 }
 
 function projectionTemplates(input: CandidateMaterializationInput): { readonly opens: readonly CandidateProjectionOpenTemplate[]; readonly closures: readonly CandidateProjectionClosureTemplate[]; readonly reused: readonly string[] } {
@@ -830,28 +858,235 @@ function orderedSetDescriptor(elementType: string, entries: readonly unknown[]):
   };
 }
 
+interface FastPathIdentityRaw {
+  readonly identityType: "entity" | "relation" | "diagnostic";
+  readonly identityKey: string;
+  readonly recordId: string;
+  readonly ownerArtifactId: string;
+  readonly ownerArtifactVersionId: string;
+  /** Carried only to reproduce `desired`'s global proposal_record_key order at finish() (see below). */
+  readonly proposalRecordKey: string;
+}
+
+/**
+ * (3a) Additive, incremental twin of `recordTemplates`'s "no prior record
+ * authority" fast branch (the one-shot path stays completely unchanged and
+ * is still what every other caller -- and `seal()` itself, when this isn't
+ * supplied or doesn't apply -- goes through). Eligible ONLY for a candidate
+ * with zero base/global-identity/absence-barrier authority (a genuine first
+ * scan: `workspace-indexing-session.ts` only ever constructs one when
+ * `currentState === undefined`, which is exactly when those three are
+ * guaranteed empty without waiting for the DB reads that confirm it) and
+ * whose records are all the compacted `MaterializationProposedRecord` shape.
+ * `accept()` is called once per accepted delta as the delta arrives (during
+ * the analysis/acceptance loop, overlapping with that loop's own I/O awaits)
+ * instead of once for the whole candidate at the end, so the dominant
+ * per-record cost -- `recordDigest`'s canonical-encode-and-hash of the
+ * record body -- lands on the main thread while other awaited work is in
+ * flight, rather than as one 60+ second blocking tail.
+ *
+ * DETERMINISM: per-record output (open template, identity raw fields,
+ * proposal-id entry) depends only on that record and its own delta/scope --
+ * never on any other delta -- so accepting deltas one at a time or all at
+ * once produces the identical unordered result set. The one order-sensitive
+ * piece is packed identity tuples, which `recordTemplates` never re-sorts
+ * because it relies on `desired` (all records, globally sorted by
+ * `proposal_record_key`) already being in that order before its loop runs;
+ * `finish()` reproduces that exact order with an explicit sort keyed by
+ * `proposalRecordKey`, so insertion order during accumulation is irrelevant.
+ * `dependencyProposalKeys` is computed per accepted delta (not globally, as
+ * `recordTemplates` does) -- safe because `fact-delta.ts`'s own acceptance
+ * validation already guarantees a delta's `proposed_dependencies` only ever
+ * reference that same delta's own `proposal_record_key`s (see
+ * `validateAcceptedFactDelta`'s "not locally resolvable" check), so the
+ * global and per-delta sets agree on every key that could possibly matter.
+ */
+export class CandidateRecordTemplateAccumulator {
+  private readonly workspaceId: string;
+  private readonly retainEveryProposalId: boolean;
+  private disqualified = false;
+  private readonly acceptedDeltas: MaterializationAcceptedFactDelta[] = [];
+  private readonly opens: CandidateRecordOpenTemplate[] = [];
+  private readonly identityRaw: FastPathIdentityRaw[] = [];
+  private readonly proposalRecordIds = new Map<string, string>();
+  private readonly recordOpenMemo = new Map<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>();
+
+  constructor(workspaceId: string, retainEveryProposalId: boolean) {
+    this.workspaceId = workspaceId;
+    this.retainEveryProposalId = retainEveryProposalId;
+  }
+
+  get isDisqualified(): boolean { return this.disqualified; }
+  get acceptedDeltaCount(): number { return this.acceptedDeltas.length; }
+
+  /**
+   * Whether this accumulator's accepted deltas are exactly `deltas`, as a
+   * set of object references -- order-independent, since `finish()` below
+   * never relies on acceptance order (every order-sensitive output is
+   * explicitly re-sorted there). This lets the caller feed deltas in
+   * whatever order they naturally become available (e.g. interleaved with
+   * native-batch acceptance) rather than `input.accepted_deltas`'s own order.
+   */
+  matchesAcceptedDeltas(deltas: readonly MaterializationAcceptedFactDelta[]): boolean {
+    if (this.acceptedDeltas.length !== deltas.length) return false;
+    const seen = new Set(this.acceptedDeltas);
+    return seen.size === this.acceptedDeltas.length && deltas.every((delta) => seen.has(delta));
+  }
+
+  matchesRetainEveryProposalId(retainEveryProposalId: boolean): boolean {
+    return this.retainEveryProposalId === retainEveryProposalId;
+  }
+
+  accept(delta: MaterializationAcceptedFactDelta): void {
+    this.acceptedDeltas.push(delta);
+    if (this.disqualified) return;
+    const dependencyProposalKeys = this.retainEveryProposalId ? undefined : (() => {
+      const keys = new Set<string>();
+      for (const dependency of delta.delta.proposed_dependencies ?? []) keys.add(dependency.proposal_record_key);
+      return keys;
+    })();
+    for (const set of delta.replacement_sets) {
+      for (const record of set.records) {
+        if (!isMaterializationProposedRecord(record)) {
+          // A generic (non-compacted) ProposedRecord disqualifies the whole
+          // candidate from this fast path, exactly like `desired.every(...)`
+          // in `recordTemplates`. Discard partial work; `seal()` falls back
+          // to the untouched general/one-shot path over the full input.
+          this.disqualified = true;
+          this.opens.length = 0;
+          this.identityRaw.length = 0;
+          this.proposalRecordIds.clear();
+          this.recordOpenMemo.clear();
+          return;
+        }
+        const identityType = identityTypeForCategory(record.category) ?? "entity";
+        const recordContentDigest = recordDigest(record);
+        const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
+        if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.proposalRecordIds.set(record.proposal_record_key, recordId);
+        const openTemplate = { record_without_validity: record.canonical_record, open_reason_code: "core:record_created", owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id, cause_references: causes(record.owner_artifact_id), record_id_hint: recordId, record_digest_hint: recordContentDigest } as CandidateRecordOpenTemplate;
+        this.opens.push(openTemplate);
+        this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
+        this.identityRaw.push({ identityType, identityKey: record.identity_key, recordId, ownerArtifactId: record.owner_artifact_id, ownerArtifactVersionId: record.owner_artifact_version_id, proposalRecordKey: record.proposal_record_key });
+      }
+    }
+  }
+
+  /**
+   * Sort, freeze, and (for a small candidate) compute the two identity
+   * digests `recordTemplates`'s packed branch defers past the threshold --
+   * the only work left for the final synchronous pass. Throws if called
+   * while disqualified; callers must check `isDisqualified` first (`seal()`
+   * does, via the eligibility check that also calls this).
+   */
+  finish(): { readonly reused: readonly string[]; readonly opens: readonly CandidateRecordOpenTemplate[]; readonly closures: readonly CandidateRecordClosureTemplate[]; readonly identities: readonly CandidateIdentityAssignmentTemplate[]; readonly proposal_record_ids: ReadonlyMap<string, string>; readonly record_open_memo: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry> } {
+    if (this.disqualified) throw new CandidateMaterializationError("core:dependency_validation_failed", "CandidateRecordTemplateAccumulator.finish() called after disqualification.", {});
+    const opens = sortOwned(this.opens, (entry) => String((entry as unknown as Record<string, unknown>)["record_id_hint"] ?? entry.record_without_validity));
+    const packIdentities = this.identityRaw.length >= PACKED_IDENTITY_THRESHOLD;
+    const identities: CandidateIdentityAssignmentTemplate[] = packIdentities
+      ? sortOwned([...this.identityRaw], (entry) => entry.proposalRecordKey).map((raw) => ([
+          PACKED_CREATED_IDENTITY_MARKER,
+          this.workspaceId,
+          raw.identityType,
+          raw.identityKey,
+          raw.recordId,
+          raw.ownerArtifactId,
+          raw.ownerArtifactVersionId,
+        ] as unknown as CandidateIdentityAssignmentTemplate))
+      : sortOwned(this.identityRaw.map((raw) => ({
+          identity_assignment_id: digest({ record_id: raw.recordId, identity_key: raw.identityKey }),
+          workspace_id: this.workspaceId,
+          identity_type: raw.identityType,
+          identity_id: `${raw.identityType}:${digest({ identity_key: raw.identityKey }).slice("sha256:".length)}`,
+          assignment_kind: "created",
+          identity_key: raw.identityKey,
+          identity_key_digest: digest(raw.identityKey),
+          record_id: raw.recordId,
+          owner_artifact_id: raw.ownerArtifactId,
+          owner_artifact_version_id: raw.ownerArtifactVersionId,
+        }) as CandidateIdentityAssignmentTemplate), (entry) => entry.identity_assignment_id);
+    return { reused: [], opens, closures: [], identities, proposal_record_ids: this.proposalRecordIds, record_open_memo: this.recordOpenMemo };
+  }
+}
+
 export class CandidateMaterializer {
   constructor(_options: CandidateMaterializerOptions = {}) {}
 
-  seal(input: CandidateMaterializationInput): SealedCandidateMaterialization {
+  /**
+   * `accumulator`: an optional, pre-fed `CandidateRecordTemplateAccumulator`
+   * (3a) covering exactly `input.accepted_deltas`. Used only when it applies
+   * cleanly (matching deltas, matching `retainEveryProposalId`, and `input`
+   * itself has no base/global-identity/absence-barrier authority); otherwise
+   * ignored and the untouched one-shot `recordTemplates` path runs, so a
+   * mismatched or absent accumulator can never change the result, only the
+   * cost of producing it.
+   */
+  seal(input: CandidateMaterializationInput, accumulator?: CandidateRecordTemplateAccumulator): SealedCandidateMaterialization {
     const owners = recordOwners(input);
-    const records = recordTemplates(input, owners);
-    const bindings = validateBindings(input, records.proposal_record_ids, owners);
-    const projections = projectionTemplates(input);
-    const recordDependencies = freeze(bindings.record_dependencies);
-    const lookupBindings = freeze(bindings.lookup_bindings);
+    const retainEveryProposalId = (input.record_dependencies?.length ?? 0) > 0 || (input.lookup_bindings?.length ?? 0) > 0 || (input.projection_dependencies?.length ?? 0) > 0;
+    const accumulatorEligible = accumulator !== undefined
+      && !accumulator.isDisqualified
+      && accumulator.matchesRetainEveryProposalId(retainEveryProposalId)
+      && accumulator.matchesAcceptedDeltas(input.accepted_deltas)
+      && input.base_records.length === 0
+      && (input.global_identity_records?.length ?? 0) === 0
+      && (input.absence_barriers?.length ?? 0) === 0;
+    // `seal_finish`: the dominant per-record cost inside `seal()` -- either
+    // the pre-fed accumulator's own `finish()` (3a's incremental-accept
+    // path) or, when ineligible, the one-shot `recordTemplates` pass over
+    // every accepted delta. Named separately from the outer `seal` bucket
+    // (`workspace-indexing-session.ts`) so it's possible to tell whether a
+    // slow seal is dominated by this record-templating work or by
+    // everything seal() does afterward (bindings, projections, digesting).
+    const records = timedSync("seal_finish", () => accumulatorEligible ? accumulator.finish() : recordTemplates(input, owners));
+    // `seal_validate_bindings`: `validateBindings`'s own record/lookup/
+    // projection-dependency validation -- including its unconditional
+    // `scopeRecords(input)` walk (the first, and only, full sort of every
+    // proposed record by `proposal_record_key` on the fast accumulator path,
+    // since `accumulator.finish()`, above, never calls it).
+    const bindings = timedSync("seal_validate_bindings", () => validateBindings(input, records.proposal_record_ids, owners));
+    // `seal_projection_templates`: near-zero whenever a scan has no
+    // projection authority to reconcile (the production JS/TS scan path
+    // never populates `accepted_projection_sets`/`base_projections`), kept
+    // as its own span so a registry that DOES use projections shows up
+    // distinctly instead of being folded into `seal_validate_bindings` or
+    // `seal_ordered_digests`.
+    const projections = timedSync("seal_projection_templates", () => projectionTemplates(input));
+    // `seal_freeze`: the deep-freeze pass over every produced template array.
+    // `freeze` (above) is recursive over `Object.values`, which for an array
+    // visits every element -- so `freeze(records.opens)`/`freeze(records.identities)`
+    // (potentially one entry per record in the whole candidate) each walk
+    // and freeze every open/identity-assignment object, not just the array
+    // reference. Named separately so a slow seal that is dominated by this
+    // recursive walk shows up distinctly from `seal_finish`'s
+    // record-templating or `seal_ordered_digests`'s content hashing below.
+    // `bindings.record_dependencies`/`bindings.lookup_bindings` are already
+    // frozen by `validateBindings` itself, so freezing them again here is a
+    // cheap `Object.isFrozen` no-op; included anyway so this bucket's total
+    // matches every `freeze` call between `seal_finish` and the materialization
+    // build, exactly as before this change.
+    const recordDependencies = timedSync("seal_freeze", () => freeze(bindings.record_dependencies));
+    const lookupBindings = timedSync("seal_freeze", () => freeze(bindings.lookup_bindings));
     const projectionDependencies = bindings.projection_dependencies;
-    const lookupRevalidations: readonly Readonly<Record<string, unknown>>[] = freeze([]);
+    const lookupRevalidations: readonly Readonly<Record<string, unknown>>[] = timedSync("seal_freeze", () => freeze([]));
     // Freeze the exact transport arrays before computing their descriptors.
     // @urdira/canonical can then memoize the digest against the immutable
     // array identity, allowing publication to verify the same in-process
     // materialization without encoding a million-entry set a second time.
-    const sourceTransitions = freeze([...input.source_plan.transitions]);
-    const recordOpens = freeze(records.opens);
-    const recordClosures = freeze(records.closures);
-    const identityAssignments = freeze(records.identities);
+    const sourceTransitions = timedSync("seal_freeze", () => freeze([...input.source_plan.transitions]));
+    const recordOpens = timedSync("seal_freeze", () => freeze(records.opens));
+    const recordClosures = timedSync("seal_freeze", () => freeze(records.closures));
+    const identityAssignments = timedSync("seal_freeze", () => freeze(records.identities));
     const barrierKeys = new Set((input.absence_barriers ?? []).map((entry) => `${entry.identity_type}\0${entry.identity_key}`));
-    const semanticPayload = {
+    // `seal_ordered_digests`: building each template set's `OrderedSetDescriptor`
+    // (`orderedSetDescriptor`, below -- an incremental `digestCanonicalArray`/
+    // `digestMappedCanonicalArray` pass over every entry in that set) plus
+    // this materialization's own top-level semantic digest. This is a
+    // separate full-corpus content-hashing pass over the very same
+    // (already-templated) records `seal_finish`/`seal_freeze` just built and
+    // froze -- not record-templating or freezing work itself, but the digest
+    // computation every one of those templates still needs before it can be
+    // durably published.
+    const semanticPayload = timedSync("seal_ordered_digests", () => ({
       workspace_id: input.candidate.workspace_id,
       // Materialization identity is candidate-salted so distinct candidates
       // (e.g. a plugin-upgrade generation over identical analysis output)
@@ -872,14 +1107,14 @@ export class CandidateMaterializer {
       artifact_dependency_template_set: canonicalJson(orderedSetDescriptor("core:RecordArtifactDependency", recordDependencies)),
       lookup_dependency_template_set: canonicalJson(orderedSetDescriptor("core:PluginLookupInvalidationDependency", lookupBindings)),
       lookup_revalidation_template_set: canonicalJson(orderedSetDescriptor("core:LookupRevalidationTemplate", lookupRevalidations)),
-    };
-    const semanticDigest = digest({ ...semanticPayload, projection_dependencies: projectionDependencies });
-    const materialization = freeze({
+    }));
+    const semanticDigest = timedSync("seal_ordered_digests", () => digest({ ...semanticPayload, projection_dependencies: projectionDependencies }));
+    const materialization = timedSync("seal_ordered_digests", () => freeze({
       candidate_materialization_id: `materialization:${semanticDigest.slice("sha256:".length)}`,
       ...semanticPayload,
       materialization_digest: semanticDigest,
-    });
-    return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: sourceTransitions, record_opens: recordOpens, record_closures: recordClosures, identity_assignments: identityAssignments, record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: lookupRevalidations, projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort() });
+    }));
+    return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: sourceTransitions, record_opens: recordOpens, record_closures: recordClosures, identity_assignments: identityAssignments, record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: lookupRevalidations, projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort(), record_open_memo: records.record_open_memo });
   }
 }
 

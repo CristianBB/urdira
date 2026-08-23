@@ -1,8 +1,9 @@
-import { cp, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { defaultDaemonOptions, runUrdira, URDIRA_VERSION, urdiraHelp } from "../apps/urdira/src/index.js";
 import { DaemonClient, DaemonRuntime } from "../packages/daemon/src/index.js";
 import { JAVASCRIPT_TYPESCRIPT_PLUGIN_ID } from "../packages/plugin-javascript-typescript/src/index.js";
@@ -417,4 +418,139 @@ describe("Urdira application runner: real multi-file JavaScript/TypeScript works
       await rm(dataRoot, { recursive: true, force: true });
     }
   });
+});
+
+async function withEnv<T>(overrides: Readonly<Record<string, string | undefined>>, run: () => Promise<T>): Promise<T> {
+  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return await run();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+// The daemon-side `largeWorkspace` gate (`apps/urdira/src/index.ts`) and the
+// plugin worker's OWN bounded-syntax gate (`isLargeSyntaxCorpus` in
+// `packages/plugin-javascript-typescript/src/analyzer.ts`, >= 512 files OR
+// >= 16MiB, no test seam) are independent thresholds that happen to agree in
+// production. `URDIRA_LARGE_WORKSPACE_ARTIFACT_THRESHOLD` only overrides the
+// former, so a K-shard stream test needs a fixture that ALSO crosses the
+// latter for real -- otherwise `dependencyGraph` stays undefined and
+// `effectiveLargeShardCount` forces 1 regardless of `URDIRA_ANALYSIS_LARGE_SHARDS`
+// (by design -- see that variable's comment). Crossing the >=16MiB leg with
+// few files/declarations (one padding comment per file, one real
+// declaration) keeps the published record set -- and so the `core:query`
+// response used to digest it -- well under the daemon's IPC frame cap,
+// unlike crossing the >=512-file leg with one declaration each.
+const SYNTHETIC_LARGE_WORKSPACE_FILE_COUNT = 20;
+const SYNTHETIC_LARGE_WORKSPACE_PADDING_BYTES = 900_000; // 20 * 900,000 = ~17.2MiB, safely over the 16MiB gate.
+
+async function writeSyntheticLargeWorkspace(root: string): Promise<void> {
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "@urdira-fixture/large-shard-synthetic", version: "1.0.0", private: true, type: "module" }, null, 2), "utf8");
+  await writeFile(join(root, "tsconfig.json"), JSON.stringify({ compilerOptions: { target: "ES2024", module: "NodeNext", moduleResolution: "NodeNext", rootDir: ".", strict: true, skipLibCheck: true }, include: ["src/**/*.ts"] }, null, 2), "utf8");
+  await mkdir(join(root, "src"), { recursive: true });
+  const padding = "x".repeat(SYNTHETIC_LARGE_WORKSPACE_PADDING_BYTES);
+  for (let index = 0; index < SYNTHETIC_LARGE_WORKSPACE_FILE_COUNT; index += 1) {
+    const name = `m${String(index).padStart(4, "0")}`;
+    await writeFile(join(root, "src", `${name}.ts`), `// padding: ${padding}\nexport function fn_${name}(): number { return ${index}; }\n`, "utf8");
+  }
+}
+
+// `URDIRA_ANALYSIS_WORKERS=1` pins the ordinary-path pool sizing low, so a
+// passing 2+-shard run only works if the pool's `max_active` was actually
+// widened for the large-shard stream (see `defaultDaemonOptions`'s
+// `Math.max(workerShards, analysisLargeWorkspaceShardCount())`).
+async function scanSyntheticLargeWorkspaceAndDigestRecords(largeShards: number): Promise<{ readonly digest: string; readonly count: number }> {
+  const dataRoot = await mkdtemp(join(tmpdir(), "urdira-shard-data-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-shard-ws-"));
+  let runtime: DaemonRuntime | undefined;
+  try {
+    return await withEnv({
+      URDIRA_ANALYSIS_LARGE_SHARDS: String(largeShards),
+      URDIRA_LARGE_WORKSPACE_ARTIFACT_THRESHOLD: "5",
+      URDIRA_ANALYSIS_WORKERS: "1",
+    }, async () => {
+      await writeSyntheticLargeWorkspace(workspaceRoot);
+      runtime = await DaemonRuntime.start(await withHashEmbeddingsProvider(() => defaultDaemonOptions(dataRoot)));
+      const client = new DaemonClient(runtime.endpoint);
+      const added = await client.call("core:workspace_add", {
+        args: [workspaceRoot],
+        confirmed: true,
+        selected_technology_ids: ["typescript"],
+        selected_plugin_ids: [JAVASCRIPT_TYPESCRIPT_PLUGIN_ID],
+      });
+      expect(added.outcome).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+      const status = await pollUntilReady(client, workspaceId, 120_000);
+      expect(status.workspace_status).toBe("ready");
+      const query = await queryAfterStagedPublication(client, workspaceId);
+      expect(query.outcome).toBe("success");
+      const names = [...recordNames(query.payload)].sort();
+      return { digest: createHash("sha256").update(JSON.stringify(names)).digest("hex"), count: names.length };
+    });
+  } finally {
+    if (runtime) await runtime.stop();
+    await rm(dataRoot, { recursive: true, force: true });
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+describe("Urdira application runner: large-workspace bounded-syntax K-shard stream", () => {
+  it("publishes a byte-identical record set whether the large-workspace stream runs 1 or 2 shards", async () => {
+    const single = await scanSyntheticLargeWorkspaceAndDigestRecords(1);
+    const multi = await scanSyntheticLargeWorkspaceAndDigestRecords(2);
+    expect(single.count).toBeGreaterThan(0);
+    expect(multi.count).toBe(single.count);
+    expect(multi.digest).toBe(single.digest);
+  }, 180_000);
+
+  it("demotes extra shards down to 1 under a tiny synthetic RSS budget, logs the demotion, and still completes the scan", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-shard-demote-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-shard-demote-ws-"));
+    let runtime: DaemonRuntime | undefined;
+    const loggedLines: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => { loggedLines.push(args.map((value) => String(value)).join(" ")); });
+    try {
+      await withEnv({
+        URDIRA_ANALYSIS_LARGE_SHARDS: "4",
+        URDIRA_LARGE_WORKSPACE_ARTIFACT_THRESHOLD: "5",
+        // 1 KiB is unreachable -- current process RSS is always far above
+        // it -- so every extra shard is demoted before it is ever spawned
+        // (the pre-spawn budget gate in `apps/urdira/src/index.ts`'s large-
+        // shard branch), deterministically exercising the demotion path
+        // without depending on scan timing or fixture size.
+        URDIRA_ANALYSIS_RSS_BUDGET_KIB: "1",
+      }, async () => {
+        await writeSyntheticLargeWorkspace(workspaceRoot);
+        runtime = await DaemonRuntime.start(await withHashEmbeddingsProvider(() => defaultDaemonOptions(dataRoot)));
+        const client = new DaemonClient(runtime.endpoint);
+        const added = await client.call("core:workspace_add", {
+          args: [workspaceRoot],
+          confirmed: true,
+          selected_technology_ids: ["typescript"],
+          selected_plugin_ids: [JAVASCRIPT_TYPESCRIPT_PLUGIN_ID],
+        });
+        expect(added.outcome).toBe("success");
+        const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+        const status = await pollUntilReady(client, workspaceId, 120_000);
+        expect(status.workspace_status).toBe("ready");
+        const query = await queryAfterStagedPublication(client, workspaceId);
+        expect(query.outcome).toBe("success");
+        expect(recordNames(query.payload).length).toBeGreaterThan(0);
+      });
+    } finally {
+      errorSpy.mockRestore();
+      if (runtime) await runtime.stop();
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+    expect(loggedLines.some((line) => line.includes("[urdira] analysis shard demotion") && line.includes("shards=1"))).toBe(true);
+  }, 180_000);
 });

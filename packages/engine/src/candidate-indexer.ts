@@ -33,6 +33,7 @@ import type {
   SourceCandidatePlan,
 } from "./source-candidate-planning.js";
 import { SourceCandidatePlanner } from "./source-candidate-planning.js";
+import { timed as timedEngine } from "./debug-timing.js";
 
 export type CandidateState = "queued" | "planning" | "analyzing" | "validating" | "projecting" | "ready" | "publishing" | "published" | "stale" | "failed" | "cleaning" | "cleaned";
 
@@ -303,22 +304,52 @@ export class CandidateIndexer {
       return { candidate_generation_id: trigger.candidate.candidate_generation_id, snapshot_id: trigger.frozen_base.snapshot_id ?? "", generation_manifest_id: "", generation, published_at: now(this.clock), status: "already_published", state: "published" };
     }
     const candidate = { ...trigger.candidate, state: "queued" } as IndexCandidate;
-    await this.options.workspace.candidates.insert(candidate, trigger.frozen_base);
-    if (trigger.frozen_base.generation !== undefined) await this.options.workspace.acquireBaseLease(candidate);
+    // `candidate_prepare`: everything from this run's own candidate-identity
+    // write through the "analyzing" transition -- `insert`/`acquireBaseLease`
+    // (below, outside the `try`) plus the "queued"->"planning" transition,
+    // `buildPlan`, `selectManifest`, and the "planning"->"analyzing"
+    // transition (inside it) -- none of which previously had a name of its
+    // own, so it only ever showed up as unattributed time inside the outer
+    // `publish` stage span (`workspace-indexing-session.ts`), ahead of
+    // `plugin_analyze`. Split across two calls under the same bucket name
+    // (which `timed`/`record`, `./debug-timing.js`, simply accumulate) so
+    // wrapping it does not move the "queued"->"planning" transition outside
+    // the `try` block below and change its exception handling.
+    await timedEngine("candidate_prepare", async () => {
+      await this.options.workspace.candidates.insert(candidate, trigger.frozen_base);
+      if (trigger.frozen_base.generation !== undefined) await this.options.workspace.acquireBaseLease(candidate);
+    });
     try {
-      await this.transition(candidate, "queued", "planning");
-      const plan = await this.buildPlan(trigger, candidate);
-      await this.options.workspace.candidates.selectManifest(candidate.candidate_generation_id, plan.manifest);
-      await this.transition(candidate, "planning", "analyzing", { analysis_started_at: now(this.clock) });
+      const plan = await timedEngine("candidate_prepare", async () => {
+        await this.transition(candidate, "queued", "planning");
+        const builtPlan = await this.buildPlan(trigger, candidate);
+        await this.options.workspace.candidates.selectManifest(candidate.candidate_generation_id, builtPlan.manifest);
+        await this.transition(candidate, "planning", "analyzing", { analysis_started_at: now(this.clock) });
+        return builtPlan;
+      });
       const accepted = await this.execute(trigger, candidate, plan);
       await this.transition(candidate, "analyzing", "validating");
       await this.transition(candidate, "validating", "projecting");
       const sealed = await this.seal(trigger, candidate, plan, accepted);
-      const templateSets = templateSetsFromSealed(sealed);
-      await this.options.workspace.candidates.saveMaterialization(candidate.candidate_generation_id, sealed.materialization, templateSets);
-      await this.transition(candidate, "projecting", "ready", { ready_at: now(this.clock), candidate_materialization_id: sealed.materialization.candidate_materialization_id, candidate_digest: sealed.materialization.materialization_digest });
-      await this.transition(candidate, "ready", "publishing");
-      const publicationInput = await this.publicationInput(trigger, candidate, trigger.frozen_base, sealed, templateSets);
+      // `publish_handoff_post`: everything between the sealed materialization
+      // coming back from `seal()` and `workspace.publishCandidate` actually
+      // being called -- persisting the sealed materialization
+      // (`candidates.saveMaterialization`, which reports its own nested
+      // `candidate_seal_persist` span), the "projecting" -> "ready" ->
+      // "publishing" state transitions, and building the
+      // `CandidatePublicationInput` itself (`publicationInput`, which
+      // reports its own nested `publication_input_build` span when the
+      // caller's `trigger.publication` is the timed callback
+      // `workspace-indexing-session.ts` supplies). None of this previously
+      // had a name of its own, so it only ever showed up as unattributed
+      // time inside the outer `publish` stage span.
+      const publicationInput = await timedEngine("publish_handoff_post", async () => {
+        const sets = templateSetsFromSealed(sealed);
+        await this.options.workspace.candidates.saveMaterialization(candidate.candidate_generation_id, sealed.materialization, sets);
+        await this.transition(candidate, "projecting", "ready", { ready_at: now(this.clock), candidate_materialization_id: sealed.materialization.candidate_materialization_id, candidate_digest: sealed.materialization.materialization_digest });
+        await this.transition(candidate, "ready", "publishing");
+        return await this.publicationInput(trigger, candidate, trigger.frozen_base, sealed, sets);
+      });
       const publication = await this.options.workspace.publishCandidate(publicationInput);
       await this.options.workspace.releaseBaseLease(candidate.candidate_generation_id);
       return { ...publication, state: "published" };
@@ -479,7 +510,11 @@ export class CandidateIndexer {
   private async publicationInput(trigger: CandidateRunTrigger, candidate: IndexCandidate, frozenBase: FrozenCandidateBaseTuple, sealed: SealedCandidateMaterialization, templateSets: CandidateTemplateSets): Promise<CandidatePublicationInput> {
     const materialization = sealed.materialization;
     const value = typeof trigger.publication === "function" ? await trigger.publication({ candidate, frozen_base: frozenBase, materialization, template_sets: templateSets }) : trigger.publication;
-    return { ...value, candidate: { ...value.candidate, state: "publishing" }, frozen_base: frozenBase, materialization, template_sets: templateSets };
+    // (3c) `sealed.record_open_memo` is keyed by the exact `record_opens`
+    // objects in `templateSets` (same array, no clone -- see
+    // `templateSetsFromSealed`), so it stays valid all the way into
+    // `buildCandidatePublicationPlan`'s own object-identity coverage check.
+    return { ...value, candidate: { ...value.candidate, state: "publishing" }, frozen_base: frozenBase, materialization, template_sets: templateSets, record_open_memo: sealed.record_open_memo };
   }
 
   private async transition(candidate: IndexCandidate, expected: string, next: CandidateState, patch: Readonly<Record<string, unknown>> = {}): Promise<void> {

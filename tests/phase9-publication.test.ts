@@ -19,7 +19,8 @@ import {
   type SqliteValue,
   type WorkspaceDatabase,
 } from "../packages/storage/src/index.js";
-import { buildCandidatePublicationPlan, buildForkPublicationPlan, buildManifestDescriptors, buildPublicationPlan, buildPublicationTransactionCommands, checkedPublicationCommand, computeSnapshotDigestFields, digestSortedRecordSet, jsonArray, logicalRecordSetDigest, manifestRow, publicationFaultCommand, publicationTransactionCommands, rowMatches, sameBytes, snapshotDigest, sqliteValue, toBytes, translateCompatibilityPublication, type ProjectionSetDigestCorpusEntry, type RecordSetDigestCorpusEntry } from "../packages/storage/src/publication-authority.js";
+import { buildCandidatePublicationPlan, buildForkPublicationPlan, buildManifestDescriptors, buildPublicationPlan, buildPublicationTransactionCommands, checkedPublicationCommand, coalesceAdjacentRuns, computeSnapshotDigestFields, digestSortedRecordSet, jsonArray, logicalRecordSetDigest, manifestRow, publicationFaultCommand, publicationTransactionCommands, rowMatches, sameBytes, snapshotDigest, sqliteValue, toBytes, translateCompatibilityPublication, type ProjectionSetDigestCorpusEntry, type RecordSetDigestCorpusEntry } from "../packages/storage/src/publication-authority.js";
+import type { SqliteCommand } from "../packages/storage/src/sqlite.js";
 import { compactPublicationPhase } from "../packages/storage/src/publication-compaction.js";
 
 const workspace = {
@@ -1166,6 +1167,117 @@ describe("Phase 9 durable candidate publication", () => {
     expect(bulkIndexBuild).toBeGreaterThan(streamed.findIndex((command) => command === identityRuns.at(-1)));
   });
 
+  it("coalesceAdjacentRuns merges only adjacent same-SQL run commands, preserving order and validating arity", () => {
+    const commands: SqliteCommand[] = [
+      { kind: "run", sql: "INSERT INTO a (x) VALUES (?)", params: [1] },
+      { kind: "run", sql: "INSERT INTO a (x) VALUES (?)", params: [2] },
+      { kind: "run", sql: "INSERT INTO a (x) VALUES (?)", params: [3] },
+      { kind: "transaction_checkpoint" },
+      // Same SQL text as the group above, but separated by a checkpoint --
+      // must NOT merge with it (adjacency-only, never cross-gap).
+      { kind: "run", sql: "INSERT INTO a (x) VALUES (?)", params: [4] },
+      { kind: "run", sql: "INSERT INTO b (y) VALUES (?)", params: [5] },
+      { kind: "assert_transaction_changes", expected: 1 },
+    ];
+    const coalesced = [...coalesceAdjacentRuns(commands)];
+    expect(coalesced).toEqual([
+      { kind: "run_batch", sql: "INSERT INTO a (x) VALUES (?)", rows: 3, params_flat: [1, 2, 3] },
+      { kind: "transaction_checkpoint" },
+      // A group of exactly one row stays a plain `run`, not a size-1 `run_batch`.
+      { kind: "run", sql: "INSERT INTO a (x) VALUES (?)", params: [4] },
+      { kind: "run", sql: "INSERT INTO b (y) VALUES (?)", params: [5] },
+      { kind: "assert_transaction_changes", expected: 1 },
+    ]);
+
+    const oversized: SqliteCommand[] = Array.from({ length: 3 }, (_, index) => ({ kind: "run" as const, sql: "INSERT INTO a (x) VALUES (?)", params: [index] }));
+    // Arity mismatch between two adjacent same-SQL commands (a producer bug,
+    // never legitimate) is rejected rather than silently misaligning params.
+    const mismatched: SqliteCommand[] = [...oversized, { kind: "run", sql: "INSERT INTO a (x) VALUES (?)", params: [1, 2] }];
+    expect(() => [...coalesceAdjacentRuns(mismatched)]).toThrow(/parameter counts/);
+  });
+
+  it("streams record_facets and record_closures through run_batch during a large publish, preserving every row and closing prior-generation records", async () => {
+    await withWorkspace(async (opened) => {
+      // `record_occurrences` FK-references (workspace_id, owner_artifact_id)
+      // -> source_artifacts and (workspace_id, owner_artifact_id,
+      // owner_artifact_version_id) -> artifact_versions -- unlike the
+      // plan-only "keeps a large record publication lazy" test above (which
+      // never executes SQL against a real database), this test publishes for
+      // real, so the owner artifact/version rows the streamed records
+      // reference must actually exist first.
+      await opened.database.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, artifact_kind) VALUES (?, ?, ?, ?)", ["artifact-facet-closure", workspace.workspace_id, "file:///facet-closure", "file"]);
+      await opened.database.run("INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", ["blob-facet-closure", "hash-facet-closure", 0, "inline"]);
+      await opened.database.run("INSERT INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)", ["batch-facet-closure", workspace.workspace_id, "binding-facet-closure", "test", "1", "test", "full", "[]", "complete", "authoritative", now, now, 1, 0, digest("batch-facet-closure")]);
+      await opened.database.run("INSERT INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash, observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)", ["observation-facet-closure", "batch-facet-closure", workspace.workspace_id, "artifact-facet-closure", "binding-facet-closure", "test", "1", "test", "full", "present", "hash-facet-closure", "metadata-facet-closure", now, now]);
+      await opened.database.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)", ["version-facet-closure", workspace.workspace_id, "artifact-facet-closure", "blob-facet-closure", "hash-facet-closure", 0, "utf8", null, "metadata-facet-closure", "observation-facet-closure", 0]);
+
+      // Generation 1: a handful of small, non-streaming records that
+      // generation 2 (below) will close. Published first so their record_ids
+      // are real rows `UPDATE record_occurrences ... valid_to_generation`
+      // can actually affect, not a no-op against nonexistent ids.
+      const priorRecords = Array.from({ length: 3 }, (_, index) => {
+        const record_without_validity = JSON.stringify({ category: "fact", kind: "prior", universal_kind: "prior", schema_version: 1, body: { index } });
+        const record_digest_hint = digestBytes(canonicalBytes(JSON.parse(record_without_validity)));
+        return { record_without_validity, owner_artifact_id: "artifact-facet-closure", owner_artifact_version_id: "version-facet-closure", record_id_hint: `record:${record_digest_hint.slice("sha256:".length)}`, record_digest_hint };
+      }).sort((left, right) => left.record_id_hint.localeCompare(right.record_id_hint));
+      const firstInput = withTemplateSets(publication("candidate-facet-closure-1", "facet-closure-1", initialBase), { record_opens: priorRecords });
+      const first = await publishStoredCandidate(opened, firstInput);
+      expect(first.generation).toBe(1);
+
+      // Generation 2: >= STREAMING_PUBLICATION_RECORD_THRESHOLD fresh records
+      // (forces the streaming lane), each carrying 2 facets -- record_facets
+      // has no windowed multi-row-VALUES batching of its own (unlike
+      // record_occurrences/identity_assignments), so this is the case
+      // `coalesceAdjacentRuns` exists for. `record_closures` targets
+      // generation 1's real record ids, so a genuinely-effective run_batch
+      // UPDATE (not a no-op) is exercised too.
+      const streamedCount = 2_048;
+      const facetsPerRecord = 2;
+      const streamedRecords = Array.from({ length: streamedCount }, (_, index) => {
+        const record_without_validity = JSON.stringify({ category: "fact", kind: "streaming-facets", universal_kind: "streaming-facets", schema_version: 1, body: { index }, facets: [`facet-${index}-a`, `facet-${index}-b`] });
+        const record_digest_hint = digestBytes(canonicalBytes(JSON.parse(record_without_validity)));
+        return { record_without_validity, owner_artifact_id: "artifact-facet-closure", owner_artifact_version_id: "version-facet-closure", record_id_hint: `record:${record_digest_hint.slice("sha256:".length)}`, record_digest_hint };
+      }).sort((left, right) => left.record_id_hint.localeCompare(right.record_id_hint));
+      const secondBaseWithoutDigest = { snapshot_id: first.snapshot_id, generation: first.generation, registry_snapshot_id: "registry-facet-closure-1", resolution_lock_id: "lock-facet-closure-1", configuration_revision_id: "configuration-facet-closure-1", source_state_digest: "source-initial", source_observation_batch_ids: [] };
+      const secondBase = { ...secondBaseWithoutDigest, tuple_digest: tupleDigest(secondBaseWithoutDigest) };
+      const secondInput = withTemplateSets(publication("candidate-facet-closure-2", "facet-closure-2", secondBase), {
+        record_opens: streamedRecords,
+        record_closures: priorRecords.map((record) => ({ record_id: record.record_id_hint })),
+      });
+      const second = await publishStoredCandidate(opened, secondInput);
+      expect(second.generation).toBe(2);
+
+      // Every streamed record's 2 facets persisted, matching what the
+      // per-record content actually said -- not merely a row count check.
+      const facetRows = await opened.database.all<{ record_id: string; facet_ordinal: number; facet: string }>("SELECT record_id, facet_ordinal, facet FROM record_facets ORDER BY record_id, facet_ordinal");
+      expect(facetRows).toHaveLength(streamedCount * facetsPerRecord);
+      const facetsByRecordId = new Map<string, string[]>();
+      for (const row of facetRows) {
+        const facets = facetsByRecordId.get(row.record_id) ?? [];
+        facets[row.facet_ordinal] = row.facet;
+        facetsByRecordId.set(row.record_id, facets);
+      }
+      for (const record of streamedRecords) {
+        const parsedFacets = (JSON.parse(record.record_without_validity) as { facets: string[] }).facets;
+        expect(facetsByRecordId.get(record.record_id_hint)).toEqual(parsedFacets);
+      }
+
+      // Generation 1's records are now closed at generation 2; the streamed
+      // records opened in generation 2 are not.
+      const priorRows = await opened.database.all<{ record_id: string; valid_to_generation: number | null }>(`SELECT record_id, valid_to_generation FROM record_occurrences WHERE record_id IN (${priorRecords.map(() => "?").join(",")}) ORDER BY record_id`, priorRecords.map((record) => record.record_id_hint));
+      expect(priorRows).toHaveLength(priorRecords.length);
+      expect(priorRows.every((row) => row.valid_to_generation === 2)).toBe(true);
+      const streamedOpenCount = await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM record_occurrences WHERE valid_from_generation = 2 AND valid_to_generation IS NULL");
+      expect(streamedOpenCount?.count).toBe(streamedCount);
+
+      // The snapshot committed with a real digest -- unaffected by command
+      // transport shape (digests are computed from `sortedVisible`/record
+      // sets before any command, chunked or not, is ever built).
+      const snapshotRow = await opened.database.get<{ snapshot_digest: string }>("SELECT snapshot_digest FROM snapshots WHERE snapshot_id = ?", [second.snapshot_id]);
+      expect(snapshotRow?.snapshot_digest.length).toBeGreaterThan(0);
+    });
+  }, 30_000);
+
   it("bounds large projection occurrence batches without dropping dependent values", async () => {
     const input = publication("candidate-authority-projection-streaming", "authority-projection-streaming", initialBase);
     const projections = Array.from({ length: 2_050 }, (_, index) => ({
@@ -1791,6 +1903,90 @@ describe("Phase 2 template-set descriptors and verifyIntegrity reconciliation", 
         expect(row.record_digest).toBe(expected.get(row.record_id));
       }
     });
+  });
+
+  // (3c) `CandidatePublicationInput.record_open_memo` -- what `candidate-indexer.ts`
+  // threads through from `CandidateMaterializer.seal()`'s own `sealed.record_open_memo`
+  // -- lets `buildCandidatePublicationPlan` skip re-parsing/re-hashing every
+  // `record_without_validity` (`memoizeRecordOpens`/`parseRecordOpens`) when it covers
+  // every `template_sets.record_opens` entry by object identity. Publishes the same
+  // fixture as the test above, this time WITH the memo supplied, and asserts the
+  // persisted `record_id`/`record_digest` columns are still byte-for-byte identical
+  // to the independently-computed recipe -- proving the memo path and the recompute
+  // path can never disagree, only cost differently.
+  it("(3c) a supplied record_open_memo publishes byte-identical record_id/record_digest to the recompute path", async () => {
+    await withWorkspace(async (opened) => {
+      const draftInput = publication("candidate-memo-carry", "memo-carry", initialBase);
+      const realSnapshotId = `snapshot:${draftInput.candidate.candidate_generation_id}`;
+      const registryDigest = computeDigest("core:registry_snapshot", "core:registry_snapshot_digest", 1, "core:RegistrySnapshotDigestPayload", 1, {
+        registry_snapshot_id: draftInput.target_registry.registry_snapshot_id,
+        registry_contract_version: draftInput.target_registry.registry_contract_version,
+        core_registry_digest: draftInput.target_registry.core_registry_digest,
+        resolution_lock_id: draftInput.target_resolution_lock.resolution_lock_id,
+        namespace_bindings: [],
+      });
+      const input: CandidatePublicationInput = {
+        ...draftInput,
+        target_registry: { ...draftInput.target_registry, registry_digest: registryDigest },
+        freshness_checkpoint: { ...draftInput.freshness_checkpoint, snapshot_id: realSnapshotId },
+      };
+      await opened.candidates.insert(input.candidate, input.frozen_base);
+      await seedReconciliationOwner(opened, workspace.workspace_id, "artifact-memo-carry", "version-memo-carry");
+      const records = Array.from({ length: 4 }, (_unused, index) => ({
+        category: "entity", kind: "test:symbol", universal_kind: "definition", schema_version: 1,
+        body: { name: `MemoCarryFixture${index}`, ordinal: index },
+      }));
+      const recordOpens = records.map((record) => ({ record_without_validity: JSON.stringify(record), open_reason_code: "core:record_created", owner_artifact_id: "artifact-memo-carry", owner_artifact_version_id: "version-memo-carry", cause_references: [] }));
+      // Exactly what `CandidateMaterializer.seal()` computes directly from the
+      // source record while sealing (`candidate-materialization.ts`'s
+      // `recordDigest`/`record_id_hint` construction), keyed by the same open
+      // template object -- never derived from `record_without_validity` here.
+      const recordOpenMemo = new Map(recordOpens.map((entry, index) => {
+        const recordDigest = digestBytes(canonicalBytes(records[index]));
+        return [entry, { recordId: `record:${recordDigest.slice("sha256:".length)}`, recordDigest }] as const;
+      }));
+      const templatedInput: CandidatePublicationInput = { ...withTemplateSets(input, { record_opens: recordOpens }), record_open_memo: recordOpenMemo };
+      await expect(opened.publishCandidate(templatedInput)).resolves.toMatchObject({ status: "published", generation: 1 });
+      const report = await opened.maintenance.verify();
+      expect(report.failures).toEqual([]);
+      expect(report.ok).toBe(true);
+      const rows = await opened.database.all<{ record_id: string; record_digest: string }>("SELECT record_id, record_digest FROM record_occurrences WHERE workspace_id = ?", [workspace.workspace_id]);
+      expect(rows).toHaveLength(records.length);
+      for (const record of records) {
+        const expectedId = `record:${digestBytes(canonicalBytes(record)).slice("sha256:".length)}`;
+        const expectedDigest = digestBytes(canonicalBytes(record));
+        const row = rows.find((candidateRow) => candidateRow.record_id === expectedId);
+        expect(row).toBeDefined();
+        expect(row!.record_digest).toBe(expectedDigest);
+      }
+    });
+  });
+
+  // (3c) CRITICAL INVARIANT (decision 13): a supplied `record_open_memo` only
+  // ever replaces the redundant `record_without_validity` re-parse/re-hash --
+  // it must never let a corrupted or stale template past
+  // `verifyTemplateSetAgainstDescriptor`'s independent digest check. This is
+  // the exact `storage:template_set_mismatch` fixture from the test above,
+  // but with a memo that "trusts" the corrupted entry supplied alongside it:
+  // if the memo were used to skip descriptor verification, this would wrongly
+  // publish instead of throwing.
+  it("(3c) a supplied record_open_memo does not bypass descriptor verification of a corrupted template", async () => {
+    const input = publication("candidate-template-set-mismatch-memo", "template-set-mismatch-memo", initialBase);
+    const corruptedEntry = { record_without_validity: JSON.stringify({ owner_artifact_id: "artifact-mismatch", owner_artifact_version_id: "version-mismatch", body: null }) };
+    const mismatchedInput: CandidatePublicationInput = {
+      ...input,
+      template_sets: { ...emptyTemplateSets, record_opens: [corruptedEntry] },
+      record_open_memo: new Map([[corruptedEntry, { recordId: "record:memo-trusted", recordDigest: `sha256:${"0".repeat(64)}` }]]),
+    } as CandidatePublicationInput;
+    await expect(buildCandidatePublicationPlan({
+      input: mismatchedInput,
+      storedCandidate: input.candidate as never,
+      workspaceId: workspace.workspace_id,
+      database: { get: async () => undefined, all: async () => [] } as never,
+      faults: createFaultInjector([]),
+      generation: 1,
+      publishedAt: now,
+    })).rejects.toMatchObject({ code: "storage:template_set_mismatch" });
   });
 
   it("computeSnapshotDigestFields' memo-less fallback digests identically to the memoized production path and skips malformed entries", async () => {

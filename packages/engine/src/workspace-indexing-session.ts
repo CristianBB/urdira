@@ -24,7 +24,8 @@ import {
   type CandidateRunTrigger,
 } from "./candidate-indexer.js";
 import type { CandidateExecutionDag, CandidatePlan, FrozenCandidateBaseTuple } from "./candidate-planning.js";
-import { CandidateMaterializer } from "./candidate-materialization.js";
+import { CandidateMaterializer, CandidateRecordTemplateAccumulator } from "./candidate-materialization.js";
+import { record as recordEngineTiming, resetTimings as resetEngineTimings, snapshotTimings as snapshotEngineTimings, timedSync as timedSyncEngine, timingEnabled as engineTimingEnabled } from "./debug-timing.js";
 import {
   DirectorySourceProvider,
   type EncodedObservationBatch,
@@ -651,7 +652,20 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // and on `applyBatch`'s `generation` computation
   // (`packages/engine/src/source-indexer.ts`) for why the stage-1 source
   // counter alone drifts behind this after a plugin-upgrade generation.
+  // `resetEngineTimings`/`snapshotEngineTimings` (`./debug-timing.js`, gated
+  // on the same `URDIRA_STORAGE_DEBUG_TIMING=1` flag as `@urdira/storage`'s
+  // own timing lines -- see that module's doc comment for why it's a local
+  // counterpart rather than an import) attribute wall time INSIDE this
+  // `source_catalog` span that isn't inside any of storage's own
+  // `commitInternal` buckets: `source_provider_read` (the provider round-trip
+  // per observation), `source_batch_digest_verify` (per-batch digest
+  // recomputation), and `source_fragment_assemble` (per-fragment row/stream
+  // construction) -- so a run can sum storage's `source_catalog` timing lines
+  // against this line and this stage's own wall time to see what remains
+  // unattributed.
+  if (engineTimingEnabled()) resetEngineTimings();
   sourceIndexResult = await timed("source_catalog", () => { throwIfCancelled(); return new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, allow_partial: enumeration.incremental, publication_current_generation: currentState?.current_generation ?? 0, ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }) }); });
+  if (engineTimingEnabled()) console.error(`[urdira] engine timings source_catalog workspace:${workspaceId} ms=${JSON.stringify(snapshotEngineTimings())}`);
   if (sourceIndexResult.status !== "published" && sourceIndexResult.status !== "equivalent") {
     throw new EngineError("engine:workspace_scan_source_index_degraded", `Source cataloging of ${input.root} did not complete (status ${sourceIndexResult.status}, error ${sourceIndexResult.error_code ?? "none"}).`);
   }
@@ -904,6 +918,25 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   };
 
   let analysis: WorkspaceScanAnalysisOutcome | undefined;
+  // (3a) Eligible only for a genuine first scan: `currentState === undefined`
+  // guarantees `seal`'s `baseRecords`/`globalIdentityRecords`/`absenceBarriers`
+  // (below) will all be empty -- the accumulator's own precondition -- without
+  // waiting for those DB reads to confirm it, since they're all `[] `
+  // literals in that branch already (see `seal`, below). This caller never
+  // supplies `record_dependencies`/`lookup_bindings`/`projection_dependencies`
+  // to `CandidateMaterializer.seal()`, so `retainEveryProposalId` is always
+  // `false` here. `seal()` re-validates every precondition itself before
+  // trusting this accumulator's output, so a wrong guess here only costs the
+  // optimization, never correctness.
+  const templateAccumulator = currentState === undefined ? new CandidateRecordTemplateAccumulator(workspaceId, false) : undefined;
+  // Marks the moment `execute` (below) finishes accepting this scan's
+  // analysis output; read back inside `seal` (below), right before the
+  // materializer's own `seal()` call, to report `publish_handoff_pre` --
+  // the wall time spent in `CandidateIndexer.run`'s two state transitions
+  // between them (`analyzing` -> `validating` -> `projecting`,
+  // `candidate-indexer.ts`) plus this closure's own prior-state reads and
+  // input marshalling, none of which is inside any other named bucket.
+  let handoffPreStartedAt = 0;
   const indexer = new CandidateIndexer({ workspace: createWorkspaceCandidatePort(database) });
   const stagePlanStartedAt = performance.now();
   const staged = await indexer.stageSourceBatch({
@@ -929,6 +962,17 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
       frozen_base: frozenBase,
       buildPlan: () => plan,
       execute: async (executingCandidate) => {
+        // `execute_non_analyze`: this whole callback's wall time minus the
+        // `plugin_analyze` span it wraps below -- everything else `execute`
+        // does (native-batch acceptance, feeding the template accumulator)
+        // that would otherwise show up only as unattributed time inside the
+        // outer `publish` stage span. `analyzeElapsedMs` is measured
+        // separately (immediately around the `plugin_analyze` call, below)
+        // rather than read back off `stageTimings["plugin_analyze"]`, since
+        // that map only ever accumulates a rounded running total and could
+        // already hold time from an earlier progressive-publication stage's
+        // own `plugin_analyze` call.
+        const executeStartedAt = engineTimingEnabled() ? performance.now() : 0;
         // `staged.plan.transitions` (the planner's actual diff, computed
         // above by `stageSourceBatch`) is the authoritative "what changed
         // this scan" set -- referencing `staged` here, inside a closure
@@ -973,10 +1017,46 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
             stageTimings["analyzed_artifact_count_before_plugin"] = selected.length;
             return selected;
           })();
+        const analyzeStartedAt = engineTimingEnabled() ? performance.now() : 0;
         analysis = await timed("plugin_analyze", () => input.plugin.analyze({ workspace_id: workspaceId, candidate: executingCandidate, artifacts: incrementalArtifacts, ...(changedArtifactIds === undefined ? {} : { changed_artifact_ids: changedArtifactIds }), ...(input.publication_stage_id === undefined ? {} : { publication_stage_id: input.publication_stage_id }) }));
+        const analyzeElapsedMs = engineTimingEnabled() ? performance.now() - analyzeStartedAt : 0;
+        // (3a) Feed each delta into the template accumulator as its native
+        // batch's own durable write confirms, keyed by `fact_delta_id` (the
+        // two lists aren't necessarily co-ordered). This puts the dominant
+        // per-record seal cost (`CandidateRecordTemplateAccumulator.accept`'s
+        // `recordDigest` calls) on the main thread WHILE the next batch's
+        // `acceptNativeFactDeltaBatch` awaits a SQLite worker-thread round
+        // trip, instead of leaving it all for one blocking pass at `seal`
+        // (below). `matchesAcceptedDeltas` (candidate-materialization.ts) is
+        // order-independent, so feeding native-batch deltas before any
+        // remaining non-native ones is safe.
+        const acceptedDeltasByFactDeltaId = templateAccumulator === undefined ? undefined : new Map(analysis.accepted_deltas.map((delta) => [delta.delta.fact_delta_id, delta] as const));
+        const accumulatorFed = templateAccumulator === undefined ? undefined : new Set<string>();
         for (const native of analysis.native_batches ?? []) {
+          // `accept_native_stage`: the SQLite worker-thread round trip that
+          // durably accepts one native FactDelta batch
+          // (`WorkspaceCandidateRepository.acceptNativeFactDeltaBatch`,
+          // `packages/storage/src/candidates.ts`) -- measured here, at the
+          // call site, rather than inside `candidates.ts` itself, because
+          // storage's own `URDIRA_STORAGE_DEBUG_TIMING` bucket map is reset
+          // the moment `publishCandidate`'s queued builder actually starts
+          // running (`storage.ts`'s `resetTimings()` immediately before
+          // `publishCandidateSerialized`), which is AFTER this loop already
+          // ran -- a storage-side span here would be silently wiped before
+          // ever being logged. Engine's own `debug-timing.ts` bucket map is
+          // instead reset once, right before `staged.publish()`
+          // (`resetEngineTimings()`, below in this file), so a span recorded
+          // here survives into the same `[urdira] engine timings publish
+          // ...` snapshot as `publish_handoff_pre`.
+          const nativeAcceptStartedAt = engineTimingEnabled() ? performance.now() : 0;
           await database.candidates.acceptNativeFactDeltaBatch(executingCandidate.candidate_generation_id, native.fact_delta_id, native.batch);
+          if (engineTimingEnabled()) recordEngineTiming("accept_native_stage", performance.now() - nativeAcceptStartedAt);
+          if (templateAccumulator !== undefined) {
+            const delta = acceptedDeltasByFactDeltaId!.get(native.fact_delta_id);
+            if (delta !== undefined) { templateAccumulator.accept(delta); accumulatorFed!.add(native.fact_delta_id); }
+          }
         }
+        if (templateAccumulator !== undefined) for (const delta of analysis.accepted_deltas) if (!accumulatorFed!.has(delta.delta.fact_delta_id)) templateAccumulator.accept(delta);
         stageTimings["analyzed_artifact_count"] = incrementalArtifacts.length;
         stageTimings["accepted_delta_count"] = analysis.accepted_deltas.length;
         // `seal` (below) only reads `knownArtifactVersions`, precomputed
@@ -985,6 +1065,10 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         // GC reclaim every file's text instead of it staying reachable for
         // the rest of the candidate run (materialization, publication).
         scannedArtifacts.length = 0;
+        if (engineTimingEnabled()) {
+          recordEngineTiming("execute_non_analyze", (performance.now() - executeStartedAt) - analyzeElapsedMs);
+          handoffPreStartedAt = performance.now();
+        }
         return [];
       },
       seal: async ({ candidate: sealedCandidate, plan: sealedPlan }) => {
@@ -1066,6 +1150,12 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         const scopedAbsenceBarriers = currentState === undefined ? [] : await timed("prior_state_scoped_absence", () => database.repositories.canonicalOccurrences.closedIdentitiesForOwners(currentState.current_generation, ownerArtifactIds));
         const globalAbsenceBarriers = currentState === undefined || identityKeys.length === 0 ? [] : await timed("prior_state_global_absence", () => database.repositories.canonicalOccurrences.closedIdentitiesForIdentityKeys(currentState.current_generation, identityKeys));
         const absenceBarriers = [...new Map([...scopedAbsenceBarriers, ...globalAbsenceBarriers].map((entry) => [`${entry.identity_type}\0${entry.identity_key}`, entry])).values()];
+        // (3a) `templateAccumulator` (constructed only when `currentState ===
+        // undefined`) was fed every accepted delta above, during `execute`.
+        // `seal()` independently re-checks its own eligibility -- matching
+        // accepted deltas, no base/global-identity/absence-barrier authority
+        // -- before trusting it, so it's passed through unconditionally here.
+        if (engineTimingEnabled()) recordEngineTiming("publish_handoff_pre", performance.now() - handoffPreStartedAt);
         return timed("seal", async () => new CandidateMaterializer().seal({
           candidate: sealedCandidate,
           manifest: sealedPlan.manifest,
@@ -1082,9 +1172,9 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
           known_artifact_versions: knownArtifactVersions,
           known_dependency_roles: input.plugin.dependency_roles,
           known_lookup_dependencies: [],
-        }));
+        }, templateAccumulator));
       },
-      publication: ({ candidate: publishingCandidate, frozen_base: publishingFrozenBase, materialization, template_sets }): CandidatePublicationInput => ({
+      publication: ({ candidate: publishingCandidate, frozen_base: publishingFrozenBase, materialization, template_sets }): CandidatePublicationInput => timedSyncEngine("publication_input_build", () => ({
         // These two fields must mirror the patch already applied by CandidateIndexer's
         // "projecting" -> "ready" transition (which rewrites the persisted candidate
         // payload), or storage's immutable-identity check rejects the publication.
@@ -1099,7 +1189,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         publication_kind: input.publication_stage_id === undefined ? "activation" : `structural_stage:${input.publication_stage_id}`,
         source_snapshot_id: `source-snapshot:${sourceIndexResult.generation}`,
         ...(input.publication_stage_id === undefined ? {} : { publication_stage_id: input.publication_stage_id, publication_stage_ordinal: input.publication_stage_ordinal, publication_stage_count: input.publication_stage_count }),
-      }),
+      })),
     } satisfies Omit<CandidateRunTrigger, "source_plan">,
   });
   if (preparedScan !== undefined) console.error(`[urdira] progressive stage plan complete workspace=${workspaceId} stage=${input.publication_stage_id ?? "unknown"}`);
@@ -1130,7 +1220,19 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
 
   if (input.publication_stage_id !== undefined) console.error(`[urdira] progressive stage publish start workspace=${workspaceId} stage=${input.publication_stage_id}`);
   throwIfCancelled();
+  // Same `resetEngineTimings`/`snapshotEngineTimings` pattern used around
+  // `source_catalog` above, mirrored here for `publish`: attributes wall
+  // time inside `staged.publish()` (`CandidateIndexer.run`,
+  // `candidate-indexer.ts`) that isn't inside `plugin_analyze`/`seal`
+  // (themselves timed above, inside the `execute`/`seal` trigger callbacks)
+  // or storage's own `publish_plan_build`/`publish_sql_transaction`/etc.
+  // (`@urdira/storage`'s own timing line) -- specifically the handoff spans
+  // either side of sealing (`publish_handoff_pre`/`publish_handoff_post`)
+  // and the storage writer's queueing (`publish_writer_queue_wait`, logged
+  // on storage's own line but sharing this same wall-clock window).
+  if (engineTimingEnabled()) resetEngineTimings();
   const result = await timed("publish", () => { throwIfCancelled(); return staged.publish(); });
+  if (engineTimingEnabled()) console.error(`[urdira] engine timings publish workspace:${workspaceId} ms=${JSON.stringify(snapshotEngineTimings())}`);
   if (input.publication_stage_id !== undefined) console.error(`[urdira] progressive stage publish complete workspace=${workspaceId} stage=${input.publication_stage_id}`);
   if (!("state" in result)) throw new EngineError("engine:workspace_scan_no_changes", `No candidate changes were staged for workspace ${workspaceId}; nothing was published.`);
   stageTimings[input.publication_stage_id === undefined ? "structural_ready_ms" : `structural_stage_${input.publication_stage_ordinal ?? 0}_ready_ms`] = Math.round(performance.now() - scanStartedAt);

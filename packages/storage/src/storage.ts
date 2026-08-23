@@ -1,10 +1,10 @@
-import { access, mkdir, rename, rm } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { canonicalBytes, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { ModelPackInstallation, Workspace, WorkspaceCurrentState, Snapshot, IndexCandidate, RegistrySnapshot, PluginResolutionLock, WorkspaceConfigurationRevision, WorkspaceFreshnessCheckpoint } from "@urdira/contracts";
-import { BlobStore, ContentAddressedStore, type BlobReference } from "./cas.js";
-import { resetTimings, snapshotTimings, timed, timingEnabled } from "./debug-timing.js";
+import { BlobStore, CAS_LAYOUT_MARKER_FILENAME, CAS_LAYOUT_VERSION, ContentAddressedStore, writeCasLayoutMarker, type BlobReference } from "./cas.js";
+import { record, resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
 import { CATALOG_SCHEMA, WORKSPACE_SCHEMA, ensureCatalogSchemaCompatibility, ensureWorkspaceSchemaCompatibility, initializeSchema } from "./schema.js";
 import { createWorkspaceRepositories, type WorkspaceRepositories } from "./repositories.js";
@@ -834,7 +834,23 @@ export class WorkspaceDatabase {
       await this.sourceIndex.commitFromCandidate(input.source_index);
       return;
     }
-    return await this.executeSerializedPublicationBuilder(async () => await this.publishCandidateSerialized(input));
+    // `enqueuedAt` marks the moment this publish asks the workspace's
+    // `SerializedWriter` to run it; the writer may already be busy with
+    // another foreground/background operation, so the builder itself can
+    // start running an arbitrary amount of wall time later. `resetTimings`
+    // moves here (the first statement the queued operation actually runs)
+    // rather than staying inside `publishCandidateSerialized` so the queue
+    // wait itself -- recorded immediately after the reset, before anything
+    // else -- survives into the same bucket snapshot as every span below it,
+    // instead of being wiped by a later reset.
+    const enqueuedAt = timingEnabled() ? performance.now() : 0;
+    return await this.executeSerializedPublicationBuilder(async () => {
+      if (timingEnabled()) {
+        resetTimings();
+        record("publish_writer_queue_wait", performance.now() - enqueuedAt);
+      }
+      return await this.publishCandidateSerialized(input);
+    });
   }
 
   private async publishCandidateSerialized(input: CandidatePublicationInput): Promise<CandidatePublicationResult> {
@@ -858,27 +874,34 @@ export class WorkspaceDatabase {
     if (storedCandidate.state !== "ready" && storedCandidate.state !== "publishing") throw new StorageError("storage:candidate_state_conflict", `Candidate ${candidateId} is terminal or not ready for publication.`);
     await this.faults.hit("candidate_publication.before_begin");
 
-    const current = await this.database.get<{
-      current_snapshot_id: string;
-      current_generation: number;
-      current_registry_snapshot_id: string;
-      current_resolution_lock_id: string;
-      current_configuration_revision_id: string;
-      current_freshness_checkpoint_id: string;
-      state_revision: number;
-    }>("SELECT current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision FROM workspace_current_state WHERE workspace_id = ?", [this.workspaceId]);
-    const currentSnapshot = current ? await this.database.get<{ source_state_digest: string; source_observation_watermarks: string }>("SELECT source_state_digest, source_observation_watermarks FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, current.current_snapshot_id]) : undefined;
-    const currentBatchIds = currentSnapshot === undefined ? [] : snapshotObservationBatchIds(currentSnapshot.source_observation_watermarks);
-    const normalizedExpectedObservations = normalizeObservationBatchIds(expected.source_observation_batch_ids);
-    const baseAgrees = current === undefined
-      ? expected.snapshot_id === undefined && expected.generation === undefined && expected.registry_snapshot_id === undefined && expected.resolution_lock_id === undefined && expected.configuration_revision_id === undefined
-      : expected.snapshot_id === current.current_snapshot_id
-        && expected.generation === current.current_generation
-        && expected.registry_snapshot_id === current.current_registry_snapshot_id
-        && expected.resolution_lock_id === current.current_resolution_lock_id
-        && expected.configuration_revision_id === current.current_configuration_revision_id
-        && JSON.stringify(normalizedExpectedObservations) === JSON.stringify(normalizeObservationBatchIds(currentBatchIds))
-        && currentSnapshot?.source_state_digest === expected.source_state_digest;
+    // `publish_frozen_base_checks`: the workspace's live current-tuple/
+    // snapshot reads and the `baseAgrees` comparison they feed -- the last
+    // storage-side verification that this candidate's frozen base still
+    // matches reality before any publication planning work begins.
+    const { current, baseAgrees } = await timed("publish_frozen_base_checks", async () => {
+      const currentRow = await this.database.get<{
+        current_snapshot_id: string;
+        current_generation: number;
+        current_registry_snapshot_id: string;
+        current_resolution_lock_id: string;
+        current_configuration_revision_id: string;
+        current_freshness_checkpoint_id: string;
+        state_revision: number;
+      }>("SELECT current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision FROM workspace_current_state WHERE workspace_id = ?", [this.workspaceId]);
+      const currentSnapshot = currentRow ? await this.database.get<{ source_state_digest: string; source_observation_watermarks: string }>("SELECT source_state_digest, source_observation_watermarks FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, currentRow.current_snapshot_id]) : undefined;
+      const currentBatchIds = currentSnapshot === undefined ? [] : snapshotObservationBatchIds(currentSnapshot.source_observation_watermarks);
+      const normalizedExpectedObservations = normalizeObservationBatchIds(expected.source_observation_batch_ids);
+      const agrees = currentRow === undefined
+        ? expected.snapshot_id === undefined && expected.generation === undefined && expected.registry_snapshot_id === undefined && expected.resolution_lock_id === undefined && expected.configuration_revision_id === undefined
+        : expected.snapshot_id === currentRow.current_snapshot_id
+          && expected.generation === currentRow.current_generation
+          && expected.registry_snapshot_id === currentRow.current_registry_snapshot_id
+          && expected.resolution_lock_id === currentRow.current_resolution_lock_id
+          && expected.configuration_revision_id === currentRow.current_configuration_revision_id
+          && JSON.stringify(normalizedExpectedObservations) === JSON.stringify(normalizeObservationBatchIds(currentBatchIds))
+          && currentSnapshot?.source_state_digest === expected.source_state_digest;
+      return { current: currentRow, baseAgrees: agrees };
+    });
     if (!baseAgrees) throw new StorageError("storage:publication_conflict", "The frozen candidate base tuple is stale.");
     await this.faults.hit("candidate_publication.after_validate_base");
 
@@ -918,7 +941,6 @@ export class WorkspaceDatabase {
     const sourceIndexState = await this.sourceIndex.getState();
     const generation = Math.max((current?.current_generation ?? 0) + 1, sourceIndexState?.current_generation ?? 0);
     const publishedAt = new Date().toISOString();
-    resetTimings();
     const plan = await timed("publish_plan_build", () => buildCandidatePublicationPlan({
       input,
       storedCandidate,
@@ -931,7 +953,14 @@ export class WorkspaceDatabase {
       ...(this.recordSetDigestCorpus === undefined ? {} : { recordSetDigestCorpus: this.recordSetDigestCorpus }),
       ...(this.projectionSetDigestCorpus === undefined ? {} : { projectionSetDigestCorpus: this.projectionSetDigestCorpus }),
     }));
-    try {
+    // `publish_pre_transaction`: bookkeeping between the plan being fully
+    // built and the transaction actually starting -- today just the counted
+    // command generator's declaration, but kept as its own span so a future
+    // regression here (rather than inside the plan build or the transaction
+    // itself) shows up distinctly instead of silently inflating one of them.
+    let publicationCommandCount = 0;
+    let publicationRunCount = 0;
+    const countedPublicationCommands = timedSync("publish_pre_transaction", () => {
       // A candidate publication's command set can be large (one full workspace
       // scan's canonical records, projections, and journal entries); stream it
       // to the worker in bounded chunks instead of materializing the full
@@ -952,44 +981,49 @@ export class WorkspaceDatabase {
       // appears in a publication's write set), so it also qualifies for
       // `discard_results`, which composes with `transfer_params`; this call
       // has never read the return value.
-      let publicationCommandCount = 0;
-      let publicationRunCount = 0;
-      function* countedPublicationCommands(): Generator<SqliteCommand> {
+      function* generate(): Generator<SqliteCommand> {
         for (const command of publicationTransactionCommands(plan)) {
           publicationCommandCount += 1;
           if (command.kind === "run") publicationRunCount += 1;
           yield command;
         }
       }
+      return generate;
+    });
+    try {
       await timed("publish_sql_transaction", () => this.rawDatabase.transactionChunked(countedPublicationCommands(), undefined, { transfer_params: true, discard_results: true }));
-      if (timingEnabled()) {
-        const timingSnapshot = snapshotTimings() as Record<string, unknown>;
-        timingSnapshot["publication_commands"] = { command_count: publicationCommandCount, run_count: publicationRunCount };
-        console.error(`[urdira] storage timings publish workspace:${this.workspaceId} generation:${generation} ms=${JSON.stringify(timingSnapshot)}`);
-      }
     } catch (error) {
       if (error instanceof StorageError && error.code === "storage:transaction_assertion_failed") throw new StorageError("storage:publication_conflict", "The workspace current tuple changed or the publication generation is not gapless.");
       if (error instanceof StorageError && error.code === "ERR_SQLITE_ERROR" && /UNIQUE|constraint/i.test(error.message)) throw new StorageError("storage:publication_conflict", `An immutable publication uniqueness collision was detected: ${error.message}`);
       throw error;
     }
-    // Commit-hook placement for the warm digest corpus (`RecordSetDigestCorpusEntry`):
-    // only reachable once `transactionChunked` above has resolved without
+    // `publish_post_commit`: everything after the transaction resolves --
+    // commit-hook placement for the warm digest corpora
+    // (`RecordSetDigestCorpusEntry`/`ProjectionSetDigestCorpusEntry`), only
+    // reachable once `transactionChunked` above has resolved without
     // throwing, i.e. after the publication transaction actually committed --
     // a fault or conflict anywhere above (including inside the transaction
     // itself, e.g. `candidate_publication.before_commit`) throws out of the
-    // `try` block and skips this assignment entirely, leaving whatever
+    // `try` block above and skips this assignment entirely, leaving whatever
     // corpus this handle already had (still valid for its own generation) in
     // place instead of poisoning it with this failed attempt's never-
     // committed candidate. Large publications deliberately omit the warm
     // corpus rather than retain a project-sized record array in the daemon;
     // assigning `undefined` also clears a prior generation so it cannot be
-    // reused against this newer snapshot.
-    this.recordSetDigestCorpus = plan.recordSetDigestCorpusCandidate;
-    // Same commit-hook placement, same reasoning, for the projection-set
-    // digest corpus (`ProjectionSetDigestCorpusEntry`).
-    if (plan.projectionSetDigestCorpusCandidate) this.projectionSetDigestCorpus = plan.projectionSetDigestCorpusCandidate;
-    this.scheduleCandidateStagingCleanup(candidateId);
-    await this.faults.hit("candidate_publication.after_commit_ack");
+    // reused against this newer snapshot. Same reasoning applies to the
+    // projection-set digest corpus below it, plus the (fire-and-forget)
+    // staging cleanup schedule and the trailing fault hit.
+    await timed("publish_post_commit", async () => {
+      this.recordSetDigestCorpus = plan.recordSetDigestCorpusCandidate;
+      if (plan.projectionSetDigestCorpusCandidate) this.projectionSetDigestCorpus = plan.projectionSetDigestCorpusCandidate;
+      this.scheduleCandidateStagingCleanup(candidateId);
+      await this.faults.hit("candidate_publication.after_commit_ack");
+    });
+    if (timingEnabled()) {
+      const timingSnapshot = snapshotTimings() as Record<string, unknown>;
+      timingSnapshot["publication_commands"] = { command_count: publicationCommandCount, run_count: publicationRunCount };
+      console.error(`[urdira] storage timings publish workspace:${this.workspaceId} generation:${generation} ms=${JSON.stringify(timingSnapshot)}`);
+    }
     return { candidate_generation_id: candidateId, snapshot_id: `snapshot:${candidateId}`, generation_manifest_id: `generation-manifest:${candidateId}`, generation, published_at: publishedAt, status: "published" };
   }
 
@@ -1089,6 +1123,7 @@ export class DurableStorage {
     const busyTimeoutMs = options.busyTimeoutMs ?? 5_000;
     await mkdir(rootDir, { recursive: true });
     await mkdir(join(rootDir, "cas"), { recursive: true });
+    await enforceCasLayoutMarker(join(rootDir, "cas"));
     const catalogDatabase = await openSqliteDatabase({ filename: join(rootDir, "catalog.sqlite"), busy_timeout_ms: busyTimeoutMs });
     await initializeSchema(catalogDatabase, CATALOG_SCHEMA);
     await ensureCatalogSchemaCompatibility(catalogDatabase);
@@ -1162,6 +1197,56 @@ export class DurableStorage {
     }
   }
 
+  /**
+   * Write-free counterpart to `openWorkspace`, for hot poll paths (the
+   * daemon's readiness poll) that must not contend with a workspace's own
+   * long-running write transactions. `openWorkspace` performs writes on
+   * EVERY call -- `initializeSchema`/`ensureWorkspaceSchemaCompatibility`
+   * (schema bookkeeping), `bindWorkspaceIdentity`/`ensureIdentityFormat`
+   * (identity verification, which upserts on first touch), and catalog
+   * lease acquire/release -- and a busy long-running publish transaction on
+   * this same database file makes those writes queue behind it and eat the
+   * SQLite busy timeout. This opens the connection read-only instead (see
+   * `sqlite.ts`'s worker `openDatabase`: `readOnly` skips the `WAL`/
+   * `synchronous` pragmas the writer already set once at creation and never
+   * needs re-set). A WAL reader snapshots the last committed state and
+   * never blocks behind -- or gets blocked by -- an in-progress writer, so
+   * this never hits SQLITE_BUSY against a held write transaction.
+   *
+   * Every write `openWorkspace` performs is either already-applied (schema
+   * compatibility, identity binding: both are one-time-on-creation facts
+   * stamped by `registerWorkspaceSerialized`/whichever writer handle opened
+   * this database first -- see `stampIdentityFormat`) or inapplicable to a
+   * read-only poll (the catalog lease models a durable "handle" the
+   * relocation/purge machinery waits out; a sub-poll-interval read-only
+   * open is not that, so its release hook is a no-op). All of them are
+   * skipped outright here rather than run in a "read-only check" mode: a
+   * read-only SQLite connection cannot execute the ALTER/INSERT statements
+   * they're built from even if asked to.
+   *
+   * Returns a normal `WorkspaceDatabase`; any write attempted through it
+   * fails at the SQLite layer (`readOnly: true`), which is the intended
+   * backstop against a caller reusing this handle for anything but reads.
+   */
+  async openWorkspaceReadOnly(workspaceId: string): Promise<WorkspaceDatabase> {
+    const workspace = await this.catalog.getWorkspace(workspaceId);
+    if (!workspace) throw new StorageError("storage:workspace_not_found", `Workspace ${workspaceId} is not registered.`);
+    // Schema/identity are stamped into the database file BEFORE the catalog
+    // row that makes `getWorkspace` above return non-undefined (see
+    // `registerWorkspaceSerialized`), so a catalog hit normally implies the
+    // file already exists and is fully initialized. This guards only the
+    // crash-mid-registration edge (file removed or never durably written)
+    // -- surfacing the same `workspace_not_found` an unregistered workspace
+    // gets, instead of a raw SQLite "unable to open database file" error a
+    // read-only connection cannot recover from the way `openWorkspace`'s
+    // schema-init would.
+    if (!(await pathExists(workspace.database_path))) throw new StorageError("storage:workspace_not_found", `Workspace ${workspaceId} is not registered.`);
+    const database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs, read_only: true });
+    const opened = new WorkspaceDatabase(workspaceId, database, this.blobs, this.rootDir, async () => undefined, this.faults);
+    this.openedWorkspaces.add(opened);
+    return opened;
+  }
+
   async close(): Promise<void> {
     for (const workspace of this.openedWorkspaces) await workspace.close();
     this.openedWorkspaces.clear();
@@ -1200,6 +1285,33 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Enforces the CAS shard-layout marker (docs/decisions/22: destructive-only
+ * migration, no in-place upgrade). A `cas/` directory without the marker but
+ * with existing `sha256/` entries predates the single-level shard flattening
+ * and must never be reinterpreted under the new layout -- reject it exactly
+ * like `ensureWorkspaceSchemaCompatibility`/`ensureCatalogSchemaCompatibility`
+ * reject other pre-v3 contract mismatches (`schema.ts`). A fresh or genuinely
+ * empty `cas/` directory gets the marker stamped so this check is O(1) (a
+ * single file read) on every subsequent open.
+ */
+async function enforceCasLayoutMarker(casDir: string): Promise<void> {
+  const markerPath = join(casDir, CAS_LAYOUT_MARKER_FILENAME);
+  let markerContent: string | undefined;
+  try { markerContent = await readFile(markerPath, "utf8"); }
+  catch (error) { if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error; }
+  if (markerContent === CAS_LAYOUT_VERSION) return;
+  if (markerContent !== undefined) {
+    throw new StorageError("core:index_contract_unsupported", "The workspace data root's CAS layout marker is not recognized by this Urdira v3 runtime; create a fresh v3 data root and reindex.", { contract_kind: "cas_layout", data_format_version: 3 });
+  }
+  let shardEntries: readonly string[] = [];
+  try { shardEntries = await readdir(join(casDir, "sha256")); } catch (error) { if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error; }
+  if (shardEntries.length > 0) {
+    throw new StorageError("core:index_contract_unsupported", "The CAS layout predates this runtime's single-level shard directories; create a fresh v3 data root and reindex.", { contract_kind: "cas_layout", data_format_version: 3 });
+  }
+  await writeCasLayoutMarker(casDir);
 }
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {

@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
 import { ContentAddressedStore, createDurableStorage, createFaultInjector, openSqliteDatabase, SerializedWriter } from "../packages/storage/src/index.js";
-import type { SqliteCommand } from "../packages/storage/src/index.js";
+import type { SqliteCommand, SqliteValue } from "../packages/storage/src/index.js";
 import type {
   ArtifactTombstone,
   ArtifactVersion,
@@ -874,6 +874,141 @@ describe("Phase 4 durable storage", () => {
     });
   });
 
+  it("run_batch inserts rows identical to the equivalent individual run commands", async () => {
+    await withStorage(async (_root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      const rowCount = 7;
+      const runBatchParamsFlat: SqliteValue[] = [];
+      for (let index = 0; index < rowCount; index += 1) runBatchParamsFlat.push(`run-batch-happy-${index}`, new Uint8Array([index, index + 1]));
+      // Driven through `transactionChunked` (not the plain `transaction()`
+      // batch) so this also exercises `dedupCommandSqls`'s `sqls`-table
+      // rewrite of a `run_batch` command, matching how the publication
+      // streaming lane actually sends it.
+      async function* batchCommands(): AsyncGenerator<SqliteCommand> {
+        yield { kind: "run_batch", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", rows: rowCount, params_flat: runBatchParamsFlat };
+      }
+      await opened.database.transactionChunked(batchCommands(), 2_000);
+      const individualCommands: SqliteCommand[] = Array.from({ length: rowCount }, (_, index) => ({ kind: "run", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", params: [`run-individual-happy-${index}`, new Uint8Array([index, index + 1])] }));
+      await opened.database.transaction(individualCommands);
+      const batchRows = await opened.database.all<{ key: string; value: Uint8Array }>("SELECT key, value FROM workspace_meta WHERE key LIKE 'run-batch-happy-%' ORDER BY key");
+      const individualRows = await opened.database.all<{ key: string; value: Uint8Array }>("SELECT key, value FROM workspace_meta WHERE key LIKE 'run-individual-happy-%' ORDER BY key");
+      expect(batchRows).toHaveLength(rowCount);
+      expect(batchRows.map((row) => new Uint8Array(row.value))).toEqual(individualRows.map((row) => new Uint8Array(row.value)));
+      await opened.close();
+    });
+  });
+
+  it("run_batch transfers Uint8Array params_flat entries under transfer_params, same as individual run commands", async () => {
+    await withStorage(async (_root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      const rowCount = 4;
+      const paramsFlat: SqliteValue[] = [];
+      for (let index = 0; index < rowCount; index += 1) paramsFlat.push(`run-batch-transfer-${index}`, new Uint8Array([index, index + 10, index + 20]));
+      async function* commands(): AsyncGenerator<SqliteCommand> {
+        yield { kind: "run_batch", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", rows: rowCount, params_flat: paramsFlat };
+      }
+      await opened.database.transactionChunked(commands(), 2_000, { transfer_params: true });
+      const rows = await opened.database.all<{ key: string; value: Uint8Array }>("SELECT key, value FROM workspace_meta WHERE key LIKE 'run-batch-transfer-%' ORDER BY key");
+      expect(rows).toHaveLength(rowCount);
+      rows.forEach((row, index) => expect(new Uint8Array(row.value)).toEqual(new Uint8Array([index, index + 10, index + 20])));
+      await opened.close();
+    });
+  });
+
+  it("rejects a run_batch whose params_flat length is not an exact multiple of rows", async () => {
+    await withStorage(async (_root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      // 7 flattened values cannot be evenly split across 3 rows (arity would
+      // be non-integer) -- the worker must reject this before running any
+      // row, not silently truncate/misalign params.
+      await expect(opened.database.transaction([
+        { kind: "run_batch", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", rows: 3, params_flat: ["a", new Uint8Array([1]), "b", new Uint8Array([2]), "c", new Uint8Array([3]), "d"] },
+      ])).rejects.toMatchObject({ code: "storage:run_batch_invalid" });
+      expect(await opened.database.all("SELECT key FROM workspace_meta WHERE key IN (?, ?, ?, ?)", ["a", "b", "c", "d"])).toEqual([]);
+      await opened.close();
+    });
+  });
+
+  it("aborts the whole transaction on a mid-batch constraint failure, surfacing the failing row and rolling back rows before it", async () => {
+    await withStorage(async (_root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      // Pre-existing row, committed in its own transaction, so the batch's
+      // row 1 is GUARANTEED to hit a UNIQUE (PRIMARY KEY) violation at a
+      // known index -- rows 0 and 2 of the same batch must never persist,
+      // proving the whole `run_batch` command (not just the failing row)
+      // rolls back with the rest of the transaction.
+      await opened.database.run("INSERT INTO workspace_meta (key, value) VALUES (?, ?)", ["run-batch-conflict-marker", new Uint8Array([0])]);
+      const paramsFlat: SqliteValue[] = ["run-batch-conflict-0", new Uint8Array([0]), "run-batch-conflict-marker", new Uint8Array([9]), "run-batch-conflict-2", new Uint8Array([2])];
+      await expect(opened.database.transaction([
+        { kind: "run_batch", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", rows: 3, params_flat: paramsFlat },
+      ])).rejects.toMatchObject({
+        code: "ERR_SQLITE_ERROR",
+        message: expect.stringMatching(/run_batch row 1 of 3.*UNIQUE/s),
+      });
+      const survivingRows = await opened.database.all<{ key: string }>("SELECT key FROM workspace_meta WHERE key LIKE 'run-batch-conflict-%' ORDER BY key");
+      // Only the pre-existing marker (inserted outside the failed
+      // transaction) survives; rows 0 and 2 from the aborted batch do not.
+      expect(survivingRows.map((row) => row.key)).toEqual(["run-batch-conflict-marker"]);
+      await opened.close();
+    });
+  });
+
+  it("aborts a chunked transaction the same way on a mid-batch constraint failure inside a run_batch", async () => {
+    await withStorage(async (_root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      await opened.database.run("INSERT INTO workspace_meta (key, value) VALUES (?, ?)", ["run-batch-chunked-conflict-marker", new Uint8Array([0])]);
+      async function* commands(): AsyncGenerator<SqliteCommand> {
+        yield { kind: "run", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", params: ["run-batch-chunked-conflict-pre", new Uint8Array([1])] };
+        yield { kind: "run_batch", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", rows: 2, params_flat: ["run-batch-chunked-conflict-0", new Uint8Array([0]), "run-batch-chunked-conflict-marker", new Uint8Array([9])] };
+      }
+      await expect(opened.database.transactionChunked(commands(), 1)).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR" });
+      expect(await opened.database.get("SELECT key FROM workspace_meta WHERE key = ?", ["run-batch-chunked-conflict-pre"])).toBeUndefined();
+      expect(await opened.database.get("SELECT key FROM workspace_meta WHERE key = ?", ["run-batch-chunked-conflict-0"])).toBeUndefined();
+      await opened.close();
+    });
+  });
+
+  it("interleaves run_batch with assert_transaction_changes/transaction_checkpoint, on both the chunked and plain transaction paths", async () => {
+    await withStorage(async (_root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      function buildCommands(prefix: string): SqliteCommand[] {
+        const firstBatchParams: SqliteValue[] = [];
+        for (let index = 0; index < 4; index += 1) firstBatchParams.push(`${prefix}-a-${index}`, new Uint8Array([index]));
+        const secondBatchParams: SqliteValue[] = [];
+        for (let index = 0; index < 3; index += 1) secondBatchParams.push(`${prefix}-b-${index}`, new Uint8Array([index + 50]));
+        return [
+          { kind: "transaction_checkpoint" },
+          { kind: "run_batch", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", rows: 4, params_flat: firstBatchParams },
+          // Interleaved with a plain `run` of the SAME SQL text, between two
+          // `run_batch` commands sharing that text: the worker's dedup table
+          // and the change-count accumulator must both keep working with
+          // `run` and `run_batch` commands mixed, not just homogeneous runs.
+          { kind: "assert_transaction_changes", expected: 4 },
+          { kind: "transaction_checkpoint" },
+          { kind: "run", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", params: [`${prefix}-mid`, new Uint8Array([77])] },
+          { kind: "run_batch", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", rows: 3, params_flat: secondBatchParams },
+          { kind: "assert_transaction_changes", expected: 4 },
+        ];
+      }
+      const chunkedCommands = buildCommands("chunked-run-batch");
+      async function* chunkedGenerator(): AsyncGenerator<SqliteCommand> { for (const command of chunkedCommands) yield command; }
+      await opened.database.transactionChunked(chunkedGenerator(), 2);
+      const plainCommands = buildCommands("plain-run-batch");
+      await opened.database.transaction(plainCommands);
+      const chunkedRows = await opened.database.all<{ key: string }>("SELECT key FROM workspace_meta WHERE key LIKE 'chunked-run-batch-%' ORDER BY key");
+      const plainRows = await opened.database.all<{ key: string }>("SELECT key FROM workspace_meta WHERE key LIKE 'plain-run-batch-%' ORDER BY key");
+      expect(chunkedRows).toHaveLength(8);
+      expect(chunkedRows.map((row) => row.key.replace("chunked-run-batch", ""))).toEqual(plainRows.map((row) => row.key.replace("plain-run-batch", "")));
+      await opened.close();
+    });
+  });
+
   it("keeps chunk results in send order under pipelining, including read-your-own-write across chunk boundaries", async () => {
     await withStorage(async (_root, storage) => {
       await storage.catalog.registerWorkspace(workspace);
@@ -1255,7 +1390,7 @@ describe("Phase 4 durable storage", () => {
       // content, but the directory hosting `first`'s three copies should be
       // fsync'd only once (its first fresh link), not three times, and the
       // digest-addressed layout means `first`/`second` almost always land in
-      // different two-level prefix directories, so two directories total.
+      // different single-level prefix directories, so two directories total.
       const blobs = await counted.putMany([{ bytes: first }, { bytes: first }, { bytes: second }, { bytes: first }, { bytes: second }]);
       expect(blobs.map((blob) => blob.content_hash)).toEqual([
         blobs[0]?.content_hash, blobs[0]?.content_hash, blobs[2]?.content_hash, blobs[0]?.content_hash, blobs[2]?.content_hash,
@@ -1272,6 +1407,73 @@ describe("Phase 4 durable storage", () => {
       await counted.putMany([{ bytes: first }, { bytes: second }]);
       expect(syncedDirectories).toEqual([]);
     });
+  });
+
+  it("defers putMany's per-blob file fsyncs to a batched pass, completed (one sync per fresh blob, none for EEXIST duplicates) strictly before any directory fsync, all before it resolves", async () => {
+    await withStorage(async (root) => {
+      // A shared, ordered sequence log across both hooks proves the file pass
+      // finishes before the directory pass starts, not just that both ran.
+      const sequence: Array<{ readonly kind: "file" | "directory"; readonly path: string }> = [];
+      const ordered = new ContentAddressedStore(join(root, "ordered-cas"), undefined, {
+        platform: "linux",
+        sync_file: async (path) => { sequence.push({ kind: "file", path }); },
+        sync_directory: async (path) => { sequence.push({ kind: "directory", path }); },
+      });
+      const first = new TextEncoder().encode("putMany ordering blob one");
+      const second = new TextEncoder().encode("putMany ordering blob two");
+      // `first` repeated three times (duplicate content within one batch):
+      // only its first occurrence is a fresh link and gets a file sync.
+      const blobs = await ordered.putMany([{ bytes: first }, { bytes: first }, { bytes: second }, { bytes: first }, { bytes: second }]);
+
+      const fileSyncs = sequence.filter((entry) => entry.kind === "file");
+      const directorySyncs = sequence.filter((entry) => entry.kind === "directory");
+      expect(fileSyncs.map((entry) => entry.path).sort()).toEqual([ordered.objectPath(blobs[0]!.content_hash), ordered.objectPath(blobs[2]!.content_hash)].sort());
+      expect(new Set(fileSyncs.map((entry) => entry.path)).size).toBe(fileSyncs.length); // each fresh blob synced at most once
+      expect(directorySyncs.length).toBeGreaterThan(0);
+      const lastFileIndex = Math.max(...sequence.map((entry, index) => (entry.kind === "file" ? index : -1)));
+      const firstDirectoryIndex = sequence.findIndex((entry) => entry.kind === "directory");
+      expect(lastFileIndex).toBeLessThan(firstDirectoryIndex);
+      await expect(ordered.read(blobs[0]!.content_hash)).resolves.toEqual(first);
+      await expect(ordered.read(blobs[2]!.content_hash)).resolves.toEqual(second);
+
+      // A second, separate `putMany` call against the same already-durable
+      // content must fsync neither files nor directories: every entry hits
+      // EEXIST and is verified, never freshly linked.
+      sequence.length = 0;
+      await ordered.putMany([{ bytes: first }, { bytes: second }]);
+      expect(sequence).toEqual([]);
+    });
+  });
+
+  it("stamps a fresh CAS root with the current layout marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-cas-layout-fresh-"));
+    try {
+      const storage = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
+      await storage.close();
+      await expect(readFile(join(root, "cas", ".layout"), "utf8")).resolves.toBe("2");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("opens fine when the CAS root already carries the current layout marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-cas-layout-current-"));
+    try {
+      const storage = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
+      await storage.close();
+      // Reopening an already-marked root must not rewrite or reject the marker.
+      const reopened = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
+      await reopened.close();
+      await expect(readFile(join(root, "cas", ".layout"), "utf8")).resolves.toBe("2");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects a CAS root with a pre-flattening two-level layout and no marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-cas-layout-legacy-"));
+    try {
+      const legacyDirectory = join(root, "cas", "sha256", "ab", "cd");
+      await mkdir(legacyDirectory, { recursive: true });
+      await writeFile(join(legacyDirectory, "e".repeat(60)), "legacy-object");
+      await expect(createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 })).rejects.toMatchObject({ code: "core:index_contract_unsupported" });
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("allows lifecycle closure only once and never reopens a closed version or tombstone", async () => {

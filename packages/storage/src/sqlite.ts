@@ -15,6 +15,15 @@ export type SqliteCommand =
   | { readonly kind: "backup"; readonly destination: string }
   | { readonly kind: "replace_database"; readonly destination: string; readonly recovery: string }
   | { readonly kind: "run"; readonly sql: string; readonly params?: readonly SqliteValue[] }
+  // One prepared statement (via the worker's existing `prepareCached`) run
+  // `rows` times. `params_flat` is a flat array, not `rows` sub-arrays: each
+  // row's params are the next `params_flat.length / rows` values sliced
+  // sequentially -- this avoids allocating `rows` short-lived param arrays
+  // (and their `postMessage` structured-clone/transfer overhead) just to
+  // shuttle them across the worker boundary. `params_flat.length` MUST be an
+  // exact multiple of `rows`; the worker validates this and throws before
+  // running any row if it isn't (see `runBatchCore` in `SQLITE_WORKER_SOURCE`).
+  | { readonly kind: "run_batch"; readonly sql: string; readonly rows: number; readonly params_flat: readonly SqliteValue[] }
   | { readonly kind: "get"; readonly sql: string; readonly params?: readonly SqliteValue[] }
   | { readonly kind: "all"; readonly sql: string; readonly params?: readonly SqliteValue[] }
   | { readonly kind: "staged_fact_delta_batch"; readonly workspace_id: string; readonly candidate_generation_id: string; readonly fact_delta_id: string; readonly accepted_at: string; readonly batch: FactDeltaBatch }
@@ -62,9 +71,9 @@ export interface TransactionChunkedOptions {
    * array per chunk, on top of whatever `transfer_params` already saves on
    * the params side -- the two options compose freely.
    *
-   * ONLY valid for command streams containing exclusively `run`, `exec`,
-   * `transaction_checkpoint`, `assert_transaction_changes`, and `fault`
-   * commands: a `get`/`all` command is meaningless to discard (its whole
+   * ONLY valid for command streams containing exclusively `run`, `run_batch`,
+   * `exec`, `transaction_checkpoint`, `assert_transaction_changes`, and
+   * `fault` commands: a `get`/`all` command is meaningless to discard (its whole
    * point is the row(s) it returns), so `transactionChunked` throws a
    * `TypeError` synchronously -- before that command's chunk is ever sent
    * to the worker -- if `discard_results` is set and it encounters one.
@@ -98,9 +107,9 @@ export interface SqliteDatabase {
    * non-worker `SqliteDatabase`) accept and ignore the option.
    *
    * `options.discard_results` (default false) opts a call into skipping
-   * per-command result construction/shipping entirely (only `run`/`exec`/
-   * `transaction_checkpoint`/`assert_transaction_changes`/`fault` command
-   * streams may use it -- see {@link TransactionChunkedOptions}), in which
+   * per-command result construction/shipping entirely (only `run`/`run_batch`/
+   * `exec`/`transaction_checkpoint`/`assert_transaction_changes`/`fault`
+   * command streams may use it -- see {@link TransactionChunkedOptions}), in which
    * case this resolves with `[]` instead of the usual per-command result
    * array. Implementations that cannot skip it accept and ignore the option
    * (still returning the full result array).
@@ -130,19 +139,56 @@ const SQLITE_WORKER_SOURCE = String.raw`
   const port = parentPort;
   if (!port) throw new Error("SQLite worker requires parentPort");
   const busyTimeout = Number(workerData.busyTimeoutMs);
-  // Opt-in wall-clock split between statement preparation and statement
-  // execution, gated the same way as \`packages/storage/src/debug-timing.ts\`
+  // Opt-in wall-clock attribution across every stage of the chunked
+  // publish-transaction pipeline, gated the same way as
+  // \`packages/storage/src/debug-timing.ts\`
   // (\`URDIRA_STORAGE_DEBUG_TIMING=1\`, threaded through explicitly via
   // \`workerData\` since a worker thread's \`process.env\` is a snapshot taken
   // at worker creation, not a live view of the parent's environment).
   // \`console.error\` in a worker thread is piped to the parent process's
   // stderr by default (no \`stderr: true\` needed), matching this codebase's
   // existing \`[urdira] ...\` stderr-diagnostic convention.
+  //
+  // Buckets, all accumulated per committed transaction and reset when that
+  // transaction's summary line is logged:
+  //  - prepare_ms / prepare_count: \`DatabaseSync.prepare\` calls that missed
+  //    \`statementCache\` (see \`prepareCached\`).
+  //  - param_ms / param_count: normalizing a command's \`params\` into the
+  //    argument list handed to the prepared statement (\`command.params ??
+  //    []\`), measured separately from the native call so a real param-side
+  //    cost (e.g. Uint8Array handling) wouldn't be hidden inside exec_ms.
+  //  - exec_ms / exec_count: the native \`DatabaseSync\` statement call itself
+  //    (\`.run\`/\`.get\`/\`.all\`) -- nothing else.
+  //  - result_ms / result_count: building the \`{changes, last_insert_rowid}\`
+  //    object a non-discard \`run\` command returns (skipped entirely when
+  //    \`discard\` is set -- see \`runStatement\`/\`runStatementTimed\`).
+  //  - chunk_idle_ms / chunk_idle_count: time the worker sat idle between
+  //    finishing one \`batch_chunk\`'s last command and starting the next
+  //    \`batch_chunk\`'s first -- i.e. waiting on the main thread's next
+  //    \`postMessage\` to arrive. A transport-starvation signal: high values
+  //    here mean the fix is pipelining/host-side, not SQL.
+  //  - txn_wall_ms: total wall time from \`batch_open\` to \`batch_commit\`
+  //    completing (not accumulated across transactions -- one value per
+  //    logged line).
   const DEBUG_TIMING = Boolean(workerData.debugTiming);
   let prepareMs = 0;
   let prepareCount = 0;
+  let paramMs = 0;
+  let paramCount = 0;
   let execMs = 0;
   let execCount = 0;
+  let resultMs = 0;
+  let resultCount = 0;
+  let chunkIdleMs = 0;
+  let chunkIdleCount = 0;
+  // Timestamp (performance.now()) the previous \`batch_chunk\` finished
+  // processing its last command, or \`null\` when there is no "previous
+  // chunk" yet to measure idle time against (right after \`batch_open\`, or
+  // when DEBUG_TIMING is off). Reset at every \`batch_open\`.
+  let lastChunkEndAt = null;
+  // Timestamp \`batch_open\` started its transaction; only meaningful while
+  // DEBUG_TIMING is on.
+  let txnStartAt = 0;
   function openDatabase(filename) {
     const opened = new DatabaseSync(filename, { readOnly: Boolean(workerData.readOnly), timeout: busyTimeout });
     opened.enableDefensive(true);
@@ -189,10 +235,23 @@ const SQLITE_WORKER_SOURCE = String.raw`
     };
   }
 
-  function logDebugTimingsIfEnabled(label) {
+  function logDebugTimingsIfEnabled(label, txnWallMs) {
     if (!DEBUG_TIMING) return;
-    console.error("[urdira] storage timings sqlite_worker " + label + " prepare_ms=" + Math.round(prepareMs) + " prepare_count=" + prepareCount + " exec_ms=" + Math.round(execMs) + " exec_count=" + execCount + " cache_size=" + statementCache.size);
-    prepareMs = 0; prepareCount = 0; execMs = 0; execCount = 0;
+    console.error(
+      "[urdira] storage timings sqlite_worker " + label +
+      " prepare_ms=" + Math.round(prepareMs) + " prepare_count=" + prepareCount +
+      " param_ms=" + Math.round(paramMs) + " param_count=" + paramCount +
+      " exec_ms=" + Math.round(execMs) + " exec_count=" + execCount +
+      " result_ms=" + Math.round(resultMs) + " result_count=" + resultCount +
+      " chunk_idle_ms=" + Math.round(chunkIdleMs) + " chunk_idle_count=" + chunkIdleCount +
+      " txn_wall_ms=" + Math.round(txnWallMs || 0) +
+      " cache_size=" + statementCache.size
+    );
+    prepareMs = 0; prepareCount = 0;
+    paramMs = 0; paramCount = 0;
+    execMs = 0; execCount = 0;
+    resultMs = 0; resultCount = 0;
+    chunkIdleMs = 0; chunkIdleCount = 0;
   }
 
   // Chunked \`batch_chunk\` messages carry a per-message \`sqls\` dedup table
@@ -229,17 +288,117 @@ const SQLITE_WORKER_SOURCE = String.raw`
   // client-side before a discard-mode chunk is ever sent, see
   // \`SqliteWorkerAdapter.transactionChunked\`), kept here only as a
   // symmetrical, cheap backstop.
+  function buildRunResult(result) {
+    return {
+      changes: Number(result.changes),
+      last_insert_rowid: typeof result.lastInsertRowid === "bigint" ? result.lastInsertRowid.toString() : Number(result.lastInsertRowid),
+    };
+  }
   function runStatement(command, statement, params, discard) {
     if (command.kind === "run") {
       const result = statement.run(...params);
       if (discard) return Number(result.changes);
-      return {
-        changes: Number(result.changes),
-        last_insert_rowid: typeof result.lastInsertRowid === "bigint" ? result.lastInsertRowid.toString() : Number(result.lastInsertRowid),
-      };
+      return buildRunResult(result);
     }
     if (command.kind === "get") return discard ? null : (statement.get(...params) ?? null);
     return discard ? null : statement.all(...params);
+  }
+  // DEBUG_TIMING twin of \`runStatement\` above: same dispatch, but times the
+  // native \`DatabaseSync\` call (\`exec_ms\`/\`exec_count\`) separately from
+  // building a non-discard \`run\`'s result object (\`result_ms\`/
+  // \`result_count\`), so neither bucket silently absorbs the other's cost.
+  // Only ever invoked when \`DEBUG_TIMING\` is true (see \`execute\`), so the
+  // \`performance.now()\` calls here never run on the hot off-path.
+  function runStatementTimed(command, statement, params, discard) {
+    if (command.kind === "run") {
+      const execStartedAt = performance.now();
+      const result = statement.run(...params);
+      execMs += performance.now() - execStartedAt; execCount += 1;
+      if (discard) return Number(result.changes);
+      const resultStartedAt = performance.now();
+      const built = buildRunResult(result);
+      resultMs += performance.now() - resultStartedAt; resultCount += 1;
+      return built;
+    }
+    const execStartedAt = performance.now();
+    const value = command.kind === "get"
+      ? (discard ? null : (statement.get(...params) ?? null))
+      : (discard ? null : statement.all(...params));
+    execMs += performance.now() - execStartedAt; execCount += 1;
+    return value;
+  }
+
+  // \`run_batch\`: one prepared statement executed \`command.rows\` times, params
+  // sliced sequentially out of \`command.params_flat\` (arity = params_flat.length
+  // / rows -- validated below, not carried on the wire). A single reused
+  // \`scratch\` array is sliced into per row instead of allocating a fresh
+  // params array per row, mirroring the flat-transport contract itself:
+  // this command kind exists specifically to avoid per-row allocation, on
+  // both sides of the worker boundary.
+  //
+  // A row that throws (typically a UNIQUE/constraint violation) is rewrapped
+  // so the message SUBSTRING-includes the original error's message (the
+  // \`ERR_SQLITE_ERROR\`/\`UNIQUE\`/\`constraint\` text \`storage.ts\`'s publish
+  // path regex-matches against is preserved verbatim, just with a "row N of
+  // rows (sql: ...)" prefix) while keeping \`.code\`/\`.name\` byte-identical to
+  // the original -- classification in storage.ts (publication_conflict) reads
+  // \`.code\`, and its regex scans the whole message, so both keep working
+  // unchanged.
+  // \`discard\`: mirrors \`runStatement\`'s discard branch -- \`totalChanges\` is
+  // still accumulated (state.changes' accumulator needs it either way), but
+  // no per-row \`{changes, last_insert_rowid}\` object is built and the
+  // returned \`rows\` array is omitted entirely, matching \`run\`'s "compute the
+  // count, skip the object nobody reads" contract at row scale.
+  function runBatchCore(sql, rows, paramsFlat, discard, timed) {
+    if (!Number.isInteger(rows) || rows < 0) {
+      const error = new Error("run_batch rows must be a non-negative integer, got " + rows + ".");
+      error.code = "storage:run_batch_invalid";
+      throw error;
+    }
+    if (rows === 0) {
+      if (paramsFlat.length !== 0) {
+        const error = new Error("run_batch with rows=0 must have an empty params_flat, got length " + paramsFlat.length + ".");
+        error.code = "storage:run_batch_invalid";
+        throw error;
+      }
+      return discard ? 0 : { changes: 0, rows: [] };
+    }
+    if (paramsFlat.length % rows !== 0) {
+      const error = new Error("run_batch params_flat.length (" + paramsFlat.length + ") is not evenly divisible by rows (" + rows + ").");
+      error.code = "storage:run_batch_invalid";
+      throw error;
+    }
+    const arity = paramsFlat.length / rows;
+    const statement = prepareCached(sql);
+    const scratch = new Array(arity);
+    let totalChanges = 0;
+    const perRow = discard ? null : new Array(rows);
+    for (let row = 0; row < rows; row += 1) {
+      const base = row * arity;
+      for (let column = 0; column < arity; column += 1) scratch[column] = paramsFlat[base + column];
+      let result;
+      if (timed) {
+        const execStartedAt = performance.now();
+        try { result = statement.run(...scratch); } catch (error) { throw wrapRunBatchRowError(error, row, rows, sql); }
+        execMs += performance.now() - execStartedAt; execCount += 1;
+        if (discard) { totalChanges += Number(result.changes); continue; }
+        const resultStartedAt = performance.now();
+        perRow[row] = buildRunResult(result);
+        resultMs += performance.now() - resultStartedAt; resultCount += 1;
+      } else {
+        try { result = statement.run(...scratch); } catch (error) { throw wrapRunBatchRowError(error, row, rows, sql); }
+        if (discard) { totalChanges += Number(result.changes); continue; }
+        perRow[row] = buildRunResult(result);
+      }
+      totalChanges += Number(result.changes);
+    }
+    return discard ? totalChanges : { changes: totalChanges, rows: perRow };
+  }
+  function wrapRunBatchRowError(error, row, rows, sql) {
+    const wrapped = new Error("run_batch row " + row + " of " + rows + " failed (sql: " + sql + "): " + (error instanceof Error ? error.message : String(error)));
+    if (error && typeof error === "object" && "code" in error) wrapped.code = error.code;
+    wrapped.name = error instanceof Error ? error.name : "Error";
+    return wrapped;
   }
 
   const FACT_DELTA_SECTIONS = ["records", "graph_edges", "identities", "dependencies"];
@@ -390,15 +549,21 @@ const SQLITE_WORKER_SOURCE = String.raw`
       statementCache = new Map();
       return null;
     }
+    if (command.kind === "run_batch") return runBatchCore(resolveSql(command, sqls), command.rows, command.params_flat, discard, DEBUG_TIMING);
     const statement = prepareCached(resolveSql(command, sqls));
-    const params = command.params ?? [];
-    if (!DEBUG_TIMING) return runStatement(command, statement, params, discard);
-    const startedAt = performance.now();
-    try {
+    if (!DEBUG_TIMING) {
+      const params = command.params ?? [];
       return runStatement(command, statement, params, discard);
-    } finally {
-      execMs += performance.now() - startedAt; execCount += 1;
     }
+    // Timed separately from \`exec_ms\`: this is whatever normalization runs
+    // per command before the native call (currently just resolving
+    // \`command.params\`'s default) -- kept as its own bucket so a future,
+    // heavier per-param transformation (e.g. Uint8Array handling) shows up
+    // here instead of being invisibly folded into \`exec_ms\`.
+    const paramStartedAt = performance.now();
+    const params = command.params ?? [];
+    paramMs += performance.now() - paramStartedAt; paramCount += 1;
+    return runStatementTimed(command, statement, params, discard);
   }
 
   // \`discard\`: same command dispatch as the non-discard path, but \`run\`'s
@@ -426,6 +591,11 @@ const SQLITE_WORKER_SOURCE = String.raw`
     }
     const result = execute(command, sqls, discard);
     if (command.kind === "run") state.changes += discard ? result : Number(result.changes);
+    // \`run_batch\`'s \`execute\` return is already the row-summed total (a
+    // plain number under \`discard\`, \`.changes\` otherwise) -- same shape
+    // \`run\`'s branch above reads, just pre-summed across every row instead
+    // of one.
+    if (command.kind === "run_batch") state.changes += discard ? result : result.changes;
     return discard ? undefined : result;
   }
 
@@ -448,6 +618,7 @@ const SQLITE_WORKER_SOURCE = String.raw`
         }
         database.exec("BEGIN IMMEDIATE;");
         activeTransaction = { txn: message.txn, changes: 0 };
+        if (DEBUG_TIMING) { lastChunkEndAt = null; txnStartAt = performance.now(); }
         port.postMessage({ id: message.id, kind: "result", result: null });
         return;
       }
@@ -462,6 +633,15 @@ const SQLITE_WORKER_SOURCE = String.raw`
           error.code = "storage:transaction_not_open";
           throw error;
         }
+        // \`chunk_idle_ms\`: time since the previous \`batch_chunk\` finished its
+        // last command (\`lastChunkEndAt\`, set below), i.e. how long this
+        // worker sat idle waiting for the current \`batch_chunk\` message to
+        // arrive. \`null\` right after \`batch_open\` (no previous chunk to
+        // measure against) and whenever DEBUG_TIMING is off.
+        if (DEBUG_TIMING && lastChunkEndAt !== null) {
+          chunkIdleMs += performance.now() - lastChunkEndAt;
+          chunkIdleCount += 1;
+        }
         try {
           // \`message.discard\` (see \`TransactionChunkedOptions.discard_results\`):
           // a plain \`for\` loop instead of \`.map\` -- there is no per-command
@@ -471,9 +651,11 @@ const SQLITE_WORKER_SOURCE = String.raw`
           // \`postMessage\` to structured-clone beyond one scalar.
       if (message.discard) {
             for (const command of message.commands) runChunkCommand(command, activeTransaction, message.sqls, true);
+            if (DEBUG_TIMING) lastChunkEndAt = performance.now();
             port.postMessage({ id: message.id, kind: "result", result: message.commands.length });
           } else {
             const results = message.commands.map((command) => runChunkCommand(command, activeTransaction, message.sqls));
+            if (DEBUG_TIMING) lastChunkEndAt = performance.now();
             port.postMessage({ id: message.id, kind: "result", result: results });
           }
         } catch (error) {
@@ -497,7 +679,7 @@ const SQLITE_WORKER_SOURCE = String.raw`
           throw error;
         }
         activeTransaction = null;
-        logDebugTimingsIfEnabled("batch_commit");
+        logDebugTimingsIfEnabled("batch_commit", DEBUG_TIMING ? performance.now() - txnStartAt : 0);
         port.postMessage({ id: message.id, kind: "result", result: null });
         return;
       }
@@ -515,6 +697,7 @@ const SQLITE_WORKER_SOURCE = String.raw`
           port.postMessage({ id: message.id, kind: "result", result: [result] });
           return;
         }
+        const batchStartedAt = DEBUG_TIMING ? performance.now() : 0;
         database.exec("BEGIN IMMEDIATE;");
         try {
           let checkpointChanges = 0;
@@ -538,10 +721,11 @@ const SQLITE_WORKER_SOURCE = String.raw`
             }
             const result = execute(command);
             if (command.kind === "run") checkpointChanges += Number(result.changes);
+            if (command.kind === "run_batch") checkpointChanges += result.changes;
             return result;
           });
           database.exec("COMMIT;");
-          logDebugTimingsIfEnabled("batch");
+          logDebugTimingsIfEnabled("batch", DEBUG_TIMING ? performance.now() - batchStartedAt : 0);
           port.postMessage({ id: message.id, kind: "result", result: results });
         } catch (error) {
           try { database.exec("ROLLBACK;"); } catch {}
@@ -609,21 +793,27 @@ function collectTransferableBuffers(commands: readonly SqliteCommand[]): ArrayBu
  * asked to throw away without ever seeing (`get`/`all`), or isn't a
  * `transactionChunked`-shaped command to begin with (`backup`,
  * `replace_database`, which never appear inside a chunked transaction).
+ * `run_batch` is included alongside `run`: it is exactly `run` repeated
+ * `rows` times against one prepared statement, so the same discard contract
+ * (compute the row-summed change count, skip the per-row result object)
+ * applies at row granularity.
  */
-const DISCARD_ALLOWED_KINDS: ReadonlySet<SqliteCommand["kind"]> = new Set(["run", "exec", "staged_fact_delta_batch", "transaction_checkpoint", "fault", "assert_transaction_changes"]);
+const DISCARD_ALLOWED_KINDS: ReadonlySet<SqliteCommand["kind"]> = new Set(["run", "run_batch", "exec", "staged_fact_delta_batch", "transaction_checkpoint", "fault", "assert_transaction_changes"]);
 
 function dedupCommandSqls(commands: readonly SqliteCommand[]): { readonly sqls: readonly string[]; readonly commands: readonly unknown[] } {
   const sqls: string[] = [];
   const indexBySql = new Map<string, number>();
   const rewritten = commands.map((command) => {
-    if (command.kind !== "run" && command.kind !== "get" && command.kind !== "all" && command.kind !== "exec") return command;
+    if (command.kind !== "run" && command.kind !== "get" && command.kind !== "all" && command.kind !== "exec" && command.kind !== "run_batch") return command;
     let index = indexBySql.get(command.sql);
     if (index === undefined) {
       index = sqls.length;
       sqls.push(command.sql);
       indexBySql.set(command.sql, index);
     }
-    return command.kind === "exec" ? { kind: command.kind, s: index } : { kind: command.kind, s: index, params: command.params };
+    if (command.kind === "exec") return { kind: command.kind, s: index };
+    if (command.kind === "run_batch") return { kind: command.kind, s: index, rows: command.rows, params_flat: command.params_flat };
+    return { kind: command.kind, s: index, params: command.params };
   });
   return { sqls, commands: rewritten };
 }
@@ -811,10 +1001,15 @@ export class SqliteWorkerAdapter implements SqliteDatabase {
         // (`AsyncIterable`) command source fails fast on the offending
         // command instead of after consuming the whole stream.
         if (discardResults && !DISCARD_ALLOWED_KINDS.has(command.kind)) {
-          throw new TypeError(`transactionChunked({ discard_results: true }) does not support "${command.kind}" commands (only run/exec/transaction_checkpoint/assert_transaction_changes/fault may be discarded).`);
+          throw new TypeError(`transactionChunked({ discard_results: true }) does not support "${command.kind}" commands (only run/run_batch/exec/transaction_checkpoint/assert_transaction_changes/fault may be discarded).`);
         }
         buffer.push(command);
-        bufferedParams += "params" in command && Array.isArray(command.params) ? command.params.length : 0;
+        // `run_batch`'s weight is its flat params array, not a per-command
+        // constant of 1 -- a single `run_batch` can carry as many params as
+        // hundreds of individual `run` commands, so it must count the same
+        // toward this budget as those `run` commands would have.
+        bufferedParams += "params" in command && Array.isArray(command.params) ? command.params.length
+          : "params_flat" in command && Array.isArray(command.params_flat) ? command.params_flat.length : 0;
         // Flush on COMMAND count or accumulated PARAM count, whichever trips
         // first. Command count alone is the wrong weight once multi-row
         // publication INSERTs exist (publication-authority.ts's

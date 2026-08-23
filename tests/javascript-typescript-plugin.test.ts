@@ -188,8 +188,8 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
     const casRoot = await mkdtemp(join(tmpdir(), "urdira-jsts-cas-"));
     const source = new TextEncoder().encode("export const value = 1;\n");
     const hex = createHash("sha256").update(source).digest("hex");
-    const casPath = join(casRoot, "sha256", hex.slice(0, 2), hex.slice(2, 4), hex.slice(4));
-    await mkdir(join(casRoot, "sha256", hex.slice(0, 2), hex.slice(2, 4)), { recursive: true });
+    const casPath = join(casRoot, "sha256", hex.slice(0, 2), hex.slice(2));
+    await mkdir(join(casRoot, "sha256", hex.slice(0, 2)), { recursive: true });
     await writeFile(casPath, source);
     const worker = createJavascriptTypescriptWorker({ cas_root: casRoot });
     try {

@@ -202,10 +202,12 @@ export {
 export {
   CandidateMaterializer,
   CandidateMaterializationError,
+  CandidateRecordTemplateAccumulator,
   type CandidateAbsenceBarrier,
   type CandidateKnownArtifactVersion,
   type CandidateLookupDependencyAuthority,
   type CandidateRecordDependencyTemplate,
+  type CandidateRecordOpenMemoEntry,
   type CandidateLookupBindingTemplate,
   type CandidateProjectionDependencyTemplate,
   type CandidateMaterializationInput,
