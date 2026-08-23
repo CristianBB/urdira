@@ -291,7 +291,7 @@ function javascriptTypescriptAccessManifest(workItemId: string, analysisContextD
   };
 }
 
-function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTypescriptRegistry, workspaceId: string, registrySnapshotId: string, configurationRevisionId: string, now: string, casRoot: string, analysisCacheDir?: string, analysisWorkerPool?: AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>, analysisWorkerShardCount = 2, acceptNativeBatch?: (candidateGenerationId: string, factDeltaId: string, batch: FactDeltaBatch) => Promise<void>): WorkspaceScanPluginProvider {
+function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTypescriptRegistry, workspaceId: string, registrySnapshotId: string, configurationRevisionId: string, now: string, casRoot: string, analysisCacheDir?: string, analysisWorkerPool?: AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>, analysisWorkerShardCount = 2, acceptNativeBatches?: (candidateGenerationId: string, batches: readonly { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[]) => Promise<void>): WorkspaceScanPluginProvider {
   const configuration = {
     configuration_revision_id: configurationRevisionId,
     schema_version: 1,
@@ -649,6 +649,12 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       const shardCount = Math.max(1, Math.min(largeWorkspace ? 1 : analysisWorkerShardCount, planCount || 1));
       const shards = plans === undefined ? [] : Array.from({ length: shardCount }, (_, shard) => plans.filter((_, index) => index % shardCount === shard));
       const acceptanceStartedAt = performance.now();
+      const pendingNativeBatches: { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[] = [];
+      const flushNativeBatches = async (force = false): Promise<void> => {
+        if (acceptNativeBatches === undefined || pendingNativeBatches.length === 0 || (!force && pendingNativeBatches.length < 64)) return;
+        const batch = pendingNativeBatches.splice(0, pendingNativeBatches.length);
+        await acceptNativeBatches(candidate.candidate_generation_id, batch);
+      };
       const consumePlanResponse = async (response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } }, plan: AnalysisPlan): Promise<MaterializationAcceptedFactDelta> => {
         const delta = await acceptance.accept({ candidate, work_item: plan.workItem, raw_delta: response.payload.validation_input.raw_delta, accepted_manifest: plan.manifest, expected_replacement_scopes: [plan.scope], target_registry: targetRegistry, base_records: [], base_record_dependencies: [], staged_records: [], analysis_context_digest: plan.contextDigest });
         const nativeBatches = response.payload.fact_delta_batches
@@ -659,12 +665,13 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         for (const batch of batches) {
           if (finalSeen) throw new Error("Plugin FactDelta batches cannot contain rows after a final batch.");
           validateFactDeltaBatch(batch, batchIndex);
-          if (acceptNativeBatch !== undefined) await acceptNativeBatch(candidate.candidate_generation_id, delta.delta.fact_delta_id, batch);
+          if (acceptNativeBatches !== undefined) pendingNativeBatches.push({ fact_delta_id: delta.delta.fact_delta_id, batch });
           else native_batches.push({ fact_delta_id: delta.delta.fact_delta_id, batch });
           finalSeen = batch.final;
           batchIndex += 1;
         }
         if (batchIndex > 0 && !finalSeen) throw new Error("Plugin FactDelta batches must terminate with a final batch.");
+        await flushNativeBatches();
         return compactAcceptedFactDelta(delta);
       };
       const invokeShard = async (shard: readonly AnalysisPlan[], shardIndex: number): Promise<readonly { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[]> => {
@@ -753,6 +760,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // deltas already retain the analyzer's structured facts and may occupy
       // gigabytes on a repository-sized first scan.
       for (const entry of shardResults) accepted.push(entry.delta);
+      await flushNativeBatches(true);
       if (debugTimingEnabled()) console.error(`[urdira] analyze timings ${workspace_id} owners=${planCount} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(performance.now() - workerStartedAt), acceptance: Math.round(performance.now() - acceptanceStartedAt), shards: shardCount, plan_mode: largeWorkspace ? "stream" : "materialized" })}`);
       // Summarize claims in place. `flatMap` here used to briefly duplicate
       // every completeness claim while the accepted deltas were still live,
@@ -844,7 +852,7 @@ function createResolveJavascriptTypescriptPluginProvider(analysisCacheDir?: stri
     const { registry, now } = await entry;
     const registrySnapshotId = registry.registry.registry_snapshot_id;
     const configurationRevisionId = `configuration:${workspace.workspace_id}:${registry.lock.resolution_lock_id}`;
-    return buildJavascriptTypescriptPluginProvider(registry, workspace.workspace_id, registrySnapshotId, configurationRevisionId, now, database.casRoot, analysisCacheDir, analysisWorkerPool, analysisWorkerShardCount, async (candidateGenerationId, factDeltaId, batch) => { await database.candidates.acceptNativeFactDeltaBatch(candidateGenerationId, factDeltaId, batch); });
+    return buildJavascriptTypescriptPluginProvider(registry, workspace.workspace_id, registrySnapshotId, configurationRevisionId, now, database.casRoot, analysisCacheDir, analysisWorkerPool, analysisWorkerShardCount, async (candidateGenerationId, batches) => { await database.candidates.acceptNativeFactDeltaBatches(candidateGenerationId, batches); });
   };
 }
 
@@ -1106,6 +1114,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
     ...(scanMaxResponseBytes === undefined ? {} : { max_response_bytes: scanMaxResponseBytes }),
   };
   const scanIoConcurrency = positiveIntegerEnv("URDIRA_SCAN_IO_CONCURRENCY");
+  const casPutConcurrency = positiveIntegerEnv("URDIRA_CAS_PUT_CONCURRENCY");
   const lexicalIndex = lexicalIndexEnabled();
   const lexicalThread = lexicalThreadEnabled();
   const semanticThread = semanticThreadEnabled();
@@ -1178,6 +1187,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
     }),
     ...(scanBudget === undefined ? {} : { scan_budget: scanBudget }),
     ...(scanIoConcurrency === undefined ? {} : { scan_io_concurrency: scanIoConcurrency }),
+    ...(casPutConcurrency === undefined ? {} : { cas_put_concurrency: casPutConcurrency }),
     // `lexicalIndexEnabled()` defaults to `true`, matching `DaemonRuntimeOptions.lexical_index`'s
     // own default -- only thread an explicit `false` through when the kill
     // switch fired, so an unset env var leaves this field omitted like every

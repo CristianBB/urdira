@@ -123,6 +123,33 @@ function freshDeltaFor(files: readonly AnalyzerFile[], rootNames: readonly strin
 }
 
 describe("JavaScript/TypeScript durable analysis cache", () => {
+  it("reuses the large stage-1 dependency graph before hydrating CAS bytes", async () => {
+    await withCacheDir(async (dir) => {
+      const files: AnalyzerFile[] = Array.from({ length: 512 }, (_, index) => ({
+        path: `src/file-${index}.ts`,
+        text: `export const value${index} = ${index};\n`,
+        content_hash: `sha256:${String(index).padStart(64, "0")}`,
+      }));
+      const rootNames = files.map((file) => file.path);
+      const request = { ...closureRequest(files, rootNames), payload: { files, root_names: rootNames, publication_stage_id: "jsts:structural_stage_1" } };
+      let builds1 = 0;
+      const worker1 = createJavascriptTypescriptWorker({ analysis_cache_dir: dir, on_analysis_build: () => { builds1 += 1; } });
+      const response1 = await worker1.invoke(request);
+      await worker1.terminate();
+      expect(builds1).toBe(1);
+      expect((await readdir(dir)).some((name) => name.endsWith(".graph.json.gz"))).toBe(true);
+
+      let builds2 = 0;
+      let loads2 = 0;
+      const worker2 = createJavascriptTypescriptWorker({ analysis_cache_dir: dir, on_analysis_build: () => { builds2 += 1; }, on_analysis_cache_load: () => { loads2 += 1; } });
+      const response2 = await worker2.invoke(request);
+      await worker2.terminate();
+      expect(builds2).toBe(0);
+      expect(loads2).toBe(1);
+      expect(response2).toEqual(response1);
+    });
+  });
+
   it("shares one durable entry across two separate worker instances: first builds, second disk-hits with an identical payload", async () => {
     await withCacheDir(async (dir) => {
       const files = makeFiles();

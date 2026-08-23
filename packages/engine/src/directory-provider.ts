@@ -145,6 +145,10 @@ export interface DirectorySourceByteStream {
   readonly metadata_digest: string;
   readonly media_type: string;
   readonly chunks: AsyncIterable<Uint8Array>;
+  /** Called by CAS after its single authoritative hash pass completes. */
+  readonly after_read?: (contentHash: string, byteLength: number) => Promise<void>;
+  /** True when the provider validated the stable token and reused the existing CAS blob. */
+  readonly reused_existing?: boolean;
 }
 
 interface CapturedFile {
@@ -456,7 +460,7 @@ export class DirectorySourceProvider implements SourceProvider {
    * streams the chunks directly into CAS, which performs the final hash and
    * length check while consuming them.
    */
-  async readStream(input: SourceProviderReadRequest): Promise<DirectorySourceByteStream> {
+  async readStream(input: SourceProviderReadRequest, options: { readonly reuse_existing?: boolean } = {}): Promise<DirectorySourceByteStream> {
     const uri = normalizeWorkspacePath(this.#root, input.normalized_uri);
     if (uri !== input.normalized_uri || uri.length === 0) throw new SourceProviderOutcomeError("failed", "core:source_provider_uri_invalid", "never", "The normalized URI is invalid.");
     const path = resolve(this.#root, uri);
@@ -466,35 +470,43 @@ export class DirectorySourceProvider implements SourceProvider {
     if (before.token !== input.provider_version_token || before.metadata_digest !== input.observed_metadata_digest) {
       throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed before reading.");
     }
+    if (options.reuse_existing === true) {
+      // The enumeration already proved the content digest. The provider token
+      // is the stable version boundary; rechecking it and the exact stat-derived
+      // metadata here avoids opening/reading unchanged bytes on a full reindex.
+      return {
+        artifact_id: input.artifact_id,
+        provider_version_token: before.token,
+        content_hash: input.observed_content_hash,
+        byte_length: before.target_stat.size,
+        metadata_digest: before.metadata_digest,
+        media_type: BINARY_EXTENSIONS.has(extname(uri).toLowerCase()) ? "application/octet-stream" : "text/plain; charset=utf-8",
+        reused_existing: true,
+        chunks: (async function* (): AsyncGenerator<Uint8Array> { })(),
+      };
+    }
     const fileSystem = this.#fileSystem;
     const sourceFactory = (): AsyncIterable<Uint8Array> => fileSystem.read_file_stream?.(before.target_path)
       ?? (async function* (): AsyncGenerator<Uint8Array> { yield await fileSystem.read_file(before.target_path); })();
-    const provider = this;
+    let streamHasNul = false;
+    let streamValidUtf8 = true;
     const chunks = (async function* (): AsyncGenerator<Uint8Array> {
-      const hash = createHash("sha256");
       let byteLength = 0;
-      let hasNul = false;
-      let validUtf8 = true;
       const decoder = new TextDecoder("utf-8", { fatal: true });
       try {
         for await (const chunk of sourceFactory()) {
           if (!(chunk instanceof Uint8Array)) throw new SourceProviderOutcomeError("failed", "core:source_provider_read_invalid", "never", "The source stream yielded a non-byte chunk.");
-          hash.update(chunk);
           byteLength += chunk.byteLength;
-          hasNul ||= chunk.some((byte) => byte === 0);
-          if (validUtf8) {
-            try { decoder.decode(chunk, { stream: true }); } catch { validUtf8 = false; }
+          streamHasNul ||= chunk.some((byte) => byte === 0);
+          if (streamValidUtf8) {
+            try { decoder.decode(chunk, { stream: true }); } catch { streamValidUtf8 = false; }
           }
           yield chunk;
         }
-        if (validUtf8) { try { decoder.decode(); } catch { validUtf8 = false; } }
-        const contentHash = `sha256:${hash.digest("hex")}`;
-        const after = await provider.#inspectBoundary(uri, path);
-        const mediaBytes = hasNul || !validUtf8 ? new Uint8Array([0]) : new Uint8Array();
-        if (!provider.#included(uri, before, mediaBytes) || !after.included || before.token !== after.token || after.token !== input.provider_version_token || contentHash !== input.observed_content_hash) {
-          throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed while reading.");
-        }
-        if (byteLength !== after.target_stat.size) throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed while reading.");
+        if (streamValidUtf8) { try { decoder.decode(); } catch { streamValidUtf8 = false; } }
+        // CAS invokes `after_read` with its actual digest. Keeping this
+        // provider-side boundary callback separate preserves the post-read
+        // race check without hashing the same stream twice.
       } catch (error) {
         if (error instanceof SourceProviderOutcomeError) throw error;
         if (errorCode(error) === "ENOENT") throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence is no longer present.");
@@ -508,6 +520,13 @@ export class DirectorySourceProvider implements SourceProvider {
       byte_length: before.target_stat.size,
       metadata_digest: before.metadata_digest,
       media_type: BINARY_EXTENSIONS.has(extname(uri).toLowerCase()) ? "application/octet-stream" : "text/plain; charset=utf-8",
+      after_read: async (contentHash, byteLength) => {
+        const after = await this.#inspectBoundary(uri, path);
+        const mediaBytes = streamHasNul || !streamValidUtf8 ? new Uint8Array([0]) : new Uint8Array();
+        if (!this.#included(uri, before, mediaBytes) || !after.included || before.token !== after.token || after.token !== input.provider_version_token || contentHash !== input.observed_content_hash || byteLength !== after.target_stat.size) {
+          throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed while reading.");
+        }
+      },
       chunks,
     };
   }

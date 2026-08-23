@@ -96,6 +96,12 @@ Each active physical workspace runs:
 
 Periodic timing is operational policy and may be configured, but disabling full reconciliation is forbidden for watched mutable providers. Equivalence produces only a new freshness checkpoint, not a generation.
 
+During a stable complete reconciliation, an observation whose provider version token,
+content digest, and analysis metadata digest equal the current occurrence may be
+validated at the provider boundary without rereading its bytes. The existing CAS
+object remains the authoritative content reference; changed observations still take
+the normal exact stream path. Incremental/partial captures never use this shortcut.
+
 ## Branch switches and mass changes
 
 A Git HEAD, index, worktree administrative, or provider-root transition opens a source barrier. Urdira pauses ordinary targeted publication, waits for the provider to report a stable state, performs one complete authoritative reconciliation, and plans the exact difference from the current snapshot. Queries continue against the prior snapshot and report freshness as stale while the barrier is open.

@@ -136,6 +136,10 @@ switch to SQLite worker threads. Timing output is opt-in and disabled by
 default; restart an already-running daemon with the flag before collecting a
 new timing sample.
 
+For storage tuning, `URDIRA_CAS_PUT_CONCURRENCY` bounds independent CAS writes
+per source-ingestion batch (default `16`). It is a scheduling knob only; each
+blob keeps the same fsync and atomic-install durability boundary.
+
 ### MCP configuration
 
 Urdira exposes one local stdio MCP server. The process starts or shares the

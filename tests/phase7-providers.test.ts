@@ -349,6 +349,18 @@ describe("Phase 7 five-call source providers", () => {
     for await (const chunk of stream.chunks) chunks.push(chunk);
     expect(new TextDecoder().decode(Buffer.concat(chunks))).toBe("export const alpha = 1;\n");
     expect(stream).toMatchObject({ artifact_id: observation.artifact_id, content_hash: observation.observed_content_hash, byte_length: 24, media_type: "text/plain; charset=utf-8" });
+
+    const reused = await provider.readStream({
+      artifact_id: observation.artifact_id,
+      normalized_uri: observation.normalized_uri,
+      observed_content_hash: observation.observed_content_hash,
+      observed_metadata_digest: observation.observed_metadata_digest,
+      provider_version_token: observation.provider_version_token,
+    }, { reuse_existing: true });
+    expect(reused.reused_existing).toBe(true);
+    const reusedChunks: Uint8Array[] = [];
+    for await (const chunk of reused.chunks) reusedChunks.push(chunk);
+    expect(reusedChunks).toHaveLength(0);
   });
 
   it("rejects direct reads of mandatory and configured exclusions even with matching observation coordinates", async () => {

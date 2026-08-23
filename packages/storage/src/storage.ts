@@ -21,6 +21,8 @@ import { ByteBoundaryTelemetry } from "./byte-telemetry.js";
 export interface DurableStorageOptions {
   readonly rootDir: string;
   readonly inlineThresholdBytes?: number;
+  /** Maximum concurrent CAS blob writes (default 16). */
+  readonly cas_put_concurrency?: number;
   readonly busyTimeoutMs?: number;
   readonly fault_injector?: FaultInjector;
   /**
@@ -1099,7 +1101,7 @@ export class DurableStorage {
     const cas = new ContentAddressedStore(
       join(rootDir, "cas"),
       (blob, mediaType) => catalog.recordCasObject(blob, mediaType),
-      { telemetry: byteTelemetry },
+      { telemetry: byteTelemetry, ...(options.cas_put_concurrency === undefined ? {} : { put_concurrency: options.cas_put_concurrency }) },
       (entries) => catalog.recordCasObjectsBatch(entries.map((entry) => (entry.media_type === undefined ? { content: entry.blob } : { content: entry.blob, media_type: entry.media_type }))),
     );
     const blobs = new BlobStore(cas, options.inlineThresholdBytes ?? 16 * 1024);

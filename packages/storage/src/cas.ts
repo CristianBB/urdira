@@ -15,6 +15,12 @@ export interface CasPutOptions {
 export interface CasPutStreamOptions extends CasPutOptions {
   readonly byte_length?: number;
   readonly telemetry?: ByteBoundaryTelemetry;
+  /**
+   * Optional provider-side boundary validation after CAS has computed the
+   * authoritative digest. This lets a streaming provider avoid hashing the
+   * same bytes a second time while retaining its post-read race check.
+   */
+  readonly after_read?: (contentHash: string, byteLength: number) => Promise<void>;
 }
 
 export type BlobReference =
@@ -29,6 +35,8 @@ export interface CasFilesystemHooks {
   readonly sync_file?: (path: string) => Promise<void>;
   readonly platform?: NodeJS.Platform;
   readonly telemetry?: ByteBoundaryTelemetry;
+  /** Maximum number of independent CAS writes in flight (default 16). */
+  readonly put_concurrency?: number;
 }
 
 export interface CasPutManyEntry {
@@ -82,6 +90,7 @@ export class ContentAddressedStore {
   private readonly syncFileHook: (path: string) => Promise<void>;
   private readonly platform: NodeJS.Platform;
   private readonly telemetry: ByteBoundaryTelemetry | undefined;
+  private readonly putConcurrency: number;
 
   constructor(rootDir: string, writeMetadata?: CasMetadataWriter, hooks: CasFilesystemHooks = {}, writeMetadataBatch?: CasMetadataBatchWriter) {
     this.rootDir = rootDir;
@@ -91,6 +100,7 @@ export class ContentAddressedStore {
     this.syncFileHook = hooks.sync_file ?? ((path) => this.syncFile(path));
     this.platform = hooks.platform ?? process.platform;
     this.telemetry = hooks.telemetry;
+    this.putConcurrency = Math.max(1, Math.min(Math.trunc(hooks.put_concurrency ?? DEFAULT_PUT_CONCURRENCY) || DEFAULT_PUT_CONCURRENCY, 256));
   }
 
   async put(bytes: Uint8Array, options: CasPutOptions = {}): Promise<ContentBlob> {
@@ -115,7 +125,7 @@ export class ContentAddressedStore {
    */
   async putStreamsMany(entries: readonly CasPutStreamEntry[]): Promise<ContentBlob[]> {
     if (entries.length === 0) return [];
-    const installed = await mapWithConcurrency(entries, DEFAULT_PUT_CONCURRENCY, async (entry) => {
+    const installed = await mapWithConcurrency(entries, this.putConcurrency, async (entry) => {
       const options = entry.options ?? {};
       const temporary = join(this.rootDir, ".tmp", `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
       await mkdir(dirname(temporary), { recursive: true });
@@ -136,6 +146,7 @@ export class ContentAddressedStore {
         const actualHash = `sha256:${hash.digest("hex")}`;
         if (options.byte_length !== undefined && byteLength !== options.byte_length) throw new StorageError("storage:cas_stream_length_mismatch", "CAS stream length did not match its declaration.", { expected_length: options.byte_length, actual_length: byteLength });
         if (options.content_hash !== undefined && options.content_hash !== actualHash) throw new StorageError("storage:cas_collision", "The supplied CAS digest does not match the streamed bytes.", { expected: options.content_hash, actual: actualHash });
+        if (options.after_read !== undefined) await options.after_read(actualHash, byteLength);
         const destination = this.objectPath(actualHash);
         await mkdir(dirname(destination), { recursive: true });
         let isNew = true;
@@ -160,13 +171,13 @@ export class ContentAddressedStore {
     });
     const freshDestinations = [...new Set(installed.filter((entry) => entry.isNew).map((entry) => entry.destination))];
     if (this.platform === "win32") {
-      await mapWithConcurrency(freshDestinations, DEFAULT_PUT_CONCURRENCY, async (path) => {
+      await mapWithConcurrency(freshDestinations, this.putConcurrency, async (path) => {
         try { await timed("cas_file_fsync", () => this.syncFileHook(path)); }
         catch (error) { throw new StorageError("storage:cas_directory_sync_failed", "The installed CAS object could not be durably synchronized.", { directory: dirname(path), cause: error instanceof Error ? error.message : String(error) }); }
       });
     } else {
       const dirtyDirectories = [...new Set(freshDestinations.map((destination) => dirname(destination)))];
-      await mapWithConcurrency(dirtyDirectories, DEFAULT_PUT_CONCURRENCY, async (directory) => {
+      await mapWithConcurrency(dirtyDirectories, this.putConcurrency, async (directory) => {
         try { await timed("cas_dir_fsync", () => this.syncDirectoryHook(directory)); }
         catch (error) { throw new StorageError("storage:cas_directory_sync_failed", "The CAS directory could not be durably synchronized.", { directory, cause: error instanceof Error ? error.message : String(error) }); }
       });
@@ -240,7 +251,21 @@ export class ContentAddressedStore {
       }
       return { copy, actualHash, media_type: entry.options?.media_type, destination: this.objectPath(actualHash) };
     });
-    const linkedNew = await mapWithConcurrency(prepared, DEFAULT_PUT_CONCURRENCY, async (item) => {
+    // A source scan can contain the same bytes many times (generated files,
+    // vendored declarations, or identical package fixtures).  The result
+    // still has one reference per input, but only the first occurrence needs
+    // a temp file, file fsync, link, and collision verification.  Previously
+    // duplicate entries raced through the full durable path and were only
+    // coalesced later for directory fsync/metadata, wasting the dominant CAS
+    // work while preserving no additional durability.
+    const uniquePrepared: typeof prepared = [];
+    const uniqueByHash = new Set<string>();
+    for (const item of prepared) {
+      if (uniqueByHash.has(item.actualHash)) continue;
+      uniqueByHash.add(item.actualHash);
+      uniquePrepared.push(item);
+    }
+    const linkedNew = await mapWithConcurrency(uniquePrepared, this.putConcurrency, async (item) => {
       await mkdir(dirname(item.destination), { recursive: true });
       const temporary = join(this.rootDir, ".tmp", `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
       await mkdir(dirname(temporary), { recursive: true });
@@ -263,14 +288,14 @@ export class ContentAddressedStore {
       await unlink(temporary).catch(() => undefined);
       return isNew;
     });
-    const freshDestinations = [...new Set(prepared.filter((_item, index) => linkedNew[index]).map((item) => item.destination))];
+    const freshDestinations = [...new Set(uniquePrepared.filter((_item, index) => linkedNew[index]).map((item) => item.destination))];
     if (this.platform === "win32") {
       // Node opens Windows directories without the FILE_FLAG_BACKUP_SEMANTICS
       // handle required for FlushFileBuffers, so FileHandle.sync() returns
       // EPERM. Reopen each newly installed hard link with write access and
       // flush that file handle instead; Windows associates the link metadata
       // with the file and FlushFileBuffers durably commits its cached metadata.
-      await mapWithConcurrency(freshDestinations, DEFAULT_PUT_CONCURRENCY, async (path) => {
+      await mapWithConcurrency(freshDestinations, this.putConcurrency, async (path) => {
         try {
           await timed("cas_file_fsync", () => this.syncFileHook(path));
         } catch (error) {
@@ -282,7 +307,7 @@ export class ContentAddressedStore {
       // least one fresh link this batch need fsyncing, and each needs it only
       // once regardless of how many of this batch's blobs landed in it.
       const dirtyDirectories = [...new Set(freshDestinations.map((destination) => dirname(destination)))];
-      await mapWithConcurrency(dirtyDirectories, DEFAULT_PUT_CONCURRENCY, async (directory) => {
+      await mapWithConcurrency(dirtyDirectories, this.putConcurrency, async (directory) => {
         try {
           await timed("cas_dir_fsync", () => this.syncDirectoryHook(directory));
         } catch (error) {

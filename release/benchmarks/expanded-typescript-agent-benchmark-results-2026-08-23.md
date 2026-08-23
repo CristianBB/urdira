@@ -116,3 +116,31 @@ parallelism, and broader cross-workspace digest-cache reuse. Redis should not
 be introduced as the indexing buffer unless a separate multi-process or
 remote-ingester requirement appears; it would add operational and durability
 cost without addressing the measured TypeScript/publication stages.
+
+## Post-change VS Code control (2026-08-23)
+
+A clean host-only control was run after this iteration against the same frozen
+VS Code commit (`038b9225c82c6b75172beda6081c64887692538c`). It is not mixed
+into the agent-arm medians above: it validates the readiness path and internal
+buckets, not transcript correctness.
+
+| Boundary / bucket | Clean control |
+|---|---:|
+| Source ready | 40,148 ms |
+| Structural stage 1 ready | 454,789 ms |
+| Final structural ready | 473,991 ms |
+| Source catalog | 202,828 ms |
+| Plugin analysis | 57,320 ms |
+| Analysis acceptance (batched native FactDelta) | 52,735 ms |
+| Seal | 77,353 ms |
+| Publish | 242,407 ms |
+| Publication plan build / SQLite transaction | 33,061 / 74,650 ms |
+
+The batched native-acceptance path reduced that bucket versus the prior
+78–79 s VS Code controls, but the end-to-end boundary remained about 474 s
+because source cataloging and publication still dominate. CAS digest
+de-duplication and the large stage-1 dependency-graph cache are therefore
+useful for duplicate or repeated full scans, not a first-index cure. The next
+high-value work is reducing per-file CAS durability overhead and the
+publication plan/transaction, or making independent project partitions
+publishable in bounded parallel lanes; Redis remains unsupported by the data.

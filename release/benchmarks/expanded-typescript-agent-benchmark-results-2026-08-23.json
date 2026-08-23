@@ -5283,6 +5283,21 @@
       "failure": null
     }
   ],
+  "post_change_vscode_control": {
+    "commit": "038b9225c82c6b75172beda6081c64887692538c",
+    "source_ready_ms": 40148,
+    "structural_stage_1_ready_ms": 454789,
+    "structural_ready_ms": 473991,
+    "source_catalog_ms": 202828,
+    "plugin_analysis_ms": 57320,
+    "analysis_acceptance_ms": 52735,
+    "seal_ms": 77353,
+    "publish_ms": 242407,
+    "publish_plan_build_ms": 33061,
+    "publish_sql_transaction_ms": 74650,
+    "measurement_kind": "clean_host_only_control",
+    "transcript_correctness_included": false
+  },
   "campaign_gate": {
     "expected_runs": 32,
     "observed_runs": 32,

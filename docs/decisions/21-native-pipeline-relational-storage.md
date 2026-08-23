@@ -55,9 +55,11 @@ not a relaxation of the 4 MiB/4096-row batch contract.
 
 The production JavaScript/TypeScript host uses the raw FactDelta as the single
 worker response representation. It derives bounded native batches only after
-validation and persists each batch immediately, so the worker does not return a
-second array containing the complete native projection. Once accepted, the host
-retains only the FactDelta identity, plugin provenance, dependencies,
+validation and persists them in small ordered groups (flushing at most 64
+batches per SQLite transaction), so the worker does not return a second array
+containing the complete native projection and each group remains bounded in
+memory. Receipt and sequence checks still apply to every batch. Once accepted,
+the host retains only the FactDelta identity, plugin provenance, dependencies,
 completeness claims, replacement sets, and validated staging bindings required
 for candidate sealing; provider proposal arrays are released. Direct plugin
 callers that do not opt into host-side batch persistence retain the response

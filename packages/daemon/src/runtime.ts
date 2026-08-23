@@ -55,6 +55,8 @@ export interface DaemonRuntimeOptions {
    * injected by the composing application from an environment variable.
    */
   readonly scan_io_concurrency?: number;
+  /** Maximum concurrent CAS writes during source ingestion (default 16). */
+  readonly cas_put_concurrency?: number;
   /**
    * Whether a successful workspace scan submits a post-ready lexical
    * maintenance job (see `scheduleWorkspaceScan`'s `submitLexicalMaintenance`
@@ -1196,7 +1198,7 @@ export class DaemonRuntime {
       // (e.g. tests exercising only the registry/IPC surface) keep today's
       // registry-only, fire-and-forget `beginReconciliation` behavior.
       indexingStorage = options.workspace_registry && options.resolve_plugin_provider
-        ? await createDurableStorage({ rootDir: options.data_root })
+        ? await createDurableStorage({ rootDir: options.data_root, ...(options.cas_put_concurrency === undefined ? {} : { cas_put_concurrency: options.cas_put_concurrency }) })
         : undefined;
       // `core:query`/`core:query_continue` reuse `indexingStorage` to open
       // (and cache, per `acquireWorkspaceQueryEngine` above) the target

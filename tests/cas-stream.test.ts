@@ -41,4 +41,19 @@ describe("CAS stream ingestion", () => {
       expect(await cas.read(blobs[1]!.content_hash)).toEqual(bytes[1]);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
+
+  it("runs provider boundary validation after the single CAS hash pass", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-cas-stream-after-read-"));
+    try {
+      let callback: string | undefined;
+      const bytes = new TextEncoder().encode("validated once");
+      const cas = new ContentAddressedStore(root);
+      const blob = await cas.putStream((async function* () { yield bytes; })(), {
+        byte_length: bytes.byteLength,
+        content_hash: "sha256:d7f1cb2e452adf9f95e500103bffd4ca2868e836e0f1d22d78adfacc990f8054",
+        after_read: async (hash, length) => { callback = `${hash}:${length}`; },
+      });
+      expect(callback).toBe(`${blob.content_hash}:${bytes.byteLength}`);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
 });

@@ -633,13 +633,13 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     }));
     return response;
   };
-  const readStream = async (observation: ProviderObservation) => provider.readStream({
+  const readStream = async (observation: ProviderObservation, options?: { readonly reuse_existing?: boolean }) => provider.readStream({
     artifact_id: observation.artifact_id,
     normalized_uri: observation.normalized_uri,
     observed_content_hash: observation.observed_content_hash,
     observed_metadata_digest: observation.observed_metadata_digest,
     provider_version_token: observation.provider_version_token,
-  });
+  }, options);
 
   // `currentState` (`workspace_current_state`, read above -- before this
   // scan's own source cataloging -- as `currentState`/`database.repositories.snapshots.getCurrent()`)

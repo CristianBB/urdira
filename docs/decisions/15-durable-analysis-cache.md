@@ -1,7 +1,7 @@
 # Durable Analysis Cache
 
 Status: **Approved**
-Last updated: 2026-08-21
+Last updated: 2026-08-23
 Depends on: [JavaScript/TypeScript MVP](07-javascript-typescript-mvp.md), [Plugin upgrade relock](14-plugin-upgrade-relock.md)
 
 ## Decision objective
@@ -24,6 +24,13 @@ This durable cache closes that gap by persisting a finished `JsTsAnalysisResult`
   payload from reintroducing the project-wide `Program`/`Checker` memory cost
   on the readiness path; changing the stage contract requires another format
   version rather than an in-place interpretation.
+- **Large-corpus graph entry.** Large stage-1 `analyze_closure` requests may
+  persist a separate `<hex>.graph.json.gz` entry keyed by the sorted
+  `(path, content_hash, byte_length)` manifest and root names. The direct
+  dependency graph is complete without source text, so a repeated full
+  reindex can answer the closure request before hydrating CAS bytes. This
+  entry is only a speedup: a missing, malformed, or stale graph is discarded
+  and the normal verified source-read path rebuilds it.
 - **Awaited write, not fire-and-forget.** `thread-transport.ts`'s `terminate()` calls `node:worker_threads`' own `Worker.terminate()` directly -- a hard kill of the whole thread, not a message the in-thread worker gets to react to; the in-thread `createJavascriptTypescriptWorker`'s own `terminate` (which just clears in-memory state) is never invoked by it. `apps/urdira/src/index.ts`'s scan loop calls `worker.terminate()` in a `finally` block immediately after its last `invoke()` resolves. A fire-and-forget durable write started inside that last `invoke()` would therefore race the hard kill and could be silently truncated. The write is awaited to completion before `invoke()` returns, closing that race entirely.
 - **Atomicity and corruption handling.** Every write goes to a per-write-unique temp file (`<hex>.json.gz.tmp-<pid>-<random>`) in the same directory, then an atomic `rename` over the final name -- a reader never observes a partially-written file. Since the durable key is a pure function of the analysis inputs, two workers racing to write the identical key always produce byte-identical content, so last-rename-wins between them is harmless. On read, `format_version`, the stored `durable_key` (recomputed and compared, not trusted blindly), and a minimal shape check on `analysis` (entities/relations/diagnostics are arrays, `dependency_closures` is a non-null object, `language`/`complete` have the right JS type) all have to pass; any failure -- missing file, a gunzip error on truncated/non-gzip bytes, a JSON parse error, or a shape mismatch -- is treated identically: best-effort `unlink` the bad file and fall through to a real build. Every fs/zlib/parse error the durable cache can produce is swallowed; it is a pure speedup and must never be able to fail a scan.
 - **Prune policy.** After every successful write, entries beyond `analysis_cache_max_entries` (default 16) are evicted oldest-mtime-first, best-effort (swallowed on any error). 16 is generous enough to survive a handful of analyzer/compiler upgrades and a handful of genuinely distinct workspace trees without unbounded growth on disk, since every upgrade or distinct tree mints a disjoint key rather than overwriting an existing entry.

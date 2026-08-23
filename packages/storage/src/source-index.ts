@@ -48,6 +48,7 @@ export interface SourceIndexContentStreamInput {
   readonly content_hash: string;
   readonly byte_length: number;
   readonly media_type: string;
+  readonly after_read?: (contentHash: string, byteLength: number) => Promise<void>;
 }
 
 export interface SourceIndexCommitInput {
@@ -623,6 +624,7 @@ export class WorkspaceSourceIndexRepository {
           content_hash: content.content_hash,
           byte_length: content.byte_length,
           media_type: content.media_type,
+          ...(content.after_read === undefined ? {} : { after_read: content.after_read }),
         },
       })));
       for (let index = 0; index < streams.length; index += 1) {

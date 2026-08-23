@@ -53,7 +53,7 @@ export interface SourceIndexApplyInput {
   readonly response: SourceProviderResponseEnvelope;
   readonly read?: (observation: ProviderObservation) => Promise<SourceProviderResponseEnvelope>;
   /** Native in-process source path; the stream is handed to CAS unchanged. */
-  readonly read_stream?: (observation: ProviderObservation) => Promise<DirectorySourceByteStream>;
+  readonly read_stream?: (observation: ProviderObservation, options?: SourceIndexReadStreamOptions) => Promise<DirectorySourceByteStream>;
   readonly supports_authoritative_delete_events?: boolean;
   /**
    * The caller may have already parsed `response.payload.observation_batch`
@@ -123,6 +123,10 @@ interface ValidatedRead {
   readonly bytes?: Uint8Array;
   readonly stream?: DirectorySourceByteStream;
   readonly text?: string;
+}
+
+export interface SourceIndexReadStreamOptions {
+  readonly reuse_existing?: boolean;
 }
 
 interface PlannedState {
@@ -436,7 +440,12 @@ export class GenericSourceIndexer {
     if (result.observations.length > SOURCE_INDEX_BATCH_MAX_ROWS) {
       return await this.applyFragmented(result, input, priorState);
     }
-    const reads = await this.readAll(result.observations, input.read, input.read_stream, input.io_concurrency);
+    const reusable = input.read_stream !== undefined && input.allow_partial !== true
+      ? new Map((await (this.workspace.sourceIndex.currentOccurrencesForIndex
+        ? this.workspace.sourceIndex.currentOccurrencesForIndex(result.batch.source_provider_binding_id)
+        : this.workspace.sourceIndex.currentOccurrences(result.batch.source_provider_binding_id))).map((value) => [value.artifact.normalized_uri, value]))
+      : undefined;
+    const reads = await this.readAll(result.observations, input.read, input.read_stream, input.io_concurrency, reusable);
     if (reads === undefined) return this.degraded(priorState, "core:source_provider_read_incomplete");
     return await this.applyBatch(result.batch, reads, result.scopes, result.watermark, priorState, input.publication_current_generation ?? 0);
   }
@@ -473,7 +482,12 @@ export class GenericSourceIndexer {
         unavailable_count: batch.unavailable_count,
       }, observations) !== batch.batch_digest) throw new EngineError("engine:source_index_result_invalid", "Native observation batch digest does not match its logical contents.");
       const scopes = parseCoverageScopes(batch);
-      const reads = await this.readAll(observations, input.read, input.read_stream, input.io_concurrency);
+      const reusable = input.read_stream !== undefined && input.allow_partial !== true
+        ? new Map((await (this.workspace.sourceIndex.currentOccurrencesForIndex
+          ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
+          : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id))).map((value) => [value.artifact.normalized_uri, value]))
+        : undefined;
+      const reads = await this.readAll(observations, input.read, input.read_stream, input.io_concurrency, reusable);
       if (reads === undefined) return this.degraded(state, "core:source_provider_read_incomplete");
       const complete = batch.coverage_completeness === "complete";
       if (complete) {
@@ -529,7 +543,12 @@ export class GenericSourceIndexer {
       }
       const observations = result.observations.slice(start, offset);
       const batch = fragmentBatch(result.batch, observations, fragmentIndex, false);
-      const reads = await this.readAll(observations, input.read, input.read_stream, input.io_concurrency);
+      const reusable = input.read_stream !== undefined && input.allow_partial !== true
+        ? new Map((await (this.workspace.sourceIndex.currentOccurrencesForIndex
+          ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
+          : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id))).map((value) => [value.artifact.normalized_uri, value]))
+        : undefined;
+      const reads = await this.readAll(observations, input.read, input.read_stream, input.io_concurrency, reusable);
       if (reads === undefined) return this.degraded(state, "core:source_provider_read_incomplete");
       const fragmentResult = await this.applyBatch(batch, reads, result.scopes, result.watermark, state, input.publication_current_generation ?? 0);
       changed ||= fragmentResult.changed === true;
@@ -560,7 +579,7 @@ export class GenericSourceIndexer {
   // taking the FIRST non-"value" entry, exactly reproducing what a strictly
   // sequential `for await` (which stops at that same first failing index and
   // never even attempts later ones) would have returned or thrown.
-  private async readAll(observations: readonly ProviderObservation[], read: SourceIndexApplyInput["read"], readStream: SourceIndexApplyInput["read_stream"], ioConcurrency = DEFAULT_READ_CONCURRENCY): Promise<readonly ValidatedRead[] | undefined> {
+  private async readAll(observations: readonly ProviderObservation[], read: SourceIndexApplyInput["read"], readStream: SourceIndexApplyInput["read_stream"], ioConcurrency = DEFAULT_READ_CONCURRENCY, reusable?: ReadonlyMap<string, CurrentSourceOccurrence>): Promise<readonly ValidatedRead[] | undefined> {
     if (observations.length > 0 && read === undefined && readStream === undefined) return undefined;
     type ReadOutcome =
       | { readonly kind: "value"; readonly read: ValidatedRead }
@@ -569,12 +588,17 @@ export class GenericSourceIndexer {
     const outcomes = await mapWithConcurrency(observations, ioConcurrency, async (observation): Promise<ReadOutcome> => {
       try {
         if (readStream !== undefined) {
-          const stream = await readStream(observation);
+          const existing = reusable?.get(observation.normalized_uri);
+          const equivalent = existing?.version.content_hash === observation.observed_content_hash
+            && existing.version.analysis_metadata_digest === observation.observed_metadata_digest;
+          const stream = await readStream(observation, equivalent ? { reuse_existing: true } : undefined);
           if (stream.artifact_id !== observation.artifact_id || stream.provider_version_token !== observation.provider_version_token
             || stream.content_hash !== observation.observed_content_hash || stream.byte_length < 0
             || stream.metadata_digest !== observation.observed_metadata_digest) {
             throw new EngineError("engine:source_index_read_invalid", "Native source stream metadata does not match the stable observed occurrence.");
           }
+          if (equivalent && stream.reused_existing !== true) throw new EngineError("engine:source_index_read_invalid", "Native source provider did not honor the requested equivalent-content reuse.");
+          if (!equivalent && stream.reused_existing === true) throw new EngineError("engine:source_index_read_invalid", "Native source provider reused content for a changed occurrence.");
           return { kind: "value", read: { observation, stream } };
         }
         const response = await read!(observation);
@@ -701,7 +725,10 @@ export class GenericSourceIndexer {
         valid_from_generation: generation,
       };
       if (read.bytes !== undefined) contents.push({ content_blob_id: contentBlobId, bytes: read.bytes, media_type: read.text === undefined ? "application/octet-stream" : "text/plain; charset=utf-8" });
-      else if (read.stream !== undefined) contentStreams.push({ content_blob_id: contentBlobId, stream: read.stream.chunks, content_hash: read.stream.content_hash, byte_length: read.stream.byte_length, media_type: read.stream.media_type });
+      else if (read.stream !== undefined) {
+        if (read.stream.reused_existing === true || read.stream.chunks === undefined) throw new EngineError("engine:source_index_read_invalid", "A changed source occurrence cannot reuse an existing CAS blob.");
+        contentStreams.push({ content_blob_id: contentBlobId, stream: read.stream.chunks, content_hash: read.stream.content_hash, byte_length: read.stream.byte_length, media_type: read.stream.media_type, ...(read.stream.after_read === undefined ? {} : { after_read: read.stream.after_read }) });
+      }
       versions.push(version);
       if (priorAbsence) {
         const closingChange = stableId("artifact-change", { kind: priorAbsence.tombstone.absence_kind === "excluded" ? "reincluded" : "recreated", batch_id: batch.observation_batch_id, artifact_id: artifact.artifact_id });

@@ -68,6 +68,66 @@ async function filesFromPayload(payload: unknown, casRoot?: string, options: { r
   return result.sort((left, right) => left.path.localeCompare(right.path));
 }
 
+type SyntaxDependencyGraph = Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>>;
+
+function largeSyntaxManifestKey(payload: unknown, rootNames: readonly string[], descriptor: JavascriptTypescriptWorkerDescriptor): string | undefined {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const entries = (payload as Record<string, unknown>)["files"];
+  if (!Array.isArray(entries) || entries.length === 0) return undefined;
+  const manifest = [] as { readonly path: string; readonly content_hash: string; readonly byte_length?: number }[];
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+    const value = entry as Record<string, unknown>;
+    if (typeof value["path"] !== "string" || typeof value["content_hash"] !== "string") return undefined;
+    manifest.push({ path: value["path"], content_hash: value["content_hash"], ...(typeof value["byte_length"] === "number" ? { byte_length: value["byte_length"] } : {}) });
+  }
+  return durableAnalysisCacheKey(canonicalSha256({
+    stage: "syntax_dependency_graph",
+    files: manifest.sort((left, right) => left.path.localeCompare(right.path)),
+    root_names: [...rootNames].sort(),
+  }), descriptor, "syntax-graph");
+}
+
+function syntaxDependencyGraphCachePath(dir: string, durableKey: string): string {
+  return join(dir, `${durableKey}.graph.json.gz`);
+}
+
+function isValidSyntaxDependencyGraph(value: unknown): value is SyntaxDependencyGraph {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value as Record<string, unknown>).every((node) => {
+    if (node === null || typeof node !== "object" || Array.isArray(node)) return false;
+    const candidate = node as Record<string, unknown>;
+    return Array.isArray(candidate["direct_files"])
+      && (candidate["direct_files"] as unknown[]).every((path) => typeof path === "string")
+      && typeof candidate["complete"] === "boolean";
+  });
+}
+
+async function readSyntaxDependencyGraphCache(dir: string, durableKey: string): Promise<SyntaxDependencyGraph | undefined> {
+  const filePath = syntaxDependencyGraphCachePath(dir, durableKey);
+  try {
+    const parsed = JSON.parse((await gunzip(await readFile(filePath))).toString("utf8")) as { format_version?: unknown; durable_key?: unknown; dependency_graph?: unknown };
+    if (parsed.format_version !== 1 || parsed.durable_key !== durableKey || !isValidSyntaxDependencyGraph(parsed.dependency_graph)) throw new Error("Invalid syntax dependency graph cache entry.");
+    return parsed.dependency_graph as SyntaxDependencyGraph;
+  } catch {
+    await unlink(filePath).catch(() => undefined);
+    return undefined;
+  }
+}
+
+async function writeSyntaxDependencyGraphCache(dir: string, durableKey: string, dependencyGraph: SyntaxDependencyGraph): Promise<void> {
+  try {
+    await mkdir(dir, { recursive: true });
+    const compressed = await gzip(Buffer.from(JSON.stringify({ format_version: 1, durable_key: durableKey, dependency_graph: dependencyGraph })), { level: 1 });
+    const finalPath = syntaxDependencyGraphCachePath(dir, durableKey);
+    const tempPath = `${finalPath}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+    await writeFile(tempPath, compressed);
+    await rename(tempPath, finalPath);
+  } catch {
+    /* The graph cache is a pure speedup; a failed write must not fail indexing. */
+  }
+}
+
 function response(request: PluginWorkerRequestEnvelope, payload: unknown): unknown {
   return {
     protocol_version: request.protocol_version,
@@ -452,12 +512,38 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
         supported_calls: ["describe", "discover_partitions", "analyze_artifact", "analyze_closure", "generate_projection"],
         supported_contracts: JAVASCRIPT_TYPESCRIPT_CAPABILITIES,
       });
+      const rawPayload = request.payload as Record<string, unknown>;
+      const preliminaryRootNames = Array.isArray(rawPayload["root_names"]) && rawPayload["root_names"].every((value) => typeof value === "string")
+        ? rawPayload["root_names"] as string[] : [];
+      const preliminaryStage = typeof rawPayload["publication_stage_id"] === "string" ? rawPayload["publication_stage_id"] : undefined;
+      // The large-corpus closure path only needs the direct import graph.  Its
+      // cache key can be derived from immutable artifact digests before any
+      // CAS bytes are decoded, so a repeated full reindex can skip both the
+      // multi-gigabyte source hydration and the graph scan.  Small requests,
+      // inline text payloads, and non-stage-1 calls retain the existing path.
+      if (request.call === "analyze_closure" && preliminaryStage === "jsts:structural_stage_1" && descriptor.analysis_cache_dir !== undefined) {
+        const entries = Array.isArray(rawPayload["files"]) ? rawPayload["files"] : [];
+        const sourceEntries = entries.filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry));
+        const rootSet = new Set(preliminaryRootNames);
+        const sourceCount = sourceEntries.filter((entry) => typeof entry["path"] === "string" && (rootSet.size === 0 || rootSet.has(entry["path"] as string))).length;
+        const totalBytes = sourceEntries.reduce((total, entry) => {
+          if (rootSet.size !== 0 && typeof entry["path"] === "string" && !rootSet.has(entry["path"])) return total;
+          return total + (typeof entry["byte_length"] === "number" ? entry["byte_length"] : 0);
+        }, 0);
+        const graphKey = largeSyntaxManifestKey(request.payload, preliminaryRootNames, descriptor);
+        if ((sourceCount >= 512 || totalBytes >= 16 * 1024 * 1024) && graphKey !== undefined) {
+          const cachedGraph = await readSyntaxDependencyGraphCache(descriptor.analysis_cache_dir, graphKey);
+          if (cachedGraph !== undefined) {
+            descriptor.on_analysis_cache_load?.();
+            return response(request, { plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, dependency_graph: cachedGraph });
+          }
+        }
+      }
       const files = await filesFromPayload(request.payload, descriptor.cas_root, {
         ...(descriptor.source_load_concurrency === undefined ? {} : { load_concurrency: descriptor.source_load_concurrency }),
         ...(descriptor.source_load_max_in_flight_bytes === undefined ? {} : { max_in_flight_bytes: descriptor.source_load_max_in_flight_bytes }),
       });
       if (request.call === "discover_partitions") return response(request, { partitions: discoverProjects(files), plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID });
-      const rawPayload = request.payload as Record<string, unknown>;
       const rootNames = Array.isArray(rawPayload["root_names"]) && rawPayload["root_names"].every((value) => typeof value === "string")
         ? rawPayload["root_names"] as string[] : files.map((file) => file.path);
       const compilerOptions = rawPayload["compiler_options"] !== null && typeof rawPayload["compiler_options"] === "object" && !Array.isArray(rawPayload["compiler_options"])
@@ -470,9 +556,12 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
         // closure call only needs the direct graph; owner facts are built from
         // bounded views below and this response deliberately warms no cache.
         descriptor.on_analysis_build?.();
+        const dependencyGraph = analyzeSyntaxDependencyGraph({ files, root_names: rootNames });
+        const graphKey = largeSyntaxManifestKey(request.payload, rootNames, descriptor);
+        if (descriptor.analysis_cache_dir !== undefined && graphKey !== undefined) await writeSyntaxDependencyGraphCache(descriptor.analysis_cache_dir, graphKey, dependencyGraph);
         return response(request, {
           plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
-          dependency_graph: analyzeSyntaxDependencyGraph({ files, root_names: rootNames }),
+          dependency_graph: dependencyGraph,
         });
       }
       const compilerOptionsDigest = canonicalSha256(compilerOptions ?? null);

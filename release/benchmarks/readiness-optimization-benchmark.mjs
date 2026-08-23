@@ -46,6 +46,34 @@ async function casBatch(root, entries, platform = process.platform) {
   return { ms: result.ms, directory_syncs: directorySyncs, file_syncs: fileSyncs };
 }
 
+// Experimental pack candidate: one append-only immutable pack per batch plus
+// an in-memory digest/offset index. It is intentionally isolated from the
+// production CAS contract so the benchmark measures whether pack framing can
+// beat one-file-per-object before we commit to a durable pack index/GC design.
+async function packCasBatch(root, entries) {
+  await mkdir(root, { recursive: true });
+  const unique = new Map();
+  const result = await elapsed(async () => {
+    const path = join(root, "batch.pack");
+    const handle = await open(path, "w", 0o600);
+    let offset = 0;
+    try {
+      for (const value of entries) {
+        const digest = sha256(value);
+        if (unique.has(digest)) continue;
+        const header = Buffer.allocUnsafe(4);
+        header.writeUInt32BE(value.byteLength, 0);
+        await handle.write(header);
+        await handle.write(value);
+        unique.set(digest, { offset, byte_length: value.byteLength });
+        offset += header.byteLength + value.byteLength;
+      }
+      await handle.sync();
+    } finally { await handle.close(); }
+  });
+  return { ms: result.ms, unique_objects: unique.size, pack_bytes: [...unique.values()].reduce((sum, item) => sum + 4 + item.byte_length, 0) };
+}
+
 async function runCasExperiments(root) {
   const values = Array.from({ length: 128 }, (_, i) => bytes(i));
   const sequential = await elapsed(async () => {
@@ -56,7 +84,15 @@ async function runCasExperiments(root) {
   const duplicateEntries = values.slice(0, 32).flatMap((value) => [value, value, value, value]);
   const duplicate = await casBatch(join(root, "duplicates"), duplicateEntries, "darwin");
   const deduped = await casBatch(join(root, "deduped"), values.slice(0, 32), "darwin");
-  return { pack_small_files: { sequential_ms: sequential.ms, batched_ms: batched.ms, speedup: Number((sequential.ms / Math.max(1, batched.ms)).toFixed(2)), batched_fsyncs: batched.directory_syncs + batched.file_syncs }, duplicate_staging: { duplicate_ms: duplicate.ms, deduped_ms: deduped.ms, duplicate_fsyncs: duplicate.directory_syncs + duplicate.file_syncs, deduped_fsyncs: deduped.directory_syncs + deduped.file_syncs } };
+  const concurrency = {};
+  for (const level of [8, 16, 32, 64]) {
+    const started = now();
+    const store = new ContentAddressedStore(join(root, `concurrency-${level}`), undefined, { platform: "darwin", put_concurrency: level, sync_directory: async () => {} });
+    await store.putMany(values.map((value) => ({ bytes: value })));
+    concurrency[level] = Math.round(now() - started);
+  }
+  const pack = await packCasBatch(join(root, "pack-candidate"), values);
+  return { pack_small_files: { sequential_ms: sequential.ms, batched_ms: batched.ms, speedup: Number((sequential.ms / Math.max(1, batched.ms)).toFixed(2)), batched_fsyncs: batched.directory_syncs + batched.file_syncs }, duplicate_staging: { duplicate_ms: duplicate.ms, deduped_ms: deduped.ms, duplicate_fsyncs: duplicate.directory_syncs + duplicate.file_syncs, deduped_fsyncs: deduped.directory_syncs + deduped.file_syncs }, cas_concurrency_ms: concurrency, pack_cas_candidate: pack };
 }
 
 function insertCommands(rows, table = "items") {

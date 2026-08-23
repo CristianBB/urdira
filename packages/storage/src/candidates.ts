@@ -475,6 +475,21 @@ export class WorkspaceCandidateRepository {
     return status;
   }
 
+  /** Accepts several transferred native batches under one SQLite transaction. */
+  async acceptNativeFactDeltaBatches(candidateGenerationId: string, entries: readonly { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[]): Promise<void> {
+    if (entries.length === 0) return;
+    await this.requireCandidate(candidateGenerationId);
+    for (const entry of entries) validateFactDeltaBatch(entry.batch);
+    await this.database.transactionChunked(entries.map((entry) => ({
+      kind: "staged_fact_delta_batch" as const,
+      workspace_id: this.workspaceId,
+      candidate_generation_id: candidateGenerationId,
+      fact_delta_id: entry.fact_delta_id,
+      accepted_at: now(),
+      batch: entry.batch,
+    })), 64, { transfer_params: true, discard_results: true });
+  }
+
   async saveMaterialization(candidateId: string, materialization: CandidateMaterialization, templateSets: CandidateTemplateSets = { source_transitions: [], record_opens: [], record_closures: [], identity_assignments: [], artifact_dependencies: [], lookup_dependencies: [], lookup_revalidations: [] }): Promise<CandidateInsertResult> {
     assertWorkspace(this.workspaceId, materialization.workspace_id);
     await this.requireCandidate(candidateId);
