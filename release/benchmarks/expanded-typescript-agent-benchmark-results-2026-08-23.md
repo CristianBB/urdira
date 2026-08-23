@@ -145,18 +145,18 @@ high-value work is reducing per-file CAS durability overhead and the
 publication plan/transaction, or making independent project partitions
 publishable in bounded parallel lanes; Redis remains unsupported by the data.
 
-## Optimized CAS/reindex control (commit `1d34426f`, 2026-08-23)
+## Optimized CAS/reindex control (commit `df637469`, 2026-08-23)
 
 The clean first-index control with `URDIRA_CAS_PUT_CONCURRENCY=16` completed at
-441.362 s. It remained correct (`source_ready`, all three structural stages,
+452.411 s. It remained correct (`source_ready`, all three structural stages,
 and `ready` were observed; no degraded or fallback path). Compared with the
-previous clean control, source cataloging fell from 202.828 s to 162.375 s
-(about 20%), while publication stayed effectively flat (248.623 s versus
-242.407 s), so the first index is still publication-bound.
+previous clean control, source cataloging fell from 202.828 s to 160.635 s
+(about 21%), while publication was 259.018 s versus 242.407 s, so the first
+index is still publication-bound.
 
 The decisive result is the forced complete reindex on the same data root:
-`core:reindex` returned `equivalent` in 99.146 s. Its source catalog took
-90.110 s, CAS writes were 0 ms, and the SQLite commit was 24 ms. The provider
+`core:reindex` returned `equivalent` in 102.636 s. Its source catalog took
+92.320 s, CAS writes were 0 ms, and the SQLite commit was 38 ms. The provider
 still enumerates and hashes the tree (8.537 s), but unchanged files are
 validated by token/metadata and reuse their existing CAS references instead
 of rereading and rewriting bytes. This is the path that makes periodic/full
