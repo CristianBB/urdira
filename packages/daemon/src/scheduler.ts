@@ -78,6 +78,21 @@ export class DaemonScheduler {
     await new Promise<void>((resolve) => this.stopWaiters.push(resolve));
   }
 
+  /** Cancel queued and active jobs from one work pool without stopping the daemon. */
+  cancelPool(pool: WorkPoolKind): void {
+    for (const entry of [...this.entries]) {
+      if (entry.request.pool !== pool) continue;
+      entry.controller.abort();
+      if (entry.state === "queued") {
+        const queue = this.queues[pool];
+        const index = queue.indexOf(entry);
+        if (index >= 0) queue.splice(index, 1);
+        this.settle(entry, undefined, new DaemonError("core:operation_cancelled", `Queued ${pool} work was cancelled.`));
+      }
+    }
+    this.pump();
+  }
+
   /** True while a query is queued or executing; background maintenance uses
    * this signal to yield at its next document/commit boundary. */
   hasQueryPressure(): boolean {

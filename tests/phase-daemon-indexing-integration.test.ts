@@ -243,9 +243,9 @@ async function pollUntilReady(client: DaemonClient, workspaceId: string, timeout
   let last: { readonly workspace_id: string; readonly workspace_status: string } | undefined;
   while (Date.now() < deadline) {
     // With an empty `workspace_ids` list, `core:index_status` returns every
-    // registered workspace's status directly (including "indexing"), unlike
-    // the single-workspace-id form used below, which -- by design -- rejects
-    // non-ready/degraded workspaces with `core:index_unavailable`.
+    // registered workspace's layered status directly (including "indexing").
+    // The v3 single-workspace detail below is also layered, so this helper
+    // waits for the terminal ready/degraded state before returning.
     const response = await client.call("core:index_status", {});
     if (response.outcome !== "success") throw new Error(`core:index_status did not succeed: ${JSON.stringify(response)}`);
     const payload = response.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_id: string; readonly workspace_status: string }> };
@@ -271,6 +271,14 @@ async function pollUntilReady(client: DaemonClient, workspaceId: string, timeout
       const detailPayload = detail.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> };
       const detailWorkspace = detailPayload.workspaces[0];
       if (detailWorkspace === undefined) throw new Error("core:index_status (detail) returned no workspace entry.");
+      // v3 exposes layered source-first readiness in the detail response too:
+      // the workspace can still be indexing structurally after source data is
+      // available. Keep polling until the workspace reaches its terminal
+      // ready/degraded status before asserting snapshot-dependent behavior.
+      if (detailWorkspace.workspace_status !== "ready" && detailWorkspace.workspace_status !== "degraded") {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        continue;
+      }
       return detailWorkspace;
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
@@ -387,7 +395,7 @@ describe("Daemon workspace indexing integration: core:workspace_add reaches stat
       };
 
       const first = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: {
           expression_type: "operation",
@@ -414,7 +422,7 @@ describe("Daemon workspace indexing integration: core:workspace_add reaches stat
       let continuations = 0;
       while (hasNext) {
         const continued = await client.call("core:query_continue", {
-          api_version: 1,
+          api_version: 3,
           scope: { scope_type: "single_workspace", workspace_id: workspaceId },
           cursor,
           response_budget: { max_items: 1, max_characters: 1_000_000 },
@@ -436,7 +444,7 @@ describe("Daemon workspace indexing integration: core:workspace_add reaches stat
       expect(names).toEqual(expect.arrayContaining(["TaskNotFoundError", "InvalidTaskTransitionError"]));
 
       const resolved = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:resolve_symbol", arguments: { reference: "InvalidTaskTransitionError", resolution_scope: "exports" } },
         options: { ...queryOptions, response_budget: { max_items: 1_000, max_characters: 1_000_000 } },
@@ -565,7 +573,7 @@ describe("Daemon post-ready lexical maintenance (D5) and core:search_text pushdo
     let lastItemCount = -1;
     while (Date.now() < deadline) {
       const response = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "cannot transition from", syntax: "literal" } },
         options: queryOptions,
@@ -630,7 +638,7 @@ describe("Daemon post-ready lexical maintenance (D5) and core:search_text pushdo
     }
   }, 120_000);
 
-  it("URDIRA_LEXICAL_INDEX kill switch (DaemonRuntimeOptions.lexical_index: false) leaves core:search_text on the corpus-scan fallback forever", async () => {
+  it("URDIRA_LEXICAL_INDEX kill switch keeps core:search_text exact through the source-catalog fallback", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-lexical-off-data-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-lexical-off-workspace-"));
     let runtime: DaemonRuntime | undefined;
@@ -675,7 +683,7 @@ describe("Daemon post-ready lexical maintenance (D5) and core:search_text pushdo
       // already been made and is final -- there is no async job left in
       // flight to race against.
       const response = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "cannot transition from", syntax: "literal" } },
         options: queryOptions,
@@ -683,7 +691,8 @@ describe("Daemon post-ready lexical maintenance (D5) and core:search_text pushdo
       expect(response.outcome).toBe("success");
       type StreamPage = { readonly items: ReadonlyArray<{ readonly value: unknown }> };
       const payload = response.payload as { readonly streams: Readonly<Record<string, StreamPage>> };
-      expect(payload.streams["matches"]?.items ?? []).toEqual([]);
+      expect(payload.streams["matches"]?.items).toHaveLength(1);
+      expect(payload.streams["matches"]?.items[0]?.value).toMatchObject({ path: "errors.ts" });
     } finally {
       if (runtime) await runtime.stop();
       await rm(dataRoot, { recursive: true, force: true });
@@ -695,8 +704,8 @@ describe("Daemon post-ready lexical maintenance (D5) and core:search_text pushdo
   // kill switch's equivalent) forces the prior in-process `reconcileLexicalProjection`
   // call path instead of the `node:worker_threads`-backed one -- see
   // `submitLexicalMaintenance` in `packages/daemon/src/runtime.ts`. Unlike the
-  // `lexical_index: false` test above (which proves the corpus-scan fallback
-  // stays in permanent effect), this proves the OPPOSITE: with the thread
+  // `lexical_index: false` test above (which proves the exact source-catalog
+  // fallback stays in permanent effect), this proves that with the thread
   // disabled but the job itself still enabled, `core:search_text` pushdown
   // must still activate exactly as it does on the (thread-enabled) default
   // path above.
@@ -854,7 +863,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       await pollUntilSemanticGenerationCurrent(dataRoot, workspaceId);
 
       const semanticResponse = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: "CreateTaskInput", query_class: "identifier" } },
         options: queryOptions,
@@ -870,7 +879,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       expect((semanticCoverage[0]!.value as { readonly materialization_state: string }).materialization_state).toBe("complete");
 
       const hybridResponse = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:search_hybrid", arguments: { query_text: "CreateTaskInput", query_class: "identifier" } },
         options: queryOptions,
@@ -949,7 +958,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       await pollUntilSemanticGenerationCurrent(dataRoot, workspaceId);
 
       const semanticResponse = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: "CreateTaskInput", query_class: "identifier" } },
         options: queryOptions,
@@ -1019,7 +1028,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       await pollUntilSemanticGenerationCurrent(dataRoot, workspaceId);
 
       const semanticResponse = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: "CreateTaskInput", query_class: "identifier" } },
         options: queryOptions,
@@ -1130,7 +1139,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       // OPPOSITE transition (unavailable -> available) within one daemon
       // process's lifetime, no restart.
       const semanticResponse = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: "CreateTaskInput", query_class: "identifier" } },
         options: queryOptions,
@@ -1161,7 +1170,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
     }
   }, 120_000);
 
-  it("URDIRA_SEMANTIC_INDEX kill switch (DaemonRuntimeOptions.semantic_index: false) never builds a semantic index, and core:search_semantic answers core:semantic_index_unavailable", async () => {
+  it("URDIRA_SEMANTIC_INDEX kill switch (DaemonRuntimeOptions.semantic_index: false) never builds a semantic index, and core:search_semantic reports unavailable coverage", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-semantic-off-data-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-semantic-off-workspace-"));
     let runtime: DaemonRuntime | undefined;
@@ -1223,23 +1232,18 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       }
 
       const response = await client.call("core:query", {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: workspaceId },
         expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: "CreateTaskInput", query_class: "identifier" } },
         options: queryOptions,
       });
       expect(response.outcome).toBe("error");
-      // `SemanticQueryError`/`EngineError` are not `DaemonError`s, but they
-      // do carry a registered namespaced code (`core:semantic_index_unavailable`),
-      // so the daemon's IPC server (`packages/daemon/src/protocol.ts`) now
-      // preserves that code on the wire instead of flattening it to
-      // `core:execution_failed` -- the same convention
-      // `tests/phase-daemon-admin-integration.test.ts` exercises for a real
-      // `core:repair` `StorageError`. `EngineError`'s own `message` is
-      // always `${code}: ${message}`, so the message still contains the
-      // code too.
-      expect(response.error?.code).toBe("core:semantic_index_unavailable");
-      expect(response.error?.message).toMatch(/core:semantic_index_unavailable/);
+      // Admission succeeds because the expression is valid; execution then
+      // reports that the requested semantic frontier is unavailable and no
+      // work is scheduled. This is deliberately a coverage error rather than
+      // a provider-specific execution error, and it is not retryable.
+      expect(response.error?.code).toBe("core:coverage_incomplete");
+      expect(response.error?.details).toMatchObject({ retryable: false, required_frontier: "semantic" });
     } finally {
       if (runtime) await runtime.stop();
       await rm(dataRoot, { recursive: true, force: true });

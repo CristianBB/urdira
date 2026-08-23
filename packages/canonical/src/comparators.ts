@@ -1,5 +1,5 @@
 import type { ComparatorDefinition, ComparatorSortKeyDefinition } from "@urdira/contracts";
-import { compareBytes, encodeCanonical } from "./cbor.js";
+import { compareBytes, encodeCanonical } from "./logical-encoding.js";
 import { fail } from "./errors.js";
 import { normalizeBigInteger, normalizeExactDecimal, normalizeText, normalizeTimestamp, timestampNanoseconds } from "./scalars.js";
 

@@ -20,7 +20,7 @@ function scope(workspaceId: string): QueryScope {
 
 function recipeRequest(recipeId: string, args: Readonly<Record<string, unknown>>, workspaceId = "workspace:recipe-test"): QueryRequest {
   return {
-    api_version: 1,
+    api_version: 3,
     scope: scope(workspaceId),
     expression: { expression_type: "recipe", recipe_id: recipeId, arguments: args as never },
     options: { freshness: "current", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "none", diagnostic_detail: false }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "none", include_payload_schemas: false }, response_budget: { max_items: 1_000, max_characters: 1_000_000 } },

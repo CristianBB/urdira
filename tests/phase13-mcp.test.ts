@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { LocalIpcRequestOptions, UceResponse } from "../packages/daemon/src/index.js";
+import type { LocalIpcRequestOptions, IpcResponse } from "../packages/daemon/src/index.js";
 import { normalizeQueryRequest } from "../packages/engine/src/index.js";
 import { operationRegistry, recipeRegistry, type QueryRequest } from "@urdira/contracts";
 import {
   MCP_SERVER_INSTRUCTIONS,
+  buildBenchmarkInstructions,
   MCP_TOOL_NAMES,
   McpProtocolError,
   createUrdiraMcpServer,
@@ -12,7 +13,7 @@ import {
   type UrdiraMcpToolDefinition,
 } from "../packages/mcp/src/index.js";
 
-function success(payload: unknown): UceResponse {
+function success(payload: unknown): IpcResponse {
   return { protocol_version: 1, request_id: "request-1", outcome: "success", payload };
 }
 
@@ -35,14 +36,147 @@ function tool(definitions: readonly UrdiraMcpToolDefinition[], name: string): Ur
 }
 
 describe("Phase 13 Urdira MCP adapter", () => {
-  it("exposes exactly four deterministically ordered public tools", () => {
+  it("exposes the deterministic public tools, including the one-call context wrapper", () => {
     const definitions = createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({})) } });
     expect(definitions.map((definition) => definition.name)).toEqual([...MCP_TOOL_NAMES]);
-    expect(definitions.map((definition) => definition.input_schema.type)).toEqual(["object", "object", "object", "object"]);
-    expect(definitions.map((definition) => definition.input_schema.properties?.["scope"]).filter((value) => value !== undefined)).toHaveLength(2);
-    expect(definitions.map((definition) => definition.input_schema.additionalProperties)).toEqual([false, false, false, false]);
+    expect(definitions.map((definition) => definition.input_schema.type)).toEqual(["object", "object", "object", "object", "object"]);
+    expect(definitions.map((definition) => definition.input_schema.properties?.["scope"]).filter((value) => value !== undefined)).toHaveLength(3);
+    expect(definitions.map((definition) => definition.input_schema.additionalProperties)).toEqual([false, false, false, false, false]);
     expect(definitions[0]?.input_schema.properties?.["request_type"]).toBeDefined();
     expect(definitions[1]?.input_schema.required).not.toContain("options");
+    const contextSeeds = definitions[1]?.input_schema.properties?.["seeds"] as { items?: { oneOf?: Array<{ oneOf?: unknown; properties?: Record<string, unknown> }> } };
+    expect(contextSeeds.items?.oneOf).toHaveLength(6);
+    expect(contextSeeds.items?.oneOf?.some((variant) => variant.oneOf !== undefined)).toBe(false);
+    expect(contextSeeds.items?.oneOf?.some((variant) => variant.properties?.["path"] !== undefined)).toBe(true);
+  });
+
+  it("rejects malformed v3 expressions before opening the IPC client", async () => {
+    const call = vi.fn(async () => success({}));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    await expect(definition.invoke({
+      request_type: "query",
+      query: {
+        api_version: 3,
+        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+        freshness: { mode: "wait", required_frontier: "source", timeout_ms: 30_000 },
+        expression: { expression_type: "operation", operation: "core:find_artifacts", arguments: {} },
+      },
+    })).rejects.toThrow(/\/query\/freshness.*\/query\/options\/freshness/u);
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it("includes pointer, received value, and example in nested admission errors", async () => {
+    const call = vi.fn(async () => success({}));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    await expect(definition.invoke({
+      request_type: "query",
+      query: {
+        api_version: 3,
+        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+        expression: { expression_type: "operation", operation: "core:find_artifacts", arguments: { unknown: true } },
+        options: { freshness: "snapshot", wait_timeout_ms: 0 },
+      },
+    })).rejects.toThrow(/received true.*example/u);
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it("defaults the complete context wrapper to a structural freshness wait", async () => {
+    let payload: unknown;
+    const definition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async (_call, value) => { payload = value; return success({}); }) } }), "urdira_context");
+    await definition.invoke({ api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, task: "trace the request path", facets: ["definitions"] });
+    expect((payload as { options: { freshness: unknown; required_frontier: unknown; wait_timeout_ms: unknown } }).options).toMatchObject({ freshness: "wait_for_current", required_frontier: "structural", wait_timeout_ms: 30_000 });
+  });
+
+  it("caps MCP query pages below the local IPC frame and leaves continuation available", async () => {
+    let payload: unknown;
+    const definition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async (_call, value) => { payload = value; return success({ result_sets: [] }); }) } }), "urdira_query");
+    await definition.invoke({
+      request_type: "query",
+      query: {
+        api_version: 3,
+        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+        expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "projectService", syntax: "literal" } },
+        options: { response_budget: { max_items: 200, max_characters: 100_000 } },
+      },
+    });
+    expect((payload as { options: { response_budget: unknown } }).options.response_budget).toEqual({ max_items: 50, max_characters: 100_000 });
+  });
+
+  it("builds benchmark instructions from registered operations and examples", () => {
+    const instructions = buildBenchmarkInstructions("src/example.ts");
+    const queryTool = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({})) } }), "urdira_query");
+    const contextTool = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({})) } }), "urdira_context");
+    expect(instructions).toContain("core:search_text");
+    expect(instructions).toContain("expression_type");
+    expect(instructions).toContain('"request_type":"query","query":{"api_version":3');
+    expect(instructions).toContain('"options":{"freshness":{"mode":"wait","required_frontier":"source"');
+    expect(instructions).toContain('"timeout_ms":240000');
+    expect(instructions).toContain("On large workspaces, use timeout_ms:240000 for post-edit freshness waits");
+    expect(instructions).toContain("do not add operation_version to a direct operation expression");
+    expect(instructions).toContain("exact field operation; never replace it with core, operator, or operation_id");
+    expect(instructions).toContain("word_mode is only substring, identifier, or token");
+    expect(instructions).toContain("subjects must be closed selector objects, never bare path strings");
+    expect(instructions).toContain("arguments.filter.paths (an array)");
+    expect(instructions).toContain("core:find_artifacts exposes output artifacts (not subjects)");
+    expect(instructions).toContain("urdira_index_status does not accept api_version or scope");
+    expect(instructions).toContain("Every urdira_context call requires top-level api_version:3");
+    expect(instructions).toContain("urdira_context overrides belong under the single top-level options object");
+    expect(instructions).toContain("Every freshness object requires mode, required_frontier, and timeout_ms together");
+    expect(instructions).toContain("Reuse the exact query_scope object returned by urdira_index_status byte-for-byte");
+    expect(instructions).toContain("After editing, wait for the structural frontier before final symbol rediscovery");
+    expect(instructions).toContain("matches and subjects are output stream names for bindings, never result_projection values");
+    expect(instructions).toContain("src/directory/** for a directory subtree");
+    expect(instructions).toContain('"subjects":[{"subject_type":"artifact","path":"src/example.ts"}]');
+    expect(instructions).toContain('symbol by known name={subject_type:"symbol",name:"QualifiedOrShortName"}');
+    expect(instructions).toContain("Never put qualified_name on an entity selector");
+    expect(instructions).toContain("core:search_text=>matches|subjects");
+    expect(instructions).toContain("core:find_artifacts=>artifacts");
+    expect(instructions).toContain("core:get_source=>sources");
+    expect(instructions).toContain("core:resolve_symbol=>reference!:Text|context_artifact?:Text");
+    expect(instructions).toContain("core:get_source=>subjects!:Sequence<SubjectSelector>|source!:SourceIncludeOptions");
+    expect(instructions).toContain("discover_definitions.matcher={text:<non-empty string>,mode:exact|prefix|contains|semantic|hybrid}");
+    expect(instructions).toContain("get_outline.container accepts only an artifact or entity selector");
+    expect(queryTool?.description).toContain("get_outline.container accepts only an artifact or entity selector");
+    expect(queryTool?.description).toContain("get_source source.mode must be signature, relevant, or body; never none");
+    expect(queryTool?.description).toContain("search_text pipeline outputs are only matches and subjects, never artifacts");
+    expect(contextTool?.description).toContain("definitions | implementations | callers | callees | dependencies | contracts | effects | tests | configuration | analogues | extension_points");
+    expect(contextTool?.description).toContain("api_version: 3 is a required top-level field");
+    expect(contextTool?.description).toContain("public_surfaces is an architecture view, not a context facet");
+    expect(instructions).toContain("public_surfaces is an architecture view, not a core:build_context facet");
+    expect(instructions).toContain("core:get_source source.mode is only signature, relevant, or body; never none");
+    expect(instructions).toContain("A pipeline binding to a scalar argument requires exactly one upstream result");
+    expect(instructions).toContain("Do not read source with grep, rg, find, ls, sed, cat, head, tail, or awk");
+    expect(instructions).toContain("urdira_benchmark_discover");
+  });
+
+  it("registers the benchmark-only discovery projection without changing public tools", () => {
+    const server = createUrdiraMcpServer({ client: { call: vi.fn(async () => success({})) } }, { benchmark_discover: true }) as unknown as { _registeredTools: Record<string, unknown> };
+    expect(server._registeredTools["urdira_benchmark_discover"]).toBeDefined();
+    expect(server._registeredTools["urdira_query"]).toBeDefined();
+  });
+
+  it("forwards monotonic MCP progress notifications and ignores stale progress", async () => {
+    const notify = vi.fn();
+    const call = vi.fn(async (_name: string, _payload: unknown, options?: LocalIpcRequestOptions) => {
+      options?.on_progress?.({ phase: "query", completed: 1, total: 3, message: "first" });
+      options?.on_progress?.({ phase: "query", completed: 0, total: 3, message: "stale" });
+      options?.on_progress?.({ phase: "query", completed: 2, total: 3, message: "second" });
+      return success({ result_sets: [] });
+    });
+    const server = createUrdiraMcpServer({ client: { call } }) as unknown as {
+      _registeredTools: Record<string, { handler: (args: unknown, context: unknown) => Promise<unknown> }>;
+    };
+    await server._registeredTools["urdira_query"]!.handler({
+      request_type: "query",
+      query: {
+        api_version: 3,
+        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+        expression: { expression_type: "operation", operation: "core:find_artifacts", arguments: {} },
+        options: { freshness: "snapshot", wait_timeout_ms: 0 },
+      },
+    }, { mcpReq: { _meta: { progressToken: "progress-1" }, signal: new AbortController().signal, notify } });
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify.mock.calls.map(([value]) => value.params.completed)).toEqual([1, 2]);
   });
 
   it("keeps output_schema on each definition as an internal reference constant, but never advertises it to the SDK or tools/list", () => {
@@ -85,12 +219,12 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const target = { subjectType: "symbol", name: "PaymentService.capture" };
     const change = { changeType: "rename", newName: "authorize" };
 
-    await tool(definitions, "urdira_analyze_change").invoke({ api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, target: { subject_type: "symbol", name: "PaymentService.capture" }, change: { change_type: "rename", new_name: "authorize" }, options: { freshness: "snapshot", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: false }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "none" }, response_budget: { max_items: 10, max_characters: 10_000 } } });
-    await tool(definitions, "urdira_build_context").invoke({ api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, task: "find the call path", facets: ["callers"], options: { freshness: "snapshot", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: false }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "none" }, response_budget: { max_items: 10, max_characters: 10_000 } } });
+    await tool(definitions, "urdira_analyze_change").invoke({ api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, target: { subject_type: "symbol", name: "PaymentService.capture" }, change: { change_type: "rename", new_name: "authorize" }, options: { freshness: "snapshot", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: false }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "none" }, response_budget: { max_items: 10, max_characters: 10_000 } } });
+    await tool(definitions, "urdira_build_context").invoke({ api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, task: "find the call path", facets: ["callers"], options: { freshness: "snapshot", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: false }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "none" }, response_budget: { max_items: 10, max_characters: 10_000 } } });
 
     expect(call.mock.calls.map(([name]) => name)).toEqual(["core:query", "core:query"]);
     expect(call.mock.calls[0]?.[1]).toMatchObject({
-      api_version: 1,
+      api_version: 3,
       scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
       expression: { expression_type: "operation", operation: "core:analyze_impact", arguments: { target: { subject_type: "symbol", name: "PaymentService.capture" }, change: { change_type: "rename", new_name: "authorize" } } },
       options: { response_budget: { max_items: 10, max_characters: 10_000 } },
@@ -101,9 +235,9 @@ describe("Phase 13 Urdira MCP adapter", () => {
   it("uses the query continuation call when the signed cursor form is supplied", async () => {
     const call = vi.fn(async (_name: string, payload: unknown) => success(payload));
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
-    await definition.invoke({ request_type: "continuation", continuation: { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, cursor: "signed.cursor", response_budget: { max_items: 2, max_characters: 100 } } });
+    await definition.invoke({ request_type: "continuation", continuation: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, cursor: "signed.cursor", response_budget: { max_items: 2, max_characters: 100 } } });
     expect(call).toHaveBeenCalledWith("core:query_continue", {
-      api_version: 1,
+      api_version: 3,
       scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
       cursor: "signed.cursor",
       response_budget: { max_items: 2, max_characters: 100 },
@@ -114,7 +248,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const call = vi.fn(async (_name: string, payload: unknown) => success(payload));
     await tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_index_status").invoke({
       request_type: "initial",
-      api_version: 1,
+      api_version: 3,
       workspace_ids: [],
       include_capabilities: true,
       include_plugins: true,
@@ -124,7 +258,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     });
     expect(call).toHaveBeenCalledWith("core:index_status", {
       request_type: "initial",
-      api_version: 1,
+      api_version: 3,
       workspace_ids: [],
       include_capabilities: true,
       include_plugins: true,
@@ -159,7 +293,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     };
     await server._registeredTools["urdira_benchmark_discover"]!.handler({ workspace_root: "/repo", path: "src/file.ts" }, { mcpReq: { _meta: {}, signal: new AbortController().signal, notify: vi.fn() } });
     expect(call.mock.calls.map(([name]) => name)).toEqual(["core:index_status", "core:query"]);
-    expect(call.mock.calls[1]?.[1]).toMatchObject({ api_version: 2, scope: { snapshot_id: "source-snapshot:7" } });
+    expect(call.mock.calls[1]?.[1]).toMatchObject({ api_version: 3, scope: { snapshot_id: "source-snapshot:7" } });
   });
 
   it("renders a compact text projection by default, and preserves the full JSON page verbatim under render: \"json\"", () => {
@@ -255,6 +389,38 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(block?.text).toContain("    const value = 1;");
   });
 
+  it("renders every line retained by the query response budget for a source bundle", () => {
+    const snippet = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n");
+    const textResult = formatUrdiraResult({
+      query_execution_id: "execution-full-source",
+      scope_kind: "single_workspace",
+      workspace_snapshot_bindings: [],
+      semantic_coverage_views: [],
+      result_sets: [{
+        result_set: "sources",
+        confirmed: {
+          classification: "confirmed", page_mode: "summary",
+          result_bundles: [{
+            result_set: "sources",
+            primary_result: { subject_type: "artifact", universal_kind: "core:artifact", kind: "core:source_file", body: { path: "src/complete.ts" } },
+            assessment: { classification: "confirmed", completeness: "complete" },
+            provenance_path: [], essential_related_entities: [],
+            optional_source_snippets: [{ text: snippet, span: { artifact_version_id: "artv-complete", start_byte: "0", end_byte: String(snippet.length), start_line: "1", end_line: "20" }, truncated: false, redacted: false, redactions: [] }],
+          }],
+          total: 1, has_next: false, has_previous: false,
+        },
+        possible: { classification: "possible", page_mode: "summary", result_bundles: [], total: 0, has_next: false, has_previous: false },
+      }],
+      expires_at: "2026-01-01T00:00:00.000Z",
+      returned_items: 1,
+      returned_characters: snippet.length,
+      completeness_report: { workspace_snapshot_binding_ids: [], overall_status: "complete", dimensions: [], diagnostic_record_ids: [] },
+      diagnostic_report: { total: 0, returned: 0, by_severity: { info: 0, warning: 0, error: 0 }, by_completeness_effect: { none: 0, local: 0, capability: 0 }, diagnostics: [], has_more: false },
+    });
+    const block = textResult.content.find((entry): entry is { type: "text"; text: string } => entry.type === "text");
+    expect(block?.text).toContain("    line 20");
+  });
+
   it("preserves source snippets when formatting the raw streams returned by a pipeline", async () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({
       query_execution_id: "execution-pipeline-source",
@@ -276,7 +442,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     })) } }), "urdira_query");
     const textResult = await definition.invoke({
       request_type: "initial",
-      api_version: 1,
+      api_version: 3,
       scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
       expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "value", syntax: "literal" } },
     });
@@ -309,7 +475,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     })) } }), "urdira_query");
     const textResult = await definition.invoke({
       request_type: "initial",
-      api_version: 1,
+      api_version: 3,
       scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
       expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "value", syntax: "literal" } },
     });
@@ -325,7 +491,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
       expect(requestOptions?.signal).toBe(controller.signal);
       return success({ ok: true });
     });
-    await tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_index_status").invoke({ request_type: "initial", api_version: 1, workspace_ids: [], include_capabilities: true, include_plugins: true, include_activation_issues: false, include_candidate_issues: false, response_budget: { max_items: 2, max_characters: 100 } }, { signal: controller.signal, onProgress: (event) => progress.push(event) });
+    await tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_index_status").invoke({ request_type: "initial", api_version: 3, workspace_ids: [], include_capabilities: true, include_plugins: true, include_activation_issues: false, include_candidate_issues: false, response_budget: { max_items: 2, max_characters: 100 } }, { signal: controller.signal, onProgress: (event) => progress.push(event) });
     expect(progress).toEqual([{ phase: "querying", completed: 1, total: 2 }]);
   });
 
@@ -372,7 +538,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const args = {
       request_type: "query",
       render: "json",
-      query: { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
     };
     const result = standard.validate(args);
     expect(result.issues).toBeUndefined();
@@ -388,7 +554,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     await definition.invoke({
       request_type: "query",
       query: {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
         expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } },
       },
@@ -413,7 +579,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     await definition.invoke({
       request_type: "query",
       query: {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
         expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } },
         options: { freshness: "snapshot", snippets: { mode: "body" } },
@@ -488,7 +654,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const result = await definition.invoke({
       request_type: "query",
-      query: { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "price + tax" } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "price + tax" } } },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("src/billing.ts: const total = price + tax;");
@@ -506,7 +672,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const result = await definition.invoke({
       request_type: "query",
-      query: { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text.match(/^MORE:/gm)).toHaveLength(1);
@@ -522,7 +688,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const result = await definition.invoke({
       request_type: "query",
       query: {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
         expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } },
         options: { response_budget: { max_characters: 300 } },
@@ -542,7 +708,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const result = await definition.invoke({
       request_type: "query",
-      query: { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "NothingMatchesThis" } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "NothingMatchesThis" } } },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text.startsWith("no results")).toBe(true);
@@ -559,7 +725,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const result = await definition.invoke({
       request_type: "query",
-      query: { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("coverage: partial (600 files affected)");
@@ -587,6 +753,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const result = await definition.invoke({ workspace_root: "/repo" });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("workspace_id=workspace-1");
+    expect(text).toContain('query_scope={"scope_type":"single_workspace","workspace_id":"workspace-1"}');
     expect(text).toContain("ready");
     expect(text).toContain("freshness=current");
     expect(text).toContain("capabilities: 2");
@@ -610,7 +777,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const result = await definition.invoke({
       request_type: "query",
       render: "json",
-      query: { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
     });
     const jsonBlock = result.content.find((block): block is { type: "text"; text: string } => block.type === "text")!;
     const page = (JSON.parse(jsonBlock.text) as { page: { completeness_report: { dimensions: Array<{ affected_artifact_count: number; affected_artifact_ids: string[]; affected_artifact_set_id?: string }> } } }).page;
@@ -629,7 +796,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
       request_type: "query",
       render: "json",
       query: {
-        api_version: 1,
+        api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
         expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } },
         options: { response_budget: { max_characters: 2000 } },
@@ -667,7 +834,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const result = await definition.invoke({
       request_type: "query",
       render: "json",
-      query: { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
     });
     const jsonBlock = result.content.find((block): block is { type: "text"; text: string } => block.type === "text")!;
     const page = (JSON.parse(jsonBlock.text) as { page: { result_sets: Array<{ confirmed: Record<string, unknown> }> } }).page;

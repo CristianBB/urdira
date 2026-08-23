@@ -2132,19 +2132,19 @@ export const authoritativeModelFieldMetadata = {
     "description": "exactly the corresponding `logical_input` or lowercase even-length `encoded_input_hex` is present",
     "source": "serialization/urdira-canonical-encoding.md"
   },
-  "CanonicalEncodingConformanceCase.expected_cbor_hex": {
+  "CanonicalEncodingConformanceCase.expected_encoding_hex": {
     "logical_type": "Text",
-    "description": "Success requires `expected_cbor_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code",
+    "description": "Success requires `expected_encoding_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code",
     "source": "serialization/urdira-canonical-encoding.md"
   },
   "CanonicalEncodingConformanceCase.expected_digest_text": {
     "logical_type": "Text",
-    "description": "Success requires `expected_cbor_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code",
+    "description": "Success requires `expected_encoding_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code",
     "source": "serialization/urdira-canonical-encoding.md"
   },
   "CanonicalEncodingConformanceCase.expected_error_code": {
     "logical_type": "Text",
-    "description": "Success requires `expected_cbor_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code",
+    "description": "Success requires `expected_encoding_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code",
     "source": "serialization/urdira-canonical-encoding.md"
   },
   "CanonicalEncodingConformanceCase.expected_outcome": {
@@ -6979,7 +6979,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "ModelPackRuntimeConfiguration.configuration": {
     "logical_type": "Bytes",
-    "description": "Complete typed value validated against that exact schema through Schema IR. It is not opaque JSON or CBOR; unknown fields, untyped values, and schema extensions are rejected.",
+    "description": "Complete typed value validated against that exact schema through Schema IR. It is not opaque JSON; unknown fields, untyped values, and schema extensions are rejected.",
     "source": "decisions/10-daemon-mcp-packaging.md"
   },
   "ModelPackRuntimeConfiguration.configuration_digest": {
@@ -12622,14 +12622,14 @@ export const authoritativeModelFieldMetadata = {
     "description": "The `byte_length` field on `SourceProviderReadResult` carries Count; it is required and is defined by `decisions/04-workspace-snapshot-incremental-indexing.md`.",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
-  "SourceProviderReadResult.content_bytes": {
-    "logical_type": "Text",
-    "description": "The `content_bytes` field on `SourceProviderReadResult` carries Text; it is required and is defined by `decisions/04-workspace-snapshot-incremental-indexing.md`.",
+  "SourceProviderReadResult.content": {
+    "logical_type": "Bytes",
+    "description": "The `content` field on `SourceProviderReadResult` carries source bytes as a Uint8Array; it is required and is defined by `decisions/04-workspace-snapshot-incremental-indexing.md`.",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "SourceProviderReadResult.content_hash": {
     "logical_type": "Digest",
-    "description": "Exact `content_bytes` returned by the stable successful read; the core recomputes it before acceptance.",
+    "description": "Exact source bytes returned by the stable successful read; the core recomputes the digest before acceptance.",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "SourceProviderReadResult.metadata_digest": {

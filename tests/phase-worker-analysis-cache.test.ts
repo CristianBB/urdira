@@ -57,7 +57,7 @@ function manifestFor(owner: string): Record<string, unknown> {
   };
 }
 
-function analyzeRequest(files: readonly AnalyzerFile[], rootNames: readonly string[], owner: string) {
+function analyzeRequest(files: readonly AnalyzerFile[], rootNames: readonly string[], owner: string, publicationStageId?: string, boundedSyntax = false) {
   return {
     protocol_version: "1.0.0",
     request_id: `cache-test:${owner}`,
@@ -75,11 +75,13 @@ function analyzeRequest(files: readonly AnalyzerFile[], rootNames: readonly stri
       analysis_configuration_digest: "sha256:jsts-configuration",
       analysis_input_digest: `digest:${owner}`,
       created_at: "1970-01-01T00:00:00.000Z",
+      ...(publicationStageId === undefined ? {} : { publication_stage_id: publicationStageId }),
+      ...(boundedSyntax ? { bounded_syntax: true } : {}),
     },
   };
 }
 
-function closureRequest(files: readonly AnalyzerFile[], rootNames: readonly string[]) {
+function closureRequest(files: readonly AnalyzerFile[], rootNames: readonly string[], publicationStageId?: string) {
   return {
     protocol_version: "1.0.0",
     request_id: "cache-test:closure",
@@ -87,7 +89,7 @@ function closureRequest(files: readonly AnalyzerFile[], rootNames: readonly stri
     call: "analyze_closure" as const,
     deadline: "2030-01-01T00:00:00.000Z",
     cancellation_id: "cancel:closure",
-    payload: { files, root_names: rootNames },
+    payload: { files, root_names: rootNames, ...(publicationStageId === undefined ? {} : { publication_stage_id: publicationStageId }) },
   };
 }
 
@@ -109,6 +111,57 @@ function freshDeltaFor(files: readonly AnalyzerFile[], rootNames: readonly strin
 }
 
 describe("JavaScript/TypeScript worker analysis cache", () => {
+  it("keeps structural stage 1 syntax-only for a large corpus", async () => {
+    const files = Array.from({ length: 512 }, (_, index): AnalyzerFile => ({
+      path: `src/large-${index}.ts`,
+      text: `export const value${index}: number = ${index};\n`,
+    }));
+    const rootNames = files.map((file) => file.path);
+    const worker = createJavascriptTypescriptWorker();
+    try {
+      const response = await worker.invoke(analyzeRequest(files, rootNames, files[0]!.path, "jsts:structural_stage_1")) as {
+        readonly payload: { readonly validation_input: { readonly raw_delta: { readonly proposed_records: readonly { readonly body?: Record<string, unknown> }[] } } };
+      };
+      const records = response.payload.validation_input.raw_delta.proposed_records;
+      expect(records.length).toBeGreaterThan(0);
+      expect(records.every((record) => !("type" in (record.body ?? {})))).toBe(true);
+    } finally {
+      await worker.terminate();
+    }
+  });
+
+  it("keeps a large stage-1 closure scan lightweight and rebuilds only the bounded owner view", async () => {
+    const files = Array.from({ length: 512 }, (_, index): AnalyzerFile => ({
+      path: `src/large-${index}.ts`,
+      text: index === 0
+        ? `import { value1 } from "./large-1";\nexport const value0 = value1;\n`
+        : `export const value${index} = ${index};\n`,
+    }));
+    const rootNames = files.map((file) => file.path);
+    let analysisBuildCount = 0;
+    const worker = createJavascriptTypescriptWorker({ on_analysis_build: () => { analysisBuildCount += 1; } });
+    try {
+      const closureResponse = await worker.invoke(closureRequest(files, rootNames, "jsts:structural_stage_1")) as {
+        readonly payload: {
+          readonly dependency_graph?: Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>>;
+          readonly dependency_closures?: unknown;
+        };
+      };
+      expect(closureResponse.payload.dependency_closures).toBeUndefined();
+      expect(closureResponse.payload.dependency_graph?.[files[0]!.path]).toEqual({ direct_files: [files[1]!.path], complete: true });
+      expect(analysisBuildCount).toBe(1);
+
+      const ownerFiles = files.slice(0, 2);
+      const response = await worker.invoke(analyzeRequest(ownerFiles, ownerFiles.map((file) => file.path), files[0]!.path, "jsts:structural_stage_1", true)) as {
+        readonly payload: { readonly validation_input: { readonly raw_delta: { readonly proposed_records: readonly { readonly body?: { readonly path?: string } }[] } } };
+      };
+      expect(analysisBuildCount).toBe(2);
+      expect(response.payload.validation_input.raw_delta.proposed_records.every((record) => record.body?.path === files[0]!.path)).toBe(true);
+    } finally {
+      await worker.terminate();
+    }
+  });
+
   it("reuses a single cached whole-project analysis across analyze_artifact calls for different owners without cross-contamination", async () => {
     const files = await fixtureFiles();
     const sourceFiles = files.filter((file) => languageForPath(file.path) !== undefined);

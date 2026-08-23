@@ -1,11 +1,12 @@
 import type {
   JsonValue,
+  SourceProviderPayload,
   SourceProviderError,
   SourceProviderRequestEnvelope,
   SourceProviderResourceBudget,
   SourceProviderResponseEnvelope,
 } from "@urdira/contracts";
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { digestLogicalValue } from "@urdira/canonical";
 
 export type SourceProviderCall = "describe" | "enumerate" | "read" | "watch" | "reconcile";
 export type SourceProviderOutcome = "success" | "source_changed" | "unavailable" | "deadline_exceeded" | "resource_exhausted" | "cancelled" | "failed";
@@ -73,7 +74,7 @@ function parseBudget(serialized: string): SourceProviderResourceBudget {
 export function sourceProviderRequestDigest(request: Pick<SourceProviderRequestEnvelope,
   "protocol_version" | "call" | "workspace_id" | "source_provider_binding_id" | "component_id" | "component_version" | "resource_budget" | "payload"
 >): string {
-  return digestBytes(canonicalBytes({
+  return digestLogicalValue({
     protocol_version: request.protocol_version,
     call: request.call,
     workspace_id: request.workspace_id,
@@ -82,11 +83,11 @@ export function sourceProviderRequestDigest(request: Pick<SourceProviderRequestE
     component_version: request.component_version,
     resource_budget: request.resource_budget,
     payload: request.payload,
-  }));
+  });
 }
 
 export function sourceProviderArtifactId(workspaceId: string, normalizedUri: string): string {
-  return digestBytes(canonicalBytes({ workspace_id: workspaceId, normalized_uri: normalizedUri }));
+  return digestLogicalValue({ workspace_id: workspaceId, normalized_uri: normalizedUri });
 }
 
 function validateEnvelope(
@@ -153,8 +154,9 @@ function jsonStringBytes(value: string): number {
   return 2 + Buffer.byteLength(value, "utf8") + extra;
 }
 
-function jsonByteLength(value: JsonValue): number {
+function jsonByteLength(value: unknown): number {
   if (value === null) return 4;
+  if (value instanceof Uint8Array) return value.byteLength;
   if (typeof value === "boolean") return value ? 4 : 5;
   if (typeof value === "number") return JSON.stringify(value).length;
   if (typeof value === "string") return jsonStringBytes(value);
@@ -163,9 +165,10 @@ function jsonByteLength(value: JsonValue): number {
     for (const item of value) total += jsonByteLength(item);
     return total;
   }
+  if (typeof value !== "object" || value === null) return 0;
   const entries = Object.entries(value).filter(([, item]) => item !== undefined);
   let total = entries.length === 0 ? 2 : 1 + entries.length;
-  for (const [key, item] of entries) total += jsonStringBytes(key) + 1 + jsonByteLength(item as JsonValue);
+  for (const [key, item] of entries) total += jsonStringBytes(key) + 1 + jsonByteLength(item);
   return total;
 }
 
@@ -174,7 +177,7 @@ export async function executeProviderCall(
   call: SourceProviderCall,
   expectations: SourceProviderRequestExpectations,
   runtime: SourceProviderRuntime,
-  operation: (budget: SourceProviderResourceBudget) => Promise<JsonValue>,
+  operation: (budget: SourceProviderResourceBudget) => Promise<unknown>,
 ): Promise<SourceProviderResponseEnvelope> {
   const started = runtime.monotonic_now();
   try {
@@ -184,7 +187,7 @@ export async function executeProviderCall(
     if (Date.parse(runtime.now()) >= Date.parse(request.deadline_at)) throw new SourceProviderOutcomeError("deadline_exceeded", "core:source_provider_deadline_exceeded", "retryable", "The provider deadline elapsed.");
     if (runtime.monotonic_now() - started > budget.max_duration_ms) throw new SourceProviderOutcomeError("resource_exhausted", "core:source_provider_duration_exhausted", "retryable", "The provider duration budget was exhausted.");
     if (jsonByteLength(payload) > budget.max_response_bytes) throw new SourceProviderOutcomeError("resource_exhausted", "core:source_provider_response_exhausted", "retryable", "The provider response budget was exhausted.");
-    return { ...responseBase(request), outcome: "success", payload };
+    return { ...responseBase(request), outcome: "success", payload: payload as SourceProviderPayload };
   } catch (error) {
     if (error instanceof SourceProviderOutcomeError) return failure(request, error);
     const message = error instanceof Error ? error.message : "The source provider failed.";

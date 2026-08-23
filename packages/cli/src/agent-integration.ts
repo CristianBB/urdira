@@ -79,7 +79,7 @@ function safePattern(value: string, syntax: unknown): boolean {
 }
 
 async function workspaceFor(client: AgentBridgeClient, cwd: string): Promise<{ readonly workspace_id: string; readonly snapshot_id?: string } | undefined> {
-  const response = await client.call("core:index_status", { api_version: 1, workspace_root: cwd });
+  const response = await client.call("core:index_status", { api_version: 3, workspace_root: cwd });
   if (response.outcome !== "success") return undefined;
   const workspaces = Array.isArray(record(response.payload).workspaces) ? record(response.payload).workspaces as readonly unknown[] : [];
   const first = record(workspaces[0]);
@@ -94,13 +94,13 @@ function operationRequest(workspace: { readonly workspace_id: string }, request:
   if (path !== undefined && request.operation === "grep") filter.paths = [path];
   if (glob !== undefined) filter.paths = [glob];
   if (request.operation === "semantic") return {
-    api_version: 1,
+    api_version: 3,
     scope: { scope_type: "single_workspace", workspace_id: workspace.workspace_id },
     expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: stringValue(args.query_text) ?? stringValue(args.query) ?? stringValue(args.pattern) ?? "", query_class: args.query_class === "identifier" || args.query_class === "source_code" || args.query_class === "mixed" ? args.query_class : "natural_text", filter } },
     options: { freshness: "current", wait_timeout_ms: 0, coverage_requirement: "require_complete", evidence: { mode: "none" }, diagnostics: { mode: "none" }, snippets: { mode: "none" }, registry: { mode: "none" }, response_budget: { max_items: limitValue(request.host_output_limit, 1000), max_characters: request.host_output_limit } },
   };
   if (request.operation === "glob") return {
-    api_version: 1,
+    api_version: 3,
     scope: { scope_type: "single_workspace", workspace_id: workspace.workspace_id },
     expression: { expression_type: "operation", operation: "core:find_artifacts", arguments: { filter } },
     options: { freshness: "current", wait_timeout_ms: 0, coverage_requirement: "require_complete", evidence: { mode: "none" }, diagnostics: { mode: "none" }, snippets: { mode: "none" }, registry: { mode: "none" }, response_budget: { max_items: limitValue(request.host_output_limit, 1000), max_characters: request.host_output_limit } },
@@ -108,7 +108,7 @@ function operationRequest(workspace: { readonly workspace_id: string }, request:
   const pattern = stringValue(args.pattern) ?? "";
   const syntax = args.syntax === "regex" || args.multiline === true ? "safe_regex" : "literal";
   return {
-    api_version: 1,
+    api_version: 3,
     scope: { scope_type: "single_workspace", workspace_id: workspace.workspace_id },
     expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern, syntax, case_sensitive: args.case_sensitive !== false, word_mode: args.word === true ? "identifier" : "substring", filter, result_projection: "match" } },
     options: { freshness: "current", wait_timeout_ms: 0, coverage_requirement: "require_complete", evidence: { mode: "none" }, diagnostics: { mode: "none" }, snippets: { mode: "none" }, registry: { mode: "none" }, response_budget: { max_items: limitValue(request.host_output_limit, 1000), max_characters: request.host_output_limit } },

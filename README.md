@@ -36,7 +36,7 @@ remain available; unsupported operations fail explicitly.
 
 ## Install
 
-Urdira 0.2.0 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
+Urdira 0.2.2 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
 requires npm `>=11.16.0`, which supplies the strict install-script policy. Check
 with `npm --version`; if necessary, update the npm paired with the active Node
 installation before preparing the runtime:
@@ -85,8 +85,9 @@ Preview registration before changing local Urdira state:
 urdira workspace add /absolute/path/to/project
 ```
 
-The CLI shows the detected technologies and compatible plugins and asks for
-confirmation interactively. To inspect the proposal without applying it, use:
+The CLI prints every detected technology, confidence, evidence path, and
+compatible plugin before asking for confirmation. A workspace path is required;
+use `.` for the current directory. To inspect the proposal without applying it, use:
 
 ```bash
 urdira workspace add /absolute/path/to/project --dry-run
@@ -98,25 +99,30 @@ After an interactive registration succeeds, Urdira asks which coding-agent
 integrations to install. Answer `yes`/`all` for every supported installer, or
 enter a comma-separated subset: `claude-code`, `codex`, `opencode`, `cursor`,
 `vscode`/`copilot`, `cline`, `roo`, and `claude-desktop`. Answer `no` to skip
-this optional step. The non-interactive `--confirm` path does not modify agent
+this optional step. The prompt explicitly accepts `yes`, `all`, a comma-separated
+client list, or `no`; the non-interactive `--confirm` path does not modify agent
 configuration; use `urdira agent install --client <name> --confirm` (and
 `--workspace /path` for a Roo project configuration) when you want to configure
 one explicitly.
 
-Administrative commands use a preview/confirmation contract. Removing a
-workspace leaves a recoverable tombstone for 24 hours. A later
+Destructive administrative commands use a preview/confirmation contract.
+Removing a workspace leaves a recoverable tombstone for 24 hours. A later
 `urdira workspace purge <workspaceId> --confirm` is refused while a
 snapshot lease, pin, query, candidate, recovery operation, backup, migration,
 or cross-workspace reference still needs its database.
 
-Daemon shutdown is direct and never starts a missing daemon:
+Daemon start and shutdown are direct; neither needs `--dry-run` or `--confirm`:
 
 ```bash
+urdira daemon start
 urdira daemon stop
 ```
 
-Use `urdira daemon stop --dry-run` only when you want to inspect the proposal.
-The command returns `already_stopped` when no daemon is running.
+`daemon start` launches a per-user background process and reports the
+`locking`, `catalog_verification`, `workspace_recovery`,
+`provider_reconciliation`, and `ready` phases as they happen. Persistent
+process output is written to `~/.urdira/daemon.log`. `daemon stop` returns
+`already_stopped` when no daemon is running.
 
 ### MCP configuration
 
@@ -225,6 +231,7 @@ by hand.
 |---|---|
 | `urdira_index_status` | Discover registered workspaces and inspect freshness, snapshots, capabilities, plugins, and indexing issues. |
 | `urdira_query` | Run a direct operation, typed pipeline, registered recipe, or cursor continuation. |
+| `urdira_context` | Execute the registered context recipe for a complete coding task in one call. |
 | `urdira_analyze_change` | Analyze a hypothetical delete, rename, move, signature, type, visibility, contract, or behavior change. |
 | `urdira_build_context` | Build one bounded evidence-aware context package for a coding task. |
 
@@ -239,6 +246,14 @@ construction, and frozen index status. See the
 Agents should first call `urdira_index_status` with the exact workspace root,
 then repeat the returned `workspaceId` on every source-reading request. A
 returned cursor is opaque and must be continued with the same scope.
+
+For a multi-step coding task, prefer `urdira_context` or an API v3 pipeline
+with explicit stage bindings. Dependent stages execute inside one snapshot and
+one MCP request; freshness and the required readiness frontier are requested
+with that same query instead of a readiness-polling loop. The complete-context
+wrapper waits for the structural frontier by default (30 seconds unless an
+explicit freshness policy is supplied); source-safe operations remain usable
+at `source_ready` while later stages continue in the background.
 
 ## Benchmark evidence
 
@@ -286,10 +301,65 @@ SHA-256 digest. See the [lifecycle report](release/benchmarks/vite-agent-lifecyc
 [JSON summary](release/benchmarks/vite-agent-lifecycle-map-results-2026-08-19.json),
 and [protocol](release/benchmarks/vite-agent-lifecycle-map-benchmark.md).
 
+### Expanded TypeScript corpus
+
+The expanded campaign covers four frozen GitHub repositories—TypeScript,
+Playwright, Prisma, and VS Code—with two implementation tasks per repository
+and four arms: baseline, Urdira with the JavaScript/TypeScript engine,
+codebase-memory MCP, and CodeGraph. The current comparison reran only Urdira
+with the final v3 build on Node `v24.18.1`; the 24 baseline,
+codebase-memory, and CodeGraph rows are unchanged reused results from the
+original audited comparison and are explicitly marked as not re-executed.
+
+| Arm | Correct | Median total time | Median tokens | Median estimated cost | Discovery MCP passed |
+|---|---:|---:|---:|---:|---:|
+| Baseline | 6/8 | 172.2 s | 2.06 M | $4.27 | n/a |
+| Urdira TypeScript v3 | 8/8 | 504.8 s | 2.41 M | $4.94 | 380/388 |
+| Codebase-memory MCP | 6/8 | 212.6 s | 4.01 M | $8.20 | historical metric unavailable |
+| CodeGraph | 7/8 | 259.5 s | 2.67 M | $5.61 | historical metric unavailable |
+
+Urdira reached the complete structural frontier in every repository, from
+38.8 s for TypeScript to 472.6 s for VS Code. The VS Code cells peaked at
+4,483,904 and 4,550,176 KiB RSS, below the 5,000,000 KiB guard. Transcript
+review confirmed 380 directly completed discovery operations and eight typed
+`core:selector_ambiguous` narrowing responses, with no unexpected MCP failure.
+All 388 requests used API v3 and an explicit workspace. Every agent used
+Urdira before editing and rediscovered the changed code through Urdira; none
+degraded to native source-reading tools.
+
+The accepted rerun therefore supports Urdira as a functionally viable
+code-intelligence alternative for this protocol, and it was the only arm to
+pass 8/8 tasks. It is not yet performance-competitive: its median total time
+was 504.8 s, about 193% slower than baseline, and VS Code readiness alone took
+about 7.8 minutes. Median token use and estimated cost were about 40% lower
+than codebase-memory and about 10% and 12% lower than CodeGraph, but about 17%
+and 16% higher than baseline.
+
+The campaign also records missing repository dependencies such as `vitest` or
+Playwright build artifacts; these do not turn a grader result into a test-pass
+claim. Setup time, per-run tokens, estimated cost, MCP failure counts,
+correctness evidence, readiness, and both provenance digests are in the
+[expanded JSON report](release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.json)
+and [expanded Markdown report](release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.md),
+with the [benchmark corpus and task contract](release/benchmarks/expanded-typescript-agent-benchmark.json).
+This is one sequential sample per cell and therefore establishes observed
+behavior, not a P95 claim. Each Urdira transcript was accepted before the next
+cell started; rejected attempts drove fixes to bounded source retrieval,
+lexical fallback, MCP rendering and request guidance, watcher rearming, and
+post-edit freshness waits. P95 fields remain ineligible until three independent
+campaigns are explicitly supplied.
+
 These agent campaigns are comparative product evidence. Stable release
 qualification additionally requires the correctness, crash, corruption,
 security, stress, deterministic replay, and three-run P95 gates in the
 [release policy](docs/decisions/08-performance-reliability-evaluation.md).
+
+Urdira v3's indexing hot path uses native `Uint8Array` streams, transferable
+worker buffers, and typed relational SQLite projections. Schema IR generates
+the relational table metadata. Cross-process providers, plugins, daemon/CLI,
+and explicit portable import/export use bounded Protobuf-ES chunks; JSON is
+limited to configuration and MCP text/opaque references. Boundary telemetry
+records bytes read, transferred, copied, decoded, and retained.
 
 ## Current limitations
 
@@ -337,15 +407,16 @@ packages.
 
 ## Architecture and documentation
 
-```text
-MCP / CLI
-    -> local daemon and IPC
-        -> query, indexing, semantic, and workspace engine
-            -> SQLite, CAS, watchers, Git providers, model runtime
-                -> contracts, canonical encoding, registries, plugin SDK
+```mermaid
+flowchart TD
+  Adapters["MCP and CLI"] --> Daemon["local daemon and IPC"]
+  Daemon --> Engine["query, indexing, semantic, and workspace engine"]
+  Engine --> Infrastructure["SQLite, CAS, watchers, Git providers, model runtime"]
+  Infrastructure --> Foundation["contracts, Schema IR, logical digests, registries, plugin SDK"]
 ```
 
-Start with the [documentation guide](docs/README.md) and
+Start with the [documentation guide](docs/README.md), the
+[current architecture and operation graphs](docs/architecture.md), and the
 [product foundation](docs/product-foundation.md). Approved decisions and their
 linked protocols, registries, and serialization contracts are normative;
 audits, release evidence, and benchmark reports are evidence only.

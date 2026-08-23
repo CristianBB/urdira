@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { lstat, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import type {
@@ -16,7 +17,7 @@ import type {
   SourceProviderWatchRequest,
   SourceProviderWatchResult,
 } from "@urdira/contracts";
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { digestLogicalValue } from "@urdira/canonical";
 import { canonicalizePath, evaluateInclusion, isWithinRoot, normalizeWorkspacePath, type GitIgnoreRules, type InclusionRules } from "@urdira/security";
 import { mapWithConcurrency } from "./concurrency.js";
 import { sourceObservationBatchDigest } from "./source-batch-digest.js";
@@ -52,6 +53,8 @@ export interface DirectoryFileStat {
 export interface DirectoryFileSystem {
   read_directory(path: string): Promise<readonly DirectoryEntry[]>;
   read_file(path: string): Promise<Uint8Array>;
+  /** Optional native chunk source; test filesystems may omit it. */
+  read_file_stream?(path: string): AsyncIterable<Uint8Array>;
   lstat(path: string): Promise<DirectoryFileStat>;
   stat(path: string): Promise<DirectoryFileStat>;
   real_path(path: string): Promise<string>;
@@ -77,6 +80,13 @@ export const NODE_DIRECTORY_FILE_SYSTEM: DirectoryFileSystem = Object.freeze({
     return entries.map((entry) => ({ name: entry.name, is_directory: entry.isDirectory(), is_symbolic_link: entry.isSymbolicLink() }));
   },
   async read_file(path: string): Promise<Uint8Array> { return readFile(path); },
+  read_file_stream(path: string): AsyncIterable<Uint8Array> {
+    return (async function* (): AsyncGenerator<Uint8Array> {
+      for await (const chunk of createReadStream(path, { highWaterMark: 64 * 1024 })) {
+        yield chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      }
+    })();
+  },
   async lstat(path: string): Promise<DirectoryFileStat> { return portableStat(await lstat(path)); },
   async stat(path: string): Promise<DirectoryFileStat> { return portableStat(await stat(path)); },
   async real_path(path: string): Promise<string> { return realpath(path); },
@@ -119,6 +129,22 @@ export interface EncodedObservationBatch {
   readonly observations: readonly ProviderObservation[];
 }
 
+export interface NativeDirectoryEnumeration {
+  readonly response: SourceProviderResponseEnvelope;
+  readonly batches: AsyncIterable<EncodedObservationBatch>;
+}
+
+/** Native internal source boundary. The stream is consumed exactly once. */
+export interface DirectorySourceByteStream {
+  readonly artifact_id: string;
+  readonly provider_version_token: string;
+  readonly content_hash: string;
+  readonly byte_length: number;
+  readonly metadata_digest: string;
+  readonly media_type: string;
+  readonly chunks: AsyncIterable<Uint8Array>;
+}
+
 interface CapturedFile {
   readonly uri: string;
   // Only populated when the pass that produced this entry retained bytes
@@ -155,17 +181,31 @@ interface Capture {
   readonly stable: boolean;
 }
 
-const DEFAULT_INCLUSION: InclusionRules = { include: [], exclude: [], allow_external_root: false };
+// Generated comparison baselines are not source artifacts. Excluding them by
+// default keeps source-first indexing focused on executable/declarative code;
+// callers can still opt in explicitly with an include rule.
+const DEFAULT_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**"], allow_external_root: false };
 const DEFAULT_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
 const DEFAULT_WALK_CONCURRENCY = 16;
 const BINARY_EXTENSIONS = new Set([".7z", ".avi", ".bin", ".bmp", ".class", ".dll", ".dylib", ".eot", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".mov", ".mp3", ".mp4", ".o", ".pdf", ".png", ".so", ".tar", ".wasm", ".webp", ".woff", ".woff2", ".zip"]);
 
 function jsonDigest(value: unknown): string {
-  return digestBytes(canonicalBytes(value));
+  return digestLogicalValue(value);
 }
 
 function rawDigest(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+/** Incremental logical digest for large ordered metadata collections. */
+function digestFields(fields: readonly string[]): string {
+  const hash = createHash("sha256");
+  for (const field of fields) {
+    const bytes = Buffer.from(field, "utf8");
+    hash.update(Buffer.from(`${bytes.byteLength}:`, "ascii"));
+    hash.update(bytes);
+  }
+  return `sha256:${hash.digest("hex")}`;
 }
 
 function metadata(statValue: DirectoryFileStat): Record<string, number> {
@@ -295,6 +335,58 @@ export class DirectorySourceProvider implements SourceProvider {
     });
   }
 
+  /**
+   * Internal in-process enumeration. It keeps the validated batch as
+   * structured metadata and deliberately omits the giant JSON observation
+   * string used only by the public provider contract.
+   */
+  enumerateNative(request: SourceProviderRequestEnvelope): Promise<SourceProviderResponseEnvelope> {
+    return executeProviderCall(request, "enumerate", this.#requestExpectations, this.#runtime, async (budget) => {
+      const payload = parseProviderPayload<SourceProviderEnumerateRequest>(request);
+      const scopes = parseScopes(payload, request.source_provider_binding_id, this.#providerKind);
+      const capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
+      if (!capture.stable) throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The source changed during enumeration.");
+      const result = this.#enumerationRecord(request, payload.previous_watermark, scopes, capture, budget, "scan", true, true);
+      return { native_observation_batch: result.encoded as unknown as JsonValue, watermark: result.watermark, capture_start_fingerprint: result.capture_start_fingerprint, capture_end_fingerprint: result.capture_end_fingerprint } as unknown as JsonValue;
+    });
+  }
+
+  /**
+   * Native in-process source boundary with bounded observation delivery. The
+   * response envelope contains only control metadata; observations are yielded
+   * as partial fragments and a final empty complete fragment so the core can
+   * apply deletion authority without constructing a giant response payload.
+   */
+  async enumerateNativeBatches(request: SourceProviderRequestEnvelope): Promise<NativeDirectoryEnumeration> {
+    let capture: Capture | undefined;
+    let budgetMaxObservations = 0;
+    const response = await executeProviderCall(request, "enumerate", this.#requestExpectations, this.#runtime, async (budget) => {
+      const payload = parseProviderPayload<SourceProviderEnumerateRequest>(request);
+      const scopes = parseScopes(payload, request.source_provider_binding_id, this.#providerKind);
+      capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
+      if (!capture.stable) throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The source changed during enumeration.");
+      if (capture.files.length > budget.max_observations) throw new SourceProviderOutcomeError("resource_exhausted", "core:source_provider_observations_exhausted", "retryable", "The observation budget was exhausted.");
+      budgetMaxObservations = budget.max_observations;
+      return { native_stream: true, watermark: `watermark:${capture.end_fingerprint}`, capture_start_fingerprint: capture.start_fingerprint, capture_end_fingerprint: capture.end_fingerprint };
+    });
+    const captured = capture;
+    const batches = (async function* (provider: DirectorySourceProvider): AsyncGenerator<EncodedObservationBatch> {
+      if (response.outcome !== "success" || captured === undefined) return;
+      const payload = request.payload as unknown as SourceProviderEnumerateRequest;
+      const scopes = parseScopes(payload, request.source_provider_binding_id, provider.#providerKind);
+      const maxRows = 4096;
+      for (let offset = 0, fragment = 0; offset < captured.files.length; fragment += 1) {
+        const files = captured.files.slice(offset, offset + maxRows);
+        offset += files.length;
+        const part = provider.#enumerationRecord(request, payload.previous_watermark, scopes, { ...captured, files }, { max_observations: budgetMaxObservations } as SourceProviderResourceBudget, "scan", true, false);
+        yield part.encoded;
+      }
+      const completion = provider.#enumerationRecord(request, payload.previous_watermark, scopes, { ...captured, files: [] }, { max_observations: budgetMaxObservations } as SourceProviderResourceBudget, "scan", true, true);
+      yield completion.encoded;
+    })(this);
+    return { response, batches };
+  }
+
   read(request: SourceProviderRequestEnvelope): Promise<SourceProviderResponseEnvelope> {
     return executeProviderCall(request, "read", this.#requestExpectations, this.#runtime, async () => {
       const payload = parseProviderPayload<SourceProviderReadRequest>(request);
@@ -318,7 +410,7 @@ export class DirectorySourceProvider implements SourceProvider {
         return {
           artifact_id: payload.artifact_id,
           provider_version_token: after.token,
-          content_bytes: Buffer.from(bytes).toString("base64"),
+          content: bytes,
           content_hash: contentHash,
           byte_length: bytes.byteLength,
           metadata_digest: after.metadata_digest,
@@ -329,6 +421,68 @@ export class DirectorySourceProvider implements SourceProvider {
         return unavailable(error);
       }
     });
+  }
+
+  /**
+   * Internal native path used by the source indexer. Unlike the JSON/provider
+   * response, it never assembles the file or converts it to text: a consumer
+   * streams the chunks directly into CAS, which performs the final hash and
+   * length check while consuming them.
+   */
+  async readStream(input: SourceProviderReadRequest): Promise<DirectorySourceByteStream> {
+    const uri = normalizeWorkspacePath(this.#root, input.normalized_uri);
+    if (uri !== input.normalized_uri || uri.length === 0) throw new SourceProviderOutcomeError("failed", "core:source_provider_uri_invalid", "never", "The normalized URI is invalid.");
+    const path = resolve(this.#root, uri);
+    if (!isWithinRoot(this.#root, path)) throw new SourceProviderOutcomeError("failed", "core:source_provider_uri_invalid", "never", "The normalized URI escapes the root.");
+    const before = await this.#inspectBoundary(uri, path);
+    if (!before.included) throw new SourceProviderOutcomeError("failed", "core:source_provider_artifact_ineligible", "never", "The requested URI is not an eligible source artifact.");
+    if (before.token !== input.provider_version_token || before.metadata_digest !== input.observed_metadata_digest) {
+      throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed before reading.");
+    }
+    const fileSystem = this.#fileSystem;
+    const sourceFactory = (): AsyncIterable<Uint8Array> => fileSystem.read_file_stream?.(before.target_path)
+      ?? (async function* (): AsyncGenerator<Uint8Array> { yield await fileSystem.read_file(before.target_path); })();
+    const provider = this;
+    const chunks = (async function* (): AsyncGenerator<Uint8Array> {
+      const hash = createHash("sha256");
+      let byteLength = 0;
+      let hasNul = false;
+      let validUtf8 = true;
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      try {
+        for await (const chunk of sourceFactory()) {
+          if (!(chunk instanceof Uint8Array)) throw new SourceProviderOutcomeError("failed", "core:source_provider_read_invalid", "never", "The source stream yielded a non-byte chunk.");
+          hash.update(chunk);
+          byteLength += chunk.byteLength;
+          hasNul ||= chunk.some((byte) => byte === 0);
+          if (validUtf8) {
+            try { decoder.decode(chunk, { stream: true }); } catch { validUtf8 = false; }
+          }
+          yield chunk;
+        }
+        if (validUtf8) { try { decoder.decode(); } catch { validUtf8 = false; } }
+        const contentHash = `sha256:${hash.digest("hex")}`;
+        const after = await provider.#inspectBoundary(uri, path);
+        const mediaBytes = hasNul || !validUtf8 ? new Uint8Array([0]) : new Uint8Array();
+        if (!provider.#included(uri, before, mediaBytes) || !after.included || before.token !== after.token || after.token !== input.provider_version_token || contentHash !== input.observed_content_hash) {
+          throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed while reading.");
+        }
+        if (byteLength !== after.target_stat.size) throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed while reading.");
+      } catch (error) {
+        if (error instanceof SourceProviderOutcomeError) throw error;
+        if (errorCode(error) === "ENOENT") throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence is no longer present.");
+        throw unavailable(error);
+      }
+    })();
+    return {
+      artifact_id: input.artifact_id,
+      provider_version_token: before.token,
+      content_hash: input.observed_content_hash,
+      byte_length: before.target_stat.size,
+      metadata_digest: before.metadata_digest,
+      media_type: BINARY_EXTENSIONS.has(extname(uri).toLowerCase()) ? "application/octet-stream" : "text/plain; charset=utf-8",
+      chunks,
+    };
   }
 
   watch(request: SourceProviderRequestEnvelope): Promise<SourceProviderResponseEnvelope> {
@@ -353,32 +507,41 @@ export class DirectorySourceProvider implements SourceProvider {
   async #capture(scopeKeys: readonly string[]): Promise<Capture> {
     // The stability proof reads every eligible file's bytes twice (this pass,
     // then again below) to prove nothing changed between the two passes. The
-    // first pass retains full bytes (needed if the capture is stable); the
-    // second is digest-only (content hash + tokens, no byte buffers kept), so
-    // the two passes never hold two complete copies of the tree in memory at
-    // once. When stable, the two passes' content hashes agree by definition,
-    // so the returned files carry the first pass's already-resident bytes.
-    const first = await this.#inventory(scopeKeys, false);
-    const second = await this.#inventory(scopeKeys, true);
-    const firstByUri = new Map(first.files.map((file) => [file.uri, file] as const));
-    const files = second.files.map((file) => {
-      const prior = firstByUri.get(file.uri);
-      return prior !== undefined && prior.content_hash === file.content_hash ? { ...file, bytes: prior.bytes } : file;
-    });
+    // enumeration response carries only metadata and digests, so retaining a
+    // complete first-pass byte image here would be dead memory: `read` below
+    // reads the bytes again after the observation has been accepted. Keeping
+    // both passes digest-only makes enumeration bounded by metadata while
+    // preserving the same stability proof and content hashes.
+    const first = await this.#inventory(scopeKeys, true, false);
+    const firstBefore = first.before_fingerprint;
+    const firstAfter = first.after_fingerprint;
+    const firstStable = first.internally_stable;
+    // On very large repositories a second complete walk is itself long
+    // enough for filesystem ctime/inode observations to race unrelated
+    // repository activity. The first pass already checks each file boundary
+    // around its streamed digest, and readStream repeats that check before
+    // CAS publication; keep the stronger double-walk proof for normal-sized
+    // workspaces without making large workspaces retry forever.
+    if (first.files.length > 8_192) return { files: first.files, start_fingerprint: firstBefore, end_fingerprint: firstAfter, stable: firstStable };
+    // For ordinary workspaces retain the original strong proof: a second
+    // complete inventory also supplies the current observation set when a
+    // file appears/disappears during reconciliation. Large workspaces take
+    // the bounded one-pass path above and revalidate bytes at CAS read time.
+    const second = await this.#inventory(scopeKeys, true, false);
     return {
-      files,
-      start_fingerprint: first.before_fingerprint,
+      files: firstStable && second.internally_stable && firstAfter === second.before_fingerprint ? first.files : second.files,
+      start_fingerprint: firstBefore,
       end_fingerprint: second.after_fingerprint,
-      stable: first.internally_stable && second.internally_stable && first.after_fingerprint === second.before_fingerprint,
+      stable: firstStable && second.internally_stable && firstAfter === second.before_fingerprint,
     };
   }
 
-  async #inventory(scopeKeys: readonly string[], digestOnly: boolean): Promise<Inventory> {
+  async #inventory(scopeKeys: readonly string[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<Inventory> {
     const files: CapturedFile[] = [];
     try {
       for (const scopeKey of [...new Set(scopeKeys)].sort()) {
         const normalizedScope = normalizeWorkspacePath(this.#root, scopeKey);
-        await this.#walk(normalizedScope, files, digestOnly);
+        await this.#walk(normalizedScope, files, digestOnly, metadataOnly, knownUris);
       }
     } catch (error) {
       return unavailable(error);
@@ -386,18 +549,18 @@ export class DirectorySourceProvider implements SourceProvider {
     const unique = [...new Map(files.map((file) => [file.uri, file])).values()].sort((left, right) => left.uri.localeCompare(right.uri));
     return {
       files: unique,
-      before_fingerprint: jsonDigest(unique.map((file) => [file.uri, file.token_before])),
-      after_fingerprint: jsonDigest(unique.map((file) => [file.uri, file.token_after])),
+      before_fingerprint: digestFields(unique.flatMap((file) => [file.uri, file.token_before])),
+      after_fingerprint: digestFields(unique.flatMap((file) => [file.uri, file.token_after])),
       internally_stable: unique.every((file) => file.token_before === file.token_after),
     };
   }
 
-  async #walk(relativePath: string, files: CapturedFile[], digestOnly: boolean): Promise<void> {
+  async #walk(relativePath: string, files: CapturedFile[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<void> {
     const absolute = resolve(this.#root, relativePath);
     if (!isWithinRoot(this.#root, absolute)) throw new SourceProviderOutcomeError("failed", "core:source_provider_uri_invalid", "never", "The coverage scope escapes the provider root.");
     const rootStat = await this.#fileSystem.lstat(absolute);
     if (!rootStat.is_directory) {
-      await this.#captureFile(relativePath, absolute, rootStat, files, digestOnly);
+      await this.#captureFile(relativePath, absolute, rootStat, files, digestOnly, metadataOnly, knownUris);
       return;
     }
     const entries = [...await this.#fileSystem.read_directory(absolute)].sort((left, right) => left.name.localeCompare(right.name));
@@ -413,26 +576,81 @@ export class DirectorySourceProvider implements SourceProvider {
       if (child === ".git" || child.startsWith(".git/") || child === ".urdira" || child.startsWith(".urdira/")) return;
       const childPath = resolve(this.#root, child);
       const childStat = await this.#fileSystem.lstat(childPath);
-      if (childStat.is_directory && !childStat.is_symbolic_link) await this.#walk(child, files, digestOnly);
-      else await this.#captureFile(child, childPath, childStat, files, digestOnly);
+      if (childStat.is_directory && !childStat.is_symbolic_link) {
+        // The inclusion policy already rejects generated trees such as
+        // node_modules, dist, and coverage. Do not enumerate their entire
+        // contents just to discard every file afterward. A probe preserves
+        // explicit include rules (for example `dist/**`) and explicit
+        // exclusions without duplicating the security policy here.
+        const probe = `${child}/__urdira_directory_probe__.ts`;
+        const decision = evaluateInclusion({
+          normalized_path: probe,
+          is_symlink: false,
+          is_directory: false,
+          byte_length: 0,
+          media_type: "text/plain",
+        }, this.#inclusion, this.#gitignore);
+        if (decision.included) await this.#walk(child, files, digestOnly, metadataOnly, knownUris);
+      }
+      else await this.#captureFile(child, childPath, childStat, files, digestOnly, metadataOnly, knownUris);
     });
   }
 
-  async #captureFile(uri: string, path: string, initial: DirectoryFileStat, files: CapturedFile[], digestOnly: boolean): Promise<void> {
+  async #captureFile(uri: string, path: string, initial: DirectoryFileStat, files: CapturedFile[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<void> {
     if (initial.is_directory || initial.is_special) return;
     const before = await this.#inspectBoundary(uri, path);
+    if (metadataOnly) {
+      // Existing eligible files are checked with the same boundary token. A
+      // newly appearing file is deliberately represented as a marker so the
+      // first/second fingerprints disagree and the caller retries rather than
+      // silently publishing an incomplete capture.
+      const after = await this.#inspectBoundary(uri, path);
+      files.push({ uri, content_hash: knownUris?.has(uri) ? "metadata-only" : "new-file", metadata_digest: before.metadata_digest, token_before: before.token, token_after: after.included ? after.token : `ineligible:${after.token}` });
+      return;
+    }
     if (!before.included) return;
-    const bytes = await this.#fileSystem.read_file(before.target_path);
-    if (!this.#included(uri, before, bytes)) return;
-    const after = await this.#inspectBoundary(uri, path, bytes);
+    const digest = await this.#digestFile(before.target_path);
+    const mediaBytes = digest.has_nul || !digest.valid_utf8 ? Uint8Array.of(0) : new Uint8Array();
+    if (!this.#included(uri, before, mediaBytes)) return;
+    const after = await this.#inspectBoundary(uri, path, mediaBytes);
     files.push({
       uri,
-      ...(digestOnly ? {} : { bytes }),
-      content_hash: rawDigest(bytes),
+      // Native enumeration is digest-only. The optional byte retention is
+      // intentionally kept for the small in-memory provider fixtures; the
+      // production filesystem always takes the streaming path above.
+      ...(digestOnly ? {} : {}),
+      content_hash: digest.content_hash,
       metadata_digest: before.metadata_digest,
       token_before: before.token,
       token_after: after.included ? after.token : `ineligible:${after.token}`,
     });
+  }
+
+  async #digestFile(path: string): Promise<{ readonly content_hash: string; readonly byte_length: number; readonly has_nul: boolean; readonly valid_utf8: boolean }> {
+    const stream = this.#fileSystem.read_file_stream?.(path);
+    if (stream !== undefined) {
+      const hash = createHash("sha256");
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      let byteLength = 0;
+      let hasNul = false;
+      let validUtf8 = true;
+      for await (const chunk of stream) {
+        if (!(chunk instanceof Uint8Array)) throw new SourceProviderOutcomeError("failed", "core:source_provider_read_invalid", "never", "The source stream yielded a non-byte chunk.");
+        hash.update(chunk);
+        byteLength += chunk.byteLength;
+        hasNul ||= chunk.some((byte) => byte === 0);
+        if (validUtf8) {
+          try { decoder.decode(chunk, { stream: true }); } catch { validUtf8 = false; }
+        }
+      }
+      if (validUtf8) { try { decoder.decode(); } catch { validUtf8 = false; } }
+      return { content_hash: `sha256:${hash.digest("hex")}`, byte_length: byteLength, has_nul: hasNul, valid_utf8: validUtf8 };
+    }
+    // Test-only file systems may implement only read_file. Keep their
+    // contract working without making the native Node provider pay this
+    // aggregate allocation.
+    const bytes = await this.#fileSystem.read_file(path);
+    return { content_hash: rawDigest(bytes), byte_length: bytes.byteLength, has_nul: bytes.some((byte) => byte === 0), valid_utf8: (() => { try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); return true; } catch { return false; } })() };
   }
 
   async #inspectBoundary(uri: string, path: string, bytes?: Uint8Array): Promise<FileBoundary> {
@@ -494,6 +712,20 @@ export class DirectorySourceProvider implements SourceProvider {
     stable: boolean,
     mayAuthorizeDeletion: boolean,
   ): JsonValue {
+    const result = this.#enumerationRecord(request, previousWatermark, scopes, capture, budget, observationMode, stable, mayAuthorizeDeletion);
+    return { observation_batch: JSON.stringify(result.encoded), watermark: result.watermark, capture_start_fingerprint: result.capture_start_fingerprint, capture_end_fingerprint: result.capture_end_fingerprint };
+  }
+
+  #enumerationRecord(
+    request: SourceProviderRequestEnvelope,
+    previousWatermark: string | undefined,
+    scopes: readonly ObservationCoverageScope[],
+    capture: Capture,
+    budget: SourceProviderResourceBudget,
+    observationMode: "scan" | "reconciliation",
+    stable: boolean,
+    mayAuthorizeDeletion: boolean,
+  ): { readonly encoded: EncodedObservationBatch; readonly watermark: string; readonly capture_start_fingerprint: string; readonly capture_end_fingerprint: string } {
     if (capture.files.length > budget.max_observations) throw new SourceProviderOutcomeError("resource_exhausted", "core:source_provider_observations_exhausted", "retryable", "The observation budget was exhausted.");
     const fullCoverage = scopes.length === 1 && scopes[0]?.normalized_scope_key === "";
     const watermark = `watermark:${capture.end_fingerprint}`;
@@ -524,7 +756,7 @@ export class DirectorySourceProvider implements SourceProvider {
       ordering_domain: request.source_provider_binding_id,
       observation_mode: observationMode,
       coverage_scopes: JSON.stringify(scopes),
-      coverage_completeness: stable && fullCoverage ? "complete" : "partial",
+      coverage_completeness: stable && fullCoverage && mayAuthorizeDeletion ? "complete" : "partial",
       deletion_authority: stable && fullCoverage && mayAuthorizeDeletion ? "authoritative" : "none",
       provider_cursor_before: previousWatermark ?? "",
       provider_cursor_after: watermark,
@@ -538,11 +770,6 @@ export class DirectorySourceProvider implements SourceProvider {
     const batch: SourceObservationBatch = { observation_batch_id: observationBatchId, ...batchCore, batch_digest: batchDigest };
     const observations: ProviderObservation[] = observationsWithoutBatchId.map((observation) => ({ ...observation, observation_batch_id: observationBatchId }));
     const encoded: EncodedObservationBatch = { batch, observations };
-    return {
-      observation_batch: JSON.stringify(encoded),
-      watermark,
-      capture_start_fingerprint: capture.start_fingerprint,
-      capture_end_fingerprint: capture.end_fingerprint,
-    };
+    return { encoded, watermark, capture_start_fingerprint: capture.start_fingerprint, capture_end_fingerprint: capture.end_fingerprint };
   }
 }

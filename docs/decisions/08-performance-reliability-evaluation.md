@@ -74,7 +74,7 @@ Once an execution is ready, P95 continuation hydration is 100 ms for a 50-item o
 
 On tier M, steady-state daemon resident memory is at most 4 GiB during indexing and 2 GiB while idle; tier L limits are 8 GiB and 3 GiB. A single ordinary query receives 1 GiB temporary memory and 30 seconds CPU by default; operation definitions may advertise a smaller class. Admission control prevents concurrent work from exceeding the installation memory ceiling.
 
-Structural analysis admission is explicit: owner work is deterministically sharded across a bounded number of independent workers, and a worker lease is never shared by concurrent scans. The pool rejects duplicate or over-capacity leases before starting analysis. Progressive structural publication retains only source metadata between stages; each later stage renews a captured-byte lease and verifies the referenced CAS bytes and digest before analysis. A benchmark campaign must pass all six one-sample arm/phase smoke runs before the sixty-run campaign is admitted.
+Structural analysis admission is explicit: owner work is deterministically sharded across a bounded number of independent workers, and a worker lease is never shared by concurrent scans. The pool rejects duplicate or over-capacity leases before starting analysis. Progressive structural publication retains only source metadata between stages; each later stage renews a captured-byte lease and verifies the referenced CAS bytes and digest before analysis. The expanded benchmark must first pass a sequential smoke covering all eight task cells; only then may a full rerun be admitted. P95 values are reportable only after at least three independent campaigns.
 
 Excluding explicitly installed model packs and retained historical snapshots, current structural database plus source CAS overhead must not exceed 2.5 times included source bytes. Generic semantic documents, segments, vectors, and indexes must not exceed another 3 times included source bytes. Reports separate logical live data, historical retention, shared CAS, model assets, temporary staging, and query cache so deduplication cannot conceal growth.
 
@@ -141,7 +141,7 @@ Crash injection covers every durable phase of CAS installation, SQLite transacti
 
 Corruption tests alter, remove, duplicate, and swap database pages, canonical payloads, CAS blobs, vector shards, registry definitions, manifests, and cursor segments. Detection must identify the affected component, prevent trusted use, preserve unaffected workspaces where isolation permits, and execute the documented repair order.
 
-Watcher tests include dropped, duplicated, reordered, and overflow events on every supported backend. The periodic reconciliation must converge to the exact full-scan digest in every trace. Fuzzing targets JSON/MCP schemas, canonical CBOR, Schema IR, plugin output, safe regex, archive/bundle parsing, model manifests, and cursor tokens.
+Watcher tests include dropped, duplicated, reordered, and overflow events on every supported backend. The periodic reconciliation must converge to the exact full-scan logical digest in every trace. Fuzzing targets JSON/MCP schemas, Schema IR, transferable batches, plugin output, safe regex, archive/bundle parsing, model manifests, and cursor tokens.
 
 ## Release acceptance
 

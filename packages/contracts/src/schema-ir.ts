@@ -220,9 +220,7 @@ function typeToJsonSchema(type: CanonicalTypeExpression, definitions: Record<str
     case "exact_decimal": return { type: "string", pattern: EXACT_DECIMAL_PATTERN.source, "x-urdira-exact-decimal-scale-policy": type.scale_policy, ...(type.minimum === undefined ? {} : { "x-urdira-exact-decimal-minimum": type.minimum }), ...(type.maximum === undefined ? {} : { "x-urdira-exact-decimal-maximum": type.maximum }) };
     case "text": return withBounds({ type: "string", ...(type.identifier_kind === "identifier" ? { pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$" } : {}), ...(type.identifier_kind === "namespaced_identifier" ? { pattern: "^[a-z][a-z0-9_-]*:[A-Za-z0-9][A-Za-z0-9._-]*$" } : {}), ...(type.identifier_kind === "semver" ? { pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" } : {}) }, type.minimum_code_point_count, type.maximum_code_point_count, "length");
     case "bytes": {
-      const minimumBytes = type.minimum_byte_length ?? (type.bound_schema_id_field === undefined ? undefined : 1);
-      const minimumEncodedLength = minimumBytes === undefined || minimumBytes === 0 ? undefined : 10 + Math.ceil(minimumBytes * 8 / 6);
-      return { type: "string", pattern: minimumEncodedLength === undefined ? "^base64url:[A-Za-z0-9_-]*$" : "^base64url:[A-Za-z0-9_-]+$", ...(minimumEncodedLength === undefined ? {} : { minLength: minimumEncodedLength }), ...(type.minimum_byte_length === undefined ? {} : { "x-urdira-minimum-byte-length": type.minimum_byte_length }), ...(type.maximum_byte_length === undefined ? {} : { "x-urdira-maximum-byte-length": type.maximum_byte_length }), ...(type.bound_schema_id_field === undefined ? {} : { "x-urdira-schema-bound-bytes": { schema_id_field: type.bound_schema_id_field, schema_version_field: type.bound_schema_version_field } }) };
+      return { type: "object", properties: { digest: { type: "string" }, byte_length: { type: "integer", minimum: 0 }, media_type: { type: "string" } }, required: ["digest", "byte_length", "media_type"], additionalProperties: false, ...(type.minimum_byte_length === undefined ? {} : { "x-urdira-minimum-byte-length": type.minimum_byte_length }), ...(type.maximum_byte_length === undefined ? {} : { "x-urdira-maximum-byte-length": type.maximum_byte_length }), ...(type.bound_schema_id_field === undefined ? {} : { "x-urdira-schema-bound-bytes": { schema_id_field: type.bound_schema_id_field, schema_version_field: type.bound_schema_version_field } }) };
     }
     case "timestamp": return { type: "string", pattern: TIMESTAMP_PATTERN.source, ...(type.earliest === undefined ? {} : { "x-urdira-timestamp-earliest": type.earliest }), ...(type.latest === undefined ? {} : { "x-urdira-timestamp-latest": type.latest }) };
     case "digest": return { type: "string", pattern: digestPattern(type.allowed_hash_algorithms).source };
@@ -877,6 +875,61 @@ function validatePipelineOperatorArguments(operator: string, argumentsValue: unk
   fail(`${path}.operator`, "must name a registered core algebra operator");
 }
 
+function validatePipelineV3Model(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
+  const stageIds = new Map<string, { index: number; outputs: readonly string[] }>();
+  for (const [index, rawStage] of (object["stages"] as unknown[]).entries()) {
+    if (rawStage === null || typeof rawStage !== "object" || Array.isArray(rawStage)) fail(`${path}.stages[${index}]`, "must be a closed v3 stage object");
+    const stage = rawStage as Record<string, unknown>;
+    requireModelFields(stage, ["stage_id", "stage_type", "arguments"], `${path}.stages[${index}]`);
+    rejectUnknownModelFields(stage, ["stage_id", "stage_type", "operation", "operation_version", "operator", "arguments", "bindings", "inputs"], `${path}.stages[${index}]`);
+    const stageId = stage["stage_id"];
+    if (typeof stageId !== "string" || stageId.length === 0 || stageIds.has(stageId)) fail(`${path}.stages[${index}].stage_id`, "must be a unique non-empty identifier");
+    if (stage["stage_type"] !== "operation" && stage["stage_type"] !== "operator") fail(`${path}.stages[${index}].stage_type`, "must be operation or operator");
+    if (stage["arguments"] === null || typeof stage["arguments"] !== "object" || Array.isArray(stage["arguments"])) fail(`${path}.stages[${index}].arguments`, "must be an object");
+    const bindings = stage["bindings"] === undefined ? {} : stage["bindings"];
+    if (bindings === null || typeof bindings !== "object" || Array.isArray(bindings)) fail(`${path}.stages[${index}].bindings`, "must be an object");
+    const inputBindings = Array.isArray(stage["inputs"]) ? stage["inputs"] as unknown[] : Object.values(bindings as Record<string, unknown>);
+    for (const [bindingIndex, rawBinding] of inputBindings.entries()) {
+      if (rawBinding === null || typeof rawBinding !== "object" || Array.isArray(rawBinding)) fail(`${path}.stages[${index}].inputs[${bindingIndex}]`, "must be a binding");
+      const binding = rawBinding as Record<string, unknown>;
+      requireModelFields(binding, ["stage_id", "output"], `${path}.stages[${index}].inputs[${bindingIndex}]`);
+      rejectUnknownModelFields(binding, ["stage_id", "output"], `${path}.stages[${index}].inputs[${bindingIndex}]`);
+      const producer = stageIds.get(String(binding["stage_id"]));
+      if (producer === undefined || producer.index >= index || !producer.outputs.includes(String(binding["output"]))) fail(`${path}.stages[${index}].inputs[${bindingIndex}]`, "must reference an earlier registered output");
+    }
+    let outputs: readonly string[];
+    if (stage["stage_type"] === "operation") {
+      if (typeof stage["operation"] !== "string") fail(`${path}.stages[${index}].operation`, "must be a registered operation");
+      const operation = operationDefinitions.find((candidate) => candidate.operation_id === stage["operation"]);
+      if (operation === undefined) fail(`${path}.stages[${index}].operation`, "must be a registered operation");
+      if (stage["operation_version"] !== undefined && stage["operation_version"] !== 3 && stage["operation_version"] !== operation.operation_version) fail(`${path}.stages[${index}].operation_version`, "does not match the registered operation version");
+      const boundArgs: Record<string, unknown> = { ...(stage["arguments"] as Record<string, unknown>) };
+      for (const [field, rawBinding] of Object.entries(bindings as Record<string, unknown>)) {
+        const selector = { subject_type: "stage_output", stage_id: (rawBinding as Record<string, unknown>)["stage_id"], output: (rawBinding as Record<string, unknown>)["output"] };
+        boundArgs[field] = ["subjects", "sources", "targets", "containers", "artifacts"].includes(field) ? [selector] : selector;
+      }
+      const selected = validateRegisteredOperationArguments(stage["operation"], boundArgs, `${path}.stages[${index}].arguments`, context, undefined, true);
+      outputs = selected.operation.result_streams;
+    } else {
+      if (typeof stage["operator"] !== "string") fail(`${path}.stages[${index}].operator`, "must be a registered operator");
+      outputs = validatePipelineOperatorArguments(stage["operator"], stage["arguments"], `${path}.stages[${index}]`, context, stageIds as unknown as ReadonlyMap<string, PipelineStageOutputInfo>) ?? [];
+    }
+    stageIds.set(stageId, { index, outputs });
+  }
+  const seen = new Set<string>();
+  for (const [index, rawOutput] of (object["outputs"] as unknown[]).entries()) {
+    if (rawOutput === null || typeof rawOutput !== "object" || Array.isArray(rawOutput)) fail(`${path}.outputs[${index}]`, "must be a v3 output");
+    const output = rawOutput as Record<string, unknown>;
+    requireModelFields(output, ["name", "stage_id", "output"], `${path}.outputs[${index}]`);
+    rejectUnknownModelFields(output, ["name", "stage_id", "output"], `${path}.outputs[${index}]`);
+    const producer = stageIds.get(String(output["stage_id"]));
+    if (producer === undefined || !producer.outputs.includes(String(output["output"]))) fail(`${path}.outputs[${index}]`, "must reference a registered stage output");
+    const key = `${String(output["stage_id"])}\u0000${String(output["output"])}`;
+    if (seen.has(key)) fail(`${path}.outputs[${index}]`, "must not contain duplicate output references");
+    seen.add(key);
+  }
+}
+
 function validateQueryExpressionModel(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
   const expressionType = object["expression_type"];
   if (expressionType === "operation") {
@@ -891,6 +944,10 @@ function validateQueryExpressionModel(object: Record<string, unknown>, path: str
     if (!Array.isArray(object["stages"]) || !Array.isArray(object["outputs"])) fail(path, "has invalid pipeline arrays");
     if (object["stages"].length < 1) fail(`${path}.stages`, "must be a non-empty array");
     if (object["outputs"].length < 1) fail(`${path}.outputs`, "must be a non-empty array");
+    if ((object["stages"] as unknown[]).some((stage) => stage !== null && typeof stage === "object" && !Array.isArray(stage) && "stage_type" in (stage as Record<string, unknown>))) {
+      validatePipelineV3Model(object, path, context);
+      return;
+    }
     const stageIds = new Map<string, PipelineStageOutputInfo>();
     for (const [index, stage] of (object["stages"] as unknown[]).entries()) {
       const result = validateQueryStageModel(stage, `${path}.stages[${index}]`, context, stageIds);
@@ -958,7 +1015,10 @@ function validateStageOutputReferenceModel(value: unknown, path: string): void {
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail(path, "must be a StageOutputReference object");
   const output = value as Record<string, unknown>;
   requireModelFields(output, ["stage_id", "output"], path);
-  rejectUnknownModelFields(output, ["stage_id", "output"], path);
+  // Normalized v3 plans retain the public output alias so the response can
+  // expose the declared name without losing the stage/output identity.
+  rejectUnknownModelFields(output, ["stage_id", "output", "name"], path);
+  if (output["name"] !== undefined && (typeof output["name"] !== "string" || output["name"].length === 0)) fail(`${path}.name`, "must be a non-empty alias when present");
   if (typeof output["stage_id"] !== "string" || output["stage_id"].length === 0) fail(`${path}.stage_id`, "must be non-empty");
   if (typeof output["output"] !== "string" || output["output"].length === 0) fail(`${path}.output`, "must be non-empty");
 }
@@ -967,11 +1027,12 @@ function validateQueryStageModel(value: unknown, path: string, context: SchemaVa
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail(path, "must be a QueryStage object");
   const stage = value as Record<string, unknown>;
   requireModelFields(stage, ["stage_id", "operator", "inputs", "arguments"], path);
-  rejectUnknownModelFields(stage, ["stage_id", "operator", "inputs", "arguments"], path);
+  rejectUnknownModelFields(stage, ["stage_id", "operator", "inputs", "arguments", "operation_version"], path);
   if (typeof stage["stage_id"] !== "string" || stage["stage_id"].length === 0) fail(`${path}.stage_id`, "must be non-empty");
   if (typeof stage["operator"] !== "string" || stage["operator"].length === 0 || !registeredQueryOperators.has(stage["operator"])) fail(`${path}.operator`, "must name a registered core algebra operator");
   if (!Array.isArray(stage["inputs"])) fail(`${path}.inputs`, "must be an array");
   if (stage["arguments"] === null || typeof stage["arguments"] !== "object" || Array.isArray(stage["arguments"])) fail(`${path}.arguments`, "must be an arguments object");
+  if (stage["operation_version"] !== undefined && (!Number.isSafeInteger(stage["operation_version"]) || Number(stage["operation_version"]) < 1)) fail(`${path}.operation_version`, "must be a positive safe integer");
   for (const [index, input] of (stage["inputs"] as unknown[]).entries()) validateStageOutputReferenceModel(input, `${path}.inputs[${index}]`);
   const operator = String(stage["operator"]);
   const inputCount = (stage["inputs"] as unknown[]).length;
@@ -1000,7 +1061,7 @@ function validateModelSchemaBoundCoordinates(typeName: string, fieldName: string
   if (typeof schemaId !== "string" || !/^[a-z][a-z0-9_-]*:[A-Za-z0-9][A-Za-z0-9._-]*$/.test(schemaId)) fail(`${path}.${idField}`, "must be a non-empty NamespacedIdentifier coordinate");
   if (!Number.isSafeInteger(object[versionField]) || Number(object[versionField]) < 1) fail(`${path}.${versionField}`, "must be a positive schema version coordinate");
   const bytes = object[fieldName];
-  if (typeof bytes !== "string" || !/^base64url:[A-Za-z0-9_-]+$/.test(bytes)) fail(`${path}.${fieldName}`, "must be non-empty SchemaBoundBytes");
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) fail(`${path}.${fieldName}`, "must be non-empty SchemaBoundBytes");
 }
 
 function validatePublicQueryModel(typeName: string, object: Record<string, unknown>, path: string, context: SchemaValidationContext, allowStageOutput = false): void {
@@ -1211,8 +1272,7 @@ function checkBigIntegerBounds(type: BigIntegerTypeExpression, value: string, pa
 
 function byteLength(value: unknown): number {
   if (value instanceof Uint8Array) return value.byteLength;
-  if (typeof value !== "string" || !/^base64url:[A-Za-z0-9_-]*$/.test(value)) fail("value", "must be bytes");
-  const encoded = value.slice("base64url:".length); if (encoded.length % 4 === 1) fail("value", "has invalid base64url length"); return Math.floor(encoded.length * 3 / 4);
+  fail("value", "must be bytes");
 }
 
 function validateLocalReferences(schema: CanonicalSchemaDefinition, context: SchemaValidationContext): void {

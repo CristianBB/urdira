@@ -12,6 +12,7 @@ export {
   scriptKindForPath,
   discoverProjects,
   analyzeSyntaxProject,
+  isLargeSyntaxCorpus,
   analyzeProject,
   JsTsAnalysisSession,
   type AnalyzerFile,
@@ -29,6 +30,7 @@ export {
 export { createJavascriptTypescriptWorker, type JavascriptTypescriptWorkerDescriptor } from "./worker.js";
 export { createJavascriptTypescriptThreadTransport, type JavascriptTypescriptThreadDescriptor } from "./thread-transport.js";
 export { buildJavascriptTypescriptFactDelta, type JavascriptTypescriptFactDeltaInput } from "./fact-delta.js";
+export { iterateNativeFactDeltaBatches, assertNativeFactDeltaBatchBudget } from "./native-batches.js";
 export {
   JAVASCRIPT_TYPESCRIPT_DEPENDENCY_ROLES,
   JAVASCRIPT_TYPESCRIPT_PAYLOAD_SCHEMAS,

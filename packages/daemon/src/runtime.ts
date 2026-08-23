@@ -2,29 +2,33 @@ import { chmod, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename } from "node:path";
-import { attemptWorkspaceFork, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider } from "@urdira/engine";
-import { recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
+import { attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
+import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
 import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-thread.js";
 import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths } from "./ownership.js";
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
 import { ensureSemanticAssetsInProcess, runSemanticReconcileInProcess, startNeuralSemanticProviderHost, type NeuralSemanticProviderHost, type SemanticProcessRun } from "./semantic-process.js";
-import { LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type UceResponse, type UceRequestHandler } from "./protocol.js";
+import { LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
 import { DaemonScheduler, PersistentCursorRecovery, type PersistedCursorState, type SchedulerOptions } from "./scheduler.js";
 
 export interface DaemonPluginCatalogEntry extends WorkspacePluginCatalogEntry {
   readonly capability_declarations: readonly PluginCapabilityDeclaration[];
 }
 
+export type DaemonStartupPhase = "locking" | "catalog_verification" | "workspace_recovery" | "provider_reconciliation" | "ready";
+
 export interface DaemonRuntimeOptions {
+  /** Private composition hook used by human CLI startup progress rendering. */
+  readonly on_startup_progress?: (phase: DaemonStartupPhase) => void;
   readonly data_root: string;
   readonly engine_build_id: string;
   readonly scheduler: SchedulerOptions;
-  readonly calls?: Readonly<Record<string, UceRequestHandler>>;
+  readonly calls?: Readonly<Record<string, IpcRequestHandler>>;
   readonly max_frame_bytes?: number;
   readonly known_cursors?: ReadonlyArray<string>;
   readonly workspace_registry?: WorkspaceRegistry;
-  readonly workspace_status?: UceRequestHandler;
+  readonly workspace_status?: IpcRequestHandler;
   readonly plugin_catalog?: readonly DaemonPluginCatalogEntry[];
   /**
    * Builds the language-plugin half of a real workspace scan (see
@@ -55,7 +59,7 @@ export interface DaemonRuntimeOptions {
    * Whether a successful workspace scan submits a post-ready lexical
    * maintenance job (see `scheduleWorkspaceScan`'s `submitLexicalMaintenance`
    * below, and `reconcileLexicalProjection`, `@urdira/engine`'s
-   * `lexical-reconciler.ts`) that brings `lexical_documents`/`lexical_trigrams`
+   * `lexical-reconciler.ts`) that brings `lexical_documents`/`lexical_fts`
    * up to date for `core:search_text` pushdown. Injected by the composing
    * application from an environment variable (a kill switch: `false` only
    * when explicitly disabled). Defaults to ON (`true`) when omitted --
@@ -103,7 +107,7 @@ export interface DaemonRuntimeOptions {
    * in-process. The in-process path only yields to the event loop BETWEEN
    * documents (see `reconcileLexicalProjection`'s `yieldToEventLoop` doc
    * comment, `@urdira/engine`'s `lexical-reconciler.ts`) -- each document's
-   * own synchronous trigram computation still runs on the daemon's main
+   * own synchronous normalization/FTS5 insertion still runs on the daemon's main
    * thread, which measured as a multi-minute status-RPC lag on a real large
    * repository. The threaded path moves that work off the main thread
    * entirely; `submitLexicalMaintenance` below also aborts an in-flight
@@ -475,8 +479,101 @@ function operationRequiredStructuralStage(payload: unknown): number {
   return 3;
 }
 
+function queryRequiredFrontier(payload: unknown): "source" | "syntax" | "structural" | "semantic" {
+  const request = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
+  const options = request["options"] !== null && typeof request["options"] === "object" && !Array.isArray(request["options"]) ? request["options"] as Record<string, unknown> : {};
+  const explicit = options["required_frontier"];
+  if (explicit === "source" || explicit === "syntax" || explicit === "structural" || explicit === "semantic") return explicit;
+  return "structural";
+}
+
+function frontierReady(readiness: WorkspaceReadiness, frontier: "source" | "syntax" | "structural" | "semantic"): boolean {
+  return frontier === "source" ? readiness.source_ready : frontier === "syntax" ? readiness.structural_stage_1_ready : frontier === "structural" ? readiness.structural_ready : readiness.semantic_ready;
+}
+
+function queryFreshnessWait(payload: unknown): { readonly requested: boolean; readonly timeoutMs: number } {
+  const request = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
+  const options = request["options"] !== null && typeof request["options"] === "object" && !Array.isArray(request["options"]) ? request["options"] as Record<string, unknown> : {};
+  const freshness = options["freshness"];
+  const requested = freshness === "wait_for_current" || (freshness !== null && typeof freshness === "object" && !Array.isArray(freshness) && (freshness as Record<string, unknown>)["mode"] === "wait");
+  const rawTimeout = options["wait_timeout_ms"];
+  return { requested, timeoutMs: typeof rawTimeout === "number" && Number.isSafeInteger(rawTimeout) && rawTimeout >= 0 ? rawTimeout : 0 };
+}
+
+function frontierForStructuralStage(stage: number): "source" | "syntax" | "structural" {
+  return stage <= 0 ? "source" : stage === 1 ? "syntax" : "structural";
+}
+
+/**
+ * Waits on the same durable readiness state exposed by `core:index_status`.
+ * The old query path converted `wait_for_current` into a fail-fast check,
+ * which made an agent poll status and retry while a scan was already making
+ * progress.  Polling is deliberately coarse (one bounded SQLite read per
+ * 100ms) and cancellation-aware; it does not rerun a query or alter the
+ * published snapshot.  A timeout is a typed, closed error carrying the
+ * pending workspace count required by the public error contract.
+ */
+async function waitForQueryFrontier(
+  workspaceId: string,
+  frontier: "source" | "syntax" | "structural" | "semantic",
+  timeoutMs: number,
+  registry: WorkspaceRegistry,
+  storage: DurableStorage,
+  semantic: ReadonlyMap<string, SemanticMaterializationStatusView>,
+  scanInFlight: ReadonlySet<string>,
+  signal: AbortSignal,
+  absoluteDeadlineMs?: number,
+): Promise<WorkspaceReadiness> {
+  const started = Date.now();
+  const deadline = Math.min(started + timeoutMs, absoluteDeadlineMs ?? Number.POSITIVE_INFINITY);
+  let latest: WorkspaceReadiness | undefined;
+  while (true) {
+    if (signal.aborted) throw new DaemonError("core:operation_cancelled", "Freshness wait was cancelled.", { workspace_id: workspaceId, frontier });
+    const workspace = registry.get(workspaceId);
+    if (workspace === undefined) throw new DaemonError("core:workspace_not_found", `Workspace ${workspaceId} is not registered.`, { workspace_id: workspaceId });
+    latest = await workspaceReadiness(workspace, storage, semantic, scanInFlight.has(workspaceId));
+    const scanRunning = scanInFlight.has(workspaceId);
+    if (!scanRunning && frontierReady(latest, frontier) && workspace.last_scan_error === undefined) return latest;
+    const frontierBuildState = frontier === "source" ? latest.source_build_state : frontier === "semantic" ? latest.semantic_build_state : latest.structural_build_state;
+    if (!scanRunning && frontierBuildState !== "building") {
+      throw new DaemonError("core:coverage_incomplete", `Required ${frontier} frontier for workspace ${workspaceId} has no scheduled work.`, {
+        workspace_ids: [workspaceId],
+        required_frontier: frontier,
+        blocking_stage: frontier,
+        blocking_operation: "unknown",
+        waited_ms: Math.max(0, Date.now() - started),
+        retryable: false,
+      });
+    }
+    const now = Date.now();
+    if (now >= deadline) {
+      throw new DaemonError("core:freshness_wait_timeout", `Required ${frontier} frontier for workspace ${workspaceId} did not become current within ${Math.max(0, now - started)} ms.`, {
+        workspace_ids: [workspaceId],
+        waited_ms: Math.max(0, now - started),
+        pending_observation_counts: [scanRunning ? 1 : 0],
+        ...(latest.retry_after_ms === undefined ? {} : { retry_after_ms: latest.retry_after_ms }),
+      });
+    }
+    await new Promise<void>((resolve, reject) => {
+      const remaining = Math.max(1, Math.min(100, deadline - Date.now()));
+      let settled = false;
+      const timer = setTimeout(() => { settled = true; signal.removeEventListener("abort", cancel); resolve(); }, remaining);
+      const cancel = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", cancel);
+        reject(new DaemonError("core:operation_cancelled", "Freshness wait was cancelled.", { workspace_id: workspaceId, frontier }));
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+    });
+  }
+}
+
 interface WorkspaceReadiness {
   readonly source_ready: boolean;
+  readonly syntax_ready: boolean;
+  readonly structural_stage_1_ready: boolean;
   readonly structural_ready: boolean;
   readonly semantic_ready: boolean;
   readonly source_snapshot_id?: string;
@@ -554,6 +651,9 @@ async function workspaceReadiness(
     && workspace.status !== "indexing"
     && workspace.last_scan_error === undefined;
   const structuralStale = workspace.current_snapshot_id !== undefined && sourceAvailable && structuralGeneration !== undefined && source.current_generation > structuralGeneration;
+  // Stage 1 publishes parser/syntax facts before the later structural closure;
+  // expose it as its own frontier so callers need not wait for semantic work.
+  const syntaxReady = sourceReady && (structuralReady || (structuralStageOrdinal !== undefined && structuralStageOrdinal >= 1));
   const semanticView = semantic.get(workspace.workspace_id);
   const semanticReady = structuralReady && semanticView?.materialization_state === "complete" && semanticView.source_snapshot_id === workspace.current_snapshot_id;
   const sourceReasonCodes = sourceAvailable ? [] : ["core:source_catalog_unavailable"];
@@ -563,6 +663,8 @@ async function workspaceReadiness(
   const semanticReasonCodes = semanticReady ? [] : [structuralUnsupported ? "core:plugin_unavailable" : structuralReady ? "core:semantic_indexing_in_progress" : "core:structural_required"];
   return {
     source_ready: sourceReady,
+    syntax_ready: syntaxReady,
+    structural_stage_1_ready: syntaxReady,
     structural_ready: structuralReady,
     semantic_ready: semanticReady,
     ...(sourceSnapshotId === undefined ? {} : { source_snapshot_id: sourceSnapshotId }),
@@ -586,11 +688,15 @@ async function workspaceReadiness(
 
 function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown> {
   const completedStage = readiness.structural_ready ? 3 : readiness.structural_stage_ordinal ?? 0;
-  const available = [
-    ...(readiness.source_ready ? SOURCE_OPERATIONS : []),
-    ...STRUCTURAL_OPERATIONS.filter((operation) => completedStage >= (STRUCTURAL_OPERATION_STAGE[operation] ?? 3)),
-  ];
-  const blocked = STRUCTURAL_OPERATIONS.filter((operation) => !available.includes(operation));
+  const operationReady = (operation: (typeof operationRegistry)[number]): boolean => {
+    if (operation.required_frontier === "source") return readiness.source_ready;
+    if (operation.required_frontier === "syntax") return readiness.structural_stage_1_ready;
+    if (operation.required_frontier === "semantic") return readiness.semantic_ready;
+    return completedStage >= operation.required_stage;
+  };
+  const queryOperations = operationRegistry.filter((operation) => operation.operation_id !== "core:index_status" && operation.lifecycle_state === "active");
+  const available = queryOperations.filter(operationReady).map((operation) => operation.operation_id);
+  const blocked = queryOperations.filter((operation) => !available.includes(operation.operation_id)).map((operation) => operation.operation_id);
   const structuralReasonCodes = readiness.structural_ready
     ? []
     : readiness.structural_freshness === "changes_pending"
@@ -610,7 +716,6 @@ function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown
         ? ["core:semantic_indexing_in_progress"]
         : ["core:structural_required"];
   const blockedReasonCode = structuralReasonCodes[0] ?? "core:analysis_in_progress";
-  const blockedRetryable = readiness.structural_completeness !== "unsupported";
   return {
     ...readiness,
     ...(readiness.source_snapshot_id === undefined ? {} : { source_snapshot_id: readiness.source_snapshot_id }),
@@ -622,6 +727,15 @@ function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown
         build_state: readiness.source_build_state,
         ...(readiness.source_snapshot_id === undefined ? {} : { snapshot_id: readiness.source_snapshot_id }),
         reason_codes: readiness.source_ready ? [] : ["core:source_catalog_unavailable"],
+      },
+      syntax: {
+        availability: readiness.structural_stage_1_ready ? "available" : "unavailable",
+        completeness: readiness.structural_stage_1_ready ? "complete" : "unknown",
+        freshness: readiness.structural_stage_1_ready ? "equivalent" : "degraded",
+        build_state: readiness.structural_stage_1_ready ? "idle" : readiness.structural_build_state === "building" ? "building" : "not_started",
+        ...(readiness.source_snapshot_id === undefined ? {} : { based_on_source_snapshot_id: readiness.source_snapshot_id }),
+        reason_codes: readiness.structural_stage_1_ready ? [] : ["core:syntax_indexing_in_progress"],
+        ...(readiness.retry_after_ms === undefined ? {} : { retry_after_ms: readiness.retry_after_ms }),
       },
       structural: {
         availability: readiness.structural_availability,
@@ -641,7 +755,15 @@ function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown
     },
     operation_availability: {
       available_now: available,
-      blocked: blocked.map((operation) => ({ operation, required_layer: "structural", retryable: blockedRetryable, reason_code: blockedReasonCode, ...(readiness.retry_after_ms === undefined ? {} : { retry_after_ms: readiness.retry_after_ms }) })),
+      blocked: blocked.map((operation) => {
+        const definition = queryOperations.find((candidate) => candidate.operation_id === operation)!;
+        const retryable = definition.required_frontier === "source"
+          ? readiness.source_build_state === "building"
+          : definition.required_frontier === "semantic"
+            ? readiness.semantic_build_state === "building"
+            : readiness.structural_build_state === "building";
+        return { operation, required_layer: definition.required_frontier, retryable, reason_code: blockedReasonCode, ...(retryable && readiness.retry_after_ms !== undefined ? { retry_after_ms: readiness.retry_after_ms } : {}) };
+      }),
     },
     available_operations: available,
     blocked_operations: blocked,
@@ -713,7 +835,7 @@ function singleWorkspaceScopeId(payload: unknown): string | undefined {
 
 function queryUsesSourceBinding(payload: unknown): boolean {
   const request = requestRecord(payload);
-  if (request["api_version"] !== 2) return false;
+  if (request["api_version"] !== 3) return false;
   const scope = requestRecord(request["scope"]);
   return typeof scope["snapshot_id"] === "string" && scope["snapshot_id"].startsWith("source-snapshot:");
 }
@@ -841,9 +963,10 @@ function enforceWarmRecordsBudget(cache: ReadonlyMap<string, CachedWorkspaceQuer
 
 async function acquireWorkspaceQueryEngine(workspaceId: string, registry: WorkspaceRegistry, storage: DurableStorage, cursorCache: CursorCache, cache: Map<string, CachedWorkspaceQueryEngine>, interner: RecordBodyInterner, lru: WarmRecordsLru, semanticProvider?: ResolvedSemanticProvider, allowSourceBinding = false): Promise<CachedWorkspaceQueryEngine> {
   const sourceWorkspace = allowSourceBinding ? registry.get(workspaceId) : undefined;
-  const resolution = sourceWorkspace !== undefined && sourceWorkspace.status !== "removed"
+  const registeredWorkspace = registry.get(workspaceId);
+  const resolution = registeredWorkspace !== undefined && registeredWorkspace.status !== "removed"
     ? { workspace_id: workspaceId }
-    : resolveIndexStatusRequest(registry, { api_version: 1, workspace_ids: [workspaceId] });
+    : { error: { code: "core:workspace_not_found" as const, details: { workspace_id: workspaceId } } };
   if ("error" in resolution) throw new DaemonError(resolution.error.code, "The requested query workspace is unavailable.", resolution.error.details);
   const cached = cache.get(resolution.workspace_id);
   if (cached) { touchWarmLru(lru, resolution.workspace_id); return cached; }
@@ -873,28 +996,20 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
 
 /**
  * Fire-and-forget pre-warm of one workspace's cached query engine (see
- * `acquireWorkspaceQueryEngine` above): forces the first `records()`/
- * `capability_states()` load (full reload or delta) and the `identityMaps`
- * memo to happen now, off the request path, so the first real `core:query`
- * against this workspace after a scan publication or a daemon start does
- * not pay that cost inline. Never throws -- failures are logged with the
- * `[urdira]` prefix used by neighboring best-effort code in this file and
- * must never affect the caller (a scan's success, or daemon startup).
+ * `acquireWorkspaceQueryEngine` above): primes only the metadata path
+ * (connection/schema, current generation, and capability state). It never
+ * loads the record corpus or builds an identity map. Never throws -- failures
+ * are logged with the `[urdira]` prefix used by neighboring best-effort code
+ * in this file and must never affect the caller (a scan's success, or daemon
+ * startup).
  *
- * Also touches the LRU again after the warm settles (`acquireWorkspaceQueryEngine`
- * already touched it once, at acquire time, before the load) and enforces
- * `lru.budget_bytes` -- see `DaemonRuntimeOptions.warm_records_budget_mb`'s
- * own doc comment for the full eviction story, including why the STARTUP
- * prewarm loop additionally checks the budget BEFORE calling this for each
- * workspace (stopping the chain early) rather than relying solely on this
- * function's own post-warm enforcement.
+ * The record LRU is intentionally untouched: it is populated only by a
+ * bounded query that actually needs record hydration.
  */
 async function warmWorkspaceQueryEngine(workspaceId: string, registry: WorkspaceRegistry, storage: DurableStorage, cursorCache: CursorCache, cache: Map<string, CachedWorkspaceQueryEngine>, interner: RecordBodyInterner, lru: WarmRecordsLru, semanticProvider?: ResolvedSemanticProvider): Promise<void> {
   try {
     const cached = await acquireWorkspaceQueryEngine(workspaceId, registry, storage, cursorCache, cache, interner, lru, semanticProvider);
     await cached.data_port.warm({ scope_type: "single_workspace", workspace_id: workspaceId });
-    touchWarmLru(lru, workspaceId);
-    enforceWarmRecordsBudget(cache, lru);
   } catch (error) {
     console.error(`[urdira] query cache warm-up failed for ${workspaceId}:`, error);
   }
@@ -1046,8 +1161,10 @@ export class DaemonRuntime {
     this.paths = paths; this.endpoint = paths.endpoint; this.scheduler = scheduler; this.recovery = recovery; this.recovered_checkpoint = recoveredCheckpoint; this.recovered_cursor_ids = recoveredCursorIds; this.knownCursorIds = new Set([...recoveredCursorIds, ...(options.known_cursors ?? [])]);
   }
   static async start(options: DaemonRuntimeOptions): Promise<DaemonRuntime> {
+    options.on_startup_progress?.("locking");
     const paths = await daemonPaths(options.data_root);
     const lock = await ProcessLock.acquire(paths.process_lock, { pid: process.pid, started_at: new Date().toISOString() });
+    options.on_startup_progress?.("catalog_verification");
     const descriptor = new EndpointDescriptorStore(paths);
     const checkpoint = new LastKnownGoodStore(paths);
     const recovery = new PersistentCursorRecovery(`${paths.data_root}/cursors.json`);
@@ -1063,6 +1180,7 @@ export class DaemonRuntime {
       const recoveredCheckpoint = await checkpoint.verify({ engine_build_id: options.engine_build_id });
       const recoveredCursorIds: string[] = [];
       for (const cursorId of recoveredCheckpoint?.cursors ?? []) if (await recovery.load(cursorId)) recoveredCursorIds.push(cursorId);
+      options.on_startup_progress?.("workspace_recovery");
       if (process.platform !== "win32") await unlink(paths.endpoint).catch(() => undefined);
       const scheduler = new DaemonScheduler(options.scheduler);
       const pluginCatalog = options.plugin_catalog ?? [];
@@ -1315,13 +1433,15 @@ export class DaemonRuntime {
       // (not instant) freshness the rest of this file already accepts
       // elsewhere (e.g. crash recovery's full-rescan retry, above).
       const scanInFlight = new Set<string>();
+      const scanControllers = new Map<string, AbortController>();
+      const scanGenerations = new Map<string, number>();
       // Tracks the currently in-flight THREADED lexical maintenance run (if
       // any) per workspace -- `submitLexicalMaintenance` below adds an entry
       // right before starting a threaded run and removes it once that run's
       // `result` settles. `scheduleWorkspaceScan` aborts whatever entry
       // exists here the moment a fresh scan starts for the same workspace
       // (see below): a lexical worker's own write transactions are the only
-      // other writer of `lexical_documents`/`lexical_trigrams`/`lexical_index_state`,
+      // other writer of `lexical_documents`/`lexical_fts`/`lexical_index_state`,
       // but they share the SAME on-disk workspace database file as the
       // scan's publish transaction, protected cross-thread only by SQLite's
       // WAL + `BEGIN IMMEDIATE` + `busy_timeout` (see `packages/storage/src/storage.ts`'s
@@ -1367,9 +1487,19 @@ export class DaemonRuntime {
           if (changedUris === undefined) pending.full = true;
           else for (const uri of changedUris) pending.uris.add(uri);
           pendingScans.set(workspaceId, pending);
+          // A concrete changed-path generation supersedes work that has not
+          // reached publication. Periodic/full reconciliation hints are not
+          // cancellation signals: aborting those on every sweep tick would
+          // starve a workspace whose sweep interval is shorter than a scan.
+          if (changedUris !== undefined) scanControllers.get(workspaceId)?.abort();
           return;
         }
         scanInFlight.add(workspaceId);
+        const scanController = new AbortController();
+        scanControllers.set(workspaceId, scanController);
+        const scanGeneration = (scanGenerations.get(workspaceId) ?? 0) + 1;
+        scanGenerations.set(workspaceId, scanGeneration);
+        const requestedUris = changedUris === undefined ? undefined : [...new Set(changedUris)];
         // Pre-empt a stale in-flight threaded lexical build (see
         // `lexicalThreadRuns`'s doc comment above) as early as possible --
         // before this scan is even admitted to the scheduler -- rather than
@@ -1406,14 +1536,15 @@ export class DaemonRuntime {
                     // plugin. Leave the registry in indexing state (there is
                     // intentionally no structural snapshot to mark ready),
                     // while the durable source catalog becomes queryable via
-                    // API v2 source bindings.
+                    // API v3 source bindings.
                     await runSourceOnlyWorkspaceScan({
                       root: workspace.canonical_root,
                       database,
                       workspace_id: workspaceId,
-                      inclusion_rules: { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", ".urdira/**"], allow_external_root: false },
+                      inclusion_rules: { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false },
                       ...(options.scan_budget === undefined ? {} : { scan_budget: options.scan_budget }),
                       ...(options.scan_io_concurrency === undefined ? {} : { io_concurrency: options.scan_io_concurrency }),
+                      signal: scanController.signal,
                     });
                     console.error(`[urdira] source catalog ready for ${workspaceId}; no compatible language plugin is active`);
                     return undefined;
@@ -1451,9 +1582,11 @@ export class DaemonRuntime {
                     database,
                     workspace_id: workspaceId,
                     plugin,
-                    inclusion_rules: { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", ".urdira/**"], allow_external_root: false },
+                      inclusion_rules: { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false },
                     ...(options.scan_budget === undefined ? {} : { scan_budget: options.scan_budget }),
                     ...(options.scan_io_concurrency === undefined ? {} : { io_concurrency: options.scan_io_concurrency }),
+                    ...(requestedUris === undefined ? {} : { changed_uris: requestedUris }),
+                    signal: scanController.signal,
                     on_stage_published: (stage, stageResult) => {
                       if (stage.ordinal < stage.stage_count) registry.markStructuralStagePublished(workspaceId, stageResult.snapshot_id);
                     },
@@ -1479,6 +1612,11 @@ export class DaemonRuntime {
                   submitLexicalMaintenance(workspaceId);
                   submitSemanticMaintenance(workspaceId);
                 } catch (error) {
+                  const cancelled = scanFailureErrorCode(error) === "core:operation_cancelled" || scanController.signal.aborted;
+                  if (cancelled) {
+                    console.error(`[urdira] workspace scan superseded for ${workspaceId}`);
+                    return undefined;
+                  }
                   // A first-ever scan failure leaves the workspace "indexing" with
                   // no visible failure state, so the error must at least reach
                   // stderr or the failure is completely undiagnosable.
@@ -1503,6 +1641,7 @@ export class DaemonRuntime {
                 return undefined;
               } finally {
                 scanInFlight.delete(workspaceId);
+                if (scanControllers.get(workspaceId) === scanController) scanControllers.delete(workspaceId);
                 // Run exactly one coalesced follow-up scan for every hint that
                 // arrived while this scan was in flight, instead of dropping
                 // them (see `pendingScans` above). The scan that just finished
@@ -1618,7 +1757,7 @@ export class DaemonRuntime {
       // allocation-light per-document CPU work (`createLocalHashProvider`'s
       // regex tokenize + two FNV-1a hashes + a 256-bucket accumulation) was
       // nowhere near the cost of a whole-project TypeScript build (the
-      // reason `analysisThreadEnabled` exists) or lexical trigram extraction
+      // reason `analysisThreadEnabled` exists) or lexical FTS5 maintenance
       // (the reason `lexical_thread` exists). That reasoning held only for
       // the hash provider; the shipped default is now a real ONNX model
       // (`@urdira/embedding-local`'s `createLocalNeuralProvider`, reached
@@ -1747,43 +1886,16 @@ export class DaemonRuntime {
       for (const workspace of options.workspace_registry?.list() ?? []) {
         if (workspace.status === "indexing") scheduleWorkspaceScan(workspace.workspace_id);
       }
-      // Startup prewarm: every already-queryable workspace ("ready" or
-      // "degraded") left over from a prior process life still has an empty
-      // in-memory records cache in this fresh process, so its first
-      // `core:query` would otherwise pay the full reload cost inline. Warm
-      // them in the background, one at a time (not `Promise.all`) so a
-      // daemon restart with many indexed workspaces does not launch a
-      // thundering herd of full corpus loads competing for the same SQLite
-      // connections and CPU; each is independently best-effort via
-      // `warmWorkspaceQueryEngine`'s own try/catch, so one failing workspace
-      // does not stop the rest of the chain. Silently does nothing if the
-      // registry/storage/cursor-cache options this needs were never
-      // supplied (mirrors `scheduleWorkspaceScan`'s own guard).
-      //
-      // Stops warming FURTHER workspaces once `warmRecordsLru.budget_bytes`
-      // is already reached (checked BEFORE each iteration, so the loop still
-      // warms at least one workspace even at a very small budget) --
-      // workspaces beyond that point stay cold and load on first query (the
-      // existing, already-accepted cold path) rather than paying a warm-up
-      // that `warmWorkspaceQueryEngine`'s own post-warm `enforceWarmRecordsBudget`
-      // call would just immediately evict again. A workspace scanned or
-      // fork-completed while this chain is still running is intentionally
-      // left cold so its first source-safe request cannot queue behind a
-      // full corpus load on the same SQLite worker.
+      // Startup metadata warm-up: open the workspace, prepare its SQLite
+      // path, resolve the current generation, and read capabilities. This is
+      // deliberately sequential and never materializes the source corpus.
       if (options.workspace_registry && indexingStorage && cursorCache) {
         const registry = options.workspace_registry;
         const storage = indexingStorage;
         const cache = cursorCache;
         const warmableWorkspaceIds = registry.list().filter((workspace) => workspace.status === "ready" || workspace.status === "degraded").map((workspace) => workspace.workspace_id);
         trackWarm((async () => {
-          for (const workspaceId of warmableWorkspaceIds) {
-            if (queryEngines.size > 0) {
-              let warmTotal = 0;
-              for (const entry of queryEngines.values()) warmTotal += entry.snapshot_port.approxWarmBytes();
-              if (warmTotal >= warmRecordsLru.budget_bytes) break;
-            }
-            await warmWorkspaceQueryEngine(workspaceId, registry, storage, cache, queryEngines, recordBodyInterner, warmRecordsLru, semanticProvider);
-          }
+          for (const workspaceId of warmableWorkspaceIds) await warmWorkspaceQueryEngine(workspaceId, registry, storage, cache, queryEngines, recordBodyInterner, warmRecordsLru, semanticProvider);
         })());
         // Startup lexical maintenance: `submitLexicalMaintenance` otherwise
         // only ever fires from a scan's own success path, so a workspace
@@ -1815,9 +1927,9 @@ export class DaemonRuntime {
         if (request.call === "core:index_status" && options.workspace_status) return options.workspace_status(request, context);
         if (request.call === "core:index_status" && options.workspace_registry) {
           const payload = request.payload !== null && typeof request.payload === "object" ? request.payload as { readonly api_version?: unknown; readonly workspace_ids?: unknown; readonly workspace_root?: unknown } : {};
-          const apiVersion = typeof payload.api_version === "number" ? payload.api_version : 1;
+          const apiVersion = typeof payload.api_version === "number" ? payload.api_version : 3;
           const workspaceIds = Array.isArray(payload.workspace_ids) ? payload.workspace_ids.filter((value): value is string => typeof value === "string") : [];
-          if (apiVersion === 1 && workspaceIds.length === 0) return { workspaces: options.workspace_registry.list().map((workspace) => ({ workspace_id: workspace.workspace_id, display_root: basename(workspace.display_root), workspace_status: workspace.status, freshness_status: workspaceFreshnessStatus(workspace), ...(workspace.last_scan_error === undefined ? {} : { last_scan_error_code: workspace.last_scan_error }), ...(workspace.last_scan_error_at === undefined ? {} : { last_scan_error_at: workspace.last_scan_error_at }), configuration_issues: [] })) };
+          if (apiVersion !== 3) throw new DaemonError("core:api_version_unsupported", "Only API version 3 is supported.", { requested_version: apiVersion, supported_versions: [3] });
           const buildStatusView = async (workspace: RegisteredWorkspace) => {
             const readiness = await workspaceReadiness(workspace, indexingStorage, semanticMaterializations, scanInFlight.has(workspace.workspace_id));
             const pluginStatus = pluginStatusForWorkspace(workspace, pluginCatalog, readiness);
@@ -1837,43 +1949,64 @@ export class DaemonRuntime {
           const cache = cursorCache;
           const workspaceId = singleWorkspaceScopeId(request.payload);
           if (workspaceId === undefined) throw new DaemonError("core:ipc_request_invalid", `${request.call} requires an explicit single_workspace scope.`);
+          // Admission is deliberately completed before scheduler submission,
+          // readiness waits, engine acquisition, or any query IPC fan-out.
+          // The normalized plan is then the only source of frontier/stage
+          // requirements below.
+          const admission: QueryAdmissionPlan | undefined = request.call === "core:query"
+            ? buildQueryAdmissionPlan(request.payload as QueryRequest)
+            : undefined;
+          const submittedAt = Date.now();
           const queryJob = scheduler.submit({
             job_id: `query:${workspaceId}:${randomUUID()}`,
             client_id: "core:query",
             workspace_id: workspaceId,
             pool: "query",
-            run: async () => {
-          const requiredStructuralStage = request.call === "core:query" ? operationRequiredStructuralStage(request.payload) : 0;
+          run: async (_jobSignal, reportProgress) => {
+          const executionStartedAt = Date.now();
+          const emitTiming = (phase: string, message: string): void => { const event = { phase, completed: 1, total: 1, message }; reportProgress(event); context.reportProgress(event); };
+          emitTiming("queue", `queue_ms=${Math.max(0, executionStartedAt - submittedAt)}`);
+          const requiredStructuralStage = admission?.required_structural_stage ?? 0;
+          if (request.call === "core:query") {
+            const freshness = queryFreshnessWait(request.payload);
+            if (freshness.requested) {
+              const freshnessStartedAt = Date.now();
+              const frontier = admission?.required_frontier ?? "source";
+              await waitForQueryFrontier(workspaceId, frontier, freshness.timeoutMs, registry, storage, semanticMaterializations, scanInFlight, context.signal, Date.parse(context.deadline_at));
+              emitTiming("freshness", `freshness_ms=${Math.max(0, Date.now() - freshnessStartedAt)}`);
+            }
+          }
           if (request.call === "core:query" && requiredStructuralStage > 0) {
             const registered = registry.get(workspaceId);
             if (registered !== undefined) {
               const readiness = await workspaceReadiness(registered, storage, semanticMaterializations, scanInFlight.has(workspaceId));
-              // Retained pre-source-first workspaces may have a valid
-              // structural snapshot but no durable source-index state yet.
-              // API v1/v2 must keep their historical structural-snapshot
-              // behavior; v3 readiness remains honest and reports that the
-              // source layer is unavailable until a source reconciliation
-              // publishes its catalog.
-              const legacyStructuralSnapshotAvailable = request.payload !== null
-                && typeof request.payload === "object"
-                && (request.payload as { readonly api_version?: unknown }).api_version !== 3
-                && registered.current_snapshot_id !== undefined
-                && (registered.status === "ready" || registered.status === "degraded")
-                && registered.last_scan_error === undefined;
               const completedStage = readiness.structural_ready ? 3 : readiness.structural_stage_ordinal ?? 0;
-              if (completedStage < requiredStructuralStage && !legacyStructuralSnapshotAvailable) {
+              if (completedStage < requiredStructuralStage) {
                 const unsupported = readiness.structural_completeness === "unsupported";
                 throw new DaemonError(unsupported ? "core:required_capability_unsupported" : "core:coverage_incomplete", unsupported
                   ? `Structural capabilities for workspace ${workspaceId} are unsupported.`
                   : `Structural stage ${requiredStructuralStage} for workspace ${workspaceId} is not ready.`, {
                   workspace_id: workspaceId,
-                  required_layer: "structural",
+                  required_frontier: admission?.required_frontier ?? "source",
+                  blocking_stage: admission?.blocking_stages.find((stage) => stage.required_structural_stage === requiredStructuralStage)?.stage_id ?? String(requiredStructuralStage),
+                  blocking_operation: admission?.blocking_stages.find((stage) => stage.required_structural_stage === requiredStructuralStage)?.operation ?? "unknown",
                   capabilities: Object.entries(CAPABILITY_STAGE).filter(([, stage]) => stage <= requiredStructuralStage).map(([capability]) => capability),
                   reason_codes: readiness.readiness_reason_codes,
                   retry_after_ms: readiness.retry_after_ms ?? 1000,
-                  retryable: !unsupported,
+                  retryable: !unsupported && readiness.structural_build_state === "building",
                   source_safe_fallback_operations: [...SOURCE_OPERATIONS],
                 });
+              }
+            }
+          }
+          if (request.call === "core:query") {
+            const registered = registry.get(workspaceId);
+            const requiredFrontier = admission?.required_frontier ?? "source";
+            if (registered !== undefined && requiredFrontier !== "structural") {
+              const readiness = await workspaceReadiness(registered, storage, semanticMaterializations, scanInFlight.has(workspaceId));
+              if (!frontierReady(readiness, requiredFrontier)) {
+                const blocking = admission?.blocking_stages[0];
+                throw new DaemonError("core:coverage_incomplete", `Required ${requiredFrontier} frontier for workspace ${workspaceId} is not ready.`, { required_frontier: requiredFrontier, blocking_stage: blocking?.stage_id ?? requiredFrontier, blocking_operation: blocking?.operation ?? "unknown", statuses: readiness.readiness_reason_codes, waited_ms: 0, retry_after_ms: readiness.retry_after_ms ?? 1000, retryable: readiness.source_build_state === "building" || readiness.structural_build_state === "building" });
               }
             }
           }
@@ -1887,32 +2020,13 @@ export class DaemonRuntime {
           // any load/warm completes" rule.
           if (request.call === "core:query") {
             const queryRequest = request.payload as QueryRequest;
-            // `freshness: "wait_for_current"` is validated and hashed into
-            // the plan (`query-plan.ts`) but nothing downstream actually
-            // waits for anything -- historically a silent no-op that served
-            // whatever generation happened to be current, even a generation
-            // frozen by a repeatedly-failing scan (the delete-then-restore
-            // `publication_conflict` wedge this fix targets). Full wiring to
-            // `FreshnessBarrier`/`ReconciliationCoordinator`
-            // (`reconciliation.ts`) needs a source-provider watermark port
-            // this query path does not have; the minimum acceptable fix --
-            // fail fast with the freshness subsystem's own timeout code
-            // instead of silently lying -- is what's implemented here: a
-            // workspace whose latest scan failed, or one with a scan
-            // currently in flight (so "current" is about to change under
-            // the caller anyway), cannot honor a current-or-fail request.
-            if (queryRequest.options?.freshness === "wait_for_current") {
-              const registered = registry.get(workspaceId);
-              const scanFailed = registered?.last_scan_error !== undefined;
-              const scanRunning = scanInFlight.has(workspaceId);
-              if (scanFailed || scanRunning) {
-                throw new DaemonError("core:freshness_wait_timeout", scanFailed
-                  ? `Workspace ${workspaceId}'s latest scan attempt failed (${registered?.last_scan_error}); there is no current generation to wait for until it is fixed.`
-                  : `Workspace ${workspaceId} has a scan in flight; freshness waiting is not wired to block on it, so the request fails fast instead of serving a stale generation.`,
-                  { workspace_id: workspaceId, ...(registered?.last_scan_error === undefined ? {} : { last_scan_error: registered.last_scan_error }) });
-              }
-            }
-            try { return attachIndexFreshness(await engine.execute(queryRequest), registry.get(workspaceId)); } finally { enforceWarmRecordsBudget(queryEngines, warmRecordsLru); }
+            const hydrationStartedAt = Date.now();
+            try {
+              const page = attachIndexFreshness(await engine.execute(queryRequest, context.signal), registry.get(workspaceId));
+              emitTiming("hydration", `hydration_ms=${Math.max(0, Date.now() - hydrationStartedAt)}`);
+              emitTiming("execution", `execution_ms=${Math.max(0, Date.now() - executionStartedAt)}`);
+              return page;
+            } finally { enforceWarmRecordsBudget(queryEngines, warmRecordsLru); }
           }
           const payload = requestRecord(request.payload);
           const cursor = payload["cursor"];
@@ -1927,7 +2041,11 @@ export class DaemonRuntime {
           }
             },
           });
-          return await queryJob.promise;
+          const cancelJob = (): void => queryJob.cancel();
+          if (context.signal.aborted) cancelJob();
+          else context.signal.addEventListener("abort", cancelJob, { once: true });
+          try { return await queryJob.promise; }
+          finally { context.signal.removeEventListener("abort", cancelJob); }
         }
         if (request.call === "core:workspace_preview") {
           const root = workspaceRootFromRequest(request.payload);
@@ -2207,6 +2325,7 @@ export class DaemonRuntime {
       await server.listen();
       if (process.platform !== "win32") await chmod(paths.endpoint, 0o600);
       await descriptor.write({ protocol_version: 1, endpoint: paths.endpoint, pid: process.pid, owner_uid: process.getuid?.() ?? 0, engine_build_id: options.engine_build_id, started_at: new Date().toISOString() });
+      options.on_startup_progress?.("provider_reconciliation");
       if (watcherManager && options.workspace_registry) {
         await Promise.all(options.workspace_registry.list().filter((workspace) => workspace.status !== "registering").map((workspace) => startWorkspaceWatcher(watcherManager, workspace)));
       }
@@ -2246,10 +2365,14 @@ export class DaemonRuntime {
       const runtime = new DaemonRuntime(options, paths, lock, descriptor, checkpoint, server!, scheduler, recoveredCheckpoint, recovery, recoveredCursorIds, pendingWarms, watcherManager, indexingStorage, queryEngines, reconciliationSweepTimer, semanticHost);
       runtime.state = "ready";
       runtimeHandle = runtime;
+      options.on_startup_progress?.("ready");
       return runtime;
     } catch (error) { await server?.close().catch(() => undefined); await indexingStorage?.close().catch(() => undefined); if (process.platform !== "win32") await unlink(paths.endpoint).catch(() => undefined); await lock.release(); throw error; }
   }
   status(): DaemonStatus { return { state: this.state, pid: process.pid, engine_build_id: this.options.engine_build_id, endpoint: this.endpoint, active_jobs: this.scheduler.activeCount, restart_leases: this.scheduler.restartLeaseCount }; }
+  byteTelemetrySnapshot(): Readonly<Record<string, unknown>> {
+    return this.indexingStorage?.byteTelemetry.snapshot() ?? {};
+  }
   async stop(options: { readonly force?: boolean } = {}): Promise<void> {
     if (this.state === "stopping") return;
     this.state = "stopping";
@@ -2315,5 +2438,5 @@ export class DaemonRuntime {
 export class DaemonClient {
   private readonly client: LocalIpcClient;
   constructor(endpoint: string, options: Omit<LocalIpcClientOptions, "endpoint"> = {}) { this.client = new LocalIpcClient({ ...options, endpoint }); }
-  async call(call: string, payload: unknown, options: LocalIpcRequestOptions = {}): Promise<UceResponse> { return this.client.request(call, payload, options); }
+  async call(call: string, payload: unknown, options: LocalIpcRequestOptions = {}): Promise<IpcResponse> { return this.client.request(call, payload, options); }
 }

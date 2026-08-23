@@ -93,6 +93,73 @@ export interface AcceptedFactDelta extends ValidatedFactDelta {
   readonly acceptance: "inserted" | "already_present";
 }
 
+/**
+ * The compact form retained after acceptance and before candidate sealing.
+ * Validation needs the complete provider delta, but materialization only
+ * needs its identity, dependencies, plugin provenance, and completeness
+ * claims; replacement records and staged bindings live in the validated
+ * sibling fields. Dropping the duplicated raw proposal arrays here is safe
+ * because the acceptance store already persisted the immutable digest.
+ */
+export type MaterializationFactDelta = Pick<FactDelta, "fact_delta_id" | "delta_digest" | "plugin_id" | "plugin_version" | "proposed_dependencies" | "completeness_claims">;
+/**
+ * Heap-bounded representation of a validated proposed record. The canonical
+ * JSON is lossless; the promoted fields are the only ones materialization
+ * needs without decoding the record body. Keeping one compact string instead
+ * of a nested object/array graph is material on repository-sized first scans,
+ * where hundreds of thousands of records remain live until candidate seal.
+ */
+export interface MaterializationProposedRecord {
+  readonly proposal_record_key: string;
+  readonly category: string;
+  readonly kind: string;
+  readonly universal_kind: string;
+  readonly identity_key: string;
+  readonly owner_artifact_id: string;
+  readonly owner_artifact_version_id: string;
+  readonly canonical_record: string;
+}
+
+export interface MaterializationReplacementSet extends Omit<ValidatedReplacementSet, "records"> {
+  /** Full records remain accepted for generic/test providers; production
+   * providers compact them immediately after authoritative validation. */
+  readonly records: readonly (ProposedRecord | MaterializationProposedRecord)[];
+}
+
+export interface MaterializationAcceptedFactDelta extends Omit<AcceptedFactDelta, "delta" | "replacement_sets"> {
+  readonly delta: MaterializationFactDelta;
+  readonly replacement_sets: readonly MaterializationReplacementSet[];
+}
+
+export function compactAcceptedFactDelta(value: AcceptedFactDelta): MaterializationAcceptedFactDelta {
+  const { fact_delta_id, delta_digest, plugin_id, plugin_version, proposed_dependencies, completeness_claims } = value.delta;
+  const replacement_sets = value.replacement_sets.map((set) => Object.freeze({
+    ...set,
+    records: Object.freeze(set.records.map((record) => Object.freeze({
+      proposal_record_key: record.proposal_record_key,
+      category: record.category,
+      kind: record.kind,
+      universal_kind: record.universal_kind,
+      identity_key: record.identity_key,
+      owner_artifact_id: set.scope.owner_artifact_id,
+      owner_artifact_version_id: set.scope.owner_artifact_version_id,
+      canonical_record: canonicalJson(record),
+    }))),
+  }));
+  return Object.freeze({
+    ...value,
+    replacement_sets: Object.freeze(replacement_sets),
+    delta: Object.freeze({
+      fact_delta_id,
+      delta_digest,
+      plugin_id,
+      plugin_version,
+      proposed_dependencies: Object.freeze([...proposed_dependencies]),
+      completeness_claims: Object.freeze([...completeness_claims]),
+    }),
+  });
+}
+
 export interface AcceptedDeltaStore {
   get(factDeltaId: string): Promise<{ readonly delta_digest: string } | undefined>;
   insert(delta: ValidatedFactDelta): Promise<"inserted" | "already_present">;
@@ -157,7 +224,7 @@ function hasString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function parseUce(value: unknown): unknown {
+function parseLogicalJson(value: unknown): unknown {
   if (typeof value !== "string" || value.length === 0) throw new TypeError("UCE must be a non-empty canonical JSON string.");
   const parsed = JSON.parse(value) as unknown;
   if (canonicalJson(parsed) !== value) throw new TypeError("UCE JSON is not canonical.");
@@ -336,12 +403,12 @@ function validateRecords(input: FactDeltaValidationInput, delta: FactDelta): voi
       fail(input, "core:record_schema_invalid", "A proposed record is not valid for its registered target schema.", { proposal_record_key: record.proposal_record_key });
     }
     try {
-      const facets = parseUce(record.facets);
+      const facets = parseLogicalJson(record.facets);
       if (!Array.isArray(facets) || facets.some((facet) => typeof facet !== "string") || new Set(facets).size !== facets.length || facets.some((facet) => !definition.allowed_facets.includes(facet)) || (definition.required_facets ?? []).some((facet) => !facets.includes(facet))) throw new TypeError("facet set is not registered");
       if (definition.body_schema !== undefined && !matchesPayloadSchema(record.body, definition.body_schema)) throw new TypeError("body does not match registered schema");
       canonicalJson(record.body);
-      if (record.source_span.length > 0) parseUce(record.source_span);
-      parseUce(record.evidence_references);
+      if (record.source_span.length > 0) parseLogicalJson(record.source_span);
+      parseLogicalJson(record.evidence_references);
     } catch {
       fail(input, "core:record_schema_invalid", "A proposed record contains invalid registered facets, body schema, or UCE fields.", { proposal_record_key: record.proposal_record_key });
     }

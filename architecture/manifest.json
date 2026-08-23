@@ -68,7 +68,7 @@
       "name": "@urdira/plugin-javascript-typescript",
       "path": "packages/plugin-javascript-typescript",
       "layer": 2,
-      "dependencies": ["@urdira/contracts", "@urdira/plugin-sdk"],
+      "dependencies": ["@urdira/canonical", "@urdira/contracts", "@urdira/plugin-sdk"],
       "responsibilities": ["javascript-typescript-analysis", "typescript-project-discovery", "language-plugin-runtime"]
     },
     {
@@ -125,7 +125,7 @@
       "name": "@urdira/runtime",
       "path": "apps/urdira",
       "layer": 7,
-      "dependencies": ["@urdira/cli", "@urdira/contracts", "@urdira/daemon", "@urdira/embedding-local", "@urdira/engine", "@urdira/mcp", "@urdira/plugin-javascript-typescript", "@urdira/plugin-sdk"],
+      "dependencies": ["@urdira/cli", "@urdira/contracts", "@urdira/daemon", "@urdira/embedding-local", "@urdira/engine", "@urdira/mcp", "@urdira/plugin-javascript-typescript", "@urdira/plugin-sdk", "@urdira/storage"],
       "responsibilities": ["composed-production-entry-point"]
     },
     {

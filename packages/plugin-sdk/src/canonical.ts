@@ -65,7 +65,7 @@ function encode(value: unknown, ancestors: Set<object>): string {
     if (!Number.isFinite(value) || !Number.isSafeInteger(value)) throw sdkError("plugin-sdk:canonical_value_invalid", "Canonical JSON numbers must be finite safe integers.");
     return Object.is(value, -0) ? "0" : String(value);
   }
-  if (value instanceof Uint8Array) return JSON.stringify({ $bytes: Buffer.from(value).toString("base64") });
+  if (value instanceof Uint8Array) return JSON.stringify({ $bytes: { digest: sha256Bytes(value), byte_length: value.byteLength, media_type: "application/octet-stream" } });
   if (typeof value !== "object") throw sdkError("plugin-sdk:canonical_value_invalid", "Canonical JSON contains an unsupported value.");
   if (ancestors.has(value)) throw sdkError("plugin-sdk:canonical_value_invalid", "Canonical JSON contains a cycle.");
   ancestors.add(value);

@@ -1,14 +1,18 @@
 import { copyFile, mkdir, open as openFile, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join, relative, resolve } from "node:path";
-import { computeDigest, computeDigestOverArrayPayload, computeDigestOverMapPayloadWithArrayField, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
+import { computeDigest, computeDigestOverArrayPayload, computeDigestOverMapPayloadWithArrayField, decodeCanonical, digestBytes, digestLogicalValue, encodeCanonical } from "@urdira/canonical";
 import type { ProjectionSetDigestEntry, RetentionLease, SnapshotExpirationMarker, SnapshotRetentionPin, SourceReference } from "@urdira/contracts";
 import type { ContentAddressedStore, BlobStore } from "./cas.js";
 import { StorageError } from "./errors.js";
 import { noFaults, type FaultInjector } from "./faults.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteValue } from "./sqlite.js";
+import { digestRelationalValue, hydrateRelationalValue, type RelationalValueRow } from "./relational-values.js";
 import { WORKSPACE_SCHEMA } from "./schema.js";
-import { WorkspaceProjectionRepository, lexicalTrigrams } from "./projections.js";
+import { WorkspaceProjectionRepository } from "./projections.js";
+import { logicalRecordSetDigest } from "./publication-authority.js";
+
+function canonicalSha256(value: unknown): string { return digestBytes(encodeCanonical(value)); }
 
 export interface RetentionLeaseInput {
   readonly retention_lease_id: string;
@@ -56,7 +60,6 @@ export interface QueryExecutionRecord {
   readonly created_at: string;
   readonly expires_at: string;
   readonly execution_status: string;
-  readonly execution_payload: unknown;
 }
 
 export interface CollectionOptions {
@@ -122,13 +125,13 @@ export const REPAIR_ORDER = ["restore_exact_object", "rebuild_derived_projection
 
 const MIGRATION_TABLE_NAMES = [
   "workspace_meta", "source_artifacts", "content_blobs", "source_observation_batches", "artifact_versions", "artifact_tombstones", "source_observations", "source_index_state",
-  "record_occurrences", "registry_snapshots", "registry_namespace_bindings", "snapshots", "workspace_current_state", "control_plane_state", "graph_edges",
-  "lexical_documents", "lexical_trigrams", "lexical_index_state", "semantic_index_state", "artifact_dependencies", "metric_projections", "vector_shards", "vector_projection_rows",
+  "record_occurrences", "record_facets", "record_value_nodes", "set_merkle_nodes", "registry_snapshots", "registry_namespace_bindings", "snapshots", "workspace_current_state", "control_plane_state", "graph_edges",
+  "lexical_documents", "lexical_index_state", "semantic_index_state", "artifact_dependencies", "metric_projections", "vector_shards", "vector_projection_rows",
   "retention_leases", "retention_pins", "snapshot_expiration_markers", "query_executions", "query_manifest_segments", "backup_barriers", "lifecycle_cas_pins",
   "lifecycle_roots", "storage_migrations", "garbage_collection_epochs", "garbage_collection_candidates",
-  "candidate_state", "candidate_work_manifests", "candidate_fact_deltas", "candidate_materializations", "candidate_template_segments", "candidate_issues", "candidate_lookup_dependencies",
+  "candidate_state", "candidate_work_manifests", "candidate_fact_deltas", "candidate_fact_delta_namespaces", "candidate_fact_delta_batches", "candidate_staged_records", "candidate_staged_graph_edges", "candidate_staged_identities", "candidate_staged_dependencies", "candidate_materializations", "candidate_issues", "candidate_lookup_dependencies",
   "candidate_retention_leases", "candidate_roots", "candidate_cleanup_markers", "candidate_publication_journal", "generation_manifests",
-  "projection_occurrences", "projection_occurrence_dependencies", "identity_assignments",
+  "projection_occurrences", "projection_occurrence_dependencies", "projection_value_nodes", "candidate_value_nodes", "identity_assignments",
 ] as const;
 
 export interface MigrationTableAdapter {
@@ -167,7 +170,7 @@ function typedMigrationAdapter(table: string, payloadColumns: readonly string[] 
   };
   const validate = (name: string, row: MigrationLogicalRow): void => {
     if (name !== table || row.table !== table) throw new StorageError("storage:migration_table_mismatch", `The ${table} adapter received a different logical table.`);
-    if (table === "workspace_meta" && (typeof row.columns["key"] !== "string" || !("value" in row.payloads))) throw new StorageError("storage:migration_row_invalid", "Workspace metadata requires a typed key and value.");
+    if (table === "workspace_meta" && (typeof row.columns["key"] !== "string" || !(row.columns["value"] instanceof Uint8Array) && !(row.columns["value"] instanceof ArrayBuffer))) throw new StorageError("storage:migration_row_invalid", "Workspace metadata requires a typed key and value.");
     if (table === "vector_projection_rows" || table === "vector_shards") {
       const elementType = row.columns["element_type"];
       if (elementType !== "float32" && elementType !== "float64") throw new StorageError("storage:migration_row_invalid", `Unsupported persisted vector element type ${String(elementType)}.`);
@@ -184,7 +187,10 @@ function typedMigrationAdapter(table: string, payloadColumns: readonly string[] 
 }
 
 const MIGRATION_PAYLOAD_COLUMNS: Readonly<Record<string, readonly string[]>> = {
-  workspace_meta: ["value"], source_artifacts: ["artifact_payload"], source_observation_batches: ["observation_batch_payload"], artifact_versions: ["artifact_version_payload"], artifact_tombstones: ["artifact_tombstone_payload"], source_observations: ["observation_payload"], record_occurrences: ["record_payload"], registry_snapshots: ["registry_payload"], snapshots: ["snapshot_payload"], workspace_current_state: ["current_payload"], control_plane_state: ["payload"], graph_edges: ["edge_payload"], lexical_documents: ["document_payload"], lexical_trigrams: ["trigram_payload"], lexical_index_state: [], semantic_index_state: [], artifact_dependencies: ["dependency_payload"], metric_projections: ["metric_payload"], vector_shards: ["shard_payload"], vector_projection_rows: ["vector_payload"], retention_leases: ["lease_payload"], retention_pins: ["pin_payload"], snapshot_expiration_markers: ["marker_payload"], query_executions: ["execution_payload"], query_manifest_segments: [], backup_barriers: ["backup_payload"], lifecycle_roots: ["root_payload"], storage_migrations: ["migration_payload"], garbage_collection_epochs: ["epoch_payload"], candidate_state: ["candidate_payload"], candidate_work_manifests: ["work_manifest_payload"], candidate_fact_deltas: ["delta_payload"], candidate_materializations: ["materialization_payload"], candidate_template_segments: [], candidate_issues: ["scope_payload", "payload"], candidate_lookup_dependencies: ["dependency_payload"], candidate_retention_leases: ["lease_payload"], candidate_roots: ["root_payload"], candidate_cleanup_markers: ["marker_payload"], candidate_publication_journal: ["journal_payload"], generation_manifests: ["manifest_payload"], projection_occurrences: ["projection_payload"], projection_occurrence_dependencies: ["dependency_payload"], identity_assignments: ["assignment_payload"]
+  // `index_contract` is a one-byte marker rather than a canonical value. Keep
+  // workspace metadata as typed SQLite BLOBs so the v2 shadow copy can move
+  // both marker bytes and version values without invoking a legacy decoder.
+  workspace_meta: [], source_artifacts: [], source_observation_batches: [], artifact_versions: [], artifact_tombstones: [], source_observations: [], record_occurrences: [], registry_snapshots: [], snapshots: [], workspace_current_state: [], control_plane_state: [], graph_edges: [], lexical_documents: [], lexical_index_state: [], semantic_index_state: [], artifact_dependencies: [], metric_projections: [], vector_shards: [], vector_projection_rows: [], retention_leases: [], retention_pins: [], snapshot_expiration_markers: [], query_executions: [], query_manifest_segments: [], backup_barriers: [], lifecycle_roots: [], storage_migrations: [], garbage_collection_epochs: [], candidate_state: [], candidate_work_manifests: [], candidate_fact_deltas: [], candidate_fact_delta_namespaces: [], candidate_staged_records: [], candidate_staged_graph_edges: [], candidate_staged_identities: [], candidate_staged_dependencies: [], candidate_materializations: [], candidate_issues: [], candidate_lookup_dependencies: [], candidate_retention_leases: [], candidate_roots: [], candidate_cleanup_markers: [], candidate_publication_journal: [], generation_manifests: [], projection_occurrences: [], projection_occurrence_dependencies: [], identity_assignments: []
 };
 
 /** Every persisted table has a table-specific, versioned decoder and lossless row adapter. */
@@ -225,37 +231,10 @@ export interface ProjectionKindDigestRow {
  * table/column identifiers, never user input -- always one of the three
  * fixed literal table configs `projectionSetDigestEntries` passes.
  */
-async function projectionDigestRows(database: SqliteDatabase, workspaceId: string, generation: number, table: string, idColumn: string, payloadColumn: string, digestSource: "stored" | "recompute"): Promise<Array<{ projection_record_id: string; content_digest: string }>> {
+async function projectionDigestRows(database: SqliteDatabase, workspaceId: string, generation: number, table: string, idColumn: string, _digestSource: "stored" | "recompute"): Promise<Array<{ projection_record_id: string; content_digest: string }>> {
   const visible = "workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)";
-  if (digestSource === "recompute") {
-    const rows = await database.all<{ row_id: string; valid_from_generation: number; payload: unknown; content_digest: string | null }>(`SELECT ${idColumn} AS row_id, valid_from_generation, ${payloadColumn} AS payload, content_digest FROM ${table} WHERE ${visible}`, [workspaceId, generation, generation]);
-    return rows.map((row) => {
-      const recomputed = digestBytes(bytes(row.payload));
-      // Free corruption check: the stored column and this recomputation
-      // share one leaf recipe over one set of bytes, so they can only
-      // disagree if the stored column itself was corrupted after being
-      // written -- exactly the class of corruption "recompute" mode exists
-      // to surface.
-      if (row.content_digest !== null && row.content_digest !== recomputed) throw new StorageError("storage:projection_content_digest_corrupt", `${table} row ${row.row_id}@${row.valid_from_generation} has a stored content_digest that disagrees with its payload.`);
-      return { projection_record_id: `${row.row_id}@${row.valid_from_generation}`, content_digest: recomputed };
-    });
-  }
-  // "stored": answered by `<table>_digest_scan_idx` (`./schema.js`) alone --
-  // id, generation validity, and the digest itself are all it selects, so no
-  // payload BLOB page is ever touched, unless a row's content_digest is
-  // still NULL (pre-backfill), in which case that one row falls back to a
-  // direct payload read exactly like "recompute" would.
-  const rows = await database.all<{ row_id: string; valid_from_generation: number; content_digest: string | null }>(`SELECT ${idColumn} AS row_id, valid_from_generation, content_digest FROM ${table} WHERE ${visible}`, [workspaceId, generation, generation]);
-  const entries: Array<{ projection_record_id: string; content_digest: string }> = [];
-  for (const row of rows) {
-    let contentDigest = row.content_digest;
-    if (contentDigest === null) {
-      const payloadRow = await database.get<{ payload: unknown }>(`SELECT ${payloadColumn} AS payload FROM ${table} WHERE workspace_id = ? AND ${idColumn} = ? AND valid_from_generation = ?`, [workspaceId, row.row_id, row.valid_from_generation]);
-      contentDigest = digestBytes(bytes(payloadRow?.payload));
-    }
-    entries.push({ projection_record_id: `${row.row_id}@${row.valid_from_generation}`, content_digest: contentDigest });
-  }
-  return entries;
+  const rows = await database.all<{ row_id: string; valid_from_generation: number; content_digest: string }>(`SELECT ${idColumn} AS row_id, valid_from_generation, content_digest FROM ${table} WHERE ${visible}`, [workspaceId, generation, generation]);
+  return rows.map((row) => ({ projection_record_id: `${row.row_id}@${row.valid_from_generation}`, content_digest: row.content_digest }));
 }
 
 /**
@@ -273,7 +252,7 @@ async function projectionDigestRows(database: SqliteDatabase, workspaceId: strin
  * description of what that transaction actually wrote. Two
  * **asynchronously-maintained** kinds are deliberately excluded:
  *
- * - "lexical": `lexical_documents`/`lexical_trigrams` are rebuilt
+ * - "lexical": `lexical_documents`/`lexical_fts` are rebuilt
  *   post-`ready` by the lexical reconciler
  *   (`packages/engine/src/lexical-reconciler.ts`, off-main-thread).
  * - "vector": `vector_shards`/`vector_projection_rows` are rebuilt
@@ -319,9 +298,9 @@ async function projectionDigestRows(database: SqliteDatabase, workspaceId: strin
  * earlier one) already hashed once at write time:
  *
  * - `"recompute"` (the default; what `verify()` and fork `verify_mode:
- *   "full"` always ask for): hashes `edge_payload`/`dependency_payload`/
- *   `metric_payload` fresh, exactly as this function always has, so it still
- *   catches real payload corruption. When a row's persisted `content_digest`
+ *   "full"` always ask for): hashes each typed row fresh, exactly as this
+ *   function always has, so it still catches real value corruption. When a
+ *   row's persisted `content_digest`
  *   column is also populated, this mode additionally compares it against the
  *   freshly recomputed hash and throws `storage:projection_content_digest_corrupt`
  *   on disagreement -- a corrupted digest column is exactly the kind of
@@ -353,27 +332,27 @@ export async function projectionSetDigestEntries(database: SqliteDatabase, works
   // Only supplied kinds are overridden; an absent kind still reads live.
   const overrides = options?.row_overrides;
   const byKind = new Map<string, { readonly generator: string; readonly rows: readonly ProjectionKindDigestRow[] }>([
-    ["graph", { generator: "urdira.storage.graph-adjacency", rows: overrides?.graph ?? await projectionDigestRows(database, workspaceId, generation, "graph_edges", "edge_id", "edge_payload", digestSource) }],
-    ["dependency", { generator: "urdira.storage.reverse-dependency", rows: overrides?.dependency ?? await projectionDigestRows(database, workspaceId, generation, "artifact_dependencies", "dependency_entry_id", "dependency_payload", digestSource) }],
-    ["metric", { generator: "urdira.storage.metric", rows: overrides?.metric ?? await projectionDigestRows(database, workspaceId, generation, "metric_projections", "metric_id", "metric_payload", digestSource) }],
+    ["graph", { generator: "urdira.storage.graph-adjacency", rows: overrides?.graph ?? await projectionDigestRows(database, workspaceId, generation, "graph_edges", "edge_id", digestSource) }],
+    ["dependency", { generator: "urdira.storage.reverse-dependency", rows: overrides?.dependency ?? await projectionDigestRows(database, workspaceId, generation, "artifact_dependencies", "dependency_entry_id", digestSource) }],
+    ["metric", { generator: "urdira.storage.metric", rows: overrides?.metric ?? await projectionDigestRows(database, workspaceId, generation, "metric_projections", "metric_id", digestSource) }],
   ]);
   const entries: Array<ProjectionSetDigestEntry> = [];
   for (const [projection_kind, value] of byKind) {
     const rows = [...value.rows].sort((left, right) => (left.projection_record_id < right.projection_record_id ? -1 : left.projection_record_id > right.projection_record_id ? 1 : 0));
     const generator_version = "1";
-    const generator_configuration_digest = digestBytes(encodeCanonical({ workspace_id: workspaceId, projection_kind, generator: value.generator, generator_version }));
-    // Streamed per element: the visible set scales with workspace size and a
-    // single-call encode would trip the default aggregate canonical limits.
-    const projection_set_digest = computeDigestOverMapPayloadWithArrayField("core:projection_set", "core:projection_set_digest", 1, "core:ProjectionSetDigestPayload", 1, { projection_kind, generator: value.generator, generator_version, generator_configuration_digest }, "entries", rows);
+    const generator_configuration_digest = digestLogicalValue({ workspace_id: workspaceId, projection_kind, generator: value.generator, generator_version }, "urdira:projection-generator:v2");
+    // Hash the logical rows directly. No aggregate transport or persistence
+    // payload is created on the query/publication hot path.
+    const projection_set_digest = digestLogicalValue({ projection_kind, generator: value.generator, generator_version, generator_configuration_digest, entries: rows }, "urdira:projection-set:v2");
     entries.push({ projection_kind, generator: value.generator, generator_version, generator_configuration_digest, projection_set_digest });
   }
   return entries;
 }
 
-const PROJECTION_DIGEST_TABLE_CONFIG: Readonly<Record<ProjectionDigestKind, { readonly table: string; readonly idColumn: string; readonly payloadColumn: string }>> = {
-  graph: { table: "graph_edges", idColumn: "edge_id", payloadColumn: "edge_payload" },
-  dependency: { table: "artifact_dependencies", idColumn: "dependency_entry_id", payloadColumn: "dependency_payload" },
-  metric: { table: "metric_projections", idColumn: "metric_id", payloadColumn: "metric_payload" },
+const PROJECTION_DIGEST_TABLE_CONFIG: Readonly<Record<ProjectionDigestKind, { readonly table: string; readonly idColumn: string }>> = {
+  graph: { table: "graph_edges", idColumn: "edge_id" },
+  dependency: { table: "artifact_dependencies", idColumn: "dependency_entry_id" },
+  metric: { table: "metric_projections", idColumn: "metric_id" },
 };
 
 /**
@@ -389,9 +368,9 @@ const PROJECTION_DIGEST_TABLE_CONFIG: Readonly<Record<ProjectionDigestKind, { re
  * read).
  */
 export async function projectionSetDigestRowsByKind(database: SqliteDatabase, workspaceId: string, generation: number, digestSource: "stored" | "recompute" = "stored"): Promise<Readonly<Record<ProjectionDigestKind, readonly ProjectionKindDigestRow[]>>> {
-  const graph = await projectionDigestRows(database, workspaceId, generation, PROJECTION_DIGEST_TABLE_CONFIG.graph.table, PROJECTION_DIGEST_TABLE_CONFIG.graph.idColumn, PROJECTION_DIGEST_TABLE_CONFIG.graph.payloadColumn, digestSource);
-  const dependency = await projectionDigestRows(database, workspaceId, generation, PROJECTION_DIGEST_TABLE_CONFIG.dependency.table, PROJECTION_DIGEST_TABLE_CONFIG.dependency.idColumn, PROJECTION_DIGEST_TABLE_CONFIG.dependency.payloadColumn, digestSource);
-  const metric = await projectionDigestRows(database, workspaceId, generation, PROJECTION_DIGEST_TABLE_CONFIG.metric.table, PROJECTION_DIGEST_TABLE_CONFIG.metric.idColumn, PROJECTION_DIGEST_TABLE_CONFIG.metric.payloadColumn, digestSource);
+  const graph = await projectionDigestRows(database, workspaceId, generation, PROJECTION_DIGEST_TABLE_CONFIG.graph.table, PROJECTION_DIGEST_TABLE_CONFIG.graph.idColumn, digestSource);
+  const dependency = await projectionDigestRows(database, workspaceId, generation, PROJECTION_DIGEST_TABLE_CONFIG.dependency.table, PROJECTION_DIGEST_TABLE_CONFIG.dependency.idColumn, digestSource);
+  const metric = await projectionDigestRows(database, workspaceId, generation, PROJECTION_DIGEST_TABLE_CONFIG.metric.table, PROJECTION_DIGEST_TABLE_CONFIG.metric.idColumn, digestSource);
   return { graph, dependency, metric };
 }
 
@@ -445,27 +424,34 @@ export class WorkspaceLifecycleRepository {
 
   private async requireSnapshots(snapshotIds: ReadonlyArray<string>): Promise<void> {
     if (snapshotIds.length === 0 || new Set(snapshotIds).size !== snapshotIds.length) throw new StorageError("storage:snapshot_binding_invalid", "An execution must bind a non-empty set of distinct snapshots.");
-    const rows = await this.database.all<{ snapshot_id: string }>(`SELECT snapshot_id FROM snapshots WHERE workspace_id = ? AND snapshot_id IN (${snapshotIds.map(() => "?").join(",")})`, [this.workspaceId, ...snapshotIds]);
+    const rows: Array<{ snapshot_id: string }> = [];
+    for (let offset = 0; offset < snapshotIds.length; offset += 400) {
+      const ids = snapshotIds.slice(offset, offset + 400);
+      rows.push(...await this.database.all<{ snapshot_id: string }>(`SELECT snapshot_id FROM snapshots WHERE workspace_id = ? AND snapshot_id IN (${ids.map(() => "?").join(",")})`, [this.workspaceId, ...ids]));
+    }
     if (rows.length !== snapshotIds.length) throw new StorageError("storage:snapshot_not_found", "Retention may only reference snapshots retained in this workspace.");
   }
 
   private async validateExecutionBindings(snapshotIds: ReadonlyArray<string>, leaseIds: ReadonlyArray<string>, createdAt: string): Promise<void> {
     await this.requireSnapshots(snapshotIds);
     if (leaseIds.length !== snapshotIds.length || new Set(leaseIds).size !== leaseIds.length) throw new StorageError("storage:execution_lease_mismatch", "Each bound snapshot must have exactly one distinct retention lease.");
-    const leases = await this.database.all<{ retention_lease_id: string; snapshot_id: string; released_at: string | null; idle_expires_at: string; absolute_expires_at: string }>(`SELECT retention_lease_id, snapshot_id, released_at, idle_expires_at, absolute_expires_at FROM retention_leases WHERE workspace_id = ? AND retention_lease_id IN (${leaseIds.map(() => "?").join(",")})`, [this.workspaceId, ...leaseIds]);
+    const leases: Array<{ retention_lease_id: string; snapshot_id: string; released_at: string | null; idle_expires_at: string; absolute_expires_at: string }> = [];
+    for (let offset = 0; offset < leaseIds.length; offset += 400) {
+      const ids = leaseIds.slice(offset, offset + 400);
+      leases.push(...await this.database.all<{ retention_lease_id: string; snapshot_id: string; released_at: string | null; idle_expires_at: string; absolute_expires_at: string }>(`SELECT retention_lease_id, snapshot_id, released_at, idle_expires_at, absolute_expires_at FROM retention_leases WHERE workspace_id = ? AND retention_lease_id IN (${ids.map(() => "?").join(",")})`, [this.workspaceId, ...ids]));
+    }
     if (leases.length !== leaseIds.length || leases.some((lease) => lease.released_at !== null || lease.idle_expires_at <= createdAt || lease.absolute_expires_at <= createdAt || !snapshotIds.includes(lease.snapshot_id)) || new Set(leases.map((lease) => lease.snapshot_id)).size !== snapshotIds.length) throw new StorageError("storage:execution_lease_mismatch", "Execution bindings require one valid, unexpired lease for every bound snapshot.");
   }
 
   async acquireLease(input: RetentionLeaseInput): Promise<RetentionLease> {
     await this.assertReaderBarrierClear();
     await this.requireSnapshots([input.snapshot_id]);
-    const payload = encodeCanonical(input);
-    const existing = await this.database.get<{ lease_payload: unknown; released_at: string | null }>("SELECT lease_payload, released_at FROM retention_leases WHERE workspace_id = ? AND retention_lease_id = ?", [this.workspaceId, input.retention_lease_id]);
+    const existing = await this.database.get<{ snapshot_id: string; holder_type: string; holder_id: string; acquired_at: string; idle_expires_at: string; absolute_expires_at: string; released_at: string | null }>("SELECT snapshot_id, holder_type, holder_id, acquired_at, idle_expires_at, absolute_expires_at, released_at FROM retention_leases WHERE workspace_id = ? AND retention_lease_id = ?", [this.workspaceId, input.retention_lease_id]);
     if (existing) {
-      if (existing.released_at !== null || !sameBytes(bytes(existing.lease_payload), payload)) throw new StorageError("storage:lease_conflict", `Retention lease ${input.retention_lease_id} is immutable.`);
+      if (existing.released_at !== null || existing.snapshot_id !== input.snapshot_id || existing.holder_type !== input.holder_type || existing.holder_id !== input.holder_id || existing.acquired_at !== input.now || existing.idle_expires_at !== input.idle_expires_at || existing.absolute_expires_at !== input.absolute_expires_at) throw new StorageError("storage:lease_conflict", `Retention lease ${input.retention_lease_id} is immutable.`);
       return this.toLease(input);
     }
-    await this.database.run("INSERT INTO retention_leases (retention_lease_id, workspace_id, snapshot_id, holder_type, holder_id, acquired_at, last_renewed_at, idle_expires_at, absolute_expires_at, released_at, release_reason, lease_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)", [input.retention_lease_id, this.workspaceId, input.snapshot_id, input.holder_type, input.holder_id, input.now, input.now, input.idle_expires_at, input.absolute_expires_at, payload]);
+    await this.database.run("INSERT INTO retention_leases (retention_lease_id, workspace_id, snapshot_id, holder_type, holder_id, acquired_at, last_renewed_at, idle_expires_at, absolute_expires_at, released_at, release_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)", [input.retention_lease_id, this.workspaceId, input.snapshot_id, input.holder_type, input.holder_id, input.now, input.now, input.idle_expires_at, input.absolute_expires_at]);
     return this.toLease(input);
   }
 
@@ -476,10 +462,9 @@ export class WorkspaceLifecycleRepository {
 
   async releaseLease(retentionLeaseId: string, releasedAt: string, reason: string): Promise<void> {
     await this.faults.hit("retention.before_release");
-    const row = await this.database.get<{ lease_payload: unknown }>("SELECT lease_payload FROM retention_leases WHERE workspace_id = ? AND retention_lease_id = ? AND released_at IS NULL", [this.workspaceId, retentionLeaseId]);
+    const row = await this.database.get<{ retention_lease_id: string }>("SELECT retention_lease_id FROM retention_leases WHERE workspace_id = ? AND retention_lease_id = ? AND released_at IS NULL", [this.workspaceId, retentionLeaseId]);
     if (!row) return;
-    const payload = decodeCanonical(bytes(row.lease_payload)) as RetentionLeaseInput;
-    await this.database.transaction([{ kind: "run", sql: "UPDATE retention_leases SET released_at = ?, release_reason = ?, lease_payload = ? WHERE workspace_id = ? AND retention_lease_id = ? AND released_at IS NULL", params: [releasedAt, reason, encodeCanonical({ ...payload, released_at: releasedAt, release_reason: reason }), this.workspaceId, retentionLeaseId] }]);
+    await this.database.transaction([{ kind: "run", sql: "UPDATE retention_leases SET released_at = ?, release_reason = ? WHERE workspace_id = ? AND retention_lease_id = ? AND released_at IS NULL", params: [releasedAt, reason, this.workspaceId, retentionLeaseId] }]);
   }
 
   async getLease(retentionLeaseId: string): Promise<RetentionLease | undefined> {
@@ -491,71 +476,67 @@ export class WorkspaceLifecycleRepository {
   async pinSnapshot(input: SnapshotPinInput): Promise<SnapshotRetentionPin> {
     await this.assertReaderBarrierClear();
     await this.requireSnapshots([input.snapshot_id]);
-    const payload = encodeCanonical(input);
-    const existing = await this.database.get<{ pin_payload: unknown }>("SELECT pin_payload FROM retention_pins WHERE workspace_id = ? AND retention_pin_id = ?", [this.workspaceId, input.retention_pin_id]);
+    const sourceReferenceJson = JSON.stringify(input.source_reference);
+    const existing = await this.database.get<{ source_reference_json: string; snapshot_id: string; pin_kind: string; reason_code: string; created_at: string; expires_at: string }>("SELECT source_reference_json, snapshot_id, pin_kind, reason_code, created_at, expires_at FROM retention_pins WHERE workspace_id = ? AND retention_pin_id = ?", [this.workspaceId, input.retention_pin_id]);
     if (existing) {
-      if (!sameBytes(bytes(existing.pin_payload), payload)) throw new StorageError("storage:pin_conflict", `Retention pin ${input.retention_pin_id} is immutable.`);
+      if (existing.source_reference_json !== sourceReferenceJson || existing.snapshot_id !== input.snapshot_id || existing.pin_kind !== input.pin_kind || existing.reason_code !== input.reason_code || existing.created_at !== input.created_at || existing.expires_at !== input.expires_at) throw new StorageError("storage:pin_conflict", `Retention pin ${input.retention_pin_id} is immutable.`);
       return this.toPin(input);
     }
-    await this.database.run("INSERT INTO retention_pins (retention_pin_id, workspace_id, snapshot_id, pin_kind, reason_code, created_at, expires_at, released_at, release_reason, pin_payload) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)", [input.retention_pin_id, this.workspaceId, input.snapshot_id, input.pin_kind, input.reason_code, input.created_at, input.expires_at, payload]);
+    await this.database.run("INSERT INTO retention_pins (retention_pin_id, workspace_id, snapshot_id, pin_kind, reason_code, created_at, expires_at, released_at, release_reason, source_reference_json) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)", [input.retention_pin_id, this.workspaceId, input.snapshot_id, input.pin_kind, input.reason_code, input.created_at, input.expires_at, sourceReferenceJson]);
     return this.toPin(input);
   }
 
   async releasePin(retentionPinId: string, releasedAt = new Date().toISOString(), reason = "released"): Promise<void> {
     await this.faults.hit("retention.before_release");
-    const row = await this.database.get<{ pin_payload: unknown }>("SELECT pin_payload FROM retention_pins WHERE workspace_id = ? AND retention_pin_id = ? AND released_at IS NULL", [this.workspaceId, retentionPinId]);
+    const row = await this.database.get<{ retention_pin_id: string }>("SELECT retention_pin_id FROM retention_pins WHERE workspace_id = ? AND retention_pin_id = ? AND released_at IS NULL", [this.workspaceId, retentionPinId]);
     if (!row) return;
-    const payload = decodeCanonical(bytes(row.pin_payload)) as SnapshotRetentionPin;
-    await this.database.transaction([{ kind: "run", sql: "UPDATE retention_pins SET released_at = ?, release_reason = ?, pin_payload = ? WHERE workspace_id = ? AND retention_pin_id = ? AND released_at IS NULL", params: [releasedAt, reason, encodeCanonical({ ...payload, released_at: releasedAt, release_reason: reason }), this.workspaceId, retentionPinId] }]);
+    await this.database.transaction([{ kind: "run", sql: "UPDATE retention_pins SET released_at = ?, release_reason = ? WHERE workspace_id = ? AND retention_pin_id = ? AND released_at IS NULL", params: [releasedAt, reason, this.workspaceId, retentionPinId] }]);
   }
   async getPin(retentionPinId: string): Promise<SnapshotRetentionPin | undefined> {
-    const row = await this.database.get<{ pin_payload: unknown; released_at: string | null; release_reason: string | null }>("SELECT pin_payload, released_at, release_reason FROM retention_pins WHERE workspace_id = ? AND retention_pin_id = ?", [this.workspaceId, retentionPinId]);
+    const row = await this.database.get<{ source_reference_json: string; retention_pin_id: string; workspace_id: string; snapshot_id: string; pin_kind: string; reason_code: string; created_at: string; expires_at: string; released_at: string | null; release_reason: string | null }>("SELECT source_reference_json, retention_pin_id, workspace_id, snapshot_id, pin_kind, reason_code, created_at, expires_at, released_at, release_reason FROM retention_pins WHERE workspace_id = ? AND retention_pin_id = ?", [this.workspaceId, retentionPinId]);
     if (!row) return undefined;
-    const payload = decodeCanonical(bytes(row.pin_payload)) as SnapshotRetentionPin;
-    return { ...payload, released_at: row.released_at ?? payload.released_at ?? "", release_reason: row.release_reason ?? payload.release_reason ?? "" };
+    return { retention_pin_id: row.retention_pin_id, workspace_id: row.workspace_id, snapshot_id: row.snapshot_id, pin_kind: row.pin_kind, reason_code: row.reason_code, source_reference: JSON.parse(row.source_reference_json) as SourceReference, created_at: row.created_at, expires_at: row.expires_at, released_at: row.released_at ?? "", release_reason: row.release_reason ?? "" };
   }
 
   async markSnapshotExpired(input: SnapshotExpirationMarkerInput): Promise<SnapshotExpirationMarker> {
-    const payload = encodeCanonical(input);
-    const existing = await this.database.get<{ marker_payload: unknown }>("SELECT marker_payload FROM snapshot_expiration_markers WHERE workspace_id = ? AND snapshot_expiration_id = ?", [this.workspaceId, input.snapshot_expiration_id]);
+    const existing = await this.database.get<Record<string, unknown>>("SELECT snapshot_expiration_id, workspace_id, snapshot_id, generation, expired_at, expiration_reason_code, garbage_collection_epoch_id, snapshot_digest FROM snapshot_expiration_markers WHERE workspace_id = ? AND snapshot_expiration_id = ?", [this.workspaceId, input.snapshot_expiration_id]);
     if (existing) {
-      if (!sameBytes(bytes(existing.marker_payload), payload)) throw new StorageError("storage:expiration_conflict", `Snapshot expiration ${input.snapshot_expiration_id} is immutable.`);
+      if (JSON.stringify(existing) !== JSON.stringify(input)) throw new StorageError("storage:expiration_conflict", `Snapshot expiration ${input.snapshot_expiration_id} is immutable.`);
       return input;
     }
-    await this.database.run("INSERT INTO snapshot_expiration_markers (snapshot_expiration_id, workspace_id, snapshot_id, generation, expired_at, expiration_reason_code, garbage_collection_epoch_id, snapshot_digest, marker_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [input.snapshot_expiration_id, this.workspaceId, input.snapshot_id, input.generation, input.expired_at, input.expiration_reason_code, input.garbage_collection_epoch_id, input.snapshot_digest, payload]);
+    await this.database.run("INSERT INTO snapshot_expiration_markers (snapshot_expiration_id, workspace_id, snapshot_id, generation, expired_at, expiration_reason_code, garbage_collection_epoch_id, snapshot_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [input.snapshot_expiration_id, this.workspaceId, input.snapshot_id, input.generation, input.expired_at, input.expiration_reason_code, input.garbage_collection_epoch_id, input.snapshot_digest]);
     return input;
   }
 
   async getExpirationMarker(snapshotId: string): Promise<SnapshotExpirationMarker | undefined> {
-    const row = await this.database.get<{ marker_payload: unknown }>("SELECT marker_payload FROM snapshot_expiration_markers WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, snapshotId]);
-    return row ? decodeCanonical(bytes(row.marker_payload)) as SnapshotExpirationMarker : undefined;
+    const row = await this.database.get<Record<string, unknown>>("SELECT snapshot_expiration_id, workspace_id, snapshot_id, generation, expired_at, expiration_reason_code, garbage_collection_epoch_id, snapshot_digest FROM snapshot_expiration_markers WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, snapshotId]);
+    return row ? row as unknown as SnapshotExpirationMarker : undefined;
   }
 
   async pinCasObject(contentHash: string): Promise<void> { await this.assertReaderBarrierClear(); await this.database.run("INSERT INTO lifecycle_cas_pins (workspace_id, content_hash) VALUES (?, ?) ON CONFLICT(workspace_id, content_hash) DO NOTHING", [this.workspaceId, contentHash]); }
 
   async addRetentionRoot(rootKind: "candidate" | "recovery" | "backup", rootId: string, contentHash: string): Promise<void> {
     await this.assertReaderBarrierClear();
-    await this.database.run("INSERT INTO lifecycle_roots (workspace_id, root_kind, root_id, content_hash, created_at, root_payload) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, root_kind, root_id, content_hash) DO NOTHING", [this.workspaceId, rootKind, rootId, contentHash, new Date().toISOString(), encodeCanonical({ root_kind: rootKind, root_id: rootId, content_hash: contentHash })]);
+    await this.database.run("INSERT INTO lifecycle_roots (workspace_id, root_kind, root_id, content_hash, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace_id, root_kind, root_id, content_hash) DO NOTHING", [this.workspaceId, rootKind, rootId, contentHash, new Date().toISOString()]);
   }
 
   async createExecution(input: QueryExecutionInput): Promise<void> {
     await this.assertReaderBarrierClear();
     const execution = this.executionValues(input);
     await this.validateExecutionBindings(input.workspace_snapshot_ids, execution.retention_lease_ids, input.created_at);
-    const payload = encodeCanonical({ ...input, ...execution });
-    const existing = await this.database.get<{ execution_payload: unknown; execution_status: string }>("SELECT execution_payload, execution_status FROM query_executions WHERE workspace_id = ? AND query_execution_id = ?", [this.workspaceId, input.query_execution_id]);
+    const existing = await this.database.get<{ execution_status: string; workspace_snapshot_ids: string; query_plan_hash: string; projection_digest: string; scope_digest: string; response_budget_ceiling: string; retention_lease_ids: string; created_at: string; expires_at: string }>("SELECT execution_status, workspace_snapshot_ids, query_plan_hash, projection_digest, scope_digest, response_budget_ceiling, retention_lease_ids, created_at, expires_at FROM query_executions WHERE workspace_id = ? AND query_execution_id = ?", [this.workspaceId, input.query_execution_id]);
     if (existing) {
-      if (!sameBytes(bytes(existing.execution_payload), payload) || existing.execution_status !== "ready") throw new StorageError("storage:execution_conflict", `Query execution ${input.query_execution_id} conflicts with its immutable metadata.`);
+      if (existing.execution_status !== "ready" || existing.workspace_snapshot_ids !== JSON.stringify(input.workspace_snapshot_ids) || existing.query_plan_hash !== execution.query_plan_hash || existing.projection_digest !== execution.projection_digest || existing.scope_digest !== execution.scope_digest || existing.response_budget_ceiling !== execution.response_budget_ceiling || existing.retention_lease_ids !== JSON.stringify(execution.retention_lease_ids) || existing.created_at !== input.created_at || existing.expires_at !== input.expires_at) throw new StorageError("storage:execution_conflict", `Query execution ${input.query_execution_id} conflicts with its immutable metadata.`);
       return;
     }
-    await this.database.run("INSERT INTO query_executions (query_execution_id, workspace_id, workspace_snapshot_ids, query_plan_hash, projection_digest, scope_digest, response_budget_ceiling, retention_lease_ids, created_at, expires_at, execution_status, execution_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)", [input.query_execution_id, this.workspaceId, JSON.stringify(input.workspace_snapshot_ids), execution.query_plan_hash, execution.projection_digest, execution.scope_digest, execution.response_budget_ceiling, JSON.stringify(execution.retention_lease_ids), input.created_at, input.expires_at, payload]);
+    await this.database.run("INSERT INTO query_executions (query_execution_id, workspace_id, workspace_snapshot_ids, query_plan_hash, projection_digest, scope_digest, response_budget_ceiling, retention_lease_ids, created_at, expires_at, execution_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready')", [input.query_execution_id, this.workspaceId, JSON.stringify(input.workspace_snapshot_ids), execution.query_plan_hash, execution.projection_digest, execution.scope_digest, execution.response_budget_ceiling, JSON.stringify(execution.retention_lease_ids), input.created_at, input.expires_at]);
   }
 
   async readExecution(executionId: string): Promise<QueryExecutionRecord | undefined> {
-    const row = await this.database.get<{ query_execution_id: string; workspace_id: string; workspace_snapshot_ids: string; query_plan_hash: string; projection_digest: string; scope_digest: string; response_budget_ceiling: string; retention_lease_ids: string; created_at: string; expires_at: string; execution_status: string; execution_payload: unknown }>("SELECT query_execution_id, workspace_id, workspace_snapshot_ids, query_plan_hash, projection_digest, scope_digest, response_budget_ceiling, retention_lease_ids, created_at, expires_at, execution_status, execution_payload FROM query_executions WHERE workspace_id = ? AND query_execution_id = ?", [this.workspaceId, executionId]);
+    const row = await this.database.get<{ query_execution_id: string; workspace_id: string; workspace_snapshot_ids: string; query_plan_hash: string; projection_digest: string; scope_digest: string; response_budget_ceiling: string; retention_lease_ids: string; created_at: string; expires_at: string; execution_status: string }>("SELECT query_execution_id, workspace_id, workspace_snapshot_ids, query_plan_hash, projection_digest, scope_digest, response_budget_ceiling, retention_lease_ids, created_at, expires_at, execution_status FROM query_executions WHERE workspace_id = ? AND query_execution_id = ?", [this.workspaceId, executionId]);
     if (!row) return undefined;
     const parse = (value: string): readonly string[] => { try { const parsed = JSON.parse(value); return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : []; } catch { return []; } };
-    return { query_execution_id: row.query_execution_id, workspace_id: row.workspace_id, workspace_snapshot_ids: parse(row.workspace_snapshot_ids), query_plan_hash: row.query_plan_hash, projection_digest: row.projection_digest, scope_digest: row.scope_digest, response_budget_ceiling: row.response_budget_ceiling, retention_lease_ids: parse(row.retention_lease_ids), created_at: row.created_at, expires_at: row.expires_at, execution_status: row.execution_status, execution_payload: decodeCanonical(bytes(row.execution_payload)) };
+    return { query_execution_id: row.query_execution_id, workspace_id: row.workspace_id, workspace_snapshot_ids: parse(row.workspace_snapshot_ids), query_plan_hash: row.query_plan_hash, projection_digest: row.projection_digest, scope_digest: row.scope_digest, response_budget_ceiling: row.response_budget_ceiling, retention_lease_ids: parse(row.retention_lease_ids), created_at: row.created_at, expires_at: row.expires_at, execution_status: row.execution_status };
   }
 
   async appendManifestSegment(executionId: string, segmentId: string, entries: ReadonlyArray<unknown>): Promise<void> {
@@ -576,10 +557,20 @@ export class WorkspaceLifecycleRepository {
     const firstOrdinal = ordinals.length === 0 ? 0 : Math.min(...ordinals);
     const lastOrdinal = ordinals.length === 0 ? 0 : Math.max(...ordinals);
     const ordinal = (await this.database.get<{ next_ordinal: number | null }>("SELECT MAX(segment_ordinal) + 1 AS next_ordinal FROM query_manifest_segments WHERE query_execution_id = ?", [executionId]))?.next_ordinal ?? 0;
+    // The segment row is an immutable compare-and-set.  A retry after a
+    // process crash may reach this point after the blob was durable and the
+    // row was committed, so the insert must be idempotent instead of turning
+    // a successful retry into a UNIQUE failure.  We verify the stored digest
+    // below and reject any attempt to reuse the segment id for different
+    // content.
     await this.database.transaction([
-      { kind: "run", sql: "INSERT INTO query_manifest_segments (query_execution_id, segment_id, segment_ordinal, entry_count, first_ordinal, last_ordinal, content_digest, storage_reference, byte_length, segment_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [executionId, segmentId, ordinal, entries.length, firstOrdinal, lastOrdinal, digest, segmentBlob.storage_reference, payload.byteLength, new Uint8Array()] },
-      { kind: "run", sql: "INSERT INTO lifecycle_roots (workspace_id, root_kind, root_id, content_hash, created_at, root_payload) VALUES (?, 'query_manifest', ?, ?, ?, ?) ON CONFLICT(workspace_id, root_kind, root_id, content_hash) DO NOTHING", params: [this.workspaceId, `${executionId}/${segmentId}`, digest, new Date().toISOString(), encodeCanonical({ root_kind: "query_manifest", root_id: `${executionId}/${segmentId}`, content_hash: digest })] },
+      { kind: "run", sql: "INSERT INTO query_manifest_segments (query_execution_id, segment_id, segment_ordinal, entry_count, first_ordinal, last_ordinal, content_digest, storage_reference, byte_length) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(query_execution_id, segment_id) DO NOTHING", params: [executionId, segmentId, ordinal, entries.length, firstOrdinal, lastOrdinal, digest, segmentBlob.storage_reference, payload.byteLength] },
+      { kind: "run", sql: "INSERT INTO lifecycle_roots (workspace_id, root_kind, root_id, content_hash, created_at) VALUES (?, 'query_manifest', ?, ?, ?) ON CONFLICT(workspace_id, root_kind, root_id, content_hash) DO NOTHING", params: [this.workspaceId, `${executionId}/${segmentId}`, digest, new Date().toISOString()] },
     ]);
+    const committed = await this.database.get<{ content_digest: string; storage_reference: string; byte_length: number }>("SELECT content_digest, storage_reference, byte_length FROM query_manifest_segments WHERE query_execution_id = ? AND segment_id = ?", [executionId, segmentId]);
+    if (committed === undefined || committed.content_digest !== digest || committed.storage_reference !== segmentBlob.storage_reference || committed.byte_length !== payload.byteLength) {
+      throw new StorageError("storage:manifest_conflict", `Manifest segment ${segmentId} does not match its durable content-addressed record.`);
+    }
     await this.faults.hit("manifest.after_append");
   }
 
@@ -595,7 +586,7 @@ export class WorkspaceLifecycleRepository {
     for (const segment of segments) {
       const payload = await this.blobs.cas.read(segment.content_digest);
       if (digestBytes(payload) !== segment.content_digest) throw new StorageError("storage:manifest_corrupt", `Manifest segment ${segment.content_digest} failed verification.`);
-      const entries = decodeCanonical(payload) as unknown[];
+      const entries = decodeCanonical(payload, { max_bytes: 256 * 1024 * 1024, max_elements: 10_000_000 }) as unknown[];
       for (const [index, entry] of entries.entries()) {
         const ordinal = entry && typeof entry === "object" && "ordinal" in entry && typeof entry.ordinal === "number" ? entry.ordinal : segment.first_ordinal + index;
         if (ordinal >= start && ordinal < end) page.push(entry);
@@ -615,7 +606,7 @@ export class WorkspaceLifecycleRepository {
     for (const segment of rows) {
       const payload = await this.blobs.cas.read(segment.content_digest);
       if (digestBytes(payload) !== segment.content_digest) throw new StorageError("storage:manifest_corrupt", `Manifest segment ${segment.content_digest} failed verification.`);
-      const entries = decodeCanonical(payload) as unknown[];
+      const entries = decodeCanonical(payload, { max_bytes: 256 * 1024 * 1024, max_elements: 10_000_000 }) as unknown[];
       for (const [index, entry] of entries.entries()) {
         const ordinal = entry && typeof entry === "object" && "ordinal" in entry && typeof entry.ordinal === "number" ? entry.ordinal : segment.first_ordinal + index;
         if (ordinal >= start && ordinal < start + limit) page.push(entry);
@@ -632,12 +623,11 @@ export class WorkspaceLifecycleRepository {
     const retainedLeaseIds = new Set(expired.flatMap((execution) => {
       try { return JSON.parse(execution.retention_lease_ids) as string[]; } catch { return []; }
     }));
-    const activeLeases = await this.database.all<{ retention_lease_id: string; holder_id: string; lease_payload: unknown }>("SELECT retention_lease_id, holder_id, lease_payload FROM retention_leases WHERE workspace_id = ? AND released_at IS NULL", [this.workspaceId]);
+    const activeLeases = await this.database.all<{ retention_lease_id: string; holder_id: string }>("SELECT retention_lease_id, holder_id FROM retention_leases WHERE workspace_id = ? AND released_at IS NULL", [this.workspaceId]);
     const commands: Array<{ kind: "run"; sql: string; params: readonly SqliteValue[] }> = [];
     for (const lease of activeLeases) {
       if (!expiredIds.has(lease.holder_id) && !retainedLeaseIds.has(lease.retention_lease_id)) continue;
-      const payload = decodeCanonical(bytes(lease.lease_payload)) as RetentionLeaseInput;
-      commands.push({ kind: "run", sql: "UPDATE retention_leases SET released_at = ?, release_reason = ?, lease_payload = ? WHERE workspace_id = ? AND retention_lease_id = ? AND released_at IS NULL", params: [now, "execution_expired", encodeCanonical({ ...payload, released_at: now, release_reason: "execution_expired" }), this.workspaceId, lease.retention_lease_id] });
+      commands.push({ kind: "run", sql: "UPDATE retention_leases SET released_at = ?, release_reason = ? WHERE workspace_id = ? AND retention_lease_id = ? AND released_at IS NULL", params: [now, "execution_expired", this.workspaceId, lease.retention_lease_id] });
     }
     for (const { query_execution_id } of expired) commands.push(
       { kind: "run", sql: "DELETE FROM lifecycle_roots WHERE workspace_id = ? AND root_kind = 'query_manifest' AND root_id LIKE ?", params: [this.workspaceId, `${query_execution_id}/%`] },
@@ -659,7 +649,7 @@ export class StorageMaintenance {
   async verify(): Promise<VerificationReport> {
     const failures: VerificationFailure[] = [];
     try { const row = await this.database.get<{ quick_check: string }>("PRAGMA quick_check"); if (row?.quick_check !== "ok") failures.push({ component_kind: "sqlite", component_id: this.database.filename, error_code: "quick_check_failed" }); } catch (error) { failures.push({ component_kind: "sqlite", component_id: this.database.filename, error_code: error instanceof Error ? error.name : "sqlite_error" }); }
-    const casRows = await this.database.all<{ content_hash: string; component_kind: string; component_id: string }>(`SELECT content_hash, 'lexical_document' AS component_kind, artifact_id AS component_id FROM lexical_documents WHERE workspace_id = ? UNION ALL SELECT content_hash, 'vector_shard', shard_id FROM vector_shards WHERE workspace_id = ? UNION ALL SELECT content_hash, 'pinned_cas_object', content_hash FROM lifecycle_cas_pins WHERE workspace_id = ? UNION ALL SELECT content_hash, 'retention_root', root_id FROM lifecycle_roots WHERE workspace_id = ? UNION ALL SELECT content_digest, 'manifest_segment', query_execution_id || '/' || segment_id FROM query_manifest_segments WHERE query_execution_id IN (SELECT query_execution_id FROM query_executions WHERE workspace_id = ?) UNION ALL SELECT content_digest, 'template_segment', candidate_materialization_id || '/' || set_kind || '/' || segment_ordinal FROM candidate_template_segments WHERE workspace_id = ? UNION ALL SELECT payload_cas_digest, 'record_occurrence', record_id FROM record_occurrences WHERE workspace_id = ? AND payload_cas_digest IS NOT NULL UNION ALL SELECT content_hash, 'content_blob', content_blob_id FROM content_blobs WHERE storage_reference LIKE 'cas:%'`, [this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId]);
+    const casRows = await this.database.all<{ content_hash: string; component_kind: string; component_id: string }>(`SELECT content_hash, 'lexical' AS component_kind, artifact_id AS component_id FROM lexical_documents WHERE workspace_id = ? UNION ALL SELECT content_hash, 'vector_shard', shard_id FROM vector_shards WHERE workspace_id = ? UNION ALL SELECT content_hash, 'pinned_cas_object', content_hash FROM lifecycle_cas_pins WHERE workspace_id = ? UNION ALL SELECT content_hash, 'retention_root', root_id FROM lifecycle_roots WHERE workspace_id = ? UNION ALL SELECT content_digest, 'manifest_segment', query_execution_id || '/' || segment_id FROM query_manifest_segments WHERE query_execution_id IN (SELECT query_execution_id FROM query_executions WHERE workspace_id = ?) UNION ALL SELECT content_hash, 'content_blob', content_blob_id FROM content_blobs WHERE storage_reference LIKE 'cas:%'`, [this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId]);
     for (const row of casRows) {
       try { await this.cas.read(row.content_hash); } catch (error) { failures.push({ component_kind: row.component_kind, component_id: row.component_id, error_code: error instanceof StorageError ? error.code : "cas_error" }); }
     }
@@ -667,41 +657,35 @@ export class StorageMaintenance {
     for (const vector of vectors) {
       try { await this.verifyVector(vector.projection_record_id, vector.valid_from_generation); } catch (error) { failures.push({ component_kind: "vector", component_id: vector.valid_from_generation === 0 ? vector.projection_record_id : `${vector.projection_record_id}@${vector.valid_from_generation}`, error_code: error instanceof StorageError ? error.code : "vector_error" }); }
     }
-    const graphRows = await this.database.all<{ edge_id: string; source_subject_id: string; target_subject_id: string; relation_record_id: string; relation_kind: string; role: string; evidence_class: string; owner_artifact_id: string; owner_artifact_version_id: string; valid_from_generation: number; valid_to_generation: number | null; edge_payload: unknown }>("SELECT edge_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, edge_payload FROM graph_edges WHERE workspace_id = ?", [this.workspaceId]);
+    const graphRows = await this.database.all<{ edge_id: string; source_subject_id: string; target_subject_id: string; relation_record_id: string; relation_kind: string; role: string; evidence_class: string; owner_artifact_id: string; owner_artifact_version_id: string; valid_from_generation: number; valid_to_generation: number | null; content_digest: string }>("SELECT edge_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest FROM graph_edges WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of graphRows) {
       try {
         const expected = { edge_id: row.edge_id, source_subject_id: row.source_subject_id, target_subject_id: row.target_subject_id, relation_record_id: row.relation_record_id, relation_kind: row.relation_kind, role: row.role, evidence_class: row.evidence_class, owner_artifact_id: row.owner_artifact_id, owner_artifact_version_id: row.owner_artifact_version_id, valid_from_generation: row.valid_from_generation, ...(row.valid_to_generation === null ? {} : { valid_to_generation: row.valid_to_generation }) };
-        if (!sameBytes(bytes(row.edge_payload), encodeCanonical(expected))) throw new StorageError("storage:graph_corrupt", `Graph edge ${row.edge_id} typed columns differ from its canonical payload.`);
+        if (row.content_digest !== digestLogicalValue(expected, "urdira:graph-edge:v2")) throw new StorageError("storage:graph_corrupt", `Graph edge ${row.edge_id} typed columns differ from its logical digest.`);
         await this.requireOwner(row.owner_artifact_id, row.owner_artifact_version_id);
       } catch (error) { failures.push({ component_kind: "graph", component_id: `${row.edge_id}@${row.valid_from_generation}`, error_code: error instanceof StorageError ? error.code : "graph_corrupt" }); }
     }
-    const lexicalRows = await this.database.all<{ artifact_id: string; artifact_version_id: string; content_hash: string; byte_length: number; valid_from_generation: number; valid_to_generation: number | null; document_payload: unknown }>("SELECT artifact_id, artifact_version_id, content_hash, byte_length, valid_from_generation, valid_to_generation, document_payload FROM lexical_documents WHERE workspace_id = ?", [this.workspaceId]);
+    const lexicalRows = await this.database.all<{ artifact_id: string; artifact_version_id: string; content_hash: string; byte_length: number; valid_from_generation: number; valid_to_generation: number | null }>("SELECT artifact_id, artifact_version_id, content_hash, byte_length, valid_from_generation, valid_to_generation FROM lexical_documents WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of lexicalRows) {
       try {
-        const payload = decodeCanonical(bytes(row.document_payload)) as { text?: unknown; artifact_id?: string; artifact_version_id?: string; valid_from_generation?: number; valid_to_generation?: number };
-        if (typeof payload.text !== "string") throw new StorageError("storage:lexical_corrupt", `Lexical document ${row.artifact_id} has no canonical text.`);
         const source = await this.cas.read(row.content_hash);
-        if (source.byteLength !== row.byte_length || digestBytes(source) !== row.content_hash || new TextDecoder().decode(source) !== payload.text) throw new StorageError("storage:lexical_corrupt", `Lexical document ${row.artifact_id} content differs from its canonical payload.`);
-        if (payload.artifact_id !== row.artifact_id || payload.artifact_version_id !== row.artifact_version_id || payload.valid_from_generation !== row.valid_from_generation || (payload.valid_to_generation ?? null) !== row.valid_to_generation) throw new StorageError("storage:lexical_corrupt", `Lexical document ${row.artifact_id} typed metadata differs from its canonical payload.`);
-        const storedTrigrams = await this.database.all<{ trigram: string }>("SELECT trigram FROM lexical_trigrams WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ? ORDER BY trigram", [this.workspaceId, row.artifact_id, row.artifact_version_id]);
-        const expectedTrigrams = lexicalTrigrams(payload.text);
-        if (storedTrigrams.length !== expectedTrigrams.length || storedTrigrams.some((stored, index) => stored.trigram !== expectedTrigrams[index])) throw new StorageError("storage:lexical_corrupt", `Lexical trigram index ${row.artifact_id} is inconsistent with its source.`);
+        if (source.byteLength !== row.byte_length || digestBytes(source) !== row.content_hash) throw new StorageError("storage:lexical_corrupt", `Lexical document ${row.artifact_id} content differs from its CAS metadata.`);
         await this.requireOwner(row.artifact_id, row.artifact_version_id);
       } catch (error) { failures.push({ component_kind: "lexical", component_id: `${row.artifact_id}/${row.artifact_version_id}`, error_code: error instanceof StorageError ? error.code : "lexical_corrupt" }); }
     }
-    const dependencyRows = await this.database.all<{ dependency_entry_id: string; record_id: string; owner_artifact_id: string; owner_artifact_version_id: string; dependency_artifact_id: string; dependency_artifact_version_id: string; dependency_role: string; producer_id: string; producer_version: string; valid_from_generation: number; valid_to_generation: number | null; dependency_payload: unknown }>("SELECT dependency_entry_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, dependency_payload FROM artifact_dependencies WHERE workspace_id = ?", [this.workspaceId]);
+    const dependencyRows = await this.database.all<{ dependency_entry_id: string; record_id: string; owner_artifact_id: string; owner_artifact_version_id: string; dependency_artifact_id: string; dependency_artifact_version_id: string; dependency_role: string; producer_id: string; producer_version: string; valid_from_generation: number; valid_to_generation: number | null; content_digest: string }>("SELECT dependency_entry_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, content_digest FROM artifact_dependencies WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of dependencyRows) {
       try {
         const expected = { dependency_entry_id: row.dependency_entry_id, record_id: row.record_id, owner_artifact_id: row.owner_artifact_id, owner_artifact_version_id: row.owner_artifact_version_id, dependency_artifact_id: row.dependency_artifact_id, dependency_artifact_version_id: row.dependency_artifact_version_id, dependency_role: row.dependency_role, producer_id: row.producer_id, producer_version: row.producer_version, valid_from_generation: row.valid_from_generation, ...(row.valid_to_generation === null ? {} : { valid_to_generation: row.valid_to_generation }) };
-        if (!sameBytes(bytes(row.dependency_payload), encodeCanonical(expected))) throw new StorageError("storage:dependency_corrupt", `Dependency ${row.dependency_entry_id} typed columns differ from its canonical payload.`);
+        if (row.content_digest !== digestLogicalValue(expected, "urdira:artifact-dependency:v2")) throw new StorageError("storage:dependency_corrupt", `Dependency ${row.dependency_entry_id} typed columns differ from its logical digest.`);
         await this.requireOwner(row.owner_artifact_id, row.owner_artifact_version_id); await this.requireOwner(row.dependency_artifact_id, row.dependency_artifact_version_id);
       } catch (error) { failures.push({ component_kind: "dependency", component_id: `${row.dependency_entry_id}@${row.valid_from_generation}`, error_code: error instanceof StorageError ? error.code : "dependency_corrupt" }); }
     }
-    const metricRows = await this.database.all<{ metric_id: string; projection_record_id: string; metric_kind: string; metric_value: number; valid_from_generation: number; valid_to_generation: number | null; metric_payload: unknown; owner_artifact_id: string; owner_artifact_version_id: string }>("SELECT metric_id, projection_record_id, metric_kind, metric_value, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, metric_payload FROM metric_projections WHERE workspace_id = ?", [this.workspaceId]);
+    const metricRows = await this.database.all<{ metric_id: string; projection_record_id: string; metric_kind: string; metric_value: number; valid_from_generation: number; valid_to_generation: number | null; content_digest: string; owner_artifact_id: string; owner_artifact_version_id: string }>("SELECT metric_id, projection_record_id, metric_kind, metric_value, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest FROM metric_projections WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of metricRows) {
       try {
         const expected = { metric_id: row.metric_id, projection_record_id: row.projection_record_id, metric_kind: row.metric_kind, metric_value: row.metric_value, owner_artifact_id: row.owner_artifact_id, owner_artifact_version_id: row.owner_artifact_version_id, valid_from_generation: row.valid_from_generation, ...(row.valid_to_generation === null ? {} : { valid_to_generation: row.valid_to_generation }) };
-        if (!sameBytes(bytes(row.metric_payload), encodeCanonical(expected))) throw new StorageError("storage:metric_corrupt", `Metric ${row.metric_id} typed columns differ from its canonical payload.`);
+        if (row.content_digest !== digestLogicalValue(expected, "urdira:metric-projection:v2")) throw new StorageError("storage:metric_corrupt", `Metric ${row.metric_id} typed columns differ from its logical digest.`);
         await this.requireOwner(row.owner_artifact_id, row.owner_artifact_version_id);
       } catch (error) { failures.push({ component_kind: "metric", component_id: `${row.metric_id}@${row.valid_from_generation}`, error_code: error instanceof StorageError ? error.code : "metric_corrupt" }); }
     }
@@ -710,29 +694,18 @@ export class StorageMaintenance {
       try {
         const payload = await this.cas.read(row.content_digest);
         if (digestBytes(payload) !== row.content_digest || row.storage_reference !== `cas:${row.content_digest}` || row.byte_length !== payload.byteLength) throw new StorageError("storage:manifest_corrupt", `Manifest segment ${row.segment_id} failed its storage metadata check.`);
-        const entries = decodeCanonical(payload) as unknown[];
+        const entries = decodeCanonical(payload, { max_bytes: 256 * 1024 * 1024, max_elements: 10_000_000 }) as unknown[];
         const ordinals = entries.map((entry, index) => entry && typeof entry === "object" && "ordinal" in entry && typeof entry.ordinal === "number" ? entry.ordinal : row.first_ordinal + index);
         if (entries.length !== row.entry_count || (entries.length > 0 && (Math.min(...ordinals) !== row.first_ordinal || Math.max(...ordinals) !== row.last_ordinal))) throw new StorageError("storage:manifest_corrupt", `Manifest segment ${row.segment_id} has inconsistent ordinal metadata.`);
       } catch (error) { failures.push({ component_kind: "manifest", component_id: `${row.query_execution_id}/${row.segment_id}`, error_code: error instanceof StorageError ? error.code : "manifest_corrupt" }); }
     }
-    const templateSegmentRows = await this.database.all<{ candidate_materialization_id: string; set_kind: string; segment_ordinal: number; entry_count: number; first_ordinal: number; last_ordinal: number; content_digest: string; storage_reference: string; byte_length: number }>("SELECT candidate_materialization_id, set_kind, segment_ordinal, entry_count, first_ordinal, last_ordinal, content_digest, storage_reference, byte_length FROM candidate_template_segments WHERE workspace_id = ?", [this.workspaceId]);
-    for (const row of templateSegmentRows) {
-      try {
-        const payload = await this.cas.read(row.content_digest);
-        if (digestBytes(payload) !== row.content_digest || row.storage_reference !== `cas:${row.content_digest}` || row.byte_length !== payload.byteLength) throw new StorageError("storage:template_segment_corrupt", `Template segment ${row.candidate_materialization_id}/${row.set_kind}/${row.segment_ordinal} failed its storage metadata check.`);
-        const entries = decodeCanonical(payload);
-        if (!Array.isArray(entries) || entries.length !== row.entry_count || row.last_ordinal - row.first_ordinal + 1 !== entries.length) throw new StorageError("storage:template_segment_corrupt", `Template segment ${row.candidate_materialization_id}/${row.set_kind}/${row.segment_ordinal} has inconsistent ordinal metadata.`);
-      } catch (error) { failures.push({ component_kind: "manifest", component_id: `${row.candidate_materialization_id}/${row.set_kind}/${row.segment_ordinal}`, error_code: error instanceof StorageError ? error.code : "template_segment_corrupt" }); }
-    }
-    const snapshotRows = await this.database.all<{ snapshot_id: string; workspace_id: string; generation: number; parent_snapshot_id: string | null; generation_manifest_id: string; registry_snapshot_id: string; resolution_lock_id: string; configuration_revision_id: string; source_state_digest: string; source_observation_watermarks: string; canonical_record_set_digest: string; projection_set_digests: string; capability_state_digest: string; published_at: string; snapshot_digest: string; snapshot_payload: unknown }>("SELECT snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload FROM snapshots WHERE workspace_id = ?", [this.workspaceId]);
+    const snapshotRows = await this.database.all<{ snapshot_id: string; workspace_id: string; generation: number; parent_snapshot_id: string | null; generation_manifest_id: string; registry_snapshot_id: string; resolution_lock_id: string; configuration_revision_id: string; source_state_digest: string; source_snapshot_id: string | null; snapshot_contract_version: number | null; publication_stage_id: string | null; publication_stage_ordinal: number | null; publication_stage_count: number | null; source_observation_watermarks: string; canonical_record_set_digest: string; projection_set_digests: string; capability_state_digest: string; published_at: string; snapshot_digest: string }>("SELECT snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_snapshot_id, snapshot_contract_version, publication_stage_id, publication_stage_ordinal, publication_stage_count, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest FROM snapshots WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of snapshotRows) {
       try {
-        const persistedSnapshot = decodeCanonical(bytes(row.snapshot_payload)) as Record<string, unknown>;
-        const expected = { snapshot_id: row.snapshot_id, workspace_id: row.workspace_id, generation: row.generation, ...(row.parent_snapshot_id === null ? {} : { parent_snapshot_id: row.parent_snapshot_id }), generation_manifest_id: row.generation_manifest_id, registry_snapshot_id: row.registry_snapshot_id, resolution_lock_id: row.resolution_lock_id, configuration_revision_id: row.configuration_revision_id, source_state_digest: row.source_state_digest, ...(typeof persistedSnapshot["source_snapshot_id"] === "string" ? { source_snapshot_id: persistedSnapshot["source_snapshot_id"], snapshot_contract_version: persistedSnapshot["snapshot_contract_version"] ?? 2 } : {}), source_observation_watermarks: row.source_observation_watermarks, canonical_record_set_digest: row.canonical_record_set_digest, projection_set_digests: row.projection_set_digests, capability_state_digest: row.capability_state_digest, published_at: row.published_at, snapshot_digest: row.snapshot_digest };
-        if (!sameBytes(bytes(row.snapshot_payload), encodeCanonical(expected))) throw new StorageError("storage:snapshot_corrupt", `Snapshot ${row.snapshot_id} typed fields or set digests differ from its canonical payload.`);
+        const expected = { snapshot_id: String(row["snapshot_id"]), workspace_id: String(row["workspace_id"]), generation: Number(row["generation"]), ...(row["parent_snapshot_id"] === null ? {} : { parent_snapshot_id: String(row["parent_snapshot_id"]) }), generation_manifest_id: String(row["generation_manifest_id"]), registry_snapshot_id: String(row["registry_snapshot_id"]), resolution_lock_id: String(row["resolution_lock_id"]), configuration_revision_id: String(row["configuration_revision_id"]), source_state_digest: String(row["source_state_digest"]), ...(row["source_snapshot_id"] === null ? {} : { source_snapshot_id: String(row["source_snapshot_id"]), snapshot_contract_version: Number(row["snapshot_contract_version"] ?? 2) }), source_observation_watermarks: String(row["source_observation_watermarks"]), canonical_record_set_digest: String(row["canonical_record_set_digest"]), projection_set_digests: String(row["projection_set_digests"]), capability_state_digest: String(row["capability_state_digest"]), published_at: String(row["published_at"]), snapshot_digest: String(row["snapshot_digest"]) };
         if (!(await this.database.get("SELECT registry_snapshot_id FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [this.workspaceId, row.registry_snapshot_id]))) throw new StorageError("storage:registry_missing", `Snapshot ${row.snapshot_id} references a registry from another workspace or an absent registry.`);
         const visibleRecords = await this.database.all<{ record_id: string; record_digest: string }>("SELECT record_id, record_digest FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?) ORDER BY record_id", [this.workspaceId, row.generation, row.generation]);
-        const recordSetDigest = computeDigestOverArrayPayload("core:canonical_record_set", "core:snapshot_record_set_digest", 1, "core:SnapshotRecordSetDigestPayload", 1, visibleRecords.map((record) => ({ record_id: record.record_id, record_digest: record.record_digest })));
+        const recordSetDigest = logicalRecordSetDigest(visibleRecords);
         const projectionEntries = await this.getProjectionSetDigestEntries(row.generation);
         if (isDigest(row.canonical_record_set_digest) && visibleRecords.every((record) => isDigest(record.record_digest)) && row.canonical_record_set_digest !== recordSetDigest) throw new StorageError("storage:canonical_set_digest_corrupt", `Snapshot ${row.snapshot_id} canonical record-set digest does not match visible records.`);
         if (isDigest(row.projection_set_digests)) throw new StorageError("storage:projection_set_digest_corrupt", `Snapshot ${row.snapshot_id} uses a non-normative aggregate projection-set digest.`);
@@ -751,29 +724,12 @@ export class StorageMaintenance {
         }
       } catch (error) { failures.push({ component_kind: "snapshot", component_id: row.snapshot_id, error_code: error instanceof StorageError ? error.code : "snapshot_corrupt" }); }
     }
-    const authoritativeArtifacts = await this.database.all<{ artifact_id: string; workspace_id: string; normalized_uri: string; normalized_path: string | null; display_path: string | null; artifact_kind: string; artifact_payload: unknown }>("SELECT artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload FROM source_artifacts WHERE workspace_id = ?", [this.workspaceId]);
+    const authoritativeArtifacts = await this.database.all<{ artifact_id: string; workspace_id: string; normalized_uri: string; normalized_path: string | null; display_path: string | null; artifact_kind: string }>("SELECT artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind FROM source_artifacts WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of authoritativeArtifacts) {
       try {
-        const payload = decodeCanonical(bytes(row.artifact_payload)) as Record<string, unknown>;
         const expected = { artifact_id: row.artifact_id, workspace_id: row.workspace_id, normalized_uri: row.normalized_uri, ...(row.normalized_path === null ? {} : { normalized_path: row.normalized_path }), ...(row.display_path === null ? {} : { display_path: row.display_path }), artifact_kind: row.artifact_kind };
-        if (!sameBytes(encodeCanonical(payload), encodeCanonical(expected))) throw new StorageError("storage:source_catalog_corrupt", `Artifact ${row.artifact_id} canonical metadata differs from its source catalog row.`);
+        if (row.artifact_id !== expected.artifact_id || row.workspace_id !== expected.workspace_id) throw new StorageError("storage:source_catalog_corrupt", `Artifact ${row.artifact_id} metadata differs from its source catalog row.`);
       } catch (error) { failures.push({ component_kind: "source_catalog", component_id: row.artifact_id, error_code: error instanceof StorageError ? error.code : "source_catalog_corrupt" }); }
-    }
-    const sourcePayloadTables = [
-      ["source_observation_batches", "observation_batch_payload", "observation_batch_id"],
-      ["artifact_versions", "artifact_version_payload", "artifact_version_id"],
-      ["artifact_tombstones", "artifact_tombstone_payload", "artifact_tombstone_id"],
-      ["source_observations", "observation_payload", "source_observation_id"],
-    ] as const;
-    for (const [table, payloadColumn, idColumn] of sourcePayloadTables) {
-      const rows = await this.database.all<Record<string, unknown>>(`SELECT * FROM "${table}" WHERE workspace_id = ?`, [this.workspaceId]);
-      for (const row of rows) {
-        try {
-          const payload = decodeCanonical(bytes(row[payloadColumn])) as Record<string, unknown>;
-          const expected = Object.fromEntries(Object.entries(row).filter(([key, value]) => key !== payloadColumn && value !== null));
-          if (!sameBytes(encodeCanonical(payload), encodeCanonical(expected))) throw new StorageError("storage:source_catalog_corrupt", `${table} ${String(row[idColumn])} canonical payload differs from its typed row.`);
-        } catch (error) { failures.push({ component_kind: "source_catalog", component_id: String(row[idColumn]), error_code: error instanceof StorageError ? error.code : "source_catalog_corrupt" }); }
-      }
     }
     const foreignKeyFailures = await this.database.all<Record<string, unknown>>("PRAGMA foreign_key_check");
     if (foreignKeyFailures.length > 0) failures.push({ component_kind: "source_catalog", component_id: "foreign_keys", error_code: "storage:source_catalog_closure_corrupt" });
@@ -783,22 +739,20 @@ export class StorageMaintenance {
         if (row.storage_reference === `cas:${row.content_hash}`) { const source = await this.cas.read(row.content_hash); if (source.byteLength !== row.byte_length || digestBytes(source) !== row.content_hash) throw new StorageError("storage:source_blob_corrupt", `Content blob ${row.content_blob_id} failed its CAS digest or length check.`); }
       } catch (error) { failures.push({ component_kind: "source_catalog", component_id: row.content_blob_id, error_code: error instanceof StorageError ? error.code : "source_blob_corrupt" }); }
     }
-    const registryRows = await this.database.all<{ registry_snapshot_id: string; workspace_id: string; registry_contract_version: string; core_registry_digest: string; resolution_lock_id: string; registry_digest: string; registry_payload: unknown }>("SELECT registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload FROM registry_snapshots WHERE workspace_id = ?", [this.workspaceId]);
+    const registryRows = await this.database.all<{ registry_snapshot_id: string; workspace_id: string; registry_contract_version: string; core_registry_digest: string; resolution_lock_id: string; registry_digest: string }>("SELECT registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest FROM registry_snapshots WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of registryRows) {
       try {
-        const payload = decodeCanonical(bytes(row.registry_payload)) as Record<string, unknown>;
         const bindings = await this.database.all<Record<string, unknown>>("SELECT namespace_binding_id, workspace_id, namespace, plugin_id, plugin_version, contribution_digest, emission_valid_from_generation, emission_valid_to_generation FROM registry_namespace_bindings WHERE workspace_id = ? AND registry_snapshot_id = ? ORDER BY namespace_binding_id", [this.workspaceId, row.registry_snapshot_id]);
         const positive = { registry_snapshot_id: row.registry_snapshot_id, registry_contract_version: row.registry_contract_version, core_registry_digest: row.core_registry_digest, resolution_lock_id: row.resolution_lock_id, namespace_bindings: bindings };
-        if (payload["registry_snapshot_id"] !== row.registry_snapshot_id || (payload["workspace_id"] !== undefined && payload["workspace_id"] !== row.workspace_id) || !Array.isArray(payload["namespace_bindings"]) || !sameBytes(encodeCanonical(payload["namespace_bindings"]), encodeCanonical(bindings))) throw new StorageError("storage:registry_corrupt", `Registry snapshot ${row.registry_snapshot_id} identity or namespace closure differs from its payload.`);
         const expectedRegistryDigest = computeDigest("core:registry_snapshot", "core:registry_snapshot_digest", 1, "core:RegistrySnapshotDigestPayload", 1, positive);
         if (row.registry_digest !== expectedRegistryDigest) throw new StorageError("storage:registry_digest_corrupt", `Registry snapshot ${row.registry_snapshot_id} digest does not match its retained namespace closure.`);
       }
       catch (error) { failures.push({ component_kind: "registry", component_id: row.registry_snapshot_id, error_code: error instanceof StorageError ? error.code : "registry_corrupt" }); }
     }
-    const controlRows = await this.database.all<{ state_key: string; workspace_id: string; state_kind: string; payload: unknown; reference_workspace_id: string | null; reference_snapshot_id: string | null; reference_source_state_digest: string | null; updated_at: string }>("SELECT state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at FROM control_plane_state WHERE workspace_id = ?", [this.workspaceId]);
+    const controlRows = await this.database.all<{ state_key: string; workspace_id: string; state_kind: string; state_json: string; reference_workspace_id: string | null; reference_snapshot_id: string | null; reference_source_state_digest: string | null; updated_at: string }>("SELECT state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at FROM control_plane_state WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of controlRows) {
       try {
-        const payload = decodeCanonical(bytes(row.payload)) as Record<string, unknown>;
+        const payload = JSON.parse(row.state_json) as Record<string, unknown>;
         if (row.workspace_id !== this.workspaceId || row.state_key.length === 0 || row.state_kind.length === 0 || Number.isNaN(Date.parse(row.updated_at)) || !payload || Array.isArray(payload) || payload["workspace_id"] !== row.workspace_id) throw new StorageError("storage:control_plane_corrupt", `Control state ${row.state_key} has invalid persisted metadata.`);
         if (row.reference_workspace_id !== null && payload["workspace_id"] !== row.reference_workspace_id) throw new StorageError("storage:control_plane_corrupt", `Control state ${row.state_key} has a mismatched workspace reference.`);
         if (row.reference_snapshot_id !== null) {
@@ -811,55 +765,43 @@ export class StorageMaintenance {
       }
       catch (error) { failures.push({ component_kind: "control_plane", component_id: row.state_key, error_code: error instanceof StorageError ? error.code : "control_plane_corrupt" }); }
     }
-    const currentRows = await this.database.all<{ workspace_id: string; current_snapshot_id: string; current_generation: number; current_registry_snapshot_id: string; current_payload: unknown }>("SELECT workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_payload FROM workspace_current_state WHERE workspace_id = ?", [this.workspaceId]);
+    const currentRows = await this.database.all<{ workspace_id: string; current_snapshot_id: string; current_generation: number; current_registry_snapshot_id: string }>("SELECT workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id FROM workspace_current_state WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of currentRows) {
-      try { const payload = decodeCanonical(row.current_payload instanceof Uint8Array ? row.current_payload : bytes(row.current_payload)) as Record<string, unknown>; if (payload["workspace_id"] !== row.workspace_id || payload["current_snapshot_id"] !== row.current_snapshot_id || payload["current_generation"] !== row.current_generation || payload["current_registry_snapshot_id"] !== row.current_registry_snapshot_id) throw new StorageError("storage:current_tuple_corrupt", `Current tuple ${row.workspace_id} differs from its canonical payload.`); const snapshot = await this.database.get<{ snapshot_id: string; registry_snapshot_id: string }>("SELECT snapshot_id, registry_snapshot_id FROM snapshots WHERE workspace_id = ? AND snapshot_id = ? AND generation = ?", [this.workspaceId, row.current_snapshot_id, row.current_generation]); if (!snapshot || snapshot.registry_snapshot_id !== row.current_registry_snapshot_id) throw new StorageError("storage:current_tuple_corrupt", `Current tuple ${row.workspace_id} references a non-current snapshot or registry.`); }
+      try { const snapshot = await this.database.get<{ snapshot_id: string; registry_snapshot_id: string }>("SELECT snapshot_id, registry_snapshot_id FROM snapshots WHERE workspace_id = ? AND snapshot_id = ? AND generation = ?", [this.workspaceId, row.current_snapshot_id, row.current_generation]); if (!snapshot || snapshot.registry_snapshot_id !== row.current_registry_snapshot_id) throw new StorageError("storage:current_tuple_corrupt", `Current tuple ${row.workspace_id} references a non-current snapshot or registry.`); }
       catch (error) { failures.push({ component_kind: "current_tuple", component_id: row.workspace_id, error_code: error instanceof StorageError ? error.code : "current_tuple_corrupt" }); }
     }
-    const leaseRows = await this.database.all<{ retention_lease_id: string; snapshot_id: string; released_at: string | null; release_reason: string | null; lease_payload: unknown }>("SELECT retention_lease_id, snapshot_id, released_at, release_reason, lease_payload FROM retention_leases WHERE workspace_id = ?", [this.workspaceId]);
+    const leaseRows = await this.database.all<{ retention_lease_id: string; snapshot_id: string; released_at: string | null; release_reason: string | null }>("SELECT retention_lease_id, snapshot_id, released_at, release_reason FROM retention_leases WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of leaseRows) {
-      try { const payload = decodeCanonical(bytes(row.lease_payload)) as Record<string, unknown>; if (payload["retention_lease_id"] !== row.retention_lease_id || payload["snapshot_id"] !== row.snapshot_id || (payload["released_at"] ?? "") !== (row.released_at ?? "") || (payload["release_reason"] ?? "") !== (row.release_reason ?? "")) throw new StorageError("storage:lease_audit_corrupt", `Lease ${row.retention_lease_id} audit payload differs from its release state.`); if (!(await this.database.get("SELECT snapshot_id FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, row.snapshot_id]))) throw new StorageError("storage:snapshot_not_found", `Lease ${row.retention_lease_id} references a missing snapshot.`); }
+      try { if (!(await this.database.get("SELECT snapshot_id FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, row.snapshot_id]))) throw new StorageError("storage:snapshot_not_found", `Lease ${row.retention_lease_id} references a missing snapshot.`); }
       catch (error) { failures.push({ component_kind: "lease", component_id: row.retention_lease_id, error_code: error instanceof StorageError ? error.code : "lease_audit_corrupt" }); }
     }
-    const pinRows = await this.database.all<{ retention_pin_id: string; snapshot_id: string; released_at: string | null; release_reason: string | null; pin_payload: unknown }>("SELECT retention_pin_id, snapshot_id, released_at, release_reason, pin_payload FROM retention_pins WHERE workspace_id = ?", [this.workspaceId]);
+    const pinRows = await this.database.all<{ retention_pin_id: string; snapshot_id: string; released_at: string | null; release_reason: string | null }>("SELECT retention_pin_id, snapshot_id, released_at, release_reason FROM retention_pins WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of pinRows) {
-      try { const payload = decodeCanonical(bytes(row.pin_payload)) as Record<string, unknown>; if (payload["retention_pin_id"] !== row.retention_pin_id || payload["snapshot_id"] !== row.snapshot_id || (payload["released_at"] ?? "") !== (row.released_at ?? "") || (payload["release_reason"] ?? "") !== (row.release_reason ?? "")) throw new StorageError("storage:pin_audit_corrupt", `Pin ${row.retention_pin_id} audit payload differs from its release state.`); if (!(await this.database.get("SELECT snapshot_id FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, row.snapshot_id]))) throw new StorageError("storage:snapshot_not_found", `Pin ${row.retention_pin_id} references a missing snapshot.`); }
+      try { if (!(await this.database.get("SELECT snapshot_id FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, row.snapshot_id]))) throw new StorageError("storage:snapshot_not_found", `Pin ${row.retention_pin_id} references a missing snapshot.`); }
       catch (error) { failures.push({ component_kind: "pin", component_id: row.retention_pin_id, error_code: error instanceof StorageError ? error.code : "pin_audit_corrupt" }); }
     }
-    const canonicalRows = await this.database.all<{ record_id: string; workspace_id: string; category: string; kind: string; universal_kind: string; schema_version: number; owner_artifact_id: string; owner_artifact_version_id: string; valid_from_generation: number; valid_to_generation: number | null; producer_id: string; producer_version: string; record_digest: string; payload_digest: string; payload_byte_length: number; payload_inline: unknown; payload_cas_digest: string | null; record_payload: unknown }>("SELECT record_id, workspace_id, category, kind, universal_kind, schema_version, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, producer_id, producer_version, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload FROM record_occurrences WHERE workspace_id = ?", [this.workspaceId]);
+    const canonicalRows = await this.database.all<Record<string, unknown>>("SELECT * FROM record_occurrences WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of canonicalRows) {
       try {
-        const payload = decodeCanonical(bytes(row.record_payload)) as Record<string, unknown>;
-        // record_payload carries no workspace_id / owner_artifact_id /
-        // owner_artifact_version_id (decision 11: canonical layer payloads
-        // are workspace-free); those are authoritative only as row columns,
-        // checked separately below via `requireOwner`.
-        const fieldMatches = payload["record_id"] === row.record_id && payload["category"] === row.category && payload["kind"] === row.kind && payload["universal_kind"] === row.universal_kind && payload["schema_version"] === row.schema_version && payload["valid_from_generation"] === row.valid_from_generation && (payload["valid_to_generation"] ?? null) === row.valid_to_generation && payload["producer_id"] === row.producer_id && payload["producer_version"] === row.producer_version && payload["record_digest"] === row.record_digest;
-        const payloadBytes = encodeCanonical(payload["payload"]);
-        const storageMatches = payloadBytes.byteLength === row.payload_byte_length && digestBytes(payloadBytes) === row.payload_digest && (row.payload_cas_digest === null ? row.payload_inline !== null && sameBytes(bytes(row.payload_inline), payloadBytes) : row.payload_inline === null && row.payload_cas_digest === row.payload_digest);
-        if (!fieldMatches || !storageMatches) throw new StorageError("storage:canonical_corrupt", `Canonical record ${row.record_id} differs from its typed row or payload digest.`);
-        if ([payload["analysis_digest"], payload["analysis_configuration_digest"], payload["artifact_dependency_digest"], row["record_digest"]].every(isDigest)) {
-          const recordPositive = { ...payload };
-          delete recordPositive["record_digest"];
-          delete recordPositive["valid_to_generation"];
-          const recomputedRecordDigest = computeDigest("core:canonical_record", "core:record_digest", 1, "core:RecordDigestPayload", 1, recordPositive);
-          if (row["record_digest"] !== recomputedRecordDigest) throw new StorageError("storage:record_digest_corrupt", `Canonical record ${row.record_id} digest does not match its positive fields.`);
-        }
-        await this.requireOwner(row.owner_artifact_id, row.owner_artifact_version_id);
-        if (row.payload_cas_digest) await this.cas.read(row.payload_cas_digest);
-      } catch (error) { failures.push({ component_kind: "canonical", component_id: row.record_id, error_code: error instanceof StorageError ? error.code : "canonical_corrupt" }); }
+        const body = row["body_payload"] == null
+          ? hydrateRelationalValue(await this.database.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [this.workspaceId, String(row["record_id"]), Number(row["valid_from_generation"])]))
+          : decodeCanonical(bytes(row["body_payload"]));
+        const logicalPayload = digestRelationalValue(body);
+        if (logicalPayload.byte_length !== Number(row["body_byte_length"]) || logicalPayload.digest !== row["body_digest"]) throw new StorageError("storage:canonical_corrupt", `Canonical record ${row["record_id"]} differs from its typed value digest.`);
+        await this.requireOwner(String(row["owner_artifact_id"]), String(row["owner_artifact_version_id"]));
+      } catch (error) { failures.push({ component_kind: "canonical", component_id: String(row["record_id"]), error_code: error instanceof StorageError ? error.code : "canonical_corrupt" }); }
     }
     const catalog = await openSqliteDatabase({ filename: join(this.rootDir, "catalog.sqlite"), read_only: true });
     try {
-      const registration = await catalog.get<{ workspace_id: string; database_path: string; removed_at: string | null; workspace_payload: unknown }>("SELECT workspace_id, database_path, removed_at, workspace_payload FROM installation_workspaces WHERE workspace_id = ?", [this.workspaceId]);
+      const registration = await catalog.get<{ workspace_id: string; database_path: string; removed_at: string | null }>("SELECT workspace_id, database_path, removed_at FROM installation_workspaces WHERE workspace_id = ?", [this.workspaceId]);
       if (!registration || registration.removed_at !== null) failures.push({ component_kind: "control_plane", component_id: this.workspaceId, error_code: "storage:catalog_workspace_missing" });
       else {
-        try { const payload = decodeCanonical(bytes(registration.workspace_payload)) as Record<string, unknown>; if (payload["workspace_id"] !== this.workspaceId || !(await pathExists(registration.database_path))) throw new StorageError("storage:catalog_workspace_corrupt", `Catalog registration ${this.workspaceId} does not close over an installed workspace database.`); }
+        try { if (registration.workspace_id !== this.workspaceId || !(await pathExists(registration.database_path))) throw new StorageError("storage:catalog_workspace_corrupt", `Catalog registration ${this.workspaceId} does not close over an installed workspace database.`); }
         catch (error) { failures.push({ component_kind: "control_plane", component_id: this.workspaceId, error_code: error instanceof StorageError ? error.code : "storage:catalog_workspace_corrupt" }); }
       }
-      const installations = await catalog.all<{ model_pack_installation_id: string; manifest_digest: string; installation_payload: unknown }>("SELECT model_pack_installation_id, manifest_digest, installation_payload FROM installation_model_pack_installations WHERE removed_at IS NULL");
+      const installations = await catalog.all<{ model_pack_installation_id: string; manifest_digest: string }>("SELECT model_pack_installation_id, manifest_digest FROM installation_model_pack_installations WHERE removed_at IS NULL");
       for (const installation of installations) {
-        try { const closure = new Set<string>([installation.manifest_digest]); collectContentHashes(decodeCanonical(bytes(installation.installation_payload)), closure); for (const hash of closure) await this.cas.read(hash); }
+        try { await this.cas.read(installation.manifest_digest); }
         catch (error) { failures.push({ component_kind: "source_catalog", component_id: installation.model_pack_installation_id, error_code: error instanceof StorageError ? error.code : "storage:catalog_installation_corrupt" }); }
       }
       const roots = await catalog.all<{ root_kind: string; root_id: string; content_hash: string }>("SELECT root_kind, root_id, content_hash FROM installation_gc_roots");
@@ -902,7 +844,7 @@ export class StorageMaintenance {
       if (!row) throw new StorageError("storage:repair_component_missing", `Lexical projection ${request.component_id} is missing.`);
       const text = new TextDecoder().decode(await this.cas.read(row.content_hash));
       await this.database.transaction([
-        { kind: "run", sql: "DELETE FROM lexical_trigrams WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?", params: [this.workspaceId, artifactId ?? request.component_id, artifactVersionId ?? ""] },
+        { kind: "run", sql: "DELETE FROM lexical_fts WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?", params: [this.workspaceId, artifactId ?? request.component_id, artifactVersionId ?? ""] },
         { kind: "run", sql: "DELETE FROM lexical_documents WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?", params: [this.workspaceId, artifactId ?? request.component_id, artifactVersionId ?? ""] },
       ]);
       const lexicalValue = { artifact_id: artifactId ?? "", artifact_version_id: artifactVersionId ?? "", text, valid_from_generation: row.valid_from_generation };
@@ -938,18 +880,18 @@ export class StorageMaintenance {
       const generation = generationText === undefined ? 0 : Number(generationText);
       const backupDb = await openSqliteDatabase({ filename: join(request.backup_directory, "workspace.sqlite"), read_only: true });
       try {
-        const row = await backupDb.get<{ projection_record_id: string; shard_id: string; shard_offset: number; byte_length: number; vector_digest: string; owner_artifact_id: string; owner_artifact_version_id: string; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string; valid_from_generation: number; valid_to_generation: number | null; vector_payload: unknown }>("SELECT projection_record_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, vector_payload FROM vector_projection_rows WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", [this.workspaceId, projectionRecordId ?? request.component_id, generation]);
+        const row = await backupDb.get<{ projection_record_id: string; shard_id: string; shard_offset: number; byte_length: number; vector_digest: string; owner_artifact_id: string; owner_artifact_version_id: string; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string; valid_from_generation: number; valid_to_generation: number | null; document_grain: string | null; document_ref: string | null }>("SELECT projection_record_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, document_grain, document_ref FROM vector_projection_rows WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", [this.workspaceId, projectionRecordId ?? request.component_id, generation]);
         if (!row) throw new StorageError("storage:repair_component_missing", `Vector projection ${request.component_id} is missing from the verified backup.`);
-        const shard = await backupDb.get<{ shard_id: string; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string; byte_length: number; content_hash: string; storage_reference: string; created_at: string; shard_payload: unknown }>("SELECT shard_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at, shard_payload FROM vector_shards WHERE workspace_id = ? AND shard_id = ?", [this.workspaceId, row.shard_id]);
+        const shard = await backupDb.get<{ shard_id: string; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string; byte_length: number; content_hash: string; storage_reference: string; created_at: string }>("SELECT shard_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at FROM vector_shards WHERE workspace_id = ? AND shard_id = ?", [this.workspaceId, row.shard_id]);
         if (!shard) throw new StorageError("storage:repair_component_missing", `Vector shard ${row.shard_id} is missing from the verified backup.`);
         const shardPath = join(request.backup_directory, "cas", "sha256", shard.content_hash.slice(7, 9), shard.content_hash.slice(9, 11), shard.content_hash.slice(11));
         const shardBytes = new Uint8Array(await readFile(shardPath));
         if (digestBytes(shardBytes) !== shard.content_hash) throw new StorageError("storage:repair_source_corrupt", `Backup vector shard ${shard.content_hash} failed verification.`);
         await unlink(this.cas.objectPath(shard.content_hash)).catch((error) => { if (!isMissing(error)) throw error; });
         await this.cas.put(shardBytes, { content_hash: shard.content_hash });
-        await this.database.run("INSERT INTO vector_shards (shard_id, workspace_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at, shard_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(shard_id) DO UPDATE SET profile_id = excluded.profile_id, executable_binding_id = excluded.executable_binding_id, dimensions = excluded.dimensions, element_type = excluded.element_type, vector_encoding = excluded.vector_encoding, normalization = excluded.normalization, distance_metric = excluded.distance_metric, byte_length = excluded.byte_length, content_hash = excluded.content_hash, storage_reference = excluded.storage_reference, created_at = excluded.created_at, shard_payload = excluded.shard_payload", [shard.shard_id, this.workspaceId, shard.profile_id, shard.executable_binding_id, shard.dimensions, shard.element_type, shard.vector_encoding, shard.normalization, shard.distance_metric, shard.byte_length, shard.content_hash, shard.storage_reference, shard.created_at, bytes(shard.shard_payload)]);
+        await this.database.run("INSERT INTO vector_shards (shard_id, workspace_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(shard_id) DO UPDATE SET profile_id = excluded.profile_id, executable_binding_id = excluded.executable_binding_id, dimensions = excluded.dimensions, element_type = excluded.element_type, vector_encoding = excluded.vector_encoding, normalization = excluded.normalization, distance_metric = excluded.distance_metric, byte_length = excluded.byte_length, content_hash = excluded.content_hash, storage_reference = excluded.storage_reference, created_at = excluded.created_at", [shard.shard_id, this.workspaceId, shard.profile_id, shard.executable_binding_id, shard.dimensions, shard.element_type, shard.vector_encoding, shard.normalization, shard.distance_metric, shard.byte_length, shard.content_hash, shard.storage_reference, shard.created_at]);
         await this.database.run("DELETE FROM vector_projection_rows WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", [this.workspaceId, projectionRecordId ?? request.component_id, generation]);
-        await this.database.run("INSERT INTO vector_projection_rows (projection_record_id, workspace_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, vector_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [row.projection_record_id, this.workspaceId, row.shard_id, row.shard_offset, row.byte_length, row.vector_digest, row.owner_artifact_id, row.owner_artifact_version_id, row.profile_id, row.executable_binding_id, row.dimensions, row.element_type, row.vector_encoding, row.normalization, row.distance_metric, row.valid_from_generation, row.valid_to_generation, bytes(row.vector_payload)]);
+        await this.database.run("INSERT INTO vector_projection_rows (projection_record_id, workspace_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, document_grain, document_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [row.projection_record_id, this.workspaceId, row.shard_id, row.shard_offset, row.byte_length, row.vector_digest, row.owner_artifact_id, row.owner_artifact_version_id, row.profile_id, row.executable_binding_id, row.dimensions, row.element_type, row.vector_encoding, row.normalization, row.distance_metric, row.valid_from_generation, row.valid_to_generation, row.document_grain, row.document_ref]);
       } finally { await backupDb.close(); }
     } else if (["canonical", "source_catalog", "registry", "control_plane", "current_tuple", "lease", "pin"].includes(request.component_kind)) {
       if (!request.backup_directory) throw new StorageError("storage:repair_source_missing", `${request.component_kind} repair requires a verified backup directory.`);
@@ -1022,7 +964,7 @@ export class StorageMaintenance {
     const backupId = `backup:${randomUUID()}`;
     const staging = `${resolve(destination)}.tmp-${randomUUID()}`;
     await mkdir(staging, { recursive: true });
-    await this.database.run("INSERT INTO backup_barriers (backup_id, workspace_id, state, started_at, completed_at, backup_payload) VALUES (?, ?, 'active', ?, NULL, ?)", [backupId, this.workspaceId, new Date().toISOString(), encodeCanonical({ backup_id: backupId, destination })]);
+    await this.database.run("INSERT INTO backup_barriers (backup_id, workspace_id, state, started_at, completed_at) VALUES (?, ?, 'active', ?, NULL)", [backupId, this.workspaceId, new Date().toISOString()]);
     try {
       const beforeHashes = await this.reachableHashes();
       await this.faults.hit("backup.before_snapshot");
@@ -1102,12 +1044,9 @@ export class StorageMaintenance {
   private async rebaseRestoredCatalog(catalogPath: string, restoredDatabasePath: string, restoredRoot: string): Promise<void> {
     const catalog = await openSqliteDatabase({ filename: catalogPath });
     try {
-      const registration = await catalog.get<{ workspace_payload: unknown }>("SELECT workspace_payload FROM installation_workspaces WHERE workspace_id = ?", [this.workspaceId]);
+      const registration = await catalog.get<{ workspace_id: string }>("SELECT workspace_id FROM installation_workspaces WHERE workspace_id = ?", [this.workspaceId]);
       if (!registration) throw new StorageError("storage:backup_corrupt", "Restored catalog has no target workspace registration.");
-      const workspace = decodeCanonical(bytes(registration.workspace_payload)) as Record<string, unknown>;
-      workspace["canonical_root"] = restoredRoot;
-      workspace["display_root"] = restoredRoot;
-      await catalog.run("UPDATE installation_workspaces SET canonical_root = ?, display_root = ?, database_path = ?, workspace_payload = ? WHERE workspace_id = ?", [restoredRoot, restoredRoot, restoredDatabasePath, encodeCanonical(workspace), this.workspaceId]);
+      await catalog.run("UPDATE installation_workspaces SET canonical_root = ?, display_root = ?, database_path = ? WHERE workspace_id = ?", [restoredRoot, restoredRoot, restoredDatabasePath, this.workspaceId]);
     } finally { await catalog.close(); }
   }
 
@@ -1173,17 +1112,17 @@ export class StorageMaintenance {
     const migrationStartedAt = new Date().toISOString();
     const shadowPath = join(this.rootDir, "migrations", `${migrationEntryName}.sqlite`);
     const recoveryPath = `${this.database.filename}.migration-recovery-${randomUUID()}`;
-    const initialPayload = encodeCanonical({ migration_id: migrationId, from_version: currentVersion, to_version: targetVersion, backup_path: backupPath, shadow_database_path: shadowPath, recovery_path: recoveryPath });
-    await this.database.run("INSERT INTO storage_migrations (migration_id, workspace_id, from_version, to_version, state, backup_path, started_at, completed_at, migration_payload, shadow_database_path, shadow_database_digest) VALUES (?, ?, ?, ?, 'running', ?, ?, NULL, ?, ?, NULL)", [migrationId, this.workspaceId, currentVersion, targetVersion, backupPath, migrationStartedAt, initialPayload, shadowPath]);
+    const initialStateJson = JSON.stringify({ migration_id: migrationId, from_version: currentVersion, to_version: targetVersion, backup_path: backupPath, shadow_database_path: shadowPath, recovery_path: recoveryPath });
+    await this.database.run("INSERT INTO storage_migrations (migration_id, workspace_id, from_version, to_version, state, backup_path, started_at, completed_at, migration_state_json, shadow_database_path, shadow_database_digest) VALUES (?, ?, ?, ?, 'running', ?, ?, NULL, ?, ?, NULL)", [migrationId, this.workspaceId, currentVersion, targetVersion, backupPath, migrationStartedAt, initialStateJson, shadowPath]);
     await mkdir(dirname(shadowPath), { recursive: true });
     const logicalColumns = await this.createTypedShadowDatabase(shadowPath);
     const sourceEquivalenceDigest = await this.databaseEquivalenceDigest(this.database, logicalColumns, true);
     const shadowEquivalenceDigest = await this.verifyShadowDatabase(shadowPath, sourceEquivalenceDigest, logicalColumns);
-    const payload = encodeCanonical({ migration_id: migrationId, from_version: currentVersion, to_version: targetVersion, backup_path: backupPath, shadow_database_path: shadowPath, shadow_database_digest: shadowEquivalenceDigest, recovery_path: recoveryPath });
+    const stateJson = JSON.stringify({ migration_id: migrationId, from_version: currentVersion, to_version: targetVersion, backup_path: backupPath, shadow_database_path: shadowPath, shadow_database_digest: shadowEquivalenceDigest, recovery_path: recoveryPath });
     await this.faults.hit("migration.after_shadow_copy");
     await this.faults.hit("migration.before_swap");
     await this.database.transaction([{ kind: "replace_database", destination: shadowPath, recovery: recoveryPath }]);
-    await this.database.run("UPDATE storage_migrations SET shadow_database_digest = ?, migration_payload = ? WHERE migration_id = ? AND state = 'running'", [shadowEquivalenceDigest, payload, migrationId]);
+    await this.database.run("UPDATE storage_migrations SET shadow_database_digest = ?, migration_state_json = ? WHERE migration_id = ? AND state = 'running'", [shadowEquivalenceDigest, stateJson, migrationId]);
     await this.verifyReadOnlyDatabase(this.database.filename);
     await this.faults.hit("migration.before_publish");
     await this.database.transaction([
@@ -1194,13 +1133,29 @@ export class StorageMaintenance {
   }
 
   async reconcileMigration(migrationId: string): Promise<"completed" | "aborted" | "unchanged"> {
-    const row = await this.database.get<{ to_version: number; state: string; shadow_database_path: string | null; shadow_database_digest: string | null; migration_payload: unknown }>("SELECT to_version, state, shadow_database_path, shadow_database_digest, migration_payload FROM storage_migrations WHERE workspace_id = ? AND migration_id = ?", [this.workspaceId, migrationId]);
+    const row = await this.database.get<{ to_version: number; state: string; shadow_database_path: string | null; shadow_database_digest: string | null; migration_state_json: string }>("SELECT to_version, state, shadow_database_path, shadow_database_digest, migration_state_json FROM storage_migrations WHERE workspace_id = ? AND migration_id = ?", [this.workspaceId, migrationId]);
     if (!row || row.state !== "running") return "unchanged";
-    const payload = decodeCanonical(bytes(row.migration_payload)) as { recovery_path?: string };
+    const payload = JSON.parse(row.migration_state_json) as { recovery_path?: string };
     const shadowPath = row.shadow_database_path;
     const recoveryPath = payload.recovery_path;
     const shadowExists = shadowPath ? await pathExists(shadowPath) : false;
     const recoveryExists = recoveryPath ? await pathExists(recoveryPath) : false;
+    // A process can die immediately after the atomic database swap and before
+    // the shadow digest update reaches SQLite. In that window the destination
+    // is already the verified shadow database, the shadow path is gone, and
+    // the recovery copy is still present. Treat the durable swap boundary as
+    // authoritative: startup schema checks have already opened the swapped
+    // database successfully, so finish publication instead of incorrectly
+    // aborting a migration whose final receipt was not flushed.
+    if (!shadowExists && recoveryExists && !row.shadow_database_digest) {
+      await this.verifyReadOnlyDatabase(this.database.filename);
+      await this.database.transaction([
+        { kind: "run", sql: "INSERT INTO workspace_meta (key, value) VALUES ('storage_format_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params: [encodeCanonical(row.to_version)] },
+        { kind: "run", sql: "UPDATE storage_migrations SET state = 'completed', completed_at = COALESCE(completed_at, ?) WHERE workspace_id = ? AND migration_id = ? AND state = 'running'", params: [new Date().toISOString(), this.workspaceId, migrationId] },
+      ]);
+      await removeTree(recoveryPath!);
+      return "completed";
+    }
     if (!shadowExists && row.shadow_database_digest) {
       const quickCheck = await this.database.get<{ quick_check: string }>("PRAGMA quick_check");
       const currentDigest = quickCheck?.quick_check === "ok" ? await this.databaseEquivalenceDigest(this.database) : "";
@@ -1221,7 +1176,7 @@ export class StorageMaintenance {
     }
     if (shadowExists && shadowPath) await removeTree(shadowPath);
     if (recoveryExists && recoveryPath) await removeTree(recoveryPath);
-    await this.database.run("UPDATE storage_migrations SET state = 'aborted', completed_at = COALESCE(completed_at, ?), migration_payload = ? WHERE workspace_id = ? AND migration_id = ? AND state = 'running'", [new Date().toISOString(), encodeCanonical({ ...payload, recovery_action: "rollback" }), this.workspaceId, migrationId]);
+    await this.database.run("UPDATE storage_migrations SET state = 'aborted', completed_at = COALESCE(completed_at, ?), migration_state_json = ? WHERE workspace_id = ? AND migration_id = ? AND state = 'running'", [new Date().toISOString(), JSON.stringify({ ...payload, recovery_action: "rollback" }), this.workspaceId, migrationId]);
     return "aborted";
   }
 
@@ -1233,52 +1188,8 @@ export class StorageMaintenance {
     return { ...row, columns };
   }
 
-  /** Rebuild typed projection indexes from their canonical projection payloads in a migrated shadow. */
-  private async recomputeProjectionTables(database: SqliteDatabase): Promise<void> {
-    const value = (payload: unknown): Record<string, unknown> => {
-      const decoded = decodeCanonical(bytes(payload));
-      if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new StorageError("storage:migration_projection_recompute_failed", "A projection payload is not a canonical object.");
-      return decoded as Record<string, unknown>;
-    };
-    const graphRows = await database.all<{ edge_id: string; valid_from_generation: number; edge_payload: unknown }>("SELECT edge_id, valid_from_generation, edge_payload FROM graph_edges WHERE workspace_id = ?", [this.workspaceId]);
-    for (const row of graphRows) {
-      const entry = value(row.edge_payload);
-      if (entry["edge_id"] !== row.edge_id || typeof entry["source_subject_id"] !== "string" || typeof entry["target_subject_id"] !== "string" || typeof entry["valid_from_generation"] !== "number") throw new StorageError("storage:migration_projection_recompute_failed", `Graph edge ${row.edge_id} has an invalid canonical payload.`);
-      await database.run("UPDATE graph_edges SET source_subject_id = ?, target_subject_id = ?, relation_record_id = ?, relation_kind = ?, role = ?, evidence_class = ?, owner_artifact_id = ?, owner_artifact_version_id = ?, valid_from_generation = ?, valid_to_generation = ? WHERE workspace_id = ? AND edge_id = ? AND valid_from_generation = ?", [sqliteValue(entry["source_subject_id"]), sqliteValue(entry["target_subject_id"]), sqliteValue(entry["relation_record_id"]), sqliteValue(entry["relation_kind"]), sqliteValue(entry["role"]), sqliteValue(entry["evidence_class"]), sqliteValue(entry["owner_artifact_id"]), sqliteValue(entry["owner_artifact_version_id"]), sqliteValue(entry["valid_from_generation"]), sqliteValue(entry["valid_to_generation"]), this.workspaceId, row.edge_id, row.valid_from_generation]);
-    }
-    const lexicalRows = await database.all<{ artifact_id: string; artifact_version_id: string; document_payload: unknown }>("SELECT artifact_id, artifact_version_id, document_payload FROM lexical_documents WHERE workspace_id = ?", [this.workspaceId]);
-    for (const row of lexicalRows) {
-      const value = decodeCanonical(bytes(row.document_payload)) as { artifact_id?: string; artifact_version_id?: string; text?: string; valid_from_generation?: number; valid_to_generation?: number };
-      if (value.artifact_id !== row.artifact_id || value.artifact_version_id !== row.artifact_version_id || typeof value.text !== "string" || !Number.isSafeInteger(value.valid_from_generation)) throw new StorageError("storage:migration_projection_recompute_failed", `Lexical document ${row.artifact_id}/${row.artifact_version_id} has an invalid canonical payload.`);
-      const source = await database.get<{ content_hash: string; byte_length: number; storage_reference: string }>("SELECT artifact_versions.content_hash AS content_hash, artifact_versions.byte_length AS byte_length, content_blobs.storage_reference AS storage_reference FROM artifact_versions JOIN content_blobs ON content_blobs.content_blob_id = artifact_versions.content_blob_id WHERE artifact_versions.workspace_id = ? AND artifact_versions.artifact_id = ? AND artifact_versions.artifact_version_id = ?", [this.workspaceId, row.artifact_id, row.artifact_version_id]);
-      if (!source) throw new StorageError("storage:migration_projection_recompute_failed", `Lexical document ${row.artifact_id}/${row.artifact_version_id} has no authoritative source version.`);
-      await database.run("UPDATE lexical_documents SET content_hash = ?, byte_length = ?, storage_reference = ?, valid_from_generation = ?, valid_to_generation = ? WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?", [source.content_hash, source.byte_length, source.storage_reference, sqliteValue(value.valid_from_generation), sqliteValue(value.valid_to_generation), this.workspaceId, row.artifact_id, row.artifact_version_id]);
-      await database.run("DELETE FROM lexical_trigrams WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?", [this.workspaceId, row.artifact_id, row.artifact_version_id]);
-      for (const trigram of lexicalTrigrams(value.text)) await database.run("INSERT INTO lexical_trigrams (workspace_id, trigram, artifact_id, artifact_version_id, trigram_payload) VALUES (?, ?, ?, ?, ?)", [this.workspaceId, trigram, row.artifact_id, row.artifact_version_id, encodeCanonical({ trigram })]);
-    }
-    const dependencyRows = await database.all<{ dependency_entry_id: string; valid_from_generation: number; dependency_payload: unknown }>("SELECT dependency_entry_id, valid_from_generation, dependency_payload FROM artifact_dependencies WHERE workspace_id = ?", [this.workspaceId]);
-    for (const row of dependencyRows) {
-      const entry = value(row.dependency_payload);
-      if (entry["dependency_entry_id"] !== row.dependency_entry_id) throw new StorageError("storage:migration_projection_recompute_failed", `Dependency ${row.dependency_entry_id} has an invalid canonical payload.`);
-      await database.run("UPDATE artifact_dependencies SET record_id = ?, owner_artifact_id = ?, owner_artifact_version_id = ?, dependency_artifact_id = ?, dependency_artifact_version_id = ?, dependency_role = ?, producer_id = ?, producer_version = ?, valid_from_generation = ?, valid_to_generation = ? WHERE workspace_id = ? AND dependency_entry_id = ? AND valid_from_generation = ?", [sqliteValue(entry["record_id"]), sqliteValue(entry["owner_artifact_id"]), sqliteValue(entry["owner_artifact_version_id"]), sqliteValue(entry["dependency_artifact_id"]), sqliteValue(entry["dependency_artifact_version_id"]), sqliteValue(entry["dependency_role"]), sqliteValue(entry["producer_id"]), sqliteValue(entry["producer_version"]), sqliteValue(entry["valid_from_generation"]), sqliteValue(entry["valid_to_generation"]), this.workspaceId, row.dependency_entry_id, row.valid_from_generation]);
-    }
-    const metricRows = await database.all<{ metric_id: string; valid_from_generation: number; metric_payload: unknown }>("SELECT metric_id, valid_from_generation, metric_payload FROM metric_projections WHERE workspace_id = ?", [this.workspaceId]);
-    for (const row of metricRows) {
-      const entry = value(row.metric_payload);
-      if (entry["metric_id"] !== row.metric_id) throw new StorageError("storage:migration_projection_recompute_failed", `Metric ${row.metric_id} has an invalid canonical payload.`);
-      await database.run("UPDATE metric_projections SET projection_record_id = ?, metric_kind = ?, metric_value = ?, owner_artifact_id = ?, owner_artifact_version_id = ?, valid_from_generation = ?, valid_to_generation = ? WHERE workspace_id = ? AND metric_id = ? AND valid_from_generation = ?", [sqliteValue(entry["projection_record_id"]), sqliteValue(entry["metric_kind"]), sqliteValue(entry["metric_value"]), sqliteValue(entry["owner_artifact_id"]), sqliteValue(entry["owner_artifact_version_id"]), sqliteValue(entry["valid_from_generation"]), sqliteValue(entry["valid_to_generation"]), this.workspaceId, row.metric_id, row.valid_from_generation]);
-    }
-    const vectorRows = await database.all<{ projection_record_id: string; valid_from_generation: number; vector_payload: unknown }>("SELECT projection_record_id, valid_from_generation, vector_payload FROM vector_projection_rows WHERE workspace_id = ?", [this.workspaceId]);
-    for (const row of vectorRows) {
-      const entry = value(row.vector_payload);
-      if (entry["projection_record_id"] !== row.projection_record_id || !(entry["vector"] instanceof Uint8Array)) throw new StorageError("storage:migration_projection_recompute_failed", `Vector ${row.projection_record_id} has an invalid canonical payload.`);
-      const vector = entry["vector"] as Uint8Array;
-      await database.run("UPDATE vector_projection_rows SET vector_digest = ?, byte_length = ?, owner_artifact_id = ?, owner_artifact_version_id = ?, profile_id = ?, executable_binding_id = ?, dimensions = ?, element_type = ?, vector_encoding = ?, normalization = ?, distance_metric = ?, valid_from_generation = ?, valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", [digestBytes(vector), vector.byteLength, sqliteValue(entry["owner_artifact_id"]), sqliteValue(entry["owner_artifact_version_id"]), sqliteValue(entry["profile_id"]), sqliteValue(entry["executable_binding_id"]), sqliteValue(entry["dimensions"]), sqliteValue(entry["element_type"]), sqliteValue(entry["vector_encoding"]), sqliteValue(entry["normalization"]), sqliteValue(entry["distance_metric"]), sqliteValue(entry["valid_from_generation"]), sqliteValue(entry["valid_to_generation"]), this.workspaceId, row.projection_record_id, row.valid_from_generation]);
-    }
-  }
-
   private async databaseEquivalenceDigest(database: SqliteDatabase, logicalColumns?: Readonly<Record<string, readonly string[]>>, canonicalizeProjections = false): Promise<string> {
-    const tables = await database.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
+    const tables = await database.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'lexical_fts%' ORDER BY name");
     const exportRows: unknown[] = [];
     for (const table of tables) {
       if (table.name === "storage_migrations") continue;
@@ -1304,7 +1215,7 @@ export class StorageMaintenance {
     try {
       await shadow.exec(WORKSPACE_SCHEMA);
       await shadow.exec("PRAGMA foreign_keys = OFF");
-      const tables = await this.database.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
+      const tables = await this.database.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'lexical_fts%' ORDER BY name");
       const logicalColumns: Record<string, readonly string[]> = {};
       for (const table of tables) {
         const adapter = MIGRATION_TABLE_ADAPTERS[table.name];
@@ -1326,10 +1237,16 @@ export class StorageMaintenance {
           await shadow.run(`INSERT INTO ${quoted} (${columns.map((column) => `"${column.replaceAll('"', '""')}"`).join(", ")}) VALUES (${placeholders})`, values);
         }
       }
+      // FTS5 is a derived virtual table and therefore intentionally excluded
+      // from the typed relational equivalence scan. Preserve its current
+      // candidate rows during a destructive v3 shadow swap; lexical_documents
+      // remains the authoritative CAS-backed projection and the reconciler can
+      // rebuild FTS5 later if its completion marker is stale.
+      const lexicalRows = await this.database.all<{ workspace_id: string; artifact_id: string; artifact_version_id: string; content: string }>("SELECT workspace_id, artifact_id, artifact_version_id, content FROM lexical_fts");
+      for (const row of lexicalRows) await shadow.run("INSERT INTO lexical_fts (workspace_id, artifact_id, artifact_version_id, content) VALUES (?, ?, ?, ?)", [row.workspace_id, row.artifact_id, row.artifact_version_id, row.content]);
       await shadow.exec("PRAGMA foreign_keys = ON");
       const foreignKeyFailures = await shadow.all<Record<string, unknown>>("PRAGMA foreign_key_check");
       if (foreignKeyFailures.length > 0) throw new StorageError("storage:migration_foreign_key_failed", "The typed shadow database contains invalid foreign-key references.");
-      await this.recomputeProjectionTables(shadow);
       return logicalColumns;
     } finally {
       await shadow.close();
@@ -1353,7 +1270,7 @@ export class StorageMaintenance {
   }
 
   private async validateMigrationAdapters(database: SqliteDatabase, logicalColumns?: Readonly<Record<string, readonly string[]>>): Promise<void> {
-    const tables = await database.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
+    const tables = await database.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'lexical_fts%' ORDER BY name");
     for (const table of tables) {
       if (!(table.name in MIGRATION_TABLE_ADAPTERS)) throw new StorageError("storage:migration_adapter_missing", `No lossless migration adapter is registered for table ${table.name}.`);
       const adapter = MIGRATION_TABLE_ADAPTERS[table.name];
@@ -1368,7 +1285,10 @@ export class StorageMaintenance {
           const roundTrip = adapter.decodeRow(table.name, encoded, logicalColumns?.[table.name]);
           adapter.validate(table.name, roundTrip);
           if (!sameBytes(encodeCanonical(decoded), encodeCanonical(roundTrip))) throw new Error("typed logical row changed during round trip");
-        } catch (error) { throw new StorageError("storage:migration_decoder_failed", `Typed migration decoder failed for ${table.name}.`, { cause: error instanceof Error ? error.message : String(error) }); }
+        } catch (error) {
+          const detail = error && typeof error === "object" && "details" in error ? JSON.stringify((error as { readonly details?: unknown }).details) : undefined;
+          throw new StorageError("storage:migration_decoder_failed", `Typed migration decoder failed for ${table.name}.`, { cause: error instanceof Error ? error.message : String(error), ...(detail === undefined ? {} : { detail }) });
+        }
       }
     }
   }
@@ -1410,14 +1330,14 @@ export class StorageMaintenance {
     if (!epoch) {
       await this.setGlobalBarrier(epochId, "marking", options.now);
       await this.faults.hit("collection.before_mark");
-      await this.database.run("INSERT INTO garbage_collection_epochs (garbage_collection_epoch_id, workspace_id, state, started_at, mark_completed_at, sweep_started_at, completed_at, retention_root_digest, candidate_object_count, deleted_object_count, failure_code, epoch_payload) VALUES (?, ?, 'marking', ?, NULL, NULL, NULL, ?, 0, 0, NULL, ?)", [epochId, this.workspaceId, options.now, digestBytes(encodeCanonical([])), encodeCanonical({ workspace_id: this.workspaceId, state: "marking" })]);
+      await this.database.run("INSERT INTO garbage_collection_epochs (garbage_collection_epoch_id, workspace_id, state, started_at, mark_completed_at, sweep_started_at, completed_at, retention_root_digest, candidate_object_count, deleted_object_count, failure_code, workspace_boundaries, candidate_object_digest, deleted_object_digest) VALUES (?, ?, 'marking', ?, NULL, NULL, NULL, ?, 0, 0, NULL, ?, ?, ?)", [epochId, this.workspaceId, options.now, digestBytes(encodeCanonical([])), JSON.stringify([this.workspaceId]), digestBytes(encodeCanonical([])), digestBytes(encodeCanonical([]))]);
       const roots = await this.reachableHashesAllWorkspaces();
       const all = await this.listCasHashes();
       const candidates = all.filter((hash) => !roots.has(hash)).sort();
       if (candidates.length > 0) {
         await this.database.transaction(candidates.map((hash) => ({ kind: "run" as const, sql: "INSERT INTO garbage_collection_candidates (garbage_collection_epoch_id, content_hash) VALUES (?, ?)", params: [epochId, hash] as readonly SqliteValue[] })));
       }
-      await this.database.run("UPDATE garbage_collection_epochs SET state = 'sweeping', mark_completed_at = ?, sweep_started_at = ?, retention_root_digest = ?, candidate_object_count = ?, epoch_payload = ? WHERE garbage_collection_epoch_id = ?", [options.now, options.now, digestBytes(encodeCanonical([...roots].sort())), candidates.length, encodeCanonical({ workspace_id: this.workspaceId, roots: [...roots].sort(), candidates }), epochId]);
+      await this.database.run("UPDATE garbage_collection_epochs SET state = 'sweeping', mark_completed_at = ?, sweep_started_at = ?, retention_root_digest = ?, candidate_object_count = ?, workspace_boundaries = ?, candidate_object_digest = ? WHERE garbage_collection_epoch_id = ?", [options.now, options.now, digestBytes(encodeCanonical([...roots].sort())), candidates.length, JSON.stringify([this.workspaceId]), digestBytes(encodeCanonical(candidates)), epochId]);
       await this.setGlobalBarrier(epochId, "sweeping", options.now);
       await this.faults.hit("collection.after_mark");
       epoch = { state: "sweeping", candidate_object_count: candidates.length };
@@ -1428,7 +1348,7 @@ export class StorageMaintenance {
       const candidates = all.filter((hash) => !roots.has(hash)).sort();
       await this.database.run("DELETE FROM garbage_collection_candidates WHERE garbage_collection_epoch_id = ?", [epochId]);
       if (candidates.length > 0) await this.database.transaction(candidates.map((hash) => ({ kind: "run" as const, sql: "INSERT INTO garbage_collection_candidates (garbage_collection_epoch_id, content_hash) VALUES (?, ?)", params: [epochId, hash] as readonly SqliteValue[] })));
-      await this.database.run("UPDATE garbage_collection_epochs SET state = 'sweeping', mark_completed_at = ?, sweep_started_at = ?, retention_root_digest = ?, candidate_object_count = ?, epoch_payload = ? WHERE garbage_collection_epoch_id = ?", [options.now, options.now, digestBytes(encodeCanonical([...roots].sort())), candidates.length, encodeCanonical({ workspace_id: this.workspaceId, roots: [...roots].sort(), candidates }), epochId]);
+      await this.database.run("UPDATE garbage_collection_epochs SET state = 'sweeping', mark_completed_at = ?, sweep_started_at = ?, retention_root_digest = ?, candidate_object_count = ?, workspace_boundaries = ?, candidate_object_digest = ? WHERE garbage_collection_epoch_id = ?", [options.now, options.now, digestBytes(encodeCanonical([...roots].sort())), candidates.length, JSON.stringify([this.workspaceId]), digestBytes(encodeCanonical(candidates)), epochId]);
       await this.setGlobalBarrier(epochId, "sweeping", options.now);
       await this.faults.hit("collection.after_mark");
     } else if (epoch.state === "sweeping") {
@@ -1440,7 +1360,7 @@ export class StorageMaintenance {
       const candidates = all.filter((hash) => !roots.has(hash)).sort();
       await this.database.run("DELETE FROM garbage_collection_candidates WHERE garbage_collection_epoch_id = ?", [epochId]);
       if (candidates.length > 0) await this.database.transaction(candidates.map((hash) => ({ kind: "run" as const, sql: "INSERT INTO garbage_collection_candidates (garbage_collection_epoch_id, content_hash) VALUES (?, ?)", params: [epochId, hash] as readonly SqliteValue[] })));
-      await this.database.run("UPDATE garbage_collection_epochs SET state = 'sweeping', mark_completed_at = ?, sweep_started_at = ?, retention_root_digest = ?, candidate_object_count = ?, failure_code = NULL, epoch_payload = ? WHERE garbage_collection_epoch_id = ?", [options.now, options.now, digestBytes(encodeCanonical([...roots].sort())), candidates.length, encodeCanonical({ workspace_id: this.workspaceId, roots: [...roots].sort(), candidates, recovered: true }), epochId]);
+      await this.database.run("UPDATE garbage_collection_epochs SET state = 'sweeping', mark_completed_at = ?, sweep_started_at = ?, retention_root_digest = ?, candidate_object_count = ?, failure_code = NULL, workspace_boundaries = ?, candidate_object_digest = ? WHERE garbage_collection_epoch_id = ?", [options.now, options.now, digestBytes(encodeCanonical([...roots].sort())), candidates.length, JSON.stringify([this.workspaceId]), digestBytes(encodeCanonical(candidates)), epochId]);
       await this.setGlobalBarrier(epochId, "sweeping", options.now);
       epoch = { state: "sweeping", candidate_object_count: candidates.length };
     }
@@ -1478,18 +1398,13 @@ export class StorageMaintenance {
   }
 
   private async verifyVector(projectionRecordId: string, generation?: number): Promise<void> {
-    const row = await this.database.get<{ shard_id: string; shard_offset: number; byte_length: number; vector_digest: string; owner_artifact_id: string; owner_artifact_version_id: string; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string; valid_from_generation: number; valid_to_generation: number | null; vector_payload: unknown }>("SELECT shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, vector_payload FROM vector_projection_rows WHERE workspace_id = ? AND projection_record_id = ? AND (? IS NULL OR valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)) ORDER BY valid_from_generation DESC LIMIT 1", [this.workspaceId, projectionRecordId, generation ?? null, generation ?? null, generation ?? null]);
+    const row = await this.database.get<{ shard_id: string; shard_offset: number; byte_length: number; vector_digest: string; owner_artifact_id: string; owner_artifact_version_id: string; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string; valid_from_generation: number; valid_to_generation: number | null }>("SELECT shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation FROM vector_projection_rows WHERE workspace_id = ? AND projection_record_id = ? AND (? IS NULL OR valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)) ORDER BY valid_from_generation DESC LIMIT 1", [this.workspaceId, projectionRecordId, generation ?? null, generation ?? null, generation ?? null]);
     if (!row) throw new StorageError("storage:vector_missing", `Vector ${projectionRecordId} is missing.`);
     if ((row.element_type !== "float32" && row.element_type !== "float64") || (row.vector_encoding !== "float32-le" && row.vector_encoding !== "float64-le") || (row.element_type === "float32" && row.vector_encoding !== "float32-le") || (row.element_type === "float64" && row.vector_encoding !== "float64-le") || row.byte_length !== row.dimensions * (row.element_type === "float32" ? 4 : 8)) throw new StorageError("storage:vector_corrupt", `Vector ${projectionRecordId} has invalid declared encoding metadata.`);
-    const payload = decodeCanonical(bytes(row.vector_payload)) as { projection_record_id?: string; owner_artifact_id?: string; owner_artifact_version_id?: string; profile_id?: string; executable_binding_id?: string; dimensions?: number; element_type?: string; vector_encoding?: string; normalization?: string; distance_metric?: string; valid_from_generation?: number; valid_to_generation?: number; vector?: unknown };
-    if (payload.projection_record_id !== projectionRecordId || payload.owner_artifact_id !== row.owner_artifact_id || payload.owner_artifact_version_id !== row.owner_artifact_version_id || payload.profile_id !== row.profile_id || payload.executable_binding_id !== row.executable_binding_id || payload.dimensions !== row.dimensions || payload.element_type !== row.element_type || payload.vector_encoding !== row.vector_encoding || payload.normalization !== row.normalization || payload.distance_metric !== row.distance_metric || payload.valid_from_generation !== row.valid_from_generation || (payload.valid_to_generation ?? null) !== row.valid_to_generation) throw new StorageError("storage:vector_corrupt", `Vector ${projectionRecordId} typed metadata differs from its canonical payload.`);
-    const payloadVector = bytes(payload.vector);
-    if (payloadVector.byteLength !== row.byte_length || digestBytes(payloadVector) !== row.vector_digest) throw new StorageError("storage:vector_corrupt", `Vector ${projectionRecordId} canonical bytes differ from its typed digest.`);
     await this.requireOwner(row.owner_artifact_id, row.owner_artifact_version_id);
-    const shard = await this.database.get<{ content_hash: string; byte_length: number; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string; shard_payload: unknown }>("SELECT content_hash, byte_length, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, shard_payload FROM vector_shards WHERE workspace_id = ? AND shard_id = ?", [this.workspaceId, row.shard_id]);
+    const shard = await this.database.get<{ content_hash: string; byte_length: number; profile_id: string; executable_binding_id: string; dimensions: number; element_type: string; vector_encoding: string; normalization: string; distance_metric: string }>("SELECT content_hash, byte_length, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric FROM vector_shards WHERE workspace_id = ? AND shard_id = ?", [this.workspaceId, row.shard_id]);
     if (!shard) throw new StorageError("storage:vector_shard_missing", `Vector shard ${row.shard_id} is not retained.`);
-    const shardPayload = decodeCanonical(bytes(shard.shard_payload)) as { shard_id?: string; content_hash?: string; dimensions?: number; element_type?: string; vector_encoding?: string; normalization?: string; distance_metric?: string };
-    if (shard.profile_id !== row.profile_id || shard.executable_binding_id !== row.executable_binding_id || shard.dimensions !== row.dimensions || shard.element_type !== row.element_type || shard.vector_encoding !== row.vector_encoding || shard.normalization !== row.normalization || shard.distance_metric !== row.distance_metric || shardPayload.shard_id !== row.shard_id || shardPayload.content_hash !== shard.content_hash || shardPayload.dimensions !== shard.dimensions || shardPayload.element_type !== shard.element_type || shardPayload.vector_encoding !== shard.vector_encoding || shardPayload.normalization !== shard.normalization || shardPayload.distance_metric !== shard.distance_metric) throw new StorageError("storage:vector_corrupt", `Vector shard ${row.shard_id} metadata is inconsistent.`);
+    if (shard.profile_id !== row.profile_id || shard.executable_binding_id !== row.executable_binding_id || shard.dimensions !== row.dimensions || shard.element_type !== row.element_type || shard.vector_encoding !== row.vector_encoding || shard.normalization !== row.normalization || shard.distance_metric !== row.distance_metric) throw new StorageError("storage:vector_corrupt", `Vector shard ${row.shard_id} metadata is inconsistent.`);
     const source = await this.cas.read(shard.content_hash);
     if (source.byteLength !== shard.byte_length || row.shard_offset < 0 || row.shard_offset + row.byte_length > source.byteLength) throw new StorageError("storage:vector_corrupt", `Vector ${projectionRecordId} falls outside its shard materialization.`);
     if (digestBytes(source.slice(row.shard_offset, row.shard_offset + row.byte_length)) !== row.vector_digest) throw new StorageError("storage:vector_corrupt", `Vector ${projectionRecordId} is corrupt.`);
@@ -1510,21 +1425,9 @@ export class StorageMaintenance {
       UNION SELECT content_hash FROM lifecycle_cas_pins${scope}
       UNION SELECT content_hash FROM lifecycle_roots${scope}
       UNION SELECT content_digest AS content_hash FROM query_manifest_segments${manifestScope}
-      UNION SELECT content_digest AS content_hash FROM candidate_template_segments${scope}
       UNION SELECT content_hash FROM content_blobs WHERE storage_reference LIKE 'cas:%'
-      UNION SELECT payload_cas_digest AS content_hash FROM record_occurrences${workspaceId === undefined ? " WHERE payload_cas_digest IS NOT NULL" : " WHERE workspace_id = ? AND payload_cas_digest IS NOT NULL"}
-    `, workspaceId === undefined ? [] : [workspaceId, workspaceId, workspaceId, workspaceId, workspaceId, workspaceId, workspaceId]);
+    `, workspaceId === undefined ? [] : [workspaceId, workspaceId, workspaceId, workspaceId, workspaceId]);
     const hashes = new Set(rows.map((row) => row.content_hash));
-    const payloadRows = await database.all<{ payload: unknown }>(workspaceId === undefined
-      ? "SELECT root_payload AS payload FROM lifecycle_roots UNION ALL SELECT pin_payload FROM retention_pins UNION ALL SELECT lease_payload FROM retention_leases UNION ALL SELECT execution_payload FROM query_executions UNION ALL SELECT snapshot_payload FROM snapshots"
-      : "SELECT root_payload AS payload FROM lifecycle_roots WHERE workspace_id = ? UNION ALL SELECT pin_payload FROM retention_pins WHERE workspace_id = ? UNION ALL SELECT lease_payload FROM retention_leases WHERE workspace_id = ? UNION ALL SELECT execution_payload FROM query_executions WHERE workspace_id = ? UNION ALL SELECT snapshot_payload FROM snapshots WHERE workspace_id = ?",
-    workspaceId === undefined ? [] : [workspaceId, workspaceId, workspaceId, workspaceId, workspaceId]);
-    for (const row of payloadRows) { try { collectContentHashes(decodeCanonical(bytes(row.payload)), hashes); } catch { /* payload verification is handled by maintenance.verify */ } }
-    const closureRows = await database.all<{ payload: unknown }>(workspaceId === undefined
-      ? "SELECT artifact_payload AS payload FROM source_artifacts UNION ALL SELECT observation_batch_payload FROM source_observation_batches UNION ALL SELECT observation_payload FROM source_observations UNION ALL SELECT artifact_version_payload FROM artifact_versions UNION ALL SELECT artifact_tombstone_payload FROM artifact_tombstones UNION ALL SELECT record_payload FROM record_occurrences UNION ALL SELECT registry_payload FROM registry_snapshots UNION ALL SELECT current_payload FROM workspace_current_state UNION ALL SELECT payload FROM control_plane_state UNION ALL SELECT shard_payload FROM vector_shards UNION ALL SELECT vector_payload FROM vector_projection_rows"
-      : "SELECT artifact_payload AS payload FROM source_artifacts WHERE workspace_id = ? UNION ALL SELECT observation_batch_payload FROM source_observation_batches WHERE workspace_id = ? UNION ALL SELECT observation_payload FROM source_observations WHERE workspace_id = ? UNION ALL SELECT artifact_version_payload FROM artifact_versions WHERE workspace_id = ? UNION ALL SELECT artifact_tombstone_payload FROM artifact_tombstones WHERE workspace_id = ? UNION ALL SELECT record_payload FROM record_occurrences WHERE workspace_id = ? UNION ALL SELECT registry_payload FROM registry_snapshots WHERE workspace_id = ? UNION ALL SELECT current_payload FROM workspace_current_state WHERE workspace_id = ? UNION ALL SELECT payload FROM control_plane_state WHERE workspace_id = ? UNION ALL SELECT shard_payload FROM vector_shards WHERE workspace_id = ? UNION ALL SELECT vector_payload FROM vector_projection_rows WHERE workspace_id = ?",
-      workspaceId === undefined ? [] : Array.from({ length: 11 }, () => workspaceId));
-    for (const row of closureRows) { try { collectContentHashes(decodeCanonical(bytes(row.payload)), hashes); } catch { /* authoritative corruption is reported by maintenance.verify */ } }
     return await this.expandCasClosure(hashes);
   }
 
@@ -1568,12 +1471,10 @@ export class StorageMaintenance {
     const catalog = await openSqliteDatabase({ filename: join(this.rootDir, "catalog.sqlite"), read_only: true });
     try {
       const hashes = new Set<string>();
-      const roots = await catalog.all<{ content_hash: string; root_payload: unknown }>("SELECT content_hash, root_payload FROM installation_gc_roots");
-      for (const row of roots) { hashes.add(row.content_hash); try { collectContentHashes(decodeCanonical(bytes(row.root_payload)), hashes); } catch { /* malformed roots are reported by verification */ } }
-      const installations = await catalog.all<{ manifest_digest: string; installation_payload: unknown }>("SELECT manifest_digest, installation_payload FROM installation_model_pack_installations");
-      for (const row of installations) { hashes.add(row.manifest_digest); try { collectContentHashes(decodeCanonical(bytes(row.installation_payload)), hashes); } catch { /* malformed installations are reported by catalog checks */ } }
-      const catalogPayloads = await catalog.all<{ payload: unknown }>("SELECT workspace_payload AS payload FROM installation_workspaces UNION ALL SELECT installation_payload FROM installation_model_pack_installations UNION ALL SELECT root_payload FROM installation_gc_roots UNION ALL SELECT value FROM storage_meta");
-      for (const row of catalogPayloads) { try { collectContentHashes(decodeCanonical(bytes(row["payload"])), hashes); } catch { /* malformed control-plane payloads are reported by catalog verification */ } }
+      const roots = await catalog.all<{ content_hash: string }>("SELECT content_hash FROM installation_gc_roots");
+      for (const row of roots) hashes.add(row.content_hash);
+      const installations = await catalog.all<{ manifest_digest: string }>("SELECT manifest_digest FROM installation_model_pack_installations");
+      for (const row of installations) hashes.add(row.manifest_digest);
       return await this.expandCasClosure(hashes);
     } finally { await catalog.close(); }
   }
@@ -1588,7 +1489,7 @@ export class StorageMaintenance {
 
   private async markEpochFailed(epochId: string, now: string, error: unknown): Promise<void> {
     const failureCode = error instanceof StorageError ? error.code : "storage:collection_failed";
-    await this.database.run("UPDATE garbage_collection_epochs SET state = 'failed', completed_at = COALESCE(completed_at, ?), failure_code = ?, epoch_payload = ? WHERE workspace_id = ? AND garbage_collection_epoch_id = ? AND state IN ('marking', 'sweeping')", [now, failureCode, encodeCanonical({ state: "failed", failure_code: failureCode }), this.workspaceId, epochId]);
+    await this.database.run("UPDATE garbage_collection_epochs SET state = 'failed', completed_at = COALESCE(completed_at, ?), failure_code = ? WHERE workspace_id = ? AND garbage_collection_epoch_id = ? AND state IN ('marking', 'sweeping')", [now, failureCode, this.workspaceId, epochId]);
   }
 
   private async hasActiveBackupBarrier(): Promise<boolean> {

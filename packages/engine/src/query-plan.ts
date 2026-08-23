@@ -6,6 +6,7 @@ import {
   coreSchemaDefinitions,
   operationErrorRegistry,
   operationRegistry,
+  operationFrontierRegistry,
   queryAlgebraOperatorIds,
   recipeRegistry,
   validateSchemaValue,
@@ -17,6 +18,7 @@ import {
   type QueryRequest,
   type QueryScope,
   type QueryStage,
+  type PipelineV3Expression,
   type RecipeDefinition,
   type RecipeExpression,
   type NormalizedQueryPlan as ContractNormalizedQueryPlan,
@@ -27,7 +29,7 @@ import { collectStageOutputSelectors } from "./stage-output-selector.js";
 export type QueryPlanErrorCode = (typeof operationErrorRegistry)[number]["code"];
 
 export class QueryPlanError extends EngineError {
-  constructor(override readonly code: QueryPlanErrorCode, message: string) {
+  constructor(override readonly code: QueryPlanErrorCode, message: string, readonly details: Readonly<Record<string, unknown>> = {}) {
     super(code, message);
     this.name = "QueryPlanError";
   }
@@ -35,12 +37,23 @@ export class QueryPlanError extends EngineError {
 
 export type NormalizedQueryPlan = ContractNormalizedQueryPlan & { readonly plan_digest: string };
 
+export type QueryFrontier = "source" | "syntax" | "structural" | "semantic";
+
+export interface QueryAdmissionPlan {
+  readonly normalized_plan: NormalizedQueryPlan;
+  readonly operation_ids: readonly string[];
+  readonly required_frontier: QueryFrontier;
+  readonly required_structural_stage: 0 | 1 | 2 | 3;
+  readonly source_safe: boolean;
+  readonly blocking_stages: readonly { readonly stage_id?: string; readonly operation?: string; readonly required_frontier: QueryFrontier; readonly required_structural_stage: 0 | 1 | 2 | 3 }[];
+}
+
 const operatorSet = new Set<string>(queryAlgebraOperatorIds);
 const MAX_RESPONSE_ITEMS = 100_000;
 const MAX_RESPONSE_CHARACTERS = 10_000_000;
 
-function invalid(code: QueryPlanErrorCode, message: string): never {
-  throw new QueryPlanError(code, message);
+function invalid(code: QueryPlanErrorCode, message: string, details: Readonly<Record<string, unknown>> = {}): never {
+  throw new QueryPlanError(code, message, details);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -66,9 +79,19 @@ function exactObject(value: unknown, allowed: readonly string[], required: reado
   if (!isRecord(value)) invalid("core:request_invalid", `${path} must be an object.`);
   const allowedSet = new Set(allowed);
   const unknown = Object.keys(value).find((key) => !allowedSet.has(key));
-  if (unknown) invalid("core:unknown_field", `${path}.${unknown} is not a registered field.`);
+  if (unknown) {
+    const pointer = `/${path.split(".").filter(Boolean).join("/")}/${unknown}`;
+    const suggestion = unknown === "freshness" && path === "query" ? "/query/options/freshness" : undefined;
+    invalid("core:unknown_field", `${pointer} is not a registered field; use ${suggestion ?? "a field from the published v3 schema"}.`, {
+      object_pointer: `/${path.split(".").filter(Boolean).join("/")}`,
+      field_names: [unknown],
+      received: value[unknown],
+      example: Object.fromEntries(required.map((field) => [field, null])),
+      ...(suggestion === undefined ? {} : { suggested_pointer: suggestion }),
+    });
+  }
   const missing = required.find((key) => !(key in value));
-  if (missing) invalid("core:request_invalid", `${path}.${missing} is required.`);
+  if (missing) invalid("core:request_invalid", `${path}.${missing} is required.`, { schema_pointer: `/${path.split(".").filter(Boolean).join("/")}/${missing}`, received: value, example: Object.fromEntries(required.map((field) => [field, null])) });
 }
 
 function schema(schemaId: string): NonNullable<(typeof coreSchemaDefinitions)[number]> {
@@ -119,10 +142,73 @@ function validatePipelineContract(expression: QueryExpression): void {
   }
 }
 
+/**
+ * v3 is the wire-level, binding-oriented pipeline contract.  The evaluator
+ * deliberately keeps one internal algebra so v1/v2 plans and v3 plans have
+ * identical semantics, provenance and cursor behaviour.  Bindings are
+ * lowered to the existing typed stage-output selectors before validation;
+ * they are never expanded into the upstream result array.
+ */
+function normalizePipelineV3(expression: PipelineV3Expression): QueryExpression {
+  const stages = expression.stages.map((stage) => {
+    if (!isRecord(stage) || typeof stage.stage_id !== "string" || typeof stage.stage_type !== "string" || !isRecord(stage.arguments)) {
+      invalid("core:request_invalid", "Every v3 pipeline stage requires stage_id, stage_type and arguments.");
+    }
+    const bindings = isRecord(stage.bindings) ? stage.bindings : {};
+    const bindingSelector = (binding: unknown): unknown => {
+      if (!isRecord(binding) || typeof binding["stage_id"] !== "string" || typeof binding["output"] !== "string") invalid("core:stage_reference_invalid", `Stage ${stage["stage_id"]} has an invalid binding.`);
+      return { subject_type: "stage_output", stage_id: binding["stage_id"], output: binding["output"] };
+    };
+    const args: Record<string, unknown> = clone(stage.arguments as Record<string, unknown>);
+    for (const [field, binding] of Object.entries(bindings)) {
+      const selector = bindingSelector(binding);
+      // Registered operation schemas distinguish sequence selectors from
+      // scalar selectors.  A v3 binding denotes the whole upstream set, so
+      // plural/batchable fields receive a one-element stage-output sequence;
+      // the executor expands that sequence lazily into the downstream batch.
+      args[field] = ["subjects", "sources", "targets", "containers", "artifacts"].includes(field) ? [selector] : selector;
+    }
+    const operator = stage.stage_type === "operation" ? (stage.operation === undefined ? "" : "source.operation") : stage.operator;
+    if (typeof operator !== "string" || operator.length === 0) invalid("core:request_invalid", `Stage ${stage.stage_id} must declare operation or operator.`);
+    if (stage.stage_type === "operation") {
+      if (typeof stage.operation !== "string" || stage.operation.length === 0) invalid("core:operation_unknown", `Stage ${stage.stage_id} is missing operation.`);
+      if (stage.operation_version !== undefined && (!Number.isSafeInteger(stage.operation_version) || stage.operation_version < 1)) invalid("core:api_version_unsupported", `Stage ${stage.stage_id} has an invalid operation_version.`);
+      const registered = operationFor(stage.operation);
+      if (stage.operation_version !== undefined && stage.operation_version !== 3 && stage.operation_version !== registered.operation_version) invalid("core:api_version_unsupported", `Stage ${stage.stage_id} requests ${stage.operation}@${stage.operation_version}, but the registered version is ${registered.operation_version}.`);
+      // The v3 pipeline envelope is versioned independently from individual
+      // operation registry revisions. Until an operation publishes a native
+      // v3 definition, an explicit @3 selects the current registered
+      // implementation while preserving the wire-level version in the plan.
+      const effectiveVersion = stage.operation_version === 3 && registered.operation_version !== 3 ? registered.operation_version : stage.operation_version;
+      return { stage_id: stage.stage_id, operator: "source.operation", inputs: [], arguments: { operation: stage.operation, operation_arguments: args }, ...(effectiveVersion === undefined ? {} : { operation_version: effectiveVersion }) } as QueryStage;
+    }
+    const inputs = Array.isArray(stage.inputs) ? stage.inputs : Object.values(bindings);
+    return { stage_id: stage.stage_id, operator, inputs: inputs.map((value) => {
+      if (!isRecord(value) || typeof value["stage_id"] !== "string" || typeof value["output"] !== "string") invalid("core:stage_reference_invalid", `Stage ${stage["stage_id"]} has an invalid input binding.`);
+      return { stage_id: value["stage_id"], output: value["output"] };
+    }), arguments: args } as QueryStage;
+  });
+  return {
+    expression_type: "pipeline",
+    stages,
+    outputs: expression.outputs.map((output) => {
+      if (!isRecord(output) || typeof output.name !== "string" || typeof output.stage_id !== "string" || typeof output.output !== "string") invalid("core:stage_reference_invalid", "A v3 pipeline output requires name, stage_id and output.");
+      return { stage_id: output.stage_id, output: output.output, name: output.name };
+    }),
+  };
+}
+
+function normalizePublicExpression(expression: QueryExpression): QueryExpression {
+  if (isRecord(expression) && expression.expression_type === "pipeline" && Array.isArray(expression.stages) && expression.stages.some((stage) => isRecord(stage) && "stage_type" in stage)) {
+    return normalizePipelineV3(expression as unknown as PipelineV3Expression);
+  }
+  return expression;
+}
+
 function validateBudget(request: QueryRequest): void {
   const options = request.options;
   if (!isRecord(options)) invalid("core:request_invalid", "options must be an object.");
-  exactObject(options, ["freshness", "wait_timeout_ms", "coverage_requirement", "evidence", "diagnostics", "snippets", "registry", "response_budget"], ["freshness", "wait_timeout_ms", "coverage_requirement", "evidence", "diagnostics", "snippets", "registry", "response_budget"], "options");
+  exactObject(options, ["freshness", "wait_timeout_ms", "required_frontier", "coverage_requirement", "evidence", "diagnostics", "snippets", "registry", "response_budget"], ["freshness", "wait_timeout_ms", "coverage_requirement", "evidence", "diagnostics", "snippets", "registry", "response_budget"], "options");
   exactObject(options["evidence"], ["evidence", "evidence_chain_depth"], ["evidence", "evidence_chain_depth"], "options.evidence");
   exactObject(options["diagnostics"], ["diagnostics", "diagnostic_detail"], ["diagnostics", "diagnostic_detail"], "options.diagnostics");
   exactObject(options["snippets"], ["mode", "max_characters_per_snippet", "max_total_characters", "context_lines"], ["mode", "max_characters_per_snippet", "max_total_characters", "context_lines"], "options.snippets");
@@ -133,6 +219,7 @@ function validateBudget(request: QueryRequest): void {
     invalid("core:budget_invalid", "response_budget is outside the advertised bounds.");
   }
   if (!Number.isSafeInteger(options["wait_timeout_ms"]) || Number(options["wait_timeout_ms"]) < 0) invalid("core:budget_invalid", "wait_timeout_ms must be a non-negative safe integer.");
+  if (options["required_frontier"] !== undefined && !["source", "syntax", "structural", "semantic"].includes(String(options["required_frontier"]))) invalid("core:request_invalid", "required_frontier is not registered.");
   if (!["snapshot", "current", "wait_for_current"].includes(String(options["freshness"]))) invalid("core:request_invalid", "freshness is not registered.");
   if (!["accept_reported", "require_complete"].includes(String(options["coverage_requirement"]))) invalid("core:request_invalid", "coverage_requirement is not registered.");
   const evidence = options["evidence"] as Record<string, unknown>;
@@ -234,7 +321,7 @@ function outputNames(stage: QueryStage, declared: ReadonlyMap<string, ReadonlySe
   return new Set(["subjects"]);
 }
 
-export function validatePipelineExpression(expression: QueryExpression): void {
+function validatePipelineExpressionInternal(expression: QueryExpression): void {
   if (!isRecord(expression) || expression["expression_type"] !== "pipeline") invalid("core:request_invalid", "Expected a pipeline expression.");
   exactObject(expression, ["expression_type", "stages", "outputs"], ["expression_type", "stages", "outputs"], "expression");
   if (!Array.isArray(expression.stages) || expression.stages.length === 0 || !Array.isArray(expression.outputs) || expression.outputs.length === 0) invalid("core:request_invalid", "A pipeline requires non-empty stages and outputs.");
@@ -243,7 +330,7 @@ export function validatePipelineExpression(expression: QueryExpression): void {
   const dependencies = new Map<string, Set<string>>();
   for (const [index, stage] of expression.stages.entries()) {
     const stageValue = stage;
-    exactObject(stage as unknown, ["stage_id", "operator", "inputs", "arguments"], ["stage_id", "operator", "inputs", "arguments"], `expression.stages[${index}]`);
+    exactObject(stage as unknown, ["stage_id", "operator", "inputs", "arguments", "operation_version"], ["stage_id", "operator", "inputs", "arguments"], `expression.stages[${index}]`);
     if (typeof stageValue.stage_id !== "string" || stageValue.stage_id.length === 0 || stages.has(stageValue.stage_id)) invalid("core:stage_reference_invalid", `Stage ${stageValue.stage_id} is empty or duplicated.`);
     if (!Array.isArray(stageValue.inputs) || typeof stageValue.operator !== "string") invalid("core:request_invalid", `Stage ${stageValue.stage_id} has invalid inputs or operator.`);
     arity(stageValue.operator, stageValue.inputs.length, stageValue.stage_id);
@@ -285,7 +372,7 @@ export function validatePipelineExpression(expression: QueryExpression): void {
   const outputs = new Set<string>();
   for (const [index, output] of expression.outputs.entries()) {
     const outputValue = output;
-    exactObject(output as unknown, ["stage_id", "output"], ["stage_id", "output"], `expression.outputs[${index}]`);
+    exactObject(output as unknown, ["stage_id", "output", "name"], ["stage_id", "output"], `expression.outputs[${index}]`);
     const key = `${outputValue.stage_id}\u0000${outputValue.output}`;
     if (outputs.has(key)) invalid("core:stage_reference_invalid", `Duplicate pipeline output ${key}.`);
     if (!declared.get(outputValue.stage_id)?.has(outputValue.output)) invalid("core:stage_reference_invalid", `Pipeline output ${key} is unknown.`);
@@ -301,6 +388,10 @@ export function validatePipelineExpression(expression: QueryExpression): void {
   for (const root of roots) visit(root);
   if (reachable.size !== stages.size) invalid("core:stage_reference_invalid", "Every pipeline stage must contribute to a declared output; disconnected stages are forbidden.");
   validatePipelineContract(expression);
+}
+
+export function validatePipelineExpression(expression: QueryExpression): void {
+  validatePipelineExpressionInternal(normalizePublicExpression(expression));
 }
 
 // Every field listed here is documented in `docs/protocol/core-intent-recipes.md`
@@ -356,11 +447,11 @@ function uniqueSorted(bindings: readonly OperationBinding[]): OperationBinding[]
 
 export function normalizeQueryRequest(request: QueryRequest): NormalizedQueryPlan {
   exactObject(request, ["api_version", "scope", "expression", "options"], ["api_version", "scope", "expression", "options"], "request");
-  if (request.api_version !== 1 && request.api_version !== 2) invalid("core:api_version_unsupported", `API version ${request.api_version} is unsupported.`);
+  if (request.api_version !== 3) invalid("core:api_version_unsupported", `API version ${request.api_version} is unsupported; use API version 3.` , { requested_version: request.api_version, supported_versions: [3] });
   validateBudget(request);
   const operationVersions: Array<{ operation_id: string; operation_version: number }> = [];
   let recipeVersions: Array<{ recipe_id: string; recipe_version: number }> = [];
-  let normalizedExpression: QueryExpression = request.expression;
+  let normalizedExpression: QueryExpression = normalizePublicExpression(request.expression);
   if (!isRecord(request.expression)) invalid("core:request_invalid", "expression must be an object.");
   if (request.expression.expression_type === "operation") {
     exactObject(request.expression, ["expression_type", "operation", "arguments"], ["expression_type", "operation", "arguments"], "expression");
@@ -387,9 +478,12 @@ export function normalizeQueryRequest(request: QueryRequest): NormalizedQueryPla
       }
     }
   } else if (request.expression.expression_type === "pipeline") {
+    if (!Array.isArray(request.expression.stages) || request.expression.stages.some((stage) => !isRecord(stage) || stage["stage_type"] !== "operation" && stage["stage_type"] !== "operator")) {
+      invalid("core:api_version_unsupported", "Legacy pipeline stages are not accepted by API v3; use the published stage_type/bindings form.", { requested_version: 1, supported_versions: [3], example: { expression_type: "pipeline", stages: [{ stage_id: "source", stage_type: "operation", operation: "core:find_artifacts", arguments: {} }], outputs: [{ name: "artifacts", stage_id: "source", output: "artifacts" }] } });
+    }
     validateScope(request.scope, ["single_workspace", "comparison"]);
-    validatePipelineExpression(request.expression);
-    for (const stage of request.expression.stages) {
+    validatePipelineExpression(normalizedExpression);
+    for (const stage of (normalizedExpression as QueryExpression & { stages: readonly QueryStage[] }).stages) {
       if ((stage.operator === "source.operation" || stage.operator === "expand.operation") && isRecord(stage.arguments) && typeof stage.arguments["operation"] === "string") {
         const operation = operationFor(stage.arguments["operation"]);
         validateScope(request.scope, operation.allowed_scope_kinds);
@@ -412,6 +506,7 @@ export function normalizeQueryRequest(request: QueryRequest): NormalizedQueryPla
     normalized_expression: freeze(canonicalize(clone(normalizedExpression))),
     freshness: request.options.freshness,
     wait_timeout_ms: request.options.wait_timeout_ms,
+    ...(request.options.required_frontier === undefined ? {} : { required_frontier: request.options.required_frontier }),
     coverage_requirement: request.options.coverage_requirement,
     projection: freeze(canonicalize(clone({ evidence: request.options.evidence, diagnostics: request.options.diagnostics, snippets: request.options.snippets, registry: request.options.registry }))),
     response_budget: freeze(canonicalize(clone(request.options.response_budget))),
@@ -420,4 +515,65 @@ export function normalizeQueryRequest(request: QueryRequest): NormalizedQueryPla
   };
   const plan_digest = computeDigest("core:query_plan", "core:query_plan_digest", 1, "core:NormalizedQueryPlan", 1, normalizedCore);
   return freeze({ ...normalizedCore, plan_digest });
+}
+
+const FRONTIER_RANK: Readonly<Record<QueryFrontier, number>> = { source: 0, syntax: 1, structural: 2, semantic: 3 };
+
+function maxFrontier(left: QueryFrontier, right: QueryFrontier): QueryFrontier {
+  return FRONTIER_RANK[left] >= FRONTIER_RANK[right] ? left : right;
+}
+
+function operationIdsFromNormalizedExpression(expression: QueryExpression): readonly { readonly operation: string; readonly stage_id?: string }[] {
+  if (expression.expression_type === "operation") return [{ operation: expression.operation }];
+  if (expression.expression_type === "recipe") {
+    const recipe = recipeFor(expression.recipe_id);
+    return recipe.operation_stages.filter((stage) => stage.operator_id.startsWith("core:")).map((stage) => ({ operation: stage.operator_id, stage_id: stage.stage_id }));
+  }
+  return expression.stages.flatMap((stage) => {
+    if (stage.operator === "source.operation" || stage.operator === "expand.operation") {
+      const args = isRecord(stage.arguments) ? stage.arguments : {};
+      const operation = args["operation"];
+      return typeof operation === "string" ? [{ operation, stage_id: stage.stage_id }] : [];
+    }
+    return [];
+  });
+}
+
+function dynamicOperationFrontier(operation: string, expression: QueryExpression, stageId?: string): { readonly required_frontier: QueryFrontier; readonly required_structural_stage: 0 | 1 | 2 | 3 } {
+  const registered = operationFrontierRegistry[operation] ?? { required_frontier: "structural" as const, required_stage: 3 as const };
+  const operationArguments = expression.expression_type === "operation" && operation === expression.operation
+    ? expression.arguments
+    : expression.expression_type === "pipeline"
+      ? (() => {
+        const stage = expression.stages.find((candidate) => candidate.stage_id === stageId && (candidate.operator === "source.operation" || candidate.operator === "expand.operation"));
+        return stage !== undefined && isRecord(stage.arguments) ? stage.arguments["operation_arguments"] : undefined;
+      })()
+      : undefined;
+  if (operation === "core:search_text" && isRecord(operationArguments)) {
+    const projection = operationArguments["result_projection"];
+    if (projection === "entity" || projection === "record") return { required_frontier: "syntax", required_structural_stage: 1 };
+  }
+  return { required_frontier: registered.required_frontier, required_structural_stage: registered.required_stage };
+}
+
+/**
+ * Normalizes and admits a request without consulting readiness or acquiring
+ * any execution resource.  All later admission decisions consume this
+ * immutable result instead of the raw wire payload.
+ */
+export function buildQueryAdmissionPlan(request: QueryRequest): QueryAdmissionPlan {
+  const normalized_plan = normalizeQueryRequest(request);
+  const bindings = operationIdsFromNormalizedExpression(normalized_plan.normalized_expression);
+  let required_frontier: QueryFrontier = normalized_plan.required_frontier ?? "source";
+  let required_structural_stage: 0 | 1 | 2 | 3 = 0;
+  const blocking_stages: Array<QueryAdmissionPlan["blocking_stages"][number]> = [];
+  for (const binding of bindings) {
+    const requirement = dynamicOperationFrontier(binding.operation, normalized_plan.normalized_expression, binding.stage_id);
+    required_frontier = maxFrontier(required_frontier, requirement.required_frontier);
+    required_structural_stage = Math.max(required_structural_stage, requirement.required_structural_stage) as 0 | 1 | 2 | 3;
+    blocking_stages.push({ ...(binding.stage_id === undefined ? {} : { stage_id: binding.stage_id }), operation: binding.operation, required_frontier: requirement.required_frontier, required_structural_stage: requirement.required_structural_stage });
+  }
+  const explicitStage = normalized_plan.required_frontier === undefined ? 0 : FRONTIER_RANK[normalized_plan.required_frontier];
+  if (explicitStage > required_structural_stage) required_structural_stage = Math.min(explicitStage, 3) as 0 | 1 | 2 | 3;
+  return freeze({ normalized_plan, operation_ids: [...new Set(bindings.map((binding) => binding.operation))].sort(), required_frontier, required_structural_stage, source_safe: required_structural_stage === 0 && required_frontier === "source", blocking_stages });
 }

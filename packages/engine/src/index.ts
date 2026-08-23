@@ -28,7 +28,9 @@ export {
 export { CursorCache, CursorCacheError, type CursorCacheOptions, type CursorDirection, type ManifestStreamReader, type ManifestStreamReadRequest, type ManifestStreamReadResult, type QueryCursorClaims, type ReadPageRequest, type ReadPageResult } from "./cursor-cache.js";
 export { evaluateOperation, expandRelations, findShortestPaths, type EvaluateOperationInput, type ExpandedRelation, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem, type RelationEdge, type RelationExpansionOptions, type ShortestPath, type ShortestPathOptions } from "./query-operators.js";
 export { DurableManifestStore, MemoryManifestStore, QueryEngine, type QueryContinuationRequest, type QueryExecutionOptions, type QueryExecutionPage, type QueryManifestStore, type QueryStreamPage } from "./query-execution.js";
-export { normalizeQueryRequest, validatePipelineExpression, QueryPlanError, type NormalizedQueryPlan } from "./query-plan.js";
+export { buildQueryAdmissionPlan, normalizeQueryRequest, validatePipelineExpression, QueryPlanError, type NormalizedQueryPlan, type QueryAdmissionPlan, type QueryFrontier } from "./query-plan.js";
+export { stageSetHandle, type StageSetHandle } from "./stage-set-handle.js";
+export { MemoryStageSpool, SqliteStageSpool, DEFAULT_HARD_BYTES, DEFAULT_SPILL_BYTES, type StageSpool, type StageSpoolLimits } from "./pipeline-spool.js";
 export {
   DeterministicFakeWatcher,
   ParcelWatcherAdapter,
@@ -161,6 +163,8 @@ export {
   validateFactDelta,
   type AcceptedDeltaStore,
   type AcceptedFactDelta,
+  type MaterializationAcceptedFactDelta,
+  compactAcceptedFactDelta,
   type CandidateTargetRegistry,
   type FactDeltaValidationInput,
   type RegisteredRecordKind,
@@ -170,6 +174,19 @@ export {
   type RegisteredArtifactVersion,
   type DependencyClosureEntry,
 } from "./fact-delta.js";
+export {
+  buildFactDeltaBatch,
+  factDeltaBatchTransferList,
+  readArenaString,
+  validateFactDeltaBatch,
+  FACT_DELTA_BATCH_MAX_BYTES,
+  FACT_DELTA_BATCH_MAX_ROWS,
+  FACT_DELTA_BATCH_PROTOCOL_VERSION,
+  type FactDeltaBatch,
+  type FactDeltaBatchRow,
+  type FactDeltaColumnBatch,
+  type Utf8Arena,
+} from "./fact-delta-batch.js";
 export {
   CandidateExecutor,
   CandidateExecutionError,

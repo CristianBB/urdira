@@ -11,16 +11,7 @@ export function normalizeText(value: unknown): string {
 
 export function normalizeBytes(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) return new Uint8Array(value);
-  if (typeof value !== "string" || !value.startsWith("base64url:")) fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "TYPE_MISMATCH", expected_type: "Bytes" });
-  const encoded = value.slice("base64url:".length);
-  if (!/^[A-Za-z0-9_-]*$/.test(encoded) || encoded.length % 4 === 1 || encoded.includes("=")) fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "CONSTRAINT_FAILED", constraint_name: "base64url" });
-  const bytes = Uint8Array.from(Buffer.from(encoded.replaceAll("-", "+").replaceAll("_", "/"), "base64"));
-  if (toBase64Url(bytes) !== value) fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "CONSTRAINT_FAILED", constraint_name: "base64url" });
-  return bytes;
-}
-
-export function toBase64Url(value: Uint8Array): string {
-  return `base64url:${Buffer.from(value).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "")}`;
+  fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "TYPE_MISMATCH", expected_type: "Bytes" });
 }
 
 export function normalizeDigest(value: unknown): string {

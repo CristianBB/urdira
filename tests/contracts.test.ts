@@ -270,7 +270,7 @@ describe("Task 2 contract registries", () => {
     expect(fullConformanceFixture.authority_kind).toBe("normative-source-table");
     expect(modelContractRegistry.map((model) => model.name)).toEqual(fullConformanceFixture.models.map((model: { name: string }) => model.name));
     expect(modelContractRegistry.every((model) => model.fields.length > 0 && model.fields.every((field) => field.description.length > 0 && field.source.length > 0 && field.logical_type.length > 0))).toBe(true);
-    expect(operationDefinitions.map(({ operation_id, operation_version }) => ({ operation_id, operation_version }))).toEqual(fullConformanceFixture.operations);
+    expect(operationDefinitions.map(({ operation_id, operation_version }) => ({ operation_id, operation_version })).sort((left, right) => left.operation_id.localeCompare(right.operation_id))).toEqual([...fullConformanceFixture.operations].sort((left: { operation_id: string }, right: { operation_id: string }) => left.operation_id.localeCompare(right.operation_id)));
     expect(recipeRegistry.map(({ recipe_id, recipe_version }) => ({ recipe_id, recipe_version }))).toEqual(fullConformanceFixture.recipes);
     expect(operationErrorDefinitions.map((entry) => entry.code)).toEqual(fullConformanceFixture.payloads.operation_errors);
     expect(diagnosticDefinitions.map((entry) => entry.code)).toEqual(fullConformanceFixture.payloads.diagnostics);
@@ -499,11 +499,11 @@ describe("Task 2 contract registries", () => {
       if (expected.enum) expect(property.items?.enum ?? property.enum).toEqual(expected.enum);
     }
     const schema = generatedJsonSchemaRegistry["core:AnalysisConfiguration@1"];
-    expect(schema?.properties?.["normalizedConfiguration"]).toMatchObject({ minLength: 12 });
+    expect(schema?.properties?.["normalizedConfiguration"]).toMatchObject({ type: "object", "x-urdira-minimum-byte-length": 1 });
     expect(() => validateSchemaValue(coreSchemaDefinitions.find((definition) => definition.schema_id === "core:AnalysisConfiguration")!, {
       configuration_schema_id: "core:analysis_configuration",
       configuration_schema_version: 1,
-      normalized_configuration: "base64url:"
+      normalized_configuration: new Uint8Array()
     })).toThrow();
   });
 
@@ -587,7 +587,7 @@ describe("Task 2 contract registries", () => {
     expect(recipeRegistry).toHaveLength(11);
     expect(canonicalSchemaRegistry).toHaveLength(46);
     expect(comparatorRegistry).toHaveLength(18);
-    expect(operationErrorRegistry).toHaveLength(47);
+    expect(operationErrorRegistry).toHaveLength(48);
     expect(Object.keys(generatedJsonSchemaRegistry)).toHaveLength(46);
     expect(Object.values(generatedJsonSchemaRegistry).every((schema) => schema.$schema === "https://json-schema.org/draft/2020-12/schema")).toBe(true);
     expect(operationDefinitions.every((operation) => operation.operation_id && operation.operation_version && operation.argument_schema_id)).toBe(true);
@@ -748,15 +748,12 @@ describe("Task 2 contract registries", () => {
       properties: {
         configurationSchemaId: { type: "string" },
         configurationSchemaVersion: { type: "integer" },
-        normalizedConfiguration: { type: "string" },
+        normalizedConfiguration: { type: "object" },
       },
       required: ["configurationSchemaId", "configurationSchemaVersion", "normalizedConfiguration"],
       additionalProperties: false,
     });
-    expect(generatedJsonSchemaRegistry["core:Bytes@1"]).toMatchObject({
-      type: "string",
-      pattern: "^base64url:[A-Za-z0-9_-]*$",
-    });
+    expect(generatedJsonSchemaRegistry["core:Bytes@1"]).toMatchObject({ type: "object", additionalProperties: false });
     expect(getGeneratedJsonSchema("core:VisibleSourceStateSet", 1)).toMatchObject({ type: "array", items: { $ref: expect.stringContaining("VisibleSourceStateEntry") } });
     expect(getGeneratedJsonSchema("core:ModelAssetManifest", 1)).toMatchObject({ $ref: expect.stringContaining("ModelAssetManifest") });
     expect(() => getGeneratedJsonSchema("core:does_not_exist@1")).not.toThrow();
@@ -994,7 +991,7 @@ describe("Schema IR validation and JSON Schema generation", () => {
     expect(modelContractRegistry.filter((model) => ["SubjectSelector", "QueryRequest", "ChangeDescriptor"].includes(model.name)).every((model) => model.owner_decision === "protocol/public-query-contract.md" && model.fields.every((field) => field.source === "protocol/public-query-contract.md"))).toBe(true);
     expect(modelContractRegistry.find((model) => model.name === "IntentRecipeDefinition")).toMatchObject({ owner_decision: "protocol/core-intent-recipes.md" });
     expect(operationDefinitions.find((operation) => operation.operation_id === "core:find_records")?.argument_fields.map((field) => field.name)).toEqual(["selector"]);
-    expect(operationDefinitions.find((operation) => operation.operation_id === "core:search_text")?.argument_fields.map((field) => field.name)).toEqual(["pattern", "syntax", "case_sensitive", "word_mode", "filter", "result_projection"]);
+    expect(operationDefinitions.find((operation) => operation.operation_id === "core:search_text")?.argument_fields.map((field) => field.name)).toEqual(["pattern", "syntax", "case_sensitive", "word_mode", "filter", "result_projection", "subjects"]);
     expect(candidateIssueDefinitions.every((issue) => issue.issue_category && issue.default_retryability && issue.allowed_phases.length > 0 && issue.allowed_retryabilities.length === 1)).toBe(true);
   });
 
@@ -1155,10 +1152,10 @@ describe("Schema IR validation and JSON Schema generation", () => {
     expect(() => validateSchemaValue(manifest, { ...validManifest, weight_asset_digests: ["not-a-digest"] })).toThrow(/digest/i);
     expect(() => validateSchemaValue(manifest, { ...validManifest, weight_asset_digests: [] })).toThrow(/minimum|non-empty/i);
     const configuration = coreSchemaDefinitions.find((schema) => schema.schema_id === "core:AnalysisConfiguration")!;
-    expect(() => validateSchemaValue(configuration, { configuration_schema_id: "core:Config", configuration_schema_version: 1, normalized_configuration: "base64url:AA" })).not.toThrow();
-    expect(() => validateSchemaValue(configuration, { configuration_schema_id: "", configuration_schema_version: 1, normalized_configuration: "base64url:AA" })).toThrow(/namespaced|schema.*id|empty/i);
-    expect(() => validateSchemaValue(configuration, { configuration_schema_id: "Config", configuration_schema_version: 1, normalized_configuration: "base64url:AA" })).toThrow(/namespaced/i);
-    expect(() => validateSchemaValue(configuration, { configuration_schema_id: "core:Config", configuration_schema_version: 1, normalized_configuration: "base64url:" })).toThrow(/bytes|empty|coordinate/i);
+    expect(() => validateSchemaValue(configuration, { configuration_schema_id: "core:Config", configuration_schema_version: 1, normalized_configuration: new Uint8Array([0]) })).not.toThrow();
+    expect(() => validateSchemaValue(configuration, { configuration_schema_id: "", configuration_schema_version: 1, normalized_configuration: new Uint8Array([0]) })).toThrow(/namespaced|schema.*id|empty/i);
+    expect(() => validateSchemaValue(configuration, { configuration_schema_id: "Config", configuration_schema_version: 1, normalized_configuration: new Uint8Array([0]) })).toThrow(/namespaced/i);
+    expect(() => validateSchemaValue(configuration, { configuration_schema_id: "core:Config", configuration_schema_version: 1, normalized_configuration: new Uint8Array() })).toThrow(/bytes|empty|coordinate/i);
   });
 
   it("recursively validates nested authoritative model references", () => {
@@ -1246,7 +1243,7 @@ describe("Schema IR validation and JSON Schema generation", () => {
       ...diagnosticDefinitions.map((entry) => ({ code: entry.code, schema: entry.payload_schema })),
       ...candidateIssueDefinitions.map((entry) => ({ code: entry.issue_code, schema: entry.payload_schema })),
     ];
-    expect(definitions).toHaveLength(95);
+    expect(definitions).toHaveLength(96);
     for (const { code, schema } of definitions) {
       const descriptions = Object.values(schema.properties).map((property) => property.description);
       expect(descriptions.every((description) => description.length > 0)).toBe(true);
@@ -1278,7 +1275,7 @@ describe("Schema IR validation and JSON Schema generation", () => {
       if (logicalType === "SemVer") return "1.0.0";
       if (logicalType === "Digest") return `sha256:${"0".repeat(64)}`;
       if (logicalType === "Boolean") return true;
-      if (logicalType === "Bytes" || logicalType === "SchemaBoundBytes") return "base64url:AA";
+      if (logicalType === "Bytes" || logicalType === "SchemaBoundBytes") return new Uint8Array([0]);
       if (logicalType === "JsonValue") return {};
       if (logicalType.includes(" | ")) return logicalType.split(" | ")[0];
       const nested = modelContractRegistry.find((model) => model.name === logicalType);

@@ -99,7 +99,7 @@ describe("coding-agent bridge", () => {
   it("keeps multi-query discovery inside a child context and returns only a bounded digest", async () => {
     let childCalls = 0;
     const bridge = { call: async () => ({ outcome: "success", payload: { streams: { matches: [{ path: "src/a.ts", line: 4 }] } } }) };
-    const digest = await runIsolatedDiscoveryDigest({ run: async (operation) => { childCalls += 1; return operation(bridge); } }, bridge, "ws-1", [{ api_version: 1 }]);
+    const digest = await runIsolatedDiscoveryDigest({ run: async (operation) => { childCalls += 1; return operation(bridge); } }, bridge, "ws-1", [{ api_version: 3 }]);
     expect(childCalls).toBe(1);
     expect(digest.workspace_id).toBe("ws-1");
     expect(digest.findings.length).toBeLessThanOrEqual(8);

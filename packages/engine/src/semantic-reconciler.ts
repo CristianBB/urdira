@@ -1,5 +1,5 @@
 import { canonicalBytes, decodeCanonical, digestBytes } from "@urdira/canonical";
-import type { WorkspaceDatabase } from "@urdira/storage";
+import { hydrateRelationalValue, type RelationalValueRow, type WorkspaceDatabase } from "@urdira/storage";
 import { buildSemanticDocument } from "./semantic-documents.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
 import type { SemanticGeneratedVector } from "./semantic-runtime.js";
@@ -212,7 +212,7 @@ const INELIGIBLE_ENTITY_BODY_KINDS = new Set(["parameter"]);
  * exact same rationale as `lexical-reconciler.ts`'s `yieldToEventLoop` (see
  * its doc comment for the full measurement-backed argument for `setImmediate`
  * specifically over a resolved promise or `setTimeout(fn, 0)`). It applies
- * here just as much as it does to lexical trigram computation: the bundled
+ * here just as much as it does to lexical FTS5 maintenance: the bundled
  * local hash embedder's `generateVector` (`semantic-provider.ts`) is a
  * synchronous, allocation-heavy regex/hash/accumulation pass over an entire
  * document's text, run on THIS thread, for every document this loop touches.
@@ -287,35 +287,17 @@ type MissingVectorRow = {
 type MissingEntityRow = {
   readonly record_id: string;
   readonly record_kind: string;
-  readonly record_payload: Uint8Array;
   readonly owner_artifact_id: string;
   readonly owner_artifact_version_id: string;
   readonly valid_from_generation: number;
   readonly content_hash: string;
   readonly byte_length: number;
   readonly display_path: string | null;
+  readonly body_payload: Uint8Array | ArrayBuffer | null;
 };
 
-/**
- * Decodes ONE `record_occurrences.record_payload` blob (a canonical-encoded
- * `RecordEnvelope`) down to its `body` object -- mirrors `SqliteCanonicalQuerySnapshotPort.decodeRow`
- * (`canonical-query-data-port.ts`) exactly, minus that class's interner (this
- * reconciler runs once per record candidate, never re-decodes the same
- * record twice within a pass, so there is no repeat-decode cost to amortize).
- * Never throws: a malformed payload (should not happen for a row this
- * codebase's own writers produced) decodes to an empty body, which
- * `evaluateEntityEligibility` below then correctly rejects as ineligible
- * (missing `kind`/`start`/`end`) rather than crashing the whole pass over one
- * bad row.
- */
-function decodeEntityRecordBody(payload: Uint8Array): Record<string, unknown> {
-  try {
-    const decoded = decodeCanonical(payload) as Record<string, unknown>;
-    const body = decoded["body"];
-    return body !== null && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
-  } catch {
-    return {};
-  }
+function decodeEntityRecordBody(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 /**
@@ -506,10 +488,10 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // (no `document_grain` filter): a provider swap invalidates an entity
   // vector exactly as completely as it invalidates an artifact vector, for
   // the identical reason, so both close together in this one statement. A
-  // single raw `UPDATE` (`vector_projection_rows.vector_payload` is opaque,
-  // immutable, raw vector bytes -- unlike `lexical_documents.document_payload`,
+  // single raw `UPDATE` (the vector shard bytes are opaque and immutable,
+  // unlike the relational lexical metadata,
   // it carries no `valid_to_generation` field for a close to keep in sync,
-  // so this needs no payload rewrite alongside the column; consistency of
+  // so this needs no value rewrite alongside the column; consistency of
   // `StorageMaintenance.verify`'s "vector" integrity check with this is
   // Agent S's storage-slice concern, not this reconciler's) closes every such
   // row in one statement rather than a per-row loop -- there is no per-row
@@ -649,7 +631,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         valid_from_generation: item.validFromGeneration,
         // Omitted (not set to a literal `undefined`) for an artifact item:
         // `encodeCanonical` (`@urdira/canonical`) rejects an object property
-        // whose value is `undefined` outright (`uce:forbidden_cbor_feature`)
+        // whose value is `undefined` outright (invalid logical value)
         // -- unlike `JSON.stringify`, which silently drops such keys -- so
         // this must be a conditional spread, not a bare `document_grain:
         // item.documentGrain`.
@@ -873,11 +855,11 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // own a binary file (the JS/TS analyzer that produces entity records only
   // ever runs against text it already parsed).
   const missingEntityRows = await sql.all<MissingEntityRow>(
-    `SELECT record_occurrences.record_id AS record_id, record_occurrences.kind AS record_kind, record_occurrences.record_payload AS record_payload,
+    `SELECT record_occurrences.record_id AS record_id, record_occurrences.kind AS record_kind,
             record_occurrences.owner_artifact_id AS owner_artifact_id, record_occurrences.owner_artifact_version_id AS owner_artifact_version_id,
             record_occurrences.valid_from_generation AS valid_from_generation,
             artifact_versions.content_hash AS content_hash, artifact_versions.byte_length AS byte_length,
-            source_artifacts.display_path AS display_path
+            source_artifacts.display_path AS display_path, record_occurrences.body_payload AS body_payload
        FROM record_occurrences
        JOIN artifact_versions ON artifact_versions.workspace_id = record_occurrences.workspace_id
         AND artifact_versions.artifact_id = record_occurrences.owner_artifact_id
@@ -931,7 +913,9 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     const fileState = currentFileState!;
     if (fileState.status === "oversized") { counts.entity_skipped_oversized += 1; continue; }
     if (fileState.status === "undecodable") { counts.entity_skipped_undecodable += 1; continue; }
-    const body = decodeEntityRecordBody(row.record_payload);
+    const body = row.body_payload == null
+      ? decodeEntityRecordBody(hydrateRelationalValue(await sql.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [workspaceId, row.record_id, row.valid_from_generation])))
+      : decodeEntityRecordBody(decodeCanonical(row.body_payload instanceof Uint8Array ? row.body_payload : new Uint8Array(row.body_payload)));
     const eligibility = evaluateEntityEligibility(row.record_kind, body, fileState.text, minEntitySpanLength);
     if (!eligibility.eligible) { counts.entity_skipped_ineligible += 1; continue; }
     const spanText = fileState.text.slice(eligibility.start, eligibility.end);

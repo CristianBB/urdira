@@ -38,48 +38,48 @@ function workspaceRegistration(workspaceId: string) {
 // (never-reopened) seeding helper does.
 async function seedObservationBatch(opened: WorkspaceDatabase, workspaceId: string, batchId: string): Promise<void> {
   await opened.database.run(
-    `INSERT OR IGNORE INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest, observation_batch_payload)
-     VALUES (?, ?, 'binding-1', 'filesystem', '1.0.0', 'path', 'full', 'workspace', 'complete', 'tombstone', NULL, NULL, ?, ?, 0, 0, ?, ?)`,
-    [batchId, workspaceId, now, now, `digest:${batchId}`, new Uint8Array([1])],
+    `INSERT OR IGNORE INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest)
+     VALUES (?, ?, 'binding-1', 'filesystem', '1.0.0', 'path', 'full', 'workspace', 'complete', 'tombstone', NULL, NULL, ?, ?, 0, 0, ?)`,
+    [batchId, workspaceId, now, now, `digest:${batchId}`],
   );
 }
 
 async function seedTextVersion(opened: WorkspaceDatabase, cas: ContentAddressedStore, workspaceId: string, batchId: string, options: { readonly artifactId: string; readonly artifactVersionId: string; readonly text: string; readonly validFromGeneration: number }): Promise<void> {
-  await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, 'physical_file', ?)", [options.artifactId, workspaceId, options.artifactId, options.artifactId, options.artifactId, new Uint8Array([1])]);
+  await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES (?, ?, ?, ?, ?, 'physical_file')", [options.artifactId, workspaceId, options.artifactId, options.artifactId, options.artifactId]);
   const observationId = `obs-${options.artifactId}`;
   await opened.database.run(
-    `INSERT OR IGNORE INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash, observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at, observation_payload)
-     VALUES (?, ?, ?, ?, 'binding-1', 'filesystem', '1.0.0', 'path', 'full', 'present', NULL, NULL, NULL, NULL, ?, ?, ?)`,
-    [observationId, batchId, workspaceId, options.artifactId, now, now, new Uint8Array([1])],
+    `INSERT OR IGNORE INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash, observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at)
+     VALUES (?, ?, ?, ?, 'binding-1', 'filesystem', '1.0.0', 'path', 'full', 'present', NULL, NULL, NULL, NULL, ?, ?)`,
+    [observationId, batchId, workspaceId, options.artifactId, now, now],
   );
   const blob = await cas.put(new TextEncoder().encode(options.text), { media_type: "text/plain; charset=utf-8" });
   await opened.database.run("INSERT OR IGNORE INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [blob.content_blob_id, blob.content_hash, blob.byte_length, blob.storage_reference]);
   await opened.database.run(
-    "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, 'utf-8', 'text', 'digest', ?, ?, NULL, ?)",
-    [options.artifactVersionId, workspaceId, options.artifactId, blob.content_blob_id, blob.content_hash, blob.byte_length, observationId, options.validFromGeneration, new Uint8Array([1])],
+    "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, 'utf-8', 'text', 'digest', ?, ?, NULL)",
+    [options.artifactVersionId, workspaceId, options.artifactId, blob.content_blob_id, blob.content_hash, blob.byte_length, observationId, options.validFromGeneration],
   );
 }
 
 async function seedCurrentGenerationChain(opened: WorkspaceDatabase, workspaceId: string): Promise<void> {
   await opened.database.run(
-    `INSERT OR IGNORE INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload)
-     VALUES ('registry-1', ?, '1.0.0', 'digest:core-registry', 'lock-1', 'digest:registry-1', ?)`,
-    [workspaceId, new Uint8Array([1])],
+    `INSERT OR IGNORE INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest)
+     VALUES ('registry-1', ?, '1.0.0', 'digest:core-registry', 'lock-1', 'digest:registry-1')`,
+    [workspaceId],
   );
   await opened.database.run(
-    `INSERT OR IGNORE INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload)
-     VALUES ('snapshot-1', ?, 1, NULL, 'manifest-1', 'registry-1', 'lock-1', 'configuration-1', 'digest:source-state', '{}', 'digest:canonical-record-set', '{}', 'digest:capability-state', ?, 'digest:snapshot-1', ?)`,
-    [workspaceId, now, new Uint8Array([1])],
+    `INSERT OR IGNORE INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest)
+     VALUES ('snapshot-1', ?, 1, NULL, 'manifest-1', 'registry-1', 'lock-1', 'configuration-1', 'digest:source-state', '{}', 'digest:canonical-record-set', '{}', 'digest:capability-state', ?, 'digest:snapshot-1')`,
+    [workspaceId, now],
   );
 }
 
 async function setCurrentGeneration(opened: WorkspaceDatabase, workspaceId: string, generation: number): Promise<void> {
   await seedCurrentGenerationChain(opened, workspaceId);
   await opened.database.run(
-    `INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload)
-     VALUES (?, 'snapshot-1', ?, 'registry-1', 'lock-1', 'configuration-1', 'freshness-1', 1, ?, ?)
+    `INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at)
+     VALUES (?, 'snapshot-1', ?, 'registry-1', 'lock-1', 'configuration-1', 'freshness-1', 1, ?)
      ON CONFLICT(workspace_id) DO UPDATE SET current_generation = excluded.current_generation`,
-    [workspaceId, generation, now, new Uint8Array([1])],
+    [workspaceId, generation, now],
   );
 }
 

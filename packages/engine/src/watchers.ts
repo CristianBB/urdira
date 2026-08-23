@@ -73,10 +73,9 @@ export interface WorkspaceWatcherManagerOptions {
    * "changed-path plumbing") when the batch is safe to interpret narrowly, or
    * is `undefined` when it is not (an `overflow`/`provider_reset`/git/worktree
    * event, where the set of actually-changed files is not knowable from the
-   * event stream itself). A caller MAY use `changedUris` to narrow later
-   * analysis, but stage-1 source cataloging always re-enumerates the whole
-   * workspace regardless (`runFullWorkspaceScan`'s planner diff remains the
-   * correctness anchor) -- `changedUris` is advisory only.
+   * event stream itself). Safe URI batches are forwarded to the scan
+   * generation so analysis and publication can be cancelled/coalesced; unsafe
+   * events deliberately widen to a full reconcile.
    */
   readonly on_reconcile?: (workspaceId: string, changedUris: readonly string[] | undefined, reason: WatcherReconcileReason) => void | Promise<void>;
   readonly on_configuration_change?: (workspaceId: string) => void | Promise<void>;
@@ -186,6 +185,8 @@ export interface ParcelWatcherAdapterOptions {
   readonly backend?: ParcelWatcherBackend;
   readonly watcher_options?: parcelWatcher.Options;
   readonly on_error?: (error: Error) => void;
+  /** Base delay for serialized watcher re-arms. Tests may set this to zero. */
+  readonly rearm_delay_ms?: number;
 }
 
 function slashPath(path: string): string {
@@ -233,12 +234,15 @@ function eventClass(binding: WatcherBinding, type: PhysicalWatcherEvent["type"],
 // periodic reconciliation sweep (`packages/daemon/src/runtime.ts`) is the
 // backstop once this gives up.
 const MAX_CONSECUTIVE_REARM_ATTEMPTS = 5;
+const DEFAULT_REARM_DELAY_MS = 100;
+const MAX_REARM_DELAY_MS = 2_000;
 
 export class ParcelWatcherAdapter {
   readonly #binding: WatcherBinding;
   readonly #backend: ParcelWatcherBackend | undefined;
   readonly #watcherOptions: parcelWatcher.Options | undefined;
   readonly #onError: ((error: Error) => void) | undefined;
+  readonly #rearmDelayMs: number;
   #sequence = 0;
   #delivery: Promise<void> = Promise.resolve();
 
@@ -247,6 +251,7 @@ export class ParcelWatcherAdapter {
     this.#backend = options.backend;
     this.#watcherOptions = options.watcher_options;
     this.#onError = options.on_error;
+    this.#rearmDelayMs = Math.max(0, options.rearm_delay_ms ?? DEFAULT_REARM_DELAY_MS);
   }
 
   normalize_events(events: readonly PhysicalWatcherEvent[]): WatcherHintBatch {
@@ -262,11 +267,27 @@ export class ParcelWatcherAdapter {
     let active: { unsubscribe(): Promise<void> } | undefined;
     let backend = this.#backend;
     let consecutiveErrors = 0;
+    let rearmExhausted = false;
+    let activeGeneration = 0;
+    let maintenance: Promise<void> = Promise.resolve();
     const arm = async (): Promise<void> => {
-      if (stopped) return;
+      if (stopped || rearmExhausted) return;
       backend ??= await import("@parcel/watcher");
+      const generation = ++activeGeneration;
       const subscription = await backend.subscribe(this.#binding.root, (error, events) => {
+        // The first error invalidates this callback immediately. Backends can
+        // report the same dropped-event episode more than once while a fresh
+        // subscription is being installed; those notifications are stale,
+        // not independent failures that should consume the whole retry budget.
+        if (generation !== activeGeneration) return;
         if (error) {
+          // Some backends continue invoking the failed subscription's
+          // callback after the bounded re-arm policy has given up. Ignore
+          // those stale notifications: repeatedly emitting provider_reset
+          // would otherwise supersede every reconciliation forever even
+          // though the adapter had already switched to the periodic sweep.
+          if (stopped || rearmExhausted) return;
+          activeGeneration += 1;
           consecutiveErrors += 1;
           // Unconditional and loud, independent of whether a caller wired
           // `on_error`: a watcher error that only reaches an optional,
@@ -277,29 +298,48 @@ export class ParcelWatcherAdapter {
           console.error(`[urdira] watcher error for workspace ${this.#binding.workspace_id} root=${this.#binding.root} (attempt ${consecutiveErrors}/${MAX_CONSECUTIVE_REARM_ATTEMPTS}): ${error.message || String(error)}`);
           this.#onError?.(error);
           this.#deliver(handler, this.#batch([this.#hint("provider_reset", "")]));
+          const failedSubscription = active;
+          active = undefined;
           if (consecutiveErrors >= MAX_CONSECUTIVE_REARM_ATTEMPTS) {
+            rearmExhausted = true;
             console.error(`[urdira] watcher for workspace ${this.#binding.workspace_id} root=${this.#binding.root} gave up re-arming after ${consecutiveErrors} consecutive errors; relying on the periodic reconciliation sweep instead.`);
+            maintenance = failedSubscription?.unsubscribe().catch(() => undefined) ?? Promise.resolve();
             return;
           }
-          // Treat the underlying subscription as dead and re-arm a fresh
-          // one. If the backend keeps calling this SAME (stale) callback
-          // after its own error, `arm()` below still installs a new
-          // subscription and `active` moves on to it, so at worst the
-          // process holds one extra (functionally idle) subscription until
-          // it too errors or `unsubscribe()` tears everything down.
-          void arm();
+          // Close the failed subscription, wait a bounded exponential
+          // backoff, and install exactly one replacement. Invalidating the
+          // generation above prevents a burst from this old callback from
+          // starting concurrent replacements.
+          const delayMs = Math.min(
+            MAX_REARM_DELAY_MS,
+            this.#rearmDelayMs * (2 ** Math.max(0, consecutiveErrors - 1)),
+          );
+          maintenance = (async () => {
+            await failedSubscription?.unsubscribe().catch(() => undefined);
+            if (delayMs > 0) await new Promise<void>((resolve) => { setTimeout(resolve, delayMs); });
+            if (!stopped && !rearmExhausted) await arm();
+          })().catch((rearmError: unknown) => {
+            const normalized = rearmError instanceof Error ? rearmError : new Error(String(rearmError));
+            console.error(`[urdira] watcher re-arm failed for workspace ${this.#binding.workspace_id} root=${this.#binding.root}: ${normalized.message}`);
+            this.#onError?.(normalized);
+          });
           return;
         }
         consecutiveErrors = 0;
         if (events.length > 0) this.#deliver(handler, this.normalize_events(events));
       }, this.#watcherOptions);
-      if (stopped) { await subscription.unsubscribe().catch(() => undefined); return; }
+      if (stopped || rearmExhausted || generation !== activeGeneration) {
+        await subscription.unsubscribe().catch(() => undefined);
+        return;
+      }
       active = subscription;
     };
     await arm();
     return {
       unsubscribe: async () => {
         stopped = true;
+        activeGeneration += 1;
+        await maintenance;
         await active?.unsubscribe();
       },
     };

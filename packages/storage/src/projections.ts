@@ -1,4 +1,4 @@
-import { decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
+import { digestBytes, digestLogicalValue } from "@urdira/canonical";
 import type { BlobStore } from "./cas.js";
 import { StorageError } from "./errors.js";
 import type { SqliteDatabase, SqliteValue } from "./sqlite.js";
@@ -129,19 +129,9 @@ export interface VectorMatch {
   readonly vector_digest: string;
 }
 
-interface StoredGraphEdge extends Record<string, unknown> { readonly edge_payload: unknown; }
-interface StoredDependency extends Record<string, unknown> { readonly dependency_payload: unknown; }
-interface StoredMetric extends Record<string, unknown> { readonly metric_payload: unknown; }
-
-function bytes(value: unknown): Uint8Array {
-  if (value instanceof Uint8Array) return new Uint8Array(value);
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  throw new StorageError("storage:invalid_blob", "SQLite returned a non-binary payload.");
-}
-
 function nullable(value: number | undefined): SqliteValue { return value ?? null; }
 // Decision 17: `semantic_index_state.document_grains` is stored as a plain
-// JSON array (not canonical-CBOR like every other payload column in this
+// JSON array (not a generic logical payload like every other payload column in this
 // file) -- it is a small, human-inspectable marker field read directly by
 // SQL-adjacent tooling, not a content-addressed/digested payload, so the
 // heavier canonical encoding buys nothing here. A NULL, unparseable, or
@@ -163,22 +153,7 @@ function decodeDocumentGrains(value: string | null): readonly ("artifact" | "ent
     return undefined;
   }
 }
-function sameBytes(left: Uint8Array, right: Uint8Array): boolean { return left.byteLength === right.byteLength && left.every((value, index) => value === right[index]); }
-function decodePayload<T>(value: unknown): T { return decodeCanonical(bytes(value)) as T; }
 function normalizedTerm(value: string): string { return value.normalize("NFKC").toLocaleLowerCase("en-US"); }
-// Trigrams are computed over normalizedTerm(text), not the raw string: this
-// makes every document's trigram set a case/normalization-insensitive
-// superset of any substring it contains, so a single trigram prefilter
-// (also built from normalizedTerm(pattern)) is a valid candidate filter for
-// BOTH case-sensitive and case-insensitive searchLiteral verification (see
-// searchLiteral below) -- normalization only folds case/compatibility forms,
-// it never removes byte sequences that survive into the normalized form.
-export function lexicalTrigrams(text: string): ReadonlyArray<string> {
-  const source = new TextEncoder().encode(normalizedTerm(text));
-  const result = new Set<string>();
-  for (let index = 0; index + 3 <= source.length; index += 1) result.add(Array.from(source.slice(index, index + 3), (value) => value.toString(16).padStart(2, "0")).join(""));
-  return [...result].sort();
-}
 
 interface VectorConfig {
   readonly element_type: "float32" | "float64";
@@ -196,6 +171,13 @@ function vectorConfig(value: VectorProjectionInput): VectorConfig {
   if (normalization !== "none" && normalization !== "l2") throw new StorageError("storage:unsupported_vector_profile", `Vector normalization ${normalization} is not supported.`);
   if (distanceMetric !== "squared_l2" && distanceMetric !== "cosine") throw new StorageError("storage:unsupported_vector_profile", `Vector distance metric ${distanceMetric} is not supported.`);
   return { element_type: value.element_type, vector_encoding: vectorEncoding, normalization, distance_metric: distanceMetric };
+}
+
+function sameVectorConfig(left: VectorConfig, right: VectorConfig): boolean {
+  return left.element_type === right.element_type
+    && left.vector_encoding === right.vector_encoding
+    && left.normalization === right.normalization
+    && left.distance_metric === right.distance_metric;
 }
 
 function decodeVectorValues(vector: Uint8Array, config: VectorConfig): number[] {
@@ -263,16 +245,13 @@ export class WorkspaceProjectionRepository {
 
   async putGraphEdge(value: GraphEdge): Promise<void> {
     await this.requireArtifactVersion(value.owner_artifact_id, value.owner_artifact_version_id);
-    const payload = encodeCanonical(value);
-    const existing = await this.database.get<{ edge_payload: unknown }>("SELECT edge_payload FROM graph_edges WHERE workspace_id = ? AND edge_id = ? AND valid_from_generation = ?", [this.workspaceId, value.edge_id, value.valid_from_generation]);
+    const contentDigest = digestLogicalValue(value, "urdira:graph-edge:v2");
+    const existing = await this.database.get<{ content_digest: string }>("SELECT content_digest FROM graph_edges WHERE workspace_id = ? AND edge_id = ? AND valid_from_generation = ?", [this.workspaceId, value.edge_id, value.valid_from_generation]);
     if (existing) {
-      if (!sameBytes(bytes(existing.edge_payload), payload)) throw new StorageError("storage:projection_immutable", `Graph edge ${value.edge_id} conflicts with its immutable payload.`);
+      if (existing.content_digest !== contentDigest) throw new StorageError("storage:projection_immutable", `Graph edge ${value.edge_id} conflicts with its immutable typed row.`);
       return;
     }
-    // `content_digest` is `digestBytes(payload)` computed once here at write
-    // time -- the exact leaf recipe `projectionSetDigestEntries` uses -- so
-    // its "stored" read path never has to re-hash this row's BLOB.
-    await this.database.run(`INSERT INTO graph_edges (edge_id, workspace_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, edge_payload, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [value.edge_id, this.workspaceId, value.source_subject_id, value.target_subject_id, value.relation_record_id, value.relation_kind, value.role, value.evidence_class, value.owner_artifact_id, value.owner_artifact_version_id, value.valid_from_generation, nullable(value.valid_to_generation), payload, digestBytes(payload)]);
+    await this.database.run(`INSERT INTO graph_edges (edge_id, workspace_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [value.edge_id, this.workspaceId, value.source_subject_id, value.target_subject_id, value.relation_record_id, value.relation_kind, value.role, value.evidence_class, value.owner_artifact_id, value.owner_artifact_version_id, value.valid_from_generation, nullable(value.valid_to_generation), contentDigest]);
   }
 
   async neighbors(subjectId: string, direction: "inbound" | "outbound" | "both" = "outbound", options: { readonly generation?: number } = {}): Promise<readonly GraphEdge[]> {
@@ -281,8 +260,7 @@ export class WorkspaceProjectionRepository {
     if (direction === "outbound" || direction === "both") { clauses.push("source_subject_id = ?"); params.push(subjectId); }
     if (direction === "inbound" || direction === "both") { clauses.push("target_subject_id = ?"); params.push(subjectId); }
     const visibility = this.visibleClause(await this.resolveGeneration(options.generation), "graph_edges");
-    const rows = await this.database.all<StoredGraphEdge>(`SELECT edge_payload FROM graph_edges WHERE workspace_id = ? AND (${clauses.join(" OR ")})${visibility.sql} ORDER BY relation_kind, role, target_subject_id, edge_id, valid_from_generation`, [...params, ...visibility.params]);
-    return rows.map((row) => decodePayload<GraphEdge>(row.edge_payload));
+    return await this.database.all<GraphEdge & Record<string, unknown>>(`SELECT edge_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation FROM graph_edges WHERE workspace_id = ? AND (${clauses.join(" OR ")})${visibility.sql} ORDER BY relation_kind, role, target_subject_id, edge_id, valid_from_generation`, [...params, ...visibility.params]) as readonly GraphEdge[];
   }
 
   async putLexicalDocument(value: LexicalDocumentInput): Promise<void> {
@@ -291,33 +269,15 @@ export class WorkspaceProjectionRepository {
     const owner = await this.requireArtifactVersion(value.artifact_id, value.artifact_version_id);
     if (owner.content_hash !== contentHash || owner.byte_length !== sourceBytes.byteLength) throw new StorageError("storage:projection_source_mismatch", `Lexical bytes do not match artifact version ${value.artifact_version_id}.`);
     const validFromGeneration = value.valid_from_generation ?? 0;
-    const normalizedValue = { ...value, valid_from_generation: validFromGeneration, ...(value.valid_to_generation === undefined ? {} : { valid_to_generation: value.valid_to_generation }) };
-    const existing = await this.database.get<{ content_hash: string; document_payload: unknown }>("SELECT content_hash, document_payload FROM lexical_documents WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?", [this.workspaceId, value.artifact_id, value.artifact_version_id]);
+    const existing = await this.database.get<{ content_hash: string; byte_length: number; valid_from_generation: number; valid_to_generation: number | null }>("SELECT content_hash, byte_length, valid_from_generation, valid_to_generation FROM lexical_documents WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?", [this.workspaceId, value.artifact_id, value.artifact_version_id]);
     if (existing) {
-      if (existing.content_hash !== contentHash || !sameBytes(bytes(existing.document_payload), encodeCanonical(normalizedValue))) throw new StorageError("storage:projection_immutable", `Lexical document ${value.artifact_id} conflicts with its immutable payload.`);
+      if (existing.content_hash !== contentHash || existing.byte_length !== sourceBytes.byteLength || existing.valid_from_generation !== validFromGeneration || existing.valid_to_generation !== (value.valid_to_generation ?? null)) throw new StorageError("storage:projection_immutable", `Lexical document ${value.artifact_id} conflicts with its immutable typed row.`);
       return;
     }
     const blob = await this.blobs.cas.put(sourceBytes, { media_type: "text/plain; charset=utf-8" });
-    const documentPayload = encodeCanonical(normalizedValue);
-    const documentTrigrams = lexicalTrigrams(value.text);
-    // Trigram rows are ordered BEFORE the `lexical_documents` row itself
-    // (not after), so that the "already inserted" existence check at the top
-    // of this method (`SELECT ... FROM lexical_documents WHERE ...`) can
-    // never observe a document as present before every one of its trigrams
-    // is durably committed alongside it. `transactionChunked` (see
-    // `packages/storage/src/sqlite.ts`) drives the whole set through ONE
-    // atomic `BEGIN IMMEDIATE` ... `COMMIT` no matter how many `batch_chunk`
-    // messages it takes to get there -- chunking only bounds the size of
-    // each individual postMessage structured clone (this call used to ship
-    // 1+N commands, N = this document's trigram count, in a single message,
-    // which is the actual cost the daemon's cross-thread lexical worker
-    // needs bounded -- see `packages/daemon/src/lexical-worker-thread.ts`),
-    // it does not weaken atomicity or allow a partial commit. This ordering
-    // is therefore defense-in-depth against a future change to that
-    // guarantee, not a requirement for correctness today.
     const commands = [
-      ...documentTrigrams.map((trigram) => ({ kind: "run" as const, sql: "INSERT INTO lexical_trigrams (workspace_id, trigram, artifact_id, artifact_version_id, trigram_payload) VALUES (?, ?, ?, ?, ?)", params: [this.workspaceId, trigram, value.artifact_id, value.artifact_version_id, encodeCanonical({ trigram })] as readonly SqliteValue[] })),
-      { kind: "run" as const, sql: "INSERT INTO lexical_documents (artifact_id, workspace_id, artifact_version_id, content_hash, byte_length, storage_reference, valid_from_generation, valid_to_generation, document_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [value.artifact_id, this.workspaceId, value.artifact_version_id, contentHash, sourceBytes.byteLength, blob.storage_reference, validFromGeneration, nullable(value.valid_to_generation), documentPayload] as readonly SqliteValue[] },
+      { kind: "run" as const, sql: "INSERT INTO lexical_documents (artifact_id, workspace_id, artifact_version_id, content_hash, byte_length, storage_reference, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", params: [value.artifact_id, this.workspaceId, value.artifact_version_id, contentHash, sourceBytes.byteLength, blob.storage_reference, validFromGeneration, nullable(value.valid_to_generation)] as readonly SqliteValue[] },
+      { kind: "run" as const, sql: "INSERT INTO lexical_fts (workspace_id, artifact_id, artifact_version_id, content) VALUES (?, ?, ?, ?)", params: [this.workspaceId, value.artifact_id, value.artifact_version_id, normalizedTerm(value.text)] as readonly SqliteValue[] },
     ];
     // Both commands above are `run`, so this stream qualifies for
     // `discard_results` -- see `TransactionChunkedOptions.discard_results`
@@ -328,16 +288,16 @@ export class WorkspaceProjectionRepository {
 
   async searchLiteral(pattern: string, options: { readonly case_sensitive?: boolean; readonly generation?: number } = {}): Promise<readonly LexicalMatch[]> {
     const normalizedPattern = normalizedTerm(pattern);
+    const ftsQuery = `"${normalizedPattern.replaceAll('"', '""')}"`;
     const visibility = this.visibleClause(await this.resolveGeneration(options.generation), "lexical_documents");
-    // Prefilter with trigrams of normalizedTerm(pattern) in BOTH case modes:
-    // document trigrams are normalized (see lexicalTrigrams), so the pattern's
-    // normalized trigrams are a valid superset filter regardless of which
-    // case mode verification below uses. Patterns whose normalized UTF-8 form
-    // is under 3 bytes can't form a whole trigram, so every visible doc is a
-    // candidate (existing behavior, unchanged by this normalization).
-    const candidateRows = new TextEncoder().encode(normalizedPattern).byteLength >= 3
-      ? await this.database.all<{ artifact_id: string; artifact_version_id: string }>(`SELECT DISTINCT lexical_trigrams.artifact_id, lexical_trigrams.artifact_version_id FROM lexical_trigrams JOIN lexical_documents ON lexical_documents.workspace_id = lexical_trigrams.workspace_id AND lexical_documents.artifact_id = lexical_trigrams.artifact_id AND lexical_documents.artifact_version_id = lexical_trigrams.artifact_version_id WHERE lexical_trigrams.workspace_id = ? AND lexical_trigrams.trigram IN (SELECT value FROM json_each(?))${visibility.sql} ORDER BY lexical_trigrams.artifact_id, lexical_trigrams.artifact_version_id`, [this.workspaceId, JSON.stringify(lexicalTrigrams(pattern)), ...visibility.params])
-      : await this.database.all<{ artifact_id: string; artifact_version_id: string }>(`SELECT artifact_id, artifact_version_id FROM lexical_documents WHERE workspace_id = ?${visibility.sql} ORDER BY artifact_id, artifact_version_id`, [this.workspaceId, ...visibility.params]);
+    // FTS5's trigram tokenizer generates candidates for patterns of at least
+    // three code points. Shorter patterns scan all visible documents. Every
+    // candidate is verified against exact CAS bytes below, preserving the
+    // public matching and offset semantics.
+    let candidateRows: readonly { artifact_id: string; artifact_version_id: string }[];
+    if (Array.from(normalizedPattern).length >= 3) {
+      candidateRows = await this.database.all<{ artifact_id: string; artifact_version_id: string }>(`SELECT lexical_fts.artifact_id, lexical_fts.artifact_version_id FROM lexical_fts JOIN lexical_documents ON lexical_documents.workspace_id = lexical_fts.workspace_id AND lexical_documents.artifact_id = lexical_fts.artifact_id AND lexical_documents.artifact_version_id = lexical_fts.artifact_version_id WHERE lexical_fts.workspace_id = ? AND lexical_fts MATCH ?${visibility.sql} ORDER BY lexical_fts.artifact_id, lexical_fts.artifact_version_id`, [this.workspaceId, ftsQuery, ...visibility.params]);
+    } else candidateRows = await this.database.all<{ artifact_id: string; artifact_version_id: string }>(`SELECT artifact_id, artifact_version_id FROM lexical_documents WHERE workspace_id = ?${visibility.sql} ORDER BY artifact_id, artifact_version_id`, [this.workspaceId, ...visibility.params]);
     const matches: LexicalMatch[] = [];
     for (const candidate of candidateRows) {
       const row = await this.database.get<{ content_hash: string; storage_reference: string }>("SELECT content_hash, storage_reference FROM lexical_documents WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?", [this.workspaceId, candidate.artifact_id, candidate.artifact_version_id]);
@@ -362,7 +322,7 @@ export class WorkspaceProjectionRepository {
     return matches;
   }
 
-  /** Generation through which the async post-ready lexical maintenance job has fully reconciled documents+trigrams, or undefined if it has never completed. */
+  /** Generation through which the async post-ready lexical maintenance job has fully reconciled documents+FTS5, or undefined if it has never completed. */
   async lexicalCompletedGeneration(): Promise<number | undefined> {
     const row = await this.database.get<{ completed_generation: number }>("SELECT completed_generation FROM lexical_index_state WHERE workspace_id = ?", [this.workspaceId]);
     return row?.completed_generation;
@@ -393,45 +353,41 @@ export class WorkspaceProjectionRepository {
   async putDependency(value: ArtifactDependency): Promise<void> {
     await this.requireArtifactVersion(value.owner_artifact_id, value.owner_artifact_version_id);
     await this.requireArtifactVersion(value.dependency_artifact_id, value.dependency_artifact_version_id);
-    const payload = encodeCanonical(value);
-    const existing = await this.database.get<{ dependency_payload: unknown }>("SELECT dependency_payload FROM artifact_dependencies WHERE workspace_id = ? AND dependency_entry_id = ? AND valid_from_generation = ?", [this.workspaceId, value.dependency_entry_id, value.valid_from_generation]);
+    const contentDigest = digestLogicalValue(value, "urdira:artifact-dependency:v2");
+    const existing = await this.database.get<{ content_digest: string }>("SELECT content_digest FROM artifact_dependencies WHERE workspace_id = ? AND dependency_entry_id = ? AND valid_from_generation = ?", [this.workspaceId, value.dependency_entry_id, value.valid_from_generation]);
     if (existing) {
-      if (!sameBytes(bytes(existing.dependency_payload), payload)) throw new StorageError("storage:projection_immutable", `Dependency ${value.dependency_entry_id} conflicts with its immutable payload.`);
+      if (existing.content_digest !== contentDigest) throw new StorageError("storage:projection_immutable", `Dependency ${value.dependency_entry_id} conflicts with its immutable typed row.`);
       return;
     }
-    // `content_digest` is `digestBytes(payload)` computed once here at write
-    // time -- the exact leaf recipe `projectionSetDigestEntries` uses -- so
-    // its "stored" read path never has to re-hash this row's BLOB.
-    await this.database.run(`INSERT INTO artifact_dependencies (dependency_entry_id, workspace_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, dependency_payload, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [value.dependency_entry_id, this.workspaceId, value.record_id, value.owner_artifact_id, value.owner_artifact_version_id, value.dependency_artifact_id, value.dependency_artifact_version_id, value.dependency_role, value.producer_id, value.producer_version, value.valid_from_generation, nullable(value.valid_to_generation), payload, digestBytes(payload)]);
+    await this.database.run(`INSERT INTO artifact_dependencies (dependency_entry_id, workspace_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [value.dependency_entry_id, this.workspaceId, value.record_id, value.owner_artifact_id, value.owner_artifact_version_id, value.dependency_artifact_id, value.dependency_artifact_version_id, value.dependency_role, value.producer_id, value.producer_version, value.valid_from_generation, nullable(value.valid_to_generation), contentDigest]);
   }
 
   async dependents(artifactId: string, artifactVersionId?: string, options: { readonly generation?: number } = {}): Promise<readonly ArtifactDependency[]> {
     const visibility = this.visibleClause(await this.resolveGeneration(options.generation), "artifact_dependencies");
     const rows = artifactVersionId === undefined
-      ? await this.database.all<StoredDependency>(`SELECT dependency_payload FROM artifact_dependencies WHERE workspace_id = ? AND dependency_artifact_id = ?${visibility.sql} ORDER BY dependency_artifact_version_id, dependency_role, record_id, dependency_entry_id, valid_from_generation`, [this.workspaceId, artifactId, ...visibility.params])
-      : await this.database.all<StoredDependency>(`SELECT dependency_payload FROM artifact_dependencies WHERE workspace_id = ? AND dependency_artifact_id = ? AND dependency_artifact_version_id = ?${visibility.sql} ORDER BY dependency_role, record_id, dependency_entry_id, valid_from_generation`, [this.workspaceId, artifactId, artifactVersionId, ...visibility.params]);
-    return rows.map((row) => decodePayload<ArtifactDependency>(row.dependency_payload));
+      ? await this.database.all<ArtifactDependency & Record<string, unknown>>(`SELECT dependency_entry_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation FROM artifact_dependencies WHERE workspace_id = ? AND dependency_artifact_id = ?${visibility.sql} ORDER BY dependency_artifact_version_id, dependency_role, record_id, dependency_entry_id, valid_from_generation`, [this.workspaceId, artifactId, ...visibility.params])
+      : await this.database.all<ArtifactDependency & Record<string, unknown>>(`SELECT dependency_entry_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation FROM artifact_dependencies WHERE workspace_id = ? AND dependency_artifact_id = ? AND dependency_artifact_version_id = ?${visibility.sql} ORDER BY dependency_role, record_id, dependency_entry_id, valid_from_generation`, [this.workspaceId, artifactId, artifactVersionId, ...visibility.params]);
+    return rows.map((row) => { const { valid_to_generation, ...base } = row; return { ...base, ...(valid_to_generation === null ? {} : { valid_to_generation }) }; }) as ArtifactDependency[];
   }
 
   async putMetric(value: MetricProjection): Promise<void> {
     await this.requireArtifactVersion(value.owner_artifact_id, value.owner_artifact_version_id);
     if (!Number.isFinite(value.metric_value)) throw new StorageError("storage:invalid_metric", "Metric projections require a finite numeric value.");
-    const payload = encodeCanonical(value);
-    const existing = await this.database.get<{ metric_payload: unknown }>("SELECT metric_payload FROM metric_projections WHERE workspace_id = ? AND metric_id = ? AND valid_from_generation = ?", [this.workspaceId, value.metric_id, value.valid_from_generation]);
+    const contentDigest = digestLogicalValue(value, "urdira:metric-projection:v2");
+    const existing = await this.database.get<{ content_digest: string }>("SELECT content_digest FROM metric_projections WHERE workspace_id = ? AND metric_id = ? AND valid_from_generation = ?", [this.workspaceId, value.metric_id, value.valid_from_generation]);
     if (existing) {
-      if (!sameBytes(bytes(existing.metric_payload), payload)) throw new StorageError("storage:projection_immutable", `Metric ${value.metric_id} conflicts with its immutable payload.`);
+      if (existing.content_digest !== contentDigest) throw new StorageError("storage:projection_immutable", `Metric ${value.metric_id} conflicts with its immutable typed row.`);
       return;
     }
-    // `content_digest` is `digestBytes(payload)` computed once here at write
-    // time -- the exact leaf recipe `projectionSetDigestEntries` uses -- so
-    // its "stored" read path never has to re-hash this row's BLOB.
-    await this.database.run("INSERT INTO metric_projections (metric_id, workspace_id, projection_record_id, metric_kind, metric_value, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, metric_payload, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [value.metric_id, this.workspaceId, value.projection_record_id, value.metric_kind, value.metric_value, value.owner_artifact_id, value.owner_artifact_version_id, value.valid_from_generation, nullable(value.valid_to_generation), payload, digestBytes(payload)]);
+    await this.database.run("INSERT INTO metric_projections (metric_id, workspace_id, projection_record_id, metric_kind, metric_value, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [value.metric_id, this.workspaceId, value.projection_record_id, value.metric_kind, value.metric_value, value.owner_artifact_id, value.owner_artifact_version_id, value.valid_from_generation, nullable(value.valid_to_generation), contentDigest]);
   }
 
   async getMetric(metricId: string, generation?: number): Promise<MetricProjection | undefined> {
     const visibility = this.visibleClause(await this.resolveGeneration(generation), "metric_projections");
-    const row = await this.database.get<StoredMetric>(`SELECT metric_payload FROM metric_projections WHERE workspace_id = ? AND metric_id = ?${visibility.sql} ORDER BY valid_from_generation DESC LIMIT 1`, [this.workspaceId, metricId, ...visibility.params]);
-    return row ? decodePayload<MetricProjection>(row.metric_payload) : undefined;
+    const row = await this.database.get<MetricProjection & Record<string, unknown>>(`SELECT metric_id, projection_record_id, metric_kind, metric_value, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation FROM metric_projections WHERE workspace_id = ? AND metric_id = ?${visibility.sql} ORDER BY valid_from_generation DESC LIMIT 1`, [this.workspaceId, metricId, ...visibility.params]);
+    if (!row) return undefined;
+    const { valid_to_generation, ...base } = row;
+    return { ...base, ...(valid_to_generation === null ? {} : { valid_to_generation }) } as MetricProjection;
   }
 
   async putVector(value: VectorProjectionInput): Promise<void> { await this.putVectors([value]); }
@@ -443,12 +399,12 @@ export class WorkspaceProjectionRepository {
     const first = ordered[0];
     if (!first || !Number.isSafeInteger(first.dimensions) || first.dimensions <= 0) throw new StorageError("storage:invalid_vector", "Vector dimensions must be a positive safe integer.");
     const config = vectorConfig(first);
-    const normalizedValues: Array<{ input: VectorProjectionInput; config: VectorConfig; vector: Uint8Array; payload: Uint8Array; digest: string; offset: number; valid_from_generation: number; valid_to_generation: number | undefined; key: string }> = [];
+    const normalizedValues: Array<{ input: VectorProjectionInput; config: VectorConfig; vector: Uint8Array; digest: string; offset: number; valid_from_generation: number; valid_to_generation: number | undefined; key: string }> = [];
     let offset = 0;
     for (const input of ordered) {
       if (input.dimensions !== first.dimensions || input.profile_id !== first.profile_id || input.executable_binding_id !== first.executable_binding_id) throw new StorageError("storage:vector_profile_mismatch", "All vectors in a packed shard must share one vector space.");
       const inputConfig = vectorConfig(input);
-      if (JSON.stringify(inputConfig) !== JSON.stringify(config)) throw new StorageError("storage:vector_profile_mismatch", "All vectors in a packed shard must share one encoding, normalization, and metric.");
+      if (!sameVectorConfig(inputConfig, config)) throw new StorageError("storage:vector_profile_mismatch", "All vectors in a packed shard must share one encoding, normalization, and metric.");
       // Decision 17: `document_ref` is required exactly when `document_grain`
       // is `"entity"` -- an artifact row (grain omitted/`"artifact"`) must
       // never carry a dangling entity reference, and an entity row must
@@ -458,26 +414,28 @@ export class WorkspaceProjectionRepository {
       const vector = canonicalVectorBytes(input.vector, input.dimensions, config);
       const validFromGeneration = input.valid_from_generation ?? 0;
       if (!Number.isSafeInteger(validFromGeneration) || validFromGeneration < 0 || (input.valid_to_generation !== undefined && (!Number.isSafeInteger(input.valid_to_generation) || input.valid_to_generation <= validFromGeneration))) throw new StorageError("storage:invalid_vector_interval", "Vector validity intervals must be ordered safe generation integers.");
-      const payload = encodeCanonical({ ...input, vector, vector_encoding: config.vector_encoding, normalization: config.normalization, distance_metric: config.distance_metric, valid_from_generation: validFromGeneration, ...(input.valid_to_generation === undefined ? {} : { valid_to_generation: input.valid_to_generation }) });
-      normalizedValues.push({ input, config, vector, payload, digest: digestBytes(vector), offset, valid_from_generation: validFromGeneration, valid_to_generation: input.valid_to_generation, key: `${input.projection_record_id}@${validFromGeneration}` });
+      normalizedValues.push({ input, config, vector, digest: digestBytes(vector), offset, valid_from_generation: validFromGeneration, valid_to_generation: input.valid_to_generation, key: `${input.projection_record_id}@${validFromGeneration}` });
       offset += vector.byteLength;
     }
     const packed = new Uint8Array(offset);
     for (const item of normalizedValues) packed.set(item.vector, item.offset);
-    const existingRows = await this.database.all<{ projection_record_id: string; valid_from_generation: number; vector_payload: unknown }>(`SELECT projection_record_id, valid_from_generation, vector_payload FROM vector_projection_rows WHERE workspace_id = ? AND projection_record_id IN (${ordered.map(() => "?").join(",")})`, [this.workspaceId, ...ordered.map((value) => value.projection_record_id)]);
+    const existingRows: Array<{ projection_record_id: string; valid_from_generation: number; vector_digest: string }> = [];
+    for (let offset = 0; offset < ordered.length; offset += 400) {
+      const ids = ordered.slice(offset, offset + 400).map((value) => value.projection_record_id);
+      existingRows.push(...await this.database.all<{ projection_record_id: string; valid_from_generation: number; vector_digest: string }>(`SELECT projection_record_id, valid_from_generation, vector_digest FROM vector_projection_rows WHERE workspace_id = ? AND projection_record_id IN (${ids.map(() => "?").join(",")})`, [this.workspaceId, ...ids]));
+    }
     const existingById = new Map(existingRows.map((row) => [`${row.projection_record_id}@${row.valid_from_generation}`, row]));
     for (const item of normalizedValues) {
       const existing = existingById.get(item.key);
-      if (existing && !sameBytes(bytes(existing.vector_payload), item.payload)) throw new StorageError("storage:projection_immutable", `Vector ${item.input.projection_record_id} conflicts with its immutable payload.`);
+      if (existing && existing.vector_digest !== item.digest) throw new StorageError("storage:projection_immutable", `Vector ${item.input.projection_record_id} conflicts with its immutable typed row.`);
     }
     if (normalizedValues.every((item) => existingById.has(item.key))) return;
     const shard = await this.blobs.cas.put(packed, { media_type: "application/octet-stream" });
     const shardId = `shard:${shard.content_hash}`;
-    const shardPayload = encodeCanonical({ shard_id: shardId, content_hash: shard.content_hash, dimensions: first.dimensions, element_type: config.element_type, vector_encoding: config.vector_encoding, normalization: config.normalization, distance_metric: config.distance_metric });
     const existingShard = await this.database.get<{ shard_id: string }>("SELECT shard_id FROM vector_shards WHERE workspace_id = ? AND content_hash = ?", [this.workspaceId, shard.content_hash]);
     const commands: Array<{ kind: "run"; sql: string; params: readonly SqliteValue[] }> = [];
-    if (!existingShard) commands.push({ kind: "run", sql: "INSERT INTO vector_shards (shard_id, workspace_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at, shard_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [shardId, this.workspaceId, first.profile_id, first.executable_binding_id, first.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, packed.byteLength, shard.content_hash, shard.storage_reference, new Date().toISOString(), shardPayload] });
-    for (const item of normalizedValues) if (!existingById.has(item.key)) commands.push({ kind: "run", sql: "INSERT INTO vector_projection_rows (projection_record_id, workspace_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, vector_payload, document_grain, document_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [item.input.projection_record_id, this.workspaceId, existingShard?.shard_id ?? shardId, item.offset, item.vector.byteLength, item.digest, item.input.owner_artifact_id, item.input.owner_artifact_version_id, item.input.profile_id, item.input.executable_binding_id, item.input.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, item.valid_from_generation, nullable(item.valid_to_generation), item.payload, item.input.document_grain ?? null, item.input.document_ref ?? null] });
+    if (!existingShard) commands.push({ kind: "run", sql: "INSERT INTO vector_shards (shard_id, workspace_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [shardId, this.workspaceId, first.profile_id, first.executable_binding_id, first.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, packed.byteLength, shard.content_hash, shard.storage_reference, new Date().toISOString()] });
+    for (const item of normalizedValues) if (!existingById.has(item.key)) commands.push({ kind: "run", sql: "INSERT INTO vector_projection_rows (projection_record_id, workspace_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, document_grain, document_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [item.input.projection_record_id, this.workspaceId, existingShard?.shard_id ?? shardId, item.offset, item.vector.byteLength, item.digest, item.input.owner_artifact_id, item.input.owner_artifact_version_id, item.input.profile_id, item.input.executable_binding_id, item.input.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, item.valid_from_generation, nullable(item.valid_to_generation), item.input.document_grain ?? null, item.input.document_ref ?? null] });
     await this.database.transaction(commands);
   }
 

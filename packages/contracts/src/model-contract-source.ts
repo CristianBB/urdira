@@ -1827,7 +1827,7 @@ export const authoritativeModelSourceFields = {
       "logical_type": "Text"
     },
     {
-      "name": "expected_cbor_hex",
+      "name": "expected_encoding_hex",
       "presence": "optional",
       "logical_type": "Text"
     },
@@ -2100,9 +2100,9 @@ export const authoritativeModelSourceFields = {
       "logical_type": "Text"
     },
     {
-      "name": "content_bytes",
+      "name": "content",
       "presence": "required",
-      "logical_type": "Text"
+      "logical_type": "Bytes"
     },
     {
       "name": "content_hash",

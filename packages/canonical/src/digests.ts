@@ -3,10 +3,28 @@ import { coreSchemaDefinitions, validateSchemaValue, type CanonicalSchemaDefinit
 import { digestDomainRegistry, digestPayloadSchemaDefinitions, digestRecipeDefinitions, digestRecipeVariantDefinitions, documentedDigestRecipeCoordinates } from "./registries.js";
 import { isWholeVerifiedInput, payloadBindingFor, payloadSchemaIdFor } from "./digest-payload-schemas.js";
 import { compareCanonicalValues, readCanonicalPointer } from "./comparators.js";
-import { canonicalBytes, compareBytes, decodeCanonical, encodeArrayHeader, encodeCanonical, encodeMapHeader, type CanonicalEncodingLimits } from "./cbor.js";
+import { canonicalBytes, compareBytes, decodeCanonical, encodeArrayHeader, encodeCanonical, encodeMapHeader, type CanonicalEncodingLimits } from "./logical-encoding.js";
 import { fail } from "./errors.js";
 
 export type DigestText = `sha256:${string}`;
+
+const frozenCanonicalArrayDigests = new WeakMap<readonly unknown[], ReadonlyMap<string, DigestText>>();
+
+function rememberFrozenCanonicalArrayDigest(elements: readonly unknown[], mappingId: string, digest: DigestText): void {
+  if (!Object.isFrozen(elements)) return;
+  const existing = frozenCanonicalArrayDigests.get(elements);
+  frozenCanonicalArrayDigests.set(elements, new Map([...(existing ?? []), [mappingId, digest]]));
+}
+
+/**
+ * Returns a digest previously computed by this module for this exact frozen
+ * array identity and mapping. Mutable arrays are deliberately never cached:
+ * publication may reuse a seal-time digest only when later mutation is
+ * impossible.
+ */
+export function memoizedCanonicalArrayDigest(elements: readonly unknown[], mappingId = "canonical"): DigestText | undefined {
+  return frozenCanonicalArrayDigests.get(elements)?.get(mappingId);
+}
 
 export interface DigestRecipe {
   readonly digest_recipe_id: string;
@@ -42,7 +60,7 @@ export function digestBytes(bytes: Uint8Array): DigestText {
 }
 
 /**
- * SHA-256 over the canonical CBOR encoding of `elements` as an array, without
+ * SHA-256 over the deterministic logical encoding of `elements` as an array, without
  * ever materializing the concatenated encoding. Byte-identical to
  * `digestBytes(encodeCanonical(elements, limits))`, computed instead by
  * hashing the canonical array header followed by each element's own
@@ -63,6 +81,69 @@ export function digestCanonicalArray(elements: readonly unknown[], limits: Canon
   const hash = createHash("sha256");
   hash.update(encodeArrayHeader(elements.length));
   for (const element of elements) hash.update(canonicalBytes(element, limits));
+  const digest = `sha256:${hash.digest("hex")}` as DigestText;
+  rememberFrozenCanonicalArrayDigest(elements, "canonical", digest);
+  return digest;
+}
+
+/**
+ * Mapped variant used when an in-memory transport object has a different
+ * canonical logical value (for example a packed JSON template). The mapping
+ * identifier prevents a digest computed with one projection from being
+ * reused by another.
+ */
+export function digestMappedCanonicalArray<T>(elements: readonly T[], mappingId: string, map: (element: T) => unknown, limits: CanonicalEncodingLimits = {}): DigestText {
+  const hash = createHash("sha256");
+  hash.update(encodeArrayHeader(elements.length));
+  for (const element of elements) hash.update(canonicalBytes(map(element), limits));
+  const digest = `sha256:${hash.digest("hex")}` as DigestText;
+  rememberFrozenCanonicalArrayDigest(elements, mappingId, digest);
+  return digest;
+}
+
+/**
+ * SHA-256 over the deterministic logical encoding of a map whose one large field is
+ * an array, without materializing the complete map. The result is byte-
+ * identical to `digestBytes(canonicalBytes({ ...scalarFields, [arrayField]:
+ * arrayElements }))`; each array element is bounded independently by
+ * `limits`, so a large workspace cannot trip the aggregate `max_bytes` limit.
+ */
+export function digestCanonicalMapWithArrayField(
+  scalarFields: Readonly<Record<string, unknown>>,
+  arrayField: string,
+  arrayElements: readonly unknown[],
+  limits: CanonicalEncodingLimits = {},
+): DigestText {
+  return digestCanonicalMapWithArrayFields(scalarFields, { [arrayField]: arrayElements }, limits);
+}
+
+/**
+ * Variant of `digestCanonicalMapWithArrayField` for maps with more than one
+ * large array field. The encoded bytes are identical to encoding the merged
+ * object, while each array element is encoded independently.
+ */
+export function digestCanonicalMapWithArrayFields(
+  scalarFields: Readonly<Record<string, unknown>>,
+  arrayFields: Readonly<Record<string, readonly unknown[]>>,
+  limits: CanonicalEncodingLimits = {},
+): DigestText {
+  for (const arrayField of Object.keys(arrayFields)) {
+    if (Object.hasOwn(scalarFields, arrayField)) fail("uce:duplicate_map_key", "normalize", { byte_offset: 0, duplicate_key: arrayField });
+  }
+  const hash = createHash("sha256");
+  const keyEncoder = new TextEncoder();
+  const fields: Array<{ sortKeyBytes: Uint8Array; keyBytes: Uint8Array; emit: () => void }> = Object.entries(scalarFields).map(([key, value]) => ({ sortKeyBytes: keyEncoder.encode(key), keyBytes: canonicalBytes(key), emit: () => hash.update(canonicalBytes(value, limits)) }));
+  for (const [arrayField, arrayElements] of Object.entries(arrayFields)) fields.push({
+    sortKeyBytes: keyEncoder.encode(arrayField),
+    keyBytes: canonicalBytes(arrayField),
+    emit: () => {
+      hash.update(encodeArrayHeader(arrayElements.length));
+      for (const element of arrayElements) hash.update(canonicalBytes(element, limits));
+    },
+  });
+  fields.sort((left, right) => compareBytes(left.sortKeyBytes, right.sortKeyBytes));
+  hash.update(encodeMapHeader(fields.length));
+  for (const field of fields) { hash.update(field.keyBytes); field.emit(); }
   return `sha256:${hash.digest("hex")}`;
 }
 
@@ -130,18 +211,21 @@ export function computeDigestOverMapPayloadWithArrayField(
   const hash = createHash("sha256");
   hash.update(encodeArrayHeader(envelope.length));
   for (let index = 0; index < envelope.length - 1; index += 1) hash.update(canonicalBytes(envelope[index]));
-  const fields: Array<{ keyBytes: Uint8Array; emit: () => void }> = Object.entries(scalarFields).map(([key, value]) => ({
+  const keyEncoder = new TextEncoder();
+  const fields: Array<{ sortKeyBytes: Uint8Array; keyBytes: Uint8Array; emit: () => void }> = Object.entries(scalarFields).map(([key, value]) => ({
+    sortKeyBytes: keyEncoder.encode(key),
     keyBytes: canonicalBytes(key),
     emit: () => hash.update(canonicalBytes(value)),
   }));
   fields.push({
+    sortKeyBytes: keyEncoder.encode(arrayField),
     keyBytes: canonicalBytes(arrayField),
     emit: () => {
       hash.update(encodeArrayHeader(arrayElements.length));
       for (const element of arrayElements) hash.update(canonicalBytes(element));
     },
   });
-  fields.sort((left, right) => compareBytes(left.keyBytes, right.keyBytes));
+  fields.sort((left, right) => compareBytes(left.sortKeyBytes, right.sortKeyBytes));
   hash.update(encodeMapHeader(fields.length));
   for (const field of fields) { hash.update(field.keyBytes); field.emit(); }
   return `sha256:${hash.digest("hex")}`;

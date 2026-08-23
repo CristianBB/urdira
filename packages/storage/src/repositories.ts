@@ -1,4 +1,4 @@
-import { decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
+import { decodeCanonical, digestBytes, digestLogicalValue, encodeCanonical } from "@urdira/canonical";
 import type {
   ArtifactVersion,
   ArtifactTombstone,
@@ -18,6 +18,7 @@ import type {
 import type { BlobReference, BlobStore } from "./cas.js";
 import { StorageError } from "./errors.js";
 import type { SqliteCommand, SqliteDatabase, SqliteValue } from "./sqlite.js";
+import { digestRelationalValue, hydrateRelationalValue, type RelationalValueRow } from "./relational-values.js";
 
 function canonicalSha256(value: unknown): string { return digestBytes(encodeCanonical(value)); }
 
@@ -75,6 +76,45 @@ function canonicalWithoutFields(value: unknown, fields: readonly string[]): Uint
   return encodeCanonical(copy);
 }
 
+function withoutFields(value: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
+  const copy = { ...value };
+  for (const field of fields) delete copy[field];
+  return copy;
+}
+
+function recordFromColumns(row: Record<string, unknown>, payload: unknown, facets: readonly string[]): RecordEnvelope {
+  const primarySourceSpan = row["primary_source_span_artifact_version_id"] == null || row["primary_source_span_start_byte"] == null || row["primary_source_span_end_byte"] == null
+    ? undefined
+    : {
+        artifact_version_id: String(row["primary_source_span_artifact_version_id"]),
+        start_byte: String(row["primary_source_span_start_byte"]),
+        end_byte: String(row["primary_source_span_end_byte"]),
+        ...(row["primary_source_span_start_line"] == null ? {} : { start_line: String(row["primary_source_span_start_line"]) }),
+        ...(row["primary_source_span_end_line"] == null ? {} : { end_line: String(row["primary_source_span_end_line"]) }),
+      };
+  return {
+    record_id: String(row["record_id"]),
+    category: String(row["category"]) as RecordEnvelope["category"],
+    kind: String(row["kind"]),
+    universal_kind: String(row["universal_kind"]),
+    facets,
+    schema_version: Number(row["schema_version"]),
+    workspace_id: String(row["workspace_id"]),
+    owner_artifact_id: String(row["owner_artifact_id"]),
+    owner_artifact_version_id: String(row["owner_artifact_version_id"]),
+    ...(primarySourceSpan === undefined ? {} : { primary_source_span: primarySourceSpan }),
+    valid_from_generation: Number(row["valid_from_generation"]),
+    ...(row["valid_to_generation"] == null ? {} : { valid_to_generation: Number(row["valid_to_generation"]) }),
+    producer_id: String(row["producer_id"]),
+    producer_version: String(row["producer_version"]),
+    analysis_digest: String(row["analysis_digest"]),
+    analysis_configuration_digest: String(row["analysis_configuration_digest"]),
+    artifact_dependency_digest: String(row["artifact_dependency_digest"]),
+    payload: (payload ?? null) as RecordEnvelope["payload"],
+    record_digest: String(row["record_digest"]),
+  };
+}
+
 export type ArtifactVersionRecord = Omit<ArtifactVersion, "language_hint" | "valid_to_generation"> & {
   readonly language_hint?: string;
   readonly valid_to_generation?: number;
@@ -101,41 +141,38 @@ export class SourceCatalogRepository {
 
   async putArtifact(value: SourceArtifact): Promise<void> {
     assertWorkspace(this.workspaceId, value.workspace_id);
-    const encoded = encodeCanonical(value);
     const existing = await this.database.get<{
       workspace_id: string;
       normalized_uri: string;
       normalized_path: string | null;
       display_path: string | null;
       artifact_kind: string;
-      artifact_payload: unknown;
-    }>("SELECT workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload FROM source_artifacts WHERE artifact_id = ?", [value.artifact_id]);
+    }>("SELECT workspace_id, normalized_uri, normalized_path, display_path, artifact_kind FROM source_artifacts WHERE artifact_id = ?", [value.artifact_id]);
     if (existing) {
       const projectionMatches = existing.workspace_id === value.workspace_id
         && existing.normalized_uri === value.normalized_uri
         && (existing.normalized_path ?? undefined) === (value.normalized_path ?? undefined)
         && (existing.display_path ?? undefined) === (value.display_path ?? undefined)
         && existing.artifact_kind === value.artifact_kind;
-      if (!projectionMatches || !sameBytes(bytes(existing.artifact_payload), encoded)) {
+      if (!projectionMatches) {
         throw new StorageError("storage:immutable_artifact", `Artifact ${value.artifact_id} is immutable and cannot be rewritten.`);
       }
       return;
     }
     await this.database.run(
-      `INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [value.artifact_id, value.workspace_id, value.normalized_uri, optionalText(value.normalized_path), optionalText(value.display_path), value.artifact_kind, encoded],
+      `INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [value.artifact_id, value.workspace_id, value.normalized_uri, optionalText(value.normalized_path), optionalText(value.display_path), value.artifact_kind],
     );
   }
 
   async getArtifact(artifactId: string): Promise<SourceArtifact | undefined> {
-    const row = await this.database.get<{ artifact_payload: unknown }>("SELECT artifact_payload FROM source_artifacts WHERE workspace_id = ? AND artifact_id = ?", [this.workspaceId, artifactId]);
-    return row ? decodeCanonical(bytes(row.artifact_payload)) as SourceArtifact : undefined;
+    const row = await this.database.get<Record<string, unknown> & SourceArtifact>("SELECT artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind FROM source_artifacts WHERE workspace_id = ? AND artifact_id = ?", [this.workspaceId, artifactId]);
+    return row;
   }
 
   async listArtifacts(): Promise<readonly SourceArtifact[]> {
-    const rows = await this.database.all<{ artifact_payload: unknown }>("SELECT artifact_payload FROM source_artifacts WHERE workspace_id = ? ORDER BY artifact_id", [this.workspaceId]);
-    return rows.map((row) => decodeCanonical(bytes(row.artifact_payload)) as SourceArtifact);
+    return await this.database.all<Record<string, unknown> & SourceArtifact>("SELECT artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind FROM source_artifacts WHERE workspace_id = ? ORDER BY artifact_id", [this.workspaceId]);
   }
 
   async putContentBlob(value: ContentBlob): Promise<void> {
@@ -160,8 +197,8 @@ export class SourceCatalogRepository {
     const result = await this.database.run(
       `INSERT INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider,
        source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority,
-       provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest,
-       observation_batch_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(observation_batch_id) DO UPDATE SET workspace_id = excluded.workspace_id,
        source_provider_binding_id = excluded.source_provider_binding_id, source_provider = excluded.source_provider,
        source_provider_version = excluded.source_provider_version, ordering_domain = excluded.ordering_domain,
@@ -169,8 +206,7 @@ export class SourceCatalogRepository {
        coverage_completeness = excluded.coverage_completeness, deletion_authority = excluded.deletion_authority,
        provider_cursor_before = excluded.provider_cursor_before, provider_cursor_after = excluded.provider_cursor_after,
        started_at = excluded.started_at, completed_at = excluded.completed_at, observation_count = excluded.observation_count,
-       unavailable_count = excluded.unavailable_count, batch_digest = excluded.batch_digest,
-       observation_batch_payload = excluded.observation_batch_payload
+       unavailable_count = excluded.unavailable_count, batch_digest = excluded.batch_digest
        WHERE source_observation_batches.workspace_id IS excluded.workspace_id
          AND source_observation_batches.source_provider_binding_id IS excluded.source_provider_binding_id
          AND source_observation_batches.source_provider IS excluded.source_provider
@@ -186,19 +222,17 @@ export class SourceCatalogRepository {
          AND source_observation_batches.completed_at IS excluded.completed_at
        AND source_observation_batches.observation_count IS excluded.observation_count
        AND source_observation_batches.unavailable_count IS excluded.unavailable_count
-       AND source_observation_batches.batch_digest IS excluded.batch_digest
-       AND source_observation_batches.observation_batch_payload IS excluded.observation_batch_payload`,
+       AND source_observation_batches.batch_digest IS excluded.batch_digest`,
       [value.observation_batch_id, value.workspace_id, value.source_provider_binding_id, value.source_provider, value.source_provider_version,
         value.ordering_domain, value.observation_mode, value.coverage_scopes, value.coverage_completeness, value.deletion_authority,
         optionalText(value.provider_cursor_before), optionalText(value.provider_cursor_after), value.started_at, value.completed_at,
-        value.observation_count, value.unavailable_count, value.batch_digest, encodeCanonical(value)],
+        value.observation_count, value.unavailable_count, value.batch_digest],
     );
     if (result.changes !== 1) throw new StorageError("storage:source_observation_batch_immutable", `Observation batch ${value.observation_batch_id} conflicts with its retained typed projection.`);
   }
 
   async getObservationBatch(batchId: string): Promise<SourceObservationBatchRecord | undefined> {
-    const row = await this.database.get<{ observation_batch_payload: unknown }>("SELECT observation_batch_payload FROM source_observation_batches WHERE workspace_id = ? AND observation_batch_id = ?", [this.workspaceId, batchId]);
-    return row ? decodeCanonical(bytes(row.observation_batch_payload)) as SourceObservationBatchRecord : undefined;
+    return await this.database.get<SourceObservationBatchRecord>("SELECT observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest FROM source_observation_batches WHERE workspace_id = ? AND observation_batch_id = ?", [this.workspaceId, batchId]);
   }
 
   async putArtifactVersion(value: ArtifactVersionRecord): Promise<void> {
@@ -207,21 +241,20 @@ export class SourceCatalogRepository {
     if (!contentBlob || contentBlob.content_hash !== value.content_hash || contentBlob.byte_length !== value.byte_length) {
       throw new StorageError("storage:artifact_version_content_blob_mismatch", `Artifact version ${value.artifact_version_id} does not match content blob ${value.content_blob_id}.`);
     }
-    const encoded = encodeCanonical(value);
-    const existingPayload = await this.database.get<{ valid_to_generation: number | null; artifact_version_payload: unknown }>("SELECT valid_to_generation, artifact_version_payload FROM artifact_versions WHERE workspace_id = ? AND artifact_version_id = ?", [this.workspaceId, value.artifact_version_id]);
-    if (existingPayload && existingPayload.valid_to_generation === null && value.valid_to_generation !== undefined
-      && !sameBytes(canonicalWithoutFields(decodeCanonical(bytes(existingPayload.artifact_version_payload)), ["valid_to_generation"]), canonicalWithoutFields(value, ["valid_to_generation"]))) {
+    const existingPayload = await this.database.get<Record<string, unknown>>("SELECT artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation FROM artifact_versions WHERE workspace_id = ? AND artifact_version_id = ?", [this.workspaceId, value.artifact_version_id]);
+    if (existingPayload && existingPayload["valid_to_generation"] === null && value.valid_to_generation !== undefined
+      && digestLogicalValue(withoutFields(existingPayload, ["valid_to_generation"])) !== digestLogicalValue(withoutFields(value, ["valid_to_generation"]))) {
       throw new StorageError("storage:artifact_version_immutable", `Artifact version ${value.artifact_version_id} has a conflicting canonical payload.`);
     }
     const result = await this.database.run(
       `INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint,
-       analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(artifact_version_id) DO UPDATE SET workspace_id = excluded.workspace_id, artifact_id = excluded.artifact_id,
        content_blob_id = excluded.content_blob_id, content_hash = excluded.content_hash, byte_length = excluded.byte_length,
        encoding = excluded.encoding, language_hint = excluded.language_hint, analysis_metadata_digest = excluded.analysis_metadata_digest,
        created_from_observation_id = excluded.created_from_observation_id, valid_from_generation = excluded.valid_from_generation,
-       valid_to_generation = excluded.valid_to_generation, artifact_version_payload = excluded.artifact_version_payload
+       valid_to_generation = excluded.valid_to_generation
        WHERE artifact_versions.workspace_id IS excluded.workspace_id
          AND artifact_versions.artifact_id IS excluded.artifact_id
          AND artifact_versions.content_blob_id IS excluded.content_blob_id
@@ -232,11 +265,11 @@ export class SourceCatalogRepository {
          AND artifact_versions.analysis_metadata_digest IS excluded.analysis_metadata_digest
          AND artifact_versions.created_from_observation_id IS excluded.created_from_observation_id
          AND artifact_versions.valid_from_generation IS excluded.valid_from_generation
-         AND ((artifact_versions.valid_to_generation IS NULL AND (excluded.valid_to_generation IS NOT NULL OR artifact_versions.artifact_version_payload IS excluded.artifact_version_payload)
+         AND ((artifact_versions.valid_to_generation IS NULL AND excluded.valid_to_generation IS NOT NULL
            AND (excluded.valid_to_generation IS NULL OR excluded.valid_to_generation > artifact_versions.valid_from_generation))
            OR (artifact_versions.valid_to_generation IS NOT NULL AND excluded.valid_to_generation IS artifact_versions.valid_to_generation
-             AND artifact_versions.artifact_version_payload IS excluded.artifact_version_payload))`,
-      [value.artifact_version_id, value.workspace_id, value.artifact_id, value.content_blob_id, value.content_hash, value.byte_length, value.encoding, optionalText(value.language_hint), value.analysis_metadata_digest, value.created_from_observation_id, value.valid_from_generation, optionalNumber(value.valid_to_generation), encoded],
+             ))`,
+      [value.artifact_version_id, value.workspace_id, value.artifact_id, value.content_blob_id, value.content_hash, value.byte_length, value.encoding, optionalText(value.language_hint), value.analysis_metadata_digest, value.created_from_observation_id, value.valid_from_generation, optionalNumber(value.valid_to_generation)],
     );
     if (result.changes !== 1) {
       const existing = await this.database.get<{ valid_to_generation: number | null }>("SELECT valid_to_generation FROM artifact_versions WHERE workspace_id = ? AND artifact_version_id = ?", [this.workspaceId, value.artifact_version_id]);
@@ -245,8 +278,9 @@ export class SourceCatalogRepository {
   }
 
   async getArtifactVersion(artifactVersionId: string): Promise<ArtifactVersionRecord | undefined> {
-    const row = await this.database.get<{ artifact_version_payload: unknown }>("SELECT artifact_version_payload FROM artifact_versions WHERE workspace_id = ? AND artifact_version_id = ?", [this.workspaceId, artifactVersionId]);
-    return row ? decodeCanonical(bytes(row.artifact_version_payload)) as ArtifactVersionRecord : undefined;
+    const row = await this.database.get<ArtifactVersionRecord>("SELECT artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation FROM artifact_versions WHERE workspace_id = ? AND artifact_version_id = ?", [this.workspaceId, artifactVersionId]);
+    if (!row) return undefined;
+    return row.valid_to_generation === null ? (({ valid_to_generation: _closed, ...open }) => open as ArtifactVersionRecord)(row) : row;
   }
 
   async putTombstone(value: ArtifactTombstoneRecord): Promise<void> {
@@ -260,24 +294,22 @@ export class SourceCatalogRepository {
         || value.replacement_artifact_version_id.length === 0)) {
       throw new StorageError("storage:tombstone_closure_metadata", `Closed tombstone ${value.artifact_tombstone_id} requires a valid closure generation, closing change, and replacement artifact version.`);
     }
-    const existingPayload = await this.database.get<{ valid_to_generation: number | null; artifact_tombstone_payload: unknown }>("SELECT valid_to_generation, artifact_tombstone_payload FROM artifact_tombstones WHERE workspace_id = ? AND artifact_tombstone_id = ?", [this.workspaceId, value.artifact_tombstone_id]);
-    if (existingPayload && existingPayload.valid_to_generation === null && value.valid_to_generation !== undefined
-      && !sameBytes(canonicalWithoutFields(decodeCanonical(bytes(existingPayload.artifact_tombstone_payload)), ["valid_to_generation", "closing_artifact_change_id", "replacement_artifact_version_id"]), canonicalWithoutFields(value, ["valid_to_generation", "closing_artifact_change_id", "replacement_artifact_version_id"]))) {
+    const existingPayload = await this.database.get<Record<string, unknown>>("SELECT artifact_tombstone_id, workspace_id, artifact_id, absence_kind, absence_reason_code, last_artifact_version_id, valid_from_generation, valid_to_generation, opening_artifact_change_id, closing_artifact_change_id, replacement_artifact_version_id, cause_references, lineage_evidence_record_ids FROM artifact_tombstones WHERE workspace_id = ? AND artifact_tombstone_id = ?", [this.workspaceId, value.artifact_tombstone_id]);
+    if (existingPayload && existingPayload["valid_to_generation"] === null && value.valid_to_generation !== undefined
+      && digestLogicalValue(withoutFields(existingPayload, ["valid_to_generation", "closing_artifact_change_id", "replacement_artifact_version_id"])) !== digestLogicalValue(withoutFields(value, ["valid_to_generation", "closing_artifact_change_id", "replacement_artifact_version_id"]))) {
       throw new StorageError("storage:tombstone_immutable", `Artifact tombstone ${value.artifact_tombstone_id} has a conflicting canonical payload.`);
     }
-    const encoded = encodeCanonical(value);
     const result = await this.database.run(
       `INSERT INTO artifact_tombstones (artifact_tombstone_id, workspace_id, artifact_id, absence_kind, absence_reason_code,
        last_artifact_version_id, valid_from_generation, valid_to_generation, opening_artifact_change_id, closing_artifact_change_id,
-       replacement_artifact_version_id, cause_references, lineage_evidence_record_ids, artifact_tombstone_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       replacement_artifact_version_id, cause_references, lineage_evidence_record_ids)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(artifact_tombstone_id) DO UPDATE SET workspace_id = excluded.workspace_id, artifact_id = excluded.artifact_id,
        absence_kind = excluded.absence_kind, absence_reason_code = excluded.absence_reason_code,
        last_artifact_version_id = excluded.last_artifact_version_id, valid_from_generation = excluded.valid_from_generation,
        valid_to_generation = excluded.valid_to_generation, opening_artifact_change_id = excluded.opening_artifact_change_id,
        closing_artifact_change_id = excluded.closing_artifact_change_id, replacement_artifact_version_id = excluded.replacement_artifact_version_id,
-       cause_references = excluded.cause_references, lineage_evidence_record_ids = excluded.lineage_evidence_record_ids,
-       artifact_tombstone_payload = excluded.artifact_tombstone_payload
+       cause_references = excluded.cause_references, lineage_evidence_record_ids = excluded.lineage_evidence_record_ids
        WHERE artifact_tombstones.workspace_id IS excluded.workspace_id
          AND artifact_tombstones.artifact_id IS excluded.artifact_id
          AND artifact_tombstones.absence_kind IS excluded.absence_kind
@@ -287,17 +319,16 @@ export class SourceCatalogRepository {
          AND artifact_tombstones.opening_artifact_change_id IS excluded.opening_artifact_change_id
          AND artifact_tombstones.cause_references IS excluded.cause_references
          AND artifact_tombstones.lineage_evidence_record_ids IS excluded.lineage_evidence_record_ids
-         AND ((artifact_tombstones.valid_to_generation IS NULL AND (excluded.valid_to_generation IS NOT NULL OR artifact_tombstones.artifact_tombstone_payload IS excluded.artifact_tombstone_payload)
+         AND ((artifact_tombstones.valid_to_generation IS NULL AND excluded.valid_to_generation IS NOT NULL
            AND (excluded.valid_to_generation IS NULL OR excluded.valid_to_generation > artifact_tombstones.valid_from_generation))
            OR (artifact_tombstones.valid_to_generation IS NOT NULL
              AND excluded.valid_to_generation IS artifact_tombstones.valid_to_generation
              AND excluded.closing_artifact_change_id IS artifact_tombstones.closing_artifact_change_id
-             AND excluded.replacement_artifact_version_id IS artifact_tombstones.replacement_artifact_version_id
-             AND artifact_tombstones.artifact_tombstone_payload IS excluded.artifact_tombstone_payload))`,
+             AND excluded.replacement_artifact_version_id IS artifact_tombstones.replacement_artifact_version_id))`,
       [value.artifact_tombstone_id, value.workspace_id, value.artifact_id, value.absence_kind, value.absence_reason_code,
         value.last_artifact_version_id, value.valid_from_generation, optionalNumber(value.valid_to_generation), value.opening_artifact_change_id,
         optionalText(value.closing_artifact_change_id || undefined), optionalText(value.replacement_artifact_version_id || undefined), value.cause_references,
-        value.lineage_evidence_record_ids, encoded],
+        value.lineage_evidence_record_ids],
     );
     if (result.changes !== 1) {
       const existing = await this.database.get<{ valid_to_generation: number | null }>("SELECT valid_to_generation FROM artifact_tombstones WHERE workspace_id = ? AND artifact_tombstone_id = ?", [this.workspaceId, value.artifact_tombstone_id]);
@@ -306,8 +337,15 @@ export class SourceCatalogRepository {
   }
 
   async getTombstone(tombstoneId: string): Promise<ArtifactTombstoneRecord | undefined> {
-    const row = await this.database.get<{ artifact_tombstone_payload: unknown }>("SELECT artifact_tombstone_payload FROM artifact_tombstones WHERE workspace_id = ? AND artifact_tombstone_id = ?", [this.workspaceId, tombstoneId]);
-    return row ? decodeCanonical(bytes(row.artifact_tombstone_payload)) as ArtifactTombstoneRecord : undefined;
+    const row = await this.database.get<ArtifactTombstoneRecord>("SELECT artifact_tombstone_id, workspace_id, artifact_id, absence_kind, absence_reason_code, last_artifact_version_id, valid_from_generation, valid_to_generation, opening_artifact_change_id, closing_artifact_change_id, replacement_artifact_version_id, cause_references, lineage_evidence_record_ids FROM artifact_tombstones WHERE workspace_id = ? AND artifact_tombstone_id = ?", [this.workspaceId, tombstoneId]);
+    if (!row) return undefined;
+    const { valid_to_generation, closing_artifact_change_id, replacement_artifact_version_id, ...base } = row;
+    return {
+      ...base,
+      ...(valid_to_generation === null ? {} : { valid_to_generation }),
+      ...(closing_artifact_change_id === null ? {} : { closing_artifact_change_id }),
+      ...(replacement_artifact_version_id === null ? {} : { replacement_artifact_version_id }),
+    } as ArtifactTombstoneRecord;
   }
 
   async putObservation(value: SourceObservationRecord): Promise<void> {
@@ -329,7 +367,6 @@ export class SourceCatalogRepository {
       || batch.observation_mode !== value.observation_mode) {
       throw new StorageError("storage:observation_batch_mismatch", `Observation ${value.source_observation_id} does not agree with authoritative batch ${value.observation_batch_id}.`);
     }
-    const encoded = encodeCanonical(value);
     const existing = await this.database.get<{
       observation_batch_id: string;
       workspace_id: string;
@@ -346,10 +383,9 @@ export class SourceCatalogRepository {
       provider_sequence: string | null;
       observed_at: string;
       received_at: string;
-      observation_payload: unknown;
     }>(`SELECT observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider,
        source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash,
-       observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at, observation_payload
+       observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at
        FROM source_observations WHERE workspace_id = ? AND source_observation_id = ?`, [this.workspaceId, value.source_observation_id]);
     if (existing) {
       const sameProjection = existing.observation_batch_id === value.observation_batch_id
@@ -366,23 +402,21 @@ export class SourceCatalogRepository {
         && (existing.provider_event_token ?? undefined) === (value.provider_event_token ?? undefined)
         && (existing.provider_sequence ?? undefined) === (value.provider_sequence ?? undefined)
         && existing.observed_at === value.observed_at
-        && existing.received_at === value.received_at
-        && sameBytes(bytes(existing.observation_payload), encoded);
+        && existing.received_at === value.received_at;
       if (!sameProjection) throw new StorageError("storage:immutable_observation", `Observation ${value.source_observation_id} is immutable and cannot be rewritten.`);
       return;
     }
     await this.database.run(
       `INSERT INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id,
        source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash,
-       observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at, observation_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [value.source_observation_id, value.observation_batch_id, value.workspace_id, value.artifact_id, value.source_provider_binding_id, value.source_provider, value.source_provider_version, value.ordering_domain, value.observation_mode, value.observed_state, optionalText(value.observed_content_hash), optionalText(value.observed_metadata_digest), optionalText(value.provider_event_token), optionalText(value.provider_sequence), value.observed_at, value.received_at, encoded],
+       observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [value.source_observation_id, value.observation_batch_id, value.workspace_id, value.artifact_id, value.source_provider_binding_id, value.source_provider, value.source_provider_version, value.ordering_domain, value.observation_mode, value.observed_state, optionalText(value.observed_content_hash), optionalText(value.observed_metadata_digest), optionalText(value.provider_event_token), optionalText(value.provider_sequence), value.observed_at, value.received_at],
     );
   }
 
   async getObservation(observationId: string): Promise<SourceObservationRecord | undefined> {
-    const row = await this.database.get<{ observation_payload: unknown }>("SELECT observation_payload FROM source_observations WHERE workspace_id = ? AND source_observation_id = ?", [this.workspaceId, observationId]);
-    return row ? decodeCanonical(bytes(row.observation_payload)) as SourceObservationRecord : undefined;
+    return await this.database.get<SourceObservationRecord>("SELECT source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash, observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at FROM source_observations WHERE workspace_id = ? AND source_observation_id = ?", [this.workspaceId, observationId]);
   }
 }
 
@@ -391,11 +425,7 @@ export class CanonicalOccurrenceRepository {
 
   async put(value: RecordEnvelope): Promise<void> {
     assertWorkspace(this.workspaceId, value.workspace_id);
-    const encodedRecord = encodeCanonical(value);
-    const encodedPayload = encodeCanonical(value.payload);
-    const payloadDigest = digestBytes(encodedPayload);
-    const expectedPayloadInline = encodedPayload.byteLength <= this.blobs.inlineThresholdBytes ? encodedPayload : null;
-    const expectedPayloadCasDigest = expectedPayloadInline === null ? payloadDigest : null;
+    const logicalPayload = digestRelationalValue(value.payload);
     const existing = await this.database.get<{
       workspace_id: string;
       category: string;
@@ -414,16 +444,16 @@ export class CanonicalOccurrenceRepository {
       valid_from_generation: number;
       valid_to_generation: number | null;
       record_digest: string;
-      payload_digest: string;
-      payload_byte_length: number;
-      payload_inline: unknown;
-      payload_cas_digest: string | null;
-      record_payload: unknown;
+      body_digest: string;
+      body_byte_length: number;
+      analysis_digest: string;
+      analysis_configuration_digest: string;
+      artifact_dependency_digest: string;
     }>(`SELECT workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version,
        owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id,
        primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line,
        primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest,
-       payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload
+       body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest
        FROM record_occurrences WHERE workspace_id = ? AND record_id = ?`, [this.workspaceId, value.record_id]);
     if (existing) {
       const sameImmutableProjection = existing.workspace_id === value.workspace_id
@@ -442,22 +472,20 @@ export class CanonicalOccurrenceRepository {
         && String(existing.primary_source_span_end_line ?? "") === String(value.primary_source_span?.end_line ?? "")
         && existing.valid_from_generation === value.valid_from_generation
         && existing.record_digest === value.record_digest
-        && existing.payload_digest === payloadDigest
-        && existing.payload_byte_length === encodedPayload.byteLength
-        && (existing.payload_cas_digest ?? null) === expectedPayloadCasDigest
-        && (expectedPayloadInline === null
-          ? existing.payload_inline === null || existing.payload_inline === undefined
-          : sameBytes(bytes(existing.payload_inline), expectedPayloadInline))
-        && sameBytes(canonicalWithoutFields(decodeCanonical(bytes(existing.record_payload)), ["valid_to_generation"]), canonicalWithoutFields(value, ["valid_to_generation"]));
+        && existing.body_digest === logicalPayload.digest
+        && existing.body_byte_length === logicalPayload.byte_length
+        && existing.analysis_digest === value.analysis_digest
+        && existing.analysis_configuration_digest === value.analysis_configuration_digest
+        && existing.artifact_dependency_digest === value.artifact_dependency_digest;
       const sameLifecycle = (existing.valid_to_generation ?? undefined) === (value.valid_to_generation ?? undefined);
-      if (sameImmutableProjection && sameLifecycle && sameBytes(bytes(existing.record_payload), encodedRecord)) return;
+      if (sameImmutableProjection && sameLifecycle) return;
       if (sameImmutableProjection && existing.valid_to_generation === null && value.valid_to_generation !== undefined) {
         if (value.valid_to_generation <= value.valid_from_generation) {
           throw new StorageError("storage:occurrence_lifecycle", `Record ${value.record_id} has an invalid closing generation.`);
         }
         const result = await this.database.run(
-          "UPDATE record_occurrences SET valid_to_generation = ?, record_payload = ? WHERE workspace_id = ? AND record_id = ? AND valid_to_generation IS NULL",
-          [value.valid_to_generation, encodedRecord, this.workspaceId, value.record_id],
+          "UPDATE record_occurrences SET valid_to_generation = ? WHERE workspace_id = ? AND record_id = ? AND valid_to_generation IS NULL",
+          [value.valid_to_generation, this.workspaceId, value.record_id],
         );
         if (result.changes === 1) return;
       }
@@ -466,31 +494,43 @@ export class CanonicalOccurrenceRepository {
       }
       throw new StorageError("storage:immutable_occurrence", `Record ${value.record_id} is immutable and cannot be rewritten.`);
     }
-    const payloadReference = await this.blobs.place(encodedPayload);
-    const payloadInline = payloadReference.storage === "inline" ? payloadReference.bytes : null;
-    const payloadCasDigest = payloadReference.storage === "cas" ? payloadReference.content_hash : null;
     await this.database.run(
       `INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, owner_artifact_id, owner_artifact_version_id,
        schema_version, producer_id, producer_version, primary_source_span_artifact_version_id, primary_source_span_start_byte,
        primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation,
-       record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [value.record_id, value.workspace_id, value.category, value.kind, value.universal_kind, value.owner_artifact_id, value.owner_artifact_version_id,
         value.schema_version, value.producer_id, value.producer_version, optionalText(value.primary_source_span?.artifact_version_id),
         optionalText(value.primary_source_span?.start_byte), optionalText(value.primary_source_span?.end_byte), optionalText(value.primary_source_span?.start_line),
         optionalText(value.primary_source_span?.end_line), value.valid_from_generation, optionalNumber(value.valid_to_generation), value.record_digest,
-        payloadDigest, payloadReference.byte_length, payloadInline, payloadCasDigest, encodedRecord],
+        logicalPayload.digest, logicalPayload.byte_length, encodeCanonical(value.payload), value.analysis_digest, value.analysis_configuration_digest, value.artifact_dependency_digest],
     );
+    const facets = value.facets.map((facet, facetOrdinal) => ({ kind: "run" as const, sql: "INSERT INTO record_facets (workspace_id, record_id, valid_from_generation, facet_ordinal, facet) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [this.workspaceId, value.record_id, value.valid_from_generation, facetOrdinal, facet] satisfies readonly SqliteValue[] }));
+    await this.database.transaction(facets);
   }
 
   async get(recordId: string): Promise<RecordEnvelope | undefined> {
-    const row = await this.database.get<{ record_payload: unknown }>("SELECT record_payload FROM record_occurrences WHERE workspace_id = ? AND record_id = ?", [this.workspaceId, recordId]);
-    return row ? decodeCanonical(bytes(row.record_payload)) as RecordEnvelope : undefined;
+    const row = await this.database.get<Record<string, unknown> & { valid_from_generation: number }>("SELECT * FROM record_occurrences WHERE workspace_id = ? AND record_id = ?", [this.workspaceId, recordId]);
+    if (!row) return undefined;
+    const payload = row["body_payload"] == null
+      ? hydrateRelationalValue(await this.database.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [this.workspaceId, recordId, row.valid_from_generation]))
+      : decodeCanonical(bytes(row["body_payload"]));
+    const facets = await this.database.all<{ facet: string }>("SELECT facet FROM record_facets WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY facet_ordinal", [this.workspaceId, recordId, row.valid_from_generation]);
+    return recordFromColumns(row, payload, facets.map((facet) => facet.facet));
   }
 
   async listByOwner(ownerArtifactId: string): Promise<readonly RecordEnvelope[]> {
-    const rows = await this.database.all<{ record_payload: unknown }>("SELECT record_payload FROM record_occurrences WHERE workspace_id = ? AND owner_artifact_id = ? ORDER BY record_id", [this.workspaceId, ownerArtifactId]);
-    return rows.map((row) => decodeCanonical(bytes(row.record_payload)) as RecordEnvelope);
+    const rows = await this.database.all<Record<string, unknown> & { record_id: string; valid_from_generation: number }>("SELECT * FROM record_occurrences WHERE workspace_id = ? AND owner_artifact_id = ? ORDER BY record_id", [this.workspaceId, ownerArtifactId]);
+    const output: RecordEnvelope[] = [];
+    for (const row of rows) {
+      const payload = row["body_payload"] == null
+        ? hydrateRelationalValue(await this.database.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [this.workspaceId, row.record_id, row.valid_from_generation]))
+        : decodeCanonical(bytes(row["body_payload"]));
+      const facets = await this.database.all<{ facet: string }>("SELECT facet FROM record_facets WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY facet_ordinal", [this.workspaceId, row.record_id, row.valid_from_generation]);
+      output.push(recordFromColumns(row, payload, facets.map((facet) => facet.facet)));
+    }
+    return output;
   }
 
   /**
@@ -580,10 +620,11 @@ export class CanonicalOccurrenceRepository {
       );
       for (const row of chunkRecords) records.push(row);
       const chunkAssignments = await this.database.all<AssignmentVisibilityRow>(
-        `SELECT record_id, identity_type, identity_id, identity_key, valid_from_generation
-         FROM identity_assignments
-         WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)
-           AND owner_artifact_id IN (${placeholders})`,
+        `SELECT a.record_id, a.identity_type, a.identity_id, a.identity_key, a.valid_from_generation
+         FROM identity_assignments a
+         JOIN record_occurrences r ON r.workspace_id = a.workspace_id AND r.record_id = a.record_id
+         WHERE a.workspace_id = ? AND a.valid_from_generation <= ? AND (a.valid_to_generation IS NULL OR a.valid_to_generation > ?)
+           AND r.owner_artifact_id IN (${placeholders})`,
         [this.workspaceId, generation, generation, ...chunk],
       );
       for (const row of chunkAssignments) assignments.push(row);
@@ -639,7 +680,7 @@ export class CanonicalOccurrenceRepository {
          JOIN record_occurrences r ON r.workspace_id = a.workspace_id AND r.record_id = a.record_id
           AND r.valid_from_generation <= ? AND (r.valid_to_generation IS NULL OR r.valid_to_generation > ?)
          WHERE a.workspace_id = ? AND a.valid_from_generation <= ? AND (a.valid_to_generation IS NULL OR a.valid_to_generation > ?)
-           AND a.owner_artifact_id IN (${placeholders}) AND r.category = ? AND r.kind = ?`,
+           AND r.owner_artifact_id IN (${placeholders}) AND r.category = ? AND r.kind = ?`,
         [generation, generation, this.workspaceId, generation, generation, ...chunk, category, kind],
       );
       for (const row of chunkAssignments) assignments.push(row);
@@ -660,10 +701,11 @@ export class CanonicalOccurrenceRepository {
     if (requested.size === 0) return [];
     const digestValues = [...new Set([...requested.values()].map((identity) => canonicalSha256(identity.identity_key)))];
     const rows: WorkspaceVisibleRecord[] = [];
+    const seenAssignments = new Set<string>();
     const excludedOwners = [...new Set(options.exclude_owner_artifact_ids ?? [])];
     for (const chunk of chunkOwnerIds(digestValues)) {
       const placeholders = chunk.map(() => "?").join(", ");
-      const ownerPredicate = excludedOwners.length === 0 ? "" : ` AND a.owner_artifact_id NOT IN (${excludedOwners.map(() => "?").join(", ")})`;
+      const ownerPredicate = excludedOwners.length === 0 ? "" : ` AND r.owner_artifact_id NOT IN (${excludedOwners.map(() => "?").join(", ")})`;
       const matches = await this.database.all<IdentityVisibleRow>(
         `SELECT r.record_id, r.record_digest, r.workspace_id, r.owner_artifact_id, r.owner_artifact_version_id,
                 r.category, r.kind, r.universal_kind, r.valid_from_generation,
@@ -681,13 +723,16 @@ export class CanonicalOccurrenceRepository {
       for (const row of matches) {
         const requestedIdentity = requested.get(`${row.identity_type}\0${row.identity_key}`);
         if (requestedIdentity === undefined || canonicalSha256(requestedIdentity.identity_key) !== row.identity_key_digest || requestedIdentity.identity_key !== row.identity_key) continue;
-        if (!rows.some((existing) => existing.record_id === row.record_id)) {
-          const { identity_key_digest: _identityKeyDigest, ...visible } = row;
-          rows.push(visible);
-        }
+        const assignmentKey = `${row.identity_type}\0${row.identity_key}\0${row.record_id}`;
+        if (seenAssignments.has(assignmentKey)) continue;
+        seenAssignments.add(assignmentKey);
+        const { identity_key_digest: _identityKeyDigest, ...visible } = row;
+        rows.push(visible);
       }
     }
-    return rows.sort((left, right) => compareRecordId(left, right));
+    return rows.sort((left, right) => compareRecordId(left, right)
+      || String(left.identity_type ?? "").localeCompare(String(right.identity_type ?? ""))
+      || String(left.identity_key ?? "").localeCompare(String(right.identity_key ?? "")));
   }
 
   /** Returns closed latest assignments for exact keys, including owners outside a replacement scope. */
@@ -773,10 +818,11 @@ export class CanonicalOccurrenceRepository {
     for (const chunk of chunks) {
       const placeholders = chunk.map(() => "?").join(", ");
       const chunkAssignments = await this.database.all<ClosedIdentityAssignmentRow>(
-        `SELECT record_id, identity_type, identity_id, identity_key, valid_from_generation
-         FROM identity_assignments
-         WHERE workspace_id = ? AND valid_from_generation <= ?
-           AND owner_artifact_id IN (${placeholders})`,
+        `SELECT a.record_id, a.identity_type, a.identity_id, a.identity_key, a.valid_from_generation
+         FROM identity_assignments a
+         JOIN record_occurrences r ON r.workspace_id = a.workspace_id AND r.record_id = a.record_id
+         WHERE a.workspace_id = ? AND a.valid_from_generation <= ?
+           AND r.owner_artifact_id IN (${placeholders})`,
         [this.workspaceId, generation, ...chunk],
       );
       for (const row of chunkAssignments) assignmentRows.push(row);
@@ -921,7 +967,6 @@ export class RegistryRepository {
       if (typeof declaredWorkspace !== "string") throw new StorageError("storage:workspace_mismatch", "Registry snapshot workspace identity is invalid.");
       assertWorkspace(this.workspaceId, declaredWorkspace);
     }
-    const encoded = encodeCanonical(value);
     for (const binding of value.namespace_bindings) assertWorkspace(this.workspaceId, binding.workspace_id);
     const existing = await this.database.get<{
       workspace_id: string;
@@ -929,8 +974,7 @@ export class RegistryRepository {
       core_registry_digest: string;
       resolution_lock_id: string;
       registry_digest: string;
-      registry_payload: unknown;
-    }>("SELECT workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [this.workspaceId, value.registry_snapshot_id]);
+    }>("SELECT workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [this.workspaceId, value.registry_snapshot_id]);
     if (existing) {
       const storedBindings = await this.database.all<{
         namespace_binding_id: string;
@@ -962,16 +1006,15 @@ export class RegistryRepository {
         && existing.core_registry_digest === value.core_registry_digest
         && existing.resolution_lock_id === value.resolution_lock_id
         && existing.registry_digest === value.registry_digest
-        && sameBytes(bytes(existing.registry_payload), encoded)
         && bindingsMatch;
       if (!projectionMatches) throw new StorageError("storage:immutable_registry_snapshot", `Registry snapshot ${value.registry_snapshot_id} is immutable and cannot be rewritten.`);
       return;
     }
     const commands: SqliteCommand[] = [{
       kind: "run",
-      sql: `INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      params: [value.registry_snapshot_id, this.workspaceId, value.registry_contract_version, value.core_registry_digest, value.resolution_lock_id, value.registry_digest, encoded],
+      sql: `INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest)
+        VALUES (?, ?, ?, ?, ?, ?)`,
+      params: [value.registry_snapshot_id, this.workspaceId, value.registry_contract_version, value.core_registry_digest, value.resolution_lock_id, value.registry_digest],
     }];
     for (const binding of value.namespace_bindings) commands.push({ kind: "run", sql: `INSERT INTO registry_namespace_bindings
       (namespace_binding_id, registry_snapshot_id, workspace_id, namespace, plugin_id, plugin_version, contribution_digest,
@@ -980,8 +1023,13 @@ export class RegistryRepository {
   }
 
   async getSnapshot(snapshotId: string): Promise<RegistrySnapshot | undefined> {
-    const row = await this.database.get<{ registry_payload: unknown }>("SELECT registry_payload FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [this.workspaceId, snapshotId]);
-    return row ? decodeCanonical(bytes(row.registry_payload)) as RegistrySnapshot : undefined;
+    const row = await this.database.get<{ registry_snapshot_id: string; workspace_id: string; registry_contract_version: string; core_registry_digest: string; resolution_lock_id: string; registry_digest: string }>("SELECT registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [this.workspaceId, snapshotId]);
+    if (!row) return undefined;
+    const bindings = await this.database.all<Record<string, unknown>>("SELECT namespace_binding_id, workspace_id, namespace, plugin_id, plugin_version, contribution_digest, emission_valid_from_generation, emission_valid_to_generation FROM registry_namespace_bindings WHERE workspace_id = ? AND registry_snapshot_id = ? ORDER BY namespace_binding_id", [this.workspaceId, snapshotId]);
+    const { workspace_id: _workspaceId, ...registry } = row;
+    return { ...registry, namespace_bindings: bindings.map((binding) => ({
+      namespace_binding_id: String(binding["namespace_binding_id"]), workspace_id: String(binding["workspace_id"]), namespace: String(binding["namespace"]), plugin_id: String(binding["plugin_id"]), plugin_version: String(binding["plugin_version"]), contribution_digest: String(binding["contribution_digest"]), emission_valid_from_generation: String(binding["emission_valid_from_generation"]), ...(binding["emission_valid_to_generation"] === null ? {} : { emission_valid_to_generation: String(binding["emission_valid_to_generation"]) }),
+    })) };
   }
 }
 
@@ -992,7 +1040,6 @@ export class SnapshotRepository {
     assertWorkspace(this.workspaceId, value.workspace_id);
     await requireControlReference(this.database, this.workspaceId, "plugin_resolution_lock", value.resolution_lock_id);
     await requireControlReference(this.database, this.workspaceId, "workspace_configuration_revision", value.configuration_revision_id);
-    const encoded = encodeCanonical(value);
     const existing = await this.database.get<{
       workspace_id: string;
       generation: number;
@@ -1008,11 +1055,16 @@ export class SnapshotRepository {
       capability_state_digest: string;
       published_at: string;
       snapshot_digest: string;
-      snapshot_payload: unknown;
+      source_snapshot_id: string | null;
+      snapshot_contract_version: number | null;
+      publication_stage_id: string | null;
+      publication_stage_ordinal: number | null;
+      publication_stage_count: number | null;
     }>(`SELECT workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id,
-       resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks,
+       resolution_lock_id, configuration_revision_id, source_state_digest, source_snapshot_id, snapshot_contract_version,
+       publication_stage_id, publication_stage_ordinal, publication_stage_count, source_observation_watermarks,
        canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at,
-       snapshot_digest, snapshot_payload FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?`, [this.workspaceId, value.snapshot_id]);
+       snapshot_digest FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?`, [this.workspaceId, value.snapshot_id]);
     if (existing) {
       const projectionMatches = existing.workspace_id === value.workspace_id
         && existing.generation === value.generation
@@ -1022,33 +1074,47 @@ export class SnapshotRepository {
         && existing.resolution_lock_id === value.resolution_lock_id
         && existing.configuration_revision_id === value.configuration_revision_id
         && existing.source_state_digest === value.source_state_digest
+        && (existing.source_snapshot_id ?? undefined) === (value.source_snapshot_id ?? undefined)
+        && (existing.snapshot_contract_version ?? undefined) === (value.snapshot_contract_version ?? undefined)
+        && (existing.publication_stage_id ?? undefined) === (value.publication_stage_id ?? undefined)
+        && (existing.publication_stage_ordinal ?? undefined) === (value.publication_stage_ordinal ?? undefined)
+        && (existing.publication_stage_count ?? undefined) === (value.publication_stage_count ?? undefined)
         && existing.source_observation_watermarks === value.source_observation_watermarks
         && existing.canonical_record_set_digest === value.canonical_record_set_digest
         && existing.projection_set_digests === value.projection_set_digests
         && existing.capability_state_digest === value.capability_state_digest
         && existing.published_at === value.published_at
-        && existing.snapshot_digest === value.snapshot_digest
-        && sameBytes(bytes(existing.snapshot_payload), encoded);
+        && existing.snapshot_digest === value.snapshot_digest;
       if (!projectionMatches) throw new StorageError("storage:immutable_snapshot", `Snapshot ${value.snapshot_id} is immutable and cannot be rewritten.`);
       return;
     }
     await this.database.run(
       `INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id,
-       resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest,
-       projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-       [value.snapshot_id, value.workspace_id, value.generation, optionalText(value.parent_snapshot_id), value.generation_manifest_id, value.registry_snapshot_id, value.resolution_lock_id, value.configuration_revision_id, value.source_state_digest, value.source_observation_watermarks, value.canonical_record_set_digest, value.projection_set_digests, value.capability_state_digest, value.published_at, value.snapshot_digest, encoded],
+       resolution_lock_id, configuration_revision_id, source_state_digest, source_snapshot_id, snapshot_contract_version, publication_stage_id, publication_stage_ordinal, publication_stage_count, source_observation_watermarks, canonical_record_set_digest,
+       projection_set_digests, capability_state_digest, published_at, snapshot_digest)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       [value.snapshot_id, value.workspace_id, value.generation, optionalText(value.parent_snapshot_id), value.generation_manifest_id, value.registry_snapshot_id, value.resolution_lock_id, value.configuration_revision_id, value.source_state_digest, optionalText(value.source_snapshot_id), value.snapshot_contract_version ?? null, optionalText(value.publication_stage_id), value.publication_stage_ordinal ?? null, value.publication_stage_count ?? null, value.source_observation_watermarks, value.canonical_record_set_digest, value.projection_set_digests, value.capability_state_digest, value.published_at, value.snapshot_digest],
     );
   }
 
   async get(snapshotId: string): Promise<SnapshotRecord | undefined> {
-    const row = await this.database.get<{ snapshot_payload: unknown }>("SELECT snapshot_payload FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, snapshotId]);
-    return row ? decodeCanonical(bytes(row.snapshot_payload)) as SnapshotRecord : undefined;
+    const row = await this.database.get<Record<string, unknown>>("SELECT snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_snapshot_id, snapshot_contract_version, publication_stage_id, publication_stage_ordinal, publication_stage_count, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [this.workspaceId, snapshotId]);
+    if (!row) return undefined;
+    const { parent_snapshot_id, source_snapshot_id, snapshot_contract_version, publication_stage_id, publication_stage_ordinal, publication_stage_count, ...base } = row;
+    return {
+      ...base,
+      ...(parent_snapshot_id === null ? {} : { parent_snapshot_id: String(parent_snapshot_id) }),
+      ...(source_snapshot_id === null ? {} : { source_snapshot_id: String(source_snapshot_id) }),
+      ...(snapshot_contract_version === null ? {} : { snapshot_contract_version: Number(snapshot_contract_version) }),
+      ...(publication_stage_id === null ? {} : { publication_stage_id: String(publication_stage_id) }),
+      ...(publication_stage_ordinal === null ? {} : { publication_stage_ordinal: Number(publication_stage_ordinal) }),
+      ...(publication_stage_count === null ? {} : { publication_stage_count: Number(publication_stage_count) }),
+    } as unknown as SnapshotRecord;
   }
 
   async getCurrent(): Promise<WorkspaceCurrentState | undefined> {
-    const row = await this.database.get<{ current_payload: unknown }>("SELECT current_payload FROM workspace_current_state WHERE workspace_id = ?", [this.workspaceId]);
-    return row ? decodeCanonical(bytes(row.current_payload)) as WorkspaceCurrentState : undefined;
+    const row = await this.database.get<Record<string, unknown>>("SELECT workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at FROM workspace_current_state WHERE workspace_id = ?", [this.workspaceId]);
+    return row ? row as unknown as WorkspaceCurrentState : undefined;
   }
 }
 
@@ -1067,19 +1133,19 @@ export class ControlPlaneRepository {
     if (stateKind === "workspace_freshness_checkpoint" && (!objectValue || typeof objectValue.workspace_id !== "string" || typeof objectValue.freshness_checkpoint_id !== "string" || stateKey !== `workspace_freshness_checkpoint:${objectValue.freshness_checkpoint_id}` || typeof objectValue.snapshot_id !== "string" || typeof objectValue.source_state_digest !== "string")) {
       throw new StorageError("storage:control_reference_mismatch", "Freshness control state must carry workspace, snapshot, and source-state identity.");
     }
-    const encoded = encodeCanonical(value);
+    const stateJson = JSON.stringify(value);
     const result = await this.database.run(
-      `INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(state_key) DO UPDATE SET workspace_id = excluded.workspace_id, state_kind = excluded.state_kind, payload = excluded.payload,
+      `INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(state_key) DO UPDATE SET workspace_id = excluded.workspace_id, state_kind = excluded.state_kind, state_json = excluded.state_json,
        reference_workspace_id = excluded.reference_workspace_id, reference_snapshot_id = excluded.reference_snapshot_id,
        reference_source_state_digest = excluded.reference_source_state_digest, updated_at = excluded.updated_at
        WHERE control_plane_state.workspace_id IS excluded.workspace_id
          AND control_plane_state.state_kind IS excluded.state_kind
-         AND control_plane_state.payload IS excluded.payload
+         AND control_plane_state.state_json IS excluded.state_json
          AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id
          AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id
          AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest`,
-      [stateKey, this.workspaceId, stateKind, encoded, referenceWorkspaceId, referenceSnapshotId, referenceSourceStateDigest, now()],
+      [stateKey, this.workspaceId, stateKind, stateJson, referenceWorkspaceId, referenceSnapshotId, referenceSourceStateDigest, now()],
     );
     if (result.changes === 1) return;
     const existing = await this.database.get<{ workspace_id: string }>("SELECT workspace_id FROM control_plane_state WHERE state_key = ?", [stateKey]);
@@ -1088,8 +1154,8 @@ export class ControlPlaneRepository {
   }
 
   async get<T>(stateKey: string): Promise<T | undefined> {
-    const row = await this.database.get<{ payload: unknown }>("SELECT payload FROM control_plane_state WHERE workspace_id = ? AND state_key = ?", [this.workspaceId, stateKey]);
-    return row ? decodeCanonical(bytes(row.payload)) as T : undefined;
+    const row = await this.database.get<{ state_json: string }>("SELECT state_json FROM control_plane_state WHERE workspace_id = ? AND state_key = ?", [this.workspaceId, stateKey]);
+    return row ? JSON.parse(row.state_json) as T : undefined;
   }
 
   async putConfiguration(value: WorkspaceConfigurationRevision): Promise<void> {

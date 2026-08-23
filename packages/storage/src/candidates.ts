@@ -1,4 +1,4 @@
-import { canonicalBytes, decodeCanonical, digestBytes, digestCanonicalArray, encodeArrayHeader, encodeCanonical } from "@urdira/canonical";
+import { canonicalBytes, decodeCanonical, digestBytes, digestCanonicalArray, digestLogicalValue, encodeCanonical } from "@urdira/canonical";
 import type {
   CandidateIssue,
   CandidateMaterialization,
@@ -11,10 +11,12 @@ import type {
   WorkspaceCurrentState,
   WorkspaceFreshnessCheckpoint,
 } from "@urdira/contracts";
+import { validateFactDeltaBatch, type FactDeltaBatch } from "@urdira/contracts";
 import type { BlobStore } from "./cas.js";
 import { resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
-import type { SqliteDatabase, SqliteValue } from "./sqlite.js";
+import type { SqliteCommand, SqliteDatabase, SqliteValue } from "./sqlite.js";
+import { flattenRelationalValue, hydrateRelationalValue, relationalValueCommandsForTable, type RelationalValueRow } from "./relational-values.js";
 export { canonicalFrozenCandidateBaseTuple, frozenCandidateBaseTupleDigest, normalizeObservationBatchIds, sameFrozenCandidateBaseTuple } from "./candidate-digest.js";
 
 /**
@@ -23,11 +25,10 @@ export { canonicalFrozenCandidateBaseTuple, frozenCandidateBaseTupleDigest, norm
  * `SealedCandidateMaterialization`), carried out-of-band from the
  * materialization itself. The materialization's Text fields hold only a
  * small, bounded `OrderedSetDescriptor` for each set (descriptor-as-text);
- * these are the real entries the descriptor describes, transported so
- * `WorkspaceCandidateRepository.saveMaterialization` can persist them as
- * CAS-backed segments and `buildCandidatePublicationPlan`
- * (`./publication-authority.js`) can install them without ever parsing a
- * giant JSON string.
+ * these are the real entries the descriptor describes. The active publication
+ * call carries these typed arrays in memory; durable recovery replays the
+ * confirmed FactDelta batches rather than persisting a second generic copy of
+ * every template entry.
  */
 export interface CandidateTemplateSets {
   readonly source_transitions: readonly unknown[];
@@ -39,41 +40,9 @@ export interface CandidateTemplateSets {
   readonly lookup_revalidations: readonly unknown[];
 }
 
-/** `set_kind` values for `candidate_template_segments`, in a stable, exported order. */
+/** `set_kind` values for staged candidate template rows, in stable order. */
 export const CANDIDATE_TEMPLATE_SET_KINDS = ["source_transitions", "record_opens", "record_closures", "identity_assignments", "artifact_dependencies", "lookup_dependencies", "lookup_revalidations"] as const;
 export type CandidateTemplateSetKind = (typeof CANDIDATE_TEMPLATE_SET_KINDS)[number];
-
-// Keep every segment below the canonical decoder's 16 MiB default limit, but
-// avoid unnecessarily small CAS objects for compact record templates. The
-// previous 500-entry/4 MiB bounds produced 1,030 CAS segments for the
-// 979-file Excalidraw cold scan even though the largest observed segment was
-// < 1 MiB; each segment still incurs a durable file fsync. These bounds keep a
-// large safety margin under 16 MiB while reducing that durable-object count.
-const TEMPLATE_SEGMENT_MAX_ENTRIES = 10_000;
-const TEMPLATE_SEGMENT_TARGET_BYTES = 8 * 1024 * 1024;
-
-// Bounded-memory batch size for persisting template segments' CAS blobs:
-// `BlobStore.cas.putMany` already runs each blob's write/fsync work
-// concurrently (bounded by `DEFAULT_PUT_CONCURRENCY` in cas.ts) and coalesces
-// directory fsyncs across the whole call, turning what used to be hundreds
-// of SERIAL file-fsync + dir-fsync round trips (one per `cas.put` call, one
-// call per segment) into a handful of concurrent batches. Kept modest so
-// persisting one candidate's whole segment set (which can run into the
-// hundreds for a very large workspace) never holds more than this many
-// segments' encoded payload bytes in memory at once -- segments are streamed
-// (`streamTemplateSetSegments`/`streamAllTemplateSetSegments`, below) rather
-// than all built and held before any persistence begins.
-const TEMPLATE_SEGMENT_CAS_BATCH_SIZE = 16;
-
-interface PendingTemplateSegment {
-  readonly setKind: CandidateTemplateSetKind;
-  readonly segmentOrdinal: number;
-  readonly firstOrdinal: number;
-  readonly lastOrdinal: number;
-  readonly entryCount: number;
-  readonly payload: Uint8Array;
-  readonly contentDigest: string;
-}
 
 export interface FrozenCandidateBaseTuple {
   readonly snapshot_id?: string;
@@ -149,13 +118,6 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return left.byteLength === right.byteLength && left.every((value, index) => value === right[index]);
 }
 
-// `CandidateMaterialization`'s template-set fields are now each a small, bounded
-// `OrderedSetDescriptor` encoded as Text (descriptor-as-text -- see
-// `packages/engine/src/candidate-materialization.ts`), not the template array itself, so
-// the persisted materialization blob is small and the ordinary shared canonical-encoding
-// defaults (`@urdira/canonical`'s `encodeCanonical`/`decodeCanonical`) apply to it like
-// any other row payload.
-
 function optionalText(value: string | undefined): SqliteValue { return value ?? null; }
 function optionalNumber(value: number | undefined): SqliteValue { return value ?? null; }
 function now(): string { return new Date().toISOString(); }
@@ -171,6 +133,27 @@ function assertWorkspace(expected: string, actual: string): void {
 
 function conflict(kind: string, id: string): never {
   throw new StorageError("storage:candidate_digest_conflict", `Immutable ${kind} ${id} was written with a different digest.`, { kind, id });
+}
+
+function manifestFromRow(row: Record<string, unknown>): CandidateWorkManifest {
+  try {
+    return {
+      work_manifest_id: String(row["work_manifest_id"]),
+      ...(row["supersedes_work_manifest_id"] === null ? {} : { supersedes_work_manifest_id: String(row["supersedes_work_manifest_id"]) }),
+      workspace_id: String(row["workspace_id"]),
+      candidate_generation_id: String(row["candidate_generation_id"]),
+      ...(row["base_snapshot_id"] === null ? {} : { base_snapshot_id: String(row["base_snapshot_id"]) }),
+      artifact_work_set: JSON.parse(String(row["artifact_work_set"])),
+      projection_work_set: JSON.parse(String(row["projection_work_set"])),
+      invalidation_plan_id: String(row["invalidation_plan_id"]),
+      target_registry_snapshot_id: String(row["target_registry_snapshot_id"]),
+      target_configuration_revision_id: String(row["target_configuration_revision_id"]),
+      created_at: String(row["created_at"]),
+      work_digest: String(row["work_digest"]),
+    } as CandidateWorkManifest;
+  } catch (error) {
+    throw new StorageError("storage:work_manifest_corrupt", `Work manifest ${String(row["work_manifest_id"])} has invalid relational descriptor text.`, { cause: error instanceof Error ? error.message : String(error) });
+  }
 }
 
 function sameFields(row: Record<string, unknown>, expected: Record<string, unknown>): boolean {
@@ -200,8 +183,80 @@ type CandidateRow = {
   readonly candidate_generation_id: string;
   readonly workspace_id: string;
   readonly state: string;
-  readonly candidate_payload: unknown;
+  readonly base_snapshot_id: string | null;
+  readonly base_generation: number | null;
+  readonly base_registry_snapshot_id: string | null;
+  readonly target_registry_snapshot_id: string;
+  readonly base_configuration_revision_id: string | null;
+  readonly target_configuration_revision_id: string;
+  readonly trigger_kind: string;
+  readonly work_manifest_id: string | null;
+  readonly source_observation_batch_ids: string;
+  readonly retention_lease_id: string | null;
+  readonly candidate_materialization_id: string | null;
+  readonly candidate_digest: string | null;
+  readonly created_at: string;
+  readonly analysis_started_at: string | null;
+  readonly ready_at: string | null;
+  readonly finished_at: string | null;
+  readonly published_snapshot_id: string | null;
+  readonly published_generation: number | null;
+  readonly generation_manifest_id: string | null;
+  readonly stale_against_snapshot_id: string | null;
+  readonly failure_code: string | null;
+  readonly issue_ids: string;
+  readonly frozen_snapshot_id: string | null;
+  readonly frozen_generation: number | null;
+  readonly frozen_registry_snapshot_id: string | null;
+  readonly frozen_resolution_lock_id: string | null;
+  readonly frozen_configuration_revision_id: string | null;
+  readonly frozen_source_state_digest: string | null;
+  readonly frozen_source_observation_batch_ids: string | null;
+  readonly frozen_tuple_digest: string | null;
 };
+
+function candidateFromRow(row: CandidateRow): IndexCandidate {
+  return {
+    candidate_generation_id: row.candidate_generation_id,
+    workspace_id: row.workspace_id,
+    ...(row.base_snapshot_id === null ? {} : { base_snapshot_id: row.base_snapshot_id }),
+    ...(row.base_generation === null ? {} : { base_generation: row.base_generation }),
+    ...(row.base_registry_snapshot_id === null ? {} : { base_registry_snapshot_id: row.base_registry_snapshot_id }),
+    target_registry_snapshot_id: row.target_registry_snapshot_id,
+    ...(row.base_configuration_revision_id === null ? {} : { base_configuration_revision_id: row.base_configuration_revision_id }),
+    target_configuration_revision_id: row.target_configuration_revision_id,
+    trigger_kind: row.trigger_kind,
+    state: row.state,
+    ...(row.work_manifest_id === null ? {} : { work_manifest_id: row.work_manifest_id }),
+    source_observation_batch_ids: JSON.parse(row.source_observation_batch_ids) as readonly string[],
+    ...(row.retention_lease_id === null ? {} : { retention_lease_id: row.retention_lease_id }),
+    ...(row.candidate_materialization_id === null ? {} : { candidate_materialization_id: row.candidate_materialization_id }),
+    ...(row.candidate_digest === null ? {} : { candidate_digest: row.candidate_digest }),
+    created_at: row.created_at,
+    ...(row.analysis_started_at === null ? {} : { analysis_started_at: row.analysis_started_at }),
+    ...(row.ready_at === null ? {} : { ready_at: row.ready_at }),
+    ...(row.finished_at === null ? {} : { finished_at: row.finished_at }),
+    ...(row.published_snapshot_id === null ? {} : { published_snapshot_id: row.published_snapshot_id }),
+    ...(row.published_generation === null ? {} : { published_generation: row.published_generation }),
+    ...(row.generation_manifest_id === null ? {} : { generation_manifest_id: row.generation_manifest_id }),
+    ...(row.stale_against_snapshot_id === null ? {} : { stale_against_snapshot_id: row.stale_against_snapshot_id }),
+    ...(row.failure_code === null ? {} : { failure_code: row.failure_code }),
+    issue_ids: JSON.parse(row.issue_ids) as readonly string[],
+  };
+}
+
+function frozenBaseFromRow(row: CandidateRow): FrozenCandidateBaseTuple {
+  return {
+    ...(row.frozen_snapshot_id === null ? {} : { snapshot_id: row.frozen_snapshot_id }),
+    ...(row.frozen_generation === null ? {} : { generation: row.frozen_generation }),
+    ...(row.frozen_registry_snapshot_id === null ? {} : { registry_snapshot_id: row.frozen_registry_snapshot_id }),
+    ...(row.frozen_resolution_lock_id === null ? {} : { resolution_lock_id: row.frozen_resolution_lock_id }),
+    ...(row.frozen_configuration_revision_id === null ? {} : { configuration_revision_id: row.frozen_configuration_revision_id }),
+    source_state_digest: row.frozen_source_state_digest ?? "",
+    source_observation_batch_ids: row.frozen_source_observation_batch_ids === null ? [] : JSON.parse(row.frozen_source_observation_batch_ids) as readonly string[],
+    tuple_digest: row.frozen_tuple_digest ?? "",
+  };
+}
 
 // `insert`'s conflict guard exists to catch a genuine identity collision (the
 // same content-derived `candidate_generation_id` proposed with DIFFERENT
@@ -299,14 +354,14 @@ export class WorkspaceCandidateRepository {
 
   async insert(candidate: IndexCandidate, frozenBase: FrozenCandidateBaseTuple): Promise<CandidateInsertResult> {
     assertWorkspace(this.workspaceId, candidate.workspace_id);
-    const payload = encodeCanonical({ candidate, frozen_base: frozenBase });
-    const existing = await this.database.get<CandidateRow>("SELECT candidate_generation_id, workspace_id, state, candidate_payload FROM candidate_state WHERE candidate_generation_id = ?", [candidate.candidate_generation_id]);
-    const values: readonly SqliteValue[] = [candidate.workspace_id, optionalText(candidate.base_snapshot_id), optionalNumber(candidate.base_generation), optionalText(candidate.base_registry_snapshot_id), candidate.target_registry_snapshot_id, optionalText(candidate.base_configuration_revision_id), candidate.target_configuration_revision_id, candidate.trigger_kind, candidate.state, optionalText(candidate.work_manifest_id), JSON.stringify(candidate.source_observation_batch_ids), optionalText(candidate.retention_lease_id), optionalText(candidate.candidate_materialization_id), optionalText(candidate.candidate_digest), candidate.created_at, optionalText(candidate.analysis_started_at), optionalText(candidate.ready_at), optionalText(candidate.finished_at), optionalText(candidate.published_snapshot_id), optionalNumber(candidate.published_generation), optionalText(candidate.generation_manifest_id), optionalText(candidate.stale_against_snapshot_id), optionalText(candidate.failure_code), JSON.stringify(candidate.issue_ids), payload];
+    const existing = await this.database.get<CandidateRow>("SELECT * FROM candidate_state WHERE candidate_generation_id = ?", [candidate.candidate_generation_id]);
+    const values: readonly SqliteValue[] = [candidate.workspace_id, optionalText(candidate.base_snapshot_id), optionalNumber(candidate.base_generation), optionalText(candidate.base_registry_snapshot_id), candidate.target_registry_snapshot_id, optionalText(candidate.base_configuration_revision_id), candidate.target_configuration_revision_id, candidate.trigger_kind, candidate.state, optionalText(candidate.work_manifest_id), JSON.stringify(candidate.source_observation_batch_ids), optionalText(candidate.retention_lease_id), optionalText(candidate.candidate_materialization_id), optionalText(candidate.candidate_digest), candidate.created_at, optionalText(candidate.analysis_started_at), optionalText(candidate.ready_at), optionalText(candidate.finished_at), optionalText(candidate.published_snapshot_id), optionalNumber(candidate.published_generation), optionalText(candidate.generation_manifest_id), optionalText(candidate.stale_against_snapshot_id), optionalText(candidate.failure_code), JSON.stringify(candidate.issue_ids), optionalText(frozenBase.snapshot_id), optionalNumber(frozenBase.generation), optionalText(frozenBase.registry_snapshot_id), optionalText(frozenBase.resolution_lock_id), optionalText(frozenBase.configuration_revision_id), frozenBase.source_state_digest, JSON.stringify(frozenBase.source_observation_batch_ids), frozenBase.tuple_digest];
     if (existing) {
-      if (existing.workspace_id === this.workspaceId && sameBytes(bytes(existing.candidate_payload), payload)) return "already_present";
-      const decodedExisting = existing.workspace_id === this.workspaceId
-        ? decodeCanonical(bytes(existing.candidate_payload)) as { candidate: IndexCandidate; frozen_base: FrozenCandidateBaseTuple }
-        : undefined;
+      const decodedExisting = existing.workspace_id === this.workspaceId ? { candidate: candidateFromRow(existing), frozen_base: frozenBaseFromRow(existing) } : undefined;
+      if (existing.workspace_id === this.workspaceId
+        && decodedExisting !== undefined
+        && sameCandidateIdentity(decodedExisting, { candidate, frozen_base: frozenBase })
+        && ["queued", "published", "cleaning", "cleaned"].includes(existing.state)) return "already_present";
       if (existing.workspace_id !== this.workspaceId
         || decodedExisting === undefined || !sameCandidateIdentity(decodedExisting, { candidate, frozen_base: frozenBase })
         || await isPublished(this.database, this.workspaceId, candidate.candidate_generation_id)) conflict("candidate", candidate.candidate_generation_id);
@@ -315,7 +370,7 @@ export class WorkspaceCandidateRepository {
           target_registry_snapshot_id = ?, base_configuration_revision_id = ?, target_configuration_revision_id = ?, trigger_kind = ?, state = ?,
           work_manifest_id = ?, source_observation_batch_ids = ?, retention_lease_id = ?, candidate_materialization_id = ?, candidate_digest = ?,
           created_at = ?, analysis_started_at = ?, ready_at = ?, finished_at = ?, published_snapshot_id = ?, published_generation = ?, generation_manifest_id = ?,
-          stale_against_snapshot_id = ?, failure_code = ?, issue_ids = ?, candidate_payload = ?
+          stale_against_snapshot_id = ?, failure_code = ?, issue_ids = ?, frozen_snapshot_id = ?, frozen_generation = ?, frozen_registry_snapshot_id = ?, frozen_resolution_lock_id = ?, frozen_configuration_revision_id = ?, frozen_source_state_digest = ?, frozen_source_observation_batch_ids = ?, frozen_tuple_digest = ?
          WHERE candidate_generation_id = ? AND state = ?`,
         [...values, candidate.candidate_generation_id, existing.state],
       );
@@ -327,34 +382,32 @@ export class WorkspaceCandidateRepository {
         target_registry_snapshot_id, base_configuration_revision_id, target_configuration_revision_id, trigger_kind, state,
         work_manifest_id, source_observation_batch_ids, retention_lease_id, candidate_materialization_id, candidate_digest,
         created_at, analysis_started_at, ready_at, finished_at, published_snapshot_id, published_generation, generation_manifest_id,
-        stale_against_snapshot_id, failure_code, issue_ids, candidate_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        stale_against_snapshot_id, failure_code, issue_ids, frozen_snapshot_id, frozen_generation, frozen_registry_snapshot_id, frozen_resolution_lock_id, frozen_configuration_revision_id, frozen_source_state_digest, frozen_source_observation_batch_ids, frozen_tuple_digest)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [candidate.candidate_generation_id, ...values],
     );
     return "inserted";
   }
 
   async get(candidateId: string): Promise<IndexCandidate | undefined> {
-    const row = await this.database.get<CandidateRow>("SELECT candidate_generation_id, workspace_id, state, candidate_payload FROM candidate_state WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
+    const row = await this.database.get<CandidateRow>("SELECT * FROM candidate_state WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
     if (!row) return undefined;
-    const decoded = decodeCanonical(bytes(row.candidate_payload)) as { candidate: IndexCandidate; frozen_base: FrozenCandidateBaseTuple };
-    return { ...decoded.candidate, state: row.state };
+    return candidateFromRow(row);
   }
 
   async getFrozenBase(candidateId: string): Promise<FrozenCandidateBaseTuple | undefined> {
-    const row = await this.database.get<{ candidate_payload: unknown }>("SELECT candidate_payload FROM candidate_state WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
+    const row = await this.database.get<CandidateRow>("SELECT * FROM candidate_state WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
     if (!row) return undefined;
-    return (decodeCanonical(bytes(row.candidate_payload)) as { frozen_base: FrozenCandidateBaseTuple }).frozen_base;
+    return frozenBaseFromRow(row);
   }
 
   async transition(candidateId: string, expected: IndexCandidate["state"], next: IndexCandidate["state"], patch: Readonly<Record<string, unknown>> = {}): Promise<void> {
-    const row = await this.database.get<CandidateRow>("SELECT candidate_generation_id, workspace_id, state, candidate_payload FROM candidate_state WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
+    const row = await this.database.get<CandidateRow>("SELECT * FROM candidate_state WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
     if (!row) throw new StorageError("storage:candidate_not_found", `Candidate ${candidateId} does not exist.`);
     if (row.state !== expected) throw new StorageError("storage:candidate_state_conflict", `Candidate ${candidateId} is ${row.state}, not ${expected}.`);
     if (!(transitions[expected] ?? []).includes(next)) throw new StorageError("storage:invalid_candidate_transition", `Candidate transition ${expected} -> ${next} is not allowed.`);
-    const decoded = decodeCanonical(bytes(row.candidate_payload)) as { candidate: IndexCandidate; frozen_base: FrozenCandidateBaseTuple };
-    const candidate = { ...decoded.candidate, ...patch, state: next } as IndexCandidate;
-    const updates: Array<[string, SqliteValue]> = [["state", next], ["candidate_payload", encodeCanonical({ candidate, frozen_base: decoded.frozen_base })]];
+    const candidate = { ...candidateFromRow(row), ...patch, state: next } as IndexCandidate;
+    const updates: Array<[string, SqliteValue]> = [["state", next]];
     const columns = new Set(["work_manifest_id", "retention_lease_id", "candidate_materialization_id", "candidate_digest", "analysis_started_at", "ready_at", "finished_at", "published_snapshot_id", "published_generation", "generation_manifest_id", "stale_against_snapshot_id", "failure_code", "issue_ids"]);
     for (const [key, value] of Object.entries(patch)) {
       if (!columns.has(key)) continue;
@@ -368,8 +421,7 @@ export class WorkspaceCandidateRepository {
   async selectManifest(candidateId: string, manifest: CandidateWorkManifest): Promise<CandidateInsertResult> {
     assertWorkspace(this.workspaceId, manifest.workspace_id);
     await this.requireCandidate(candidateId, manifest.candidate_generation_id);
-    const payload = encodeCanonical(manifest);
-    const existing = await this.database.get<{ work_digest: string; work_manifest_payload: unknown }>("SELECT work_digest, work_manifest_payload FROM candidate_work_manifests WHERE workspace_id = ? AND work_manifest_id = ?", [this.workspaceId, manifest.work_manifest_id]);
+    const existing = await this.database.get<{ work_digest: string }>("SELECT work_digest FROM candidate_work_manifests WHERE workspace_id = ? AND work_manifest_id = ?", [this.workspaceId, manifest.work_manifest_id]);
     if (existing) {
       // `work_digest` (`stableId("workspace-scan-work-digest", ...)`,
       // `packages/engine/src/workspace-indexing-session.ts`) is already the
@@ -388,7 +440,7 @@ export class WorkspaceCandidateRepository {
       if (existing.work_digest !== manifest.work_digest) conflict("work manifest", manifest.work_manifest_id);
       return "already_present";
     }
-    await this.database.run("INSERT INTO candidate_work_manifests (work_manifest_id, workspace_id, candidate_generation_id, supersedes_work_manifest_id, base_snapshot_id, invalidation_plan_id, target_registry_snapshot_id, target_configuration_revision_id, work_digest, work_manifest_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [manifest.work_manifest_id, manifest.workspace_id, manifest.candidate_generation_id, optionalText(manifest.supersedes_work_manifest_id), optionalText(manifest.base_snapshot_id), manifest.invalidation_plan_id, manifest.target_registry_snapshot_id, manifest.target_configuration_revision_id, manifest.work_digest, payload]);
+    await this.database.run("INSERT INTO candidate_work_manifests (work_manifest_id, workspace_id, candidate_generation_id, supersedes_work_manifest_id, base_snapshot_id, invalidation_plan_id, target_registry_snapshot_id, target_configuration_revision_id, artifact_work_set, projection_work_set, created_at, work_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [manifest.work_manifest_id, manifest.workspace_id, manifest.candidate_generation_id, optionalText(manifest.supersedes_work_manifest_id), optionalText(manifest.base_snapshot_id), manifest.invalidation_plan_id, manifest.target_registry_snapshot_id, manifest.target_configuration_revision_id, JSON.stringify(manifest.artifact_work_set), JSON.stringify(manifest.projection_work_set), manifest.created_at, manifest.work_digest]);
     await this.database.run("UPDATE candidate_state SET work_manifest_id = ? WHERE workspace_id = ? AND candidate_generation_id = ?", [manifest.work_manifest_id, this.workspaceId, candidateId]);
     return "inserted";
   }
@@ -396,158 +448,60 @@ export class WorkspaceCandidateRepository {
   async acceptDelta(delta: CandidateDeltaInput): Promise<{ status: "inserted" | "already_accepted" }> {
     assertWorkspace(this.workspaceId, delta.workspace_id);
     await this.requireCandidate(delta.candidate_generation_id);
-    const payload = encodeCanonical(delta);
-    const existing = await this.database.get<{ delta_digest: string; delta_payload: unknown }>("SELECT delta_digest, delta_payload FROM candidate_fact_deltas WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?", [this.workspaceId, delta.candidate_generation_id, delta.fact_delta_id]);
+    const existing = await this.database.get<{ delta_digest: string }>("SELECT delta_digest FROM candidate_fact_deltas WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?", [this.workspaceId, delta.candidate_generation_id, delta.fact_delta_id]);
     if (existing) {
-      if (existing.delta_digest !== delta.delta_digest || !sameBytes(bytes(existing.delta_payload), payload)) conflict("fact delta", delta.fact_delta_id);
+      if (existing.delta_digest !== delta.delta_digest) conflict("fact delta", delta.fact_delta_id);
       return { status: "already_accepted" };
     }
-    await this.database.run("INSERT INTO candidate_fact_deltas (fact_delta_id, workspace_id, candidate_generation_id, delta_digest, accepted_at, delta_payload) VALUES (?, ?, ?, ?, ?, ?)", [delta.fact_delta_id, delta.workspace_id, delta.candidate_generation_id, delta.delta_digest, now(), payload]);
+    await this.database.run("INSERT INTO candidate_fact_delta_namespaces (workspace_id, candidate_generation_id, fact_delta_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", [delta.workspace_id, delta.candidate_generation_id, delta.fact_delta_id]);
+    await this.database.run("INSERT INTO candidate_fact_deltas (fact_delta_id, workspace_id, candidate_generation_id, delta_digest, accepted_at) VALUES (?, ?, ?, ?, ?)", [delta.fact_delta_id, delta.workspace_id, delta.candidate_generation_id, delta.delta_digest, now()]);
     return { status: "inserted" };
+  }
+
+  /** Accepts one transferred native batch idempotently before materialisation. */
+  async acceptNativeFactDeltaBatch(candidateGenerationId: string, factDeltaId: string, batch: FactDeltaBatch): Promise<"inserted" | "already_accepted"> {
+    validateFactDeltaBatch(batch);
+    await this.requireCandidate(candidateGenerationId);
+    const [result] = await this.database.transactionChunked([{
+      kind: "staged_fact_delta_batch",
+      workspace_id: this.workspaceId,
+      candidate_generation_id: candidateGenerationId,
+      fact_delta_id: factDeltaId,
+      accepted_at: now(),
+      batch,
+    }], 1, { transfer_params: true });
+    const status = (result as { readonly status?: unknown } | undefined)?.status;
+    if (status !== "inserted" && status !== "already_accepted") throw new StorageError("storage:fact_delta_batch_invalid", "SQLite returned an invalid FactDelta batch acknowledgement.");
+    return status;
   }
 
   async saveMaterialization(candidateId: string, materialization: CandidateMaterialization, templateSets: CandidateTemplateSets = { source_transitions: [], record_opens: [], record_closures: [], identity_assignments: [], artifact_dependencies: [], lookup_dependencies: [], lookup_revalidations: [] }): Promise<CandidateInsertResult> {
     assertWorkspace(this.workspaceId, materialization.workspace_id);
     await this.requireCandidate(candidateId);
-    const payload = encodeCanonical(materialization);
-    const existing = await this.database.get<{ materialization_digest: string; materialization_payload: unknown }>("SELECT materialization_digest, materialization_payload FROM candidate_materializations WHERE workspace_id = ? AND candidate_materialization_id = ?", [this.workspaceId, materialization.candidate_materialization_id]);
+    const contractText = JSON.stringify(materialization);
+    const existing = await this.database.get<{ materialization_digest: string; materialization_contract_text: string }>("SELECT materialization_digest, materialization_contract_text FROM candidate_materializations WHERE workspace_id = ? AND candidate_materialization_id = ?", [this.workspaceId, materialization.candidate_materialization_id]);
     if (existing) {
-      if (existing.materialization_digest !== materialization.materialization_digest || !sameBytes(bytes(existing.materialization_payload), payload)) conflict("materialization", materialization.candidate_materialization_id);
+      if (existing.materialization_digest !== materialization.materialization_digest || existing.materialization_contract_text !== contractText) conflict("materialization", materialization.candidate_materialization_id);
     } else {
-      await this.database.run("INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_payload) VALUES (?, ?, ?, ?, ?, ?)", [materialization.candidate_materialization_id, materialization.workspace_id, candidateId, materialization.materialization_digest, now(), payload]);
+      await this.database.run("INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_contract_text) VALUES (?, ?, ?, ?, ?, ?)", [materialization.candidate_materialization_id, materialization.workspace_id, candidateId, materialization.materialization_digest, now(), contractText]);
       await this.database.run("UPDATE candidate_state SET candidate_materialization_id = ? WHERE workspace_id = ? AND candidate_generation_id = ?", [materialization.candidate_materialization_id, this.workspaceId, candidateId]);
     }
     if (timingEnabled()) resetTimings();
-    const anySegmentInserted = await this.persistTemplateSegments(materialization.candidate_materialization_id, templateSets);
     if (timingEnabled()) console.error(`[urdira] storage timings save_materialization workspace:${this.workspaceId} ms=${JSON.stringify(snapshotTimings())}`);
-    return existing ? (anySegmentInserted ? "inserted" : "already_present") : "inserted";
-  }
-
-  /**
-   * Chunks `entries` into segments bounded by BOTH an entry cap and a byte
-   * target, yielding each as a pure-CPU {@link PendingTemplateSegment}
-   * (encode/chunk/digest only -- no I/O). Byte-aware chunking matters
-   * because template entries embed record bodies: a fixed entry count could
-   * produce a segment exceeding the default canonical `max_bytes` decode
-   * limit. Each segment payload is assembled from per-entry encodings
-   * (`encodeArrayHeader` + concatenated element bytes is exactly the
-   * canonical array encoding), so no whole-chunk encode occurs. A generator
-   * (rather than building the whole set kind's segment array up front) so
-   * `persistTemplateSegments` can bound how many segments' payload bytes it
-   * holds in memory at once across the whole materialization, not just
-   * within one set kind.
-   */
-  private *streamTemplateSetSegments(setKind: CandidateTemplateSetKind, entries: readonly unknown[]): Generator<PendingTemplateSegment> {
-    let segmentOrdinal = 0;
-    let firstOrdinal = 0;
-    let chunkParts: Uint8Array[] = [];
-    let chunkBytes = 0;
-    const buildSegment = (): PendingTemplateSegment => {
-      const header = encodeArrayHeader(chunkParts.length);
-      const payload = new Uint8Array(header.length + chunkBytes);
-      payload.set(header, 0);
-      let offset = header.length;
-      for (const part of chunkParts) { payload.set(part, offset); offset += part.length; }
-      const contentDigest = timedSync("segment_digest", () => digestBytes(payload));
-      const lastOrdinal = firstOrdinal + chunkParts.length - 1;
-      const segment: PendingTemplateSegment = { setKind, segmentOrdinal, firstOrdinal, lastOrdinal, entryCount: chunkParts.length, payload, contentDigest };
-      firstOrdinal += chunkParts.length;
-      segmentOrdinal += 1;
-      chunkParts = [];
-      chunkBytes = 0;
-      return segment;
-    };
-    for (const entry of entries) {
-      const encoded = timedSync("segment_encode", () => encodeCanonical(entry));
-      if (chunkParts.length > 0 && (chunkParts.length >= TEMPLATE_SEGMENT_MAX_ENTRIES || chunkBytes + encoded.length > TEMPLATE_SEGMENT_TARGET_BYTES)) yield buildSegment();
-      chunkParts.push(encoded);
-      chunkBytes += encoded.length;
-    }
-    if (chunkParts.length > 0) yield buildSegment();
-  }
-
-  /** `streamTemplateSetSegments` across every set kind, in `CANDIDATE_TEMPLATE_SET_KINDS`'s stable order. */
-  private *streamAllTemplateSetSegments(templateSets: CandidateTemplateSets): Generator<PendingTemplateSegment> {
-    for (const setKind of CANDIDATE_TEMPLATE_SET_KINDS) yield* this.streamTemplateSetSegments(setKind, templateSets[setKind]);
-  }
-
-  /**
-   * Persists every set kind's template segments for one materialization.
-   * Replaces the former per-segment `await cas.put(...)` loop (755 SERIAL
-   * file-fsync + dir-fsync round trips, measured on a 981-file workspace)
-   * with `BlobStore.cas.putMany` over bounded batches
-   * (`TEMPLATE_SEGMENT_CAS_BATCH_SIZE`), which runs each batch's blobs'
-   * write/fsync work concurrently and coalesces directory fsyncs per batch
-   * instead of per blob. Existence/conflict checking is still done up front
-   * (`SELECT ... WHERE workspace_id = ? AND candidate_materialization_id =
-   * ?`, unfiltered by set_kind/segment_ordinal): one round trip returning
-   * every row already persisted for this materialization -- cheap (no blob
-   * bytes, just the small digest/ordinal columns) regardless of how many of
-   * this call's own segments turn out to already exist, and equivalent to
-   * the old per-segment `SELECT ... AND set_kind = ? AND segment_ordinal =
-   * ?` lookups because each row is independently keyed by
-   * `(workspace_id, candidate_materialization_id, set_kind, segment_ordinal)`
-   * and nothing here writes a row this materialization's own segment stream
-   * won't also independently re-derive on any retry.
-   */
-  private async persistTemplateSegments(candidateMaterializationId: string, templateSets: CandidateTemplateSets): Promise<boolean> {
-    if (CANDIDATE_TEMPLATE_SET_KINDS.every((setKind) => templateSets[setKind].length === 0)) return false;
-    if (!this.blobs) throw new StorageError("storage:template_segment_storage_unavailable", "Candidate template segments require a content-addressed blob store.");
-    const existingRows = await timed("segment_sql", () => this.database.all<{ set_kind: string; segment_ordinal: number; content_digest: string }>("SELECT set_kind, segment_ordinal, content_digest FROM candidate_template_segments WHERE workspace_id = ? AND candidate_materialization_id = ?", [this.workspaceId, candidateMaterializationId]));
-    const existingByKey = new Map(existingRows.map((row) => [`${row.set_kind} ${row.segment_ordinal}`, row.content_digest]));
-    let inserted = false;
-    let batch: PendingTemplateSegment[] = [];
-    const flushBatch = async (): Promise<void> => {
-      if (batch.length === 0) return;
-      const blobs = await timed("segment_cas_put", () => this.blobs!.cas.putMany(batch.map((segment) => ({ bytes: segment.payload, options: { media_type: "application/urdira-template-segment" } }))));
-      for (let index = 0; index < batch.length; index += 1) {
-        const segment = batch[index]!;
-        const blob = blobs[index]!;
-        await timed("segment_sql", () => this.database.run("INSERT INTO candidate_template_segments (workspace_id, candidate_materialization_id, set_kind, segment_ordinal, entry_count, first_ordinal, last_ordinal, content_digest, storage_reference, byte_length) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [this.workspaceId, candidateMaterializationId, segment.setKind, segment.segmentOrdinal, segment.entryCount, segment.firstOrdinal, segment.lastOrdinal, segment.contentDigest, blob.storage_reference, segment.payload.byteLength]));
-        inserted = true;
-      }
-      batch = [];
-    };
-    for (const segment of this.streamAllTemplateSetSegments(templateSets)) {
-      const key = `${segment.setKind} ${segment.segmentOrdinal}`;
-      const existingDigest = existingByKey.get(key);
-      if (existingDigest !== undefined) {
-        if (existingDigest !== segment.contentDigest) conflict("template segment", `${candidateMaterializationId}/${segment.setKind}/${segment.segmentOrdinal}`);
-        continue;
-      }
-      batch.push(segment);
-      if (batch.length >= TEMPLATE_SEGMENT_CAS_BATCH_SIZE) await flushBatch();
-    }
-    await flushBatch();
-    return inserted;
-  }
-
-  /** Loads a template set's segments in ordinal order, CAS-verifying and concatenating their entries. */
-  async readTemplateSet(candidateMaterializationId: string, setKind: string): Promise<readonly unknown[]> {
-    if (!this.blobs) throw new StorageError("storage:template_segment_storage_unavailable", "Candidate template segments require a content-addressed blob store.");
-    const segments = await this.database.all<{ content_digest: string }>("SELECT content_digest FROM candidate_template_segments WHERE workspace_id = ? AND candidate_materialization_id = ? AND set_kind = ? ORDER BY segment_ordinal", [this.workspaceId, candidateMaterializationId, setKind]);
-    const entries: unknown[] = [];
-    for (const segment of segments) {
-      const payload = await this.blobs.cas.read(segment.content_digest);
-      if (digestBytes(payload) !== segment.content_digest) throw new StorageError("storage:template_segment_corrupt", `Template segment ${candidateMaterializationId}/${setKind} failed digest verification.`);
-      const decoded = decodeCanonical(payload);
-      if (!Array.isArray(decoded)) throw new StorageError("storage:template_segment_corrupt", `Template segment ${candidateMaterializationId}/${setKind} did not decode to an array.`);
-      entries.push(...decoded);
-    }
-    return entries;
+    return existing ? "already_present" : "inserted";
   }
 
   async appendIssue(issue: CandidateIssue): Promise<CandidateInsertResult> {
     assertWorkspace(this.workspaceId, (issue.scope as unknown as { workspace_id?: string }).workspace_id ?? this.workspaceId);
     await this.requireCandidate(issue.candidate_generation_id);
-    const payload = encodeCanonical(issue.payload);
-    const scopePayload = encodeCanonical(issue.scope);
-    const existing = await this.database.get<Record<string, unknown>>("SELECT issue_code, phase, severity, retryability, scope_payload, summary, detail, cause_references, payload, created_at FROM candidate_issues WHERE workspace_id = ? AND candidate_generation_id = ? AND candidate_issue_id = ?", [this.workspaceId, issue.candidate_generation_id, issue.candidate_issue_id]);
+    const issueJson = JSON.stringify(issue.payload);
+    const scopeJson = JSON.stringify(issue.scope);
+    const existing = await this.database.get<Record<string, unknown>>("SELECT issue_code, phase, severity, retryability, scope_json, summary, detail, cause_references, issue_json, created_at FROM candidate_issues WHERE workspace_id = ? AND candidate_generation_id = ? AND candidate_issue_id = ?", [this.workspaceId, issue.candidate_generation_id, issue.candidate_issue_id]);
     if (existing) {
-      if (!sameFields(existing, { issue_code: issue.issue_code, phase: issue.phase, severity: issue.severity, retryability: issue.retryability, scope_payload: scopePayload, summary: issue.summary, detail: issue.detail, cause_references: issue.cause_references, payload, created_at: issue.created_at })) conflict("issue", issue.candidate_issue_id);
+      if (!sameFields(existing, { issue_code: issue.issue_code, phase: issue.phase, severity: issue.severity, retryability: issue.retryability, scope_json: scopeJson, summary: issue.summary, detail: issue.detail, cause_references: issue.cause_references, issue_json: issueJson, created_at: issue.created_at })) conflict("issue", issue.candidate_issue_id);
       return "already_present";
     }
-    await this.database.run("INSERT INTO candidate_issues (candidate_issue_id, workspace_id, candidate_generation_id, issue_code, phase, severity, retryability, scope_payload, summary, detail, cause_references, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [issue.candidate_issue_id, this.workspaceId, issue.candidate_generation_id, issue.issue_code, issue.phase, issue.severity, issue.retryability, scopePayload, issue.summary, issue.detail, issue.cause_references, payload, issue.created_at]);
+    await this.database.run("INSERT INTO candidate_issues (candidate_issue_id, workspace_id, candidate_generation_id, issue_code, phase, severity, retryability, scope_json, summary, detail, cause_references, issue_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [issue.candidate_issue_id, this.workspaceId, issue.candidate_generation_id, issue.issue_code, issue.phase, issue.severity, issue.retryability, scopeJson, issue.summary, issue.detail, issue.cause_references, issueJson, issue.created_at]);
     return "inserted";
   }
 
@@ -555,26 +509,24 @@ export class WorkspaceCandidateRepository {
     const workspaceId = String(value["workspace_id"]);
     assertWorkspace(this.workspaceId, workspaceId);
     const id = String(value["lookup_dependency_id"]);
-    const payload = encodeCanonical(value);
-    const dependencyDigest = typeof value["dependency_digest"] === "string" ? value["dependency_digest"] : canonicalSha256(value);
+    const dependencyDigest = typeof value["dependency_digest"] === "string" ? value["dependency_digest"] : digestLogicalValue(value, "urdira:lookup-dependency:v2");
     const candidateId = String(value["candidate_generation_id"]);
     await this.requireCandidate(candidateId);
-    const existing = await this.database.get<{ dependency_digest: string; dependency_payload: unknown }>("SELECT dependency_digest, dependency_payload FROM candidate_lookup_dependencies WHERE workspace_id = ? AND candidate_generation_id = ? AND lookup_dependency_id = ?", [this.workspaceId, candidateId, id]);
+    const existing = await this.database.get<{ dependency_digest: string }>("SELECT dependency_digest FROM candidate_lookup_dependencies WHERE workspace_id = ? AND candidate_generation_id = ? AND lookup_dependency_id = ?", [this.workspaceId, candidateId, id]);
     if (existing) {
-      if (existing.dependency_digest !== dependencyDigest || !sameBytes(bytes(existing.dependency_payload), payload)) conflict("lookup dependency", id);
+      if (existing.dependency_digest !== dependencyDigest) conflict("lookup dependency", id);
       return "already_present";
     }
-    await this.database.run("INSERT INTO candidate_lookup_dependencies (lookup_dependency_id, workspace_id, candidate_generation_id, consumer_type, consumer_id, owner_artifact_id, owner_artifact_version_id, operation, normalized_selector_or_address, selector_digest, previous_result_set_digest, invalidation_scope, valid_from_generation, valid_to_generation, dependency_digest, dependency_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, workspaceId, candidateId, String(value["consumer_type"]), String(value["consumer_id"]), sqliteValue(value["owner_artifact_id"] ?? null), sqliteValue(value["owner_artifact_version_id"] ?? null), String(value["operation"]), String(value["normalized_selector_or_address"]), String(value["selector_digest"]), String(value["previous_result_set_digest"]), String(value["invalidation_scope"]), sqliteValue(value["valid_from_generation"] ?? null), sqliteValue(value["valid_to_generation"] ?? null), dependencyDigest, payload]);
+    await this.database.run("INSERT INTO candidate_lookup_dependencies (lookup_dependency_id, workspace_id, candidate_generation_id, consumer_type, consumer_id, owner_artifact_id, owner_artifact_version_id, operation, normalized_selector_or_address, selector_digest, previous_result_set_digest, invalidation_scope, valid_from_generation, valid_to_generation, dependency_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, workspaceId, candidateId, String(value["consumer_type"]), String(value["consumer_id"]), sqliteValue(value["owner_artifact_id"] ?? null), sqliteValue(value["owner_artifact_version_id"] ?? null), String(value["operation"]), String(value["normalized_selector_or_address"]), String(value["selector_digest"]), String(value["previous_result_set_digest"]), String(value["invalidation_scope"]), sqliteValue(value["valid_from_generation"] ?? null), sqliteValue(value["valid_to_generation"] ?? null), dependencyDigest]);
     return "inserted";
   }
 
   async acquireLease(candidateId: string, baseSnapshotId: string | undefined, acquiredAt = now()): Promise<CandidateInsertResult> {
     await this.requireCandidate(candidateId);
     const id = `lease:${candidateId}`;
-    const payload = encodeCanonical({ retention_lease_id: id, candidate_generation_id: candidateId, ...(baseSnapshotId === undefined ? {} : { base_snapshot_id: baseSnapshotId }), acquired_at: acquiredAt });
-    const existing = await this.database.get<{ state: string; lease_payload: unknown }>("SELECT state, lease_payload FROM candidate_retention_leases WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
+    const existing = await this.database.get<{ state: string; base_snapshot_id: string | null; acquired_at: string; released_at: string | null }>("SELECT state, base_snapshot_id, acquired_at, released_at FROM candidate_retention_leases WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
     if (existing) {
-      if (existing.state === "active" && sameBytes(bytes(existing.lease_payload), payload)) return "already_present";
+      if (existing.state === "active" && existing.base_snapshot_id === (baseSnapshotId ?? null) && existing.acquired_at === acquiredAt) return "already_present";
       // `CandidateIndexer.run` (`packages/engine/src/candidate-indexer.ts`)
       // always calls `candidates.insert` BEFORE `acquireBaseLease`, and
       // `insert`'s own reclaim above already conflicts outright for any
@@ -599,34 +551,30 @@ export class WorkspaceCandidateRepository {
       // `insert`'s own reclaim (above) exists to unblock. Reclaim it:
       // reactivate the row for this fresh attempt instead of erroring.
       const reactivated = await this.database.run(
-        "UPDATE candidate_retention_leases SET base_snapshot_id = ?, state = 'active', acquired_at = ?, released_at = NULL, lease_payload = ? WHERE workspace_id = ? AND candidate_generation_id = ? AND state = ?",
-        [baseSnapshotId ?? null, acquiredAt, payload, this.workspaceId, candidateId, existing.state],
+        "UPDATE candidate_retention_leases SET base_snapshot_id = ?, state = 'active', acquired_at = ?, released_at = NULL WHERE workspace_id = ? AND candidate_generation_id = ? AND state = ?",
+        [baseSnapshotId ?? null, acquiredAt, this.workspaceId, candidateId, existing.state],
       );
       if (reactivated.changes !== 1) conflict("retention lease", id);
       await this.database.run("UPDATE candidate_state SET retention_lease_id = ? WHERE workspace_id = ? AND candidate_generation_id = ?", [id, this.workspaceId, candidateId]);
       return "inserted";
     }
-    await this.database.run("INSERT INTO candidate_retention_leases (retention_lease_id, workspace_id, candidate_generation_id, base_snapshot_id, state, acquired_at, released_at, lease_payload) VALUES (?, ?, ?, ?, 'active', ?, NULL, ?)", [id, this.workspaceId, candidateId, baseSnapshotId ?? null, acquiredAt, payload]);
+    await this.database.run("INSERT INTO candidate_retention_leases (retention_lease_id, workspace_id, candidate_generation_id, base_snapshot_id, state, acquired_at, released_at) VALUES (?, ?, ?, ?, 'active', ?, NULL)", [id, this.workspaceId, candidateId, baseSnapshotId ?? null, acquiredAt]);
     await this.database.run("UPDATE candidate_state SET retention_lease_id = ? WHERE workspace_id = ? AND candidate_generation_id = ?", [id, this.workspaceId, candidateId]);
     return "inserted";
   }
 
   async renewLease(candidateId: string, renewedAt = now()): Promise<void> {
     await this.requireCandidate(candidateId);
-    const existing = await this.database.get<{ lease_payload: unknown }>("SELECT lease_payload FROM candidate_retention_leases WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'active'", [this.workspaceId, candidateId]);
+    const existing = await this.database.get<{ state: string }>("SELECT state FROM candidate_retention_leases WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'active'", [this.workspaceId, candidateId]);
     if (!existing) throw new StorageError("storage:candidate_lease_not_found", `No active retention lease exists for candidate ${candidateId}.`);
-    const decoded = decodeCanonical(bytes(existing.lease_payload)) as Record<string, unknown>;
-    const payload = encodeCanonical({ ...decoded, acquired_at: renewedAt });
-    await this.database.run("UPDATE candidate_retention_leases SET acquired_at = ?, lease_payload = ? WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'active'", [renewedAt, payload, this.workspaceId, candidateId]);
+    await this.database.run("UPDATE candidate_retention_leases SET acquired_at = ? WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'active'", [renewedAt, this.workspaceId, candidateId]);
   }
 
   async releaseLease(candidateId: string, releasedAt = now()): Promise<"released" | "already_released"> {
     await this.requireCandidate(candidateId);
-    const existing = await this.database.get<{ lease_payload: unknown }>("SELECT lease_payload FROM candidate_retention_leases WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'active'", [this.workspaceId, candidateId]);
+    const existing = await this.database.get<{ state: string }>("SELECT state FROM candidate_retention_leases WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'active'", [this.workspaceId, candidateId]);
     if (!existing) return "already_released";
-    const decoded = decodeCanonical(bytes(existing.lease_payload)) as Record<string, unknown>;
-    const payload = encodeCanonical({ ...decoded, released_at: releasedAt });
-    await this.database.run("UPDATE candidate_retention_leases SET state = 'released', released_at = ?, lease_payload = ? WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'active'", [releasedAt, payload, this.workspaceId, candidateId]);
+    await this.database.run("UPDATE candidate_retention_leases SET state = 'released', released_at = ? WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'active'", [releasedAt, this.workspaceId, candidateId]);
     return "released";
   }
 
@@ -634,73 +582,74 @@ export class WorkspaceCandidateRepository {
     await this.requireCandidate(marker.candidate_generation_id);
     const markedAt = marker.marked_at ?? now();
     const state = marker.state ?? "pending";
-    const payload = encodeCanonical({ ...marker, state, marked_at: markedAt });
-    const existing = await this.database.get<{ state: string; marker_payload: unknown }>("SELECT state, marker_payload FROM candidate_cleanup_markers WHERE candidate_generation_id = ? AND resource_type = ? AND resource_id = ?", [marker.candidate_generation_id, marker.resource_type, marker.resource_id]);
+    const existing = await this.database.get<{ state: string }>("SELECT state FROM candidate_cleanup_markers WHERE candidate_generation_id = ? AND resource_type = ? AND resource_id = ?", [marker.candidate_generation_id, marker.resource_type, marker.resource_id]);
     if (existing) {
       if (state === "cleaned" && existing.state !== "cleaned") {
-        await this.database.run("UPDATE candidate_cleanup_markers SET state = 'cleaned', marked_at = ?, marker_payload = ? WHERE candidate_generation_id = ? AND resource_type = ? AND resource_id = ?", [markedAt, payload, marker.candidate_generation_id, marker.resource_type, marker.resource_id]);
+        await this.database.run("UPDATE candidate_cleanup_markers SET state = 'cleaned', marked_at = ? WHERE candidate_generation_id = ? AND resource_type = ? AND resource_id = ?", [markedAt, marker.candidate_generation_id, marker.resource_type, marker.resource_id]);
         return "marked";
       }
       return "already_marked";
     }
-    await this.database.run("INSERT INTO candidate_cleanup_markers (candidate_generation_id, resource_type, resource_id, state, marked_at, marker_payload) VALUES (?, ?, ?, ?, ?, ?)", [marker.candidate_generation_id, marker.resource_type, marker.resource_id, state, markedAt, payload]);
+    await this.database.run("INSERT INTO candidate_cleanup_markers (candidate_generation_id, resource_type, resource_id, state, marked_at) VALUES (?, ?, ?, ?, ?)", [marker.candidate_generation_id, marker.resource_type, marker.resource_id, state, markedAt]);
     return "marked";
   }
 
   async listRecoverable(): Promise<readonly IndexCandidate[]> {
-    const rows = await this.database.all<CandidateRow>("SELECT candidate_generation_id, workspace_id, state, candidate_payload FROM candidate_state WHERE workspace_id = ? AND state IN ('queued', 'planning', 'analyzing', 'validating', 'projecting', 'ready', 'publishing') ORDER BY created_at, candidate_generation_id", [this.workspaceId]);
-    return rows.map((row) => ({ ...(decodeCanonical(bytes(row.candidate_payload)) as { candidate: IndexCandidate }).candidate, state: row.state }));
+    const rows = await this.database.all<CandidateRow>("SELECT * FROM candidate_state WHERE workspace_id = ? AND state IN ('queued', 'planning', 'analyzing', 'validating', 'projecting', 'ready', 'publishing') ORDER BY created_at, candidate_generation_id", [this.workspaceId]);
+    return rows.map(candidateFromRow);
   }
 
   async putRoot(root: CandidateRoot): Promise<CandidateInsertResult> {
     assertWorkspace(this.workspaceId, root.workspace_id);
     await this.requireCandidate(root.candidate_generation_id);
-    const payload = encodeCanonical(root.payload);
-    const existing = await this.database.get<Record<string, unknown>>("SELECT workspace_id, candidate_generation_id, resource_type, content_digest, state, root_payload FROM candidate_roots WHERE workspace_id = ? AND root_id = ?", [this.workspaceId, root.root_id]);
+    const existing = await this.database.get<Record<string, unknown>>("SELECT workspace_id, candidate_generation_id, resource_type, content_digest, state FROM candidate_roots WHERE workspace_id = ? AND root_id = ?", [this.workspaceId, root.root_id]);
     if (existing) {
-      if (!sameFields(existing, { workspace_id: this.workspaceId, candidate_generation_id: root.candidate_generation_id, resource_type: root.resource_type, content_digest: root.content_digest, state: root.state, root_payload: payload })) conflict("candidate root", root.root_id);
+      if (!sameFields(existing, { workspace_id: this.workspaceId, candidate_generation_id: root.candidate_generation_id, resource_type: root.resource_type, content_digest: root.content_digest, state: root.state })) conflict("candidate root", root.root_id);
       return "already_present";
     }
-    await this.database.run("INSERT INTO candidate_roots (root_id, workspace_id, candidate_generation_id, resource_type, content_digest, state, root_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [root.root_id, this.workspaceId, root.candidate_generation_id, root.resource_type, root.content_digest, root.state, payload]);
+    await this.database.transaction([
+      { kind: "run", sql: "INSERT INTO candidate_roots (root_id, workspace_id, candidate_generation_id, resource_type, content_digest, state) VALUES (?, ?, ?, ?, ?, ?)", params: [root.root_id, this.workspaceId, root.candidate_generation_id, root.resource_type, root.content_digest, root.state] },
+      ...relationalValueCommandsForTable(flattenRelationalValue(this.workspaceId, root.root_id, 0, root.payload), "candidate_value_nodes"),
+    ]);
     return "inserted";
   }
 
   async getManifest(manifestId: string): Promise<CandidateWorkManifest | undefined> {
-    const row = await this.database.get<{ work_manifest_payload: unknown }>("SELECT work_manifest_payload FROM candidate_work_manifests WHERE workspace_id = ? AND work_manifest_id = ?", [this.workspaceId, manifestId]);
-    return row ? decodeCanonical(bytes(row.work_manifest_payload)) as CandidateWorkManifest : undefined;
+    const row = await this.database.get<Record<string, unknown>>("SELECT * FROM candidate_work_manifests WHERE workspace_id = ? AND work_manifest_id = ?", [this.workspaceId, manifestId]);
+    return row ? manifestFromRow(row) : undefined;
   }
 
   async listManifests(candidateId: string): Promise<readonly CandidateWorkManifest[]> {
     await this.requireCandidate(candidateId);
-    const rows = await this.database.all<{ work_manifest_payload: unknown }>("SELECT work_manifest_payload FROM candidate_work_manifests WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY work_manifest_id", [this.workspaceId, candidateId]);
-    return rows.map((row) => decodeCanonical(bytes(row.work_manifest_payload)) as CandidateWorkManifest);
+    const rows = await this.database.all<Record<string, unknown>>("SELECT * FROM candidate_work_manifests WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY work_manifest_id", [this.workspaceId, candidateId]);
+    return rows.map(manifestFromRow);
   }
 
   async getDelta(candidateId: string, deltaId: string): Promise<CandidateDeltaInput | undefined> {
     await this.requireCandidate(candidateId);
-    const row = await this.database.get<{ delta_payload: unknown }>("SELECT delta_payload FROM candidate_fact_deltas WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?", [this.workspaceId, candidateId, deltaId]);
-    return row ? decodeCanonical(bytes(row.delta_payload)) as CandidateDeltaInput : undefined;
+    const row = await this.database.get<{ fact_delta_id: string; candidate_generation_id: string; workspace_id: string; delta_digest: string }>("SELECT fact_delta_id, candidate_generation_id, workspace_id, delta_digest FROM candidate_fact_deltas WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?", [this.workspaceId, candidateId, deltaId]);
+    return row ? row as CandidateDeltaInput : undefined;
   }
 
   async listDeltas(candidateId: string): Promise<readonly CandidateDeltaInput[]> {
     await this.requireCandidate(candidateId);
-    const rows = await this.database.all<{ delta_payload: unknown }>("SELECT delta_payload FROM candidate_fact_deltas WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY accepted_at, fact_delta_id", [this.workspaceId, candidateId]);
-    return rows.map((row) => decodeCanonical(bytes(row.delta_payload)) as CandidateDeltaInput);
+    const rows = await this.database.all<{ fact_delta_id: string; candidate_generation_id: string; workspace_id: string; delta_digest: string }>("SELECT fact_delta_id, candidate_generation_id, workspace_id, delta_digest FROM candidate_fact_deltas WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY accepted_at, fact_delta_id", [this.workspaceId, candidateId]);
+    return rows as CandidateDeltaInput[];
   }
 
   async getMaterialization(candidateId: string): Promise<CandidateMaterialization | undefined> {
     await this.requireCandidate(candidateId);
-    const row = await this.database.get<{ materialization_payload: unknown }>("SELECT materialization_payload FROM candidate_materializations WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY sealed_at DESC LIMIT 1", [this.workspaceId, candidateId]);
-    return row ? decodeCanonical(bytes(row.materialization_payload)) as CandidateMaterialization : undefined;
+    const row = await this.database.get<{ materialization_contract_text: string }>("SELECT materialization_contract_text FROM candidate_materializations WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY sealed_at DESC LIMIT 1", [this.workspaceId, candidateId]);
+    return row ? JSON.parse(row.materialization_contract_text) as CandidateMaterialization : undefined;
   }
 
   async listIssues(candidateId: string): Promise<readonly CandidateIssue[]> {
     await this.requireCandidate(candidateId);
     const rows = await this.database.all<{
       candidate_issue_id: string; candidate_generation_id: string; issue_code: string; phase: string;
-      severity: string; retryability: string; scope_payload: unknown; summary: string; detail: string;
-      cause_references: string; payload: unknown; created_at: string;
-    }>("SELECT candidate_issue_id, candidate_generation_id, issue_code, phase, severity, retryability, scope_payload, summary, detail, cause_references, payload, created_at FROM candidate_issues WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY created_at, candidate_issue_id", [this.workspaceId, candidateId]);
+      severity: string; retryability: string; scope_json: string; summary: string; detail: string;
+      cause_references: string; issue_json: string; created_at: string;
+    }>("SELECT candidate_issue_id, candidate_generation_id, issue_code, phase, severity, retryability, scope_json, summary, detail, cause_references, issue_json, created_at FROM candidate_issues WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY created_at, candidate_issue_id", [this.workspaceId, candidateId]);
     return rows.map((row) => ({
       candidate_issue_id: row.candidate_issue_id,
       candidate_generation_id: row.candidate_generation_id,
@@ -708,37 +657,38 @@ export class WorkspaceCandidateRepository {
       phase: row.phase,
       severity: row.severity,
       retryability: row.retryability,
-      scope: decodeCanonical(bytes(row.scope_payload)) as CandidateIssue["scope"],
+      scope: JSON.parse(row.scope_json) as CandidateIssue["scope"],
       summary: row.summary,
       detail: row.detail,
       cause_references: row.cause_references,
-      payload: decodeCanonical(bytes(row.payload)) as CandidateIssue["payload"],
+      payload: JSON.parse(row.issue_json) as CandidateIssue["payload"],
       created_at: row.created_at,
     }));
   }
 
   async listLookupDependencies(candidateId: string): Promise<readonly Record<string, unknown>[]> {
     await this.requireCandidate(candidateId);
-    const rows = await this.database.all<{ dependency_payload: unknown }>("SELECT dependency_payload FROM candidate_lookup_dependencies WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY lookup_dependency_id", [this.workspaceId, candidateId]);
-    return rows.map((row) => decodeCanonical(bytes(row.dependency_payload)) as Record<string, unknown>);
+    const rows = await this.database.all<Record<string, unknown>>("SELECT lookup_dependency_id, workspace_id, candidate_generation_id, consumer_type, consumer_id, owner_artifact_id, owner_artifact_version_id, operation, normalized_selector_or_address, selector_digest, previous_result_set_digest, invalidation_scope, valid_from_generation, valid_to_generation, dependency_digest FROM candidate_lookup_dependencies WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY lookup_dependency_id", [this.workspaceId, candidateId]);
+    return rows.map((row) => ({ ...row, lookup_dependency_id: String(row["lookup_dependency_id"]), workspace_id: String(row["workspace_id"]), candidate_generation_id: String(row["candidate_generation_id"]) }));
   }
 
   async listRoots(candidateId: string): Promise<readonly CandidateRoot[]> {
     await this.requireCandidate(candidateId);
-    const rows = await this.database.all<Record<string, unknown> & { root_payload: unknown }>("SELECT * FROM candidate_roots WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY root_id", [this.workspaceId, candidateId]);
-    return rows.map((row) => ({ root_id: String(row["root_id"]), workspace_id: String(row["workspace_id"]), candidate_generation_id: String(row["candidate_generation_id"]), resource_type: String(row["resource_type"]), content_digest: String(row["content_digest"]), state: String(row["state"]), payload: decodeCanonical(bytes(row.root_payload)) }));
+    const rows = await this.database.all<Record<string, unknown>>("SELECT * FROM candidate_roots WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY root_id", [this.workspaceId, candidateId]);
+    return Promise.all(rows.map(async (row) => ({ root_id: String(row["root_id"]), workspace_id: String(row["workspace_id"]), candidate_generation_id: String(row["candidate_generation_id"]), resource_type: String(row["resource_type"]), content_digest: String(row["content_digest"]), state: String(row["state"]), payload: hydrateRelationalValue(await this.database.all<Record<string, unknown> & RelationalValueRow>("SELECT * FROM candidate_value_nodes WHERE workspace_id = ? AND record_id = ? ORDER BY value_path", [this.workspaceId, String(row["root_id"])])) })));
   }
 
   async getRoot(candidateId: string, rootId: string): Promise<CandidateRoot | undefined> {
     await this.requireCandidate(candidateId);
-    const row = await this.database.get<Record<string, unknown> & { root_payload: unknown }>("SELECT * FROM candidate_roots WHERE workspace_id = ? AND candidate_generation_id = ? AND root_id = ?", [this.workspaceId, candidateId, rootId]);
-    return row ? { root_id: String(row["root_id"]), workspace_id: String(row["workspace_id"]), candidate_generation_id: String(row["candidate_generation_id"]), resource_type: String(row["resource_type"]), content_digest: String(row["content_digest"]), state: String(row["state"]), payload: decodeCanonical(bytes(row.root_payload)) } : undefined;
+    const row = await this.database.get<Record<string, unknown>>("SELECT * FROM candidate_roots WHERE workspace_id = ? AND candidate_generation_id = ? AND root_id = ?", [this.workspaceId, candidateId, rootId]);
+    if (!row) return undefined;
+    return { root_id: String(row["root_id"]), workspace_id: String(row["workspace_id"]), candidate_generation_id: String(row["candidate_generation_id"]), resource_type: String(row["resource_type"]), content_digest: String(row["content_digest"]), state: String(row["state"]), payload: hydrateRelationalValue(await this.database.all<Record<string, unknown> & RelationalValueRow>("SELECT * FROM candidate_value_nodes WHERE workspace_id = ? AND record_id = ? ORDER BY value_path", [this.workspaceId, rootId])) };
   }
 
   async getLease(candidateId: string): Promise<Record<string, unknown> | undefined> {
     await this.requireCandidate(candidateId);
-    const row = await this.database.get<{ lease_payload: unknown }>("SELECT lease_payload FROM candidate_retention_leases WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
-    return row ? decodeCanonical(bytes(row.lease_payload)) as Record<string, unknown> : undefined;
+    const row = await this.database.get<Record<string, unknown>>("SELECT retention_lease_id, workspace_id, candidate_generation_id, base_snapshot_id, state, acquired_at, released_at FROM candidate_retention_leases WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
+    return row;
   }
 
   private async requireCandidate(candidateId: string, expectedCandidateId = candidateId): Promise<void> {

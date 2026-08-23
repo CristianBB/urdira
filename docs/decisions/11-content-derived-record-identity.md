@@ -28,7 +28,11 @@ Urdira's persisted state has three layers with three different identity policies
 - `identity_id` for an entity identity drops `workspace_id` from its digest input: `entity:${digest({identity_key})}` (or the absence-barrier variant, `entity:${digest({identity_key, absence_barrier})}`). `identity_assignment_id = digest({record_id, identity_key})` was already content-derived by cascade through `record_id` and is unchanged. `workspace_id` stays as a plain field on the identity template/row — it feeds the row column — it just never enters a digest.
 - Projection content digests (`projectionDigest` in the engine, `projection_occurrences.content_digest` in storage) drop `workspace_id` from their input the same way. `source_artifact_version_ids` and the other source-binding arrays stay inside the stored payload for now; restructuring them is left to the fork implementation, since they are low-volume and a fork can patch them without a phase-1 digest change.
 
-Storage row payloads (`record_occurrences.record_payload`) no longer embed `workspace_id`, `owner_artifact_id`, or `owner_artifact_version_id` — those are row columns only, sourced from the open template's own routing fields rather than parsed out of the record. `verify()`'s recomputed occurrence-identity shape and every publication-authority conflict check were updated in lockstep.
+Record occurrences no longer store an aggregate row payload. The workspace,
+owner, and source-span values are typed columns, while the logical body is
+stored in `record_value_nodes` and reconstructed only for selected query
+results. `verify()` recomputes the logical-body digest from those rows and
+publication conflict checks compare the typed columns and child rows.
 
 ## Schema and format
 

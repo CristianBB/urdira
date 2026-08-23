@@ -1,13 +1,20 @@
 import { mkdir, open, readFile, stat, unlink, link } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { digestBytes } from "@urdira/canonical";
 import type { ContentBlob } from "@urdira/contracts";
 import { timed } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
+import type { ByteBoundaryTelemetry } from "./byte-telemetry.js";
 
 export interface CasPutOptions {
   readonly content_hash?: string;
   readonly media_type?: string;
+}
+
+export interface CasPutStreamOptions extends CasPutOptions {
+  readonly byte_length?: number;
+  readonly telemetry?: ByteBoundaryTelemetry;
 }
 
 export type BlobReference =
@@ -21,11 +28,17 @@ export interface CasFilesystemHooks {
   readonly sync_directory?: (directory: string) => Promise<void>;
   readonly sync_file?: (path: string) => Promise<void>;
   readonly platform?: NodeJS.Platform;
+  readonly telemetry?: ByteBoundaryTelemetry;
 }
 
 export interface CasPutManyEntry {
   readonly bytes: Uint8Array;
   readonly options?: CasPutOptions;
+}
+
+export interface CasPutStreamEntry {
+  readonly chunks: AsyncIterable<Uint8Array>;
+  readonly options?: CasPutStreamOptions;
 }
 
 // Bounded concurrency for `putMany`'s per-blob filesystem work (temp-file
@@ -68,6 +81,7 @@ export class ContentAddressedStore {
   private readonly syncDirectoryHook: (directory: string) => Promise<void>;
   private readonly syncFileHook: (path: string) => Promise<void>;
   private readonly platform: NodeJS.Platform;
+  private readonly telemetry: ByteBoundaryTelemetry | undefined;
 
   constructor(rootDir: string, writeMetadata?: CasMetadataWriter, hooks: CasFilesystemHooks = {}, writeMetadataBatch?: CasMetadataBatchWriter) {
     this.rootDir = rootDir;
@@ -76,11 +90,94 @@ export class ContentAddressedStore {
     this.syncDirectoryHook = hooks.sync_directory ?? ((directory) => this.syncDirectory(directory));
     this.syncFileHook = hooks.sync_file ?? ((path) => this.syncFile(path));
     this.platform = hooks.platform ?? process.platform;
+    this.telemetry = hooks.telemetry;
   }
 
   async put(bytes: Uint8Array, options: CasPutOptions = {}): Promise<ContentBlob> {
+    this.telemetry?.add("cas", { read: bytes.byteLength, copied: bytes.byteLength });
     const [blob] = await this.putMany([{ bytes, options }]);
     return blob as ContentBlob;
+  }
+
+  /** Consume a source stream once while hashing and writing the CAS object. */
+  async putStream(chunks: AsyncIterable<Uint8Array>, options: CasPutStreamOptions = {}): Promise<ContentBlob> {
+    const [blob] = await this.putStreamsMany([{ chunks, options }]);
+    return blob as ContentBlob;
+  }
+
+  /**
+   * Stream counterpart of `putMany`: every stream retains the same private
+   * temp-file, hash, fsync, atomic-link, and collision-verification sequence
+   * as `putStream`, while independent streams run with bounded concurrency.
+   * Namespace fsyncs and installation-catalog metadata are coalesced only
+   * after all stream bytes are durable, so a resolved call has the identical
+   * crash boundary without one SQLite commit per source file.
+   */
+  async putStreamsMany(entries: readonly CasPutStreamEntry[]): Promise<ContentBlob[]> {
+    if (entries.length === 0) return [];
+    const installed = await mapWithConcurrency(entries, DEFAULT_PUT_CONCURRENCY, async (entry) => {
+      const options = entry.options ?? {};
+      const temporary = join(this.rootDir, ".tmp", `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      await mkdir(dirname(temporary), { recursive: true });
+      const hash = createHash("sha256");
+      let byteLength = 0;
+      const handle = await open(temporary, "wx", 0o600);
+      try {
+        for await (const chunk of entry.chunks) {
+          if (!(chunk instanceof Uint8Array)) throw new StorageError("storage:cas_stream_invalid", "CAS streams must yield Uint8Array chunks.");
+          hash.update(chunk); byteLength += chunk.byteLength;
+          options.telemetry?.add("cas", { read: chunk.byteLength });
+          this.telemetry?.add("cas", { read: chunk.byteLength });
+          if (options.byte_length !== undefined && byteLength > options.byte_length) throw new StorageError("storage:cas_stream_length_mismatch", "CAS stream exceeded its declared length.", { expected_length: options.byte_length, actual_length: byteLength });
+          await handle.write(chunk);
+        }
+        await handle.sync();
+        await handle.close();
+        const actualHash = `sha256:${hash.digest("hex")}`;
+        if (options.byte_length !== undefined && byteLength !== options.byte_length) throw new StorageError("storage:cas_stream_length_mismatch", "CAS stream length did not match its declaration.", { expected_length: options.byte_length, actual_length: byteLength });
+        if (options.content_hash !== undefined && options.content_hash !== actualHash) throw new StorageError("storage:cas_collision", "The supplied CAS digest does not match the streamed bytes.", { expected: options.content_hash, actual: actualHash });
+        const destination = this.objectPath(actualHash);
+        await mkdir(dirname(destination), { recursive: true });
+        let isNew = true;
+        try { await link(temporary, destination); }
+        catch (error) {
+          if (!isAlreadyExists(error)) throw error;
+          isNew = false;
+          await this.verifyExisting(destination, actualHash, byteLength);
+        }
+        await unlink(temporary).catch(() => undefined);
+        return {
+          blob: { content_blob_id: actualHash, content_hash: actualHash, byte_length: byteLength, storage_reference: `cas:${actualHash}` } satisfies ContentBlob,
+          destination,
+          isNew,
+          media_type: options.media_type,
+        };
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        await unlink(temporary).catch(() => undefined);
+        throw error;
+      }
+    });
+    const freshDestinations = [...new Set(installed.filter((entry) => entry.isNew).map((entry) => entry.destination))];
+    if (this.platform === "win32") {
+      await mapWithConcurrency(freshDestinations, DEFAULT_PUT_CONCURRENCY, async (path) => {
+        try { await timed("cas_file_fsync", () => this.syncFileHook(path)); }
+        catch (error) { throw new StorageError("storage:cas_directory_sync_failed", "The installed CAS object could not be durably synchronized.", { directory: dirname(path), cause: error instanceof Error ? error.message : String(error) }); }
+      });
+    } else {
+      const dirtyDirectories = [...new Set(freshDestinations.map((destination) => dirname(destination)))];
+      await mapWithConcurrency(dirtyDirectories, DEFAULT_PUT_CONCURRENCY, async (directory) => {
+        try { await timed("cas_dir_fsync", () => this.syncDirectoryHook(directory)); }
+        catch (error) { throw new StorageError("storage:cas_directory_sync_failed", "The CAS directory could not be durably synchronized.", { directory, cause: error instanceof Error ? error.message : String(error) }); }
+      });
+    }
+    const blobs = installed.map((entry) => entry.blob);
+    if (this.writeMetadataBatch) {
+      await timed("cas_metadata_batch", () => this.writeMetadataBatch!(installed.map((entry) => entry.media_type === undefined ? { blob: entry.blob } : { blob: entry.blob, media_type: entry.media_type })));
+    } else if (this.writeMetadata) {
+      for (const entry of installed) await this.writeMetadata(entry.blob, entry.media_type);
+    }
+    return blobs;
   }
 
   /**

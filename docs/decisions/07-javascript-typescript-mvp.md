@@ -1,7 +1,7 @@
 # JavaScript and TypeScript MVP
 
 Status: **Approved**  
-Last updated: 2026-08-08  
+Last updated: 2026-08-21
 Depends on: Universal data model and plugin contract
 
 ## Decision objective
@@ -28,6 +28,16 @@ calls, inheritance, and implementations; and (3) types, compiler diagnostics,
 control/data flow, effects, test relationships, and semantic preparation. The
 worker may reuse one immutable program/session; stage three must match a fresh
 monolithic analysis in visible records and canonical/projection digests.
+
+Stage 1 is a memory-bounded syntax frontier. It uses `analyzeSyntaxProject` and
+must not construct a project-wide TypeScript `Program` or `Checker`; those
+objects retain the complete source graph and are reserved for later semantic
+stages. A syntax result may be reused for a compatible narrowed closure, but
+the worker retains at most one such result and a bounded source-hash memo (512
+entries or 16 MiB of UTF-8 text). Any checker-backed stage releases the
+syntax-only result before retaining its semantic analysis. This restriction
+changes no published capability: typed, resolved, diagnostic, flow, and
+semantic-preparation facts remain unavailable until their owning later stage.
 
 No second parser defines canonical identity. A lightweight scanner may preclassify files or compute local invalidation candidates, but every published syntax or semantic fact is validated against the exact TypeScript syntax tree and program selected by the work item.
 

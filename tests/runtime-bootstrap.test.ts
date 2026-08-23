@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   BOOTSTRAP_VERSION,
+  MINIMUM_NODE_VERSION,
   RUNTIME_INSTALL_SCRIPT_APPROVALS,
   RUNTIME_PACKAGE_NAME,
   RUNTIME_VERSION,
@@ -18,9 +19,10 @@ const knownDeprecation = "npm warn deprecated boolean@3.2.0: Package no longer s
 
 describe("dependency-free runtime bootstrap", () => {
   it("binds one bootstrap release to one exact runtime and reviewed script closure", () => {
-    expect(BOOTSTRAP_VERSION).toBe("0.2.0");
+    expect(BOOTSTRAP_VERSION).toBe("0.2.2");
     expect(RUNTIME_PACKAGE_NAME).toBe("@urdira/runtime");
-    expect(RUNTIME_VERSION).toBe("0.2.0");
+    expect(RUNTIME_VERSION).toBe("0.2.2");
+    expect(MINIMUM_NODE_VERSION).toBe("24.18.1");
     expect(RUNTIME_INSTALL_SCRIPT_APPROVALS).toEqual({
       "onnxruntime-node@1.24.3": true,
       "sharp@0.35.3": true,
@@ -31,7 +33,8 @@ describe("dependency-free runtime bootstrap", () => {
     const plan = createRuntimePreparationPlan("/var/lib/urdira");
     expect(plan).toMatchObject({
       package_name: "@urdira/runtime",
-      package_version: "0.2.0",
+      package_version: "0.2.2",
+      minimum_node_version: "24.18.1",
       minimum_npm_version: "11.16.0",
       registry: "https://registry.npmjs.org/",
       known_upstream_notices: ["boolean@3.2.0 is deprecated through @huggingface/transformers@4.2.0 -> onnxruntime-node@1.24.3 -> global-agent@3.0.0."],
@@ -41,6 +44,18 @@ describe("dependency-free runtime bootstrap", () => {
 
   it("discloses the npm version required by the strict install-script policy", () => {
     expect(createRuntimePreparationPlan("/var/lib/urdira").minimum_npm_version).toBe("11.16.0");
+  });
+
+  it("refuses an unsupported Node runtime before executing the prepared application", async () => {
+    let executed = false;
+    const result = await runBootstrap(["daemon", "start"], {
+      node_version: "24.14.0",
+      resolve_entrypoint: async () => "/private/runtime/cli.js",
+      execute_runtime: async () => { executed = true; return 0; },
+    });
+    expect(result).toMatchObject({ exit_code: 2, stdout: "" });
+    expect(result.stderr).toContain("requires Node >=24.18.1; found 24.14.0");
+    expect(executed).toBe(false);
   });
 
   it("classifies only the disclosed upstream warning as acknowledged", () => {
@@ -66,7 +81,7 @@ describe("dependency-free runtime bootstrap", () => {
       install: async ({ staging_root }) => {
         const privateManifest = JSON.parse(await readFile(join(staging_root, "package.json"), "utf8"));
         expect(privateManifest).toMatchObject({
-          dependencies: { "@urdira/runtime": "0.2.0" },
+          dependencies: { "@urdira/runtime": "0.2.2" },
           overrides: { "adm-zip": "0.6.0", sharp: "0.35.3" },
           allowScripts: RUNTIME_INSTALL_SCRIPT_APPROVALS,
         });
@@ -104,6 +119,7 @@ describe("dependency-free runtime bootstrap", () => {
     let prepared = false;
     const result = await runBootstrap(["status"], {
       data_root: "/tmp/urdira-not-prepared",
+      node_version: "24.18.1",
       interactive: false,
       resolve_entrypoint: async () => undefined,
       prepare_runtime: async () => {
@@ -121,6 +137,7 @@ describe("dependency-free runtime bootstrap", () => {
     const entrypoint = "/private/runtime/cli.js";
     const result = await runBootstrap(["status", "--json"], {
       data_root: "/tmp/urdira-interactive",
+      node_version: "24.18.1",
       interactive: true,
       resolve_entrypoint: async () => undefined,
       prompt: async (message) => {

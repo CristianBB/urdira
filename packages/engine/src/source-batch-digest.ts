@@ -1,4 +1,4 @@
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { LogicalDigestWriter, MerkleRadixSet } from "@urdira/canonical";
 
 interface BatchDigestSource {
   readonly workspace_id: string;
@@ -25,54 +25,48 @@ interface ObservationDigestSource {
   readonly provider_sequence?: string;
 }
 
-interface CanonicalObservationDigestEntry {
-  readonly artifact_id: string;
-  readonly observed_state: string;
-  readonly observed_content_hash?: string;
-  readonly observed_metadata_digest?: string;
-  readonly provider_event_token?: string;
-  readonly provider_sequence?: string;
-}
-
-function compareBytes(left: Uint8Array, right: Uint8Array): number {
-  const length = Math.min(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const difference = left[index]! - right[index]!;
-    if (difference !== 0) return difference;
-  }
-  return left.length - right.length;
+function observationDigest(observation: ObservationDigestSource): string {
+  const writer = new LogicalDigestWriter("urdira:source-observation:v3");
+  const optional = (value: unknown): value is string => typeof value === "string";
+  writer.field("artifact_id", true, () => writer.text(0, observation.artifact_id));
+  writer.field("observed_state", true, () => writer.text(0, observation.observed_state));
+  writer.field("observed_content_hash", optional(observation.observed_content_hash), () => writer.text(0, observation.observed_content_hash as string));
+  writer.field("observed_metadata_digest", optional(observation.observed_metadata_digest), () => writer.text(0, observation.observed_metadata_digest as string));
+  writer.field("provider_event_token", optional(observation.provider_event_token), () => writer.text(0, observation.provider_event_token as string));
+  writer.field("provider_sequence", optional(observation.provider_sequence), () => writer.text(0, observation.provider_sequence as string));
+  return writer.digest();
 }
 
 export function sourceObservationBatchDigest(
   batch: BatchDigestSource,
   observations: readonly ObservationDigestSource[],
 ): string {
-  const ordered = observations.map((observation): { readonly entry: CanonicalObservationDigestEntry; readonly bytes: Uint8Array } => {
-    const entry: CanonicalObservationDigestEntry = {
-      artifact_id: observation.artifact_id,
-      observed_state: observation.observed_state,
-      ...(observation.observed_content_hash === undefined ? {} : { observed_content_hash: observation.observed_content_hash }),
-      ...(observation.observed_metadata_digest === undefined ? {} : { observed_metadata_digest: observation.observed_metadata_digest }),
-      ...(observation.provider_event_token === undefined ? {} : { provider_event_token: observation.provider_event_token }),
-      ...(observation.provider_sequence === undefined ? {} : { provider_sequence: observation.provider_sequence }),
-    };
-    return { entry, bytes: canonicalBytes(entry) };
-  }).sort((left, right) => compareBytes(left.bytes, right.bytes));
-  const deduplicated = ordered.filter((value, index) => index === 0 || compareBytes(value.bytes, ordered[index - 1]!.bytes) !== 0).map(({ entry }) => entry);
-  return digestBytes(canonicalBytes({
-    workspace_id: batch.workspace_id,
-    source_provider_binding_id: batch.source_provider_binding_id,
-    source_provider: batch.source_provider,
-    source_provider_version: batch.source_provider_version,
-    ordering_domain: batch.ordering_domain,
-    observation_mode: batch.observation_mode,
-    coverage_scopes: batch.coverage_scopes,
-    coverage_completeness: batch.coverage_completeness,
-    deletion_authority: batch.deletion_authority,
-    provider_cursor_before: batch.provider_cursor_before,
-    provider_cursor_after: batch.provider_cursor_after,
-    observation_count: batch.observation_count,
-    unavailable_count: batch.unavailable_count,
-    observations: deduplicated,
-  }));
+  // Build the set bottom-up so a large provider page does not recompute 64
+  // radix branches for every observation.
+  const observationsRoot = MerkleRadixSet.from((function* () {
+    for (const observation of observations) {
+      const digest = observationDigest(observation);
+      yield { member_digest: digest, logical_digest: digest };
+    }
+  })());
+  const writer = new LogicalDigestWriter("urdira:source-observation-batch:v3");
+  const required = (name: string, value: string): void => { writer.field(name, true, () => { writer.text(0, value); }); };
+  required("workspace_id", batch.workspace_id);
+  required("source_provider_binding_id", batch.source_provider_binding_id);
+  required("source_provider", batch.source_provider);
+  required("source_provider_version", batch.source_provider_version);
+  required("ordering_domain", batch.ordering_domain);
+  required("observation_mode", batch.observation_mode);
+  required("coverage_scopes", batch.coverage_scopes);
+  required("coverage_completeness", batch.coverage_completeness);
+  required("deletion_authority", batch.deletion_authority);
+  required("provider_cursor_before", batch.provider_cursor_before);
+  required("provider_cursor_after", batch.provider_cursor_after);
+  writer.field("observation_count", true, () => writer.integer(batch.observation_count));
+  writer.field("unavailable_count", true, () => writer.integer(batch.unavailable_count));
+  writer.field("observation_set", true, () => {
+    writer.field("root", true, () => writer.text(0, observationsRoot.root()));
+    writer.field("member_count", true, () => writer.integer(observationsRoot.size()));
+  });
+  return writer.digest();
 }

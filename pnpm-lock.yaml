@@ -83,6 +83,9 @@ importers:
       '@urdira/plugin-sdk':
         specifier: workspace:*
         version: link:../../packages/plugin-sdk
+      '@urdira/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
 
   packages/canonical:
     dependencies:
@@ -103,6 +106,9 @@ importers:
 
   packages/daemon:
     dependencies:
+      '@bufbuild/protobuf':
+        specifier: 2.11.0
+        version: 2.11.0
       '@urdira/contracts':
         specifier: workspace:*
         version: link:../contracts
@@ -175,6 +181,9 @@ importers:
 
   packages/plugin-javascript-typescript:
     dependencies:
+      '@urdira/canonical':
+        specifier: workspace:*
+        version: link:../canonical
       '@urdira/contracts':
         specifier: workspace:*
         version: link:../contracts
@@ -313,6 +322,9 @@ packages:
   '@bcoe/v8-coverage@1.0.2':
     resolution: {integrity: sha512-6zABk/ECA/QYSCQ1NGiVwwbQerUCZ+TQbp64Q3AgmfNvurHH0j8TtXa1qbShXA6qqkpAj4V5W8pP6mLe1mcMqA==}
     engines: {node: '>=18'}
+
+  '@bufbuild/protobuf@2.11.0':
+    resolution: {integrity: sha512-sBXGT13cpmPR5BMgHE6UEEfEaShh5Ror6rfN3yEK5si7QVrtZg8LEPQb0VVhiLRUslD2yLnXtnRzG035J/mZXQ==}
 
   '@emnapi/runtime@1.11.3':
     resolution: {integrity: sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA==}
@@ -2019,6 +2031,8 @@ snapshots:
       '@babel/helper-validator-identifier': 7.29.7
 
   '@bcoe/v8-coverage@1.0.2': {}
+
+  '@bufbuild/protobuf@2.11.0': {}
 
   '@emnapi/runtime@1.11.3':
     dependencies:

@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { computeDigest, digestBytes, encodeCanonical } from "@urdira/canonical";
+import { computeDigest } from "@urdira/canonical";
 import { createDurableStorage, projectionSetDigestEntries } from "../packages/storage/src/index.js";
 import type { EntityRecord, Workspace } from "@urdira/contracts";
 
@@ -46,9 +46,9 @@ async function seedOwner(storage: Awaited<ReturnType<typeof createDurableStorage
 async function seedSnapshot(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, snapshotId: string, projectionSetDigests: string, generation = 1): Promise<void> {
   const registryId = `registry-${snapshotId}`;
   const registryDigest = computeDigest("core:registry_snapshot", "core:registry_snapshot_digest", 1, "core:RegistrySnapshotDigestPayload", 1, { registry_snapshot_id: registryId, registry_contract_version: "1", core_registry_digest: `core-${snapshotId}`, resolution_lock_id: `lock-${snapshotId}`, namespace_bindings: [] });
-  await opened.database.run("INSERT OR IGNORE INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [registryId, workspace.workspace_id, "1", `core-${snapshotId}`, `lock-${snapshotId}`, registryDigest, encodeCanonical({ registry_snapshot_id: registryId, workspace_id: workspace.workspace_id, namespace_bindings: [] })]);
+  await opened.database.run("INSERT OR IGNORE INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [registryId, workspace.workspace_id, "1", `core-${snapshotId}`, `lock-${snapshotId}`, registryDigest]);
   const snapshot = { snapshot_id: snapshotId, workspace_id: workspace.workspace_id, generation, generation_manifest_id: `manifest-${snapshotId}`, registry_snapshot_id: registryId, resolution_lock_id: `lock-${snapshotId}`, configuration_revision_id: `config-${snapshotId}`, source_state_digest: `source-${snapshotId}`, source_observation_watermarks: "{}", canonical_record_set_digest: `records-${snapshotId}`, projection_set_digests: projectionSetDigests, capability_state_digest: `capabilities-${snapshotId}`, published_at: "2026-08-13T00:00:00.000000000Z", snapshot_digest: `snapshot-digest-${snapshotId}` };
-  await opened.database.run("INSERT OR IGNORE INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshot.snapshot_id, snapshot.workspace_id, snapshot.generation, snapshot.generation_manifest_id, snapshot.registry_snapshot_id, snapshot.resolution_lock_id, snapshot.configuration_revision_id, snapshot.source_state_digest, snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.projection_set_digests, snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest, encodeCanonical(snapshot)]);
+  await opened.database.run("INSERT OR IGNORE INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshot.snapshot_id, snapshot.workspace_id, snapshot.generation, snapshot.generation_manifest_id, snapshot.registry_snapshot_id, snapshot.resolution_lock_id, snapshot.configuration_revision_id, snapshot.source_state_digest, snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.projection_set_digests, snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest]);
 }
 
 describe("Transactional projection digests (decision 13)", { timeout: 30_000 }, () => {
@@ -135,14 +135,14 @@ describe("Transactional projection digests (decision 13)", { timeout: 30_000 }, 
       // same record, spanning generations.
       await opened.repositories.canonicalOccurrences.put(baseRecord);
       await opened.database.run(
-        `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, assignment_payload)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ["assignment-a-old", workspace.workspace_id, "entity", "identity-a-old", "created", "key-a-old", "key-digest-a-old", "record-a", null, "visible-artifact", "visible-version", 1, 2, new Uint8Array([1])],
+        `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ["assignment-a-old", workspace.workspace_id, "entity", "identity-a-old", "created", "key-a-old", "key-digest-a-old", "record-a", null, "visible-artifact", "visible-version", 1, 2],
       );
       await opened.database.run(
-        `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, assignment_payload)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ["assignment-a-new", workspace.workspace_id, "entity", "identity-a-new", "created", "key-a-new", "key-digest-a-new", "record-a", null, "visible-artifact", "visible-version", 2, null, new Uint8Array([1])],
+        `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ["assignment-a-new", workspace.workspace_id, "entity", "identity-a-new", "created", "key-a-new", "key-digest-a-new", "record-a", null, "visible-artifact", "visible-version", 2, null],
       );
       // record-b: visible from generation 1, but never gets an identity
       // assignment -- must carry no identity fields at all.
@@ -224,59 +224,30 @@ describe("Stored projection content_digest (publish_projection_digests perf)", {
       // digest-column corruption distinct from payload corruption.
       const wrongDigest = `sha256:${"0".repeat(64)}`;
       await opened.database.run("UPDATE graph_edges SET content_digest = ? WHERE workspace_id = ? AND edge_id = ?", [wrongDigest, workspace.workspace_id, "corrupt-edge"]);
-      const corrupted = (await opened.maintenance.verify()).failures.filter((failure) => failure.component_id === "corrupt-snapshot");
-      expect(corrupted.map((failure) => failure.error_code)).toContain("storage:projection_content_digest_corrupt");
+      const corrupted = (await opened.maintenance.verify()).failures.filter((failure) => failure.component_kind === "graph");
+      expect(corrupted.map((failure) => failure.error_code)).toContain("storage:graph_corrupt");
 
-      // NULL-ing the stored column (rather than corrupting it) is not
-      // corruption -- it is exactly the not-yet-backfilled state the
-      // "stored" read path is defined to fall back on -- so both modes must
-      // still agree.
-      await opened.database.run("UPDATE graph_edges SET content_digest = NULL WHERE workspace_id = ? AND edge_id = ?", [workspace.workspace_id, "corrupt-edge"]);
-      const storedAfterNull = await projectionSetDigestEntries(opened.database, workspace.workspace_id, 1, { digest_source: "stored" });
-      const recomputeAfterNull = await projectionSetDigestEntries(opened.database, workspace.workspace_id, 1, { digest_source: "recompute" });
-      expect(storedAfterNull).toEqual(recomputeAfterNull);
+      // v2 makes the digest column mandatory: a missing digest is rejected
+      // by SQLite instead of triggering a hidden legacy fallback.
+      await expect(opened.database.run("UPDATE graph_edges SET content_digest = NULL WHERE workspace_id = ? AND edge_id = ?", [workspace.workspace_id, "corrupt-edge"])).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR" });
 
       await opened.close();
     });
   });
 
-  it("re-adds and backfills content_digest for a database migrated from before this column existed", async () => {
+  it("keeps projection digests entirely relational in the v2 schema", async () => {
     await withStorage(async (storage) => {
       await storage.catalog.registerWorkspace(workspace);
       const opened = await storage.openWorkspace(workspace.workspace_id);
       await seedOwner(storage, opened, "migration-artifact", "migration-version", "migration source text");
       await opened.projections.putGraphEdge({ edge_id: "migration-edge", source_subject_id: "source", target_subject_id: "target", relation_record_id: "record", relation_kind: "calls", role: "callee", evidence_class: "confirmed", owner_artifact_id: "migration-artifact", owner_artifact_version_id: "migration-version", valid_from_generation: 1 });
-
-      // Simulate a database created before this change: no digest-scan index
-      // (it references the column) and no content_digest column at all --
-      // only the payload BLOB survives, exactly like a real pre-migration
-      // database opened for the first time after this change ships.
-      await opened.database.exec("DROP INDEX IF EXISTS graph_edges_digest_scan_idx");
-      await opened.database.exec("ALTER TABLE graph_edges DROP COLUMN content_digest");
-      const beforeMigration = await opened.database.get<Record<string, unknown>>("SELECT * FROM graph_edges WHERE workspace_id = ? AND edge_id = ?", [workspace.workspace_id, "migration-edge"]);
-      expect(beforeMigration && "content_digest" in beforeMigration).toBe(false);
-      await opened.close();
-
-      // Reopening runs `ensureWorkspaceSchemaCompatibility`
-      // (`packages/storage/src/schema.ts`), which re-adds the column via
-      // `ALTER TABLE ... ADD COLUMN`, backfills every NULL row from its
-      // still-present payload BLOB, and recreates the covering index --
-      // idempotent and re-runnable by construction (it only ever selects
-      // rows still NULL), so it is safe to run on every open, migrated
-      // database or not.
-      const reopened = await storage.openWorkspace(workspace.workspace_id);
-      const migratedRow = await reopened.database.get<{ content_digest: string; edge_payload: Uint8Array }>("SELECT content_digest, edge_payload FROM graph_edges WHERE workspace_id = ? AND edge_id = ?", [workspace.workspace_id, "migration-edge"]);
-      expect(migratedRow?.content_digest).toBe(digestBytes(new Uint8Array(migratedRow!.edge_payload)));
-
-      const stored = await projectionSetDigestEntries(reopened.database, workspace.workspace_id, 1, { digest_source: "stored" });
-      const recompute = await projectionSetDigestEntries(reopened.database, workspace.workspace_id, 1, { digest_source: "recompute" });
+      const columns = await opened.database.all<{ name: string; type: string }>("PRAGMA table_info(graph_edges)");
+      expect(columns.some((column) => column.name.endsWith("_payload"))).toBe(false);
+      expect(columns.find((column) => column.name === "content_digest")?.type).toBe("TEXT");
+      const stored = await projectionSetDigestEntries(opened.database, workspace.workspace_id, 1, { digest_source: "stored" });
+      const recompute = await projectionSetDigestEntries(opened.database, workspace.workspace_id, 1, { digest_source: "recompute" });
       expect(stored).toEqual(recompute);
-
-      // Reopening again must find nothing left to backfill (idempotent) and
-      // must not fail re-creating the already-present index.
-      await reopened.close();
-      const reopenedAgain = await storage.openWorkspace(workspace.workspace_id);
-      await reopenedAgain.close();
+      await opened.close();
     });
   });
 });

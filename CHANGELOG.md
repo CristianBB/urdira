@@ -3,6 +3,58 @@
 All notable user-visible changes are documented here. Urdira follows the
 repository's [semantic versioning policy](docs/versioning.md).
 
+## Unreleased — Urdira v3 optimized pipeline
+
+- binding-oriented v3 pipelines now validate a closed dependency DAG, execute
+  independent branches concurrently, preserve scalar cardinality, and expose
+  all registered set/filter/join/deduplicate/select operators through one
+  deterministic MCP call;
+- logical digests use incremental `urdira.logical-digest.v3` writers; the
+  canonical record-set digest streams ordered record id/digest pairs with O(1)
+  auxiliary writer memory, while staging and SQLite writes use bounded batches
+  and a conservative 999-variable ceiling;
+- `urdira_context` and the v3 freshness barrier let agents request complete
+  task context and readiness in one call; the daemon rejects pre-v3 and
+  early-preview v3 data roots and requires a fresh root plus source reindexing;
+- relation joins reuse a bounded exact endpoint index per immutable snapshot,
+  and progressive TypeScript analysis retains persistent checker state instead
+  of forcing full-project reanalysis.
+
+## Historical v2 native pipeline
+
+- source ingestion now streams `Uint8Array` chunks into CAS and transfers
+  native arenas to worker threads without an aggregate workspace buffer;
+- record bodies are stored as relational SQLite child rows with incremental
+  logical SHA-256 digests and persistent sparse-Merkle set roots;
+- `FactDeltaBatch` is bounded to 4 MiB or 4096 rows, validates sequence order,
+  and is staged atomically with idempotent retry handling;
+- local process IPC carries length-prefixed Protobuf messages with explicit
+  byte and in-flight budgets; Protobuf is not persisted or hashed; and
+- aggregate record payload columns and their tests are removed. v1 indexes are
+  rejected and require the explicit `migrate --to-data-format 2 --reindex
+  --discard-v1-index` flow.
+
+## [0.2.2] - 2026-08-20
+
+Patch release fixing workspace registration feedback:
+
+- `workspace add` now prints detected technologies, evidence, confidence, and
+  compatible plugins before asking for confirmation; and
+- missing workspace paths fail clearly before any confirmation prompt.
+
+
+## [0.2.1] - 2026-08-20
+
+Patch release fixing daemon startup:
+
+- `urdira daemon start` no longer requires `--dry-run` or `--confirm`;
+- daemon startup runs detached, reports its startup phases, and persists logs;
+- invalid CLI lifecycle requests are rejected before expensive runtime startup;
+- the daemon remains alive after `start` until an explicit `stop`; and
+- the bootstrap rejects Node.js versions below `24.18.1` immediately; and
+- the bundled JavaScript/TypeScript plugin is published as 0.3.3 with the
+  Urdira 0.2.1 dependency pins.
+
 ## [0.1.0] - 2026-08-19
 
 Initial public release candidate:

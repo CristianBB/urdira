@@ -1,4 +1,4 @@
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { digestLogicalValue, LogicalDigestWriter, MerkleRadixSet } from "@urdira/canonical";
 import type {
   AffectedArtifactEntry,
   AffectedProjectionEntry,
@@ -176,7 +176,7 @@ function compareBytes(left: string, right: string): number {
 }
 
 function digest(value: unknown): string {
-  return digestBytes(canonicalBytes(value));
+  return digestLogicalValue(value);
 }
 
 function stableId(kind: string, value: unknown): string {
@@ -506,7 +506,28 @@ export class CandidatePlanner {
       };
     });
 
-    const dependencyIndexDigest = digest([...dependencies, ...input.projection_dependencies].sort((left, right) => compareBytes(JSON.stringify(left), JSON.stringify(right))));
+    // Compare canonical identity digests rather than JSON text. This keeps
+    // object insertion order out of the invalidation plan and avoids building
+    // a second string representation of every dependency for the hot digest
+    // path.
+    // Dependency identity is a set.  Feed digests directly into the radix
+    // tree so planning does not allocate, sort, and re-encode a second
+    // aggregate array for the digest hot path.
+    const dependencyEntries = function* (): Iterable<{ readonly member_digest: string; readonly logical_digest: string }> {
+      for (const entry of dependencies) {
+        const digest = digestLogicalValue(entry, "urdira:dependency-index-entry:v3");
+        yield { member_digest: digest, logical_digest: digest };
+      }
+      for (const entry of input.projection_dependencies) {
+        const digest = digestLogicalValue(entry, "urdira:dependency-index-entry:v3");
+        yield { member_digest: digest, logical_digest: digest };
+      }
+    };
+    const dependencyTree = MerkleRadixSet.from(dependencyEntries());
+    const dependencyWriter = new LogicalDigestWriter("urdira:dependency-index:v3");
+    dependencyWriter.field("root", true, () => dependencyWriter.text(0, dependencyTree.root()));
+    dependencyWriter.field("member_count", true, () => dependencyWriter.integer(dependencyTree.size()));
+    const dependencyIndexDigest = dependencyWriter.digest();
     const contractPayload = {
       workspace_id: input.candidate.workspace_id,
       candidate_generation_id: input.candidate.candidate_generation_id,
@@ -558,7 +579,19 @@ export class CandidatePlanner {
             capability: capabilityName,
             record_categories: [...new Set(records.map((entry) => entry.category))].sort(compareBytes),
             record_kinds: [...new Set(records.map((entry) => entry.kind))].sort(compareBytes),
-            base_record_set_digest: digest(records.map((entry) => [entry.record_id, entry.record_digest]).sort((left, right) => compareBytes(String(left[0]), String(right[0])))),
+            base_record_set_digest: (() => {
+              const tree = MerkleRadixSet.from((function* (): Iterable<{ readonly member_digest: string; readonly logical_digest: string }> {
+                for (const entry of records) {
+                  const member = digestLogicalValue(entry.record_id, "urdira:record-member:v3");
+                  const logical = /^sha256:[0-9a-f]{64}$/u.test(entry.record_digest) ? entry.record_digest : digestLogicalValue(entry.record_digest, "urdira:record-digest:v3");
+                  yield { member_digest: member, logical_digest: logical };
+                }
+              })());
+              const writer = new LogicalDigestWriter("urdira:record-set:v3");
+              writer.field("root", true, () => writer.text(0, tree.root()));
+              writer.field("member_count", true, () => writer.integer(tree.size()));
+              return writer.digest();
+            })(),
             output_completeness: "complete",
           };
         });

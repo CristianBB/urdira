@@ -1,4 +1,4 @@
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { digestBytes, digestLogicalValue, MerkleRadixSet } from "@urdira/canonical";
 import type {
   ArtifactTombstone,
   ArtifactVersion,
@@ -20,7 +20,7 @@ import type {
   SourceObservationRecord,
 } from "@urdira/storage";
 import { mapWithConcurrency } from "./concurrency.js";
-import type { ProviderObservation } from "./directory-provider.js";
+import type { DirectorySourceByteStream, EncodedObservationBatch, ProviderObservation } from "./directory-provider.js";
 import { EngineError } from "./errors.js";
 import { sourceObservationBatchDigest } from "./source-batch-digest.js";
 import type { SourceProviderOutcome } from "./source-provider.js";
@@ -32,6 +32,9 @@ import type { SourceProviderOutcome } from "./source-provider.js";
 // providers' typical fd/connection limits against full utilization for large
 // workspaces.
 const DEFAULT_READ_CONCURRENCY = 16;
+/** Source observations are committed as bounded, retryable fragments. */
+export const SOURCE_INDEX_BATCH_MAX_ROWS = 4096;
+export const SOURCE_INDEX_BATCH_MAX_BYTES = 4 * 1024 * 1024;
 
 const CLOSED_OUTCOMES = new Set<SourceProviderOutcome>(["success", "source_changed", "unavailable", "deadline_exceeded", "resource_exhausted", "cancelled", "failed"]);
 const AUTHORITATIVE_DELETE_EVENTS = new Set(["delete", "deleted"]);
@@ -49,6 +52,8 @@ type ArtifactTombstoneInput = Omit<ArtifactTombstone, "valid_to_generation" | "c
 export interface SourceIndexApplyInput {
   readonly response: SourceProviderResponseEnvelope;
   readonly read?: (observation: ProviderObservation) => Promise<SourceProviderResponseEnvelope>;
+  /** Native in-process source path; the stream is handed to CAS unchanged. */
+  readonly read_stream?: (observation: ProviderObservation) => Promise<DirectorySourceByteStream>;
   readonly supports_authoritative_delete_events?: boolean;
   /**
    * The caller may have already parsed `response.payload.observation_batch`
@@ -58,6 +63,8 @@ export interface SourceIndexApplyInput {
    * fields still runs unchanged.
    */
   readonly parsed_batch?: unknown;
+  /** Native provider stream; the response envelope carries only control metadata. */
+  readonly native_batches?: AsyncIterable<EncodedObservationBatch>;
   /**
    * Maximum number of `read` provider calls in flight at once (default 16).
    * Purely a concurrency bound: the observations actually read, and the
@@ -84,6 +91,8 @@ export interface SourceIndexApplyResult {
   readonly checkpoint_id?: string;
   readonly retryable?: boolean;
   readonly error_code?: string;
+  /** Internal signal used to complete a fragmented scan without a false no-op. */
+  readonly changed?: boolean;
 }
 
 export interface SourceIndexWorkspacePort {
@@ -92,6 +101,9 @@ export interface SourceIndexWorkspacePort {
     getState(): Promise<SourceIndexState | undefined>;
     currentOccurrences(sourceProviderBindingId: string): Promise<readonly CurrentSourceOccurrence[]>;
     currentAbsences(sourceProviderBindingId: string): Promise<readonly CurrentSourceAbsence[]>;
+    /** Typed-column reconciliation reads used by the native scan path. */
+    currentOccurrencesForIndex?(sourceProviderBindingId: string): Promise<readonly CurrentSourceOccurrence[]>;
+    currentAbsencesForIndex?(sourceProviderBindingId: string): Promise<readonly CurrentSourceAbsence[]>;
     commit(input: SourceIndexCommitInput): Promise<void>;
   };
   readonly publishCandidate?: (input: SourceIndexPublicationInput) => Promise<void>;
@@ -99,7 +111,8 @@ export interface SourceIndexWorkspacePort {
 
 interface ValidatedRead {
   readonly observation: ProviderObservation;
-  readonly bytes: Uint8Array;
+  readonly bytes?: Uint8Array;
+  readonly stream?: DirectorySourceByteStream;
   readonly text?: string;
 }
 
@@ -115,11 +128,11 @@ interface ValidatedCoverageScope {
 
 const COVERAGE_SCOPE_TYPES = new Set<ValidatedCoverageScope["scope_type"]>(["artifact", "uri_prefix", "source_root", "virtual_collection"]);
 
-function objectValue(value: JsonValue | undefined, description: string): Record<string, JsonValue> {
+function objectValue(value: unknown, description: string): Record<string, unknown> {
   if (value === undefined || value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new EngineError("engine:source_index_result_invalid", `${description} must be an object.`);
   }
-  return value as Record<string, JsonValue>;
+  return value as Record<string, unknown>;
 }
 
 function requiredString(value: unknown, description: string): string {
@@ -138,19 +151,12 @@ function requiredCount(value: unknown, description: string): number {
 }
 
 function stableId(kind: string, value: unknown): string {
-  return `${kind}:${digestBytes(canonicalBytes(value)).slice("sha256:".length)}`;
+  return `${kind}:${digestLogicalValue(value).slice("sha256:".length)}`;
 }
 
-function decodeBase64(value: string): Uint8Array {
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
-    throw new EngineError("engine:source_index_read_invalid", "Provider content bytes are not canonical base64.");
-  }
-  // The caller (`readAll`, below) verifies `digestBytes(content) === value.content_hash`
-  // immediately after decoding; that content-hash check subsumes a base64
-  // round-trip re-encode-and-compare (which would otherwise allocate a second
-  // full copy of the decoded bytes on every read for a check the hash already
-  // makes redundant).
-  return new Uint8Array(Buffer.from(value, "base64"));
+function requiredBytes(value: unknown, description: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) throw new EngineError("engine:source_index_read_invalid", `${description} must be a Uint8Array.`);
+  return value;
 }
 
 function decodeText(value: Uint8Array): string | undefined {
@@ -171,20 +177,23 @@ function parseWatermarks(value: string | undefined): Record<string, string> {
 }
 
 function sourceStateDigest(state: PlannedState): string {
-  const present = [...state.present.entries()].map(([normalized_uri, occurrence]) => ({
-    normalized_uri,
-    artifact_id: occurrence.artifact.artifact_id,
-    artifact_version_id: occurrence.version.artifact_version_id,
-    content_hash: occurrence.version.content_hash,
-    analysis_metadata_digest: occurrence.version.analysis_metadata_digest,
-  })).sort((left, right) => left.normalized_uri.localeCompare(right.normalized_uri));
-  const absent = [...state.absent.entries()].map(([normalized_uri, occurrence]) => ({
-    normalized_uri,
-    artifact_id: occurrence.artifact.artifact_id,
-    artifact_tombstone_id: occurrence.tombstone.artifact_tombstone_id,
-    absence_kind: occurrence.tombstone.absence_kind,
-  })).sort((left, right) => left.normalized_uri.localeCompare(right.normalized_uri));
-  return digestBytes(canonicalBytes({ present, absent }));
+  // The source frontier can contain hundreds of thousands of URIs. Keep the
+  // state maps as the provider's authoritative lookup structures and compose
+  // two content-addressed roots instead of allocating/sorting a second full
+  // corpus solely for the publication digest.
+  const present = MerkleRadixSet.from((function* () {
+    for (const [normalized_uri, occurrence] of state.present) {
+      const value = { normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_version_id: occurrence.version.artifact_version_id, content_hash: occurrence.version.content_hash, analysis_metadata_digest: occurrence.version.analysis_metadata_digest };
+      yield { member_digest: digestLogicalValue(normalized_uri, "urdira:source-member:v3"), logical_digest: digestLogicalValue(value, "urdira:source-entry:v3") };
+    }
+  })());
+  const absent = MerkleRadixSet.from((function* () {
+    for (const [normalized_uri, occurrence] of state.absent) {
+      const value = { normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_tombstone_id: occurrence.tombstone.artifact_tombstone_id, absence_kind: occurrence.tombstone.absence_kind };
+      yield { member_digest: digestLogicalValue(normalized_uri, "urdira:source-member:v3"), logical_digest: digestLogicalValue(value, "urdira:source-entry:v3") };
+    }
+  })());
+  return digestLogicalValue({ present: { root: present.root(), member_count: present.size() }, absent: { root: absent.root(), member_count: absent.size() } }, "urdira:source-state:v3");
 }
 
 function normalizedPath(uri: string): string | undefined {
@@ -268,13 +277,17 @@ function scopeContainsUri(scope: ValidatedCoverageScope, uri: string): boolean {
 function parseBatch(response: SourceProviderResponseEnvelope, preParsed?: unknown): { readonly batch: SourceObservationBatchRecord; readonly observations: readonly ProviderObservation[]; readonly scopes: readonly ValidatedCoverageScope[]; readonly watermark: string; readonly stable: boolean } {
   if (response.call !== "enumerate" && response.call !== "reconcile") throw new EngineError("engine:source_index_result_invalid", "Batch indexing accepts only enumerate or reconcile responses.");
   const payload = objectValue(response.payload, "Provider batch payload");
-  const encoded = requiredString(payload["observation_batch"], "Encoded observation batch");
+  const encoded = payload["observation_batch"];
   let parsed: unknown;
   if (preParsed !== undefined) {
     parsed = preParsed;
-  } else {
+  } else if (payload["native_observation_batch"] !== undefined) {
+    parsed = payload["native_observation_batch"];
+  } else if (typeof encoded === "string") {
     try { parsed = JSON.parse(encoded); }
     catch { throw new EngineError("engine:source_index_result_invalid", "Encoded observation batch is not valid JSON."); }
+  } else {
+    throw new EngineError("engine:source_index_result_invalid", "Provider response is missing its observation batch.");
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new EngineError("engine:source_index_result_invalid", "Encoded observation batch must be an object.");
   const record = parsed as Record<string, unknown>;
@@ -341,6 +354,46 @@ function parseBatch(response: SourceProviderResponseEnvelope, preParsed?: unknow
   return { batch, observations, scopes, watermark: requiredString(payload["watermark"], "Provider watermark"), stable };
 }
 
+function fragmentBatch(
+  source: SourceObservationBatchRecord,
+  sourceObservations: readonly ProviderObservation[],
+  fragmentIndex: number,
+  complete: boolean,
+): SourceObservationBatchRecord {
+  const batchId = stableId("observation-fragment", {
+    source_batch_id: source.observation_batch_id,
+    fragment_index: fragmentIndex,
+    complete,
+  });
+  const observations = sourceObservations.map((observation) => ({ ...observation, observation_batch_id: batchId }));
+  const coverageCompleteness = complete ? "complete" : "partial";
+  const deletionAuthority = complete && source.deletion_authority === "authoritative" ? "authoritative" : "none";
+  const digestInput = {
+    workspace_id: source.workspace_id,
+    source_provider_binding_id: source.source_provider_binding_id,
+    source_provider: source.source_provider,
+    source_provider_version: source.source_provider_version,
+    ordering_domain: source.ordering_domain,
+    observation_mode: source.observation_mode,
+    coverage_scopes: source.coverage_scopes,
+    coverage_completeness: coverageCompleteness,
+    deletion_authority: deletionAuthority,
+    provider_cursor_before: source.provider_cursor_before ?? "",
+    provider_cursor_after: source.provider_cursor_after ?? "",
+    observation_count: observations.length,
+    unavailable_count: 0,
+  };
+  return {
+    ...source,
+    observation_batch_id: batchId,
+    coverage_completeness: coverageCompleteness,
+    deletion_authority: deletionAuthority,
+    observation_count: observations.length,
+    unavailable_count: 0,
+    batch_digest: sourceObservationBatchDigest(digestInput, observations),
+  };
+}
+
 function parseWatchEvents(response: SourceProviderResponseEnvelope): { readonly events: readonly SourceProviderWatchEvent[]; readonly watermark: string } {
   if (response.call !== "watch") throw new EngineError("engine:source_index_result_invalid", "Authoritative individual absence accepts only watch responses.");
   const payload = objectValue(response.payload, "Provider watch payload");
@@ -368,11 +421,113 @@ export class GenericSourceIndexer {
     const priorState = await this.workspace.sourceIndex.getState();
     if (outcome !== "success") return this.degraded(priorState, `core:source_provider_${outcome}`);
     if (input.response.call === "watch") return await this.applyWatch(input, priorState);
+    if (input.native_batches !== undefined) return await this.applyNativeBatches(input, priorState);
     const result = parseBatch(input.response, input.parsed_batch);
     if (!result.stable) return this.degraded(priorState, "core:source_provider_source_changed");
-    const reads = await this.readAll(result.observations, input.read, input.io_concurrency);
+    if (result.observations.length > SOURCE_INDEX_BATCH_MAX_ROWS) {
+      return await this.applyFragmented(result, input, priorState);
+    }
+    const reads = await this.readAll(result.observations, input.read, input.read_stream, input.io_concurrency);
     if (reads === undefined) return this.degraded(priorState, "core:source_provider_read_incomplete");
     return await this.applyBatch(result.batch, reads, result.scopes, result.watermark, priorState, input.publication_current_generation ?? 0);
+  }
+
+  private async applyNativeBatches(input: SourceIndexApplyInput, initialState: SourceIndexState | undefined): Promise<SourceIndexApplyResult> {
+    let state = initialState;
+    let changed = false;
+    let final: SourceIndexApplyResult | undefined;
+    const seenUris = new Set<string>();
+    for await (const encoded of input.native_batches!) {
+      const batch = encoded.batch as SourceObservationBatchRecord;
+      if (batch.workspace_id !== input.response.workspace_id || batch.source_provider_binding_id !== input.response.source_provider_binding_id
+        || batch.source_provider !== input.response.component_id || batch.source_provider_version !== input.response.component_version) {
+        throw new EngineError("engine:source_index_result_invalid", "Native observation batch does not agree with its response envelope.");
+      }
+      if (encoded.observations.length !== batch.observation_count || new Set(encoded.observations.map((observation) => observation.normalized_uri)).size !== encoded.observations.length) {
+        throw new EngineError("engine:source_index_result_invalid", "Native observation batch count or URI uniqueness is invalid.");
+      }
+      const observations = encoded.observations.map((observation) => parseObservation(observation, batch));
+      if (sourceObservationBatchDigest({
+        workspace_id: batch.workspace_id,
+        source_provider_binding_id: batch.source_provider_binding_id,
+        source_provider: batch.source_provider,
+        source_provider_version: batch.source_provider_version,
+        ordering_domain: batch.ordering_domain,
+        observation_mode: batch.observation_mode,
+        coverage_scopes: batch.coverage_scopes,
+        coverage_completeness: batch.coverage_completeness,
+        deletion_authority: batch.deletion_authority,
+        provider_cursor_before: batch.provider_cursor_before ?? "",
+        provider_cursor_after: batch.provider_cursor_after ?? "",
+        observation_count: batch.observation_count,
+        unavailable_count: batch.unavailable_count,
+      }, observations) !== batch.batch_digest) throw new EngineError("engine:source_index_result_invalid", "Native observation batch digest does not match its logical contents.");
+      const scopes = parseCoverageScopes(batch);
+      const reads = await this.readAll(observations, input.read, input.read_stream, input.io_concurrency);
+      if (reads === undefined) return this.degraded(state, "core:source_provider_read_incomplete");
+      const complete = batch.coverage_completeness === "complete";
+      if (complete) {
+        final = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0, seenUris, changed);
+        state = await this.workspace.sourceIndex.getState();
+        break;
+      }
+      const fragmentResult = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0);
+      changed ||= fragmentResult.changed === true;
+      state = await this.workspace.sourceIndex.getState();
+      for (const observation of observations) seenUris.add(observation.normalized_uri);
+    }
+    return final ?? this.degraded(state, "core:source_provider_read_incomplete");
+  }
+
+  /**
+   * Applies a complete provider capture through bounded source-index
+   * fragments. The provider still proves the complete capture before this
+   * method is entered, but no fragment retains all source streams or bytes
+   * until the final commit. Partial fragments deliberately keep the previous
+   * source generation; their rows are stamped for the one generation that the
+   * final completion commit will publish. This makes a crash resumable without
+   * exposing an intermediate complete snapshot or deleting unseen artifacts.
+   */
+  private async applyFragmented(
+    result: ReturnType<typeof parseBatch>,
+    input: SourceIndexApplyInput,
+    initialState: SourceIndexState | undefined,
+  ): Promise<SourceIndexApplyResult> {
+    const seenUris = new Set<string>();
+    let state = initialState;
+    let changed = false;
+    let offset = 0;
+    let fragmentIndex = 0;
+    while (offset < result.observations.length) {
+      const start = offset;
+      let estimatedBytes = 0;
+      while (offset < result.observations.length && (offset - start < SOURCE_INDEX_BATCH_MAX_ROWS || offset === start)) {
+        const observation = result.observations[offset]!;
+        const estimate = observation.normalized_uri.length + observation.artifact_id.length
+          + observation.observed_content_hash.length + observation.observed_metadata_digest.length
+          + observation.provider_version_token.length + 256;
+        if (offset > start && estimatedBytes + estimate > SOURCE_INDEX_BATCH_MAX_BYTES) break;
+        estimatedBytes += estimate;
+        offset += 1;
+      }
+      const observations = result.observations.slice(start, offset);
+      const batch = fragmentBatch(result.batch, observations, fragmentIndex, false);
+      const reads = await this.readAll(observations, input.read, input.read_stream, input.io_concurrency);
+      if (reads === undefined) return this.degraded(state, "core:source_provider_read_incomplete");
+      const fragmentResult = await this.applyBatch(batch, reads, result.scopes, result.watermark, state, input.publication_current_generation ?? 0);
+      changed ||= fragmentResult.changed === true;
+      state = await this.workspace.sourceIndex.getState();
+      fragmentIndex += 1;
+      for (const observation of observations) seenUris.add(observation.normalized_uri);
+    }
+
+    // A zero-observation complete fragment is the only operation allowed to
+    // authorize deletion. Its observed URI set is the union of all fragments,
+    // so a complete scan cannot accidentally tombstone a file from an earlier
+    // fragment.
+    const completionBatch = fragmentBatch(result.batch, [], fragmentIndex, true);
+    const completion = await this.applyBatch(completionBatch, [], result.scopes, result.watermark, state, input.publication_current_generation ?? 0, seenUris, changed);
+    return completion;
   }
 
   private degraded(state: SourceIndexState | undefined, errorCode: string): SourceIndexApplyResult {
@@ -388,14 +543,23 @@ export class GenericSourceIndexer {
   // taking the FIRST non-"value" entry, exactly reproducing what a strictly
   // sequential `for await` (which stops at that same first failing index and
   // never even attempts later ones) would have returned or thrown.
-  private async readAll(observations: readonly ProviderObservation[], read: SourceIndexApplyInput["read"], ioConcurrency = DEFAULT_READ_CONCURRENCY): Promise<readonly ValidatedRead[] | undefined> {
-    if (observations.length > 0 && read === undefined) return undefined;
+  private async readAll(observations: readonly ProviderObservation[], read: SourceIndexApplyInput["read"], readStream: SourceIndexApplyInput["read_stream"], ioConcurrency = DEFAULT_READ_CONCURRENCY): Promise<readonly ValidatedRead[] | undefined> {
+    if (observations.length > 0 && read === undefined && readStream === undefined) return undefined;
     type ReadOutcome =
       | { readonly kind: "value"; readonly read: ValidatedRead }
       | { readonly kind: "undefined" }
       | { readonly kind: "error"; readonly error: unknown };
     const outcomes = await mapWithConcurrency(observations, ioConcurrency, async (observation): Promise<ReadOutcome> => {
       try {
+        if (readStream !== undefined) {
+          const stream = await readStream(observation);
+          if (stream.artifact_id !== observation.artifact_id || stream.provider_version_token !== observation.provider_version_token
+            || stream.content_hash !== observation.observed_content_hash || stream.byte_length < 0
+            || stream.metadata_digest !== observation.observed_metadata_digest) {
+            throw new EngineError("engine:source_index_read_invalid", "Native source stream metadata does not match the stable observed occurrence.");
+          }
+          return { kind: "value", read: { observation, stream } };
+        }
         const response = await read!(observation);
         const outcome = validateEnvelope(response, this.workspace.workspaceId);
         if (outcome !== "success") return { kind: "undefined" };
@@ -407,17 +571,12 @@ export class GenericSourceIndexer {
         const value: SourceProviderReadResult = {
           artifact_id: requiredString(payload["artifact_id"], "Read artifact ID"),
           provider_version_token: requiredString(payload["provider_version_token"], "Read provider token"),
-          // `content_bytes` is the base64 encoding of the artifact's raw bytes,
-          // which is the empty string for a legitimately empty (0-byte) file --
-          // that is a valid observed occurrence, not a missing/invalid field, so
-          // this must accept an empty string (`requiredText`) rather than reject
-          // it (`requiredString`, which conflates "absent" with "empty").
-          content_bytes: requiredText(payload["content_bytes"], "Read content bytes"),
+          content: requiredBytes(payload["content"], "Read content"),
           content_hash: requiredString(payload["content_hash"], "Read content hash"),
           byte_length: requiredCount(payload["byte_length"], "Read byte length"),
           metadata_digest: requiredString(payload["metadata_digest"], "Read metadata digest"),
         };
-        const content = decodeBase64(value.content_bytes);
+        const content = value.content;
         if (value.artifact_id !== observation.artifact_id || value.provider_version_token !== observation.provider_version_token
           || value.content_hash !== observation.observed_content_hash || value.metadata_digest !== observation.observed_metadata_digest
           || value.byte_length !== content.byteLength || digestBytes(content) !== value.content_hash) {
@@ -438,9 +597,22 @@ export class GenericSourceIndexer {
     return results;
   }
 
-  private async applyBatch(batch: SourceObservationBatchRecord, reads: readonly ValidatedRead[], scopes: readonly ValidatedCoverageScope[], watermark: string, priorState: SourceIndexState | undefined, publicationCurrentGeneration: number): Promise<SourceIndexApplyResult> {
-    const current = await this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id);
-    const absent = await this.workspace.sourceIndex.currentAbsences(batch.source_provider_binding_id);
+  private async applyBatch(
+    batch: SourceObservationBatchRecord,
+    reads: readonly ValidatedRead[],
+    scopes: readonly ValidatedCoverageScope[],
+    watermark: string,
+    priorState: SourceIndexState | undefined,
+    publicationCurrentGeneration: number,
+    completeObservedUris?: ReadonlySet<string>,
+    stagedChanges = false,
+  ): Promise<SourceIndexApplyResult> {
+    const current = await (this.workspace.sourceIndex.currentOccurrencesForIndex
+      ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
+      : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id));
+    const absent = await (this.workspace.sourceIndex.currentAbsencesForIndex
+      ? this.workspace.sourceIndex.currentAbsencesForIndex(batch.source_provider_binding_id)
+      : this.workspace.sourceIndex.currentAbsences(batch.source_provider_binding_id));
     const planned: PlannedState = {
       present: new Map(current.map((value) => [value.artifact.normalized_uri, value])),
       absent: new Map(absent.map((value) => [value.artifact.normalized_uri, value])),
@@ -470,6 +642,7 @@ export class GenericSourceIndexer {
     const generation = Math.max(priorState?.current_generation ?? 0, publicationCurrentGeneration) + 1;
     const artifacts: SourceArtifact[] = [];
     const contents: SourceIndexCommitInput["contents"][number][] = [];
+    const contentStreams: NonNullable<SourceIndexCommitInput["content_streams"]>[number][] = [];
     const observations: SourceObservationRecord[] = [];
     const versionClosures: ArtifactVersionRecord[] = [];
     const versions: ArtifactVersionRecord[] = [];
@@ -493,21 +666,24 @@ export class GenericSourceIndexer {
       if (equivalent) continue;
       changed = true;
       if (existing) versionClosures.push({ ...existing.version, valid_to_generation: generation });
-      const contentBlobId = stableId("content", { content_hash: read.observation.observed_content_hash, byte_length: read.bytes.byteLength });
+      const byteLength = read.bytes?.byteLength ?? read.stream?.byte_length;
+      if (byteLength === undefined) throw new EngineError("engine:source_index_read_invalid", "Validated source read has no byte length.");
+      const contentBlobId = stableId("content", { content_hash: read.observation.observed_content_hash, byte_length: byteLength });
       const version: ArtifactVersionInput = {
         artifact_version_id: stableId("artifact-version", { artifact_id: artifact.artifact_id, observation_id: observation.source_observation_id, content_hash: read.observation.observed_content_hash }),
         workspace_id: batch.workspace_id,
         artifact_id: artifact.artifact_id,
         content_blob_id: contentBlobId,
         content_hash: read.observation.observed_content_hash,
-        byte_length: read.bytes.byteLength,
-        encoding: read.text === undefined ? "binary" : "utf-8",
-        ...(read.text === undefined ? {} : { language_hint: "text" }),
+        byte_length: byteLength,
+        encoding: read.text === undefined && read.stream?.media_type === "application/octet-stream" ? "binary" : "utf-8",
+        ...(read.text === undefined && read.stream?.media_type === "application/octet-stream" ? {} : { language_hint: "text" }),
         analysis_metadata_digest: read.observation.observed_metadata_digest,
         created_from_observation_id: observation.source_observation_id,
         valid_from_generation: generation,
       };
-      contents.push({ content_blob_id: contentBlobId, bytes: read.bytes, media_type: read.text === undefined ? "application/octet-stream" : "text/plain; charset=utf-8" });
+      if (read.bytes !== undefined) contents.push({ content_blob_id: contentBlobId, bytes: read.bytes, media_type: read.text === undefined ? "application/octet-stream" : "text/plain; charset=utf-8" });
+      else if (read.stream !== undefined) contentStreams.push({ content_blob_id: contentBlobId, stream: read.stream.chunks, content_hash: read.stream.content_hash, byte_length: read.stream.byte_length, media_type: read.stream.media_type });
       versions.push(version);
       if (priorAbsence) {
         const closingChange = stableId("artifact-change", { kind: priorAbsence.tombstone.absence_kind === "excluded" ? "reincluded" : "recreated", batch_id: batch.observation_batch_id, artifact_id: artifact.artifact_id });
@@ -518,7 +694,7 @@ export class GenericSourceIndexer {
     }
 
     if (mayDelete) {
-      const observedUris = new Set(reads.map((read) => read.observation.normalized_uri));
+      const observedUris = completeObservedUris ?? new Set(reads.map((read) => read.observation.normalized_uri));
       for (const [uri, occurrence] of [...planned.present]) {
         if (observedUris.has(uri) || !scopes.some((scope) => scopeContainsUri(scope, uri))) continue;
         changed = true;
@@ -530,7 +706,11 @@ export class GenericSourceIndexer {
       }
     }
 
-    const committedGeneration = changed ? generation : priorState?.current_generation ?? 0;
+    changed ||= stagedChanges;
+    // Fragment rows are stamped for the pending generation but the source
+    // state must not advertise that generation until the completion fragment
+    // has reconciled deletions and the complete capture has been confirmed.
+    const committedGeneration = complete && changed ? generation : priorState?.current_generation ?? 0;
     const status = complete ? (changed ? "published" : "equivalent") : "degraded";
     const state = this.nextState(priorState, batch.source_provider_binding_id, watermark, committedGeneration, batch.completed_at, planned, batch.observation_batch_id);
     const commitInput: SourceIndexCommitInput = {
@@ -540,6 +720,7 @@ export class GenericSourceIndexer {
       observations,
       artifacts,
       contents,
+      content_streams: contentStreams,
       version_closures: versionClosures,
       versions,
       tombstone_closures: tombstoneClosures,
@@ -548,8 +729,8 @@ export class GenericSourceIndexer {
     if (this.workspace.publishCandidate) await this.workspace.publishCandidate({ source_index: commitInput });
     else await this.workspace.sourceIndex.commit(commitInput);
     return status === "degraded"
-      ? { status, generation: committedGeneration, checkpoint_id: state.checkpoint_id, retryable: true, error_code: "core:source_provider_partial_coverage" }
-      : { status, generation: committedGeneration, checkpoint_id: state.checkpoint_id };
+      ? { status, generation: committedGeneration, checkpoint_id: state.checkpoint_id, retryable: true, error_code: "core:source_provider_partial_coverage", changed }
+      : { status, generation: committedGeneration, checkpoint_id: state.checkpoint_id, changed };
   }
 
   private async applyWatch(input: SourceIndexApplyInput, priorState: SourceIndexState | undefined): Promise<SourceIndexApplyResult> {

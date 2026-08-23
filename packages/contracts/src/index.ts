@@ -1,5 +1,7 @@
 export { toPublicName, toCanonicalName, generateJsonSchema, validateSchemaDefinition, validateSchemaValue, validateSchemaReferenceGraph, validateQueryExpressionModelValue, validateOperationArgumentsModelValue, queryAlgebraOperatorIds } from "./schema-ir.js";
 export type { Presence, LifecycleState, SchemaFieldDefinition as SchemaIRFieldDefinition, SchemaVariantDefinition as SchemaIRVariantDefinition, CanonicalNamedTypeDefinition as CanonicalIRNamedTypeDefinition, CanonicalTypeExpression as CanonicalIRTypeExpression, CanonicalSchemaDefinition as CanonicalIRSchemaDefinition, JsonSchema, SchemaValidationContext } from "./schema-ir.js";
+export { generateAllRelationalSql, generateRelationalSql, generatedRelationalTableSpecs, relationalTableSpec, type GeneratedRelationalChildTableSpec, type GeneratedRelationalColumn, type GeneratedRelationalSql, type GeneratedRelationalTableSpec, type RelationalColumnType } from "./relational-schema.js";
+export * from "./fact-delta-batch.js";
 export * from "./model-names.js";
 export * from "./models.js";
 export * from "./generated-model-contracts.js";

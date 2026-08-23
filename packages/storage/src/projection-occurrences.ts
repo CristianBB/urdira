@@ -1,6 +1,7 @@
-import { canonicalBytes, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
+import { digestLogicalValue } from "@urdira/canonical";
 import { StorageError } from "./errors.js";
 import type { SqliteDatabase, SqliteValue } from "./sqlite.js";
+import { flattenRelationalValue, hydrateRelationalValue, relationalValueCommandsForTable, type RelationalValueRow } from "./relational-values.js";
 
 export interface WorkspaceProjectionOccurrence {
   readonly projection_record_id: string;
@@ -28,15 +29,7 @@ export interface ProjectionOccurrenceDependency {
   readonly source_id: string;
 }
 
-function bytes(value: unknown): Uint8Array {
-  if (value instanceof Uint8Array) return new Uint8Array(value);
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  throw new StorageError("storage:invalid_blob", "SQLite returned a non-binary payload.");
-}
-
-function sameBytes(left: Uint8Array, right: Uint8Array): boolean { return left.byteLength === right.byteLength && left.every((value, index) => value === right[index]); }
 function nullable(value: number | undefined): SqliteValue { return value ?? null; }
-function canonicalSha256(value: unknown): string { return digestBytes(canonicalBytes(value)); }
 
 // See `repositories.ts`'s identical constant/comment (`OWNER_ID_CHUNK_SIZE`):
 // duplicated here rather than imported because there is no existing shared
@@ -117,20 +110,22 @@ export class WorkspaceProjectionOccurrenceRepository {
 
   async put(value: WorkspaceProjectionOccurrence): Promise<"inserted" | "already_present"> {
     if (value.workspace_id !== this.workspaceId) throw new StorageError("storage:workspace_mismatch", "Projection occurrence workspace does not match the workspace database.");
-    const { content_digest: suppliedDigest, ...digestInput } = value;
-    const contentDigest = suppliedDigest ?? canonicalSha256(digestInput);
-    const payload = encodeCanonical(value.payload);
-    const existing = await this.database.get<{ content_digest: string; projection_payload: unknown }>("SELECT content_digest, projection_payload FROM projection_occurrences WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", [this.workspaceId, value.projection_record_id, value.valid_from_generation]);
+    const { content_digest: suppliedDigest, payload, ...digestInput } = value;
+    const contentDigest = suppliedDigest ?? digestLogicalValue({ ...digestInput, payload }, "urdira:projection-occurrence:v2");
+    const existing = await this.database.get<{ content_digest: string }>("SELECT content_digest FROM projection_occurrences WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", [this.workspaceId, value.projection_record_id, value.valid_from_generation]);
     if (existing) {
-      if (existing.content_digest !== contentDigest || !sameBytes(bytes(existing.projection_payload), payload)) throw new StorageError("storage:candidate_digest_conflict", `Projection occurrence ${value.projection_record_id} was written with a different digest.`);
+      if (existing.content_digest !== contentDigest) throw new StorageError("storage:candidate_digest_conflict", `Projection occurrence ${value.projection_record_id} was written with a different digest.`);
       return "already_present";
     }
-    await this.database.run("INSERT INTO projection_occurrences (projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, valid_to_generation, content_digest, projection_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [value.projection_record_id, this.workspaceId, value.projection_kind, value.projection_key, value.owner_artifact_id, value.owner_artifact_version_id, JSON.stringify(value.source_artifact_version_ids), JSON.stringify(value.source_record_ids), JSON.stringify(value.source_projection_record_ids), value.generator, value.generator_version, value.generator_configuration_digest, value.valid_from_generation, nullable(value.valid_to_generation), contentDigest, payload]);
+    await this.database.transaction([
+      { kind: "run", sql: "INSERT INTO projection_occurrences (projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, valid_to_generation, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [value.projection_record_id, this.workspaceId, value.projection_kind, value.projection_key, value.owner_artifact_id, value.owner_artifact_version_id, JSON.stringify(value.source_artifact_version_ids), JSON.stringify(value.source_record_ids), JSON.stringify(value.source_projection_record_ids), value.generator, value.generator_version, value.generator_configuration_digest, value.valid_from_generation, nullable(value.valid_to_generation), contentDigest] },
+      ...relationalValueCommandsForTable(flattenRelationalValue(this.workspaceId, value.projection_record_id, value.valid_from_generation, value.payload), "projection_value_nodes"),
+    ]);
     return "inserted";
   }
 
   async get(projectionRecordId: string, validFromGeneration?: number): Promise<WorkspaceProjectionOccurrence | undefined> {
-    const row = await this.database.get<Record<string, unknown> & { projection_payload: unknown }>(validFromGeneration === undefined
+    const row = await this.database.get<Record<string, unknown>>(validFromGeneration === undefined
       ? "SELECT * FROM projection_occurrences WHERE workspace_id = ? AND projection_record_id = ? ORDER BY valid_from_generation DESC LIMIT 1"
       : "SELECT * FROM projection_occurrences WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", validFromGeneration === undefined ? [this.workspaceId, projectionRecordId] : [this.workspaceId, projectionRecordId, validFromGeneration]);
     if (!row) return undefined;
@@ -138,21 +133,15 @@ export class WorkspaceProjectionOccurrenceRepository {
   }
 
   async listByOwner(ownerArtifactId: string, ownerArtifactVersionId?: string): Promise<readonly WorkspaceProjectionOccurrence[]> {
-    const rows = await this.database.all<Record<string, unknown> & { projection_payload: unknown }>(ownerArtifactVersionId === undefined
+    const rows = await this.database.all<Record<string, unknown>>(ownerArtifactVersionId === undefined
       ? "SELECT * FROM projection_occurrences WHERE workspace_id = ? AND owner_artifact_id = ? ORDER BY valid_from_generation, projection_record_id"
       : "SELECT * FROM projection_occurrences WHERE workspace_id = ? AND owner_artifact_id = ? AND owner_artifact_version_id = ? ORDER BY valid_from_generation, projection_record_id", ownerArtifactVersionId === undefined ? [this.workspaceId, ownerArtifactId] : [this.workspaceId, ownerArtifactId, ownerArtifactVersionId]);
-    return rows.map((row) => this.decode(row));
+    return Promise.all(rows.map((row) => this.decode(row)));
   }
 
   async putDependency(value: ProjectionOccurrenceDependency): Promise<"inserted" | "already_present"> {
-    const payload = encodeCanonical(value);
-    const existing = await this.database.get<{ dependency_payload: unknown }>("SELECT dependency_payload FROM projection_occurrence_dependencies WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ? AND source_type = ? AND source_id = ?", [this.workspaceId, value.projection_record_id, value.valid_from_generation, value.source_type, value.source_id]);
-    if (existing) {
-      if (!sameBytes(bytes(existing.dependency_payload), payload)) throw new StorageError("storage:candidate_digest_conflict", `Projection dependency ${value.projection_record_id}/${value.source_id} conflicts.`);
-      return "already_present";
-    }
-    await this.database.run("INSERT INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id, dependency_payload) VALUES (?, ?, ?, ?, ?, ?)", [this.workspaceId, value.projection_record_id, value.valid_from_generation, value.source_type, value.source_id, payload]);
-    return "inserted";
+    const result = await this.database.run("INSERT OR IGNORE INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id) VALUES (?, ?, ?, ?, ?)", [this.workspaceId, value.projection_record_id, value.valid_from_generation, value.source_type, value.source_id]);
+    return result.changes === 0 ? "already_present" : "inserted";
   }
 
   /**
@@ -166,22 +155,22 @@ export class WorkspaceProjectionOccurrenceRepository {
    * closed and reopened on every scan.
    */
   async currentlyVisible(generation: number): Promise<readonly WorkspaceProjectionOccurrence[]> {
-    const rows = await this.database.all<Record<string, unknown> & { projection_payload: unknown }>(
+    const rows = await this.database.all<Record<string, unknown>>(
       "SELECT * FROM projection_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?) ORDER BY projection_record_id",
       [this.workspaceId, generation, generation],
     );
-    return rows.map((row) => this.decode(row));
+    return Promise.all(rows.map((row) => this.decode(row)));
   }
 
   /**
    * `currentlyVisible`, but (a) narrowed to the given owner artifact ids
    * (`projection_occurrences_owner_idx`, `schema.ts`, chunked at
    * `OWNER_ID_CHUNK_SIZE` -- same rationale as `CanonicalOccurrenceRepository.currentlyVisibleForOwners`,
-   * `repositories.ts`) and (b) never decodes `projection_payload`: every
+   * `repositories.ts`) and (b) never hydrates the relational value body: every
    * seal-time consumer of `CandidateMaterializationInput.base_projections`
    * (`candidate-materialization.ts`'s `projectionTemplates`) reads only
    * `content_digest` plus the identity/source-binding columns, never the
-   * payload itself, so skipping that CBOR decode (and not even selecting the
+   * payload itself, so skipping that generic payload decode (and not even selecting the
    * column) is free. Chunk results are merged and re-sorted by
    * `projection_record_id` for the same reason `currentlyVisibleForOwners`
    * re-sorts: each chunk is independently ordered, their concatenation is
@@ -214,7 +203,8 @@ export class WorkspaceProjectionOccurrenceRepository {
     return rows.map((row) => ({ projection_record_id: String(row["projection_record_id"]), valid_from_generation: Number(row["valid_from_generation"]), source_type: String(row["source_type"]) as ProjectionOccurrenceDependency["source_type"], source_id: String(row["source_id"]) }));
   }
 
-  private decode(row: Record<string, unknown> & { projection_payload: unknown }): WorkspaceProjectionOccurrence {
+  private async decode(row: Record<string, unknown>): Promise<WorkspaceProjectionOccurrence> {
+    const valueRows = await this.database.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM projection_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [this.workspaceId, String(row["projection_record_id"]), Number(row["valid_from_generation"])]);
     return {
       projection_record_id: String(row["projection_record_id"]),
       projection_kind: String(row["projection_kind"]),
@@ -231,7 +221,7 @@ export class WorkspaceProjectionOccurrenceRepository {
       valid_from_generation: Number(row["valid_from_generation"]),
       ...(row["valid_to_generation"] === null ? {} : { valid_to_generation: Number(row["valid_to_generation"]) }),
       content_digest: String(row["content_digest"]),
-      payload: decodeCanonical(bytes(row["projection_payload"])),
+      payload: hydrateRelationalValue(valueRows),
     };
   }
 }

@@ -1,14 +1,8 @@
-import { decodeCanonical } from "@urdira/canonical";
 import type { WorkspaceDatabase } from "@urdira/storage";
 
-function toBytes(value: unknown): Uint8Array | undefined {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  return undefined;
-}
 
 /**
- * Reads back a `control_plane_state` row's decoded payload, if one already
+ * Reads back a `control_plane_state` row's typed JSON state, if one already
  * exists for `stateKey` -- used by a plugin provider's own resolution
  * (`apps/urdira/src/index.ts`'s `prepareJavascriptTypescriptRegistry`) to
  * make a workspace's `plugin_resolution_lock`/`workspace_configuration_revision`
@@ -38,18 +32,13 @@ function toBytes(value: unknown): Uint8Array | undefined {
  * these same rows too, so it surfaces there just as easily.
  */
 export async function readPersistedControlState<T>(database: WorkspaceDatabase, workspaceId: string, stateKey: string): Promise<T | undefined> {
-  const row = await database.database.get<{ readonly payload: unknown }>("SELECT payload FROM control_plane_state WHERE workspace_id = ? AND state_key = ?", [workspaceId, stateKey]);
+  const row = await database.database.get<{ readonly state_json: string }>("SELECT state_json FROM control_plane_state WHERE workspace_id = ? AND state_key = ?", [workspaceId, stateKey]);
   if (!row) return undefined;
-  const bytes = toBytes(row.payload);
-  if (bytes === undefined) return undefined;
-  try { return decodeCanonical(bytes) as T; } catch { return undefined; }
+  try { return JSON.parse(row.state_json) as T; } catch { return undefined; }
 }
 
 /** Same idea as {@link readPersistedControlState}, for `registry_snapshots` -- keyed by `registry_snapshot_id`, not `state_key`. */
 export async function readPersistedRegistrySnapshot<T>(database: WorkspaceDatabase, workspaceId: string, registrySnapshotId: string): Promise<T | undefined> {
-  const row = await database.database.get<{ readonly registry_payload: unknown }>("SELECT registry_payload FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [workspaceId, registrySnapshotId]);
-  if (!row) return undefined;
-  const bytes = toBytes(row.registry_payload);
-  if (bytes === undefined) return undefined;
-  try { return decodeCanonical(bytes) as T; } catch { return undefined; }
+  const row = await database.repositories.registries.getSnapshot(registrySnapshotId);
+  return row as T | undefined;
 }

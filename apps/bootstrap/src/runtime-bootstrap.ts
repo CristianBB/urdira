@@ -4,10 +4,11 @@ import { access, lstat, mkdir, open, readFile, rename, rm, stat, writeFile, type
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 
-export const BOOTSTRAP_VERSION = "0.2.0";
+export const BOOTSTRAP_VERSION = "0.2.2";
 export const RUNTIME_PACKAGE_NAME = "@urdira/runtime";
-export const RUNTIME_VERSION = "0.2.0";
+export const RUNTIME_VERSION = "0.2.2";
 export const RUNTIME_REGISTRY = "https://registry.npmjs.org/";
+export const MINIMUM_NODE_VERSION = "24.18.1";
 export const MINIMUM_NPM_VERSION = "11.16.0";
 export const RUNTIME_INSTALL_SCRIPT_APPROVALS = Object.freeze({
   "onnxruntime-node@1.24.3": true,
@@ -32,6 +33,7 @@ export interface RuntimePreparationPlan {
   readonly bootstrap_version: string;
   readonly package_name: string;
   readonly package_version: string;
+  readonly minimum_node_version: string;
   readonly minimum_npm_version: string;
   readonly registry: string;
   readonly target_root: string;
@@ -98,6 +100,7 @@ export function createRuntimePreparationPlan(dataRoot = defaultDataRoot()): Runt
     bootstrap_version: BOOTSTRAP_VERSION,
     package_name: RUNTIME_PACKAGE_NAME,
     package_version: RUNTIME_VERSION,
+    minimum_node_version: MINIMUM_NODE_VERSION,
     minimum_npm_version: MINIMUM_NPM_VERSION,
     registry: RUNTIME_REGISTRY,
     target_root: paths.active_root,
@@ -298,6 +301,8 @@ export interface BootstrapResult {
 
 export interface RunBootstrapOptions {
   readonly data_root?: string;
+  /** Test seam; production always uses process.versions.node. */
+  readonly node_version?: string;
   readonly interactive?: boolean;
   readonly prompt?: (message: string) => Promise<boolean>;
   readonly resolve_entrypoint?: (dataRoot?: string) => Promise<string | undefined>;
@@ -311,6 +316,7 @@ export function formatRuntimePreparationPlan(plan: RuntimePreparationPlan): stri
     `Target: ${plan.target_root}`,
     `Registry: ${plan.registry}`,
     `Package: ${plan.package_name}@${plan.package_version}`,
+    `Required Node: >=${plan.minimum_node_version}`,
     `Required npm: >=${plan.minimum_npm_version}`,
     "Reviewed installation scripts:",
     ...plan.install_scripts.map((script) => `  - ${script}`),
@@ -343,6 +349,12 @@ export async function runBootstrap(argv: readonly string[], options: RunBootstra
   const prepare = options.prepare_runtime ?? prepareRuntime;
   const execute = options.execute_runtime ?? executeRuntimeProcess;
   const plan = createRuntimePreparationPlan(dataRoot);
+  const nodeVersion = options.node_version ?? process.versions.node;
+  const unsupportedNode = (): BootstrapResult => ({
+    exit_code: 2,
+    stdout: "",
+    stderr: `Urdira ${RUNTIME_VERSION} requires Node >=${MINIMUM_NODE_VERSION}; found ${nodeVersion || "unknown"}. Switch Node versions before preparing or running the Urdira runtime.\n`,
+  });
 
   if (argv[0] === "runtime") {
     if (argv.length === 2 && argv[1] === "status") {
@@ -356,11 +368,14 @@ export async function runBootstrap(argv: readonly string[], options: RunBootstra
         return { exit_code: 2, stdout: "", stderr: "Usage: urdira runtime prepare --dry-run | --confirm\n" };
       }
       if (argv[2] === "--dry-run") return { exit_code: 0, stdout: `${formatRuntimePreparationPlan(plan)}\n`, stderr: "" };
+      if (!minimumVersionSatisfied(nodeVersion, MINIMUM_NODE_VERSION)) return unsupportedNode();
       const prepared = await prepare({ data_root: dataRoot, confirm: true });
       return { exit_code: 0, stdout: `Urdira runtime ${RUNTIME_VERSION} ${prepared.status === "already_prepared" ? "was already prepared" : "is prepared"}.\n`, stderr: "" };
     }
     return { exit_code: 2, stdout: "", stderr: "Usage: urdira runtime status | runtime prepare --dry-run | --confirm\n" };
   }
+
+  if (!minimumVersionSatisfied(nodeVersion, MINIMUM_NODE_VERSION)) return unsupportedNode();
 
   let entrypoint = await resolveEntrypoint(dataRoot);
   if (entrypoint === undefined) {

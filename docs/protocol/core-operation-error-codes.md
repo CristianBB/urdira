@@ -23,7 +23,7 @@ The following table is normative. `Details fields` is the complete closed detail
 | `core:unknown_field` | A closed request object contains at least one undeclared field. | no | `remove_unknown_fields` | `object_pointer`, `field_names[]` |
 | `core:option_conflict` | Individually valid options violate a documented presence or interaction rule. | no | `correct_request` | `option_pointers[]`, `rule_code` |
 | `core:budget_invalid` | An item, character, depth, work, or wait budget is zero, negative, above the advertised maximum, or illegal for the selected operation. | no | `use_advertised_budget` | `budget_field`, `provided`, `minimum`, `maximum` |
-| `core:workspace_not_registered` | An explicit API v2 workspace root has no exact registered workspace after canonicalization. | no | `register_workspace` | `registration_command` |
+| `core:workspace_not_registered` | An explicit API v3 workspace root has no exact registered workspace after canonicalization. | no | `register_workspace` | `registration_command` |
 | `core:workspace_not_found` | An explicit workspace ID has no registered workspace. | no | `inspect_index_status`, `register_workspace` | `workspace_id` |
 | `core:duplicate_comparison_participant` | A comparison duplicates a role or exact workspace-snapshot coordinate, or repeats one workspace without distinct explicit snapshots. | no | `correct_scope` | `workspace_id`, `snapshot_ids[]`, `roles[]`, `participant_ordinals[]` |
 | `core:participant_role_invalid` | A required role is missing, duplicated, unknown, or illegal for the selected operation. | no | `correct_scope` | `operation`, `provided_roles[]`, `required_roles[]` |

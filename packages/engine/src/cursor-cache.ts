@@ -32,6 +32,8 @@ export interface QueryCursorClaims {
   readonly response_budget_ceiling_digest: string;
   readonly frozen_snapshot_digest: string;
   readonly frozen_status_digest: string;
+  /** Signed execution metadata preserved across continuation calls. */
+  readonly completeness?: { readonly overall_status: "complete" | "partial" | "unknown" | "unsupported" | "stale"; readonly dimensions: readonly unknown[] };
   readonly expires_at: string;
 }
 
@@ -59,6 +61,7 @@ export interface ReadPageRequest<T> {
   readonly expected_frozen_status_digest?: string;
   readonly expected_scope_digest?: string;
   readonly expected_ordering_digest?: string;
+  readonly completeness?: QueryCursorClaims["completeness"];
   readonly expires_at?: string;
   readonly now?: string;
   readonly limit: number;
@@ -109,8 +112,10 @@ export class CursorCache {
   }
 
   encode(claims: QueryCursorClaims): string {
-    const payload = Buffer.from(stableJson(claims), "utf8").toString("base64url");
-    const signature = createHmac("sha256", this.secret).update(payload).digest("base64url");
+    // Cursor tokens are local opaque handles. Hexadecimal framing keeps them
+    // self-contained without adding an encoded-byte representation to the runtime.
+    const payload = Buffer.from(stableJson(claims), "utf8").toString("hex");
+    const signature = createHmac("sha256", this.secret).update(payload).digest("hex");
     return `${payload}.${signature}`;
   }
 
@@ -118,11 +123,11 @@ export class CursorCache {
     if (typeof token !== "string") throw new CursorCacheError("core:cursor_invalid", "Cursor must be a string.");
     const parts = token.split(".");
     if (parts.length !== 2 || parts[0]!.length === 0 || parts[1]!.length === 0) throw new CursorCacheError("core:cursor_invalid", "Cursor encoding is invalid.");
-    const expected = Buffer.from(createHmac("sha256", this.secret).update(parts[0]!).digest("base64url"));
-    const provided = Buffer.from(parts[1]!);
+    const expected = Buffer.from(createHmac("sha256", this.secret).update(parts[0]!).digest("hex"), "utf8");
+    const provided = Buffer.from(parts[1]!, "utf8");
     if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) throw new CursorCacheError("core:cursor_invalid", "Cursor authentication failed.");
     let value: unknown;
-    try { value = JSON.parse(Buffer.from(parts[0]!, "base64url").toString("utf8")); } catch { throw new CursorCacheError("core:cursor_invalid", "Cursor payload is not valid JSON."); }
+    try { value = JSON.parse(Buffer.from(parts[0]!, "hex").toString("utf8")); } catch { throw new CursorCacheError("core:cursor_invalid", "Cursor payload is not valid JSON."); }
     if (!isRecord(value) || value["cursor_kind"] !== "query" || typeof value["execution_id"] !== "string" || typeof value["scope_digest"] !== "string" || typeof value["result_stream"] !== "string" || typeof value["stable_position"] !== "string" || !["forward", "backward"].includes(String(value["direction"])) || typeof value["projection_digest"] !== "string" || typeof value["ordering_digest"] !== "string" || typeof value["response_budget_ceiling_digest"] !== "string" || typeof value["frozen_snapshot_digest"] !== "string" || typeof value["frozen_status_digest"] !== "string" || typeof value["expires_at"] !== "string") throw new CursorCacheError("core:cursor_invalid", "Cursor claims are incomplete.");
     return value as unknown as QueryCursorClaims;
   }
@@ -145,7 +150,7 @@ export class CursorCache {
     } else {
       if (typeof request.execution_id !== "string" || typeof request.result_stream !== "string" || !request.direction || typeof request.projection_digest !== "string" || typeof request.response_budget_ceiling_digest !== "string" || typeof request.frozen_snapshot_digest !== "string" || typeof request.frozen_status_digest !== "string") throw new CursorCacheError("core:cursor_invalid", "Initial cursor claims are incomplete.");
       const expiresAt = request.expires_at ?? new Date(Date.parse(now) + this.defaultTtlMs).toISOString();
-      claims = { cursor_kind: "query", execution_id: request.execution_id, scope_digest: request.scope_digest ?? request.frozen_snapshot_digest, result_stream: request.result_stream, stable_position: "", direction: request.direction, projection_digest: request.projection_digest, ordering_digest: request.ordering_digest ?? request.projection_digest, response_budget_ceiling_digest: request.response_budget_ceiling_digest, frozen_snapshot_digest: request.frozen_snapshot_digest, frozen_status_digest: request.frozen_status_digest, expires_at: expiresAt };
+      claims = { cursor_kind: "query", execution_id: request.execution_id, scope_digest: request.scope_digest ?? request.frozen_snapshot_digest, result_stream: request.result_stream, stable_position: "", direction: request.direction, projection_digest: request.projection_digest, ordering_digest: request.ordering_digest ?? request.projection_digest, response_budget_ceiling_digest: request.response_budget_ceiling_digest, frozen_snapshot_digest: request.frozen_snapshot_digest, frozen_status_digest: request.frozen_status_digest, ...(request.completeness === undefined ? {} : { completeness: request.completeness }), expires_at: expiresAt };
     }
     const readRequest: ManifestStreamReadRequest = { execution_id: claims.execution_id, result_stream: claims.result_stream, direction: claims.direction, limit: request.limit + 1 };
     if (claims.stable_position.length > 0) (readRequest as { position?: string }).position = claims.stable_position;

@@ -1,5 +1,6 @@
 import { operationRegistry, type OperationDefinition, type QueryScope } from "@urdira/contracts";
 import { EngineError } from "./errors.js";
+import type { StageSetHandle } from "./stage-set-handle.js";
 
 export interface QueryStreamItem {
   readonly value: unknown;
@@ -11,9 +12,17 @@ export interface QueryStreamItem {
 
 export interface OperationEvaluation {
   readonly streams: Readonly<Record<string, ReadonlyArray<QueryStreamItem | unknown>>>;
+  /** Internal lazy streams. These never cross the MCP boundary; the pipeline
+   * executor seals them into its execution-local spool before another stage
+   * can consume them. `streams` remains populated for legacy ports and final
+   * response adapters. */
+  readonly stream_sources?: Readonly<Record<string, AsyncIterable<QueryStreamItem>>>;
+  /** Reverse iterators for final manifests. Internal only; never crosses MCP. */
+  readonly reverse_stream_sources?: Readonly<Record<string, AsyncIterable<QueryStreamItem>>>;
   readonly completeness?: unknown;
   readonly diagnostics?: ReadonlyArray<unknown>;
   readonly semantic_state?: "ready" | "updating" | "partial" | "failed" | "unsupported";
+  readonly stage_handles?: ReadonlyMap<string, unknown>;
 }
 
 export interface OperationInvocation {
@@ -23,10 +32,25 @@ export interface OperationInvocation {
   readonly arguments: unknown;
   readonly scope: QueryScope;
   readonly snapshot_bindings?: readonly unknown[];
+  /** Execution-local relational inputs. Providers may stream these handles
+   * directly instead of receiving expanded selector arrays. */
+  readonly input_handles?: ReadonlyMap<string, unknown>;
 }
 
 export interface QueryDataPort {
+  /** When true, the adapter understands stage_output tokens paired with
+   * `input_handles` and can resolve them without executor-side arrays. */
+  readonly consumes_stage_handles?: boolean;
   readonly execute: (operation: OperationInvocation) => Promise<OperationEvaluation>;
+  /** Optional indexed relation predicate used by the v3 join operator. */
+  readonly relation_exists?: (scope: QueryScope, left: QueryStreamItem, right: QueryStreamItem, relationSelector: unknown, direction: "inbound" | "outbound" | "both") => Promise<boolean>;
+  /** Batch relation join over a complete left/right frontier. */
+  readonly relation_pairs?: (scope: QueryScope, left: readonly QueryStreamItem[], right: readonly QueryStreamItem[], relationSelector: unknown, direction: "inbound" | "outbound" | "both") => Promise<ReadonlySet<string>>;
+  /** Handle-native batch relation join. Implementations can consume the
+   * execution-local spool directly and avoid hydrating either frontier into
+   * JavaScript arrays. The array method remains as a compatibility fallback
+   * for older adapters. */
+  readonly relation_pairs_handles?: (scope: QueryScope, left: StageSetHandle, right: StageSetHandle, relationSelector: unknown, direction: "inbound" | "outbound" | "both") => Promise<ReadonlySet<string>>;
 }
 
 export interface EvaluateOperationInput {
@@ -35,13 +59,14 @@ export interface EvaluateOperationInput {
   readonly arguments: unknown;
   readonly scope: QueryScope;
   readonly snapshot_bindings?: readonly unknown[];
+  readonly input_handles?: ReadonlyMap<string, unknown>;
   readonly port: QueryDataPort;
 }
 
 export async function evaluateOperation(input: EvaluateOperationInput): Promise<OperationEvaluation> {
   const operation = operationRegistry.find((candidate) => candidate.operation_id === input.operation_id && (input.operation_version === undefined || candidate.operation_version === input.operation_version));
   if (!operation) throw new EngineError(input.operation_version === undefined ? "core:operation_unknown" : "core:api_version_unsupported", `Operation ${input.operation_id}@${input.operation_version ?? "?"} is not registered.`);
-  const evaluation = await input.port.execute({ operation_id: operation.operation_id, operation_version: operation.operation_version, result_streams: operation.result_streams, arguments: input.arguments, scope: input.scope, ...(input.snapshot_bindings === undefined ? {} : { snapshot_bindings: input.snapshot_bindings }) });
+  const evaluation = await input.port.execute({ operation_id: operation.operation_id, operation_version: operation.operation_version, result_streams: operation.result_streams, arguments: input.arguments, scope: input.scope, ...(input.snapshot_bindings === undefined ? {} : { snapshot_bindings: input.snapshot_bindings }), ...(input.input_handles === undefined ? {} : { input_handles: input.input_handles }) });
   const streams = Object.fromEntries(operation.result_streams.map((stream) => [stream, evaluation.streams[stream] ?? []]));
   return { ...evaluation, streams };
 }

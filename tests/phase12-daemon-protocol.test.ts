@@ -12,11 +12,14 @@ import {
   LocalIpcServer,
   normalizeLocalIpcEndpoint,
   daemonPaths,
-  encodeUceFrame,
+  encodeIpcFrame,
   LengthPrefixedDecoder,
-  decodeUceFrame,
-  type UceRequest,
-  type UceResponse,
+  decodeIpcFrame,
+  decodeProcessByteChunk,
+  encodeFactDeltaChunk,
+  encodeSourceBytesChunk,
+  type IpcRequest,
+  type IpcResponse,
 } from "../packages/daemon/src/index.js";
 import { StorageError } from "../packages/storage/src/index.js";
 import { EngineError } from "../packages/engine/src/index.js";
@@ -24,11 +27,18 @@ import { EngineError } from "../packages/engine/src/index.js";
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
-function request(overrides: Partial<UceRequest> = {}): UceRequest {
-  return { protocol_version: 1, request_id: "request-1", call: "core:status", deadline_at: "2026-08-10T17:00:00.000Z", cancellation_id: "cancel-1", payload: { workspace_ids: ["workspace-1"] }, ...overrides };
+function request(overrides: Partial<IpcRequest> = {}): IpcRequest {
+  return { protocol_version: 2, request_id: "request-1", call: "core:status", deadline_at: "2099-01-01T00:00:00.000Z", cancellation_id: "cancel-1", payload: { workspace_ids: ["workspace-1"] }, ...overrides };
 }
 
-describe("Phase 12 bounded UCE and daemon startup state", () => {
+describe("Phase 12 bounded IPC and daemon startup state", () => {
+  it("round-trips length-prefixed source and FactDelta chunks with explicit budgets", () => {
+    const base = { protocol_version: 2 as const, stream_id: "stream", sequence: 3, offset: 7n, payload: new Uint8Array([1, 2, 3]), final: false, cancellation_id: "cancel", max_bytes: 20n, max_in_flight: 2, max_in_flight_bytes: 8n };
+    expect(decodeProcessByteChunk(encodeSourceBytesChunk(base))).toMatchObject({ ...base, chunk_kind: "source_bytes" });
+    expect(decodeProcessByteChunk(encodeFactDeltaChunk({ ...base, final: true }))).toMatchObject({ ...base, final: true, chunk_kind: "fact_delta" });
+    expect(() => encodeSourceBytesChunk({ ...base, payload: new Uint8Array(256 * 1024 + 1) })).toThrow("core:ipc_chunk_invalid");
+    expect(() => encodeSourceBytesChunk({ ...base, max_in_flight_bytes: 2n })).toThrow("core:ipc_chunk_invalid");
+  });
   it("maps filesystem socket paths to deterministic Windows named pipes", () => {
     const endpoint = normalizeLocalIpcEndpoint("C:\\Users\\runner\\urdira.sock", "win32");
     expect(endpoint).toMatch(/^\\\\\.\\pipe\\urdira-[0-9a-f]{64}$/);
@@ -36,13 +46,13 @@ describe("Phase 12 bounded UCE and daemon startup state", () => {
   });
 
   it("round-trips a bounded length-prefixed request and rejects oversized frames", () => {
-    const encoded = encodeUceFrame(request(), 4_096);
+    const encoded = encodeIpcFrame(request(), 4_096);
     expect(encoded.readUInt32BE(0)).toBe(encoded.byteLength - 4);
-    expect(decodeUceFrame(encoded, 4_096)).toEqual(request());
+    expect(decodeIpcFrame(encoded, 4_096)).toEqual(request());
     const decoder = new LengthPrefixedDecoder(4_096);
     expect(decoder.push(encoded.subarray(0, 3))).toEqual([]);
     expect(decoder.push(encoded.subarray(3))).toEqual([request()]);
-    expect(() => encodeUceFrame(request({ payload: "x".repeat(5_000) }), 128)).toThrowError(DaemonError);
+    expect(() => encodeIpcFrame(request({ payload: "x".repeat(5_000) }), 128)).toThrowError(DaemonError);
   });
 
   it("creates owner-only paths and writes an atomic endpoint descriptor", async () => {
@@ -102,8 +112,8 @@ describe("Phase 12 bounded UCE and daemon startup state", () => {
     socket.on("data", (chunk) => responses.push(...decoder.push(chunk).filter((frame) => "outcome" in frame)));
     await new Promise<void>((resolve) => socket.once("connect", resolve));
     const duplicateRequest = request({ request_id: "duplicate", call: "core:echo", deadline_at: "2099-01-01T00:00:00.000Z" });
-    socket.write(encodeUceFrame(duplicateRequest));
-    socket.write(encodeUceFrame(duplicateRequest));
+    socket.write(encodeIpcFrame(duplicateRequest));
+    socket.write(encodeIpcFrame(duplicateRequest));
     await new Promise((resolve) => setTimeout(resolve, 20)); socket.end();
     expect(responses).toHaveLength(2);
     const duplicateError = responses.find((response) => (response as { error?: { code: string } }).error) as { error?: { code: string } } | undefined;
@@ -170,7 +180,7 @@ describe("Phase 12 bounded UCE and daemon startup state", () => {
     const endpoint = join(root, "oversized-response-client.sock");
     // A handler result too large to fit `max_frame_bytes` -- mirrors
     // `core:find_records` embedding a huge record body. Before this fix, the
-    // server's `LocalIpcServer.write` swallowed `encodeUceFrame`'s
+    // server's `LocalIpcServer.write` swallowed `encodeIpcFrame`'s
     // `core:ipc_frame_too_large` into a bare `socket.destroy()`, leaving the
     // client with no error frame to key off of: it only ever discovered the
     // failure by hitting its own `request_timeout_ms` deadline.
@@ -200,17 +210,17 @@ describe("Phase 12 bounded UCE and daemon startup state", () => {
     await server.listen();
     const socket = connect(normalizeLocalIpcEndpoint(endpoint));
     const decoder = new LengthPrefixedDecoder();
-    const responses: UceResponse[] = [];
-    socket.on("data", (chunk) => responses.push(...decoder.push(chunk).filter((frame): frame is UceResponse => "outcome" in frame)));
+    const responses: IpcResponse[] = [];
+    socket.on("data", (chunk) => responses.push(...decoder.push(chunk).filter((frame): frame is IpcResponse => "outcome" in frame)));
     await new Promise<void>((resolve) => socket.once("connect", resolve));
-    socket.write(encodeUceFrame(request({ request_id: "oversized-1", call: "core:find_records", deadline_at: "2099-01-01T00:00:00.000Z" })));
+    socket.write(encodeIpcFrame(request({ request_id: "oversized-1", call: "core:find_records", deadline_at: "2099-01-01T00:00:00.000Z" })));
     await new Promise<void>((resolve) => { const check = (): void => (responses.length >= 1 ? resolve() : void setTimeout(check, 5)); check(); });
     expect(responses).toHaveLength(1);
     expect(responses[0]).toMatchObject({ request_id: "oversized-1", outcome: "error", error: { code: "core:ipc_frame_too_large" } });
     expect(socket.destroyed).toBe(false);
     // The socket was kept alive (not destroyed) by the fix above -- a
     // normal, small-response request on the SAME connection still completes.
-    socket.write(encodeUceFrame(request({ request_id: "after-oversized", call: "core:status", deadline_at: "2099-01-01T00:00:00.000Z" })));
+    socket.write(encodeIpcFrame(request({ request_id: "after-oversized", call: "core:status", deadline_at: "2099-01-01T00:00:00.000Z" })));
     await new Promise<void>((resolve) => { const check = (): void => (responses.length >= 2 ? resolve() : void setTimeout(check, 5)); check(); });
     expect(responses).toHaveLength(2);
     expect(responses[1]).toMatchObject({ request_id: "after-oversized", outcome: "success" });

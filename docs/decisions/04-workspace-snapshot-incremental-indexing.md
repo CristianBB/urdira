@@ -47,7 +47,7 @@ A physical workspace stores both its display path and a provider-normalized cano
 
 `suspended` stops watching and indexing while retaining the current snapshot. Resume changes `suspended -> indexing`, performs a full authoritative reconciliation, and reaches `ready` or `degraded`; there is no separate `active` state. `removed` closes the registration, watchers, and future updates but leaves retained snapshots governed by retention. Re-registering the same directory after removal creates a new workspace ID; removed identities never reopen.
 
-Workspace state is `registering`, `indexing`, `ready`, `degraded`, `suspended`, `removing`, or `removed`. The legacy structural query contract treats only `ready` and `degraded` as having a current queryable structural snapshot. Source-first Index Status API v3 additionally exposes a separate immutable source snapshot after generic catalog publication; that source snapshot is queryable only through the source-safe Query API v2 operations and does not make structural facts queryable. `degraded` means the last valid snapshot remains readable while freshness or optional capabilities are incomplete; it never exposes a half-published candidate.
+Workspace state is `registering`, `indexing`, `ready`, `degraded`, `suspended`, `removing`, or `removed`. API v3 exposes a separate immutable source snapshot after generic catalog publication; that source snapshot is queryable only through source-safe operations and does not make structural facts queryable. `degraded` means the last valid snapshot remains readable while freshness or optional capabilities are incomplete; it never exposes a half-published candidate.
 
 ## Codebase grouping
 
@@ -84,6 +84,8 @@ The Git-reference provider resolves a branch or tag to an exact commit before en
 Watcher events are low-latency hints. The default scheduler begins a workspace batch after 50 ms without another related event and forces a capture after 250 ms of continuous activity. These defaults are configurable within safety bounds and do not affect logical output. Deletion, exclusion, provider reset, and explicit freshness barriers bypass ordinary debounce.
 
 Coalescing may collapse repeated modify hints for the same path before stable capture. It may not erase an authoritative absence barrier, reorder provider watermarks, or merge events across different provider bindings. Rename hints are normalized to absence plus presence with optional lineage metadata. The stable reconciliation result, not watcher event shape, determines content updates.
+
+A physical watcher backend error invalidates that underlying subscription and emits one provider-reset barrier. Urdira closes the failed subscription and serially installs one replacement after bounded exponential backoff. Repeated callbacks from the invalidated subscription are stale and cannot consume additional retry attempts or start concurrent replacements. A successful event resets the consecutive-failure count; bounded exhaustion leaves the periodic authoritative reconciliation as the recovery backstop.
 
 Each active physical workspace runs:
 

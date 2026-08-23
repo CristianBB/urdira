@@ -56,7 +56,7 @@ export const digestDomainRegistry = Object.freeze([
 const errorEntries = [
   ["uce:trailing_data", ["decode"]],
   ["uce:non_canonical_encoding", ["decode"]],
-  ["uce:forbidden_cbor_feature", ["decode"]],
+  ["uce:invalid_logical_encoding", ["decode", "normalize"]],
   ["uce:duplicate_map_key", ["decode"]],
   ["uce:invalid_utf8", ["decode"]],
   ["uce:invalid_unicode_scalar", ["normalize"]],
@@ -82,11 +82,11 @@ const errorEntries = [
 ] as readonly [string, readonly CanonicalEncodingPhase[]][];
 
 const errorDescriptions: Readonly<Record<string, string>> = {
-  "uce:trailing_data": "A valid root CBOR item ends before the supplied byte sequence ends.",
-  "uce:non_canonical_encoding": "The input is valid within the UCE data model but uses a non-minimal integer, length, tag, float width, or incorrect deterministic map-key order.",
-  "uce:forbidden_cbor_feature": "The input uses an indefinite length, unknown tag, shared reference, embedded CBOR, forbidden simple value, non-finite float, or another CBOR feature excluded by UCE v1.",
+  "uce:trailing_data": "A logical value ends before the supplied byte sequence ends.",
+  "uce:non_canonical_encoding": "The input uses a non-deterministic logical representation or incorrect map-key order.",
+  "uce:invalid_logical_encoding": "The input uses a value or logical encoding that is not accepted by the active contract.",
   "uce:duplicate_map_key": "One map contains the same decoded key more than once.",
-  "uce:invalid_utf8": "A CBOR text string contains malformed, overlong, truncated, or otherwise invalid UTF-8 bytes.",
+  "uce:invalid_utf8": "A text value contains malformed, overlong, truncated, or otherwise invalid UTF-8 bytes.",
   "uce:invalid_unicode_scalar": "A public or in-memory text value contains a lone surrogate or another value that is not a Unicode scalar.",
   "uce:unsupported_encoding_version": "The digest envelope or retained contract selects a UCE version the engine cannot interpret losslessly.",
   "uce:unsupported_hash_algorithm": "A recipe or digest selects a hash algorithm unsupported by the active engine contract.",
@@ -112,7 +112,7 @@ const errorDescriptions: Readonly<Record<string, string>> = {
 const authoritativeErrorDetailSchemas: Readonly<Record<string, string>> = {
   "uce:trailing_data": "core:trailing_data_details",
   "uce:non_canonical_encoding": "core:non_canonical_encoding_details",
-  "uce:forbidden_cbor_feature": "core:forbidden_cbor_feature_details",
+  "uce:invalid_logical_encoding": "core:invalid_logical_encoding_details",
   "uce:duplicate_map_key": "core:duplicate_map_key_details",
   "uce:invalid_utf8": "core:invalid_utf8_details",
   "uce:invalid_unicode_scalar": "core:invalid_unicode_scalar_details",
@@ -146,7 +146,7 @@ export interface CanonicalEncodingErrorDetailContract {
 const authoritativeErrorDetailRows = [
   ["uce:trailing_data", ["byte_offset"], []],
   ["uce:non_canonical_encoding", ["byte_offset", "canonicality_kind"], ["value_path"]],
-  ["uce:forbidden_cbor_feature", ["byte_offset", "feature_kind"], ["value_path"]],
+  ["uce:invalid_logical_encoding", ["byte_offset", "feature_kind"], ["value_path"]],
   ["uce:duplicate_map_key", ["byte_offset", "duplicate_key"], ["value_path"]],
   ["uce:invalid_utf8", ["byte_offset"], ["value_path"]],
   ["uce:invalid_unicode_scalar", ["value_path"], []],
@@ -790,44 +790,6 @@ export const terminalDigestRecipeDefinitions = [
   lifecycle_state: "active",
 }));
 
-export const canonicalEncodingConformanceCases = [
-  { case_id: "uce-v1-empty-bytes", corpus_revision: "1", input_kind: "typed", logical_input: "base64url:", encoded_input_hex: "40", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "accepted", expected_cbor_hex: "40" },
-  { case_id: "uce-v1-bytes", corpus_revision: "1", input_kind: "typed", logical_input: "base64url:AAE", encoded_input_hex: "420001", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "accepted", expected_cbor_hex: "420001" },
-  { case_id: "uce-v1-single-byte", corpus_revision: "1", input_kind: "typed", logical_input: "base64url:AA", encoded_input_hex: "4100", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "accepted", expected_cbor_hex: "4100" },
-  { case_id: "uce-v1-noncanonical-bytes-length", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "580100", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:non_canonical_encoding" },
-  { case_id: "uce-v1-indefinite-bytes", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "5fff", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:forbidden_cbor_feature" },
-  { case_id: "uce-v1-forbidden-tag", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "c100", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:forbidden_cbor_feature" },
-  { case_id: "uce-v1-trailing-data", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "4000", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:trailing_data" },
-  { case_id: "uce-v1-noncanonical-integer", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "1817", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:non_canonical_encoding" },
-  { case_id: "uce-v1-map-order", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "a2616201616102", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:non_canonical_encoding" },
-  { case_id: "uce-v1-duplicate-map-key", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "a2616101616102", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:duplicate_map_key" },
-  { case_id: "uce-v1-invalid-utf8", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "61ff", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:invalid_utf8" },
-  { case_id: "uce-v1-indefinite-array", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "9fff", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:forbidden_cbor_feature" },
-  { case_id: "uce-v1-forbidden-simple", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "f801", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:forbidden_cbor_feature" },
-  { case_id: "uce-v1-noncanonical-float", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "fa3fc00000", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:non_canonical_encoding" },
-  { case_id: "uce-v1-wide-noncanonical-integer", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "1b0000000000000017", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:non_canonical_encoding" },
-  { case_id: "uce-v1-wide-noncanonical-float", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "fb3ff8000000000000", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:non_canonical_encoding" },
-  { case_id: "uce-v1-forbidden-embedded-cbor", corpus_revision: "1", input_kind: "encoded", encoded_input_hex: "d81840", schema_id: "core:Bytes", schema_version: 1, expected_outcome: "rejected", expected_error_code: "uce:forbidden_cbor_feature" },
-];
-
-export const canonicalTypedConformanceCases = [
-  { case_id: "uce-v1-record", type_expression: { type_kind: "record" as const, fields: [{ field_name: "name", description: "Name.", presence: "required" as const, value_type: { type_kind: "text" as const } }] }, logical_input: { name: "n" }, expected_cbor_hex: "a1646e616d65616e" },
-  { case_id: "uce-v1-map", type_expression: { type_kind: "map" as const, value_type: { type_kind: "text" as const } }, logical_input: { a: "b" }, expected_cbor_hex: "a161616162" },
-  { case_id: "uce-v1-union", type_expression: { type_kind: "union" as const, discriminator_field: "kind", discriminator_description: "Kind.", variants: [{ discriminator_value: "item", description: "Item.", fields: [{ field_name: "value", description: "Value.", presence: "required" as const, value_type: { type_kind: "text" as const } }] }] }, logical_input: { kind: "item", value: "x" }, expected_cbor_hex: "a2646b696e64646974656d6576616c75656178" },
-  { case_id: "uce-v1-set", type_expression: { type_kind: "set" as const, element_type: { type_kind: "text" as const } }, logical_input: ["b", "a"], expected_cbor_hex: "8261616162" },
-  { case_id: "uce-v1-ordered-set", type_expression: { type_kind: "ordered_set" as const, element_type: { type_kind: "record" as const, fields: [{ field_name: "record_id", description: "Record ID.", presence: "required" as const, value_type: { type_kind: "text" as const } }] }, comparator_id: "core:record_id_order", comparator_version: 1 }, logical_input: [{ record_id: "b" }, { record_id: "a" }], expected_cbor_hex: "82a1697265636f72645f69646161a1697265636f72645f69646162" },
-  { case_id: "uce-v1-json", type_expression: { type_kind: "schema_reference" as const, reference_scope: "external" as const, type_name: "JsonValue", schema_id: "core:JsonValue", schema_version: 1 }, logical_input: { a: [true] }, expected_cbor_hex: "a1616181f5" },
-  { case_id: "uce-v1-text-boundary", type_expression: { type_kind: "text" as const, minimum_code_point_count: 0, maximum_code_point_count: 1 }, logical_input: "é", expected_cbor_hex: "62c3a9" },
-  { case_id: "uce-v1-bytes-boundary", type_expression: { type_kind: "bytes" as const, minimum_byte_length: 0, maximum_byte_length: 1 }, logical_input: Uint8Array.of(255), expected_cbor_hex: "41ff" },
-  { case_id: "uce-v1-text-unicode", type_expression: { type_kind: "text" as const, minimum_code_point_count: 1, maximum_code_point_count: 2 }, logical_input: "é", expected_cbor_hex: "62c3a9" },
-  { case_id: "uce-v1-safe-integer-boundary", type_expression: { type_kind: "safe_integer" as const, minimum: 24 }, logical_input: 24, expected_cbor_hex: "1818" },
-  { case_id: "uce-v1-big-integer", type_expression: { type_kind: "big_integer" as const }, logical_input: "bigint:3", expected_cbor_hex: "03" },
-  { case_id: "uce-v1-exact-decimal", type_expression: { type_kind: "exact_decimal" as const, scale_policy: "significant" as const }, logical_input: "decimal:1.50", expected_cbor_hex: "c482211896" },
-  { case_id: "uce-v1-timestamp", type_expression: { type_kind: "timestamp" as const }, logical_input: "2026-08-09T00:00:00.000000000Z", expected_cbor_hex: "1b18c9f9fecdde0000" },
-  { case_id: "uce-v1-map-multiple", type_expression: { type_kind: "map" as const, value_type: { type_kind: "text" as const } }, logical_input: { a: "b", c: "d" }, expected_cbor_hex: "a26161616261636164" },
-  { case_id: "uce-v1-record-multiple", type_expression: { type_kind: "record" as const, fields: [{ field_name: "a", description: "A.", presence: "required" as const, value_type: { type_kind: "text" as const } }, { field_name: "b", description: "B.", presence: "required" as const, value_type: { type_kind: "safe_integer" as const } }] }, logical_input: { a: "x", b: 1 }, expected_cbor_hex: "a261616178616201" },
-  { case_id: "uce-v1-json-nested", type_expression: { type_kind: "schema_reference" as const, reference_scope: "external" as const, type_name: "JsonValue", schema_id: "core:JsonValue", schema_version: 1 }, logical_input: { a: [true, null] }, expected_cbor_hex: "a1616182f5f6" },
-];
 
 export const digestReferenceDefinitions = digestReferenceContracts.map((contract) => ({
   digest_reference_id: `core:${contract.target_field.split(".").map((part) => toSnakeCase(part)).join("_")}_reference`,

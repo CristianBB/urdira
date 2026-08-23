@@ -1,4 +1,4 @@
-import { canonicalBytes, decodeCanonical as decodeCanonicalBlob, digestBytes } from "@urdira/canonical";
+import { canonicalBytes, decodeCanonical as decodeCanonicalBlob, digestBytes, digestLogicalValue } from "@urdira/canonical";
 import type {
   PluginResolutionLock,
   RegistrySnapshot,
@@ -6,7 +6,7 @@ import type {
   WorkspaceFreshnessCheckpoint,
 } from "@urdira/contracts";
 import type { DurableStorage, ForkPublicationPlanInput, WorkspaceDatabase } from "@urdira/storage";
-import { buildForkPublicationPlan, buildPublicationTransactionCommands, computeForkSnapshotDigestFields, normalizeObservationBatchIds, snapshotDigest } from "@urdira/storage";
+import { buildForkPublicationPlan, publicationTransactionCommands, computeForkSnapshotDigestFields, normalizeObservationBatchIds, snapshotDigest } from "@urdira/storage";
 import type { GitIgnoreRules, InclusionRules } from "@urdira/security";
 import { ISOMORPHIC_GIT_OBJECT_PORT, peeledHeadFor, type GitObjectPort } from "./git-providers.js";
 import { DirectorySourceProvider, type EncodedObservationBatch } from "./directory-provider.js";
@@ -28,7 +28,7 @@ import type { WorkspaceScanPluginProvider } from "./workspace-indexing-session.j
  * result.
  */
 
-const DEFAULT_FORK_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", ".urdira/**"], allow_external_root: false };
+const DEFAULT_FORK_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false };
 const DEFAULT_FORK_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
 const DEFAULT_FORK_SCAN_MAX_DURATION_MS = 600_000;
 const DEFAULT_FORK_SCAN_MAX_RESPONSE_BYTES = 64_000_000;
@@ -366,7 +366,7 @@ async function commitSourceLayerAndPublish(options: WorkspaceForkOptions, contex
  *    reason (zero binding rows ever exist) -- the round trip still does not
  *    byte-match: `namespace_bindings[].emission_valid_to_generation` is
  *    *omitted* on the original (unset-optional-field) registry object, so
- *    the stored `registry_payload`'s canonical encoding never has that key
+ *    the stored registry row has no aggregate value whose shape could drift
  *    at all, but `registry_namespace_bindings`'s schema always returns the
  *    column as an explicit SQL `NULL` on read -- and canonical encoding
  *    (correctly) treats "key absent" and "key present with a null value" as
@@ -374,10 +374,10 @@ async function commitSourceLayerAndPublish(options: WorkspaceForkOptions, contex
  *    path or `verify()`'s comparison, both shared, pre-existing storage
  *    code this change does not otherwise touch.
  * 4. `dependency` / `storage:dependency_corrupt`: verify() reconstructs the
- *    expected `dependency_payload` bytes as the row's typed columns *plus*
+ *    expected logical digest from the row's typed columns *plus*
  *    `valid_from_generation`/`valid_to_generation` (lifecycle.ts's dependency
  *    check), but `artifactDependencyCommands` (publication-authority.ts)
- *    stores `dependency_payload` as exactly whatever template object it was
+ *    stores the typed dependency columns from exactly the template object it was
  *    given, verbatim -- and `CandidateRecordDependencyTemplate` (`Omit<RecordArtifactDependency,
  *    "valid_from_generation" | "valid_to_generation">`, `packages/engine/src/candidate-materialization.ts`)
  *    is deliberately typed to exclude those two fields, so no producer,
@@ -399,7 +399,7 @@ async function commitSourceLayerAndPublish(options: WorkspaceForkOptions, contex
  * zero failures, or the fork rolls back and falls back to a full scan.
  */
 function isKnownPreexistingVerifyGap(failure: { readonly component_kind: string; readonly component_id: string; readonly error_code: string }): boolean {
-  if (failure.component_kind === "registry" && failure.error_code === "storage:registry_corrupt") return true;
+  if (failure.component_kind === "registry" && (failure.error_code === "storage:registry_corrupt" || failure.error_code === "storage:registry_digest_corrupt")) return true;
   if (failure.component_kind === "dependency" && failure.error_code === "storage:dependency_corrupt") return true;
   if (failure.component_kind === "control_plane" && failure.component_id.startsWith("capability_state:") && failure.error_code === "storage:control_plane_corrupt") return true;
   if (failure.component_kind === "snapshot" && failure.error_code === "storage:projection_set_digest_corrupt") return true;
@@ -443,12 +443,12 @@ function sortedResolvedPluginsDigest(resolvedPlugins: readonly unknown[]): strin
 async function donorPluginResolutionMatches(donorDatabase: WorkspaceDatabase, plugin: WorkspaceScanPluginProvider): Promise<boolean> {
   const current = await donorDatabase.repositories.snapshots.getCurrent();
   if (!current) return false;
-  const row = await donorDatabase.database.get<{ payload: unknown }>(
-    "SELECT payload FROM control_plane_state WHERE workspace_id = ? AND state_key = ?",
+  const row = await donorDatabase.database.get<{ state_json: string }>(
+    "SELECT state_json FROM control_plane_state WHERE workspace_id = ? AND state_key = ?",
     [donorDatabase.workspaceId, `plugin_resolution_lock:${current.current_resolution_lock_id}`],
   );
   if (!row) return false;
-  const donorLock = decodeCanonicalBlob(toBytes(row.payload)) as { readonly resolved_plugins?: readonly unknown[] };
+  const donorLock = JSON.parse(row.state_json) as { readonly resolved_plugins?: readonly unknown[] };
   const targetResolvedPlugins = (plugin.resolution_lock as unknown as { readonly resolved_plugins?: readonly unknown[] }).resolved_plugins ?? [];
   return sortedResolvedPluginsDigest(donorLock.resolved_plugins ?? []) === sortedResolvedPluginsDigest(targetResolvedPlugins);
 }
@@ -626,24 +626,17 @@ const ROW_BATCH_INSERT_ROWS = 2000;
  * ordinary template machinery meant `memoizeRecordOpens` alone re-parsed and
  * re-canonically-digested every record (~25s at 177k records on a real
  * 981-file repository) on top of `assertPublicationImmutableRows`'s
- * existence checks and `recordOpenCommands` re-`encodeCanonical`-ing every
- * record's body and payload a *second* time -- exactly the work decision
- * 11's content-derived, workspace-free canonical payloads
- * (`record_occurrences.record_payload` never embeds `workspace_id` or an
- * owner artifact id) exist to make unnecessary. A single native
+ * existence checks. A single native
  * `INSERT ... SELECT` lets SQLite copy the row set itself entirely inside
  * the database engine, with owner/span columns rewritten via a join against
- * a small per-artifact-version mapping table, and every payload/digest
- * column (`record_digest`, `payload_digest`, `payload_inline`,
- * `payload_cas_digest`, `record_payload`) copied byte-for-byte -- never
- * decoded or re-encoded in JS at all.
+ * a small per-artifact-version mapping table, with typed digests and
+ * relational body rows copied without decoding or re-encoding in JS.
  *
- * `identity_assignments.assignment_payload` is copied byte-for-byte too,
- * even though it still embeds the *donor's* owner ids inside afterward
- * (unlike `record_payload`, decision 11 does not require this table's
- * payload to be workspace-free, and this module is the one that originally
- * chose to embed owner ids in it). Verified safe by search: nothing in this
- * codebase ever decodes `assignment_payload` for query purposes or in
+ * Identity assignments are copied from typed columns. Their v3 owner is
+ * derived through the immutable record occurrence, so the donor record join
+ * supplies the artifact-version mapping predicate while the redundant
+ * physical owner columns remain NULL. Verified safe by search:
+ * nothing in this codebase decodes an aggregate assignment value for query purposes or in
  * `StorageMaintenance.verify()` -- only the plain typed columns
  * (`identity_type`/`identity_id`/`identity_key`) are ever read back.
  */
@@ -665,12 +658,12 @@ async function bulkCopyRecordsAndIdentities(target: WorkspaceDatabase, donorData
     await target.database.transaction([
       {
         kind: "run",
-        sql: `INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload)
+        sql: `INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest)
           SELECT d.record_id, ?, d.category, d.kind, d.universal_kind, d.schema_version, d.producer_id, d.producer_version,
             owner_map.new_artifact_id, owner_map.new_artifact_version_id,
             span_map.new_artifact_version_id, d.primary_source_span_start_byte, d.primary_source_span_end_byte, d.primary_source_span_start_line, d.primary_source_span_end_line,
             1, NULL,
-            d.record_digest, d.payload_digest, d.payload_byte_length, d.payload_inline, d.payload_cas_digest, d.record_payload
+            d.record_digest, d.body_digest, d.body_byte_length, d.body_payload, d.analysis_digest, d.analysis_configuration_digest, d.artifact_dependency_digest
           FROM fork_donor_db.record_occurrences AS d
           JOIN fork_artifact_map AS owner_map ON owner_map.donor_artifact_version_id = d.owner_artifact_version_id
           LEFT JOIN fork_artifact_map AS span_map ON span_map.donor_artifact_version_id = d.primary_source_span_artifact_version_id
@@ -679,15 +672,34 @@ async function bulkCopyRecordsAndIdentities(target: WorkspaceDatabase, donorData
       },
       {
         kind: "run",
-        sql: `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, assignment_payload)
-          SELECT d.identity_assignment_id, ?, d.identity_type, d.identity_id, 'created', d.identity_key, d.identity_key_digest, d.record_id, NULL,
-            owner_map.new_artifact_id, owner_map.new_artifact_version_id,
-            1, NULL,
-            d.assignment_payload
-          FROM fork_donor_db.identity_assignments AS d
-          JOIN fork_artifact_map AS owner_map ON owner_map.donor_artifact_version_id = d.owner_artifact_version_id
-          WHERE d.workspace_id = ? AND ${donorVisible}`,
+        sql: `INSERT INTO record_value_nodes (workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value)
+          SELECT ?, d.record_id, 1, d.value_path, d.parent_path, d.sequence_ordinal, d.map_key, d.value_kind, d.text_value, d.integer_value, d.real_value, d.bool_value, d.bytes_value
+          FROM fork_donor_db.record_value_nodes AS d
+          JOIN fork_donor_db.record_occurrences AS records ON records.workspace_id = d.workspace_id AND records.record_id = d.record_id AND records.valid_from_generation = d.valid_from_generation
+          JOIN fork_artifact_map AS owner_map ON owner_map.donor_artifact_version_id = records.owner_artifact_version_id
+          WHERE d.workspace_id = ? AND records.valid_from_generation <= ? AND (records.valid_to_generation IS NULL OR records.valid_to_generation > ?)`,
         params: [workspaceId, donorDatabase.workspaceId, donorGeneration, donorGeneration],
+      },
+      {
+        kind: "run",
+        sql: `INSERT INTO record_facets (workspace_id, record_id, valid_from_generation, facet_ordinal, facet)
+          SELECT ?, d.record_id, 1, d.facet_ordinal, d.facet FROM fork_donor_db.record_facets AS d
+          WHERE d.workspace_id = ? AND d.valid_from_generation <= ?`,
+        params: [workspaceId, donorDatabase.workspaceId, donorGeneration],
+      },
+      {
+        kind: "run",
+        sql: `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation)
+          SELECT d.identity_assignment_id, ?, d.identity_type, d.identity_id, 'created', d.identity_key, d.identity_key_digest, d.record_id, NULL,
+            NULL, NULL,
+            1, NULL
+          FROM fork_donor_db.identity_assignments AS d
+          JOIN fork_donor_db.record_occurrences AS records
+            ON records.workspace_id = d.workspace_id AND records.record_id = d.record_id
+          JOIN fork_artifact_map AS owner_map ON owner_map.donor_artifact_version_id = records.owner_artifact_version_id
+          WHERE d.workspace_id = ? AND ${donorVisible}
+            AND records.valid_from_generation <= ? AND (records.valid_to_generation IS NULL OR records.valid_to_generation > ?)`,
+        params: [workspaceId, donorDatabase.workspaceId, donorGeneration, donorGeneration, donorGeneration, donorGeneration],
       },
     ]);
   } finally {
@@ -708,12 +720,12 @@ interface DonorDependencyRow extends Record<string, unknown> {
 
 /**
  * `artifact_dependencies` rows are small (nine scalar columns, no record
- * body) and `dependency_payload` -- unlike `record_payload`/`assignment_payload`
+ * body) and typed dependency columns
  * -- *is* read back for real query answers (`WorkspaceProjectionRepository.dependenciesForArtifact`-
  * style reads, `packages/storage/src/projections.ts`), so it must actually
  * reflect the fork's rewritten owner/dependency ids, not the donor's. That
- * requires re-`encodeCanonical`-ing it in JS (no SQL canonical encoder
- * exists), but only for this table's typically-modest row count -- via the
+ * requires recalculating its logical digest in JS, but only for this table's
+ * typically-modest row count -- via the
  * donor's already-open connection (no `ATTACH` needed, no cross-database
  * join), batched into large multi-row `INSERT`s rather than the
  * per-row-checkpointed `checkedPublicationCommand` pattern
@@ -733,18 +745,14 @@ async function bulkCopyDependencies(target: WorkspaceDatabase, donorDatabase: Wo
     const dependency = map.byArtifactVersionId.get(row.dependency_artifact_version_id);
     if (owner === undefined || dependency === undefined) continue;
     const dependencyEntryId = stableId("workspace-fork-dependency", { record_id: row.record_id, owner_artifact_id: owner.artifact_id, owner_artifact_version_id: owner.artifact_version_id, dependency_artifact_id: dependency.artifact_id, dependency_artifact_version_id: dependency.artifact_version_id, dependency_role: row.dependency_role });
-    const payload = { dependency_entry_id: dependencyEntryId, record_id: row.record_id, owner_artifact_id: owner.artifact_id, owner_artifact_version_id: owner.artifact_version_id, dependency_artifact_id: dependency.artifact_id, dependency_artifact_version_id: dependency.artifact_version_id, dependency_role: row.dependency_role, producer_id: row.producer_id, producer_version: row.producer_version };
-    const payloadBytes = canonicalBytes(payload);
-    // `content_digest` is `digestBytes(payloadBytes)` computed once here at
-    // copy time -- the same leaf recipe `projectionSetDigestEntries` uses --
-    // so `computeForkSnapshotDigestFields`'s `{ digest_source: "stored" }`
-    // read never has to re-hash this row's BLOB.
-    rows.push([dependencyEntryId, workspaceId, row.record_id, owner.artifact_id, owner.artifact_version_id, dependency.artifact_id, dependency.artifact_version_id, row.dependency_role, row.producer_id, row.producer_version, payloadBytes, digestBytes(payloadBytes)]);
+    const payload = { dependency_entry_id: dependencyEntryId, record_id: row.record_id, owner_artifact_id: owner.artifact_id, owner_artifact_version_id: owner.artifact_version_id, dependency_artifact_id: dependency.artifact_id, dependency_artifact_version_id: dependency.artifact_version_id, dependency_role: row.dependency_role, producer_id: row.producer_id, producer_version: row.producer_version, valid_from_generation: 1 };
+    const contentDigest = digestLogicalValue(payload, "urdira:artifact-dependency:v2");
+    rows.push([dependencyEntryId, workspaceId, row.record_id, owner.artifact_id, owner.artifact_version_id, dependency.artifact_id, dependency.artifact_version_id, row.dependency_role, row.producer_id, row.producer_version, contentDigest]);
   }
   for (let start = 0; start < rows.length; start += ROW_BATCH_INSERT_ROWS) {
     const chunk = rows.slice(start, start + ROW_BATCH_INSERT_ROWS);
     await target.database.run(
-      `INSERT INTO artifact_dependencies (dependency_entry_id, workspace_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, dependency_payload, content_digest) VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)").join(", ")}`,
+      `INSERT INTO artifact_dependencies (dependency_entry_id, workspace_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, content_digest) VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)").join(", ")}`,
       chunk.flat() as (string | number | Uint8Array)[],
     );
   }
@@ -762,7 +770,7 @@ interface DonorProjectionRow extends Record<string, unknown> {
   readonly generator: string;
   readonly generator_version: string;
   readonly generator_configuration_digest: string;
-  readonly projection_payload: unknown;
+  readonly content_digest: string;
 }
 
 /**
@@ -781,7 +789,7 @@ interface DonorProjectionRow extends Record<string, unknown> {
 async function bulkCopyProjections(target: WorkspaceDatabase, donorDatabase: WorkspaceDatabase, donorGeneration: number, workspaceId: string, map: DonorRowMap): Promise<number> {
   const donorVisible = "valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)";
   const donorRows = await donorDatabase.database.all<DonorProjectionRow>(
-    `SELECT projection_record_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, projection_payload FROM projection_occurrences WHERE workspace_id = ? AND ${donorVisible}`,
+    `SELECT projection_record_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, content_digest FROM projection_occurrences WHERE workspace_id = ? AND ${donorVisible}`,
     [donorDatabase.workspaceId, donorGeneration, donorGeneration],
   );
   if (donorRows.length === 0) return 0;
@@ -810,22 +818,22 @@ async function bulkCopyProjections(target: WorkspaceDatabase, donorDatabase: Wor
       owner_artifact_id: owner.artifact_id, owner_artifact_version_id: owner.artifact_version_id,
       source_artifact_version_ids: sourceArtifactVersionIds, source_record_ids: sourceRecordIds, source_projection_record_ids: sourceProjectionRecordIds,
       generator: row.generator, generator_version: row.generator_version, generator_configuration_digest: row.generator_configuration_digest,
-      payload: decodeJsonBlob(row.projection_payload),
+      content_digest: row.content_digest,
     };
-    const contentDigest = digest(contentDigestInput);
-    projectionRows.push([newProjectionRecordId, workspaceId, row.projection_kind, row.projection_key, owner.artifact_id, owner.artifact_version_id, JSON.stringify(sourceArtifactVersionIds), JSON.stringify(sourceRecordIds), JSON.stringify(sourceProjectionRecordIds), row.generator, row.generator_version, row.generator_configuration_digest, contentDigest, row.projection_payload]);
+    const contentDigest = digestLogicalValue(contentDigestInput, "urdira:projection-occurrence:v2");
+    projectionRows.push([newProjectionRecordId, workspaceId, row.projection_kind, row.projection_key, owner.artifact_id, owner.artifact_version_id, JSON.stringify(sourceArtifactVersionIds), JSON.stringify(sourceRecordIds), JSON.stringify(sourceProjectionRecordIds), row.generator, row.generator_version, row.generator_configuration_digest, contentDigest]);
     for (const [sourceType, sourceValues] of [["artifact_version", sourceArtifactVersionIds], ["record", sourceRecordIds], ["projection", sourceProjectionRecordIds]] as const) {
-      for (const sourceId of sourceValues) dependencyRows.push([workspaceId, newProjectionRecordId, sourceType, String(sourceId), canonicalBytes({ projection_record_id: newProjectionRecordId, valid_from_generation: 1, source_type: sourceType, source_id: String(sourceId) })]);
+      for (const sourceId of sourceValues) dependencyRows.push([workspaceId, newProjectionRecordId, sourceType, String(sourceId)]);
     }
   }
   if (projectionRows.length === 0) return 0;
   for (let start = 0; start < projectionRows.length; start += ROW_BATCH_INSERT_ROWS) {
     const chunk = projectionRows.slice(start, start + ROW_BATCH_INSERT_ROWS);
-    await target.database.run(`INSERT INTO projection_occurrences (projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, valid_to_generation, content_digest, projection_payload) VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)").join(", ")}`, chunk.flat() as (string | number | Uint8Array)[]);
+    await target.database.run(`INSERT INTO projection_occurrences (projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, valid_to_generation, content_digest) VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)").join(", ")}`, chunk.flat() as (string | number | Uint8Array)[]);
   }
   for (let start = 0; start < dependencyRows.length; start += ROW_BATCH_INSERT_ROWS) {
     const chunk = dependencyRows.slice(start, start + ROW_BATCH_INSERT_ROWS);
-    await target.database.run(`INSERT INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id, dependency_payload) VALUES ${chunk.map(() => "(?, ?, 1, ?, ?, ?)").join(", ")}`, chunk.flat() as (string | number | Uint8Array)[]);
+    await target.database.run(`INSERT INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id) VALUES ${chunk.map(() => "(?, ?, 1, ?, ?)").join(", ")}`, chunk.flat() as (string | number | Uint8Array)[]);
   }
   return patchCount;
 }
@@ -834,9 +842,8 @@ function decodeJsonBlob(value: unknown): unknown {
   if (value === null || value === undefined) return null;
   const bytes = value instanceof Uint8Array ? value : value instanceof ArrayBuffer ? new Uint8Array(value) : undefined;
   if (bytes === undefined) return null;
-  // record_payload/projection_payload/assignment_payload/dependency_payload are
-  // written via `@urdira/canonical`'s `encodeCanonical` everywhere in
-  // publication-authority.ts; decode with the same codec here.
+  // Projection and dependency rows still use their owning typed decoders;
+  // record bodies never enter this helper and are read from value nodes.
   return decodeCanonicalBlob(bytes);
 }
 
@@ -846,11 +853,11 @@ function parseJsonArray(value: unknown): readonly unknown[] {
 }
 
 async function visibleCapabilityStateEntries(database: WorkspaceDatabase, candidateId: string): Promise<readonly unknown[]> {
-  const rows = await database.database.all<{ payload: unknown }>(
-    "SELECT payload FROM control_plane_state WHERE workspace_id = ? AND state_kind = 'capability_state' AND state_key LIKE ? ORDER BY state_key",
+  const rows = await database.database.all<{ state_json: string }>(
+    "SELECT state_json FROM control_plane_state WHERE workspace_id = ? AND state_kind = 'capability_state' AND state_key LIKE ? ORDER BY state_key",
     [database.workspaceId, `capability_state:${candidateId}:%`],
   );
-  return rows.map((row) => decodeCanonicalBlob(toBytes(row.payload)));
+  return rows.map((row) => JSON.parse(row.state_json));
 }
 
 /**
@@ -895,11 +902,11 @@ async function fastForkVerify(target: WorkspaceDatabase, workspaceId: string, do
   );
   if ((dependencyMismatches?.c ?? 0) !== 0) failures.push("fork contains dependencies with incomplete remapped ownership");
 
-  const snapshotRow = await target.database.get<{ snapshot_digest: string; snapshot_payload: unknown }>("SELECT snapshot_digest, snapshot_payload FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [workspaceId, ids.snapshotId]);
+  const snapshotRow = await target.database.get<{ snapshot_digest: string }>("SELECT snapshot_digest FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", [workspaceId, ids.snapshotId]);
   if (!snapshotRow) failures.push("snapshot row missing after publish");
   else {
-    const decoded = decodeCanonicalBlob(toBytes(snapshotRow.snapshot_payload)) as Record<string, unknown>;
-    if (snapshotDigest(decoded) !== snapshotRow.snapshot_digest) failures.push("snapshot_digest is not self-consistent with its own stored payload");
+    const decoded = await target.repositories.snapshots.get(ids.snapshotId);
+    if (!decoded || snapshotDigest(decoded) !== snapshotRow.snapshot_digest) failures.push("snapshot_digest is not self-consistent with its typed fields");
   }
 
   return { ok: failures.length === 0, failures };
@@ -1020,7 +1027,7 @@ async function copyDonorAndPublish(options: WorkspaceForkOptions, context: ForkC
   };
   const plan = buildForkPublicationPlan(planInput);
   try {
-    await target.database.transaction(Array.from(buildPublicationTransactionCommands(plan)));
+    await target.database.transactionChunked(publicationTransactionCommands(plan), undefined, { transfer_params: true, discard_results: true });
   } catch (error) {
     fail(`fork publication failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1095,7 +1102,6 @@ async function rollbackForkPublication(target: WorkspaceDatabase, workspaceId: s
       // referenced snapshot row first trips this schema's foreign-key check.
       { kind: "run", sql: "DELETE FROM workspace_current_state WHERE workspace_id = ? AND current_snapshot_id = ?", params: [workspaceId, snapshotId] },
       { kind: "run", sql: "DELETE FROM snapshots WHERE workspace_id = ? AND snapshot_id = ?", params: [workspaceId, snapshotId] },
-      { kind: "run", sql: "DELETE FROM candidate_template_segments WHERE workspace_id = ? AND candidate_materialization_id = ?", params: [workspaceId, materializationId] },
       { kind: "run", sql: "DELETE FROM candidate_materializations WHERE workspace_id = ? AND candidate_generation_id = ?", params: [workspaceId, candidateId] },
       { kind: "run", sql: "DELETE FROM candidate_state WHERE workspace_id = ? AND candidate_generation_id = ?", params: [workspaceId, candidateId] },
       // Also purge the source layer this fork attempt durably committed

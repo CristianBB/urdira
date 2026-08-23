@@ -9,6 +9,8 @@ import {
   decodeCanonical,
   decodeDigest,
   digestBytes,
+  digestCanonicalMapWithArrayField,
+  digestCanonicalMapWithArrayFields,
   digestEnvelope,
   digestPayloadBytes,
   digestToBytes,
@@ -27,7 +29,6 @@ import {
   sortCanonicalValues,
   timestampFromNanoseconds,
   timestampNanoseconds,
-  toBase64Url,
   toBigIntegerText,
   validateDigestRecipeGraph,
   verifyDigest,
@@ -64,10 +65,8 @@ describe("canonical repository coverage vectors", () => {
     expect(normalizeText("raw")).toBe("raw");
     expect(() => normalizeText(42)).toThrow();
     expect(() => normalizeText(String.fromCharCode(0xd800))).toThrow();
-    expect(normalizeBytes("base64url:AA")).toEqual(new Uint8Array([0]));
+    expect(normalizeBytes(new Uint8Array([0]))).toEqual(new Uint8Array([0]));
     expect(() => normalizeBytes("invalid")).toThrow();
-    expect(() => normalizeBytes("base64url:A")).toThrow();
-    expect(toBase64Url(new Uint8Array([0]))).toBe("base64url:AA");
     expect(normalizeDigest("sha256:" + "0".repeat(64))).toContain("sha256:");
     expect(() => normalizeDigest("invalid")).toThrow();
     expect(normalizeBigInteger("bigint:42")).toBe(42n);
@@ -103,9 +102,22 @@ describe("canonical repository coverage vectors", () => {
     expect(() => computeDigestRecipe({ ...recipe, payload_schema_id: "unknown" } as never, { target: {} } as never)).toThrow();
   });
 
+  it("streams large canonical map arrays without changing their digest", () => {
+    const fields = { base: "sha256:base" };
+    const elements = [{ id: "a", value: 1 }, { id: "b", value: 2 }];
+    expect(digestCanonicalMapWithArrayField(fields, "transitions", elements)).toBe(digestBytes(encodeCanonical({ ...fields, transitions: elements })));
+    const multipleFields = { first: [1, 2], second: [{ id: "x" }] };
+    expect(digestCanonicalMapWithArrayFields({}, multipleFields)).toBe(digestBytes(encodeCanonical(multipleFields)));
+    const largeElements = Array.from({ length: 150_000 }, (_, index) => ({ id: index, value: "x".repeat(128) }));
+    expect(() => encodeCanonical({ ...fields, transitions: largeElements })).toThrow();
+    expect(digestCanonicalMapWithArrayField(fields, "transitions", largeElements)).toMatch(/^sha256:/u);
+    const nestedElements = [{ scope: { replacement_scope_id: "scope:small" }, records: [{ id: "a" }] }];
+    expect(digestCanonicalMapWithArrayField({}, "replacement_sets", nestedElements)).toBe(digestBytes(encodeCanonical({ replacement_sets: nestedElements })));
+  });
+
   it("covers canonical encoding limits and rejected wire forms", () => {
     expect(encodeFloat64(Math.PI)).toHaveLength(9);
-    expect(encodeFloat64(Math.fround(1.1))).toHaveLength(5);
+    expect(encodeFloat64(Math.fround(1.1))).toHaveLength(9);
     expect(() => encodeCanonical("x", { max_bytes: 0 })).toThrow();
     expect(() => encodeCanonical(Symbol("unsupported"))).toThrow();
     expect(() => encodeCanonical(new Date())).toThrow();
@@ -114,13 +126,11 @@ describe("canonical repository coverage vectors", () => {
     expect(() => encodeCanonical([1], { max_elements: 0 })).toThrow();
     expect(() => encodeCanonical([[[1]]], { max_depth: 1 })).toThrow();
     expect(() => encodeCanonical(new Uint8Array([1]), { max_bytes: 0 })).toThrow();
-    expect(() => decodeCanonical(new Uint8Array([0x63, 0xff, 0xff, 0xff]))).toThrow();
-    expect(() => decodeCanonical(new Uint8Array([0x18, 0x01]))).toThrow();
-    expect(() => decodeCanonical(new Uint8Array([0x9f]))).toThrow();
-    expect(() => decodeCanonical(new Uint8Array([0xc1, 0x00]))).toThrow();
-    expect(() => decodeCanonical(new Uint8Array([0xc2, 0x01]))).toThrow();
-    expect(() => decodeCanonical(new Uint8Array([0xf7]))).toThrow();
-    expect(() => decodeCanonical(new Uint8Array([0x82, 0x01]))).toThrow();
+    expect(() => decodeCanonical(new Uint8Array([3, 1, 0xff]))).toThrow();
+    expect(() => decodeCanonical(new Uint8Array([0, 0]))).toThrow();
+    expect(() => decodeCanonical(new Uint8Array([5]))).toThrow();
+    expect(() => decodeCanonical(new Uint8Array([9]))).toThrow();
+    expect(() => decodeCanonical(new Uint8Array([6, 1, 3, 1, 97]))).toThrow();
   });
 
   it("validates a local schema through the public canonical boundary", () => {

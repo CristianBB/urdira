@@ -1,12 +1,14 @@
 # Public Query Contract
 
-Status: **Approved initial contract**  
-Last updated: 2026-08-08  
+Status: **Approved and implemented v3 contract**
+
+Last updated: 2026-08-23
+
 Depends on: [Universal data model](../decisions/01-universal-data-model.md) and [Query algebra and public API](../decisions/03-query-algebra-public-api.md)
 
 ## Purpose and schema rules
 
-This file is authoritative for every operation-specific and pipeline-operator-specific field in public API version 1. The universal data model owns the shared request and response envelopes. Generated MCP JSON Schemas must reproduce these rules and give every field the descriptions below without adding adapter-only behavior.
+This file is authoritative for the destructive public API v3 wire contract. v3 carries the supported operation, recipe, pipeline, pagination, completeness, and response guarantees; v1/v2 request aliases and legacy pipeline envelopes are not accepted. The v3 runtime also rejects every pre-v3 or early-preview v3 data root with `core:index_contract_unsupported`: there is no legacy reader or in-place migration, and activation requires a fresh root plus source reindexing. The universal data model owns the shared request and response envelopes. Generated MCP JSON Schemas must reproduce these rules and give every field the descriptions below without adding adapter-only behavior.
 
 All objects are closed. `required` below means the field must be present; `optional` means absence has the documented default or meaning. Arrays are ordered and duplicate-free unless stated otherwise. Identifiers are namespaced strings. Counts, depths, character limits, and milliseconds are non-negative integers bounded by advertised server maxima. An empty optional selector means no restriction; it never means no results unless stated explicitly.
 
@@ -25,6 +27,13 @@ All objects are closed. `required` below means the field must be present; `optio
 | `stage_output` | `stage_id`, `output` | The complete typed subject set produced by an earlier pipeline stage. |
 
 The first four variants are legal in an operation expression. `stage_output` is legal only in pipeline arguments. When an unpinned lifecycle or path resolves to several visible candidates, the operation returns possible candidates or a selector error according to its contract; it never chooses by database order. A pipeline binding from lexical `core:search_text` to `core:get_source` preserves each matched artifact's `artifact_id` and `artifact_version_id`, so the source stage hydrates the exact pinned artifact occurrence rather than treating it as an ordinary record.
+
+Pipeline final outputs are sealed into the immutable execution manifest through
+bounded iterators; the executor does not materialize the complete output as a
+JavaScript array before cursor creation. Forward and backward cursor streams
+use the same sealed ordering. Completeness is propagated from every stage;
+missing provider coverage is reported as `unknown`, and continuations preserve
+the signed execution completeness report instead of assuming `complete`.
 
 For coding-agent discovery, a pipeline should normally bind an upstream `subjects` stream into the dependent operation so each artifact or entity is hydrated once. The `matches` stream remains available when each textual occurrence is itself relevant. This is a usage rule, not a relaxation of exactness: stage outputs remain complete typed subject sets under the same snapshot, scope, and completeness rules as direct operations.
 
@@ -177,8 +186,10 @@ Output `paths` is exhaustive under the declared maximum and policy or the operat
 | `word_mode` | optional `substring`, `identifier`, or `token`; default `substring` | Boundary contract for literal matches. Regex always uses its own explicit boundaries. |
 | `filter` | optional `StructuralFilter` | Hard searched scope and primary result constraints. |
 | `result_projection` | optional `match`, `artifact`, `record`, or `entity`; default `match` | Primary subject normalization. Ambiguous entity ownership remains a match/artifact result. |
+| `subjects` | optional non-empty subject selector array or stage output | Restricts lexical matching to an earlier source-safe pipeline result, enabling `find_artifacts → search_text → get_source` without structural readiness. |
 
 Outputs are `matches` and `subjects`. Every match contains exact artifact version and byte span.
+For literal searches, path constraints and the normalized `include_generated`/`include_external` flags remain on the exact lexical source projection. While asynchronous lexical maintenance is not current, execution scans the pinned source catalog/CAS exactly; neither an incomplete lexical marker nor explicit default-false flags may widen execution into a decoded structural-corpus scan.
 
 ### `core:search_semantic` and `core:search_hybrid`
 
@@ -273,6 +284,8 @@ Outputs preserve both participant-bound subjects. Correlations never become cano
 
 Output `context` is a deduplicated ordered set of result bundles. Response and source budgets control hydration only; operation work limits are server-advertised and exact failure replaces truncation of logical membership.
 
+Without a configured semantic lane, task discovery is conservative and bounded: explicit `seeds` and identifier-shaped task terms are resolved through exact indexed subject lookups. A prose-only task with no resolvable seed returns an empty context instead of widening into a complete-corpus scan. Returned subjects can be expanded with the ordinary structural operations. This keeps absence of relevance ranking explicit and prevents context construction from materializing an entire large workspace merely to produce no useful result.
+
 ### `core:index_status`
 
 | Field | Presence | Exact meaning |
@@ -290,7 +303,9 @@ current source snapshot; `semantic_ready` means complete semantic materialized
 against the current structural snapshot. `partial` is queryable partial data;
 `unknown` is not queryable. `operation_availability` lists source-safe
 operations and blocked structural operations with a required layer, reason
-code, retryability, and optional retry delay. v1 and v2 remain compatible.
+code, retryability, and optional retry delay. Only API v3 is accepted on the
+public wire; older persisted snapshots are a storage concern and never change
+the request schema.
 
 Inside `QueryRequest`, this operation uses the mandatory explicit query scope. Global workspace discovery is available only through the dedicated `urdira_index_status` MCP/CLI wrapper below. Both return safe display roots, never private storage/package paths.
 
@@ -314,9 +329,9 @@ Recursion depth is server-bounded. Predicate values use the same exact registry 
 
 `deduplicate` accepts one or more inputs and required `identity` equal to `subject`, `entity`, `artifact`, or `portable_key`. `portable_key` additionally requires `include_possible: true` because it is correlation rather than identity. Provenance and evidence from removed duplicates are accumulated.
 
-`bind.record_selector` accepts exactly one registry definition-set input. It maps record-kind IDs to `KindSelector.kinds`, facet IDs to `KindSelector.any_facets`, and language IDs to `StructuralFilter.languages`; values within a family combine by OR and present families combine by AND. Its optional static `record_categories`, `producer_ids`, and `filter` fields are conjoined. An empty input produces an exact empty-result sentinel; any other definition family is rejected with `core:invalid_definition_instance_selector`. The operator is not accepted in caller-authored `PipelineExpression` under API v1; only an immutable advertised core recipe may contain it.
+`bind.record_selector` accepts exactly one registry definition-set input. It maps record-kind IDs to `KindSelector.kinds`, facet IDs to `KindSelector.any_facets`, and language IDs to `StructuralFilter.languages`; values within a family combine by OR and present families combine by AND. Its optional static `record_categories`, `producer_ids`, and `filter` fields are conjoined. An empty input produces an exact empty-result sentinel; any other definition family is rejected with `core:invalid_definition_instance_selector`. The operator is not accepted in caller-authored `PipelineExpression` under API v3; only an immutable advertised core recipe may contain it.
 
-`bind.subject_record_selector` accepts one visible record/entity subject set, hydrates each exact selected record descriptor, and constructs `RecordStructuralSelector.kind_selector.kinds` from the duplicate-free concrete kind set plus `filter.languages` from the duplicate-free owner-language set. Kinds combine by OR, languages combine by OR, and the two dimensions combine by AND. An optional explicit structural filter is conjoined. Empty input produces an exact empty-result sentinel. The downstream membership returned by `core:find_records` is exact for that derived selector, while result assessment preserves possible relevance from any semantic upstream stage; this operator never promotes evidence. It is core-recipe-only in API v1.
+`bind.subject_record_selector` accepts one visible record/entity subject set, hydrates each exact selected record descriptor, and constructs `RecordStructuralSelector.kind_selector.kinds` from the duplicate-free concrete kind set plus `filter.languages` from the duplicate-free owner-language set. Kinds combine by OR, languages combine by OR, and the two dimensions combine by AND. An optional explicit structural filter is conjoined. Empty input produces an exact empty-result sentinel. The downstream membership returned by `core:find_records` is exact for that derived selector, while result assessment preserves possible relevance from any semantic upstream stage; this operator never promotes evidence. It is core-recipe-only in API v3.
 
 `select` accepts one or more inputs and required non-empty `outputs`. Each output supplies unique `name`, input reference, result projection (`subjects`, `relations`, `paths`, `definitions`, or the exact upstream operation output), and optional `StructuralFilter`. It cannot request fields forbidden by the public result models.
 
@@ -324,20 +339,28 @@ No operator accepts arbitrary ranking, score, profile, SQL, graph query, script,
 
 ## MCP wrapper schemas
 
-`urdira_query` accepts exactly one of `query` (`QueryRequest`) or `continuation` (`ContinuationRequest`). The discriminator is `request_type = query | continuation`. Its public wrapper value is exactly one of `page` (`QueryResultPage`) or `error` (`OperationError`). The MCP adapter returns that wrapper as the single `content[0].text` block (compact plain text by default, or complete JSON for the undocumented debug renderer); it does not emit `structuredContent` because the tools intentionally declare no `outputSchema`. A page is a successful tool result; an `OperationError` is an `isError: true` tool result, not a JSON-RPC protocol error.
+`urdira_query` accepts exactly one of `query` (`QueryRequest`) or `continuation` (`ContinuationRequest`). The discriminator is `request_type = query | continuation`. Its public wrapper value is exactly one of `page` (`QueryResultPage`) or `error` (`OperationError`). The MCP adapter returns that wrapper as the single `content[0].text` block (compact plain text by default, or complete JSON for the undocumented debug renderer); source bundles preserve every snippet line admitted by the query's explicit per-snippet, total-snippet, and serialized-response budgets and are not subject to a second renderer-only line cap. The adapter does not emit `structuredContent` because the tools intentionally declare no `outputSchema`. A page is a successful tool result; an `OperationError` is an `isError: true` tool result, not a JSON-RPC protocol error.
 
 `urdira_analyze_change` requires `api_version`, `scope`, `target`, `change`, and `options`; it optionally accepts `include_transitive`, `include_tests`, and `filter`. It normalizes byte-for-byte to `core:analyze_impact` and returns the ordinary query page/error union.
 
-`urdira_build_context` requires `api_version`, `scope`, `task`, `facets`, and `options`; it optionally accepts `query_class`, `seeds`, and `filter`. It normalizes to `core:build_context` and returns the ordinary query page/error union.
+`urdira_build_context` requires `api_version`, `scope`, `task`, `facets`, and `options`; it optionally accepts `query_class`, `seeds`, and `filter`. It normalizes to `core:build_context` and returns the ordinary query page/error union. When `options.freshness` is omitted, this complete-context wrapper requests `mode: "wait"`, `required_frontier: "structural"`, and a bounded 30-second timeout; an explicit freshness policy remains authoritative.
 
-`urdira_index_status` keeps the API v1 request unchanged, accepts `IndexStatusInitialRequestV2`, and defaults to `IndexStatusInitialRequestV3`. The v2/v3 initial form requires an exact `workspace_root` and `workspace_ids: []`; v3 returns layered readiness and may report source-ready while structural analysis is still building. Root matching is exact after provider canonicalization; the response returns the resolved `workspace_id` and never repeats the absolute root. An unregistered root returns `core:workspace_not_registered` with `registration_command: "urdira workspace add <workspace-root>"`. Configuration issues are an independently paginated status stream. Continuations retain v1 semantics and never infer scope.
+`urdira_index_status` defaults to API v3. The MCP initial form accepts an exact
+`workspace_root`; it returns layered
+readiness and may report source-ready while structural analysis is still
+building. Root matching is exact after provider canonicalization; the response
+returns the resolved opaque `workspace_id` and a copy-ready `query_scope`
+object, and never repeats the absolute root. Clients reuse `query_scope`
+byte-for-byte rather than retyping or synthesizing its identifier. An
+unregistered root returns `core:workspace_not_registered` with
+`registration_command: "urdira workspace add <workspace-root>"`.
+Configuration issues are an independently paginated status stream.
 
-Query API v2 may bind a source-safe operation to
+API v3 may bind a source-safe operation to
 `scope.snapshot_id = source-snapshot:<generation>`. This binding is accepted
 only for `core:find_artifacts`, source-projection `core:search_text`, and
 artifact-selector `core:get_source`; structural pipelines and recipes remain
-bound to structural snapshots. Query API v1 retains its existing structural
-snapshot requirement.
+bound to structural snapshots.
 
 Every wrapper field has the same meaning as its operation counterpart. Wrappers cannot change defaults, completeness, ordering, ranking, or cursor behavior.
 
@@ -371,3 +394,19 @@ Every other recipe argument stays required because it has no server-inferrable d
 ## Conformance
 
 The generated JSON Schema corpus contains one valid minimal, valid maximal, and invalid interaction example for every operation, change variant, shared selector, pipeline operator, MCP wrapper, response stream, and continuation. Schema validation and logical normalization must produce identical accepted values in the MCP adapter, CLI, daemon, and canonical query-plan encoder.
+
+## API v3 binding-oriented pipelines
+
+Version 3 accepts a closed stage form with `stage_id`, `stage_type`, an
+operation or algebra operator, static `arguments`, and explicit `bindings` to
+earlier stage outputs. Bindings are typed references to complete upstream
+streams; they are not expanded into a JSON array before execution. The server
+validates and topologically orders the dependency DAG before starting an
+expensive stage, rejects ambiguous scalar cardinality, and preserves one
+immutable snapshot across the chain. Independent branches may run in
+parallel. The response contains results, provenance, completeness, freshness
+and a continuation; a continuation only pages the already-produced manifest.
+The canonical data port receives the sealed handle for each binding and may
+consume it as a bounded iterator; adapters that only implement the legacy
+operation port are isolated behind an explicit compatibility materialisation
+boundary and cannot change the v3 wire semantics.

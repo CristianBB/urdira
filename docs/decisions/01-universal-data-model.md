@@ -1195,14 +1195,14 @@ CanonicalEncodingConformanceCase
   digest_recipe_id?
   recipe_version?
   expected_outcome
-  expected_cbor_hex?
+  expected_encoding_hex?
   expected_digest_text?
   expected_error_code?
 ```
 
 `CanonicalEncodingErrorCodeDefinition.code` is a stable core-owned error cause. `definition_revision` and `schema_version` follow the common registry rules. `description` defines the exact trigger and non-meaning. `allowed_phases` is a non-empty set drawn from `decode`, `normalize`, `schema_validation`, `recipe_validation`, `hash`, and `verify`. `details_schema` is closed. Lifecycle fields follow the common registry rules. UCE v1 does not allow plugins to extend this low-level error registry; plugin validation maps failures to these core causes. Initial definitions are authoritative in [Core canonical encoding errors](../serialization/core-canonical-encoding-error-codes.md).
 
-`CanonicalEncodingConformanceCase.case_id` is stable within the immutable positive `corpus_revision`. `input_kind` is `logical_value` or `encoded_bytes`; exactly the corresponding `logical_input` or lowercase even-length `encoded_input_hex` is present. The exact schema is always required. Recipe identifier and version are present together exactly when digest behavior is under test. `expected_outcome` is `success` or `error`. Success requires `expected_cbor_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code`. `expected_digest_text` is `Text` matching the selected hash algorithm's one canonical public `Digest` projection; the harness parses it to `Digest` before byte-for-byte comparison, so it is an oracle literal rather than another computed or referenced digest field. Error requires `expected_error_code` and omits success fields. Published cases never change.
+`CanonicalEncodingConformanceCase.case_id` is stable within the immutable positive `corpus_revision`. `input_kind` is `logical_value` or `encoded_bytes`; exactly the corresponding `logical_input` or lowercase even-length `encoded_input_hex` is present. The exact schema is always required. Recipe identifier and version are present together exactly when digest behavior is under test. `expected_outcome` is `success` or `error`. Success requires `expected_encoding_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code`. `expected_digest_text` is `Text` matching the selected hash algorithm's one canonical public `Digest` projection; the harness parses it to `Digest` before byte-for-byte comparison, so it is an oracle literal rather than another computed or referenced digest field. Error requires `expected_error_code` and omits success fields. Published cases never change.
 
 ## Record-kind registry
 
@@ -1826,7 +1826,7 @@ ModelAssetManifest
 | `ModelAssetManifest.weight_asset_digests` | Non-empty ordered duplicate-free list of same-pack asset content digests whose entries have role `model_weight`. List order is the exact shard order consumed by the generator. |
 | `ModelAssetManifest.model_identity_digest` | Digest of exactly the eight preceding fields under `core:model_identity_digest`. The field itself is omitted and the value must equal every referencing `EmbeddingProfile.model_identity_digest`. |
 
-`ModelAssetManifest` is encoded as exact Urdira Canonical Encoding bytes with media type `application/vnd.urdira.model-asset-manifest+cbor` and appears through a `ModelPackAssetEntry` whose semantic role is `model_manifest`. Its asset `content_digest` covers the complete encoded bytes including `model_identity_digest`; the logical `model_identity_digest` independently covers the decoded fields except itself. These domains are intentionally distinct.
+`ModelAssetManifest` is stored as typed logical fields and appears through a `ModelPackAssetEntry` whose semantic role is `model_manifest`. Its asset `content_digest` covers immutable CAS bytes; the logical `model_identity_digest` independently covers the declared fields except itself. These domains are intentionally distinct.
 
 Every embedded profile resolves exactly one same-pack `ModelAssetManifest` by `model_identity_digest`, and provider, model, and revision fields must also agree. Several profiles may share that exact model manifest. Every configuration and weight digest must resolve inside the same pack with the required role, length, media type, and content digest. Model configuration and weight assets are terminal bytes under this graph; paths, filenames, URLs, cross-pack lookup, implicit shard discovery, and undeclared sidecar files are forbidden.
 
@@ -1857,7 +1857,7 @@ TokenizerAssetManifest
 
 The configuration and tokenizer-data lists are disjoint. A digest cannot occur in both lists, and neither list may contain an undeclared, cross-pack, path-resolved, or role-mismatched asset. `tokenizer_format` defines the exact meaning of every list position, so a reordering changes tokenizer identity even when the same blobs remain present.
 
-`TokenizerAssetManifest` is encoded as exact Urdira Canonical Encoding bytes with media type `application/vnd.urdira.tokenizer-asset-manifest+cbor` and appears through a `ModelPackAssetEntry` whose role is `tokenizer_manifest`. Its asset `content_digest` covers the complete encoded bytes including `tokenizer_digest`; the logical tokenizer digest independently covers the decoded fields except itself. These domains are intentionally distinct.
+`TokenizerAssetManifest` is stored as typed logical fields and appears through a `ModelPackAssetEntry` whose role is `tokenizer_manifest`. Its asset `content_digest` covers immutable CAS bytes; the logical tokenizer digest independently covers the declared fields except itself. These domains are intentionally distinct.
 
 Every embedded profile resolves exactly one same-pack tokenizer manifest by `tokenizer_digest`, and tokenizer ID and revision must also agree. Several profiles may share it. The profile's `segmenter` and `generator` runtime requirements must both declare support for the exact `tokenizer_format` through their registered contracts. Failure of canonical decoding, field equality, asset closure, list disjointness, positional interpretation, runtime-format support, or either digest rejects installation atomically.
 
@@ -1887,10 +1887,10 @@ ModelPackRuntimeConfiguration
 | `ModelPackRuntimeConfiguration.component_version` | Exact component release selected by that requirement; ranges, aliases, and platform-selected variants are forbidden. |
 | `ModelPackRuntimeConfiguration.contract_version` | Exact component-contract version selected by that requirement and equal to the profile's `embedding_contract_version`. |
 | `ModelPackRuntimeConfiguration.configuration_schema_id` | Exact closed canonical schema identifier declared by the selected component's matching `RuntimeComponentContractBinding`. Its exact schema version is pinned by that binding and cannot be chosen by the pack. |
-| `ModelPackRuntimeConfiguration.configuration` | Complete typed value validated against that exact schema through Schema IR. It is not opaque JSON or CBOR; unknown fields, untyped values, and schema extensions are rejected. |
+| `ModelPackRuntimeConfiguration.configuration` | Complete typed value validated against that exact schema through Schema IR. It is not opaque JSON; unknown fields, untyped values, and schema extensions are rejected. |
 | `ModelPackRuntimeConfiguration.configuration_digest` | UCE digest of exactly the preceding eight fields under `core:model_pack_runtime_configuration_digest`. The included `runtime_role` separates segmenter and generator meanings. The digest field itself is omitted. |
 
-The complete envelope is encoded as exact Urdira Canonical Encoding bytes with media type `application/vnd.urdira.model-pack-runtime-configuration+cbor`. A `segmenter` value appears through exactly one same-pack `ModelPackAssetEntry` with semantic role `segmentation_configuration`; a `generator` value appears through exactly one entry with role `generator_configuration`. Its asset `content_digest` covers the complete encoded bytes including `configuration_digest`, while the logical configuration digest independently covers the decoded envelope except its own field.
+The complete envelope is stored as typed logical fields. A `segmenter` value appears through exactly one same-pack `ModelPackAssetEntry` with semantic role `segmentation_configuration`; a `generator` value appears through exactly one entry with role `generator_configuration`. Its asset `content_digest` covers immutable CAS bytes, while the logical configuration digest independently covers the envelope except its own field.
 
 Every embedded profile resolves exactly one runtime-configuration asset for each of the two roles. Logical uniqueness is `embedding_profile_id + runtime_role`. The envelope's component ID, component version, and contract version must equal the matching `ModelPackRuntimeRequirement`; the selected runtime definition must expose the corresponding `embedding_segmenter` or `embedding_generator` binding, and the envelope's `configuration_schema_id` must equal the schema ID in that binding. The binding's exact schema version validates `configuration` before either digest is accepted.
 
@@ -3600,7 +3600,7 @@ SourceProviderReadRequest
 SourceProviderReadResult
   artifact_id
   provider_version_token
-  content_bytes
+  content
   content_hash
   byte_length
   metadata_digest

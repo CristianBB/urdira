@@ -1,6 +1,6 @@
 // Runs `reconcileLexicalProjection` (`@urdira/engine`'s `lexical-reconciler.ts`)
 // inside a real `node:worker_threads` worker, so the daemon's own event loop
-// is never blocked by its per-document trigram computation (see
+// is never blocked by its per-document FTS5 insertion (see
 // `lexical-reconciler.ts`'s `yieldToEventLoop` doc comment for the measured
 // multi-minute stall this replaces). This file is the worker thread's
 // *entry point*: it is loaded via `new Worker(new URL(...))` (see

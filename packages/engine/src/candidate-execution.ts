@@ -1,4 +1,5 @@
 import { canonicalSha256 } from "@urdira/plugin-sdk";
+import { LogicalDigestWriter } from "@urdira/canonical";
 import type { ArtifactWorkItem, CandidateProjectionTemplate, IndexCandidate, ProjectionWorkItem } from "@urdira/contracts";
 import type { PluginAnalysisSession } from "@urdira/plugin-sdk";
 import type { AcceptedWorkResult, CandidatePlan, CandidatePlanningWorkItem } from "./candidate-planning.js";
@@ -64,6 +65,7 @@ export class CandidateExecutionError extends Error {
 }
 
 function digest(value: unknown): string { return canonicalSha256(value); }
+function logicalProjectionSetDigest(value: unknown): string { return new LogicalDigestWriter("urdira:projection-set:v3").value(value).digest(); }
 
 function isProjection(item: CandidatePlanningWorkItem): item is ProjectionWorkItem & { readonly work_item_id: string } {
   return "projection_work_item_id" in item;
@@ -121,7 +123,9 @@ function projectionSuccess(
   if (!exactShape(set, ["projections", "projection_set_digest"])) invalid("Projection worker output contains an unknown projection-set field.");
   const projections = set["projections"];
   const projectionSetDigest = set["projection_set_digest"];
-  if (!Array.isArray(projections) || typeof projectionSetDigest !== "string" || projectionSetDigest !== digest(projections)) throw executionError(item, "core:projection_digest_mismatch", "Projection set digest does not match its canonical projections.", { expected_digest: digest(projections), actual_digest: projectionSetDigest });
+  const canonicalDigest = Array.isArray(projections) ? digest(projections) : undefined;
+  const logicalDigest = Array.isArray(projections) ? logicalProjectionSetDigest(projections) : undefined;
+  if (!Array.isArray(projections) || typeof projectionSetDigest !== "string" || (projectionSetDigest !== canonicalDigest && projectionSetDigest !== logicalDigest)) throw executionError(item, "core:projection_digest_mismatch", "Projection set digest does not match its canonical or logical projections.", { expected_digest: logicalDigest ?? canonicalDigest, legacy_expected_digest: canonicalDigest, actual_digest: projectionSetDigest });
   const expectedFields = ["projection_record_id", "projection_kind", "projection_key", "workspace_id", "owner_artifact_id", "owner_artifact_version_id", "source_artifact_version_ids", "source_record_ids", "source_projection_record_ids", "generator", "generator_version", "generator_configuration_digest", "payload"].sort().join("\0");
   const artifactSources = new Set(context.base_artifact_version_ids);
   const recordSources = new Set(context.base_record_ids);

@@ -3,24 +3,28 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import type { ArtifactWorkItem, ReplacementScope, SnapshotCapabilityStateEntry } from "@urdira/contracts";
+import { validateFactDeltaBatch, type ArtifactWorkItem, type FactDeltaBatch, type ReplacementScope, type SnapshotCapabilityStateEntry } from "@urdira/contracts";
 import { parseCliArgs, runCli, type CliCommand, type CliResult } from "@urdira/cli";
-import { createPersistentWorkspaceRegistry, DaemonClient, DaemonRuntime, EndpointDescriptorStore, daemonPaths, type DaemonRuntimeOptions, type SemanticProviderDescriptor } from "@urdira/daemon";
+import { createPersistentWorkspaceRegistry, DaemonClient, DaemonRuntime, EndpointDescriptorStore, daemonPaths, type DaemonRuntimeOptions, type DaemonStartupPhase, type SemanticProviderDescriptor } from "@urdira/daemon";
 import {
   candidateTargetRegistryFromSnapshot,
+  compactAcceptedFactDelta,
   createCanonicalPluginDigestAuthority,
   FactDeltaAcceptanceService,
   readPersistedControlState,
-  type AcceptedFactDelta,
+  type MaterializationAcceptedFactDelta,
   type WorkspaceScanPluginProvider,
   type WorkspaceScanSourceArtifact,
 } from "@urdira/engine";
-import { serveUrdiraStdio, type ServeUrdiraStdioOptions, type UrdiraMcpClient } from "@urdira/mcp";
+import { MCP_BENCHMARK_INSTRUCTIONS, buildBenchmarkInstructions, serveUrdiraStdio, type ServeUrdiraStdioOptions, type UrdiraMcpClient } from "@urdira/mcp";
+export { MCP_BENCHMARK_INSTRUCTIONS, buildBenchmarkInstructions } from "@urdira/mcp";
+import type { PluginWorkerRequestEnvelope } from "@urdira/plugin-sdk";
 import {
   bundledPluginCatalogEntry,
   createJavascriptTypescriptInstalledBundle,
   createJavascriptTypescriptThreadTransport,
   createJavascriptTypescriptWorker,
+  iterateNativeFactDeltaBatches,
   languageForPath,
   JAVASCRIPT_TYPESCRIPT_CAPABILITIES,
   JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES,
@@ -52,12 +56,17 @@ export interface UrdiraRunOptions {
   readonly daemon?: DaemonRuntimeOptions;
   readonly execute_admin?: (command: CliCommand, preview: unknown) => Promise<unknown>;
   readonly prompt?: (question: string) => Promise<string | boolean>;
+  readonly on_startup_progress?: (phase: DaemonStartupPhase) => void;
 }
 
-export const URDIRA_VERSION = "0.2.0";
+export const URDIRA_VERSION = "0.2.2";
+
+function urdiraHelpLegacy(): string {
+  return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace add <path> [--dry-run]\n  urdira workspace configure <id> [--dry-run]\n  urdira workspace remove <id> [--dry-run|--confirm]\n  urdira workspace purge <id> [--dry-run|--confirm]\n  urdira daemon start\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n\nWorkspace add/configure and daemon start/stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;
+}
 
 export function urdiraHelp(): string {
-  return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace add <path> [--dry-run]\n  urdira workspace configure <id> [--dry-run]\n  urdira workspace remove <id> [--dry-run|--confirm]\n  urdira workspace purge <id> [--dry-run|--confirm]\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n\nWorkspace add/configure and daemon stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;
+  return `${urdiraHelpLegacy()}  urdira migrate --to-data-format 3 --reindex [--confirm]\n`;
 }
 
 export interface UrdiraMcpRunOptions {
@@ -67,7 +76,7 @@ export interface UrdiraMcpRunOptions {
   readonly request_timeout_ms?: number;
   readonly stdio?: ServeUrdiraStdioOptions;
   /** Optional narrowed MCP projection used by focused benchmark clients. */
-  readonly tool_names?: readonly ("urdira_query" | "urdira_index_status")[];
+  readonly tool_names?: readonly ("urdira_query" | "urdira_context" | "urdira_analyze_change" | "urdira_build_context" | "urdira_index_status")[];
   /** Optional compact instructions paired with a narrowed tool projection. */
   readonly instructions?: string;
   /** Optional compact input schemas for a focused benchmark projection. */
@@ -281,7 +290,7 @@ function javascriptTypescriptAccessManifest(workItemId: string, analysisContextD
   };
 }
 
-function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTypescriptRegistry, workspaceId: string, registrySnapshotId: string, configurationRevisionId: string, now: string, analysisCacheDir?: string, analysisWorkerPool?: AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>, analysisWorkerShardCount = 2): WorkspaceScanPluginProvider {
+function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTypescriptRegistry, workspaceId: string, registrySnapshotId: string, configurationRevisionId: string, now: string, casRoot: string, analysisCacheDir?: string, analysisWorkerPool?: AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>, analysisWorkerShardCount = 2, acceptNativeBatch?: (candidateGenerationId: string, factDeltaId: string, batch: FactDeltaBatch) => Promise<void>): WorkspaceScanPluginProvider {
   const configuration = {
     configuration_revision_id: configurationRevisionId,
     schema_version: 1,
@@ -326,12 +335,15 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
     registry_contribution_digest: prepared.plugin.contribution.contribution_digest,
     analysis_digest: prepared.plugin.compatibility.analysis_digest,
     analysis_configuration_digest: prepared.plugin.analysis_configuration_digest,
+    cas_root: casRoot,
     ...(analysisCacheDir === undefined ? {} : { analysis_cache_dir: analysisCacheDir }),
+    native_batch_transport: "host",
   };
   const workerDescriptorDigest = canonicalSha256(workerDescriptor);
 
   return {
     supports_progressive_publication: true,
+    supports_native_content_refs: true,
     registry_snapshot_id: registrySnapshotId,
     configuration_revision_id: configurationRevisionId,
     registry: prepared.registry,
@@ -370,6 +382,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       const artifactVersions = artifacts.map((artifact) => ({ artifact_id: artifact.artifact_id, artifact_version_id: artifact.artifact_version_id, content_hash: artifact.content_hash }));
       const targetRegistry = candidateTargetRegistryFromSnapshot({ registry: prepared.registry, artifact_versions: artifactVersions });
       const acceptance = new FactDeltaAcceptanceService();
+      const native_batches: { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[] = [];
       // Real analysis: the compiled `@urdira/plugin-javascript-typescript`
       // worker runs the pinned TypeScript checker over the scanned files.
       // Default (`URDIRA_ANALYSIS_THREAD` unset or truthy): a real
@@ -406,7 +419,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         ? analysisWorkerPool.acquire(closureWorkerKey, workerDescriptor, workerDescriptorDigest)
         : (analysisThreadEnabled() ? createJavascriptTypescriptThreadTransport(workerDescriptor) : createJavascriptTypescriptWorker(workerDescriptor));
       const sourceArtifacts = artifacts.filter((artifact) => languageForPath(artifact.path) !== undefined);
-      const accepted: AcceptedFactDelta[] = [];
+      const accepted: MaterializationAcceptedFactDelta[] = [];
       const changedArtifactIds = changed_artifact_ids === undefined ? undefined : new Set(changed_artifact_ids);
       // The JavaScript/TypeScript provider owns only language-plugin source
       // artifacts. A reconciliation that changes only JSON, Markdown, or
@@ -449,7 +462,8 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       const closureStartedAt = performance.now();
       let closureResponse: {
         readonly payload: {
-          readonly dependency_closures: Readonly<Record<string, { readonly files: readonly string[]; readonly complete: boolean }>>;
+          readonly dependency_closures?: Readonly<Record<string, { readonly files: readonly string[]; readonly complete: boolean }>>;
+          readonly dependency_graph?: Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>>;
           readonly impactful_changed_paths?: readonly string[];
         };
       } | undefined;
@@ -457,10 +471,15 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       try {
         closureResponse = !needsSemanticClosure || sourceArtifacts.length === 0 ? undefined : await worker.invoke({
         protocol_version: "1.0.0", request_id: closureRequestId, request_digest: canonicalSha256({ request_id: closureRequestId, inputs_digest: inputsDigest }), call: "analyze_closure", deadline: "2099-01-01T00:00:00.000Z", cancellation_id: `cancel:${closureRequestId}`,
-        payload: { files: artifacts, root_names: rootNames, ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
+        // The language worker must never receive non-source workspace files.
+        // They are part of the source catalog, but cannot participate in the
+        // TypeScript program and would otherwise be decoded and retained in
+        // the worker's project graph for no semantic benefit.
+        payload: { files: sourceArtifacts, root_names: rootNames, ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
       }) as {
         readonly payload: {
-          readonly dependency_closures: Readonly<Record<string, { readonly files: readonly string[]; readonly complete: boolean }>>;
+          readonly dependency_closures?: Readonly<Record<string, { readonly files: readonly string[]; readonly complete: boolean }>>;
+          readonly dependency_graph?: Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>>;
           /**
            * Changed paths (a subset of `changedPaths`, below) whose
            * dependent-visible surface actually differs from what the
@@ -485,6 +504,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       closureWorkerRetained = true;
       const closureMs = needsSemanticClosure ? Math.round(performance.now() - closureStartedAt) : 0;
       const dependencyClosures = closureResponse?.payload.dependency_closures ?? {};
+      const dependencyGraph = closureResponse?.payload.dependency_graph;
       const impactfulChangedPaths = closureResponse?.payload.impactful_changed_paths === undefined ? undefined : new Set(closureResponse.payload.impactful_changed_paths);
       // 5.3: only owners actually affected by this scan get fresh
       // `analyze_artifact` work; every other owner's records survive
@@ -510,22 +530,61 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // only safe choice is to treat that owner as affected rather than risk
       // silently skipping a real dependent.
       const changedPaths = changedArtifactIds === undefined ? undefined : new Set(artifacts.filter((artifact) => changedArtifactIds.has(artifact.artifact_id)).map((artifact) => artifact.path));
+      const reverseReachable = (seeds: ReadonlySet<string>): ReadonlySet<string> => {
+        if (dependencyGraph === undefined) return seeds;
+        const reverse = new Map<string, string[]>();
+        for (const [source, node] of Object.entries(dependencyGraph)) for (const dependency of node.direct_files) {
+          const dependents = reverse.get(dependency);
+          if (dependents === undefined) reverse.set(dependency, [source]);
+          else dependents.push(source);
+        }
+        const reachable = new Set(seeds);
+        const queue = [...seeds];
+        for (let index = 0; index < queue.length; index += 1) for (const dependent of reverse.get(queue[index]!) ?? []) {
+          if (reachable.has(dependent)) continue;
+          reachable.add(dependent);
+          queue.push(dependent);
+        }
+        return reachable;
+      };
+      // An unresolved local dependency anywhere in an owner's reachable graph
+      // keeps the conservative "affected" behavior used by transitive
+      // closures, without materializing one closure array per owner.
+      const graphIncompleteOwners = dependencyGraph === undefined
+        ? new Set<string>()
+        : reverseReachable(new Set(Object.entries(dependencyGraph).filter(([, node]) => !node.complete).map(([path]) => path)));
+      const graphAffectedOwners = changedPaths === undefined
+        ? undefined
+        : reverseReachable(impactfulChangedPaths ?? changedPaths);
       const isAffectedOwner = (owner: WorkspaceScanSourceArtifact): boolean => {
         if (changedPaths === undefined) return true;
         if (changedPaths.has(owner.path)) return true;
+        if (dependencyGraph !== undefined) {
+          if (dependencyGraph[owner.path] === undefined || graphIncompleteOwners.has(owner.path)) return true;
+          return graphAffectedOwners?.has(owner.path) ?? true;
+        }
         const closure = dependencyClosures[owner.path];
         if (closure === undefined || !closure.complete) return true;
         if (impactfulChangedPaths !== undefined) return closure.files.some((path) => impactfulChangedPaths.has(path));
         return closure.files.some((path) => changedPaths.has(path));
       };
       const affectedOwners = sourceArtifacts.filter(isAffectedOwner);
-      // Per-owner plans (work item, replacement scope, access manifest, and
-      // the worker request envelope) are pure, cheap, synchronous
-      // computations over already-known data -- precomputing all of them
-      // upfront lets the loop below pipeline `worker.invoke` for owner i+1
-      // with `acceptance.accept` (CPU-bound, main-thread) for owner i,
-      // instead of the two ever waiting on each other.
-      const plans = affectedOwners.map((owner) => {
+      // A TypeScript checker keeps a complete program graph in each worker.
+      // Duplicating that graph across two workers is faster for ordinary
+      // workspaces, but becomes the dominant memory cost on large repositories
+      // (VS Code crossed 10 GiB before this cap). Keep one checker for a large
+      // corpus; the requests remain bounded and correctness is unchanged.
+      const sourceByteLength = sourceArtifacts.reduce((total, artifact) => total + artifact.byte_length, 0);
+      const largeWorkspace = sourceArtifacts.length >= 4_096 || sourceByteLength >= 128 * 1024 * 1024;
+      type AnalysisPlan = {
+        readonly planIndex: number;
+        readonly workItem: ArtifactWorkItem & { readonly candidate_generation_id: string; readonly base_snapshot_id?: string };
+        readonly scope: ReplacementScope;
+        readonly manifest: AutomaticPluginInputAccessManifest;
+        readonly contextDigest: string;
+        readonly request: PluginWorkerRequestEnvelope;
+      };
+      const buildPlan = (owner: WorkspaceScanSourceArtifact, planIndex: number): AnalysisPlan => {
         const workItemId = `work:${owner.artifact_id}`;
         const contextDigest = canonicalSha256({ registry: prepared.registry.registry_digest, owner: owner.artifact_version_id, inputs_digest: inputsDigest });
         const scope: ReplacementScope = {
@@ -561,23 +620,53 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         // every cross-file relation TARGET's artifact version to be inside
         // this manifest, and the closure is built (in `analyzer.ts`'s
         // `relate`) to be a superset of exactly that.
+        const graphNode = dependencyGraph?.[owner.path];
         const closure = dependencyClosures[owner.path];
-        const narrowed = closure !== undefined && closure.complete;
-        const ownerArtifacts = narrowed
-          ? closure.files.map((path) => artifactsByPath.get(path)).filter((artifact): artifact is WorkspaceScanSourceArtifact => artifact !== undefined)
-          : artifacts;
+        const narrowedPaths = graphNode !== undefined
+          ? [...new Set([owner.path, ...graphNode.direct_files])].sort()
+          : closure !== undefined && closure.complete ? closure.files : undefined;
+        const narrowed = narrowedPaths !== undefined;
+        const ownerArtifacts = narrowedPaths !== undefined
+          ? narrowedPaths.map((path) => artifactsByPath.get(path)).filter((artifact): artifact is WorkspaceScanSourceArtifact => artifact !== undefined)
+          : sourceArtifacts;
         const ownerManifestEntries = narrowed ? javascriptTypescriptAccessManifestEntries(ownerArtifacts.map((artifact) => ({ artifact_id: artifact.artifact_id, artifact_version_id: artifact.artifact_version_id, content_hash: artifact.content_hash }))) : manifestEntries;
         const manifest = javascriptTypescriptAccessManifest(workItemId, contextDigest, ownerManifestEntries);
         const analysisInputDigest = canonicalSha256({ owner: owner.path, inputs_digest: narrowed ? canonicalSha256(ownerManifestEntries) : manifestEntriesDigest });
         const request = {
           protocol_version: "1.0.0", request_id: manifest.request_id, request_digest: analysisInputDigest, call: "analyze_artifact" as const, deadline: "2099-01-01T00:00:00.000Z", cancellation_id: `cancel:${workItemId}`,
-          payload: { files: ownerArtifacts, root_names: narrowed ? closure.files : rootNames, owner_path: owner.path, work_item: workItem, accepted_manifest: manifest, analysis_digest: prepared.plugin.compatibility.analysis_digest, analysis_configuration_digest: prepared.plugin.analysis_configuration_digest, analysis_input_digest: analysisInputDigest, created_at: now, ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
+          payload: { files: ownerArtifacts, root_names: narrowedPaths ?? rootNames, owner_path: owner.path, work_item: workItem, accepted_manifest: manifest, analysis_digest: prepared.plugin.compatibility.analysis_digest, analysis_configuration_digest: prepared.plugin.analysis_configuration_digest, analysis_input_digest: analysisInputDigest, created_at: now, ...(dependencyGraph === undefined ? {} : { bounded_syntax: true }), ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
         };
-        return { workItem, scope, manifest, contextDigest, request };
-      });
-      const shardCount = Math.max(1, Math.min(analysisWorkerShardCount, plans.length || 1));
-      const shards = Array.from({ length: shardCount }, (_, shard) => plans.filter((_, index) => index % shardCount === shard));
-      const invokeShard = async (shard: typeof plans, shardIndex: number): Promise<readonly { readonly plan: typeof plans[number]; readonly response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown } } } }[]> => {
+        return { workItem, scope, manifest, contextDigest, request, planIndex };
+      };
+      // Ordinary workspaces keep the existing two-stage pipeline. Large
+      // workspaces deliberately do not materialise 10k+ request envelopes and
+      // closure-sized file arrays: one plan is built, consumed, and released
+      // before the next owner is planned. This preserves order and bounded
+      // worker backpressure without retaining a corpus-sized plan graph.
+      const plans: readonly AnalysisPlan[] | undefined = largeWorkspace ? undefined : affectedOwners.map(buildPlan);
+      const planCount = plans?.length ?? affectedOwners.length;
+      const shardCount = Math.max(1, Math.min(largeWorkspace ? 1 : analysisWorkerShardCount, planCount || 1));
+      const shards = plans === undefined ? [] : Array.from({ length: shardCount }, (_, shard) => plans.filter((_, index) => index % shardCount === shard));
+      const acceptanceStartedAt = performance.now();
+      const consumePlanResponse = async (response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } }, plan: AnalysisPlan): Promise<MaterializationAcceptedFactDelta> => {
+        const delta = await acceptance.accept({ candidate, work_item: plan.workItem, raw_delta: response.payload.validation_input.raw_delta, accepted_manifest: plan.manifest, expected_replacement_scopes: [plan.scope], target_registry: targetRegistry, base_records: [], base_record_dependencies: [], staged_records: [], analysis_context_digest: plan.contextDigest });
+        const nativeBatches = response.payload.fact_delta_batches
+          ?? (response.payload.fact_delta_batch === undefined ? [] : [response.payload.fact_delta_batch]);
+        const batches = nativeBatches.length > 0 ? nativeBatches : iterateNativeFactDeltaBatches(delta.delta);
+        let batchIndex = 0;
+        let finalSeen = false;
+        for (const batch of batches) {
+          if (finalSeen) throw new Error("Plugin FactDelta batches cannot contain rows after a final batch.");
+          validateFactDeltaBatch(batch, batchIndex);
+          if (acceptNativeBatch !== undefined) await acceptNativeBatch(candidate.candidate_generation_id, delta.delta.fact_delta_id, batch);
+          else native_batches.push({ fact_delta_id: delta.delta.fact_delta_id, batch });
+          finalSeen = batch.final;
+          batchIndex += 1;
+        }
+        if (batchIndex > 0 && !finalSeen) throw new Error("Plugin FactDelta batches must terminate with a final batch.");
+        return compactAcceptedFactDelta(delta);
+      };
+      const invokeShard = async (shard: readonly AnalysisPlan[], shardIndex: number): Promise<readonly { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[]> => {
         if (shard.length === 0) return [];
         const shardKey = `${workspace_id}:shard:${shardIndex}`;
         const ownsClosureWorker = shardIndex === 0;
@@ -596,15 +685,19 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
               call: "analyze_closure",
               deadline: "2099-01-01T00:00:00.000Z",
               cancellation_id: `cancel:${shardClosureRequestId}`,
-              payload: { files: artifacts, root_names: rootNames, ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
+              payload: { files: sourceArtifacts, root_names: rootNames, ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
             });
           }
-          const results: { plan: typeof plans[number]; response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown } } } }[] = [];
+          const results: { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[] = [];
           let pending = shardWorker.invoke(shard[0]!.request);
           pending.catch(() => undefined);
           for (let index = 0; index < shard.length; index += 1) {
-            const response = await pending as { readonly payload: { readonly validation_input: { readonly raw_delta: unknown } } };
-            results.push({ plan: shard[index]!, response });
+            const response = await pending as { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } };
+            const plan = shard[index]!;
+            // Accept each response before releasing it. Retaining every raw
+            // FactDelta until all owners finish doubles the peak heap for a
+            // large workspace and was the direct cause of the VS Code OOM.
+            results.push({ plan_index: plan.planIndex, delta: await consumePlanResponse(response, plan) });
             if ((index + 1) % 100 === 0 || index + 1 === shard.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=${shardIndex} completed=${index + 1}/${shard.length}`);
             if (index + 1 < shard.length) {
               pending = shardWorker.invoke(shard[index + 1]!.request);
@@ -622,35 +715,73 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         }
       };
       const workerStartedAt = performance.now();
-      const shardResults = (await Promise.all(shards.map((shard, shardIndex) => invokeShard(shard, shardIndex)))).flat();
-      if (plans.length === 0 && closureWorkerRetained) {
+      let shardResults: readonly { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[] = [];
+      if (plans !== undefined) {
+        shardResults = (await Promise.all(shards.map((shard, shardIndex) => invokeShard(shard, shardIndex)))).flat().sort((left, right) => left.plan_index - right.plan_index);
+      } else if (affectedOwners.length > 0) {
+        // Large workspaces use a single bounded owner stream. At most one
+        // request envelope, one worker response, and one accepted delta are
+        // live at each step; no corpus-sized `plans` or `shards` array exists.
+        let currentPlan = buildPlan(affectedOwners[0]!, 0);
+        let pending = worker.invoke(currentPlan.request);
+        pending.catch(() => undefined);
+        try {
+          for (let index = 0; index < affectedOwners.length; index += 1) {
+            const response = await pending as { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } };
+            accepted.push(await consumePlanResponse(response, currentPlan));
+            if ((index + 1) % 100 === 0 || index + 1 === affectedOwners.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=0 completed=${index + 1}/${affectedOwners.length}`);
+            if (index + 1 < affectedOwners.length) {
+              currentPlan = buildPlan(affectedOwners[index + 1]!, index + 1);
+              pending = worker.invoke(currentPlan.request);
+              pending.catch(() => undefined);
+            }
+          }
+        } finally {
+          if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
+          else await worker.terminate();
+          closureWorkerRetained = false;
+        }
+      }
+      if ((plans === undefined ? affectedOwners.length : plans.length) === 0 && closureWorkerRetained) {
         if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
         else await worker.terminate();
         closureWorkerRetained = false;
       }
-      const responses = new Map(shardResults.map((entry) => [entry.plan.workItem.work_item_id, entry]));
-      const acceptanceStartedAt = performance.now();
-      for (const plan of plans) {
-        const result = responses.get(plan.workItem.work_item_id);
-        if (result === undefined) throw new Error(`Missing analysis response for ${plan.workItem.work_item_id}.`);
-        accepted.push(await acceptance.accept({ candidate, work_item: plan.workItem, raw_delta: result.response.payload.validation_input.raw_delta, accepted_manifest: plan.manifest, expected_replacement_scopes: [plan.scope], target_registry: targetRegistry, base_records: [], base_record_dependencies: [], staged_records: [], analysis_context_digest: plan.contextDigest }));
+      // Keep the accepted deltas as the durable candidate input, but avoid a
+      // second array allocation for the large-workspace summary path. The
+      // deltas already retain the analyzer's structured facts and may occupy
+      // gigabytes on a repository-sized first scan.
+      for (const entry of shardResults) accepted.push(entry.delta);
+      console.error(`[urdira] analyze timings ${workspace_id} owners=${planCount} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(performance.now() - workerStartedAt), acceptance: Math.round(performance.now() - acceptanceStartedAt), shards: shardCount, plan_mode: largeWorkspace ? "stream" : "materialized" })}`);
+      // Summarize claims in place. `flatMap` here used to briefly duplicate
+      // every completeness claim while the accepted deltas were still live,
+      // which was enough to push large TypeScript workspaces over V8's heap
+      // limit. The sets preserve the previous deterministic result without a
+      // project-sized intermediate array.
+      const reasonCodeSet = new Set<string>();
+      const affectedArtifactIdSet = new Set<string>();
+      const incompleteCapabilities = new Set<string>();
+      for (const delta of accepted) {
+        for (const claim of delta.delta.completeness_claims) {
+          for (const reasonCode of JSON.parse(claim.reason_codes) as string[]) reasonCodeSet.add(reasonCode);
+          for (const artifactId of JSON.parse(claim.affected_artifact_ids) as string[]) affectedArtifactIdSet.add(artifactId);
+          if (claim.status !== "complete") incompleteCapabilities.add(claim.capability);
+        }
       }
-      console.error(`[urdira] analyze timings ${workspace_id} owners=${plans.length} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(performance.now() - workerStartedAt), acceptance: Math.round(performance.now() - acceptanceStartedAt), shards: shardCount })}`);
-      const claims = accepted.flatMap((delta) => delta.delta.completeness_claims);
-      const reasonCodes = [...new Set(claims.flatMap((claim) => JSON.parse(claim.reason_codes) as string[]))].sort();
-      const affectedArtifactIds = [...new Set(claims.flatMap((claim) => JSON.parse(claim.affected_artifact_ids) as string[]))].sort();
+      const reasonCodes = [...reasonCodeSet].sort();
+      const affectedArtifactIds = [...affectedArtifactIdSet].sort();
       const capability_state_entries: SnapshotCapabilityStateEntry[] = completedCapabilities.map((capability) => ({
         capability,
         capability_contract_version: "1.0.0",
         provider_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
         provider_version: JAVASCRIPT_TYPESCRIPT_VERSION,
-        status: stage === undefined || stage.ordinal < 3 || !stageCapabilities.includes(capability) ? "complete" : claims.filter((claim) => claim.capability === capability).every((claim) => claim.status === "complete") ? "complete" : "partial",
+        status: stage === undefined || stage.ordinal < 3 || !stageCapabilities.includes(capability) || !incompleteCapabilities.has(capability) ? "complete" : "partial",
         reason_codes: reasonCodes,
         affected_artifact_ids: affectedArtifactIds,
         diagnostic_record_ids: [],
         ...(stage === undefined ? {} : { publication_stage_id: stage.stage_id, publication_stage_ordinal: stage.ordinal, publication_stage_count: stage.stage_count }),
       }));
-      return { accepted_deltas: accepted, capability_state_entries };
+      return { accepted_deltas: accepted, capability_state_entries, native_batches };
     },
   };
 }
@@ -712,7 +843,7 @@ function createResolveJavascriptTypescriptPluginProvider(analysisCacheDir?: stri
     const { registry, now } = await entry;
     const registrySnapshotId = registry.registry.registry_snapshot_id;
     const configurationRevisionId = `configuration:${workspace.workspace_id}:${registry.lock.resolution_lock_id}`;
-    return buildJavascriptTypescriptPluginProvider(registry, workspace.workspace_id, registrySnapshotId, configurationRevisionId, now, analysisCacheDir, analysisWorkerPool, analysisWorkerShardCount);
+    return buildJavascriptTypescriptPluginProvider(registry, workspace.workspace_id, registrySnapshotId, configurationRevisionId, now, database.casRoot, analysisCacheDir, analysisWorkerPool, analysisWorkerShardCount, async (candidateGenerationId, factDeltaId, batch) => { await database.candidates.acceptNativeFactDeltaBatch(candidateGenerationId, factDeltaId, batch); });
   };
 }
 
@@ -739,14 +870,14 @@ function warmRecordsBudgetMbEnv(): number | undefined {
 }
 
 // Default ON: a kill switch, not an opt-in. Lexical projection generation
-// (`lexical_documents`/`lexical_trigrams`) now runs as an async, post-ready
+// (`lexical_documents`/`lexical_fts`) now runs as an async, post-ready
 // maintenance job (`reconcileLexicalProjection`, `@urdira/engine`'s
 // `lexical-reconciler.ts`, submitted by `packages/daemon/src/runtime.ts`'s
 // `submitLexicalMaintenance` after every successful scan) rather than
 // inline during the scan itself -- it reads source text from CAS, never the
 // filesystem, and its own try/catch means a failure can never turn a
 // successful scan into a failed one. `core:search_text` prefers this
-// trigram-backed pushdown once it catches up (real file-text search), and
+// FTS5-backed pushdown once it catches up (real file-text search), and
 // transparently falls back to the existing in-memory corpus scan otherwise.
 // `URDIRA_LEXICAL_INDEX=0` (or `false`/`off`/`no`) disables the maintenance
 // job entirely, leaving `core:search_text` on the corpus-scan path forever.
@@ -843,7 +974,7 @@ function resolveSemanticDescriptor(dataRoot: string): SemanticProviderDescriptor
 // Default ON: a kill switch, not an opt-in. See `DaemonRuntimeOptions.lexical_thread`'s
 // doc comment (`packages/daemon/src/runtime.ts`) -- mirrors `URDIRA_ANALYSIS_THREAD`
 // below for the same reason: the lexical maintenance job (when
-// `lexicalIndexEnabled()` above is also on) runs its per-document trigram
+// `lexicalIndexEnabled()` above is also on) runs its per-document FTS5
 // computation in a dedicated `node:worker_threads` worker instead of on the
 // daemon's own event loop. `URDIRA_LEXICAL_THREAD=0` (or `false`/`off`/`no`)
 // forces the prior in-process path instead -- e.g. to rule out the worker
@@ -1072,7 +1203,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   };
 }
 
-async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, startIfMissing = true): Promise<{ readonly endpoint: string; readonly runtime?: DaemonRuntime } | undefined> {
+async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, startIfMissing = true, onStartupProgress?: (phase: DaemonStartupPhase) => void): Promise<{ readonly endpoint: string; readonly runtime?: DaemonRuntime } | undefined> {
   if (endpoint !== undefined) return { endpoint };
   const dataRoot = options?.data_root ?? process.env["URDIRA_DATA_ROOT"] ?? join(homedir(), ".urdira");
   const paths = await daemonPaths(dataRoot);
@@ -1085,7 +1216,16 @@ async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, 
   }
   if (!startIfMissing) return undefined;
   const daemonOptions = options ?? (await defaultDaemonOptions(dataRoot));
-  const runtime = await DaemonRuntime.start(daemonOptions);
+  const configuredProgress = daemonOptions.on_startup_progress;
+  const runtime = await DaemonRuntime.start({
+    ...daemonOptions,
+    ...((configuredProgress === undefined && onStartupProgress === undefined) ? {} : {
+      on_startup_progress: (phase) => {
+        configuredProgress?.(phase);
+        if (onStartupProgress !== configuredProgress) onStartupProgress?.(phase);
+      },
+    }),
+  });
   return { endpoint: runtime.endpoint, runtime };
 }
 
@@ -1094,12 +1234,13 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
   // expensive composed runtime merely to discover a local CLI error, and a
   // stop request must not create the daemon it intends to stop.
   const command = parseCliArgs(argv);
-  const daemon = command.name === "stop"
-    ? await resolveDaemon(options.daemon, options.endpoint, false)
-    : await resolveDaemon(options.daemon, options.endpoint);
+  const previewOnlyLifecycle = (command.name === "start" || command.name === "stop") && command.options.dry_run;
+  const daemon = command.name === "stop" || previewOnlyLifecycle
+    ? await resolveDaemon(options.daemon, options.endpoint, false, options.on_startup_progress)
+    : await resolveDaemon(options.daemon, options.endpoint, true, options.on_startup_progress);
   const prompt = options.prompt ?? (process.stdin.isTTY && process.stdout.isTTY ? async (question: string) => {
     const readline = createInterface({ input: process.stdin, output: process.stdout });
-    try { return await readline.question(`${question} [y/N] `); } finally { readline.close(); }
+    try { return await readline.question(`${question} `); } finally { readline.close(); }
   } : undefined);
   const client = daemon === undefined
     ? { call: async () => ({ outcome: "success", payload: { state: "already_stopped" } }) }
@@ -1115,7 +1256,12 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
       read_stdin: async () => { const chunks: Buffer[] = []; for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk)); return Buffer.concat(chunks).toString("utf8"); },
     });
   }
-  finally { if (daemon?.runtime) await daemon.runtime.stop({ force: false }); }
+  finally {
+    // `daemon start` deliberately transfers ownership to the long-lived
+    // process. Every other one-shot CLI call keeps the previous scoped
+    // behavior and tears down a runtime it created only for that request.
+    if (daemon?.runtime && command.name !== "start") await daemon.runtime.stop({ force: false });
+  }
 }
 
 export async function runUrdiraMcp(options: UrdiraMcpRunOptions): Promise<{ readonly close: () => Promise<void> }> {

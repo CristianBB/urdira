@@ -54,8 +54,14 @@ export const JAVASCRIPT_TYPESCRIPT_NAMESPACE = "jsts" as const;
 // 0.3.1 -> 0.3.2: dependency refresh for the Urdira 0.2.0 release; analyzer
 // semantics remain unchanged, but the package identity must not reuse the
 // published 0.3.1 tarball with stale core dependency pins.
+// 0.3.2 -> 0.3.3: dependency refresh for the Urdira 0.2.1 release; analyzer
+// semantics remain unchanged, but the package identity must not reuse the
+// published 0.3.2 tarball with stale core dependency pins.
+// 0.3.3 -> 0.3.4: dependency refresh for the Urdira 0.2.2 release; analyzer
+// semantics remain unchanged, but the package identity must not reuse the
+// published 0.3.3 tarball with stale core dependency pins.
 // bootstrap and sanitized public metadata; analyzer output is unchanged.
-export const JAVASCRIPT_TYPESCRIPT_VERSION = "0.3.2" as const;
+export const JAVASCRIPT_TYPESCRIPT_VERSION = "0.3.4" as const;
 export const TYPESCRIPT_COMPILER_VERSION = TYPESCRIPT_VERSION;
 
 /** Ordered structural publication stages for the bundled analyzer. */
@@ -199,6 +205,17 @@ export interface JsTsDependencyClosure {
   readonly complete: boolean;
 }
 
+/**
+ * Compact stage-1 dependency shape for large workspaces.  Unlike
+ * `JsTsDependencyClosure`, this never materializes a transitive path array per
+ * owner.  The host derives reverse reachability only when an incremental scan
+ * actually needs it and analyzes one owner plus its direct targets at a time.
+ */
+export interface JsTsDirectDependency {
+  readonly direct_files: readonly string[];
+  readonly complete: boolean;
+}
+
 export interface JsTsAnalysisResult {
   readonly language: JsTsLanguage;
   readonly entities: readonly JsTsEntity[];
@@ -210,12 +227,130 @@ export interface JsTsAnalysisResult {
 }
 
 /**
+ * Stage 1 must remain useful on repositories whose source set is too large
+ * for a project-wide TypeScript program to be a reasonable readiness gate.
+ * This bounded lexer deliberately emits only syntax/declaration/module facts;
+ * resolution, types, calls, and diagnostics remain owned by later stages.
+ * Keeping the large-corpus path independent from the checker also means its
+ * memory is proportional to the current source text and result batch rather
+ * than to TypeScript's complete semantic graph.
+ */
+export function isLargeSyntaxCorpus(input: { readonly files: readonly AnalyzerFile[]; readonly root_names?: readonly string[] }): boolean {
+  const rootNames = new Set(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined));
+  let sourceFileCount = 0;
+  let totalBytes = 0;
+  for (const file of input.files) {
+    if (!rootNames.has(file.path) || languageForPath(file.path) === undefined) continue;
+    sourceFileCount += 1;
+    totalBytes += Buffer.byteLength(file.text, "utf8");
+  }
+  return sourceFileCount >= 512 || totalBytes >= 16 * 1024 * 1024;
+}
+
+function resolveLargeSyntaxModule(available: ReadonlySet<string>, from: string, specifier: string): string | undefined {
+  if (!specifier.startsWith(".")) return undefined;
+  const parts = from.split("/"); parts.pop();
+  for (const part of specifier.split("/")) { if (part === "" || part === ".") continue; if (part === "..") parts.pop(); else parts.push(part); }
+  const base = parts.join("/");
+  const extensions = [...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS];
+  for (const candidate of [base, ...extensions.map((extension) => `${base}${extension}`), ...extensions.map((extension) => `${base}/index${extension}`)]) if (available.has(candidate)) return candidate;
+  return undefined;
+}
+
+/**
+ * Scan only the direct import graph required to plan a large stage-1 pass.
+ * It deliberately retains no declarations, relations, ASTs, transitive
+ * closures, or source text after the worker response has been transferred.
+ */
+export function analyzeSyntaxDependencyGraph(input: { readonly files: readonly AnalyzerFile[]; readonly root_names?: readonly string[] }): Readonly<Record<string, JsTsDirectDependency>> {
+  const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].filter((path) => languageForPath(path) !== undefined).sort();
+  const rootNameSet = new Set(rootNames);
+  const sourceFiles = input.files.filter((file) => rootNameSet.has(file.path)).sort((left, right) => left.path.localeCompare(right.path));
+  const available = new Set(sourceFiles.map((file) => file.path));
+  const graph: Record<string, JsTsDirectDependency> = {};
+  const importPattern = /\b(import|export)\b[^;\n]*?\bfrom\s*["']([^"']+)["']|\bimport\s*["']([^"']+)["']/gu;
+  for (const file of sourceFiles) {
+    const direct = new Set<string>();
+    let complete = true;
+    for (const match of file.text.matchAll(importPattern)) {
+      const specifier = match[2] ?? match[3];
+      if (specifier === undefined) continue;
+      const targetPath = resolveLargeSyntaxModule(available, file.path, specifier);
+      if (targetPath !== undefined) direct.add(targetPath);
+      else if (specifier.startsWith(".") && !relativeAssetSpecifier(specifier)) complete = false;
+    }
+    graph[file.path] = { direct_files: [...direct].sort(), complete };
+  }
+  return graph;
+}
+
+/** Always use the bounded, checker-free stage-1 scanner. */
+export function analyzeBoundedSyntaxProject(input: { readonly files: readonly AnalyzerFile[]; readonly root_names?: readonly string[] }): JsTsAnalysisResult {
+  const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].filter((path) => languageForPath(path) !== undefined).sort();
+  const rootNameSet = new Set(rootNames);
+  const sourceFiles = input.files.filter((file) => rootNameSet.has(file.path)).sort((left, right) => left.path.localeCompare(right.path));
+  const available = new Set(sourceFiles.map((file) => file.path));
+  const modules = new Map<string, JsTsEntity>();
+  const entities: JsTsEntity[] = [];
+  const relations: JsTsRelation[] = [];
+  const directEdges = new Map<string, Set<string>>();
+  const incomplete = new Set<string>();
+  for (const file of sourceFiles) {
+    const moduleEntity: JsTsEntity = { id: stableId("module", file.path, 0, file.path), name: file.path, kind: "module", universal_kind: "core:container", path: file.path, start: 0, end: file.text.length, ...(file.text.includes('from "node:test"') || file.text.includes("from 'node:test'") ? { is_test: true } : {}) };
+    modules.set(file.path, moduleEntity); entities.push(moduleEntity);
+  }
+  const declarationPattern = /\b(?:export\s+)?(?:default\s+)?(?:async\s+)?(function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/gu;
+  const addRelation = (kind: string, source: JsTsEntity, target: JsTsEntity | undefined, path: string, start: number, end: number, classification: "confirmed" | "possible"): void => {
+    relations.push({ id: `${JAVASCRIPT_TYPESCRIPT_NAMESPACE}:${kind}:${path}:${start}:${end}:${source.id}:${target?.id ?? "unresolved"}`, kind: `core:${kind}`, source_id: source.id, ...(target === undefined ? {} : { target_id: target.id }), path, start, end, classification });
+  };
+  for (const file of sourceFiles) {
+    const moduleEntity = modules.get(file.path)!;
+    for (const match of file.text.matchAll(declarationPattern)) {
+      const name = match[2]; const declarationKind = match[1];
+      if (name === undefined || declarationKind === undefined) continue;
+      const start = match.index + match[0].lastIndexOf(name);
+      if (start < 0) continue;
+      const kind = declarationKind === "function" ? "function" : declarationKind === "class" ? "class" : declarationKind === "interface" ? "interface" : declarationKind === "type" ? "type" : declarationKind === "enum" ? "enum" : "variable";
+      const universalKind = kind === "function" ? "core:callable" : kind === "variable" ? "core:value" : "core:type";
+      const entity: JsTsEntity = { id: stableId(kind, file.path, start, name), name, kind, universal_kind: universalKind, path: file.path, start, end: start + name.length, parent_id: moduleEntity.id, qualified_name: `${file.path}.${name}` };
+      entities.push(entity);
+      addRelation("contains", moduleEntity, entity, file.path, start, start + name.length, "confirmed");
+    }
+    const importPattern = /\b(import|export)\b[^;\n]*?\bfrom\s*["']([^"']+)["']|\bimport\s*["']([^"']+)["']/gu;
+    for (const match of file.text.matchAll(importPattern)) {
+      const specifier = match[2] ?? match[3]; if (specifier === undefined) continue;
+      const targetPath = resolveLargeSyntaxModule(available, file.path, specifier); const target = targetPath === undefined ? undefined : modules.get(targetPath);
+      const start = match.index; addRelation(match[1] === "export" ? "export" : "import", moduleEntity, target, file.path, start, start + match[0].length, target === undefined ? "possible" : "confirmed");
+      if (targetPath !== undefined) {
+        const edges = directEdges.get(file.path);
+        if (edges === undefined) directEdges.set(file.path, new Set([targetPath]));
+        else edges.add(targetPath);
+      }
+      else if (specifier.startsWith(".") && !relativeAssetSpecifier(specifier)) incomplete.add(file.path);
+    }
+  }
+  entities.sort((left, right) => left.id.localeCompare(right.id)); relations.sort((left, right) => left.id.localeCompare(right.id));
+  const dependencyClosures: Record<string, JsTsDependencyClosure> = {};
+  for (const file of sourceFiles) {
+    const visited = new Set<string>([file.path]); const stack = [file.path]; let complete = true;
+    while (stack.length > 0) { const current = stack.pop()!; if (incomplete.has(current)) complete = false; for (const next of directEdges.get(current) ?? []) if (!visited.has(next)) { visited.add(next); stack.push(next); } }
+    dependencyClosures[file.path] = { files: [...visited].sort(), complete };
+  }
+  return { language: rootNames.some((path) => languageForPath(path) === "javascript") && !rootNames.some((path) => languageForPath(path) === "typescript") ? "javascript" : "typescript", entities, relations, diagnostics: [], complete: true, dependency_closures: dependencyClosures };
+}
+
+/**
  * Build only the facts that are valid after structural stage 1.  This keeps
  * the TypeScript program construction (which is cheap) but deliberately never
  * asks for a checker, symbols, signatures, types, or diagnostics.  Stage 1 is
  * therefore useful while the expensive semantic walk is still pending.
  */
 export function analyzeSyntaxProject(input: { readonly files: readonly AnalyzerFile[]; readonly root_names?: readonly string[]; readonly compiler_options?: Readonly<Record<string, unknown>> }): JsTsAnalysisResult {
+  // The checker path remains valuable for ordinary projects. The threshold
+  // is intentionally lower than the worker's one-process RSS ceiling: a few
+  // thousand modest files can already make TypeScript's project graph
+  // hundreds of megabytes before any useful stage-1 row is published.
+  if (isLargeSyntaxCorpus(input)) return analyzeBoundedSyntaxProject(input);
   const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].sort();
   const sourceFiles = input.files.filter((candidate) => rootNames.includes(candidate.path)).sort((left, right) => left.path.localeCompare(right.path));
   const virtualRoot = "/urdira-workspace";

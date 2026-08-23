@@ -1,0 +1,1592 @@
+{
+  "report_version": 1,
+  "generated_at": "2026-08-22T20:25:24.926Z",
+  "benchmark": {
+    "campaign_id": "expanded-typescript-agent-2026-08-22T18:51:22.455Z",
+    "generated_at": "2026-08-22T18:51:22.455Z",
+    "corpus": "release/benchmarks/expanded-typescript-agent-benchmark.json",
+    "model": "gpt-5.6-luna",
+    "node": "v24.18.1",
+    "samples_per_cell": 1,
+    "arms": [
+      "urdira-typescript"
+    ],
+    "repositories": [
+      {
+        "id": "typescript",
+        "repository": "microsoft/TypeScript",
+        "commit": "b465fdbfe175304d9b977da137b2c178ae1091d3",
+        "tasks": [
+          {
+            "id": "transpile-diagnostic-callback",
+            "complexity": "medium"
+          },
+          {
+            "id": "session-project-event-hook",
+            "complexity": "high"
+          }
+        ]
+      },
+      {
+        "id": "playwright",
+        "repository": "microsoft/playwright",
+        "commit": "644132a6326cb12b0549b0f3c57071143c22b2bb",
+        "tasks": [
+          {
+            "id": "affected-tests-deterministic",
+            "complexity": "medium"
+          },
+          {
+            "id": "reporter-error-isolation",
+            "complexity": "high"
+          }
+        ]
+      },
+      {
+        "id": "prisma",
+        "repository": "prisma/prisma",
+        "commit": "0f37454eec96b193e8b20e8f569e453acd2af644",
+        "tasks": [
+          {
+            "id": "wire-name-validation",
+            "complexity": "medium"
+          },
+          {
+            "id": "mongo-value-set-transform",
+            "complexity": "high"
+          }
+        ]
+      },
+      {
+        "id": "vscode",
+        "repository": "microsoft/vscode",
+        "commit": "038b9225c82c6b75172beda6081c64887692538c",
+        "tasks": [
+          {
+            "id": "language-registry-change-notification",
+            "complexity": "medium"
+          },
+          {
+            "id": "language-provider-registration-idempotence",
+            "complexity": "high"
+          }
+        ]
+      }
+    ],
+    "successful_runs": 8,
+    "failed_runs": 0,
+    "expected_runs": 8,
+    "campaign_gate": {
+      "passed": true
+    }
+  },
+  "price_card_usd_per_million_tokens": {
+    "input": 2,
+    "output": 8,
+    "reasoning": 8
+  },
+  "source_audit": {
+    "sha256": "sha256:f005f58bd7add8c496ab060e185be78c101ed466daf995c7f3a7fc078630693a",
+    "raw_evidence": "Raw transcripts and host logs remain outside the repository; this report contains their derived metrics and grader evidence."
+  },
+  "groups": {
+    "typescript:transpile-diagnostic-callback:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 42781,
+        "mean": 42781
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 292638,
+        "mean": 292638
+      },
+      "total_tokens": {
+        "median": 1373749,
+        "mean": 1373749
+      },
+      "estimated_cost_usd": {
+        "median": 2.83607,
+        "mean": 2.83607
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 5,
+        "mean": 5
+      }
+    },
+    "typescript:session-project-event-hook:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 42689,
+        "mean": 42689
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 435324,
+        "mean": 435324
+      },
+      "total_tokens": {
+        "median": 2183140,
+        "mean": 2183140
+      },
+      "estimated_cost_usd": {
+        "median": 4.517348,
+        "mean": 4.517348
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 8,
+        "mean": 8
+      }
+    },
+    "playwright:affected-tests-deterministic:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 61714,
+        "mean": 61714
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 292058,
+        "mean": 292058
+      },
+      "total_tokens": {
+        "median": 1324884,
+        "mean": 1324884
+      },
+      "estimated_cost_usd": {
+        "median": 2.734788,
+        "mean": 2.734788
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 6,
+        "mean": 6
+      }
+    },
+    "playwright:reporter-error-isolation:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 63243,
+        "mean": 63243
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 294409,
+        "mean": 294409
+      },
+      "total_tokens": {
+        "median": 921008,
+        "mean": 921008
+      },
+      "estimated_cost_usd": {
+        "median": 1.942534,
+        "mean": 1.942534
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 4,
+        "mean": 4
+      }
+    },
+    "prisma:wire-name-validation:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 112291,
+        "mean": 112291
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 222910,
+        "mean": 222910
+      },
+      "total_tokens": {
+        "median": 921574,
+        "mean": 921574
+      },
+      "estimated_cost_usd": {
+        "median": 1.917938,
+        "mean": 1.917938
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 3,
+        "mean": 3
+      }
+    },
+    "prisma:mongo-value-set-transform:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 119397,
+        "mean": 119397
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 249105,
+        "mean": 249105
+      },
+      "total_tokens": {
+        "median": 912912,
+        "mean": 912912
+      },
+      "estimated_cost_usd": {
+        "median": 1.891056,
+        "mean": 1.891056
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 5,
+        "mean": 5
+      }
+    },
+    "vscode:language-registry-change-notification:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 469406,
+        "mean": 469406
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 338020,
+        "mean": 338020
+      },
+      "total_tokens": {
+        "median": 1179829,
+        "mean": 1179829
+      },
+      "estimated_cost_usd": {
+        "median": 2.466344,
+        "mean": 2.466344
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 3,
+        "mean": 3
+      }
+    },
+    "vscode:language-provider-registration-idempotence:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 468481,
+        "mean": 468481
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 292344,
+        "mean": 292344
+      },
+      "total_tokens": {
+        "median": 1106914,
+        "mean": 1106914
+      },
+      "estimated_cost_usd": {
+        "median": 2.313338,
+        "mean": 2.313338
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 5,
+        "mean": 5
+      }
+    }
+  },
+  "runs": [
+    {
+      "run_id": "typescript-transpile-diagnostic-callback-urdira-typescript-1",
+      "repository": "typescript",
+      "task": "transpile-diagnostic-callback",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 42781,
+      "elapsed_ms_from_first_instruction": 292638,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 23,
+        "mcp_calls": 5,
+        "file_change_batches": 4,
+        "input_tokens": 1358987,
+        "cached_input_tokens": 1259520,
+        "uncached_input_tokens": 99467,
+        "output_tokens": 10426,
+        "reasoning_tokens": 4336,
+        "total_tokens": 1373749,
+        "estimated_cost_usd": 2.83607
+      },
+      "host_metrics": {
+        "peak_rss_kib": 2764384,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": 53.54437781109437,
+        "sample_count": 667,
+        "duration_ms": 334948,
+        "sqlite_bytes": 556506592,
+        "cas_bytes": 37154866,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 42172,
+        "readiness_events": [
+          {
+            "elapsed_ms": 319,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 7664,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 42172,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "publishing_structural"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 1156,
+          "source_catalog": 5979,
+          "source_ready_ms": 7135,
+          "enumerated_artifact_count": 852,
+          "cataloged_artifact_count": 852,
+          "stage_plan": 56,
+          "plugin_analyze": 7805,
+          "analyzed_artifact_count": 852,
+          "accepted_delta_count": 756,
+          "seal": 12402,
+          "publish": 33847,
+          "structural_stage_1_ready_ms": 41050,
+          "total": 41050
+        },
+        "analysis_timings": {
+          "closure": 226,
+          "worker_wait": 7560,
+          "acceptance": 7560,
+          "shards": 1,
+          "plan_mode": "materialized"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 37155388,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 37155388,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "src/services/transpile.ts",
+          "src/testRunner/unittests/services/transpile.ts",
+          "tests/baselines/reference/api/typescript.d.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/services/transpile.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "typescript-session-project-event-hook-urdira-typescript-1",
+      "repository": "typescript",
+      "task": "session-project-event-hook",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 42689,
+      "elapsed_ms_from_first_instruction": 435324,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 26,
+        "mcp_calls": 8,
+        "file_change_batches": 9,
+        "input_tokens": 2157962,
+        "cached_input_tokens": 2064896,
+        "uncached_input_tokens": 93066,
+        "output_tokens": 17632,
+        "reasoning_tokens": 7546,
+        "total_tokens": 2183140,
+        "estimated_cost_usd": 4.517348
+      },
+      "host_metrics": {
+        "peak_rss_kib": 2818080,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": 66.19789695057835,
+        "sample_count": 951,
+        "duration_ms": 477398,
+        "sqlite_bytes": 587988448,
+        "cas_bytes": 38366155,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 41944,
+        "readiness_events": [
+          {
+            "elapsed_ms": 315,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 7467,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 41944,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "publishing_structural"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 1155,
+          "source_catalog": 5937,
+          "source_ready_ms": 7093,
+          "enumerated_artifact_count": 852,
+          "cataloged_artifact_count": 852,
+          "stage_plan": 54,
+          "plugin_analyze": 7827,
+          "analyzed_artifact_count": 852,
+          "accepted_delta_count": 756,
+          "seal": 12471,
+          "publish": 33682,
+          "structural_stage_1_ready_ms": 40838,
+          "total": 40838
+        },
+        "analysis_timings": {
+          "closure": 225,
+          "worker_wait": 7583,
+          "acceptance": 7583,
+          "shards": 1,
+          "plan_mode": "materialized"
+        },
+        "byte_telemetry": null,
+        "bytes_read": null,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "src/server/editorServices.ts",
+          "src/server/session.ts",
+          "src/testRunner/unittests/tsserver/session.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/server/session.ts": true,
+          "src/server/editorServices.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-affected-tests-deterministic-urdira-typescript-1",
+      "repository": "playwright",
+      "task": "affected-tests-deterministic",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 61714,
+      "elapsed_ms_from_first_instruction": 292058,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 22,
+        "mcp_calls": 6,
+        "file_change_batches": 1,
+        "input_tokens": 1310714,
+        "cached_input_tokens": 1229312,
+        "uncached_input_tokens": 81402,
+        "output_tokens": 9864,
+        "reasoning_tokens": 4306,
+        "total_tokens": 1324884,
+        "estimated_cost_usd": 2.734788
+      },
+      "host_metrics": {
+        "peak_rss_kib": 1497344,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": 43.886059743954455,
+        "sample_count": 703,
+        "duration_ms": 353055,
+        "sqlite_bytes": 673033720,
+        "cas_bytes": 29134777,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 60738,
+        "readiness_events": [
+          {
+            "elapsed_ms": 264,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 25021,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 57412,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 59884,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 60738,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "publishing_structural"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 2536,
+          "source_catalog": 21990,
+          "source_ready_ms": 24526,
+          "enumerated_artifact_count": 2657,
+          "cataloged_artifact_count": 2657,
+          "stage_plan": 108,
+          "plugin_analyze": 11557,
+          "analyzed_artifact_count": 2657,
+          "accepted_delta_count": 1560,
+          "seal": 10829,
+          "publish": 34886,
+          "structural_stage_1_ready_ms": 59547,
+          "total": 59547
+        },
+        "analysis_timings": {
+          "closure": 261,
+          "worker_wait": 11240,
+          "acceptance": 11240,
+          "shards": 1,
+          "plan_mode": "materialized"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 31202938,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 31202938,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/transform/compilationCache.ts",
+          "tests/playwright-test/only-changed.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/transform/compilationCache.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-reporter-error-isolation-urdira-typescript-1",
+      "repository": "playwright",
+      "task": "reporter-error-isolation",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 63243,
+      "elapsed_ms_from_first_instruction": 294409,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 12,
+        "mcp_calls": 4,
+        "file_change_batches": 7,
+        "input_tokens": 904255,
+        "cached_input_tokens": 849152,
+        "uncached_input_tokens": 55103,
+        "output_tokens": 10845,
+        "reasoning_tokens": 5908,
+        "total_tokens": 921008,
+        "estimated_cost_usd": 1.942534
+      },
+      "host_metrics": {
+        "peak_rss_kib": 1893760,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": 74.83873239436613,
+        "sample_count": 710,
+        "duration_ms": 356918,
+        "sqlite_bytes": 698482720,
+        "cas_bytes": 29134061,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 62268,
+        "readiness_events": [
+          {
+            "elapsed_ms": 265,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 26360,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 62268,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "publishing_structural"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 2516,
+          "source_catalog": 23500,
+          "source_ready_ms": 26017,
+          "enumerated_artifact_count": 2657,
+          "cataloged_artifact_count": 2657,
+          "stage_plan": 115,
+          "plugin_analyze": 11414,
+          "analyzed_artifact_count": 2657,
+          "accepted_delta_count": 1560,
+          "seal": 10897,
+          "publish": 34914,
+          "structural_stage_1_ready_ms": 61076,
+          "total": 61076
+        },
+        "analysis_timings": {
+          "closure": 268,
+          "worker_wait": 11096,
+          "acceptance": 11096,
+          "shards": 1,
+          "plan_mode": "materialized"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 31202222,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 31202222,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/reporters/multiplexer.ts",
+          "tests/playwright-test/reporter-onend.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/reporters/multiplexer.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-wire-name-validation-urdira-typescript-1",
+      "repository": "prisma",
+      "task": "wire-name-validation",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 112291,
+      "elapsed_ms_from_first_instruction": 222910,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 12,
+        "mcp_calls": 3,
+        "file_change_batches": 4,
+        "input_tokens": 909109,
+        "cached_input_tokens": 855296,
+        "uncached_input_tokens": 53813,
+        "output_tokens": 8654,
+        "reasoning_tokens": 3811,
+        "total_tokens": 921574,
+        "estimated_cost_usd": 1.917938
+      },
+      "host_metrics": {
+        "peak_rss_kib": 1619376,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": 78.72687687687686,
+        "sample_count": 666,
+        "duration_ms": 335037,
+        "sqlite_bytes": 1045631920,
+        "cas_bytes": 45425448,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 111620,
+        "readiness_events": [
+          {
+            "elapsed_ms": 263,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 38055,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 106706,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 110407,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 111620,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "publishing_structural"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 6639,
+          "source_catalog": 55516,
+          "source_ready_ms": 62155,
+          "enumerated_artifact_count": 7203,
+          "cataloged_artifact_count": 7203,
+          "stage_plan": 288,
+          "plugin_analyze": 16741,
+          "analyzed_artifact_count": 7203,
+          "accepted_delta_count": 4510,
+          "seal": 14290,
+          "publish": 47533,
+          "structural_stage_1_ready_ms": 110074,
+          "total": 110074
+        },
+        "analysis_timings": {
+          "closure": 400,
+          "worker_wait": 16304,
+          "acceptance": 16304,
+          "shards": 1,
+          "plan_mode": "stream"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 47099911,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 47099911,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "packages/2-sql/1-core/schema-ir/src/exports/naming.ts",
+          "packages/2-sql/1-core/schema-ir/src/naming.ts",
+          "packages/2-sql/1-core/schema-ir/test/naming.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-sql/1-core/schema-ir/src/naming.ts": true,
+          "packages/2-sql/1-core/schema-ir/test/": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-mongo-value-set-transform-urdira-typescript-1",
+      "repository": "prisma",
+      "task": "mongo-value-set-transform",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 119397,
+      "elapsed_ms_from_first_instruction": 249105,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 13,
+        "mcp_calls": 5,
+        "file_change_batches": 3,
+        "input_tokens": 902040,
+        "cached_input_tokens": 848128,
+        "uncached_input_tokens": 53912,
+        "output_tokens": 7954,
+        "reasoning_tokens": 2918,
+        "total_tokens": 912912,
+        "estimated_cost_usd": 1.891056
+      },
+      "host_metrics": {
+        "peak_rss_kib": 1679680,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": 75.23342428376526,
+        "sample_count": 733,
+        "duration_ms": 368488,
+        "sqlite_bytes": 1045800240,
+        "cas_bytes": 45397492,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 118882,
+        "readiness_events": [
+          {
+            "elapsed_ms": 261,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 45127,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 113962,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 117645,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 118882,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "publishing_structural"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 6616,
+          "source_catalog": 63028,
+          "source_ready_ms": 69645,
+          "enumerated_artifact_count": 7203,
+          "cataloged_artifact_count": 7203,
+          "stage_plan": 285,
+          "plugin_analyze": 16893,
+          "analyzed_artifact_count": 7203,
+          "accepted_delta_count": 4510,
+          "seal": 14214,
+          "publish": 47268,
+          "structural_stage_1_ready_ms": 117306,
+          "total": 117306
+        },
+        "analysis_timings": {
+          "closure": 427,
+          "worker_wait": 16432,
+          "acceptance": 16432,
+          "shards": 1,
+          "plan_mode": "stream"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 47051727,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 47051727,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts",
+          "packages/2-mongo-family/1-foundation/mongo-contract/test/ir/mongo-value-set.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts": true,
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/index.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "vscode-language-registry-change-notification-urdira-typescript-1",
+      "repository": "vscode",
+      "task": "language-registry-change-notification",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 469406,
+      "elapsed_ms_from_first_instruction": 338020,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 19,
+        "mcp_calls": 3,
+        "file_change_batches": 4,
+        "input_tokens": 1162048,
+        "cached_input_tokens": 1097728,
+        "uncached_input_tokens": 64320,
+        "output_tokens": 12344,
+        "reasoning_tokens": 5437,
+        "total_tokens": 1179829,
+        "estimated_cost_usd": 2.466344
+      },
+      "host_metrics": {
+        "peak_rss_kib": 4260144,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": 105.19490049751222,
+        "sample_count": 1608,
+        "duration_ms": 808556,
+        "sqlite_bytes": 5355332280,
+        "cas_bytes": 222632044,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 469065,
+        "readiness_events": [
+          {
+            "elapsed_ms": 254,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 48979,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 405442,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 458240,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 469065,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "publishing_structural"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 9136,
+          "source_catalog": 166912,
+          "source_ready_ms": 176049,
+          "enumerated_artifact_count": 17675,
+          "cataloged_artifact_count": 17675,
+          "stage_plan": 685,
+          "plugin_analyze": 83187,
+          "analyzed_artifact_count": 17675,
+          "accepted_delta_count": 12944,
+          "seal": 79891,
+          "publish": 280946,
+          "structural_stage_1_ready_ms": 457936,
+          "total": 457936
+        },
+        "analysis_timings": {
+          "closure": 4449,
+          "worker_wait": 78644,
+          "acceptance": 78644,
+          "shards": 1,
+          "plan_mode": "stream"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 224534403,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 224534403,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "src/vs/editor/common/languageFeatureRegistry.ts",
+          "src/vs/editor/test/common/languageFeatureRegistry.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/vs/editor/common/languageFeatureRegistry.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "vscode-language-provider-registration-idempotence-urdira-typescript-1",
+      "repository": "vscode",
+      "task": "language-provider-registration-idempotence",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 468481,
+      "elapsed_ms_from_first_instruction": 292344,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 13,
+        "command_actions": 18,
+        "mcp_calls": 5,
+        "file_change_batches": 4,
+        "input_tokens": 1090329,
+        "cached_input_tokens": 1010432,
+        "uncached_input_tokens": 79897,
+        "output_tokens": 11456,
+        "reasoning_tokens": 5129,
+        "total_tokens": 1106914,
+        "estimated_cost_usd": 2.313338
+      },
+      "host_metrics": {
+        "peak_rss_kib": 4365792,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": 100.51374752148038,
+        "sample_count": 1513,
+        "duration_ms": 760554,
+        "sqlite_bytes": 5360752464,
+        "cas_bytes": 222637358,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 467016,
+        "readiness_events": [
+          {
+            "elapsed_ms": 269,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 49137,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 467016,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "publishing_structural"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 9003,
+          "source_catalog": 166655,
+          "source_ready_ms": 175658,
+          "enumerated_artifact_count": 17675,
+          "cataloged_artifact_count": 17675,
+          "stage_plan": 672,
+          "plugin_analyze": 83117,
+          "analyzed_artifact_count": 17675,
+          "accepted_delta_count": 12944,
+          "seal": 80872,
+          "publish": 278948,
+          "structural_stage_1_ready_ms": 455543,
+          "total": 455543
+        },
+        "analysis_timings": {
+          "closure": 4462,
+          "worker_wait": 78564,
+          "acceptance": 78564,
+          "shards": 1,
+          "plan_mode": "stream"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 224536659,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 224536659,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "extensions/typescript-language-features/src/languageProvider.ts",
+          "extensions/typescript-language-features/src/test/unit/languageProvider.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "extensions/typescript-language-features/src/languageProvider.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    }
+  ],
+  "campaign_gate": {
+    "expected_runs": 8,
+    "observed_runs": 8,
+    "successful_runs": 8,
+    "failed_or_blocked_runs": 0,
+    "passed": true
+  }
+}

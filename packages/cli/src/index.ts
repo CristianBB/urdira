@@ -105,6 +105,53 @@ function pluginSelectionFromPreview(preview: unknown): { readonly selected_techn
   return { selected_technology_ids, selected_plugin_ids };
 }
 
+function formatWorkspaceTechnologyProposal(preview: unknown): string {
+  const record = preview !== null && typeof preview === "object" ? preview as { readonly technologies?: unknown } : {};
+  const technologies = Array.isArray(record.technologies) ? record.technologies : [];
+  if (technologies.length === 0) return "Detected technologies: none. The workspace will be registered without language plugins.";
+  const lines = ["Detected technologies and compatible plugins:"];
+  for (const value of technologies) {
+    if (typeof value === "string") {
+      lines.push(`  - ${value}`);
+      continue;
+    }
+    if (value === null || typeof value !== "object") continue;
+    const technology = value as { readonly technology_id?: unknown; readonly kind?: unknown; readonly confidence?: unknown; readonly compatible_plugin_ids?: unknown; readonly evidence?: unknown };
+    const id = typeof technology.technology_id === "string" ? technology.technology_id : "unknown";
+    const kind = typeof technology.kind === "string" ? `, ${technology.kind}` : "";
+    const confidence = typeof technology.confidence === "number" ? `, confidence ${Math.round(technology.confidence * 100)}%` : "";
+    lines.push(`  - ${id}${kind}${confidence}`);
+    const plugins = Array.isArray(technology.compatible_plugin_ids) ? technology.compatible_plugin_ids.filter((item): item is string => typeof item === "string") : [];
+    lines.push(`    compatible plugins: ${plugins.length > 0 ? plugins.join(", ") : "none"}`);
+    const evidence = Array.isArray(technology.evidence) ? technology.evidence : [];
+    for (const item of evidence) {
+      if (item === null || typeof item !== "object") continue;
+      const detail = item as { readonly path?: unknown; readonly rule?: unknown; readonly value?: unknown };
+      if (typeof detail.path !== "string" || typeof detail.rule !== "string") continue;
+      lines.push(`    detected from: ${detail.path} (${detail.rule}${typeof detail.value === "string" ? `: ${detail.value}` : ""})`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatWorkspacePluginProposal(preview: unknown): string {
+  const record = preview !== null && typeof preview === "object" ? preview as { readonly technologies?: unknown } : {};
+  const technologies = Array.isArray(record.technologies) ? record.technologies : [];
+  const plugins = [...new Set(technologies.flatMap((value) => {
+    if (value === null || typeof value !== "object") return [];
+    const ids = (value as { readonly compatible_plugin_ids?: unknown }).compatible_plugin_ids;
+    return Array.isArray(ids) ? ids.filter((item): item is string => typeof item === "string") : [];
+  }))];
+  if (plugins.length === 0) return "Compatible plugins: none. Observation will start without a structural language plugin.";
+  return `Compatible plugins to activate: ${plugins.join(", ")}`;
+}
+
+function formatWorkspaceConfigurationTarget(command: CliCommand): string {
+  const target = command.args[0] ?? command.options.values["workspace"] ?? command.options.values["path"] ?? "unknown";
+  const payload = command.options.payload === undefined ? "" : `\nConfiguration payload: ${JSON.stringify(command.options.payload)}`;
+  return `Workspace configuration target: ${target}.${payload}`;
+}
+
 export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDependencies): Promise<CliResult> {
   const command = parseCliArgs(argv);
   if (command.name === "agent-status" || command.name === "agent-install" || command.name === "agent-uninstall" || command.name === "agent-hook") {
@@ -129,12 +176,23 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
   }
   if ((MUTATING_COMMANDS as readonly string[]).includes(command.name)) {
     const mutationName = command.name as (typeof MUTATING_COMMANDS)[number];
-    const directCommand = mutationName === "stop";
+    // Starting and stopping the daemon are idempotent lifecycle requests.
+    // The command itself is the user's intent; neither operation needs a
+    // second --confirm acknowledgement. A dry-run remains available when a
+    // caller explicitly wants the lifecycle proposal without executing it.
+    const directCommand = mutationName === "start" || mutationName === "stop";
+    if (mutationName === "workspace-add" && command.args.length === 0 && command.options.values["path"] === undefined && command.options.values["workspace_root"] === undefined) {
+      throw new CliError("cli:command_invalid", "workspace add requires a workspace path.");
+    }
     const preview = dependencies.preview_admin ? await dependencies.preview_admin(command) : { command: mutationName, call: adminCall[mutationName], args: command.args, values: command.options.values };
     if (!command.options.dry_run && !command.options.confirm && dependencies.prompt && (mutationName === "workspace-add" || mutationName === "workspace-configure")) {
-      const technologyAnswer = await dependencies.prompt(`Confirm detected technologies for ${mutationName}?`);
-      const pluginAnswer = await dependencies.prompt("Confirm compatible plugins and start observation?");
       const accepted = (value: string | boolean): boolean => value === true || (typeof value === "string" && ["y", "yes", "si", "sí"].includes(value.trim().toLocaleLowerCase("en-US")));
+      const technologyAnswer = mutationName === "workspace-add"
+        ? await dependencies.prompt(`${formatWorkspaceTechnologyProposal(preview)}\n\nConfirm these technologies? [y/N]`)
+        : await dependencies.prompt(`${formatWorkspaceConfigurationTarget(command)}\n\nNo technology detection is performed by workspace configure. Apply this configuration? [y/N]`);
+      const pluginAnswer = mutationName === "workspace-add"
+        ? await dependencies.prompt(`${formatWorkspacePluginProposal(preview)}\n\nActivate these plugins and start observation? [y/N]`)
+        : "yes";
       if (!accepted(technologyAnswer) || !accepted(pluginAnswer)) {
         const data = { dry_run: false, confirmed: false, interactive: true, command: mutationName, preview };
         return { exit_code: 0, data, stdout: output(data, command.options.json) };
@@ -142,7 +200,7 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
       const selection = pluginSelectionFromPreview(preview);
       const result = dependencies.execute_admin ? await dependencies.execute_admin(command, preview) : await dependencies.client.call(adminCall[mutationName], { args: command.args, values: command.options.values, ...(command.options.proposal_id === undefined ? {} : { proposal_id: command.options.proposal_id }), ...(command.options.payload === undefined ? {} : { payload: command.options.payload }), selected_technology_ids: selection.selected_technology_ids, selected_plugin_ids: selection.selected_plugin_ids, confirmed: true, preview });
       const resultPayload = "outcome" in (result as object) ? (result as { readonly payload?: unknown; readonly error?: unknown }).payload ?? (result as { readonly error?: unknown }).error ?? result : result;
-      const integrationAnswer = mutationName === "workspace-add" ? await dependencies.prompt("Configure Urdira in an agent now? Enter yes/all, or a comma-separated list (claude-code, codex, opencode, cursor, vscode/copilot, cline, roo, claude-desktop). Enter no to skip.") : undefined;
+      const integrationAnswer = mutationName === "workspace-add" ? await dependencies.prompt("Configure Urdira in an agent now? Enter yes/all, or a comma-separated client list (claude-code, codex, opencode, cursor, vscode/copilot, cline, roo, claude-desktop). Enter no to skip. [yes/all/clients/no]") : undefined;
       const agent_integrations = integrationAnswer === undefined ? undefined : await configureInteractiveAgents(integrationAnswer, dependencies.home_directory, command.args[0]);
       const data = { dry_run: false, confirmed: true, interactive: true, command: mutationName, preview, result: resultPayload, ...(agent_integrations === undefined ? {} : { agent_integrations }) };
       return { exit_code: "outcome" in (result as object) && (result as { readonly outcome: string }).outcome !== "success" ? 1 : 0, data, stdout: output(data, command.options.json, semanticModelNotice(resultPayload)) };

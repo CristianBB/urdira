@@ -1,4 +1,3 @@
-import { decodeCanonical, encodeCanonical } from "@urdira/canonical";
 import type { WorkspaceDatabase } from "@urdira/storage";
 
 /**
@@ -18,7 +17,7 @@ export interface ReconcileLexicalProjectionInput {
   readonly content: LexicalReconcilerContentReader;
   /**
    * Documents whose declared `byte_length` exceeds this are skipped entirely
-   * (never read from CAS, never trigram-indexed) to bound per-file trigram
+   * (never read from CAS or inserted into FTS5) to bound per-file index
    * blowup on giant bundled/generated files. Defaults to 2 MB. A skipped
    * document simply never participates in `core:search_text` pushdown (nor,
    * once pushdown is active for a workspace, in the corpus-scan fallback --
@@ -53,7 +52,7 @@ export interface ReconcileLexicalProjectionResult {
   readonly generation: number;
   /** Lexical documents closed because their owning `artifact_versions` row had itself already closed. */
   readonly closed: number;
-  /** Lexical documents newly inserted (and trigram-indexed) this pass. */
+  /** Lexical documents newly inserted into FTS5 this pass. */
   readonly inserted: number;
   /** Visible, text-encoded versions skipped because their declared byte length exceeded `max_document_bytes`. */
   readonly skipped_oversized: number;
@@ -81,10 +80,9 @@ const DEFAULT_MAX_DOCUMENT_BYTES = 2_000_000;
  * pipes), so a loop of purely-`await`-ed calls can still starve the event
  * loop for as long as their combined *synchronous* work takes. That is
  * exactly this reconciler's actual cost profile: `putLexicalDocument`
- * (`packages/storage/src/projections.ts`) computes `lexicalTrigrams` --
- * a synchronous, allocation-heavy byte-sliding-window scan over an entire
- * document's normalized text -- on this thread, not inside the SQLite
- * worker any `await` here would otherwise be yielding into. Measured on a
+ * (`packages/storage/src/projections.ts`) normalizes and inserts one document
+ * into FTS5 on this thread, not inside the SQLite worker any `await` here
+ * would otherwise be yielding into. Measured on a
  * real 981-file/177k-record repository: readiness was reached at ~222s but
  * the daemon's own status-poll HTTP handler only got scheduled again at
  * ~405s, i.e. roughly three minutes where this reconciler's loop held the
@@ -95,7 +93,7 @@ const DEFAULT_MAX_DOCUMENT_BYTES = 2_000_000;
  * true yield available, letting any pending status-poll response (or other
  * I/O) actually go out between documents instead of only after the entire
  * reconcile pass finishes. This bounds the worst-case per-stall duration to
- * one document's own trigram computation (capped by `max_document_bytes`,
+ * one document's own normalization/FTS5 insertion (capped by `max_document_bytes`,
  * default 2MB) rather than every document in the pass combined.
  */
 function yieldToEventLoop(): Promise<void> {
@@ -116,7 +114,13 @@ function yieldToEventLoop(): Promise<void> {
  */
 function decodeText(bytes: Uint8Array): string | undefined {
   if (bytes.some((byte) => byte === 0)) return undefined;
-  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  // Preserve an explicit UTF-8 BOM. `TextDecoder` otherwise consumes it by
+  // default, so the subsequent `TextEncoder` in `putLexicalDocument` would
+  // produce bytes that no longer match the immutable artifact content hash.
+  // The lexical projection is content-addressed and must round-trip the
+  // source bytes exactly, including BOM-prefixed XML/TS fixtures in real
+  // workspaces.
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
   catch { return undefined; }
 }
 
@@ -128,7 +132,6 @@ function decodeText(bytes: Uint8Array): string | undefined {
 type StaleDocumentRow = {
   readonly artifact_id: string;
   readonly artifact_version_id: string;
-  readonly document_payload: Uint8Array;
   readonly closing_generation: number;
 };
 
@@ -143,7 +146,7 @@ type MissingDocumentRow = {
 /**
  * D4: async post-ready lexical maintenance (`packages/daemon/src/runtime.ts`
  * submits this after every successful scan, see `scheduleWorkspaceScan`).
- * Brings `lexical_documents`/`lexical_trigrams` up to date with
+ * Brings `lexical_documents`/`lexical_fts` up to date with
  * `artifact_versions` as of the workspace's current generation, without ever
  * touching the filesystem -- source text is read from CAS by `content_hash`,
  * exactly like `core:get_source`'s `artifact_text`
@@ -191,15 +194,9 @@ export async function reconcileLexicalProjection(input: ReconcileLexicalProjecti
   // Step 2 (close stale): every OPEN lexical document whose owning
   // artifact_versions row has ITSELF already closed can never be visible at
   // any currently-or-future generation, so it is closed to the same
-  // generation its version closed at. The document_payload BLOB must be
-  // rewritten alongside the column (not just the column): `StorageMaintenance.verify`'s
-  // "lexical" check (`packages/storage/src/lifecycle.ts`) requires the
-  // canonical payload's own `valid_to_generation` to agree with the row's
-  // column, so this decodes the existing payload, adds `valid_to_generation`,
-  // and re-encodes rather than touching the column alone.
   const staleRows = await sql.all<StaleDocumentRow>(
     `SELECT lexical_documents.artifact_id AS artifact_id, lexical_documents.artifact_version_id AS artifact_version_id,
-            lexical_documents.document_payload AS document_payload, artifact_versions.valid_to_generation AS closing_generation
+            artifact_versions.valid_to_generation AS closing_generation
        FROM lexical_documents
        JOIN artifact_versions ON artifact_versions.workspace_id = lexical_documents.workspace_id
         AND artifact_versions.artifact_id = lexical_documents.artifact_id
@@ -214,11 +211,9 @@ export async function reconcileLexicalProjection(input: ReconcileLexicalProjecti
     // checkpoint below it: an abort observed here means this row (and every
     // row after it) is simply left OPEN for the next pass to close instead.
     if (shouldAbort?.()) return { generation, closed, inserted: 0, skipped_oversized: 0, skipped_undecodable: 0, marker_written: false, aborted: true };
-    const decoded = decodeCanonical(row.document_payload) as Record<string, unknown>;
-    const closedPayload = encodeCanonical({ ...decoded, valid_to_generation: row.closing_generation });
     await sql.run(
-      "UPDATE lexical_documents SET valid_to_generation = ?, document_payload = ? WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?",
-      [row.closing_generation, closedPayload, workspaceId, row.artifact_id, row.artifact_version_id],
+      "UPDATE lexical_documents SET valid_to_generation = ? WHERE workspace_id = ? AND artifact_id = ? AND artifact_version_id = ?",
+      [row.closing_generation, workspaceId, row.artifact_id, row.artifact_version_id],
     );
     closed += 1;
     await yieldToEventLoop();
@@ -264,7 +259,7 @@ export async function reconcileLexicalProjection(input: ReconcileLexicalProjecti
     await database.projections.putLexicalDocument({ artifact_id: row.artifact_id, artifact_version_id: row.artifact_version_id, text, valid_from_generation: row.valid_from_generation });
     inserted += 1;
     // See `yieldToEventLoop`'s doc comment: this is the loop whose combined
-    // per-document `lexicalTrigrams` cost was observed to starve the event
+    // per-document normalization/FTS5 insertion cost was observed to starve the event
     // loop for minutes on a real large repository.
     await yieldToEventLoop();
   }

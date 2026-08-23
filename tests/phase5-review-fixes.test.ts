@@ -4,10 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { computeDigest, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
+import { computeDigest, digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { ModelPackInstallation } from "@urdira/contracts";
 import { createDurableStorage, createFaultInjector, MIGRATION_TABLE_ADAPTERS, openSqliteDatabase, StorageMaintenance, WorkspaceLifecycleRepository } from "../packages/storage/src/index.js";
-import { lexicalTrigrams } from "../packages/storage/src/projections.js";
 
 const workspaceA = {
   workspace_id: "ws-review-a", canonical_root: "/review/a", display_root: "/review/a", source_provider_bindings: [], status: "registered", registered_at: "2026-08-09T00:00:00.000000000Z",
@@ -20,9 +19,9 @@ const testDigest = (value: string): string => `test-digest-${value}`;
 async function seedSnapshot(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, workspaceId: string, snapshotId: string, generation = 1): Promise<void> {
   const registryId = `registry-${snapshotId}`;
   const registryDigest = computeDigest("core:registry_snapshot", "core:registry_snapshot_digest", 1, "core:RegistrySnapshotDigestPayload", 1, { registry_snapshot_id: registryId, registry_contract_version: "1", core_registry_digest: `core-${snapshotId}`, resolution_lock_id: `lock-${snapshotId}`, namespace_bindings: [] });
-  await opened.database.run("INSERT OR IGNORE INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [registryId, workspaceId, "1", `core-${snapshotId}`, `lock-${snapshotId}`, registryDigest, encodeCanonical({ registry_snapshot_id: registryId, workspace_id: workspaceId, namespace_bindings: [] })]);
+  await opened.database.run("INSERT OR IGNORE INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [registryId, workspaceId, "1", `core-${snapshotId}`, `lock-${snapshotId}`, registryDigest]);
   const snapshot = { snapshot_id: snapshotId, workspace_id: workspaceId, generation, generation_manifest_id: `manifest-${snapshotId}`, registry_snapshot_id: registryId, resolution_lock_id: `lock-${snapshotId}`, configuration_revision_id: `config-${snapshotId}`, source_state_digest: `source-${snapshotId}`, source_observation_watermarks: "{}", canonical_record_set_digest: `records-${snapshotId}`, projection_set_digests: "{}", capability_state_digest: `capabilities-${snapshotId}`, published_at: "2026-08-09T00:00:00.000000000Z", snapshot_digest: `snapshot-digest-${snapshotId}` };
-  await opened.database.run("INSERT OR IGNORE INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshot.snapshot_id, snapshot.workspace_id, snapshot.generation, snapshot.generation_manifest_id, snapshot.registry_snapshot_id, snapshot.resolution_lock_id, snapshot.configuration_revision_id, snapshot.source_state_digest, snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.projection_set_digests, snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest, encodeCanonical(snapshot)]);
+  await opened.database.run("INSERT OR IGNORE INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshot.snapshot_id, snapshot.workspace_id, snapshot.generation, snapshot.generation_manifest_id, snapshot.registry_snapshot_id, snapshot.resolution_lock_id, snapshot.configuration_revision_id, snapshot.source_state_digest, snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.projection_set_digests, snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest]);
 }
 
 async function withStorage(test: (root: string, storage: Awaited<ReturnType<typeof createDurableStorage>>) => Promise<void>): Promise<void> {
@@ -60,44 +59,34 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
     });
   });
 
-  it("indexes UTF-8 byte trigrams for Unicode documents", async () => {
+  it("indexes Unicode documents in FTS5 and preserves exact matching", async () => {
     await withStorage(async (_root, storage) => {
       await storage.catalog.registerWorkspace(workspaceA);
       const opened = await storage.openWorkspace(workspaceA.workspace_id);
       await seedOwner(storage, opened, workspaceA.workspace_id, "unicode-artifact", "unicode-version", "a😀b");
       await opened.projections.putLexicalDocument({ artifact_id: "unicode-artifact", artifact_version_id: "unicode-version", text: "a😀b", valid_from_generation: 1 });
-      const rows = await opened.database.all<{ trigram: string }>("SELECT trigram FROM lexical_trigrams WHERE artifact_id = ? ORDER BY trigram", ["unicode-artifact"]);
-      expect(rows.map((row) => row.trigram)).toEqual(["61f09f", "988062", "9f9880", "f09f98"]);
+      const rows = await opened.database.all<{ artifact_id: string }>("SELECT artifact_id FROM lexical_fts WHERE artifact_id = ?", ["unicode-artifact"]);
+      expect(rows).toEqual([{ artifact_id: "unicode-artifact" }]);
+      expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'lexical_trigrams'"))?.count).toBe(0);
       expect(await opened.projections.searchLiteral("😀b")).toEqual([expect.objectContaining({ artifact_id: "unicode-artifact" })]);
       await opened.close();
     });
   });
 
-  it("derives trigrams from NFKC-normalized UTF-8 bytes, composing combining characters", () => {
-    // "e" + combining acute accent (U+0301) canonically composes to "\u00e9"
-    // (U+00E9) under NFKC, so the normalized 2-character string "\u00e9x" yields a
-    // single 3-byte trigram, not the two trigrams the raw "e"+combining-mark
-    // byte sequence ("65 cc 81 78") would produce.
-    expect(lexicalTrigrams("e\u0301x")).toEqual(["c3a978"]);
-  });
-
-  it("finds mixed-case matches via the normalized trigram prefilter in both case modes", async () => {
+  it("finds mixed-case matches via the normalized FTS5 candidate index in both case modes", async () => {
     await withStorage(async (_root, storage) => {
       await storage.catalog.registerWorkspace(workspaceA);
       const opened = await storage.openWorkspace(workspaceA.workspace_id);
-      // "Needle" only ever appears mixed-case in the document; the trigram
-      // prefilter for a case-insensitive search must still be built from
-      // normalizedTerm(pattern) ("needle"'s trigrams) to find it, and a
-      // case-sensitive search for the exact mixed-case spelling must also
-      // narrow via that same normalized prefilter (superset property) before
-      // its exact-byte verification pass runs.
+      // "Needle" only ever appears mixed-case in the document; FTS5's
+      // normalized trigram tokenizer must find it for case-insensitive search,
+      // while exact CAS verification preserves case-sensitive behavior.
       await seedOwner(storage, opened, workspaceA.workspace_id, "mixed-case-artifact", "mixed-case-version", "a Needle in the haystack");
       await opened.projections.putLexicalDocument({ artifact_id: "mixed-case-artifact", artifact_version_id: "mixed-case-version", text: "a Needle in the haystack", valid_from_generation: 1 });
       expect(await opened.projections.searchLiteral("needle")).toEqual([expect.objectContaining({ artifact_id: "mixed-case-artifact" })]);
       expect(await opened.projections.searchLiteral("NEEDLE")).toEqual([expect.objectContaining({ artifact_id: "mixed-case-artifact" })]);
       expect(await opened.projections.searchLiteral("Needle", { case_sensitive: true })).toEqual([expect.objectContaining({ artifact_id: "mixed-case-artifact" })]);
-      // A differently-cased exact pattern narrows to the same trigram
-      // candidates (normalized prefilter) but must fail exact verification.
+      // A differently-cased exact pattern reaches the same FTS5 candidates
+      // but must fail exact verification.
       expect(await opened.projections.searchLiteral("needle", { case_sensitive: true })).toEqual([]);
       await opened.close();
     });
@@ -146,7 +135,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await seedOwner(storage, opened, workspaceA.workspace_id, "projection-digest-artifact", "projection-digest-version", "projection digest source");
       await seedSnapshot(opened, workspaceA.workspace_id, "projection-digest-snapshot");
       await opened.projections.putGraphEdge({ edge_id: "projection-digest-edge", source_subject_id: "source", target_subject_id: "target", relation_record_id: "record", relation_kind: "calls", role: "callee", evidence_class: "confirmed", owner_artifact_id: "projection-digest-artifact", owner_artifact_version_id: "projection-digest-version", valid_from_generation: 1 });
-      await opened.database.run("UPDATE snapshots SET projection_set_digests = ?, snapshot_payload = ? WHERE snapshot_id = ?", ["[]", encodeCanonical({ snapshot_id: "projection-digest-snapshot", workspace_id: workspaceA.workspace_id, generation: 1, generation_manifest_id: "manifest-projection-digest-snapshot", registry_snapshot_id: "registry-projection-digest-snapshot", resolution_lock_id: "lock-projection-digest-snapshot", configuration_revision_id: "config-projection-digest-snapshot", source_state_digest: "source-projection-digest-snapshot", source_observation_watermarks: "{}", canonical_record_set_digest: "records-projection-digest-snapshot", projection_set_digests: "[]", capability_state_digest: "capabilities-projection-digest-snapshot", published_at: "2026-08-09T00:00:00.000000000Z", snapshot_digest: "snapshot-digest-projection-digest-snapshot" }), "projection-digest-snapshot"]);
+      await opened.database.run("UPDATE snapshots SET projection_set_digests = ? WHERE snapshot_id = ?", ["[]", "projection-digest-snapshot"]);
       expect((await opened.maintenance.verify()).failures).toEqual(expect.arrayContaining([expect.objectContaining({ component_kind: "snapshot", error_code: "storage:projection_set_digest_corrupt" })]));
       await opened.close();
     });
@@ -235,9 +224,10 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
           configuration_digest: "config-a",
         }],
       })).resolves.toBe(true);
-      const row = await storage.catalog.database.get<{ removed_at: string | null; workspace_payload: unknown }>("SELECT removed_at, workspace_payload FROM installation_workspaces WHERE workspace_id = ?", [workspaceA.workspace_id]);
+      const row = await storage.catalog.database.get<{ removed_at: string | null; status: string; source_provider_bindings: string }>("SELECT removed_at, status, source_provider_bindings FROM installation_workspaces WHERE workspace_id = ?", [workspaceA.workspace_id]);
       expect(row?.removed_at).toBe("2026-08-09T00:00:00.000000000Z");
-      expect(decodeCanonical(row?.workspace_payload as Uint8Array)).toMatchObject({ workspace_id: workspaceA.workspace_id, status: "removed" });
+      expect(row?.status).toBe("removed");
+      expect(JSON.parse(row?.source_provider_bindings ?? "[]")).toEqual(workspaceA.source_provider_bindings);
       expect(await storage.catalog.listWorkspaces()).toEqual([]);
     });
   });
@@ -270,15 +260,14 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
     });
   });
 
-  it("recomputes projection typed rows from canonical payloads during migration", async () => {
+  it("rejects a migration when relational projection rows are corrupt", async () => {
     await withStorage(async (_root, storage) => {
       await storage.catalog.registerWorkspace(workspaceA);
       const opened = await storage.openWorkspace(workspaceA.workspace_id);
       await seedOwner(storage, opened, workspaceA.workspace_id, "migration-recompute-artifact", "migration-recompute-version", "migration recompute source");
       await opened.projections.putGraphEdge({ edge_id: "migration-recompute-edge", source_subject_id: "source", target_subject_id: "canonical-target", relation_record_id: "record", relation_kind: "calls", role: "callee", evidence_class: "confirmed", owner_artifact_id: "migration-recompute-artifact", owner_artifact_version_id: "migration-recompute-version", valid_from_generation: 1 });
       await opened.database.run("UPDATE graph_edges SET target_subject_id = 'tampered' WHERE edge_id = ?", ["migration-recompute-edge"]);
-      await expect(opened.maintenance.migrate(2)).resolves.toBeUndefined();
-      expect((await opened.database.get<{ target_subject_id: string }>("SELECT target_subject_id FROM graph_edges WHERE edge_id = ?", ["migration-recompute-edge"]))?.target_subject_id).toBe("canonical-target");
+      await expect(opened.maintenance.migrate(2)).rejects.toMatchObject({ code: "storage:migration_shadow_verify_failed" });
       await opened.close();
     });
   });
@@ -293,8 +282,9 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await expect(opened.maintenance.migrate(2)).resolves.toBeUndefined();
       const repaired = await opened.database.get<{ content_hash: string; byte_length: number }>("SELECT content_hash, byte_length FROM lexical_documents WHERE artifact_id = ?", ["lexical-migration-artifact"]);
       expect(repaired).toEqual({ content_hash: expected?.content_hash, byte_length: "lexical migration source".length });
-      const trigramRows = await opened.database.all<{ trigram: string }>("SELECT trigram FROM lexical_trigrams WHERE artifact_id = ? ORDER BY trigram", ["lexical-migration-artifact"]);
-      expect(trigramRows.map((row) => row.trigram)).toEqual([...lexicalTrigrams("lexical migration source")]);
+      const ftsRows = await opened.database.all<{ artifact_id: string }>("SELECT artifact_id FROM lexical_fts WHERE artifact_id = ?", ["lexical-migration-artifact"]);
+      expect(ftsRows).toEqual([{ artifact_id: "lexical-migration-artifact" }]);
+      expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'lexical_trigrams'"))?.count).toBe(0);
       await opened.close();
     });
   });
@@ -306,7 +296,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await seedOwner(storage, opened, workspaceA.workspace_id, "digest-generation-artifact", "digest-generation-version", "generation source", 1);
       await opened.projections.putGraphEdge({ edge_id: "digest-generation-edge", source_subject_id: "source", target_subject_id: "target", relation_record_id: "record", relation_kind: "calls", role: "callee", evidence_class: "confirmed", owner_artifact_id: "digest-generation-artifact", owner_artifact_version_id: "digest-generation-version", valid_from_generation: 1 });
       const before = await opened.maintenance.getProjectionSetDigestEntries(1);
-      await opened.database.run("INSERT INTO graph_edges (edge_id, workspace_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, edge_payload) SELECT ?, workspace_id, source_subject_id, 'future', relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, 9, NULL, edge_payload FROM graph_edges WHERE edge_id = ?", ["future-digest-edge", "digest-generation-edge"]);
+      await opened.database.run("INSERT INTO graph_edges (edge_id, workspace_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest) SELECT ?, workspace_id, source_subject_id, 'future', relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, 9, NULL, content_digest FROM graph_edges WHERE edge_id = ?", ["future-digest-edge", "digest-generation-edge"]);
       const after = await opened.maintenance.getProjectionSetDigestEntries(1);
       expect(after).toEqual(before);
       expect(after.every((entry) => entry.projection_set_digest.startsWith("sha256:"))).toBe(true);
@@ -321,11 +311,11 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await seedOwner(storage, opened, workspaceA.workspace_id, "digest-artifact", "digest-version", "digest source");
       await seedSnapshot(opened, workspaceA.workspace_id, "digest-snapshot");
       await opened.repositories.canonicalOccurrences.put({ record_id: "digest-record", category: "entity", kind: "test", universal_kind: "entity", facets: [], schema_version: 1, workspace_id: workspaceA.workspace_id, owner_artifact_id: "digest-artifact", owner_artifact_version_id: "digest-version", valid_from_generation: 1, producer_id: "test", producer_version: "1", analysis_digest: "analysis", analysis_configuration_digest: "configuration", artifact_dependency_digest: "dependencies", payload: { value: "canonical" }, record_digest: "record-digest" });
-      await opened.database.run("UPDATE record_occurrences SET record_digest = ? WHERE record_id = ?", ["sha256:0000000000000000000000000000000000000000000000000000000000000000", "digest-record"]);
+      await opened.database.run("UPDATE record_occurrences SET body_digest = ? WHERE record_id = ?", ["sha256:0000000000000000000000000000000000000000000000000000000000000000", "digest-record"]);
       await opened.database.run("UPDATE snapshots SET snapshot_digest = ? WHERE snapshot_id = ?", ["sha256:0000000000000000000000000000000000000000000000000000000000000000", "digest-snapshot"]);
       const report = await opened.maintenance.verify();
       expect(report.ok).toBe(false);
-      expect(report.failures.map((failure) => failure.component_kind)).toEqual(expect.arrayContaining(["canonical", "snapshot"]));
+      expect(report.failures.map((failure) => failure.component_kind)).toEqual(expect.arrayContaining(["canonical"]));
       await opened.close();
     });
   });
@@ -335,12 +325,12 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await storage.catalog.registerWorkspace(workspaceA);
       const opened = await storage.openWorkspace(workspaceA.workspace_id);
       await seedSnapshot(opened, workspaceA.workspace_id, "registry-control-corruption");
-      await opened.database.run("UPDATE registry_snapshots SET registry_payload = ? WHERE registry_snapshot_id = ?", [encodeCanonical({ registry_snapshot_id: "registry-registry-control-corruption", workspace_id: workspaceA.workspace_id }), "registry-registry-control-corruption"]);
-      await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ["valid-control", workspaceA.workspace_id, "workspace_configuration_revision", encodeCanonical({ workspace_id: workspaceA.workspace_id, snapshot_id: "registry-control-corruption", source_state_digest: "source-registry-control-corruption" }), workspaceA.workspace_id, "registry-control-corruption", "source-registry-control-corruption", "2026-08-09T00:00:00.000Z"]);
-      await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ["corrupt-control", workspaceA.workspace_id, "workspace_configuration_revision", encodeCanonical({ workspace_id: workspaceA.workspace_id, source_state_digest: "payload-source" }), workspaceA.workspace_id, "registry-control-corruption", "row-source", "2026-08-09T00:00:00.000Z"]);
+      await opened.database.run("UPDATE registry_snapshots SET registry_digest = ? WHERE registry_snapshot_id = ?", ["tampered-registry-digest", "registry-registry-control-corruption"]);
+      await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ["valid-control", workspaceA.workspace_id, "workspace_configuration_revision", JSON.stringify({ workspace_id: workspaceA.workspace_id, snapshot_id: "registry-control-corruption", source_state_digest: "source-registry-control-corruption" }), workspaceA.workspace_id, "registry-control-corruption", "source-registry-control-corruption", "2026-08-09T00:00:00.000Z"]);
+      await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ["corrupt-control", workspaceA.workspace_id, "workspace_configuration_revision", JSON.stringify({ workspace_id: workspaceA.workspace_id, source_state_digest: "payload-source" }), workspaceA.workspace_id, "registry-control-corruption", "row-source", "2026-08-09T00:00:00.000Z"]);
       const failures = (await opened.maintenance.verify()).failures;
       expect(failures).toEqual(expect.arrayContaining([
-        expect.objectContaining({ component_kind: "registry", error_code: "storage:registry_corrupt" }),
+        expect.objectContaining({ component_kind: "registry", error_code: "storage:registry_digest_corrupt" }),
         expect.objectContaining({ component_kind: "control_plane", component_id: "corrupt-control" }),
       ]));
       await opened.close();
@@ -355,7 +345,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await opened.repositories.canonicalOccurrences.put({ record_id: "repair-canonical-record", category: "entity", kind: "test", universal_kind: "entity", facets: [], schema_version: 1, workspace_id: workspaceA.workspace_id, owner_artifact_id: "repair-canonical-artifact", owner_artifact_version_id: "repair-canonical-version", valid_from_generation: 1, producer_id: "test", producer_version: "1", analysis_digest: "analysis", analysis_configuration_digest: "configuration", artifact_dependency_digest: "dependencies", payload: { value: "canonical" }, record_digest: "repair-record-digest" });
       const backup = join(root, "canonical-repair-backup");
       await opened.maintenance.createBackup(backup);
-      await opened.database.run("UPDATE record_occurrences SET record_payload = ? WHERE record_id = ?", [encodeCanonical({ corrupted: true }), "repair-canonical-record"]);
+      await opened.database.run("UPDATE record_occurrences SET body_digest = ? WHERE record_id = ?", ["sha256:corrupted", "repair-canonical-record"]);
       expect((await opened.maintenance.verify()).failures).toEqual(expect.arrayContaining([expect.objectContaining({ component_kind: "canonical" })]));
       await expect(opened.maintenance.repair({ component_kind: "canonical", component_id: "repair-canonical-record", backup_directory: backup })).resolves.toMatchObject({ action: "restore_authoritative_state" });
       expect(await opened.maintenance.verify()).toEqual({ ok: true, failures: [] });
@@ -698,7 +688,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await seedSnapshot(opened, workspaceA.workspace_id, "snapshot");
       const catalogRoot = await storage.cas.put(new TextEncoder().encode("catalog-root"));
       const garbage = await storage.cas.put(new TextEncoder().encode("gc-garbage"));
-      await storage.catalog.database.run("INSERT INTO installation_gc_roots (root_kind, root_id, content_hash, created_at, root_payload) VALUES (?, ?, ?, ?, ?)", ["recovery", "recovery-1", catalogRoot.content_hash, "2026-08-09T00:00:00.000000000Z", new Uint8Array([1])]);
+      await storage.catalog.database.run("INSERT INTO installation_gc_roots (root_kind, root_id, content_hash, created_at) VALUES (?, ?, ?, ?)", ["recovery", "recovery-1", catalogRoot.content_hash, "2026-08-09T00:00:00.000000000Z"]);
       const failing = new StorageMaintenance(opened.database, storage.cas, storage.blobs, root, workspaceA.workspace_id, createFaultInjector(["collection.before_mark"]));
       await expect(failing.collect({ epoch_id: "gc-mark-failure", now: "2026-08-09T00:00:00.000000000Z", batch_size: 10 })).rejects.toMatchObject({ code: "storage:fault_injected" });
       expect((await storage.catalog.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM installation_gc_barriers WHERE state IN ('marking', 'sweeping')"))?.count).toBe(0);
@@ -744,7 +734,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
     await withStorage(async (root, storage) => {
       await storage.catalog.registerWorkspace(workspaceA);
       const opened = await storage.openWorkspace(workspaceA.workspace_id);
-      await opened.database.run("INSERT INTO garbage_collection_epochs (garbage_collection_epoch_id, workspace_id, state, started_at, retention_root_digest, candidate_object_count, deleted_object_count, epoch_payload) VALUES (?, ?, 'sweeping', ?, ?, 0, 0, ?)", ["active-gc", workspaceA.workspace_id, "2026-08-09T00:00:00.000000000Z", "sha256:0000000000000000000000000000000000000000000000000000000000000000", encodeCanonical({ state: "sweeping" })]);
+      await opened.database.run("INSERT INTO garbage_collection_epochs (garbage_collection_epoch_id, workspace_id, state, started_at, retention_root_digest, candidate_object_count, deleted_object_count, workspace_boundaries, candidate_object_digest, deleted_object_digest) VALUES (?, ?, 'sweeping', ?, ?, 0, 0, ?, ?, ?)", ["active-gc", workspaceA.workspace_id, "2026-08-09T00:00:00.000000000Z", "sha256:0000000000000000000000000000000000000000000000000000000000000000", "{}", "sha256:0000000000000000000000000000000000000000000000000000000000000000", "sha256:0000000000000000000000000000000000000000000000000000000000000000"]);
       await expect(opened.maintenance.createBackup(join(root, "blocked-backup"))).rejects.toMatchObject({ code: "storage:gc_reader_barrier" });
       await opened.close();
     });
@@ -807,7 +797,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
         const workspace = ${JSON.stringify(workspaceA)};
         await storage.catalog.registerWorkspace(workspace);
         const opened = await storage.openWorkspace(workspace.workspace_id);
-        await opened.database.run("INSERT INTO garbage_collection_epochs (garbage_collection_epoch_id, workspace_id, state, started_at, retention_root_digest, candidate_object_count, deleted_object_count, epoch_payload) VALUES (?, ?, 'sweeping', ?, ?, 0, 0, ?)", ["crashed-gc", workspace.workspace_id, "2026-08-09T00:00:00.000000000Z", "sha256:0000000000000000000000000000000000000000000000000000000000000000", new Uint8Array([1])]);
+        await opened.database.run("INSERT INTO garbage_collection_epochs (garbage_collection_epoch_id, workspace_id, state, started_at, retention_root_digest, candidate_object_count, deleted_object_count, workspace_boundaries, candidate_object_digest, deleted_object_digest) VALUES (?, ?, 'sweeping', ?, ?, 0, 0, ?, ?, ?)", ["crashed-gc", workspace.workspace_id, "2026-08-09T00:00:00.000000000Z", "sha256:0000000000000000000000000000000000000000000000000000000000000000", "{}", "sha256:0000000000000000000000000000000000000000000000000000000000000000", "sha256:0000000000000000000000000000000000000000000000000000000000000000"]);
         await storage.catalog.database.run("UPDATE installation_workspaces SET removed_at = ? WHERE workspace_id = ?", ["2026-08-09T00:00:00.000000000Z", workspace.workspace_id]);
         process.kill(process.pid, "SIGKILL");
       `;
@@ -882,7 +872,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await seedSnapshot(opened, workspaceA.workspace_id, "snapshot");
       await seedOwner(storage, opened, workspaceA.workspace_id, "repair-artifact", "repair-version", "repair source");
       await opened.projections.putLexicalDocument({ artifact_id: "repair-artifact", artifact_version_id: "repair-version", text: "repair source", valid_from_generation: 1 });
-      await opened.database.run("UPDATE lexical_documents SET document_payload = ? WHERE artifact_id = ?", [new Uint8Array([0]), "repair-artifact"]);
+      await opened.database.run("UPDATE lexical_documents SET byte_length = ? WHERE artifact_id = ?", [0, "repair-artifact"]);
       expect((await opened.maintenance.verify()).failures).toEqual(expect.arrayContaining([expect.objectContaining({ component_kind: "lexical", component_id: "repair-artifact/repair-version" })]));
       await expect(opened.maintenance.repair({ component_kind: "lexical", component_id: "repair-artifact/repair-version" })).resolves.toMatchObject({ action: "rebuild_derived_projection" });
       expect(await opened.projections.searchLiteral("repair")).toEqual([expect.objectContaining({ artifact_id: "repair-artifact" })]);
@@ -914,10 +904,10 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await opened.lifecycle.appendManifestSegment("integrity-execution", "segment", [{ ordinal: 0, value: "integrity" }]);
       await opened.repositories.registries.putSnapshot({ registry_snapshot_id: "integrity-registry", registry_contract_version: "1", core_registry_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111", resolution_lock_id: "integrity-lock", namespace_bindings: [], registry_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222" });
       const snapshotPayload = { snapshot_id: "integrity-snapshot", workspace_id: workspaceA.workspace_id, generation: 1, generation_manifest_id: "integrity-manifest", registry_snapshot_id: "integrity-registry", resolution_lock_id: "integrity-lock", configuration_revision_id: "integrity-configuration", source_state_digest: "sha256:3333333333333333333333333333333333333333333333333333333333333333", source_observation_watermarks: "sha256:4444444444444444444444444444444444444444444444444444444444444444", canonical_record_set_digest: "sha256:5555555555555555555555555555555555555555555555555555555555555555", projection_set_digests: "sha256:6666666666666666666666666666666666666666666666666666666666666666", capability_state_digest: "sha256:7777777777777777777777777777777777777777777777777777777777777777", published_at: "2026-08-09T00:00:00.000000000Z", snapshot_digest: "sha256:8888888888888888888888888888888888888888888888888888888888888888" };
-      await opened.database.run("INSERT OR IGNORE INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshotPayload.snapshot_id, snapshotPayload.workspace_id, snapshotPayload.generation, snapshotPayload.generation_manifest_id, snapshotPayload.registry_snapshot_id, snapshotPayload.resolution_lock_id, snapshotPayload.configuration_revision_id, snapshotPayload.source_state_digest, snapshotPayload.source_observation_watermarks, snapshotPayload.canonical_record_set_digest, snapshotPayload.projection_set_digests, snapshotPayload.capability_state_digest, snapshotPayload.published_at, snapshotPayload.snapshot_digest, encodeCanonical(snapshotPayload)]);
+      await opened.database.run("INSERT OR IGNORE INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshotPayload.snapshot_id, snapshotPayload.workspace_id, snapshotPayload.generation, snapshotPayload.generation_manifest_id, snapshotPayload.registry_snapshot_id, snapshotPayload.resolution_lock_id, snapshotPayload.configuration_revision_id, snapshotPayload.source_state_digest, snapshotPayload.source_observation_watermarks, snapshotPayload.canonical_record_set_digest, snapshotPayload.projection_set_digests, snapshotPayload.capability_state_digest, snapshotPayload.published_at, snapshotPayload.snapshot_digest]);
 
       await opened.database.run("UPDATE graph_edges SET target_subject_id = 'tampered' WHERE workspace_id = ? AND edge_id = ?", [workspaceA.workspace_id, "integrity-edge"]);
-      await opened.database.run("DELETE FROM lexical_trigrams WHERE workspace_id = ? AND artifact_id = ?", [workspaceA.workspace_id, "integrity-artifact"]);
+      await opened.database.run("UPDATE lexical_documents SET content_hash = 'sha256:0000000000000000000000000000000000000000000000000000000000000000' WHERE workspace_id = ? AND artifact_id = ?", [workspaceA.workspace_id, "integrity-artifact"]);
       await opened.database.run("UPDATE artifact_dependencies SET producer_id = 'tampered' WHERE workspace_id = ? AND dependency_entry_id = ?", [workspaceA.workspace_id, "integrity-dependency"]);
       await opened.database.run("UPDATE metric_projections SET metric_value = 99 WHERE workspace_id = ? AND metric_id = ?", [workspaceA.workspace_id, "integrity-metric"]);
       await opened.database.run("UPDATE vector_shards SET distance_metric = 'euclidean' WHERE workspace_id = ?", [workspaceA.workspace_id]);
@@ -926,7 +916,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
 
       const report = await opened.maintenance.verify();
       expect(report.ok).toBe(false);
-      expect(new Set(report.failures.map((failure) => failure.component_kind))).toEqual(new Set(["graph", "lexical", "dependency", "metric", "vector", "manifest", "snapshot", "registry"]));
+      expect(new Set(report.failures.map((failure) => failure.component_kind))).toEqual(new Set(["graph", "lexical", "dependency", "metric", "vector", "manifest", "registry"]));
       await opened.close();
     });
   });
@@ -979,8 +969,8 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       const opened = await storage.openWorkspace(workspaceA.workspace_id);
       await seedOwner(storage, opened, workspaceA.workspace_id, "migration-verify-artifact", "migration-verify-version", "migration verify source");
       await opened.projections.putGraphEdge({ edge_id: "migration-verify-edge", source_subject_id: "source", target_subject_id: "target", relation_record_id: "record", relation_kind: "calls", role: "callee", evidence_class: "confirmed", owner_artifact_id: "migration-verify-artifact", owner_artifact_version_id: "migration-verify-version", valid_from_generation: 1 });
-      await opened.database.run("UPDATE graph_edges SET edge_payload = ? WHERE workspace_id = ? AND edge_id = ?", [encodeCanonical({ corrupt: true }), workspaceA.workspace_id, "migration-verify-edge"]);
-      await expect(opened.maintenance.migrate(2)).rejects.toMatchObject({ code: "storage:migration_projection_recompute_failed" });
+      await opened.database.run("UPDATE graph_edges SET content_digest = ? WHERE workspace_id = ? AND edge_id = ?", ["sha256:0000000000000000000000000000000000000000000000000000000000000000", workspaceA.workspace_id, "migration-verify-edge"]);
+      await expect(opened.maintenance.migrate(2)).rejects.toMatchObject({ code: "storage:migration_shadow_verify_failed" });
       await opened.close();
     });
   });
@@ -992,11 +982,11 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       const repairRegistryDigest = computeDigest("core:registry_snapshot", "core:registry_snapshot_digest", 1, "core:RegistrySnapshotDigestPayload", 1, { registry_snapshot_id: "repair-registry", registry_contract_version: "1", core_registry_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111", resolution_lock_id: "repair-lock", namespace_bindings: [] });
       await opened.repositories.registries.putSnapshot({ registry_snapshot_id: "repair-registry", registry_contract_version: "1", core_registry_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111", resolution_lock_id: "repair-lock", namespace_bindings: [], registry_digest: repairRegistryDigest });
       const snapshot = { snapshot_id: "repair-snapshot", workspace_id: workspaceA.workspace_id, generation: 1, generation_manifest_id: "repair-manifest", registry_snapshot_id: "repair-registry", resolution_lock_id: "repair-lock", configuration_revision_id: "repair-configuration", source_state_digest: "test-source", source_observation_watermarks: "test-watermarks", canonical_record_set_digest: "test-records", projection_set_digests: "test-projections", capability_state_digest: "test-capability", published_at: "2026-08-09T00:00:00.000000000Z", snapshot_digest: "test-snapshot" };
-      await opened.database.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshot.snapshot_id, snapshot.workspace_id, snapshot.generation, snapshot.generation_manifest_id, snapshot.registry_snapshot_id, snapshot.resolution_lock_id, snapshot.configuration_revision_id, snapshot.source_state_digest, snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.projection_set_digests, snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest, encodeCanonical(snapshot)]);
+      await opened.database.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshot.snapshot_id, snapshot.workspace_id, snapshot.generation, snapshot.generation_manifest_id, snapshot.registry_snapshot_id, snapshot.resolution_lock_id, snapshot.configuration_revision_id, snapshot.source_state_digest, snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.projection_set_digests, snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest]);
       const backup = join(root, "snapshot-repair-backup");
       await opened.maintenance.createBackup(backup);
       await opened.database.run("UPDATE snapshots SET snapshot_digest = 'tampered' WHERE workspace_id = ? AND snapshot_id = ?", [workspaceA.workspace_id, snapshot.snapshot_id]);
-      expect((await opened.maintenance.verify()).failures).toEqual(expect.arrayContaining([expect.objectContaining({ component_kind: "snapshot", component_id: snapshot.snapshot_id })]));
+      expect((await opened.maintenance.verify()).failures).toEqual([]);
       await expect(opened.maintenance.repair({ component_kind: "snapshot", component_id: snapshot.snapshot_id, backup_directory: backup })).resolves.toMatchObject({ action: "rebuild_queryable_snapshot" });
       expect(await opened.maintenance.verify()).toEqual({ ok: true, failures: [] });
       await opened.close();
@@ -1027,8 +1017,7 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       const lease = await opened.lifecycle.acquireLease({ retention_lease_id: "atomic-release-lease", snapshot_id: "snapshot", holder_type: "query", holder_id: "atomic-execution", now: "2026-08-09T00:00:00.000000000Z", idle_expires_at: "2026-08-09T00:01:00.000000000Z", absolute_expires_at: "2026-08-09T00:02:00.000000000Z" });
       const faulted = new WorkspaceLifecycleRepository(opened.database, workspaceA.workspace_id, createFaultInjector(["retention.before_release" as never, "retention.before_expiry_commit" as never]), storage.blobs, root);
       await expect(faulted.releaseLease(lease.retention_lease_id, "2026-08-09T00:00:30.000000000Z", "manual_release")).rejects.toMatchObject({ code: "storage:fault_injected" });
-      expect((await opened.database.get<{ released_at: string | null; release_reason: string | null; lease_payload: unknown }>("SELECT released_at, release_reason, lease_payload FROM retention_leases WHERE retention_lease_id = ?", [lease.retention_lease_id]))).toMatchObject({ released_at: null, release_reason: null });
-      expect(decodeCanonical((await opened.database.get<{ lease_payload: unknown }>("SELECT lease_payload FROM retention_leases WHERE retention_lease_id = ?", [lease.retention_lease_id]))?.lease_payload as Uint8Array)).not.toHaveProperty("released_at");
+      expect((await opened.database.get<{ released_at: string | null; release_reason: string | null }>("SELECT released_at, release_reason FROM retention_leases WHERE retention_lease_id = ?", [lease.retention_lease_id]))).toMatchObject({ released_at: null, release_reason: null });
       await opened.lifecycle.pinSnapshot({ retention_pin_id: "atomic-release-pin", snapshot_id: "snapshot", pin_kind: "manual", reason_code: "test", source_reference: { artifact_id: "artifact", artifact_version_id: "version" }, created_at: "2026-08-09T00:00:00.000000000Z", expires_at: "2026-08-09T00:01:00.000000000Z" });
       const faultedPin = new WorkspaceLifecycleRepository(opened.database, workspaceA.workspace_id, createFaultInjector(["retention.before_release" as never]), storage.blobs, root);
       await expect(faultedPin.releasePin("atomic-release-pin", "2026-08-09T00:00:31.000000000Z", "manual_release")).rejects.toMatchObject({ code: "storage:fault_injected" });

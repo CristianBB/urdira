@@ -1,12 +1,15 @@
 import { canonicalBytes, decodeCanonical, digestBytes } from "@urdira/canonical";
 import { facetRegistry, languageRegistry, universalEntityKinds, universalRelationKinds, type QueryScope, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
+import { hydrateRelationalValue, type RelationalValueRow } from "@urdira/storage";
 import type { SqliteDatabase } from "@urdira/storage";
 import { EngineError, EngineErrorWithDetails } from "./errors.js";
 import { QueryPlanError } from "./query-plan.js";
+import { toSubjectSelector } from "./recipe-executor.js";
 import { expandRelations, findShortestPaths, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem, type RelationEdge } from "./query-operators.js";
 import type { RecordBodyInterner } from "./record-body-interner.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
 import { exactVectorScan, fuseSemanticLanes, rerankSemanticMatches } from "./semantic-retrieval.js";
+import type { StageSetHandle } from "./stage-set-handle.js";
 
 export interface CanonicalQueryRecord {
   readonly record_id: string;
@@ -31,6 +34,16 @@ export interface RecordColumnSelector {
 }
 
 export interface CanonicalQuerySnapshotPort {
+  /**
+   * Query-only fallback for operations whose predicate is not yet expressible
+   * as a bounded SQL projection. Implementations must use paginated SQL and
+   * must not populate the warm corpus cache. The legacy `records` method is
+   * retained only for non-SQL adapters and compatibility tests.
+   */
+  readonly records_for_query?: (scope: QueryScope) => Promise<readonly CanonicalQueryRecord[]>;
+  /** Bounded query reader for graph/set operations. Implementations must not
+   * retain the complete decoded corpus while yielding batches. */
+  readonly records_for_query_batches?: (scope: QueryScope, batch_size?: number) => AsyncIterable<readonly CanonicalQueryRecord[]>;
   readonly records: (scope: QueryScope) => Promise<readonly CanonicalQueryRecord[]>;
   readonly capability_states?: (scope: QueryScope) => Promise<readonly SnapshotCapabilityStateEntry[]>;
   readonly artifact_text?: (scope: QueryScope, artifact_version_id: string) => Promise<{ readonly text: string } | undefined>;
@@ -80,9 +93,13 @@ export interface CanonicalQuerySnapshotPort {
    * Visibility-filtered like `records()`.
    */
   readonly records_by_selector?: (scope: QueryScope, selector: RecordColumnSelector, limit: number) => Promise<readonly CanonicalQueryRecord[]>;
+  /** Indexed relation join over subject record ids. This is the preferred
+   * handle-native path; it reads graph edge columns only and never hydrates
+   * the complete record corpus. */
+  readonly relation_pairs_by_subject_ids?: (scope: QueryScope, left_ids: readonly string[], right_ids: readonly string[], relation_selector: unknown, direction: "inbound" | "outbound" | "both") => Promise<ReadonlySet<string> | undefined>;
   /**
-   * Literal-substring search over the workspace's trigram-backed lexical
-   * projection (`lexical_documents`/`lexical_trigrams`, built asynchronously
+   * Literal-substring search over the workspace's FTS5-backed lexical
+   * projection (`lexical_documents`/`lexical_fts`, built asynchronously
    * post-ready by `reconcileLexicalProjection`, `@urdira/engine`'s
    * `lexical-reconciler.ts`) for `core:search_text` pushdown -- this searches
    * real file text, unlike the in-memory corpus path (which only matches
@@ -94,13 +111,13 @@ export interface CanonicalQuerySnapshotPort {
    * string indices into the searched text (case-insensitive offsets are
    * indices into its NFKC-lowercased normalized form -- see
    * `WorkspaceProjectionRepository.searchLiteral`,
-   * `packages/storage/src/projections.ts`, whose case/trigram semantics this
-   * mirrors), one entry per non-overlapping match. `path_prefixes`, when
-   * supplied, is an exact hard filter applied by the lexical provider before
+   * `packages/storage/src/projections.ts`, whose case/FTS5 semantics this
+   * mirrors), one entry per non-overlapping match. `path_patterns`, when
+   * supplied, is an exact glob filter applied by the lexical provider before
    * candidate caps and hydration; providers that cannot honor it should omit
    * this pushdown capability rather than widen the answer.
    */
-  readonly search_literal?: (scope: QueryScope, pattern: string, options: { readonly case_sensitive?: boolean; readonly path_prefixes?: readonly string[] }) => Promise<readonly LexicalSearchMatch[] | undefined>;
+  readonly search_literal?: (scope: QueryScope, pattern: string, options: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly path_patterns?: readonly string[]; readonly include_generated?: boolean; readonly include_external?: boolean }) => Promise<readonly LexicalSearchMatch[] | undefined>;
   /**
    * Resolves one artifact-shaped `CanonicalQueryRecord` per given
    * `artifact_version_id`, for turning `search_literal` matches into
@@ -114,7 +131,7 @@ export interface CanonicalQuerySnapshotPort {
    * -- `'artifact'` is not, and cannot become, a real persisted record
    * category. So despite the name, `SqliteCanonicalQuerySnapshotPort`'s
    * implementation does NOT query `record_occurrences` at all; it synthesizes
-   * an in-memory `category: "artifact"` record straight from `artifact_versions`
+   * an in-memory `category: "artifact_subject"` record straight from `artifact_versions`
    * joined with `source_artifacts` (never persisted, so the CHECK constraint
    * never applies to it) -- see that method's doc comment for the reasoning.
    */
@@ -267,7 +284,8 @@ function yieldToEventLoop(): Promise<void> {
 // (below) runs one query with no `LIMIT` for the full-corpus and
 // delta-refresh callers, and `SqliteDatabase.all` (see
 // `packages/storage/src/sqlite.ts`'s `SqliteWorkerAdapter.all`) returns every
-// matching `RecordRow` -- record_payload bytes included -- in ONE
+// matching `RecordRow` -- relational value rows are hydrated in bounded
+// batches -- in ONE
 // structured-clone `postMessage` from the SQLite worker thread. For a
 // corpus-scale result that single clone is itself a synchronous stall (on
 // both the worker thread building the message and the main thread receiving
@@ -291,7 +309,11 @@ const DELTA_CHURN_FALLBACK_RATIO = 0.3;
 // higher depending on build) is comfortably above this; 500 keeps each `IN
 // (...)` statement well clear of it while still batching effectively, matching
 // the batch size other large-IN-list code in this repo targets.
-const DELTA_ID_CHUNK_SIZE = 500;
+const DELTA_ID_CHUNK_SIZE = 200;
+// A selector can legally contain a large registered kind/category set.  Keep
+// every generated statement below SQLite's smallest supported variable limit,
+// including the five visibility parameters added by queryRecordRows().
+const SELECTOR_VALUE_CHUNK_SIZE = 200;
 // Safety cap for the `core:find_records` pushdown path (see `tryPushdown`):
 // `records_by_selector` is asked for one more than this many rows. Getting
 // back the full LIMIT+1 means there may be further matches beyond the
@@ -339,7 +361,8 @@ const SEMANTIC_MAX_DOCUMENT_BYTES = 2_000_000;
 
 type RecordRow = {
   readonly record_id: string; readonly workspace_id: string; readonly category: string; readonly kind: string; readonly universal_kind: string;
-  readonly owner_artifact_id: string; readonly owner_artifact_version_id: string; readonly record_payload: Uint8Array;
+  readonly owner_artifact_id: string; readonly owner_artifact_version_id: string; readonly value_rows?: readonly RelationalValueRow[]; readonly facet_rows?: readonly string[];
+  readonly body_payload: Uint8Array | ArrayBuffer | null;
   readonly primary_source_span_artifact_version_id: string | number | null;
   readonly primary_source_span_start_byte: string | number | null;
   readonly primary_source_span_end_byte: string | number | null;
@@ -347,6 +370,10 @@ type RecordRow = {
   readonly primary_source_span_end_line: string | number | null;
   readonly identity_id: string | null; readonly identity_key: string | null;
 };
+
+function recordBodyPayload(value: Uint8Array | ArrayBuffer): Uint8Array {
+  return value instanceof Uint8Array ? value : new Uint8Array(value);
+}
 
 function primarySourceSpan(row: RecordRow): SourceSpan | undefined {
   if (row.primary_source_span_artifact_version_id == null || row.primary_source_span_start_byte == null || row.primary_source_span_end_byte == null) return undefined;
@@ -375,23 +402,14 @@ function facetsInternerKey(recordId: string): string {
 }
 
 // D1/D7: NFKC + toLocaleLowerCase("en-US") normalization, duplicated here
-// (rather than imported) because `lexicalTrigrams`/`normalizedTerm`
+// (rather than imported) because `normalizedTerm`
 // (`packages/storage/src/projections.ts`) are storage-internal, not exported
 // from `@urdira/storage`'s package index -- the query port's pushdown SQL is
 // intentionally its own implementation, consistent with how `records_by_*`
 // above already duplicate the record-row query shape rather than delegating
-// to storage. Trigrams are computed over `normalizedTerm(text)`, not the raw
-// string, making a document's trigram set a normalization-insensitive
-// superset of any substring it contains -- see `search_literal` above for why
-// that makes one trigram prefilter valid for both case modes.
+// to storage. FTS5 performs candidate generation; exact CAS verification below
+// preserves the public case and offset semantics.
 function normalizedTerm(value: string): string { return value.normalize("NFKC").toLocaleLowerCase("en-US"); }
-
-function patternTrigrams(pattern: string): readonly string[] {
-  const source = new TextEncoder().encode(normalizedTerm(pattern));
-  const result = new Set<string>();
-  for (let index = 0; index + 3 <= source.length; index += 1) result.add(Array.from(source.slice(index, index + 3), (value) => value.toString(16).padStart(2, "0")).join(""));
-  return [...result].sort();
-}
 
 /**
  * Sorted merge of a base array (already sorted by `record_id`, per SQLite
@@ -418,7 +436,7 @@ async function mergeSortedByRecordId(base: readonly CanonicalQueryRecord[], addi
 /** Durable immutable-snapshot reader used by daemon query composition. */
 export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotPort {
   // `bytes` is `approxCorpusBytes`'s reading at load/delta time -- the total
-  // `record_payload` byte length visible at `generation` -- feeding
+  // relational body byte length visible at `generation` -- feeding
   // `approxWarmBytes()` below (see that method's own doc comment for why
   // this is a fresh cheap aggregate per generation rather than bookkeeping
   // accumulated incrementally across loads/deltas).
@@ -473,7 +491,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
   private async currentGeneration(scope: QueryScope): Promise<number | undefined> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
     const workspaceId = scope.workspace_id;
-    // Query API v2 source bindings intentionally use a synthetic immutable
+    // Query API v3 source bindings intentionally use a synthetic immutable
     // identifier. Source catalog generations are already interval-versioned
     // in artifact_versions, so they can be read without requiring a plugin
     // snapshot or a structural publication.
@@ -511,9 +529,8 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
 
   /**
    * `record_id` is content-derived (decision 11), so an `interner` hit for
-   * `row.record_id` proves `row.record_payload`'s bytes are IDENTICAL to
-   * whatever a prior decode of that same id already produced -- there is no
-   * need to `decodeCanonical` this row's payload at all. Both `body` and
+   * `row.record_id` proves the relational body is IDENTICAL to whatever a
+   * prior hydration of that same id already produced. Both `body` and
    * `facets` (also content-derived from the same payload bytes, under a
    * second, derived interner key -- see `RecordBodyInterner`'s own doc
    * comment) must hit for this shortcut; a miss on either falls back to a
@@ -522,21 +539,17 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    */
   private decodeRow(row: RecordRow): CanonicalQueryRecord {
     const internedBody = this.interner?.lookup(row.record_id);
-    const internedFacets = internedBody === undefined ? undefined : this.interner?.lookup(facetsInternerKey(row.record_id));
     let body: Record<string, unknown>;
     let facets: readonly string[];
-    if (internedBody !== undefined && internedFacets !== undefined) {
+    if (internedBody !== undefined && row.facet_rows !== undefined) {
       body = internedBody as Record<string, unknown>;
-      facets = strings(internedFacets["facets"]);
+      facets = row.facet_rows;
     } else {
-      const payload = decodeCanonical(row.record_payload) as Record<string, unknown>;
-      body = object(payload["body"]);
-      facets = [];
-      if (typeof payload["facets"] === "string") {
-        try { facets = strings(JSON.parse(payload["facets"] as string)); } catch { facets = []; }
-      }
+      body = row.body_payload == null
+        ? object(hydrateRelationalValue(row.value_rows ?? []))
+        : object(decodeCanonical(recordBodyPayload(row.body_payload)));
+      facets = row.facet_rows ?? [];
       this.interner?.register(row.record_id, body);
-      this.interner?.register(facetsInternerKey(row.record_id), { facets });
     }
     const sourceSpan = primarySourceSpan(row);
     return {
@@ -555,6 +568,41 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     };
   }
 
+  private async attachRelationalValues(rows: readonly RecordRow[]): Promise<readonly RecordRow[]> {
+    if (rows.length === 0) return rows;
+    const byRecord = new Map<string, RelationalValueRow[]>();
+    const relationalRecordIds = rows.filter((row) => row.body_payload == null).map((row) => row.record_id);
+    for (const ids of chunk(relationalRecordIds, DELTA_ID_CHUNK_SIZE)) {
+      const values = await this.database.all<Record<string, unknown> & RelationalValueRow>(
+        `SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value
+           FROM record_value_nodes WHERE workspace_id = ? AND record_id IN (${ids.map(() => "?").join(", ")}) ORDER BY record_id, value_path`,
+        [rows[0]!.workspace_id, ...ids],
+      );
+      for (const value of values) {
+        const bucket = byRecord.get(value.record_id) ?? [];
+        bucket.push(value);
+        byRecord.set(value.record_id, bucket);
+      }
+    }
+    const facetsByRecord = new Map<string, string[]>();
+    // Keep the facet hydration bound by the conservative SQLite variable
+    // budget as well.  Search pushdown can return tens of thousands of rows;
+    // the old single IN-list then failed with "too many SQL variables" even
+    // though the record-value query above was already chunked.
+    for (const ids of chunk(rows.map((row) => row.record_id), DELTA_ID_CHUNK_SIZE)) {
+      const facets = await this.database.all<{ record_id: string; facet: string }>(
+        `SELECT record_id, facet FROM record_facets WHERE workspace_id = ? AND record_id IN (${ids.map(() => "?").join(", ")}) ORDER BY record_id, facet_ordinal`,
+        [rows[0]!.workspace_id, ...ids],
+      );
+      for (const facet of facets) {
+        const values = facetsByRecord.get(facet.record_id) ?? [];
+        values.push(facet.facet);
+        facetsByRecord.set(facet.record_id, values);
+      }
+    }
+    return rows.map((row) => ({ ...row, value_rows: byRecord.get(row.record_id) ?? [], facet_rows: facetsByRecord.get(row.record_id) ?? [] }));
+  }
+
   /**
    * Runs the shared records+identity join, visible at `generation`, with one
    * extra caller-supplied SQL condition ANDed in, and an optional `LIMIT`.
@@ -563,13 +611,13 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    * callers don't need pagination). When `limit` is omitted, keyset-paginates
    * on `records.record_id` instead of running one unbounded query.
    */
-  private async queryRecordRows(workspaceId: string, generation: number, extraCondition: string, extraParams: ReadonlyArray<string | number>, limit?: number): Promise<readonly RecordRow[]> {
+  private async queryRecordRows(workspaceId: string, generation: number, extraCondition: string, extraParams: ReadonlyArray<string | number>, limit?: number, afterRecordId?: string): Promise<readonly RecordRow[]> {
     const baseSql =
-      `SELECT records.record_id, records.workspace_id, records.category, records.kind, records.universal_kind,
+      `SELECT records.record_id, records.workspace_id, records.category, records.kind, records.universal_kind, records.body_payload,
               records.owner_artifact_id, records.owner_artifact_version_id,
               records.primary_source_span_artifact_version_id, records.primary_source_span_start_byte,
               records.primary_source_span_end_byte, records.primary_source_span_start_line,
-              records.primary_source_span_end_line, records.record_payload,
+              records.primary_source_span_end_line,
               identities.identity_id, identities.identity_key
          FROM record_occurrences AS records
          LEFT JOIN identity_assignments AS identities
@@ -580,7 +628,8 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
           AND ${extraCondition}`;
     const baseParams = [generation, generation, workspaceId, generation, generation, ...extraParams];
     if (limit !== undefined) {
-      return await this.database.all<RecordRow>(`${baseSql} ORDER BY records.record_id LIMIT ?`, [...baseParams, limit]);
+      const cursorCondition = afterRecordId === undefined ? "" : " AND records.record_id > ?";
+      return this.attachRelationalValues(await this.database.all<RecordRow>(`${baseSql}${cursorCondition} ORDER BY records.record_id LIMIT ?`, [...baseParams, ...(afterRecordId === undefined ? [] : [afterRecordId]), limit]));
     }
     const rows: RecordRow[] = [];
     let cursor: string | undefined;
@@ -596,7 +645,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       cursor = batch[batch.length - 1]!.record_id;
       await yieldToEventLoop();
     }
-    return rows;
+    return this.attachRelationalValues(rows);
   }
 
   /** Decodes every row in `rows`, yielding to the event loop every `RECORDS_YIELD_BATCH_SIZE` records -- see that constant's own doc comment. Shared by every decode loop in this class that can run over corpus-scale row counts (a full load, or a large delta). */
@@ -674,7 +723,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
   }
 
   /**
-   * `approxWarmBytes()`'s per-workspace input: the total `record_payload`
+   * `approxWarmBytes()`'s per-workspace input: the total logical body
    * byte length of every row visible at `generation`, read with one cheap
    * SQL aggregate rather than accumulated from whichever rows a load or
    * delta happened to fetch this time. A windowed `deltaRecords` only fetches
@@ -689,7 +738,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    */
   private async approxCorpusBytes(workspaceId: string, generation: number): Promise<number> {
     const row = await this.database.get<{ bytes: number }>(
-      "SELECT COALESCE(SUM(LENGTH(record_payload)), 0) AS bytes FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)",
+            "SELECT COALESCE(SUM(body_byte_length), 0) AS bytes FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)",
       [workspaceId, generation, generation],
     );
     return row?.bytes ?? 0;
@@ -704,7 +753,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    * the daemon's `URDIRA_WARM_RECORDS_BUDGET_MB` LRU eviction loop.
    *
    * "Approximate" in two specific, documented ways: (1) it is a sum of
-   * ENCODED `record_payload` byte lengths, not measured decoded-heap RSS --
+   * logical body byte lengths, not measured decoded-heap RSS --
    * the decoded `CanonicalQueryRecord` tree a payload expands into is
    * typically larger than its encoded bytes, so this under-counts true
    * memory pressure by roughly the same expansion factor for every
@@ -777,6 +826,36 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return promise;
   }
 
+  /**
+   * Cold query fallback. It deliberately bypasses `recordsCache` and
+   * `recordsLoading`: a complex graph operation may need a broad candidate
+   * set, but it must not turn that one query into a process-wide warm corpus
+   * or make future requests pay for it. The underlying row reader remains
+   * keyset-paginated and relational values are hydrated only for this query.
+   */
+  async records_for_query(scope: QueryScope): Promise<readonly CanonicalQueryRecord[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return [];
+    return this.decodeRows(await this.queryRecordRows(scope.workspace_id, generation, "1 = 1", []));
+  }
+
+  async *records_for_query_batches(scope: QueryScope, batchSize = ROW_FETCH_BATCH_SIZE): AsyncIterable<readonly CanonicalQueryRecord[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    if (!Number.isSafeInteger(batchSize) || batchSize <= 0 || batchSize > ROW_FETCH_BATCH_SIZE) throw new RangeError("Query record batch size is outside the bounded range.");
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return;
+    let cursor: string | undefined;
+    while (true) {
+      const rows = await this.queryRecordRows(scope.workspace_id, generation, "1 = 1", [], batchSize, cursor);
+      if (rows.length === 0) return;
+      yield await this.decodeRows(rows);
+      if (rows.length < batchSize) return;
+      cursor = rows[rows.length - 1]!.record_id;
+      await yieldToEventLoop();
+    }
+  }
+
   /** See `CanonicalQuerySnapshotPort.has_warm_records` -- deliberately never calls `resolveRecords`/`records()`, only the cheap generation lookup, so it can never trigger a load. */
   async has_warm_records(scope: QueryScope): Promise<boolean> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
@@ -838,8 +917,8 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     // final segment in JS so a `name` that happens to contain `%`/`_` can
     // never produce a false positive.
     const rows = await this.database.all<RecordRow>(
-      `SELECT records.record_id, records.workspace_id, records.category, records.kind, records.universal_kind,
-              records.owner_artifact_id, records.owner_artifact_version_id, records.record_payload,
+      `SELECT records.record_id, records.workspace_id, records.category, records.kind, records.universal_kind, records.body_payload,
+              records.owner_artifact_id, records.owner_artifact_version_id,
               identities.identity_id, identities.identity_key
          FROM identity_assignments AS identities
          JOIN record_occurrences AS records
@@ -850,7 +929,8 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
           AND identities.identity_key LIKE '%:' || ?
         ORDER BY records.record_id`,
       [generation, generation, workspaceId, generation, generation, name]);
-    return rows.map((row) => this.decodeRow(row)).filter((record) => identityKeyTail(record.identity_key) === name);
+    const hydrated = await this.attachRelationalValues(rows);
+    return hydrated.map((row) => this.decodeRow(row)).filter((record) => identityKeyTail(record.identity_key) === name);
   }
 
   async records_by_selector(scope: QueryScope, selector: RecordColumnSelector, limit: number): Promise<readonly CanonicalQueryRecord[]> {
@@ -862,8 +942,13 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     const params: (string | number)[] = [];
     for (const [column, values] of [["records.category", selector.categories], ["records.universal_kind", selector.universal_kinds], ["records.kind", selector.kinds]] as const) {
       if (values !== undefined && values.length > 0) {
-        conditions.push(`${column} IN (${values.map(() => "?").join(", ")})`);
-        params.push(...values);
+        const clauses: string[] = [];
+        for (let start = 0; start < values.length; start += SELECTOR_VALUE_CHUNK_SIZE) {
+          const part = values.slice(start, start + SELECTOR_VALUE_CHUNK_SIZE);
+          clauses.push(`${column} IN (${part.map(() => "?").join(", ")})`);
+          params.push(...part);
+        }
+        conditions.push(clauses.length === 1 ? clauses[0]! : `(${clauses.join(" OR ")})`);
       }
     }
     const extraCondition = conditions.length > 0 ? conditions.join(" AND ") : "1 = 1";
@@ -871,8 +956,44 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return rows.map((row) => this.decodeRow(row));
   }
 
+  async relation_pairs_by_subject_ids(scope: QueryScope, leftIds: readonly string[], rightIds: readonly string[], relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<ReadonlySet<string> | undefined> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    if (leftIds.length === 0 || rightIds.length === 0) return new Set();
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return new Set();
+    const available = await this.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM graph_edges WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)", [scope.workspace_id, generation, generation]);
+    // Some providers publish canonical relation records without the optional
+    // graph projection. Returning undefined keeps the complete record-based
+    // fallback authoritative instead of treating an absent projection as an
+    // empty relation set.
+    if ((available?.count ?? 0) === 0) return undefined;
+    const right = new Set(rightIds);
+    const selector = object(relationSelector);
+    const kinds = new Set(strings(selector["universal_kinds"]));
+    const output = new Set<string>();
+    for (let offset = 0; offset < leftIds.length; offset += DELTA_ID_CHUNK_SIZE) {
+      const chunk = leftIds.slice(offset, offset + DELTA_ID_CHUNK_SIZE);
+      const left = new Set(chunk);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = await this.database.all<{ source_subject_id: string; target_subject_id: string; relation_kind: string }>(
+        `SELECT source_subject_id, target_subject_id, relation_kind
+           FROM graph_edges
+          WHERE workspace_id = ? AND valid_from_generation <= ?
+            AND (valid_to_generation IS NULL OR valid_to_generation > ?)
+            AND (source_subject_id IN (${placeholders}) OR target_subject_id IN (${placeholders}))`,
+        [scope.workspace_id, generation, generation, ...chunk, ...chunk],
+      );
+      for (const row of rows) {
+        if (kinds.size > 0 && !kinds.has(row.relation_kind)) continue;
+        if ((direction === "outbound" || direction === "both") && left.has(row.source_subject_id) && right.has(row.target_subject_id)) output.add(`${row.source_subject_id}\u0000${row.target_subject_id}`);
+        if ((direction === "inbound" || direction === "both") && left.has(row.target_subject_id) && right.has(row.source_subject_id)) output.add(`${row.target_subject_id}\u0000${row.source_subject_id}`);
+      }
+    }
+    return output;
+  }
+
   /**
-   * Synthesizes one `category: "artifact"` `CanonicalQueryRecord` per
+   * Synthesizes one `category: "artifact_subject"` `CanonicalQueryRecord` per
    * requested `artifact_version_id` directly from `artifact_versions` joined
    * with `source_artifacts` -- NOT from `record_occurrences` (see the
    * interface doc comment on `CanonicalQuerySnapshotPort.records_by_artifact_versions`
@@ -906,7 +1027,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
         found.set(row.artifact_version_id, {
           record_id: `artifact-record:${row.artifact_version_id}`,
           workspace_id: workspaceId,
-          category: "artifact",
+          category: "artifact_subject",
           kind: "core:source_file",
           universal_kind: "core:artifact",
           owner_artifact_id: row.artifact_id,
@@ -978,10 +1099,9 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
 
   /** See `CanonicalQuerySnapshotPort.semantic_vectors`'s own doc comment. */
   /**
-   * NOTE on implementation: `vector_projection_rows.vector_payload` is NOT
-   * the raw vector -- like `record_occurrences.record_payload` elsewhere in
-   * this file, it is a canonical-encoded audit/idempotency wrapper (see
-   * `WorkspaceProjectionRepository.putVectors`, `packages/storage/src/projections.ts`).
+   * NOTE on implementation: the row contains typed vector metadata and a
+   * reference to immutable shard bytes; it does not contain an aggregate
+   * vector value.
    * The raw vector bytes live in a CAS-backed, packed shard (`vector_shards`),
    * sliced out via `shard_id`/`shard_offset`/`byte_length` -- exactly what
    * `WorkspaceProjectionRepository.readVector` does for one id at a time.
@@ -1007,10 +1127,16 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     );
     if (rows.length === 0) return [];
     const shardIds = [...new Set(rows.map((row) => row.shard_id))];
-    const shardRows = await this.database.all<{ shard_id: string; content_hash: string }>(
-      `SELECT shard_id, content_hash FROM vector_shards WHERE workspace_id = ? AND shard_id IN (${shardIds.map(() => "?").join(", ")})`,
-      [scope.workspace_id, ...shardIds],
-    );
+    const shardRows: Array<{ shard_id: string; content_hash: string }> = [];
+    // SQLite's variable ceiling is a runtime property (and can be as low as
+    // 999).  A semantic result may reference many packed shards, so never
+    // construct one unbounded IN-list here.
+    for (const ids of chunk(shardIds, DELTA_ID_CHUNK_SIZE)) {
+      shardRows.push(...await this.database.all<{ shard_id: string; content_hash: string }>(
+        `SELECT shard_id, content_hash FROM vector_shards WHERE workspace_id = ? AND shard_id IN (${ids.map(() => "?").join(", ")})`,
+        [scope.workspace_id, ...ids],
+      ));
+    }
     const shardBytes = new Map<string, Uint8Array>();
     for (const shard of shardRows) {
       try { shardBytes.set(shard.shard_id, await this.content.read(shard.content_hash)); } catch { /* unreadable shard -> its rows are dropped below, same "best effort" discipline artifact_text's CAS-read catch uses */ }
@@ -1071,10 +1197,10 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
   }
 
   /**
-   * D1/D6: literal-substring search over `lexical_documents`/`lexical_trigrams`,
+   * D1/D6: literal-substring search over `lexical_documents`/`lexical_fts`,
    * trusted only when `lexical_index_state.completed_generation` equals
    * `scope`'s current generation (otherwise `undefined`, meaning "fall back").
-   * Trigram candidate filtering, and the raw-vs-normalized verification split
+   * FTS5 trigram candidate filtering, and the raw-vs-normalized verification split
    * between case modes, mirror `WorkspaceProjectionRepository.searchLiteral`
    * (`packages/storage/src/projections.ts`) exactly -- see that function's
    * doc comment for the case/offset semantics this reproduces. Verification
@@ -1083,7 +1209,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    * repeated searches (and `get_source` snippet reads for the same file) share
    * one cache.
    */
-  async search_literal(scope: QueryScope, pattern: string, options: { readonly case_sensitive?: boolean; readonly path_prefixes?: readonly string[] } = {}): Promise<readonly LexicalSearchMatch[] | undefined> {
+  async search_literal(scope: QueryScope, pattern: string, options: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly path_patterns?: readonly string[]; readonly include_generated?: boolean; readonly include_external?: boolean } = {}): Promise<readonly LexicalSearchMatch[] | undefined> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
     if (this.content === undefined) return undefined;
     const workspaceId = scope.workspace_id;
@@ -1091,67 +1217,88 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     if (generation === undefined) return undefined;
     const sourceOnly = scope.snapshot_id?.startsWith("source-snapshot:") === true;
     const completion = sourceOnly ? undefined : await this.database.get<{ completed_generation: number }>("SELECT completed_generation FROM lexical_index_state WHERE workspace_id = ?", [workspaceId]);
-    if (!sourceOnly && completion?.completed_generation !== generation) return undefined;
+    // Lexical maintenance is asynchronous. Until its completion marker is
+    // current, `core:search_text` must remain source-safe and exact instead
+    // of falling through to the decoded structural corpus. Scan the current
+    // interval-versioned source catalog/CAS directly; once maintenance is
+    // current, the normal FTS candidate lane takes over again.
+    const sourceState = !sourceOnly && completion?.completed_generation !== generation
+      ? await this.database.get<{ current_generation: number }>("SELECT current_generation FROM source_index_state WHERE workspace_id = ?", [workspaceId])
+      : undefined;
+    const scanSourceCatalog = sourceOnly || sourceState !== undefined;
+    const effectiveGeneration = sourceState?.current_generation ?? generation;
+    const effectiveScope: QueryScope = scanSourceCatalog && !sourceOnly
+      ? { ...scope, snapshot_id: `source-snapshot:${effectiveGeneration}` }
+      : scope;
 
     const normalizedPattern = normalizedTerm(pattern);
+    const ftsQuery = `"${normalizedPattern.replaceAll('"', '""')}"`;
     const visibilitySql = " AND lexical_documents.valid_from_generation <= ? AND (lexical_documents.valid_to_generation IS NULL OR lexical_documents.valid_to_generation > ?)";
-    const pathPrefixes = options.path_prefixes?.filter((prefix) => prefix.length > 0) ?? [];
-    const pathFilterSql = pathPrefixes.length === 0
+    const pathPatterns = options.path_patterns?.filter((pattern) => pattern.length > 0) ?? [];
+    const pathPrefixes = pathPatterns.map(literalGlobPrefix);
+    const pathFilterSql = pathPrefixes.length === 0 || pathPrefixes.some((prefix) => prefix.length === 0)
       ? ""
       : ` AND (${pathPrefixes.map(() => "source_artifacts.normalized_path LIKE ? ESCAPE '\\'").join(" OR ")})`;
-    const pathParams = pathPrefixes.map((prefix) => `${escapeLikePattern(prefix)}%`);
-    const candidateRows = sourceOnly
-      ? await this.database.all<{ artifact_id: string; artifact_version_id: string }>(
-          `SELECT version.artifact_id, version.artifact_version_id FROM artifact_versions AS version
+    const pathParams = pathFilterSql.length === 0 ? [] : pathPrefixes.map((prefix) => `${escapeLikePattern(prefix)}%`);
+    const artifactKindFilterSql = `${options.include_generated === true ? "" : " AND LOWER(source_artifacts.artifact_kind) NOT LIKE '%generated%'"}${options.include_external === true ? "" : " AND LOWER(source_artifacts.artifact_kind) NOT LIKE '%external%'"}`;
+    let candidateRows = scanSourceCatalog
+      ? await this.database.all<{ artifact_id: string; artifact_version_id: string; normalized_path: string | null }>(
+          `SELECT version.artifact_id, version.artifact_version_id, source_artifacts.normalized_path FROM artifact_versions AS version
              JOIN source_artifacts ON source_artifacts.workspace_id = version.workspace_id AND source_artifacts.artifact_id = version.artifact_id
-            WHERE version.workspace_id = ?${pathFilterSql}
+            WHERE version.workspace_id = ?${pathFilterSql}${artifactKindFilterSql}
               AND version.valid_from_generation <= ? AND (version.valid_to_generation IS NULL OR version.valid_to_generation > ?)
             ORDER BY version.artifact_id, version.artifact_version_id`,
-          [workspaceId, ...pathParams, generation, generation],
+          [workspaceId, ...pathParams, effectiveGeneration, effectiveGeneration],
         )
-      : new TextEncoder().encode(normalizedPattern).byteLength >= 3
-      ? await this.database.all<{ artifact_id: string; artifact_version_id: string }>(
-          `SELECT DISTINCT lexical_trigrams.artifact_id, lexical_trigrams.artifact_version_id FROM lexical_trigrams
-             JOIN lexical_documents ON lexical_documents.workspace_id = lexical_trigrams.workspace_id
-              AND lexical_documents.artifact_id = lexical_trigrams.artifact_id
-              AND lexical_documents.artifact_version_id = lexical_trigrams.artifact_version_id
+      : Array.from(normalizedPattern).length >= 3
+      ? await this.database.all<{ artifact_id: string; artifact_version_id: string; normalized_path: string | null }>(
+          `SELECT lexical_fts.artifact_id, lexical_fts.artifact_version_id, source_artifacts.normalized_path FROM lexical_fts
+             JOIN lexical_documents ON lexical_documents.workspace_id = lexical_fts.workspace_id
+              AND lexical_documents.artifact_id = lexical_fts.artifact_id
+              AND lexical_documents.artifact_version_id = lexical_fts.artifact_version_id
              JOIN source_artifacts ON source_artifacts.workspace_id = lexical_documents.workspace_id
               AND source_artifacts.artifact_id = lexical_documents.artifact_id
-            WHERE lexical_trigrams.workspace_id = ? AND lexical_trigrams.trigram IN (SELECT value FROM json_each(?))${pathFilterSql}${visibilitySql}
-            ORDER BY lexical_trigrams.artifact_id, lexical_trigrams.artifact_version_id`,
-          [workspaceId, JSON.stringify(patternTrigrams(pattern)), ...pathParams, generation, generation],
+            WHERE lexical_fts.workspace_id = ? AND lexical_fts MATCH ?${pathFilterSql}${artifactKindFilterSql}${visibilitySql}
+            ORDER BY lexical_fts.artifact_id, lexical_fts.artifact_version_id`,
+          [workspaceId, ftsQuery, ...pathParams, generation, generation],
         )
-      : await this.database.all<{ artifact_id: string; artifact_version_id: string }>(
-          `SELECT lexical_documents.artifact_id, lexical_documents.artifact_version_id FROM lexical_documents
+      : await this.database.all<{ artifact_id: string; artifact_version_id: string; normalized_path: string | null }>(
+          `SELECT lexical_documents.artifact_id, lexical_documents.artifact_version_id, source_artifacts.normalized_path FROM lexical_documents
              JOIN source_artifacts ON source_artifacts.workspace_id = lexical_documents.workspace_id
               AND source_artifacts.artifact_id = lexical_documents.artifact_id
-            WHERE lexical_documents.workspace_id = ?${pathFilterSql}${visibilitySql}
+            WHERE lexical_documents.workspace_id = ?${pathFilterSql}${artifactKindFilterSql}${visibilitySql}
             ORDER BY lexical_documents.artifact_id, lexical_documents.artifact_version_id`,
-          [workspaceId, ...pathParams, generation, generation],
-        );
-
+        [workspaceId, ...pathParams, generation, generation],
+      );
+    if (pathPatterns.length > 0) candidateRows = candidateRows.filter((candidate) => candidate.normalized_path !== null && pathPatterns.some((pathPattern) => matchesArtifactGlob(candidate.normalized_path!, pathPattern)));
     const matches: LexicalSearchMatch[] = [];
     for (const candidate of candidateRows) {
-      const file = await this.artifact_text(scope, candidate.artifact_version_id);
+      const file = await this.artifact_text(effectiveScope, candidate.artifact_version_id);
       if (file === undefined) continue;
       // Case-insensitive verification runs against normalizedTerm(source), so
       // returned offsets are indices into the normalized string, not the raw
       // source -- this caveat predates this change (see
       // `WorkspaceProjectionRepository.searchLiteral`). Case-sensitive
       // verification runs against the exact raw source and raw pattern.
-      const comparable = options.case_sensitive ? file.text : normalizedTerm(file.text);
-      const needle = options.case_sensitive ? pattern : normalizedPattern;
+      // This storage-facing port keeps its historical false default; the
+      // public operation layer always supplies the contract default (true).
+      const caseSensitive = options.case_sensitive === true;
+      const comparable = caseSensitive ? file.text : normalizedTerm(file.text);
+      const needle = caseSensitive ? pattern : normalizedPattern;
+      const wordMode = options.word_mode ?? "substring";
       const offsets: number[] = [];
       const lineSpans: Pick<SourceSpan, "start_line" | "end_line">[] = [];
       let start = 0;
       while (true) {
         const offset = comparable.indexOf(needle, start);
         if (offset < 0) break;
-        offsets.push(offset);
-        lineSpans.push({
-          start_line: String(lineNumberAt(comparable, offset)),
-          end_line: String(lineNumberAt(comparable, Math.max(offset + needle.length - 1, offset))),
-        });
+        if (matchesWordMode(comparable, offset, needle.length, wordMode)) {
+          offsets.push(offset);
+          lineSpans.push({
+            start_line: String(lineNumberAt(comparable, offset)),
+            end_line: String(lineNumberAt(comparable, Math.max(offset + needle.length - 1, offset))),
+          });
+        }
         start = offset + Math.max(1, needle.length);
       }
       if (offsets.length > 0) matches.push({ artifact_id: candidate.artifact_id, artifact_version_id: candidate.artifact_version_id, offsets, line_spans: lineSpans });
@@ -1166,10 +1313,10 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     if (generation === undefined) return [];
     const cached = this.capabilityCache.get(workspaceId);
     if (cached !== undefined && cached.generation === generation) return cached.states;
-    const rows = await this.database.all<{ payload: Uint8Array }>("SELECT payload FROM control_plane_state WHERE workspace_id = ? AND state_kind = 'capability_state' ORDER BY updated_at, state_key", [workspaceId]);
+    const rows = await this.database.all<{ state_json: string }>("SELECT state_json FROM control_plane_state WHERE workspace_id = ? AND state_kind = 'capability_state' ORDER BY updated_at, state_key", [workspaceId]);
     const latest = new Map<string, SnapshotCapabilityStateEntry>();
     for (const row of rows) {
-      const state = decodeCanonical(row.payload) as SnapshotCapabilityStateEntry;
+      const state = JSON.parse(row.state_json) as SnapshotCapabilityStateEntry;
       latest.set(`${state.capability}\0${state.provider_id}`, state);
     }
     const states = [...latest.values()].sort((left, right) => `${left.capability}\0${left.provider_id}`.localeCompare(`${right.capability}\0${right.provider_id}`));
@@ -1202,6 +1349,8 @@ function recordValue(record: CanonicalQueryRecord, classification: "confirmed" |
       artifact_id: record.owner_artifact_id,
       artifact_version_id: record.owner_artifact_version_id,
       path: record.body["path"],
+      universal_kind: record.universal_kind,
+      kind: record.kind,
       classification,
       body: record.body,
     };
@@ -1221,11 +1370,26 @@ function recordValue(record: CanonicalQueryRecord, classification: "confirmed" |
   };
 }
 
+/**
+ * Extracts only identifier-shaped terms from a natural-language task. Plain
+ * prose words are intentionally excluded: `records_by_name` is an exact
+ * symbol lookup, so querying every word both wastes IPC time and gives a
+ * misleading impression that natural-language ranking happened here.
+ * Camel/Pascal case, underscores and dollar-prefixed names are stable,
+ * language-neutral signals that the caller supplied a code identifier.
+ */
+function contextIdentifierCandidates(task: string, queryClass: unknown): readonly string[] {
+  const tokens = task.match(/[$_\p{L}][$_\p{L}\p{N}]*/gu) ?? [];
+  const identifiers = tokens.filter((token) => token.includes("_") || token.includes("$") || /[\p{Ll}\p{N}][\p{Lu}]/u.test(token));
+  if ((queryClass === "identifier" || queryClass === "source_code") && tokens.length === 1) identifiers.push(tokens[0]!);
+  return [...new Set(identifiers)];
+}
+
 function sourceArtifactRecord(workspaceId: string, row: { readonly artifact_id: string; readonly artifact_version_id: string; readonly normalized_uri: string; readonly normalized_path: string | null }): CanonicalQueryRecord {
   return {
     record_id: `artifact-record:${row.artifact_version_id}`,
     workspace_id: workspaceId,
-    category: "artifact",
+    category: "artifact_subject",
     kind: "core:source_file",
     universal_kind: "core:artifact",
     owner_artifact_id: row.artifact_id,
@@ -1251,6 +1415,11 @@ function strings(value: unknown): readonly string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
 }
 
+function relationScopeKey(scope: QueryScope): string {
+  if (scope.scope_type === "single_workspace") return `single\u0000${scope.workspace_id}\u0000${scope.snapshot_id ?? "current"}`;
+  return `comparison\u0000${scope.participants.map((participant) => `${participant.workspace_id}\u0000${participant.snapshot_id ?? "current"}`).join("\u0001")}`;
+}
+
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (character) => `\\${character}`);
 }
@@ -1259,6 +1428,51 @@ function subjectIdentity(value: unknown): string | undefined {
   const record = object(value);
   for (const field of ["entity_id", "relation_id", "diagnostic_id", "record_id", "identity_key"]) if (typeof record[field] === "string") return record[field] as string;
   return undefined;
+}
+
+function subjectIdentities(value: unknown): readonly string[] {
+  const record = object(value);
+  return ["entity_id", "relation_id", "diagnostic_id", "record_id", "identity_key"].flatMap((field) => typeof record[field] === "string" ? [record[field] as string] : []);
+}
+
+/** Resolve execution-local pipeline bindings at the data boundary. The
+ * executor passes stage_output tokens together with their sealed handles so a
+ * dependent stage never receives an expanded selector array from JavaScript.
+ * This adapter hydrates only the selectors required by the concrete legacy
+ * operation implementation; SQL-aware adapters may consume `input_handles`
+ * directly and skip this compatibility materialisation. */
+async function materializeHandleBindings(value: unknown, handles: ReadonlyMap<string, unknown> | undefined): Promise<unknown> {
+  if (Array.isArray(value)) {
+    const output: unknown[] = [];
+    for (const entry of value) {
+      if (isStageOutputToken(entry)) {
+        const handle = handles?.get(`${entry.stage_id}.${entry.output}`) as StageSetHandle | undefined;
+        if (handle?.iterate === undefined) { output.push(entry); continue; }
+        for await (const item of handle.iterate()) output.push(toSubjectSelector(item));
+      } else output.push(await materializeHandleBindings(entry, handles));
+    }
+    return output;
+  }
+  if (isStageOutputToken(value)) {
+    const handle = handles?.get(`${value.stage_id}.${value.output}`) as StageSetHandle | undefined;
+    if (handle?.iterate === undefined) return value;
+    if (handle.row_count !== 1) throw new EngineErrorWithDetails("core:stage_type_mismatch", "A scalar stage binding must resolve to exactly one row.", { referenced_stage_id: value.stage_id, referenced_output: value.output, actual_count: handle.row_count, cardinality: "one" });
+    for await (const item of handle.iterate()) return toSubjectSelector(item);
+    return value;
+  }
+  if (value !== null && typeof value === "object") {
+    const output: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = await materializeHandleBindings(entry, handles);
+    return output;
+  }
+  return value;
+}
+
+function isStageOutputToken(value: unknown): value is { readonly subject_type: "stage_output"; readonly stage_id: string; readonly output: string } {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && (value as Record<string, unknown>)["subject_type"] === "stage_output"
+    && typeof (value as Record<string, unknown>)["stage_id"] === "string"
+    && typeof (value as Record<string, unknown>)["output"] === "string";
 }
 
 /** The final `:`-delimited segment of an `identity_key` (e.g. `createCanvas` out of `jsts:parameter:...:5578:createCanvas`) -- the entity/relation name, per the jsts identity-key format `records_by_name` pushes its LIKE scan down against. */
@@ -1432,7 +1646,7 @@ async function identityMaps(records: readonly CanonicalQueryRecord[]): Promise<I
   const relations: CanonicalQueryRecord[] = [];
   for (let index = 0; index < records.length; index += 1) {
     const record = records[index]!;
-    for (const id of [record.record_id, record.identity_id, record.identity_key]) if (id !== undefined) byAnyId.set(id, record);
+    for (const id of [record.record_id, record.identity_id, record.identity_key, record.body["entity_id"], record.body["relation_id"], record.body["diagnostic_id"]]) if (typeof id === "string") byAnyId.set(id, record);
     if (record.category === "entity") entities.push(record);
     else if (record.category === "relation") relations.push(record);
     if ((index + 1) % RECORDS_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
@@ -1530,14 +1744,20 @@ function extendSpanForContext(text: string, start: number, end: number, contextL
 
 async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: QueryScope, record: CanonicalQueryRecord, mode: "signature" | "relevant" | "body", maxCharactersPerSnippet: number, contextLines: number, remainingBudget: number): Promise<SourceSnippetValue | undefined> {
   if (remainingBudget <= 0) return undefined;
+  const file = await snapshots.artifact_text?.(scope, record.owner_artifact_version_id);
+  if (file === undefined) return undefined;
   const bodyStart = record.body["start"];
   const bodyEnd = record.body["end"];
   const canonicalSpan = record.primary_source_span;
-  const start = typeof bodyStart === "number" ? bodyStart : canonicalSpan === undefined ? undefined : Number(canonicalSpan.start_byte);
-  const end = typeof bodyEnd === "number" ? bodyEnd : canonicalSpan === undefined ? undefined : Number(canonicalSpan.end_byte);
+  // A source-catalog artifact represents the complete file and therefore has
+  // no entity span. Treat its implicit span as the full artifact; requiring a
+  // structural container solely to manufacture start=0/end=file.length would
+  // defeat source-ready direct artifact reads and force a full corpus load.
+  const wholeArtifact = record.category === "artifact_subject";
+  const start = typeof bodyStart === "number" ? bodyStart : canonicalSpan === undefined ? wholeArtifact ? 0 : undefined : Number(canonicalSpan.start_byte);
+  const end = typeof bodyEnd === "number" ? bodyEnd : canonicalSpan === undefined ? wholeArtifact ? file.text.length : undefined : Number(canonicalSpan.end_byte);
   if (typeof start !== "number" || typeof end !== "number" || start < 0 || end < start) return undefined;
-  const file = await snapshots.artifact_text?.(scope, record.owner_artifact_version_id);
-  if (file === undefined || end > file.text.length) return undefined;
+  if (end > file.text.length) return undefined;
   const text = file.text;
   let coreEnd = end;
   if (mode === "signature") {
@@ -1718,6 +1938,32 @@ function matchesArtifactGlob(path: string, pattern: string): boolean {
   return new RegExp(`${expression}$`).test(normalizedPath);
 }
 
+function literalGlobPrefix(pattern: string): string {
+  const normalized = pattern.replaceAll("\\", "/");
+  const wildcard = normalized.search(/[?*]/u);
+  return wildcard < 0 ? normalized : normalized.slice(0, wildcard);
+}
+
+function codePointBefore(value: string, offset: number): string {
+  if (offset <= 0) return "";
+  const trailing = value.charCodeAt(offset - 1);
+  return trailing >= 0xdc00 && trailing <= 0xdfff && offset >= 2 ? value.slice(offset - 2, offset) : value.slice(offset - 1, offset);
+}
+
+function codePointAt(value: string, offset: number): string {
+  if (offset >= value.length) return "";
+  const width = (value.codePointAt(offset) ?? 0) > 0xffff ? 2 : 1;
+  return value.slice(offset, offset + width);
+}
+
+function matchesWordMode(value: string, offset: number, length: number, mode: "substring" | "identifier" | "token"): boolean {
+  if (mode === "substring") return true;
+  const boundaryCharacter = mode === "identifier" ? /[$\p{ID_Continue}]/u : /[_\p{L}\p{M}\p{N}]/u;
+  const before = codePointBefore(value, offset);
+  const after = codePointAt(value, offset + length);
+  return (before.length === 0 || !boundaryCharacter.test(before)) && (after.length === 0 || !boundaryCharacter.test(after));
+}
+
 /**
  * Builds the single `SemanticCoverageView` item `trySemanticSearch` emits.
  * State machine (see the pinned spec's coverage bullet, and this module's
@@ -1821,7 +2067,154 @@ function semanticCandidateItem(record: CanonicalQueryRecord, rank: number): Quer
  * through their registered universal kinds and validated relation endpoints.
  */
 export class CanonicalRecordQueryDataPort implements QueryDataPort {
+  readonly consumes_stage_handles = true;
+  /** Relation joins retain only identities and endpoint pairs, never complete
+   * decoded records (which would duplicate the corpus in the join cache). */
+  private readonly relationIndexCache = new Map<string, { readonly byAnyId: ReadonlyMap<string, string>; readonly pairs: ReadonlyMap<string, ReadonlySet<string>> }>();
+
   constructor(private readonly snapshots: CanonicalQuerySnapshotPort, private readonly options: { readonly semantic?: ResolvedSemanticProvider } = {}) {}
+
+  private async relationIndex(scope: QueryScope): Promise<{ readonly byAnyId: ReadonlyMap<string, string>; readonly pairs: ReadonlyMap<string, ReadonlySet<string>> }> {
+    const scopeKey = relationScopeKey(scope);
+    let index = this.relationIndexCache.get(scopeKey);
+    if (index !== undefined) return index;
+    const byAnyId = new Map<string, string>();
+    const relationRows: Array<{ readonly source_id: string; readonly target_id: string; readonly relation_kind: string }> = [];
+    const consume = (records: readonly CanonicalQueryRecord[]): void => {
+      for (const record of records) {
+        for (const id of [record.record_id, record.identity_id, record.identity_key, record.body["entity_id"], record.body["relation_id"]]) if (typeof id === "string") byAnyId.set(id, record.record_id);
+        if (record.category === "relation" && typeof record.body["source_id"] === "string" && typeof record.body["target_id"] === "string") relationRows.push({ source_id: record.body["source_id"], target_id: record.body["target_id"], relation_kind: record.universal_kind });
+      }
+    };
+    if (this.snapshots.records_for_query_batches !== undefined) {
+      for await (const batch of this.snapshots.records_for_query_batches(scope)) consume(batch);
+    } else {
+      consume(this.snapshots.records_for_query !== undefined ? await this.snapshots.records_for_query(scope) : await this.snapshots.records(scope));
+    }
+    const pairs = new Map<string, Set<string>>();
+    for (const relation of relationRows) {
+      const sourceId = byAnyId.get(relation.source_id);
+      const targetId = byAnyId.get(relation.target_id);
+      if (sourceId === undefined || targetId === undefined) continue;
+      const key = `${sourceId}\u0000${targetId}`;
+      const kinds = pairs.get(key) ?? new Set<string>();
+      kinds.add(relation.relation_kind);
+      pairs.set(key, kinds);
+    }
+    index = { byAnyId, pairs };
+    this.relationIndexCache.set(scopeKey, index);
+    while (this.relationIndexCache.size > 4) this.relationIndexCache.delete(this.relationIndexCache.keys().next().value as string);
+    return index;
+  }
+
+  /**
+   * Indexed relation predicate for pipeline v3 joins.  The method resolves
+   * only the two participating subjects and scans the relation slice, so a
+   * join does not need to hydrate or compare the complete workspace in
+   * JavaScript.  SQL-backed snapshot adapters can replace this with a direct
+   * indexed implementation without changing the public contract.
+   */
+  readonly relation_exists = async (scope: QueryScope, left: QueryStreamItem, right: QueryStreamItem, relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<boolean> => {
+    // Relation endpoints are separate records. Build one exact, immutable
+    // endpoint index per snapshot scope and reuse it for every pair in a
+    // pipeline join; the old fallback reloaded and rescanned the entire
+    // relation corpus once per left/right pair (quadratic I/O).
+    const index = await this.relationIndex(scope);
+    const leftRecordId = index.byAnyId.get(subjectIdentity(left.value) ?? "");
+    const rightRecordId = index.byAnyId.get(subjectIdentity(right.value) ?? "");
+    if (leftRecordId === undefined || rightRecordId === undefined) return false;
+    const selectorObject = object(relationSelector);
+    const kinds = Array.isArray(selectorObject["universal_kinds"]) ? new Set(selectorObject["universal_kinds"].filter((value): value is string => typeof value === "string")) : new Set<string>();
+    const hasKind = (key: string): boolean => {
+      const available = index!.pairs.get(key);
+      return available !== undefined && (kinds.size === 0 || [...available].some((kind) => kinds.has(kind)));
+    };
+    const outbound = hasKind(`${leftRecordId}\u0000${rightRecordId}`);
+    const inbound = hasKind(`${rightRecordId}\u0000${leftRecordId}`);
+    return direction === "outbound" ? outbound : direction === "inbound" ? inbound : outbound || inbound;
+  };
+
+  readonly relation_pairs = async (scope: QueryScope, left: readonly QueryStreamItem[], right: readonly QueryStreamItem[], relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<ReadonlySet<string>> => {
+    const index = await this.relationIndex(scope);
+    const selectorObject = object(relationSelector);
+    const kinds = Array.isArray(selectorObject["universal_kinds"]) ? new Set(selectorObject["universal_kinds"].filter((value): value is string => typeof value === "string")) : new Set<string>();
+    const leftIds = new Map(left.map((item) => [subjectIdentity(item.value) ?? "", item.stable_sort_key]));
+    const rightIds = new Map(right.map((item) => [subjectIdentity(item.value) ?? "", item.stable_sort_key]));
+    const output = new Set<string>();
+    for (const [key, available] of index.pairs) {
+      if (kinds.size > 0 && ![...available].some((kind) => kinds.has(kind))) continue;
+      const [source, target] = key.split("\u0000");
+      const add = (leftId: string | undefined, rightId: string | undefined) => {
+        const leftKey = leftIds.get(leftId ?? ""); const rightKey = rightIds.get(rightId ?? "");
+        if (leftKey !== undefined && rightKey !== undefined) output.add(`${leftKey}\u0000${rightKey}`);
+      };
+      if (direction === "outbound" || direction === "both") add(source, target);
+      if (direction === "inbound" || direction === "both") add(target, source);
+    }
+    return output;
+  };
+
+  /** Handle-native variant used by large v3 pipelines. Only compact stable
+   * keys are retained while the relational index is probed; full subject
+   * payloads stay in the execution spool until the final operator hydrates
+   * its page. */
+  readonly relation_pairs_handles = async (scope: QueryScope, left: StageSetHandle, right: StageSetHandle, relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<ReadonlySet<string>> => {
+    if (left.iterate === undefined || right.iterate === undefined) throw new EngineError("core:required_capability_unsupported", "The relational spool handle cannot be iterated for a batch join.");
+    // Keep only the compact identity -> stable-key maps required to form the
+    // join result. Payloads remain in the execution spool and are never
+    // duplicated in a second left/right array (the old compatibility path did
+    // exactly that and was the dominant memory spike for large joins).
+    const leftIds = new Map<string, string>();
+    const rightIds = new Map<string, string>();
+    for await (const item of left.iterate()) for (const id of subjectIdentities(item.value)) leftIds.set(id, item.stable_sort_key);
+    for await (const item of right.iterate()) for (const id of subjectIdentities(item.value)) rightIds.set(id, item.stable_sort_key);
+    if (this.snapshots.relation_pairs_by_subject_ids !== undefined) {
+      const ids = await this.snapshots.relation_pairs_by_subject_ids(scope, [...leftIds.keys()], [...rightIds.keys()], relationSelector, direction);
+      if (ids === undefined) return this.relationPairsFromCachedIndex(scope, leftIds, rightIds, relationSelector, direction);
+      const output = new Set<string>();
+      for (const pair of ids) {
+        const separator = pair.indexOf("\u0000");
+        if (separator <= 0) continue;
+        const leftKey = leftIds.get(pair.slice(0, separator));
+        const rightKey = rightIds.get(pair.slice(separator + 1));
+        if (leftKey !== undefined && rightKey !== undefined) output.add(`${leftKey}\u0000${rightKey}`);
+      }
+      return output;
+    }
+    const index = await this.relationIndex(scope);
+    const selectorObject = object(relationSelector);
+    const kinds = Array.isArray(selectorObject["universal_kinds"]) ? new Set(selectorObject["universal_kinds"].filter((value): value is string => typeof value === "string")) : new Set<string>();
+    const output = new Set<string>();
+    for (const [key, available] of index.pairs) {
+      if (kinds.size > 0 && ![...available].some((kind) => kinds.has(kind))) continue;
+      const [source, target] = key.split("\u0000");
+      const add = (leftId: string | undefined, rightId: string | undefined) => {
+        const leftKey = leftIds.get(leftId ?? ""); const rightKey = rightIds.get(rightId ?? "");
+        if (leftKey !== undefined && rightKey !== undefined) output.add(`${leftKey}\u0000${rightKey}`);
+      };
+      if (direction === "outbound" || direction === "both") add(source, target);
+      if (direction === "inbound" || direction === "both") add(target, source);
+    }
+    return output;
+  };
+
+  private async relationPairsFromCachedIndex(scope: QueryScope, leftIds: ReadonlyMap<string, string>, rightIds: ReadonlyMap<string, string>, relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<ReadonlySet<string>> {
+    const index = await this.relationIndex(scope);
+    const selectorObject = object(relationSelector);
+    const kinds = Array.isArray(selectorObject["universal_kinds"]) ? new Set(selectorObject["universal_kinds"].filter((value): value is string => typeof value === "string")) : new Set<string>();
+    const output = new Set<string>();
+    for (const [key, available] of index.pairs) {
+      if (kinds.size > 0 && ![...available].some((kind) => kinds.has(kind))) continue;
+      const [source, target] = key.split("\u0000");
+      const add = (leftId: string | undefined, rightId: string | undefined) => {
+        const leftKey = leftIds.get(leftId ?? ""); const rightKey = rightIds.get(rightId ?? "");
+        if (leftKey !== undefined && rightKey !== undefined) output.add(`${leftKey}\u0000${rightKey}`);
+      };
+      if (direction === "outbound" || direction === "both") add(source, target);
+      if (direction === "inbound" || direction === "both") add(target, source);
+    }
+    return output;
+  }
 
   /**
    * Pre-loads this scope's records and capability states (paying whatever a
@@ -1835,9 +2228,79 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * around this call themselves.
    */
   async warm(scope: QueryScope): Promise<void> {
-    const records = await this.snapshots.records(scope);
+    // Query warm-up is metadata-only. Never materialize the record corpus at
+    // startup: SQL pushdowns and bounded hydration are the query path.
     await this.snapshots.capability_states?.(scope);
-    await cachedIdentityMaps(records);
+  }
+
+  /**
+   * Bounded implementation of `core:build_context`. The former generic
+   * fallback decoded the complete structural corpus and built global identity
+   * maps even though no `build_context` branch existed afterward, then
+   * returned an empty stream. On large workspaces that was both useless and
+   * capable of exhausting the daemon's memory budget.
+   *
+   * Context discovery now starts from explicit seed selectors and exact
+   * identifier-shaped task terms through the snapshot port's indexed point
+   * lookups. This is deliberately conservative: prose-only tasks without a
+   * semantic lane return an honest empty context, never a widened full-corpus
+   * scan pretending to be relevance ranking. Agents can then use the normal
+   * structural operations to expand any returned seed.
+   */
+  private async tryBuildContextPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
+    if (operation.operation_id !== "core:build_context") return undefined;
+    const args = object(operation.arguments);
+    const task = String(args["task"] ?? "");
+    const selectors = Array.isArray(args["seeds"]) ? args["seeds"] : [];
+    const records: CanonicalQueryRecord[] = [];
+
+    const directIds = selectors.map(subjectIdentity).filter((value): value is string => value !== undefined);
+    if (directIds.length > 0 && this.snapshots.records_by_ids !== undefined) records.push(...await this.snapshots.records_by_ids(operation.scope, [...new Set(directIds)]));
+
+    const seedNames = selectors.flatMap((selector) => {
+      const value = object(selector);
+      return value["subject_type"] === "symbol" && typeof value["name"] === "string" ? [value["name"]] : [];
+    });
+    const taskNames = contextIdentifierCandidates(task, args["query_class"]);
+    if (this.snapshots.records_by_name !== undefined) {
+      for (const name of [...new Set([...seedNames, ...taskNames])]) records.push(...await this.snapshots.records_by_name(operation.scope, name));
+    }
+
+    const unique = [...new Map(records.map((record) => [record.record_id, record])).values()];
+    const filter = object(args["filter"]);
+    const paths = strings(filter["paths"]);
+    const languages = strings(filter["languages"]);
+    let artifactPaths = new Map<string, string>();
+    if (paths.length > 0 && this.snapshots.records_by_artifact_versions !== undefined) {
+      const artifacts = await this.snapshots.records_by_artifact_versions(operation.scope, [...new Set(unique.map((record) => record.owner_artifact_version_id))]);
+      artifactPaths = new Map(artifacts.map((record) => [record.owner_artifact_version_id, String(record.body["path"] ?? "")]));
+    }
+    const filtered = unique.filter((record) => {
+      const path = typeof record.body["path"] === "string" ? record.body["path"] : artifactPaths.get(record.owner_artifact_version_id);
+      if (paths.length > 0 && (path === undefined || !paths.some((pattern) => matchesArtifactGlob(path, pattern)))) return false;
+      if (languages.length > 0 && !languages.includes(String(record.body["language"] ?? ""))) return false;
+      return true;
+    });
+
+    let remainingSnippetBudget = 20_000;
+    const context: QueryStreamItem[] = [];
+    for (const record of filtered) {
+      const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "relevant", 2_000, 2, remainingSnippetBudget);
+      if (snippet !== undefined) remainingSnippetBudget -= snippet.text.length;
+      context.push({
+        value: {
+          result_set: "context",
+          primary_result: recordValue(record),
+          assessment: { classification: "confirmed", completeness: "complete" },
+          provenance_path: [],
+          essential_related_entities: [],
+          optional_source_snippets: snippet === undefined ? [] : [snippet],
+        },
+        stable_sort_key: `confirmed\0${String(context.length).padStart(6, "0")}\0${record.identity_key ?? record.record_id}`,
+      });
+    }
+    const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+    return result({ context }, capabilityStates);
   }
 
   /**
@@ -1884,20 +2347,49 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
       return result({ declarations: declarations.map((record) => item(record)), candidates: [] }, capabilityStates);
     }
-    if (operation.operation_id === "core:get_source" && this.snapshots.records_by_ids !== undefined) {
+    if (operation.operation_id === "core:get_source" && (this.snapshots.records_by_ids !== undefined || this.snapshots.records_by_name !== undefined)) {
       const selectors = Array.isArray(args["subjects"]) ? args["subjects"] : [];
+      const directArtifactSelectors = selectors.filter((selector) => {
+        const value = object(selector);
+        return value["subject_type"] === "artifact" && typeof value["artifact_version_id"] !== "string";
+      });
+      // Direct artifact_id/path selectors are source-catalog identities, not
+      // structural record identities. Resolve them against the bounded
+      // artifact catalog rather than falling back to records_for_query(),
+      // which decodes the complete structural corpus on large workspaces.
+      if (directArtifactSelectors.length > 0 && this.snapshots.artifacts_by_filter === undefined) return undefined;
+      const artifactCatalog = directArtifactSelectors.length === 0
+        ? []
+        : await this.snapshots.artifacts_by_filter!(operation.scope, { include_generated: true, include_external: true });
+      const directArtifactRecords = directArtifactSelectors.flatMap((selectorValue) => {
+        const selector = object(selectorValue);
+        return artifactCatalog.filter((record) =>
+          (typeof selector["artifact_id"] !== "string" || record.owner_artifact_id === selector["artifact_id"])
+          && (typeof selector["path"] !== "string" || record.body["path"] === selector["path"]));
+      });
       const ids = selectors.map(subjectIdentity).filter((value): value is string => value !== undefined);
-      const rows = await this.snapshots.records_by_ids(operation.scope, ids);
+      const symbolNames = selectors.flatMap((selector) => {
+        const value = object(selector);
+        return value["subject_type"] === "symbol" && typeof value["name"] === "string" ? [value["name"]] : [];
+      });
+      if (selectors.some((selector) => object(selector)["subject_type"] === "symbol") && this.snapshots.records_by_name === undefined) return undefined;
+      const directRows = this.snapshots.records_by_ids === undefined || ids.length === 0 ? [] : await this.snapshots.records_by_ids(operation.scope, ids);
+      const namedRows = this.snapshots.records_by_name === undefined ? [] : (await Promise.all([...new Set(symbolNames)].map((name) => this.snapshots.records_by_name!(operation.scope, name)))).flat();
+      const rows = [...new Map([...directRows, ...namedRows].map((record) => [record.record_id, record])).values()];
       const byAnyId = new Map<string, CanonicalQueryRecord>();
       for (const record of rows) for (const id of [record.record_id, record.identity_id, record.identity_key]) if (id !== undefined) byAnyId.set(id, record);
+      const maps = await identityMaps(rows);
       const subjects = selectors.flatMap((selector) => {
-        const id = subjectIdentity(selector);
-        const record = id === undefined ? undefined : byAnyId.get(id);
-        return record === undefined ? [] : [record];
+        const value = object(selector);
+        if (value["subject_type"] !== "artifact" || typeof value["artifact_version_id"] === "string") return resolveSelectorToRecords(selector, maps);
+        return directArtifactRecords.filter((record) =>
+          (typeof value["artifact_id"] !== "string" || record.owner_artifact_id === value["artifact_id"])
+          && (typeof value["path"] !== "string" || record.body["path"] === value["path"]));
       });
       const hydratedArtifacts = await hydrateArtifactSelectorRecords(this.snapshots, operation.scope, selectors, subjects);
       const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
-      return result(await buildGetSourceStreams(this.snapshots, operation.scope, [...subjects, ...hydratedArtifacts], args), capabilityStates);
+      const resolved = [...new Map([...subjects, ...hydratedArtifacts].map((record) => [record.record_id, record])).values()];
+      return result(await buildGetSourceStreams(this.snapshots, operation.scope, resolved, args), capabilityStates);
     }
     if (operation.operation_id === "core:find_records" && this.snapshots.records_by_selector !== undefined) {
       const selectorArg = object(args["selector"]);
@@ -1931,8 +2423,10 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * `records_by_artifact_versions`, and the request's arguments are ones the
    * lexical index can answer: `syntax` absent or `"literal"` (never
    * `"safe_regex"`), `word_mode` absent/falsy (only plain substring search),
-   * and `filter` absent, empty, or limited to the supported `paths` field
-   * (path narrowing is applied after artifact hydration). Returns `undefined` -- meaning "fall back
+   * and `filter` absent, empty, or limited to paths plus the generated and
+   * external inclusion flags emitted by the normalized public contract.
+   * Literal `word_mode` boundaries and path globs are enforced by the lexical
+   * provider before candidate caps. Returns `undefined` -- meaning "fall back
    * to the full in-memory path, byte-for-byte identical to before this
    * change" -- when ineligible, or when `search_literal` itself returns
    * `undefined` (lexical projection not yet complete for this generation).
@@ -1942,16 +2436,22 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const args = object(operation.arguments);
     const syntax = args["syntax"];
     if (syntax !== undefined && syntax !== "literal") return undefined;
-    if (args["word_mode"]) return undefined;
+    const wordMode = args["word_mode"] === "identifier" || args["word_mode"] === "token" ? args["word_mode"] : "substring";
     const filterArg = args["filter"];
     const filter = object(filterArg);
     const filterKeys = Object.keys(filter);
-    if (filterKeys.some((key) => key !== "paths")) return undefined;
-    const pathPrefixes = strings(filter["paths"]);
+    if (filterKeys.some((key) => key !== "paths" && key !== "include_generated" && key !== "include_external")) return undefined;
+    const pathPatterns = strings(filter["paths"]);
     const pattern = String(args["pattern"] ?? "");
-    const caseSensitive = args["case_sensitive"] === true;
+    const caseSensitive = args["case_sensitive"] !== false;
 
-    const matches = await this.snapshots.search_literal(operation.scope, pattern, { case_sensitive: caseSensitive, path_prefixes: pathPrefixes });
+    const matches = await this.snapshots.search_literal(operation.scope, pattern, {
+      case_sensitive: caseSensitive,
+      word_mode: wordMode,
+      path_patterns: pathPatterns,
+      include_generated: filter["include_generated"] === true,
+      include_external: filter["include_external"] === true,
+    });
     if (matches === undefined) return undefined;
 
     const cappedArtifacts = matches.slice(0, SEARCH_TEXT_PUSHDOWN_ARTIFACT_CAP);
@@ -2055,7 +2555,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
   private async rankedLexicalMatches(operation: OperationInvocation, queryText: string, pathPrefixes: readonly string[], artifactSubjectsExcluded: boolean): Promise<readonly { readonly artifact_version_id: string; readonly rank: number }[] | undefined> {
     if (artifactSubjectsExcluded) return [];
     if (this.snapshots.search_literal === undefined) return undefined;
-    const matches = await this.snapshots.search_literal(operation.scope, queryText, { case_sensitive: false, path_prefixes: pathPrefixes });
+    const matches = await this.snapshots.search_literal(operation.scope, queryText, { case_sensitive: false, word_mode: "substring", path_patterns: pathPrefixes });
     if (matches === undefined) return undefined;
     let filtered = matches;
     if (pathPrefixes.length > 0) {
@@ -2309,29 +2809,38 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
   }
 
   async execute(operation: OperationInvocation): Promise<OperationEvaluation> {
-    const pushedSearchText = await this.trySearchTextPushdown(operation);
+    const boundArguments = await materializeHandleBindings(operation.arguments, operation.input_handles);
+    const boundOperation: OperationInvocation = boundArguments === operation.arguments ? operation : { ...operation, arguments: boundArguments };
+    const pushedSearchText = await this.trySearchTextPushdown(boundOperation);
     if (pushedSearchText !== undefined) return pushedSearchText;
-    const pushedSemantic = await this.trySemanticSearch(operation);
+    const pushedContext = await this.tryBuildContextPushdown(boundOperation);
+    if (pushedContext !== undefined) return pushedContext;
+    const pushedSemantic = await this.trySemanticSearch(boundOperation);
     if (pushedSemantic !== undefined) return pushedSemantic;
-    const warm = (await this.snapshots.has_warm_records?.(operation.scope)) ?? false;
+    const warm = (await this.snapshots.has_warm_records?.(boundOperation.scope)) ?? false;
     if (!warm) {
-      const pushed = await this.tryPushdown(operation);
+      const pushed = await this.tryPushdown(boundOperation);
       if (pushed !== undefined) return pushed;
     }
-    if (operation.operation_id === "core:find_artifacts" && this.snapshots.artifacts_by_filter !== undefined) {
-      const artifacts = await this.snapshots.artifacts_by_filter(operation.scope, object(operation.arguments)["filter"] as StructuralFilter | undefined);
-      const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+    if (boundOperation.operation_id === "core:find_artifacts" && this.snapshots.artifacts_by_filter !== undefined) {
+      const artifacts = await this.snapshots.artifacts_by_filter(boundOperation.scope, object(boundOperation.arguments)["filter"] as StructuralFilter | undefined);
+      const capabilityStates = await this.snapshots.capability_states?.(boundOperation.scope) ?? [];
       return result({ artifacts: artifacts.map((record) => item(record)) }, capabilityStates);
     }
-    const records = await this.snapshots.records(operation.scope);
-    const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+    // SQL-backed production ports use the uncached paginated query path.
+    // `records()` remains only as a compatibility fallback for adapters that
+    // predate the v2 query port.
+    const records = this.snapshots.records_for_query !== undefined
+      ? await this.snapshots.records_for_query(boundOperation.scope)
+      : await this.snapshots.records(boundOperation.scope);
+    const capabilityStates = await this.snapshots.capability_states?.(boundOperation.scope) ?? [];
     const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => result(streams, capabilityStates);
     const maps = await cachedIdentityMaps(records);
-    const args = object(operation.arguments);
-    if (operation.operation_id === "core:find_records") {
+    const args = object(boundOperation.arguments);
+    if (boundOperation.operation_id === "core:find_records") {
       return evaluated({ records: records.filter((record) => selected(record, args["selector"])).map((record) => item(record)) });
     }
-    if (operation.operation_id === "core:resolve_symbol") {
+    if (boundOperation.operation_id === "core:resolve_symbol") {
       const reference = String(args["reference"] ?? "");
       let declarations: readonly CanonicalQueryRecord[] = maps.entities.filter((record) => record.body["name"] === reference || record.body["qualified_name"] === reference);
       declarations = filterByKindSelector(declarations, args["kind_selector"]);
@@ -2362,7 +2871,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       }
       return evaluated({ declarations: declarations.map((record) => item(record)), candidates: [] });
     }
-    if (operation.operation_id === "core:get_outline") {
+    if (boundOperation.operation_id === "core:get_outline") {
       const containers = resolveSelectorsToRecords(args["container"] === undefined ? [] : [args["container"]], maps);
       const container = containers[0];
       // Bug Group 3: an unresolvable container (including the artifact/path
@@ -2386,7 +2895,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       }
       return evaluated({ members: members.map((record) => item(record)) });
     }
-    if (operation.operation_id === "core:find_references") {
+    if (boundOperation.operation_id === "core:find_references") {
       const targets = resolveSelectorsToRecords(args["target"] === undefined ? [] : [args["target"]], maps);
       const target = targets[0];
       const relations = target === undefined ? [] : maps.relations.filter((record) => relationEndpoints(record, maps.by_any_id).target === target);
@@ -2396,7 +2905,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       });
       return evaluated({ references: relations.map((record) => item(record, relationClassification(record))), owners: [...new Map(owners.map((record) => [record.record_id, record])).values()].map((record) => item(record)) });
     }
-    if (operation.operation_id === "core:expand_relations") {
+    if (boundOperation.operation_id === "core:expand_relations") {
       // Bug Group 4.2: real multi-hop BFS (adapted from `expandRelations`/
       // `findShortestPaths` in `query-operators.ts`), honoring
       // direction/min_depth/max_depth instead of the prior single-hop
@@ -2443,7 +2952,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
           }));
       return evaluated({ subjects: [...discoveredIds.values()].map((record) => item(record)), relations: relationsUsed.map((record) => item(record, relationClassification(record))), paths });
     }
-    if (operation.operation_id === "core:find_paths") {
+    if (boundOperation.operation_id === "core:find_paths") {
       const sourceIds = resolveSelectorsToRecords(args["sources"], maps).map((record) => record.record_id);
       const targetRecords = new Set(resolveSelectorsToRecords(args["targets"], maps));
       const relationKinds = strings(object(args["relations"])["universal_kinds"]);
@@ -2465,18 +2974,22 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       }
       return evaluated({ paths: found.map((record) => item(record, relationClassification(record))) });
     }
-    if (operation.operation_id === "core:get_source") {
+    if (boundOperation.operation_id === "core:get_source") {
       const selectors = Array.isArray(args["subjects"]) ? args["subjects"] : [];
       const subjects = resolveSelectorsToRecords(selectors, maps);
-      const hydratedArtifacts = await hydrateArtifactSelectorRecords(this.snapshots, operation.scope, selectors, subjects);
-      return evaluated(await buildGetSourceStreams(this.snapshots, operation.scope, [...subjects, ...hydratedArtifacts], args));
+      const hydratedArtifacts = await hydrateArtifactSelectorRecords(this.snapshots, boundOperation.scope, selectors, subjects);
+      return evaluated(await buildGetSourceStreams(this.snapshots, boundOperation.scope, [...subjects, ...hydratedArtifacts], args));
     }
-    if (operation.operation_id === "core:search_text") {
+    if (boundOperation.operation_id === "core:search_text") {
       const pattern = String(args["pattern"] ?? "").toLocaleLowerCase("en-US");
-      const matches = records.filter((record) => JSON.stringify(record.body).toLocaleLowerCase("en-US").includes(pattern));
+      const subjectInput = args["subjects"];
+      const selected = subjectInput === undefined
+        ? records
+        : resolveSelectorsToRecords(Array.isArray(subjectInput) ? subjectInput : [subjectInput], maps);
+      const matches = selected.filter((record) => JSON.stringify(record.body).toLocaleLowerCase("en-US").includes(pattern));
       return evaluated({ matches: matches.map((record) => item(record)), subjects: matches.map((record) => item(record)) });
     }
-    if (operation.operation_id === "core:analyze_impact") {
+    if (boundOperation.operation_id === "core:analyze_impact") {
       const targets = resolveSelectorsToRecords(args["target"] === undefined ? [] : [args["target"]], maps);
       const target = targets[0];
       const callerRecords = target === undefined ? [] : maps.relations.filter((record) => record.universal_kind === "core:call" && relationEndpoints(record, maps.by_any_id).target === target).flatMap((record) => {
@@ -2486,19 +2999,19 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const tests = relatedTests([...callerRecords, ...(target === undefined ? [] : [target])], maps);
       return evaluated({ will_break: callerRecords.map((record) => item(record)), must_update: [], may_be_affected: [], tests_to_run: tests.map((record) => item(record)), uncertain_dynamic_usage: [] });
     }
-    if (operation.operation_id === "core:find_related_tests") {
+    if (boundOperation.operation_id === "core:find_related_tests") {
       const subjects = resolveSelectorsToRecords(args["subjects"], maps);
       return evaluated({ tests: relatedTests(subjects, maps).map((record) => item(record)), fixtures: [], mocks: [], helpers: [] });
     }
-    if (operation.operation_id === "core:inspect_architecture") {
+    if (boundOperation.operation_id === "core:inspect_architecture") {
       const containers = maps.entities.filter((record) => record.universal_kind === "core:container");
       const publicSurfaces = maps.entities.filter((record) => record.universal_kind === "core:type" && !String(record.body["name"] ?? "").startsWith("_"));
       return evaluated({ entry_points: containers.map((record) => item(record)), public_surfaces: publicSurfaces.map((record) => item(record)), layers: [] });
     }
-    if (operation.operation_id === "core:discover_definitions") {
+    if (boundOperation.operation_id === "core:discover_definitions") {
       return evaluated(discoverDefinitions(args));
     }
-    return evaluated(Object.fromEntries(operation.result_streams.map((stream) => [stream, []])));
+    return evaluated(Object.fromEntries(boundOperation.result_streams.map((stream) => [stream, []])));
   }
 }
 

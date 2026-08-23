@@ -8,7 +8,7 @@ import {
 } from "@urdira/contracts";
 import { canonicalComparatorRegistry } from "./registries.js";
 import { sortCanonicalValues, type CanonicalComparator } from "./comparators.js";
-import { compareBytes, decodeCanonical, encodeCanonical, encodeDecimalFraction, encodeFloat64 } from "./cbor.js";
+import { compareBytes, decodeCanonical, encodeCanonical, encodeDecimalFraction, encodeFloat64 } from "./logical-encoding.js";
 import { fail } from "./errors.js";
 import { digestToBytes } from "./digests.js";
 import { normalizeBigInteger, normalizeBytes, normalizeDigest, normalizeExactDecimal, normalizeText, normalizeTimestamp, timestampFromNanoseconds, timestampNanoseconds } from "./scalars.js";
@@ -51,7 +51,6 @@ export function encodeSchemaValueTyped(value: unknown, schema: CanonicalSchemaDe
 export function decodeTypedValue(bytes: Uint8Array, type: CanonicalTypeExpression, context: SchemaValidationContext = {}): unknown {
   if (type.type_kind === "schema_reference" && type.type_name === "JsonValue") return decodeJsonValue(decodeCanonical(bytes));
   const resolvedType = resolveType(type, context);
-  if (resolvedType.type_kind === "float64") assertFloatEncoding(bytes);
   const decoded = decodeCanonical(bytes);
   return decodeTyped(decoded, resolvedType, context);
 }
@@ -69,7 +68,7 @@ function decodeTyped(value: unknown, type: CanonicalTypeExpression, context: Sch
       return `sha256:${Buffer.from(value[1]).toString("hex")}`;
     }
     case "timestamp": if (typeof value !== "bigint" && typeof value !== "number") typeError("Timestamp"); { const normalized = timestampFromNanoseconds(value); checkTimestampBounds(type.earliest, type.latest, normalized); return normalized; }
-    case "exact_decimal": if (!isDecimalFraction(value)) typeError("ExactDecimal"); { const normalized = decimalFromFraction(value.value as readonly [number | bigint, number | bigint], type.scale_policy); checkDecimalBounds(type.minimum, type.maximum, normalized); return normalized; }
+    case "exact_decimal": if (!isDecimalFraction(value)) typeError("ExactDecimal"); { const fraction = Array.isArray(value) ? value : value.value; const normalized = decimalFromFraction(fraction as readonly [number | bigint, number | bigint], type.scale_policy); checkDecimalBounds(type.minimum, type.maximum, normalized); return normalized; }
     case "big_integer": if (typeof value !== "bigint" && typeof value !== "number") typeError("BigInteger"); { const parsed = BigInt(value); checkBigIntegerBounds(type.minimum, type.maximum, parsed); return `bigint:${parsed.toString()}`; }
     case "bytes": if (!(value instanceof Uint8Array)) typeError("Bytes"); checkByteBounds(type.minimum_byte_length, type.maximum_byte_length, value.byteLength); return value;
     case "sequence": if (!Array.isArray(value)) typeError("Sequence"); checkCollectionBounds(type.minimum_item_count, type.maximum_item_count, value.length, "sequence"); return value.map((entry) => decodeTyped(entry, resolveType(type.element_type, context), context));
@@ -143,18 +142,23 @@ function encodeDecimal(value: unknown, type: Extract<CanonicalTypeExpression, { 
 function encodeJsonValue(value: unknown): Uint8Array {
   if (value === null || typeof value === "string" || typeof value === "boolean") return encodeCanonical(value);
   if (typeof value === "number" && Number.isFinite(value)) return encodeCanonical(value);
-  if (Array.isArray(value)) return concatHeaderAndValues(4, value.map((entry) => encodeJsonValue(entry)));
-  if (isRecord(value)) {
-    const entries = Object.entries(value).map(([key, entry]) => [encodeCanonical(key), encodeJsonValue(entry)] as const).sort(([left], [right]) => compareBytes(left, right));
-    return concatHeaderAndValues(5, entries.flat(), entries.length);
-  }
+  if (Array.isArray(value) && value.every((entry) => isJsonValue(entry))) return encodeCanonical(value);
+  if (isRecord(value) && Object.values(value).every((entry) => isJsonValue(entry))) return encodeCanonical(value);
   fail("uce:schema_validation_failed", "schema_validation", { value_path: "", validation_kind: "TYPE_MISMATCH", expected_type: "JsonValue" });
+}
+
+function isJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every((entry) => isJsonValue(entry));
+  return isRecord(value) && !(value instanceof Uint8Array) && Object.values(value).every((entry) => isJsonValue(entry));
 }
 
 function encodeSequence(value: unknown, type: Extract<CanonicalTypeExpression, { type_kind: "sequence" }>, context: SchemaValidationContext): Uint8Array {
   if (!Array.isArray(value)) typeError("Sequence");
   checkCollectionBounds(type.minimum_item_count, type.maximum_item_count, value.length, "sequence");
-  return concatHeaderAndValues(4, value.map((entry) => encodeTypedValue(entry, resolveType(type.element_type, context), context)));
+  const elementType = resolveType(type.element_type, context);
+  return encodeCanonical(value.map((entry) => decodeTypedValue(encodeTypedValue(entry, elementType, context), elementType, context)));
 }
 
 function encodeSet(value: unknown, type: Extract<CanonicalTypeExpression, { type_kind: "set" }>, context: SchemaValidationContext): Uint8Array {
@@ -163,7 +167,7 @@ function encodeSet(value: unknown, type: Extract<CanonicalTypeExpression, { type
   const encoded = value.map((entry) => encodeTypedValue(entry, resolveType(type.element_type, context), context));
   assertUnique(encoded);
   encoded.sort(compareBytes);
-  return concatHeaderAndValues(4, encoded);
+  return encodeCanonical(encoded.map((entry) => decodeCanonical(entry)));
 }
 
 function encodeOrderedSet(value: unknown, type: Extract<CanonicalTypeExpression, { type_kind: "ordered_set" }>, context: SchemaValidationContext): Uint8Array {
@@ -173,28 +177,32 @@ function encodeOrderedSet(value: unknown, type: Extract<CanonicalTypeExpression,
   if (!comparator) fail("uce:unknown_canonical_comparator", "schema_validation", { comparator_id: type.comparator_id, comparator_version: type.comparator_version });
   const normalized = sortCanonicalValues(value, comparator as CanonicalComparator);
   assertUnique(normalized.map((entry) => encodeTypedValue(entry, resolveType(type.element_type, context), context)));
-  return concatHeaderAndValues(4, normalized.map((entry) => encodeTypedValue(entry, resolveType(type.element_type, context), context)));
+  const elementType = resolveType(type.element_type, context);
+  return encodeCanonical(normalized.map((entry) => decodeTypedValue(encodeTypedValue(entry, elementType, context), elementType, context)));
 }
 
 function encodeMap(value: unknown, type: Extract<CanonicalTypeExpression, { type_kind: "map" }>, context: SchemaValidationContext): Uint8Array {
   if (!isRecord(value)) typeError("Map");
   checkCollectionBounds(type.minimum_entry_count, type.maximum_entry_count, Object.keys(value).length, "map");
-  const encoded = Object.entries(value).map(([key, entry]) => [encodeCanonical(key), encodeTypedValue(entry, resolveType(type.value_type, context), context)] as const).sort(([left], [right]) => compareBytes(left, right));
-  return concatHeaderAndValues(5, encoded.flat(), encoded.length);
+  const valueType = resolveType(type.value_type, context);
+  const normalized = Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, decodeTypedValue(encodeTypedValue(entry, valueType, context), valueType, context)]));
+  return encodeCanonical(normalized);
 }
 
 function encodeRecord(value: unknown, fields: readonly SchemaFieldDefinition[], context: SchemaValidationContext): Uint8Array {
   if (!isRecord(value)) typeError("Record");
   const allowed = new Set(fields.map((field) => field.field_name));
   for (const key of Object.keys(value)) if (!allowed.has(key)) fail("uce:schema_validation_failed", "schema_validation", { value_path: `/${key}`, validation_kind: "UNKNOWN_FIELD" });
-  const entries = fields.flatMap((field) => {
+  const normalized: Record<string, unknown> = {};
+  fields.forEach((field) => {
     if (!Object.hasOwn(value, field.field_name)) {
       if (field.presence === "required") fail("uce:schema_validation_failed", "schema_validation", { value_path: `/${field.field_name}`, validation_kind: "REQUIRED_FIELD_MISSING" });
-      return [];
+      return;
     }
-    return [[encodeCanonical(field.field_name), encodeFieldValue(value, field, context)]] as const;
-  }).sort(([left], [right]) => compareBytes(left, right));
-  return concatHeaderAndValues(5, entries.flat(), entries.length);
+    const encoded = encodeFieldValue(value, field, context);
+    normalized[field.field_name] = decodeTyped(decodeCanonical(encoded), resolveType(field.value_type, context), context);
+  });
+  return encodeCanonical(normalized);
 }
 
 function encodeUnion(value: unknown, type: Extract<CanonicalTypeExpression, { type_kind: "union" }>, context: SchemaValidationContext): Uint8Array {
@@ -238,6 +246,7 @@ function parseLogicalType(logicalType: string): CanonicalTypeExpression {
 }
 
 function isDecimalFraction(value: unknown): value is { readonly tag: 4; readonly value: readonly [number | bigint, number | bigint] } {
+  if (Array.isArray(value)) return value.length === 2 && value.every((entry) => typeof entry === "bigint" || typeof entry === "number");
   if (!isRecord(value)) return false;
   const candidate = value as { readonly tag?: unknown; readonly value?: unknown };
   return candidate.tag === 4 && Array.isArray(candidate.value) && candidate.value.length === 2 && (typeof candidate.value[0] === "bigint" || typeof candidate.value[0] === "number") && (typeof candidate.value[1] === "bigint" || typeof candidate.value[1] === "number");
@@ -253,19 +262,6 @@ function decimalFromFraction(value: readonly [number | bigint, number | bigint],
   return normalizeExactDecimal(`decimal:${negative && mantissa !== 0n ? "-" : ""}${unsigned}`, policy);
 }
 
-function concatHeaderAndValues(major: number, values: readonly Uint8Array[], itemCount = values.length): Uint8Array {
-  return concat(encodeCanonicalHeader(major, itemCount), ...values);
-}
-
-function encodeCanonicalHeader(major: number, length: number): Uint8Array { return encodeCanonicalHeaderBytes(major, length); }
-function encodeCanonicalHeaderBytes(major: number, length: number): Uint8Array {
-  if (length < 24) return Uint8Array.of((major << 5) | length);
-  if (length <= 0xff) return Uint8Array.of((major << 5) | 24, length);
-  if (length <= 0xffff) return Uint8Array.of((major << 5) | 25, length >> 8, length & 0xff);
-  return Uint8Array.of((major << 5) | 26, length >>> 24, (length >>> 16) & 0xff, (length >>> 8) & 0xff, length & 0xff);
-}
-
-function concat(...parts: Uint8Array[]): Uint8Array { const result = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0)); let offset = 0; for (const part of parts) { result.set(part, offset); offset += part.length; } return result; }
 function assertUnique(values: readonly Uint8Array[]): void { for (let index = 1; index < values.length; index += 1) if (compareBytes(values[index - 1]!, values[index]!) === 0) fail("uce:schema_validation_failed", "schema_validation", { value_path: "", validation_kind: "DUPLICATE_SET_ELEMENT" }); }
 function isRecord(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value) || value instanceof Uint8Array) return false;
@@ -369,12 +365,4 @@ function decodeJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(decodeJsonValue);
   if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, decodeJsonValue(entry)]));
   typeError("JsonValue");
-}
-
-function assertFloatEncoding(bytes: Uint8Array): void {
-  const initial = bytes[0];
-  const additional = initial === undefined ? -1 : initial & 0x1f;
-  if (initial === undefined || initial >> 5 !== 7 || (additional !== 25 && additional !== 26 && additional !== 27)) {
-    fail("uce:schema_validation_failed", "schema_validation", { value_path: "", validation_kind: "TYPE_MISMATCH", expected_type: "Float64" }, "Float64 requires a canonical CBOR floating-point item");
-  }
 }

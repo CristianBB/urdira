@@ -194,10 +194,10 @@ Order:
      (by `normalized_uri`) to the fork target's own freshly minted
      `artifact_id`/`artifact_version_id` is built first
      (`buildFullArtifactMap`, `workspace-fork.ts`).
-   - `record_occurrences` and `identity_assignments` — the two large tables
-     whose payload columns (`record_payload`; `assignment_payload`, never
-     decoded by any reader) are safe to copy byte-for-byte per decision 11 —
-     are bulk-copied via a single native cross-database `INSERT ... SELECT`
+   - `record_occurrences` and `identity_assignments` are bulk-copied via a
+     single native cross-database `INSERT ... SELECT`; record body child rows
+     are copied in the same transaction and no aggregate record payload is
+     decoded or recreated
      (`bulkCopyRecordsAndIdentities`): the fork target's connection `ATTACH`es
      the donor's own sqlite file read-only-in-intent, joins against a small
      temp `fork_artifact_map` table (populated in batched `INSERT`s from the
@@ -216,7 +216,13 @@ Order:
      (`memoizeRecordOpens` alone measured ~25s at 177k records on a real
      981-file repository) — exactly the cost the byte-copy design was always
      meant to skip; see the "Bulk-copy publication layer" note below for why
-     this needed a companion change to the publication side too.
+     this needed a companion change to the publication side too. Identity
+     ownership follows the v3 relational contract: the copy joins each
+     assignment through its immutable record to locate the mapped donor
+     artifact version, while the assignment's redundant physical owner
+     columns remain `NULL`. Joining the obsolete assignment owner columns
+     would silently copy zero identities from a v3 donor and make the next
+     incremental scan attempt to reopen existing records.
    - `artifact_dependencies` rows **are** re-canonicalized in JS
      (`bulkCopyDependencies`), unlike records/identities: `dependency_payload`
      is actually decoded by real query code (`WorkspaceProjectionRepository`'s
@@ -412,32 +418,24 @@ continuously with no scheduler checkpoint in between. The cause:
 `reconcileLexicalProjection`'s (`packages/engine/src/lexical-reconciler.ts`)
 step-3 loop calls `WorkspaceProjectionRepository.putLexicalDocument`
 (`packages/storage/src/projections.ts`) once per newly-visible text document,
-and `putLexicalDocument` computes `lexicalTrigrams` — a synchronous,
-allocation-heavy byte-sliding-window scan over the *entire* normalized
-document text (slicing a new `Uint8Array` and hex-encoding it per byte
-position) — on the calling thread, not inside the `node:sqlite` worker any
-`await` in the loop would otherwise be yielding into. `await`ing an
+and the historical implementation performed synchronous trigram extraction
+on the calling thread, not inside the `node:sqlite` worker any `await` in the
+loop would otherwise be yielding into. `await`ing an
 already-settled (or fast-settling) promise only drains the microtask queue;
 it does not yield to pending I/O, so a loop of purely-`await`-ed calls can
 still starve the event loop for as long as their combined *synchronous* work
 takes — which, across hundreds of documents with no yield point between
 them, was the observed ~3 minutes.
 
-Fix: `yieldToEventLoop()` (`lexical-reconciler.ts`) — `setImmediate`,
+Historical fix: `yieldToEventLoop()` (`lexical-reconciler.ts`) — `setImmediate`,
 specifically, not a resolved promise or `setTimeout(fn, 0)`, since
 `setImmediate` queues onto the "check" phase, which runs after Node's I/O
 callbacks for the current loop turn — called once per document in both the
 step-2 (close stale) and step-3 (insert missing) loops. This bounds the
-worst-case single stall to one document's own trigram computation (capped by
+worst-case single stall to one document's own lexical-index update (capped by
 `max_document_bytes`, default 2MB) instead of every document in the pass
-combined, at the cost of one `setImmediate` round-trip per document (negligible
-relative to the trigram computation itself). This is a mitigation, not a
-structural fix: the total CPU cost of trigram computation for a pass is
-unchanged, and a single very large document (near the 2MB cap) can still
-produce a multi-second stall on its own — a genuinely non-blocking trigram
-computation would need to move the loop off the main thread entirely (a
-worker thread, mirroring `URDIRA_ANALYSIS_THREAD`'s existing pattern for
-plugin analysis), which was judged out of scope for this round.
+combined. In v3, the legacy relational trigram projection is removed; the
+reconciler writes only FTS5 and retains the worker-thread boundary.
 
 ## Fix: `.git/**` watcher noise racing a fork's donor-readiness read
 

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fs from "node:fs";
 import git from "isomorphic-git";
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { canonicalBytes, digestBytes, digestLogicalValue } from "@urdira/canonical";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   JsonValue,
@@ -63,7 +63,7 @@ function request(
   if (overrides.request_digest !== undefined) return envelope;
   return {
     ...envelope,
-    request_digest: digestBytes(canonicalBytes({
+    request_digest: digestLogicalValue({
       protocol_version: envelope.protocol_version,
       call: envelope.call,
       workspace_id: envelope.workspace_id,
@@ -72,7 +72,7 @@ function request(
       component_version: envelope.component_version,
       resource_budget: envelope.resource_budget,
       payload: envelope.payload,
-    })),
+    }),
   };
 }
 
@@ -113,7 +113,7 @@ async function fileState(root: string): Promise<Readonly<Record<string, string>>
     for (const entry of await readdir(absolute, { withFileTypes: true })) {
       const child = relative ? `${relative}/${entry.name}` : entry.name;
       if (entry.isDirectory()) await visit(child);
-      else state[child] = Buffer.from(await readFile(join(root, child))).toString("base64");
+      else state[child] = digestBytes(new Uint8Array(await readFile(join(root, child))));
     }
   };
   await visit("");
@@ -143,7 +143,7 @@ describe("Phase 7 five-call source providers", () => {
     expect(sameCanonicalArtifactPath("C:\\Users\\RunnerAdmin\\workspace\\src\\task.ts", "C:/Users/RunnerAdmin/workspace/src/task.ts")).toBe(true);
   });
 
-  it("exposes exactly the five protocol calls", async () => {
+  it("exposes the five protocol calls and the directory native stream boundary", async () => {
     const root = await temporaryDirectory();
     const providers = [
       new DirectorySourceProvider({ ...boundProvider, root, now: () => instant }),
@@ -151,9 +151,8 @@ describe("Phase 7 five-call source providers", () => {
       new GitReferenceSourceProvider({ ...boundProvider, git_dir: join(root, ".git"), ref: "refs/heads/main", now: () => instant }),
     ];
 
-    for (const provider of providers) {
-      expect(methodNames(provider)).toEqual(["describe", "enumerate", "read", "reconcile", "watch"]);
-    }
+    expect(methodNames(providers[0]!)).toEqual(["describe", "enumerate", "enumerateNative", "enumerateNativeBatches", "read", "readStream", "reconcile", "watch"]);
+    for (const provider of providers.slice(1)) expect(methodNames(provider)).toEqual(["describe", "enumerate", "read", "reconcile", "watch"]);
   });
 
   it("rejects a mismatched request digest for every call before provider IO", async () => {
@@ -304,13 +303,25 @@ describe("Phase 7 five-call source providers", () => {
       observed_metadata_digest: observation.observed_metadata_digest,
       provider_version_token: observation.provider_version_token,
     }));
-    const readResult = responsePayload<{ content_bytes: string; content_hash: string; byte_length: number; metadata_digest: string }>(read);
-    expect(Buffer.from(readResult.content_bytes, "base64").toString("utf8")).toBe("export const alpha = 1;\n");
+    const readResult = responsePayload<{ content: Uint8Array; content_hash: string; byte_length: number; metadata_digest: string }>(read);
+    expect(new TextDecoder().decode(readResult.content)).toBe("export const alpha = 1;\n");
     expect(readResult).toMatchObject({
       content_hash: observation.observed_content_hash,
       metadata_digest: observation.observed_metadata_digest,
       byte_length: 24,
     });
+
+    const stream = await provider.readStream({
+      artifact_id: observation.artifact_id,
+      normalized_uri: observation.normalized_uri,
+      observed_content_hash: observation.observed_content_hash,
+      observed_metadata_digest: observation.observed_metadata_digest,
+      provider_version_token: observation.provider_version_token,
+    });
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of stream.chunks) chunks.push(chunk);
+    expect(new TextDecoder().decode(Buffer.concat(chunks))).toBe("export const alpha = 1;\n");
+    expect(stream).toMatchObject({ artifact_id: observation.artifact_id, content_hash: observation.observed_content_hash, byte_length: 24, media_type: "text/plain; charset=utf-8" });
   });
 
   it("rejects direct reads of mandatory and configured exclusions even with matching observation coordinates", async () => {
@@ -474,12 +485,12 @@ describe("Phase 7 five-call source providers", () => {
       now: () => instant,
       file_system: {
         ...NODE_DIRECTORY_FILE_SYSTEM,
-        read_file: async (candidate) => {
+        read_file_stream: (candidate) => (async function* (): AsyncGenerator<Uint8Array> {
           const bytes = await NODE_DIRECTORY_FILE_SYSTEM.read_file(candidate);
           reads += 1;
           if (reads === 1) await writeFile(path, "changed during capture\n");
-          return bytes;
-        },
+          yield bytes;
+        })(),
       },
     });
 
@@ -623,14 +634,14 @@ describe("Phase 7 five-call source providers", () => {
     );
     expect(stillPinned.capture_start_fingerprint).toBe(first.capture_start_fingerprint);
 
-    const read = responsePayload<{ content_bytes: string }>(await provider.read(referenceRequest("read", {
+    const read = responsePayload<{ content: Uint8Array }>(await provider.read(referenceRequest("read", {
       artifact_id: firstObservation.artifact_id,
       normalized_uri: firstObservation.normalized_uri,
       observed_content_hash: firstObservation.observed_content_hash,
       observed_metadata_digest: firstObservation.observed_metadata_digest,
       provider_version_token: firstObservation.provider_version_token,
     })));
-    expect(Buffer.from(read.content_bytes, "base64").toString("utf8")).toBe("one\n");
+    expect(new TextDecoder().decode(read.content)).toBe("one\n");
     expect(await readFile(join(root, "alpha.ts"), "utf8")).toBe("two\n");
 
     const refreshed = responsePayload<{ capture_start_fingerprint: string; observation_batch: string }>(
@@ -665,7 +676,7 @@ describe("Phase 7 five-call source providers", () => {
       artifact_id: `artifact:${uri}`,
       normalized_uri: uri,
       observed_content_hash: digestBytes(bytes),
-      observed_metadata_digest: digestBytes(canonicalBytes({ commit, mode, oid, uri })),
+      observed_metadata_digest: digestLogicalValue({ commit, mode, oid, uri }),
       provider_version_token: `${commit}:${oid}:${mode}`,
     });
 
@@ -767,5 +778,37 @@ describe("Phase 7 five-call source providers", () => {
     const observations = decoded<{ observations: ProviderObservation[] }>(sequential.observation_batch).observations;
     expect(observations.length).toBe(44);
     expect(observations.map((observation) => observation.normalized_uri)).toEqual([...observations.map((observation) => observation.normalized_uri)].sort());
+  });
+
+  it("does not enumerate generated directory trees that the inclusion policy will reject", async () => {
+    const root = await temporaryDirectory();
+    await mkdir(join(root, "src"));
+    await mkdir(join(root, "node_modules", "large-dependency"), { recursive: true });
+    await mkdir(join(root, "dist", "generated"), { recursive: true });
+    await mkdir(join(root, "coverage", "html"), { recursive: true });
+    await writeFile(join(root, "src", "index.ts"), "export const index = true;\n");
+    await writeFile(join(root, "node_modules", "large-dependency", "index.ts"), "export const dependency = true;\n");
+    await writeFile(join(root, "dist", "generated", "index.js"), "export const generated = true;\n");
+    await writeFile(join(root, "coverage", "html", "index.html"), "<!doctype html>\n");
+
+    const listed: string[] = [];
+    const provider = new DirectorySourceProvider({
+      ...boundProvider,
+      root,
+      now: () => instant,
+      file_system: {
+        ...NODE_DIRECTORY_FILE_SYSTEM,
+        read_directory: async (path) => {
+          listed.push(path);
+          return NODE_DIRECTORY_FILE_SYSTEM.read_directory(path);
+        },
+      },
+    });
+    const response = await provider.enumerate(request("enumerate", { coverage_scopes: completeScope }));
+    const payload = responsePayload<{ readonly observation_batch: string }>(response);
+    const observations = decoded<{ readonly observations: readonly ProviderObservation[] }>(payload.observation_batch).observations;
+
+    expect(observations.map((observation) => observation.normalized_uri)).toEqual(["src/index.ts"]);
+    expect(listed.some((path) => path.includes("node_modules") || path.includes("/dist") || path.includes("/coverage"))).toBe(false);
   });
 });

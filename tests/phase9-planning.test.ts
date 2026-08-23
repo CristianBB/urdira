@@ -230,10 +230,10 @@ describe("Phase 9 candidate planning", () => {
 
   it("invalidates owner projections and projections reached through source records", () => {
     const plan = new CandidatePlanner().plan(input({
-      owned_projections: [input().owned_projections[0]!, { ...input().owned_projections[0]!, projection_record_id: "projection:consumer", owner_artifact_id: "artifact:projection-owner", owner_artifact_version_id: "version:artifact:projection-owner", source_record_ids: ["record:consumer"] }],
-      projection_dependencies: [{ projection_record_id: "projection:consumer", source_type: "record", source_id: "record:consumer" }],
+      owned_projections: [input().owned_projections[0]!, { ...input().owned_projections[0]!, projection_record_id: "projection:consumer", owner_artifact_id: "artifact:projection-owner", owner_artifact_version_id: "version:artifact:projection-owner", source_record_ids: ["record:consumer"] }, { ...input().owned_projections[0]!, projection_record_id: "projection:grandchild", owner_artifact_id: "artifact:grandchild", owner_artifact_version_id: "version:artifact:grandchild", source_record_ids: [] }],
+      projection_dependencies: [{ projection_record_id: "projection:consumer", source_type: "record", source_id: "record:consumer" }, { projection_record_id: "projection:grandchild", source_type: "projection", source_id: "projection:consumer" }],
     }));
-    expect(plan.invalidation.affected_projections.map((entry) => entry.projection_record_id)).toEqual(["projection:consumer", "projection:owner"]);
+    expect(plan.invalidation.affected_projections.map((entry) => entry.projection_record_id)).toEqual(["projection:consumer", "projection:grandchild", "projection:owner"]);
   });
 
   it("invalidates unchanged empty lookups only when the complete digest changes", () => {

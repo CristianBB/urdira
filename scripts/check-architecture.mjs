@@ -111,8 +111,36 @@ export async function checkArchitecture(repositoryRoot, manifest) {
   errors.push(...checkCoverage(manifest.coverage, entriesByName));
   errors.push(...(await checkSourceProviderCommandIsolation(repositoryRoot)));
   errors.push(...(await checkPluginPhaseBoundaries(repositoryRoot, workspacePackages)));
+  errors.push(...(await checkNativePipelineContracts(repositoryRoot, workspacePackages)));
 
   return { errors, checkedPackages };
+}
+
+async function checkNativePipelineContracts(repositoryRoot, workspacePackages) {
+  const errors = [];
+  for (const workspacePackage of workspacePackages) {
+    const sourceFiles = await findSourceFiles(join(workspacePackage.path, "src"));
+    for (const sourceFile of sourceFiles) {
+      const source = await readFile(sourceFile, "utf8");
+      const sourcePath = normalizeArchitecturePath(relative(repositoryRoot, sourceFile));
+      if (/(?:from|import|require)\s*\(?\s*["'][^"']*cbor[^"']*["']/iu.test(source)) {
+        errors.push(`${sourcePath} cannot import a removed generic binary serializer`);
+      }
+      if (/(?:toString|toStringAsync)\(\s*["']base64(?:url)?["']\s*\)|Buffer\.from\([^\n]*,[^\n]*["']base64(?:url)?["']/iu.test(source)) {
+        errors.push(`${sourcePath} cannot encode or decode bytes as Base64`);
+      }
+      if (/\b(?:record|candidate|fact_delta|work_manifest|snapshot|registry|manifest|current|control|projection|edge|dependency|metric|vector|assignment|trigram|document)_payload\b|\bpayload_inline\b/iu.test(source) && /(?:CREATE\s+TABLE|INSERT\s+INTO|UPDATE\s+\w+\s+SET|SELECT[\s\S]{0,160}\b_payload\b)/iu.test(source)) {
+        errors.push(`${sourcePath} cannot persist removed aggregate record or candidate payload columns`);
+      }
+      if (/\bcontent_bytes\b/u.test(source)) {
+        errors.push(`${sourcePath} cannot project source bytes through a string field`);
+      }
+      if (/(?:\b(?:Uce|UCE)\w+\b|\b(?:encode|decode)Uce\w*\b)/u.test(source)) {
+        errors.push(`${sourcePath} cannot retain the removed UCE runtime integration; use the v2 IPC contract`);
+      }
+    }
+  }
+  return errors;
 }
 
 const languageWorkerName = /(?:^(?:create)?(?:JavaScript|TypeScript|Rust).*(?:Worker|Plugin)$)|(?:^(?:Worker|Plugin).*(?:JavaScript|TypeScript|Rust)$)/u;
@@ -883,6 +911,9 @@ function checkDependencies(workspacePackage, entry) {
     dependencyFields.flatMap((field) => Object.keys(workspacePackage.packageJson[field] ?? {})),
   );
   for (const dependencyName of declaredDependencies) {
+    if (/(?:^|[-_.])(?:cbor|cbor-x|borc)(?:$|[-_.])/iu.test(dependencyName)) {
+      errors.push(`${workspacePackage.name} cannot declare a removed CBOR serializer dependency`);
+    }
     if (isInternalPackageName(dependencyName) && !entry.dependencies.includes(dependencyName)) {
       errors.push(
         `${workspacePackage.name} declares dependency ${dependencyName} outside its architecture boundary`,

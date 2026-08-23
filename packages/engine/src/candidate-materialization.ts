@@ -1,5 +1,5 @@
 import { canonicalJson, canonicalSha256 } from "@urdira/plugin-sdk";
-import { canonicalBytes, compareBytes, digestBytes, digestCanonicalArray } from "@urdira/canonical";
+import { canonicalBytes, digestBytes, digestCanonicalArray, digestCanonicalMapWithArrayFields, digestMappedCanonicalArray, LogicalDigestWriter } from "@urdira/canonical";
 import type { CanonicalEncodingLimits } from "@urdira/canonical";
 import type { BoundPluginLookupInvalidationDependency, PluginInvalidationConsumerType, PluginInvalidationScope, PluginLookupOperation } from "@urdira/plugin-sdk";
 import type {
@@ -21,7 +21,7 @@ import type {
 } from "@urdira/contracts";
 import type { CandidatePlan } from "./candidate-planning.js";
 import type { SourceCandidatePlan } from "./source-candidate-planning.js";
-import type { AcceptedFactDelta, BaseCandidateRecord } from "./fact-delta.js";
+import type { MaterializationAcceptedFactDelta, MaterializationProposedRecord, BaseCandidateRecord } from "./fact-delta.js";
 import type { BaseCandidateProjection } from "./candidate-planning.js";
 import type { ProviderWatermark, SnapshotCapabilityStateEntry, CandidateWorkManifest } from "@urdira/contracts";
 
@@ -29,7 +29,7 @@ export interface CandidateMaterializationInput {
   readonly candidate: IndexCandidate;
   readonly manifest: CandidateWorkManifest;
   readonly source_plan: SourceCandidatePlan;
-  readonly accepted_deltas: readonly AcceptedFactDelta[];
+  readonly accepted_deltas: readonly MaterializationAcceptedFactDelta[];
   readonly accepted_projection_sets: readonly ValidatedProjectionReplacementSet[];
   readonly base_records: readonly BaseCandidateRecord[];
   /**
@@ -101,19 +101,84 @@ function freeze<T>(value: T): T {
   return value;
 }
 
-const sortKeyEncoder = new TextEncoder();
-
-// Schwartzian transform: encode each sort key once instead of allocating two
-// fresh Buffers per comparison over potentially multi-KB keys.
+// Sort a shallow copy without a Schwartzian transform. The old transform
+// allocated a key buffer and wrapper object for every proposed record, then a
+// second array for the unwrapped values; on a large first scan that temporary
+// graph was enough to exceed V8's heap while the accepted deltas were live.
 function sorted<T>(values: readonly T[], key: (value: T) => string): T[] {
-  return values
-    .map((value) => ({ value, keyBytes: sortKeyEncoder.encode(key(value)) }))
-    .sort((left, right) => compareBytes(left.keyBytes, right.keyBytes))
-    .map((entry) => entry.value);
+  return [...values].sort((left, right) => {
+    const leftKey = key(left);
+    const rightKey = key(right);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+}
+
+function sortOwned<T>(values: T[], key: (value: T) => string): T[] {
+  return values.sort((left, right) => {
+    const leftKey = key(left);
+    const rightKey = key(right);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
 }
 
 function digest(value: unknown, limits: CanonicalEncodingLimits = {}): string {
   return digestBytes(canonicalBytes(value, limits));
+}
+
+interface PackedCandidateTemplate {
+  readonly canonical_template: string;
+}
+
+const PACKED_CREATED_IDENTITY_MARKER = "urdira:created-identity:v1";
+const PACKED_IDENTITY_THRESHOLD = 10_000;
+type PackedCreatedIdentityAssignment = readonly [
+  typeof PACKED_CREATED_IDENTITY_MARKER,
+  workspace_id: string,
+  identity_type: string,
+  identity_key: string,
+  record_id: string,
+  owner_artifact_id: string,
+  owner_artifact_version_id: string,
+];
+
+function isPackedCreatedIdentityAssignment(value: unknown): value is PackedCreatedIdentityAssignment {
+  return Array.isArray(value)
+    && value.length === 7
+    && value[0] === PACKED_CREATED_IDENTITY_MARKER
+    && value.every((entry) => typeof entry === "string");
+}
+
+function unpackCreatedIdentityAssignment(value: PackedCreatedIdentityAssignment): CandidateIdentityAssignmentTemplate {
+  const [, workspaceId, identityType, identityKey, recordId, ownerArtifactId, ownerArtifactVersionId] = value;
+  return {
+    identity_assignment_id: digest({ record_id: recordId, identity_key: identityKey }),
+    workspace_id: workspaceId,
+    identity_type: identityType,
+    identity_id: `${identityType}:${digest({ identity_key: identityKey }).slice("sha256:".length)}`,
+    assignment_kind: "created",
+    identity_key: identityKey,
+    identity_key_digest: digest(identityKey),
+    record_id: recordId,
+    owner_artifact_id: ownerArtifactId,
+    owner_artifact_version_id: ownerArtifactVersionId,
+  };
+}
+
+function isPackedCandidateTemplate(value: unknown): boolean {
+  return isPackedCreatedIdentityAssignment(value)
+    || value !== null && typeof value === "object" && !Array.isArray(value) && typeof (value as Record<string, unknown>)["canonical_template"] === "string";
+}
+
+function packedTemplateValue(value: unknown): unknown {
+  if (isPackedCreatedIdentityAssignment(value)) return unpackCreatedIdentityAssignment(value);
+  if (value !== null && typeof value === "object" && !Array.isArray(value) && typeof (value as Record<string, unknown>)["canonical_template"] === "string") {
+    return JSON.parse((value as PackedCandidateTemplate).canonical_template);
+  }
+  return value;
+}
+
+function digestTemplateArray(entries: readonly unknown[]): string {
+  return digestMappedCanonicalArray(entries, "urdira:candidate-template-logical-value:v2", packedTemplateValue);
 }
 
 // `CandidateMaterialization`'s template-set fields (`record_open_template_set`,
@@ -129,15 +194,31 @@ function digest(value: unknown, limits: CanonicalEncodingLimits = {}): string {
 // digest inside a descriptor, can use the shared default limits everywhere: no field of
 // the sealed materialization object is an aggregate of unbounded size anymore. The
 // caller carries the actual arrays out-of-band (`SealedCandidateMaterialization`) for
-// storage to persist as CAS-backed segments (`packages/storage/src/candidates.ts`).
+// the active publication call; durable recovery replays confirmed FactDelta batches.
 export interface CandidateMaterializerOptions {}
 
-const recordDigestMemo = new WeakMap<ProposedRecord, string>();
+type RetainedProposedRecord = ProposedRecord | MaterializationProposedRecord;
 
-function recordDigest(record: ProposedRecord): string {
+function isMaterializationProposedRecord(record: RetainedProposedRecord): record is MaterializationProposedRecord {
+  return "canonical_record" in record;
+}
+
+const recordDigestMemo = new WeakMap<RetainedProposedRecord, string>();
+
+function decodeMaterializationRecord(record: RetainedProposedRecord): ProposedRecord {
+  return isMaterializationProposedRecord(record) ? JSON.parse(record.canonical_record) as ProposedRecord : record;
+}
+
+function recordDigest(record: RetainedProposedRecord): string {
+  // Compacted production records are visited exactly once on the first-open
+  // path. Retaining one WeakMap entry per record therefore buys no reuse and
+  // keeps the million-record VS Code candidate live through sealing. Generic
+  // providers can revisit full ProposedRecord objects during replacement and
+  // closure handling, so keep memoization for that compatibility path.
+  if (isMaterializationProposedRecord(record)) return digest(decodeMaterializationRecord(record));
   const cached = recordDigestMemo.get(record);
   if (cached !== undefined) return cached;
-  const value = digest(record);
+  const value = digest(decodeMaterializationRecord(record));
   recordDigestMemo.set(record, value);
   return value;
 }
@@ -146,14 +227,16 @@ function causes(ownerArtifactId: string): readonly ChangeCauseReference[] {
   return [{ cause_type: "artifact", cause_id: ownerArtifactId }];
 }
 
-const scopedRecordsMemo = new WeakMap<object, ProposedRecord[]>();
+const scopedRecordsMemo = new WeakMap<object, RetainedProposedRecord[]>();
 
-function scopeRecords(input: CandidateMaterializationInput): ProposedRecord[] {
+function scopeRecords(input: CandidateMaterializationInput): RetainedProposedRecord[] {
   const cached = scopedRecordsMemo.get(input as object);
   if (cached !== undefined) return cached;
-  const records = sorted(input.accepted_deltas.flatMap((delta) => delta.replacement_sets.flatMap((set) => set.records)), (record) => record.proposal_record_key);
-  scopedRecordsMemo.set(input as object, records);
-  return records;
+  const records: RetainedProposedRecord[] = [];
+  for (const delta of input.accepted_deltas) for (const set of delta.replacement_sets) for (const record of set.records) records.push(record);
+  const sortedRecords = sorted(records, (record) => record.proposal_record_key);
+  scopedRecordsMemo.set(input as object, sortedRecords);
+  return sortedRecords;
 }
 
 interface RecordOwner {
@@ -170,8 +253,21 @@ interface RecordOwner {
 // instead of each independently re-deriving it.
 function recordOwners(input: CandidateMaterializationInput): ReadonlyMap<string, RecordOwner> {
   const owners = new Map<string, RecordOwner>();
-  for (const delta of input.accepted_deltas) for (const set of delta.replacement_sets) for (const record of set.records) owners.set(record.proposal_record_key, { owner_artifact_id: set.scope.owner_artifact_id, owner_artifact_version_id: set.scope.owner_artifact_version_id });
+  // Compacted production records promote their owner alongside the canonical
+  // record string. Do not rebuild a million-entry proposal->owner Map at
+  // seal; generic providers retaining full ProposedRecord objects continue
+  // to use this compatibility index.
+  for (const delta of input.accepted_deltas) for (const set of delta.replacement_sets) for (const record of set.records) {
+    if (isMaterializationProposedRecord(record)) continue;
+    owners.set(record.proposal_record_key, { owner_artifact_id: set.scope.owner_artifact_id, owner_artifact_version_id: set.scope.owner_artifact_version_id });
+  }
   return owners;
+}
+
+function retainedRecordOwner(record: RetainedProposedRecord, owners: ReadonlyMap<string, RecordOwner>): RecordOwner | undefined {
+  return isMaterializationProposedRecord(record)
+    ? { owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id }
+    : owners.get(record.proposal_record_key);
 }
 
 function identityTypeForCategory(category: string): "entity" | "relation" | "diagnostic" | undefined {
@@ -217,6 +313,59 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
 } {
   const desired = scopeRecords(input);
   const workspaceId = input.candidate.workspace_id;
+  const noPriorRecordAuthority = input.base_records.length === 0
+    && (input.global_identity_records?.length ?? 0) === 0
+    && (input.absence_barriers?.length ?? 0) === 0;
+  if (noPriorRecordAuthority && desired.every(isMaterializationProposedRecord)) {
+    const dependencyProposalKeys = new Set<string>();
+    for (const accepted of input.accepted_deltas) for (const dependency of accepted.delta.proposed_dependencies ?? []) dependencyProposalKeys.add(dependency.proposal_record_key);
+    const retainEveryProposalId = (input.record_dependencies?.length ?? 0) > 0
+      || (input.lookup_bindings?.length ?? 0) > 0
+      || (input.projection_dependencies?.length ?? 0) > 0;
+    const opens: CandidateRecordOpenTemplate[] = [];
+    const identities: CandidateIdentityAssignmentTemplate[] = [];
+    const packIdentities = desired.length >= PACKED_IDENTITY_THRESHOLD;
+    const proposalRecordIds = new Map<string, string>();
+    for (const record of desired) {
+      const owner = retainedRecordOwner(record, owners)!;
+      const identityType = identityTypeForCategory(record.category) ?? "entity";
+      const recordContentDigest = recordDigest(record);
+      const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
+      if (retainEveryProposalId || dependencyProposalKeys.has(record.proposal_record_key)) proposalRecordIds.set(record.proposal_record_key, recordId);
+      opens.push({ record_without_validity: record.canonical_record, open_reason_code: "core:record_created", owner_artifact_id: owner.owner_artifact_id, owner_artifact_version_id: owner.owner_artifact_version_id, cause_references: causes(owner.owner_artifact_id), record_id_hint: recordId, record_digest_hint: recordContentDigest } as CandidateRecordOpenTemplate);
+      if (packIdentities) {
+        identities.push([
+          PACKED_CREATED_IDENTITY_MARKER,
+          workspaceId,
+          identityType,
+          record.identity_key,
+          recordId,
+          owner.owner_artifact_id,
+          owner.owner_artifact_version_id,
+        ] as unknown as CandidateIdentityAssignmentTemplate);
+      } else {
+        identities.push({
+          identity_assignment_id: digest({ record_id: recordId, identity_key: record.identity_key }),
+          workspace_id: workspaceId,
+          identity_type: identityType,
+          identity_id: `${identityType}:${digest({ identity_key: record.identity_key }).slice("sha256:".length)}`,
+          assignment_kind: "created",
+          identity_key: record.identity_key,
+          identity_key_digest: digest(record.identity_key),
+          record_id: recordId,
+          owner_artifact_id: owner.owner_artifact_id,
+          owner_artifact_version_id: owner.owner_artifact_version_id,
+        });
+      }
+    }
+    return {
+      reused: [],
+      opens: sortOwned(opens, (entry) => String((entry as unknown as Record<string, unknown>)["record_id_hint"] ?? entry.record_without_validity)),
+      closures: [],
+      identities: packIdentities ? identities : sortOwned(identities, (entry) => entry.identity_assignment_id),
+      proposal_record_ids: proposalRecordIds,
+    };
+  }
   const base = matchingBaseRecords(input);
   const globalByKey = new Map<string, BaseCandidateRecord[]>();
   for (const record of input.global_identity_records ?? []) {
@@ -230,7 +379,7 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
   }
   const baseByKey = new Map(base.filter((record) => record.identity_key !== undefined).map((record) => [`${record.identity_type ?? identityTypeForCategory(record.category) ?? "entity"}\0${record.identity_key!}`, record]));
   const absenceBarriers = new Map((input.absence_barriers ?? []).map((entry) => [`${entry.identity_type}\0${entry.identity_key}`, entry]));
-  const desiredByKey = new Map<string, ProposedRecord>();
+  const desiredByKey = new Map<string, RetainedProposedRecord>();
   for (const record of desired) if (!desiredByKey.has(record.identity_key)) desiredByKey.set(record.identity_key, record);
   const reused: string[] = [];
   const opens: CandidateRecordOpenTemplate[] = [];
@@ -241,7 +390,7 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
   const migrationPredecessors = new Map<string, BaseCandidateRecord>();
 
   for (const record of desired) {
-    const owner = owners.get(record.proposal_record_key)!;
+    const owner = retainedRecordOwner(record, owners)!;
     const identityType = identityTypeForCategory(record.category) ?? "entity";
     const identityKey = `${identityType}\0${record.identity_key}`;
     const previousCandidate = baseByKey.get(identityKey);
@@ -302,14 +451,16 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
     if (candidate !== undefined) salt["previous_record_id"] = candidate.record_id;
     if (barrier !== undefined) salt["absence_barrier"] = barrier.closed_identity_id;
     const hasSalt = candidate !== undefined || barrier !== undefined;
-    const digestInput = hasSalt ? { record, ...salt } : record;
-    const newRecordId = `record:${digest(digestInput).slice("sha256:".length)}`;
+    const decodedRecord = decodeMaterializationRecord(record);
+    const digestInput = hasSalt ? { record: decodedRecord, ...salt } : decodedRecord;
+    const newRecordDigest = digest(digestInput);
+    const newRecordId = `record:${newRecordDigest.slice("sha256:".length)}`;
     proposalRecordIds.set(record.proposal_record_key, newRecordId);
     replacementIds.set(record.identity_key, newRecordId);
     // `record_without_validity` carries the canonical JSON of exactly the digest
     // input above, so storage (`memoizeRecordOpens`, publication-authority.ts)
     // re-derives the identical id byte-for-byte from the template alone.
-    opens.push({ record_without_validity: canonicalJson(digestInput), open_reason_code: previous === undefined ? "core:record_created" : "core:record_replaced", ...(previous === undefined ? {} : { previous_record_id: previous.record_id }), owner_artifact_id: owner.owner_artifact_id, owner_artifact_version_id: owner.owner_artifact_version_id, cause_references: causes(owner.owner_artifact_id) });
+    opens.push({ record_without_validity: hasSalt ? canonicalJson(digestInput) : isMaterializationProposedRecord(record) ? record.canonical_record : canonicalJson(record), open_reason_code: previous === undefined ? "core:record_created" : "core:record_replaced", ...(previous === undefined ? {} : { previous_record_id: previous.record_id }), owner_artifact_id: owner.owner_artifact_id, owner_artifact_version_id: owner.owner_artifact_version_id, cause_references: causes(owner.owner_artifact_id), record_id_hint: newRecordId, record_digest_hint: newRecordDigest } as CandidateRecordOpenTemplate);
     if (previous?.identity_type !== undefined && previous.identity_id !== undefined) identities.push({
       identity_assignment_id: digest({ record_id: newRecordId, identity_key: record.identity_key }),
       workspace_id: workspaceId,
@@ -353,7 +504,7 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
       closures.push({ record_id: previous.record_id, workspace_id: previous.workspace_id, owner_artifact_id: previous.owner_artifact_id, owner_artifact_version_id: previous.owner_artifact_version_id, category: previous.category, kind: previous.kind, universal_kind: previous.universal_kind, closure_reason_code: "core:record_replaced", ...(replacement === undefined ? {} : { replacement_record_id: replacement }), cause_references: [{ cause_type: "artifact", cause_id: previous.owner_artifact_id }] });
     } else if (previous.identity_key !== undefined && desiredByKey.has(previous.identity_key)) {
       const desiredRecord = desiredByKey.get(previous.identity_key);
-      const desiredOwner = desiredRecord === undefined ? undefined : owners.get(desiredRecord.proposal_record_key);
+      const desiredOwner = desiredRecord === undefined ? undefined : retainedRecordOwner(desiredRecord, owners);
       if (desiredRecord !== undefined && desiredOwner?.owner_artifact_id === previous.owner_artifact_id && previous.record_digest === recordDigest(desiredRecord)) continue;
       const replacement = previous.identity_key === undefined ? undefined : replacementIds.get(previous.identity_key);
       closures.push({ record_id: previous.record_id, workspace_id: previous.workspace_id, owner_artifact_id: previous.owner_artifact_id, owner_artifact_version_id: previous.owner_artifact_version_id, category: previous.category, kind: previous.kind, universal_kind: previous.universal_kind, closure_reason_code: "core:record_replaced", ...(replacement === undefined ? {} : { replacement_record_id: replacement }), cause_references: [{ cause_type: "artifact", cause_id: previous.owner_artifact_id }] });
@@ -362,10 +513,18 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
     }
   }
 
-  return { reused: sorted(reused, (entry) => entry), opens: sorted(opens, (entry) => entry.record_without_validity), closures: sorted(closures, (entry) => entry.record_id), identities: sorted(identities, (entry) => entry.identity_assignment_id), proposal_record_ids: proposalRecordIds };
+  return { reused: sorted(reused, (entry) => entry), opens: sorted(opens, (entry) => String((entry as unknown as Record<string, unknown>)["record_id_hint"] ?? entry.record_without_validity)), closures: sorted(closures, (entry) => entry.record_id), identities: sorted(identities, (entry) => entry.identity_assignment_id), proposal_record_ids: proposalRecordIds };
 }
 
 function projectionTemplates(input: CandidateMaterializationInput): { readonly opens: readonly CandidateProjectionOpenTemplate[]; readonly closures: readonly CandidateProjectionClosureTemplate[]; readonly reused: readonly string[] } {
+  // There is no projection authority to validate or reconcile on a genuine
+  // projection-free stage. Returning before constructing `allowedRecords`
+  // avoids a million-entry Set of proposal keys during JS/TS stage 1, whose
+  // registry contributes records only. Any base or proposed projection keeps
+  // the full validation/replacement path below.
+  if (input.accepted_projection_sets.length === 0 && input.base_projections.length === 0) {
+    return { opens: freeze([]), closures: freeze([]), reused: freeze([]) };
+  }
   const opens: CandidateProjectionOpenTemplate[] = [];
   const closures: CandidateProjectionClosureTemplate[] = [];
   const reused: string[] = [];
@@ -373,12 +532,13 @@ function projectionTemplates(input: CandidateMaterializationInput): { readonly o
   const projectionIds = new Set<string>();
   const projectionKeys = new Set<string>();
   const allowedArtifactVersions = new Set(input.known_artifact_versions.map((entry) => entry.artifact_version_id));
-  const allowedRecords = new Set([
-    ...input.base_records.map((record) => record.record_id),
-    ...scopeRecords(input).map((record) => record.proposal_record_key),
-    ...input.accepted_deltas.flatMap((delta) => delta.validated_staged_records.flatMap((record) => [record.staged_record_id, record.proposal_record_key])),
-    ...(input.record_dependencies ?? []).map((dependency) => dependency.record_id),
-  ]);
+  const allowedRecords = new Set<string>(input.base_records.map((record) => record.record_id));
+  for (const record of scopeRecords(input)) allowedRecords.add(record.proposal_record_key);
+  for (const delta of input.accepted_deltas) for (const record of delta.validated_staged_records) {
+    allowedRecords.add(record.staged_record_id);
+    allowedRecords.add(record.proposal_record_key);
+  }
+  for (const dependency of input.record_dependencies ?? []) allowedRecords.add(dependency.record_id);
   const allowedProjections = new Set(input.base_projections.map((projection) => projection.projection_record_id));
   for (const set of input.accepted_projection_sets) for (const projection of set.projections) allowedProjections.add(projection.projection_record_id);
   const projectionFields = ["projection_record_id", "projection_kind", "projection_key", "workspace_id", "owner_artifact_id", "owner_artifact_version_id", "source_artifact_version_ids", "source_record_ids", "source_projection_record_ids", "generator", "generator_version", "generator_configuration_digest", "payload"].sort().join("\0");
@@ -404,8 +564,12 @@ function projectionTemplates(input: CandidateMaterializationInput): { readonly o
     projectionKeys.add(projection.projection_key);
   };
   for (const set of input.accepted_projection_sets) {
-    const expectedDigest = digest(set.projections);
-    if (set.projection_set_digest !== expectedDigest) throw new CandidateMaterializationError("core:projection_digest_mismatch", "Projection replacement set digest does not match its canonical projections.", { expected_digest: expectedDigest, actual_digest: set.projection_set_digest });
+    // The worker payload may contain a large replacement set. Hash its
+    // canonical array incrementally so validation never builds one aggregate
+    // encoding merely to recompute the declared digest.
+    const expectedDigest = digestCanonicalArray(set.projections);
+    const logicalDigest = new LogicalDigestWriter("urdira:projection-set:v3").value(set.projections).digest();
+    if (set.projection_set_digest !== expectedDigest && set.projection_set_digest !== logicalDigest) throw new CandidateMaterializationError("core:projection_digest_mismatch", "Projection replacement set digest does not match its canonical or logical projections.", { expected_digest: logicalDigest, legacy_expected_digest: expectedDigest, actual_digest: set.projection_set_digest });
     for (const projection of set.projections) {
       validateProjection(projection, set.work_item);
       current.set(projection.projection_record_id, projection);
@@ -464,11 +628,18 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
   if (!Array.isArray(input.known_lookup_dependencies)) candidateMaterializationError("Complete lookup authority is required.", { dependency_failure_kind: "lookup_authority_missing" });
   const workspaceId = input.candidate.workspace_id;
   const baseRecords = new Map(input.base_records.map((record) => [record.record_id, record]));
-  const proposedRecords = new Map(scopeRecords(input).map((record) => [record.proposal_record_key, record]));
-  const proposedRecordsByFinalId = new Map([...proposalRecordIds].flatMap(([proposalKey, recordId]) => {
+  const dependencyProposalKeys = new Set<string>();
+  for (const accepted of input.accepted_deltas) for (const dependency of accepted.delta.proposed_dependencies ?? []) dependencyProposalKeys.add(dependency.proposal_record_key);
+  const requiresCompleteRecordAuthority = (input.record_dependencies?.length ?? 0) > 0
+    || (input.lookup_bindings?.length ?? 0) > 0
+    || (input.projection_dependencies?.length ?? 0) > 0;
+  const proposedRecords = new Map<string, RetainedProposedRecord>();
+  for (const record of scopeRecords(input)) if (requiresCompleteRecordAuthority || dependencyProposalKeys.has(record.proposal_record_key)) proposedRecords.set(record.proposal_record_key, record);
+  const proposedRecordsByFinalId = new Map<string, RetainedProposedRecord>();
+  for (const [proposalKey, recordId] of proposalRecordIds) {
     const record = proposedRecords.get(proposalKey);
-    return record === undefined ? [] : [[recordId, record] as const];
-  }));
+    if (record !== undefined) proposedRecordsByFinalId.set(recordId, record);
+  }
   // Owner of any record known here, whichever source it came from: a base
   // row already has workspace/owner as row columns; a proposed record's
   // owner is content-free (decision 11) and comes from its replacement scope
@@ -479,10 +650,21 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
     const base = baseRecords.get(recordId);
     if (base !== undefined) return { workspace_id: base.workspace_id, owner_artifact_id: base.owner_artifact_id, owner_artifact_version_id: base.owner_artifact_version_id };
     const proposed = proposedRecords.get(recordId) ?? proposedRecordsByFinalId.get(recordId);
-    const owner = proposed === undefined ? undefined : owners.get(proposed.proposal_record_key);
+    const owner = proposed === undefined ? undefined : retainedRecordOwner(proposed, owners);
     return owner === undefined ? undefined : { workspace_id: workspaceId, ...owner };
   };
-  const knownRecords = new Set([...baseRecords.keys(), ...proposedRecords.keys(), ...proposedRecordsByFinalId.keys(), ...input.accepted_deltas.flatMap((delta) => delta.validated_staged_records.flatMap((entry) => [entry.staged_record_id, entry.proposal_record_key]))]);
+  const knownRecords = new Set<string>(baseRecords.keys());
+  for (const proposalKey of proposedRecords.keys()) knownRecords.add(proposalKey);
+  for (const recordId of proposedRecordsByFinalId.keys()) knownRecords.add(recordId);
+  // Full staged-record visibility is required only for externally supplied
+  // record/lookup/projection bindings. Promoted analyzer dependencies refer to
+  // `dependencyProposalKeys`, already retained above. Expanding every staged
+  // record here on a first scan otherwise creates a second million-entry Set
+  // after record sealing, with no validation consumer.
+  if (requiresCompleteRecordAuthority) for (const delta of input.accepted_deltas) for (const entry of delta.validated_staged_records) {
+    knownRecords.add(entry.staged_record_id);
+    knownRecords.add(entry.proposal_record_key);
+  }
   const knownArtifacts = new Map<string, CandidateKnownArtifactVersion>();
   const addArtifact = (entry: CandidateKnownArtifactVersion): void => {
     const raw = entry as unknown as Record<string, unknown>;
@@ -491,13 +673,16 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
     knownArtifacts.set(entry.artifact_version_id, entry);
   };
   for (const entry of input.known_artifact_versions) addArtifact(entry);
-  const knownProjections = new Set([...input.base_projections.map((projection) => projection.projection_record_id), ...input.accepted_projection_sets.flatMap((set) => set.projections.map((projection) => projection.projection_record_id))]);
+  const knownProjections = new Set<string>(input.base_projections.map((projection) => projection.projection_record_id));
+  for (const set of input.accepted_projection_sets) for (const projection of set.projections) knownProjections.add(projection.projection_record_id);
   const roles = new Set(input.known_dependency_roles ?? ["references"]);
   const dependencies: CandidateRecordDependencyTemplate[] = [];
   const dependencyIds = new Set<string>();
-  const promotedDependencies: RecordArtifactDependency[] = input.accepted_deltas.flatMap((accepted) => (accepted.delta.proposed_dependencies ?? []).map((dependency) => {
+  const promotedDependencies: RecordArtifactDependency[] = [];
+  for (const accepted of input.accepted_deltas) for (const dependency of accepted.delta.proposed_dependencies ?? []) {
     const recordId = proposalRecordIds.get(dependency.proposal_record_key);
-    const owner = owners.get(dependency.proposal_record_key);
+    const proposed = proposedRecords.get(dependency.proposal_record_key);
+    const owner = proposed === undefined ? undefined : retainedRecordOwner(proposed, owners);
     if (owner === undefined || recordId === undefined) throw new CandidateMaterializationError("core:dependency_validation_failed", "Accepted dependency source proposal is absent from the sealed record set.", { dependency_failure_kind: "proposal_record_missing", proposal_record_key: dependency.proposal_record_key });
     // The dependency's owner must match whichever owner its *record*
     // (`recordId`) actually has, not necessarily this scan's own fresh
@@ -530,7 +715,7 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
     // all, which should not happen given `recordId` was itself derived from
     // `proposalRecordIds`.
     const resolvedOwner = ownerOf(recordId) ?? owner;
-    return {
+    promotedDependencies.push({
       dependency_entry_id: `dependency:${digest({ fact_delta_id: accepted.delta.fact_delta_id, proposed_dependency_id: dependency.proposed_dependency_id, record_id: recordId }).slice("sha256:".length)}`,
       workspace_id: workspaceId,
       record_id: recordId,
@@ -542,8 +727,8 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
       producer_id: accepted.delta.plugin_id,
       producer_version: accepted.delta.plugin_version,
       valid_from_generation: 0,
-    };
-  }));
+    });
+  }
   for (const dependency of [...(input.record_dependencies ?? []), ...promotedDependencies]) {
     const raw = dependency as unknown as Record<string, unknown>;
     if (!exactBindingKeys(raw, ["dependency_entry_id", "workspace_id", "record_id", "owner_artifact_id", "owner_artifact_version_id", "dependency_artifact_id", "dependency_artifact_version_id", "dependency_role", "producer_id", "producer_version", "valid_from_generation"], ["valid_to_generation"]) || !Object.values(raw).every((value) => value !== undefined)) throw new CandidateMaterializationError("core:dependency_validation_failed", "Record dependency binding is incomplete or has unknown fields.", { dependency_failure_kind: "binding_shape" });
@@ -593,9 +778,13 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
   return { record_dependencies: freeze(sorted(dependencies, (entry) => `${entry.record_id}\0${entry.dependency_artifact_version_id}\0${entry.dependency_role}`)), lookup_bindings: freeze(sorted(lookupBindings, (entry) => canonicalJson(entry))), projection_dependencies: freeze(sorted(projectionDependencies, (entry) => canonicalJson(entry))) };
 }
 
-function semanticAcceptedDeltaDigest(delta: AcceptedFactDelta): string {
-  return digest({
-    replacement_sets: delta.replacement_sets,
+function semanticAcceptedDeltaDigest(delta: MaterializationAcceptedFactDelta): string {
+  return digestCanonicalMapWithArrayFields({}, {
+    replacement_sets: delta.replacement_sets.map((set) => ({
+      scope: set.scope,
+      record_set_digest: set.record_set_digest,
+      record_count: set.records.length,
+    })),
     input_artifact_version_ids: delta.input_artifact_version_ids,
     input_record_ids: delta.input_record_ids,
     transitive_artifact_version_ids: delta.transitive_artifact_version_ids,
@@ -627,7 +816,9 @@ export class CandidateMaterializationError extends Error {
  * no aggregate encoding of `entries` is ever materialized.
  */
 function orderedSetDescriptor(elementType: string, entries: readonly unknown[]): OrderedSetDescriptor {
-  const contentDigest = digestCanonicalArray(entries);
+  const contentDigest = entries.some(isPackedCandidateTemplate)
+    ? digestTemplateArray(entries)
+    : digestCanonicalArray(entries);
   return {
     descriptor_id: `set:${contentDigest.slice("sha256:".length)}`,
     element_type: elementType,
@@ -647,11 +838,18 @@ export class CandidateMaterializer {
     const records = recordTemplates(input, owners);
     const bindings = validateBindings(input, records.proposal_record_ids, owners);
     const projections = projectionTemplates(input);
-    const recordDependencies = bindings.record_dependencies;
-    const lookupBindings = bindings.lookup_bindings;
+    const recordDependencies = freeze(bindings.record_dependencies);
+    const lookupBindings = freeze(bindings.lookup_bindings);
     const projectionDependencies = bindings.projection_dependencies;
-    const lookupRevalidations: readonly Readonly<Record<string, unknown>>[] = [];
-    const sourceTransitions = input.source_plan.transitions;
+    const lookupRevalidations: readonly Readonly<Record<string, unknown>>[] = freeze([]);
+    // Freeze the exact transport arrays before computing their descriptors.
+    // @urdira/canonical can then memoize the digest against the immutable
+    // array identity, allowing publication to verify the same in-process
+    // materialization without encoding a million-entry set a second time.
+    const sourceTransitions = freeze([...input.source_plan.transitions]);
+    const recordOpens = freeze(records.opens);
+    const recordClosures = freeze(records.closures);
+    const identityAssignments = freeze(records.identities);
     const barrierKeys = new Set((input.absence_barriers ?? []).map((entry) => `${entry.identity_type}\0${entry.identity_key}`));
     const semanticPayload = {
       workspace_id: input.candidate.workspace_id,
@@ -664,9 +862,9 @@ export class CandidateMaterializer {
       candidate_generation_id: input.candidate.candidate_generation_id,
       accepted_fact_delta_digests: sorted(input.accepted_deltas.map(semanticAcceptedDeltaDigest), (entry) => entry),
       source_transition_template_set: canonicalJson(orderedSetDescriptor("core:CandidateSourceTransitionTemplate", sourceTransitions)),
-      record_open_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordOpenTemplate", records.opens)),
-      record_closure_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordClosureTemplate", records.closures)),
-      identity_assignment_template_set: canonicalJson(orderedSetDescriptor("core:CandidateIdentityAssignmentTemplate", records.identities)),
+      record_open_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordOpenTemplate", recordOpens)),
+      record_closure_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordClosureTemplate", recordClosures)),
+      identity_assignment_template_set: canonicalJson(orderedSetDescriptor("core:CandidateIdentityAssignmentTemplate", identityAssignments)),
       projection_open_template_sets: projections.opens,
       projection_closure_template_sets: projections.closures,
       capability_state_entries: input.capability_state_entries,
@@ -681,7 +879,7 @@ export class CandidateMaterializer {
       ...semanticPayload,
       materialization_digest: semanticDigest,
     });
-    return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: freeze([...sourceTransitions]), record_opens: freeze(records.opens), record_closures: freeze(records.closures), identity_assignments: freeze(records.identities), record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: freeze([...lookupRevalidations]), projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort() });
+    return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: sourceTransitions, record_opens: recordOpens, record_closures: recordClosures, identity_assignments: identityAssignments, record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: lookupRevalidations, projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort() });
   }
 }
 

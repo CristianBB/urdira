@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import type { ArtifactWorkItem, IndexCandidate, ProjectionWorkItem } from "@urdira/contracts";
+import { LogicalDigestWriter } from "@urdira/canonical";
 import { canonicalSha256 } from "@urdira/plugin-sdk";
 import { CandidateExecutor, buildCandidateExecutionDag, type AcceptedManifestPersistencePort, type CandidateExecutionInput, type ValidatedStagedRecord } from "../packages/engine/src/index.js";
 
@@ -38,9 +39,10 @@ function projectionRecord(overrides: Record<string, unknown> = {}): Record<strin
   return { projection_record_id: "projection-record:1", projection_kind: "core:test", projection_key: "key", workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", source_artifact_version_ids: ["version:owner"], source_record_ids: [], source_projection_record_ids: [], generator: "core:test", generator_version: "1.0.0", generator_configuration_digest: digest("config"), payload: {}, ...overrides };
 }
 
-function projectionExecutionInput(projections: readonly Record<string, unknown>[], overrides: Record<string, unknown> = {}): CandidateExecutionInput {
+function projectionExecutionInput(projections: readonly Record<string, unknown>[], overrides: Record<string, unknown> = {}, digestKind: "canonical" | "logical" = "canonical"): CandidateExecutionInput {
   const item = projectionWorkItem();
-  const output = { outcome: "success", result_type: "projection_set", work_item_id: item.projection_work_item_id, projection_set: { projections, projection_set_digest: digest(projections) } };
+  const projectionSetDigest = digestKind === "logical" ? new LogicalDigestWriter("urdira:projection-set:v3").value(projections).digest() : digest(projections);
+  const output = { outcome: "success", result_type: "projection_set", work_item_id: item.projection_work_item_id, projection_set: { projections, projection_set_digest: projectionSetDigest } };
   return executionInput({ plan: { invalidation: {} as never, manifest: {} as never, artifact_work_items: [], projection_work_items: [item], lookup_decisions: [], dag: buildCandidateExecutionDag([item as never], []) }, worker_port: { async execute() { return output; } }, ...overrides } as never);
 }
 
@@ -108,6 +110,23 @@ describe("Phase 9 candidate execution", () => {
     ["undeclared source IDs", [projectionRecord({ source_artifact_version_ids: ["version:undeclared"] })]],
   ] as const)("rejects %s before accepting projection output", async (_name, projections) => {
     await expect(new CandidateExecutor().execute(projectionExecutionInput(projections))).rejects.toMatchObject({ code: "core:projection_output_invalid", scope: expect.objectContaining({ scope_type: "projection" }) });
+  });
+
+  it("accepts the v3 logical projection-set digest emitted by plugins", async () => {
+    await expect(new CandidateExecutor().execute(projectionExecutionInput([projectionRecord()], {}, "logical"))).resolves.toHaveLength(1);
+  });
+
+  it("rolls back when accepted-manifest persistence fails", async () => {
+    const input = executionInput({ accepted_manifest_persistence: { async persist() { throw new Error("persistence unavailable"); }, async discard() {} } });
+    await expect(new CandidateExecutor().execute(input)).rejects.toMatchObject({ code: "core:analysis_context_unavailable" });
+  });
+
+  it("rejects accepted deltas without manifest identity or delta identity", async () => {
+    const missingManifest = executionInput({ worker_port: { async execute(item) { return { outcome: "success", result_type: "fact_delta", work_item_id: (item as ArtifactWorkItem).work_item_id, validation_input: { raw_delta: { fact_delta_id: "delta:a" }, accepted_manifest: {} } }; } } });
+    await expect(new CandidateExecutor().execute(missingManifest)).rejects.toMatchObject({ code: "core:analysis_context_unavailable" });
+    const single = workItem("single");
+    const missingDeltaId = executionInput({ plan: { invalidation: {} as never, manifest: {} as never, artifact_work_items: [single], projection_work_items: [], lookup_decisions: [], dag: buildCandidateExecutionDag([single], []) }, worker_port: { async execute(item) { return { outcome: "success", result_type: "fact_delta", work_item_id: (item as ArtifactWorkItem).work_item_id, validation_input: { raw_delta: {}, accepted_manifest: { plugin_input_access_manifest_id: "manifest:single", manifest_digest: digest("manifest:single") } } }; } }, acceptance: { async accept() { return { delta: { delta_digest: digest("missing-id") }, validated_staged_records: [] }; }, async discard() {} } as never });
+    await expect(new CandidateExecutor().execute(missingDeltaId)).rejects.toMatchObject({ code: "core:analysis_context_unavailable" });
   });
 
   it.each([

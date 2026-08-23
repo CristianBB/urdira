@@ -144,7 +144,7 @@ function digest(value: unknown): string { return digestBytes(canonicalBytes(valu
 /**
  * Maps a sealed materialization's template arrays onto the shape storage
  * expects out-of-band (`CandidateTemplateSets`, `@urdira/storage`), so both
- * `saveMaterialization` (which persists them as CAS-backed segments) and
+ * `saveMaterialization` (which persists only their bounded descriptor) and
  * `publishCandidate` (which installs and verifies them against the
  * materialization's committed `OrderedSetDescriptor`s) see the identical
  * arrays this candidate actually sealed.

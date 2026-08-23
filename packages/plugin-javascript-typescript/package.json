@@ -1,6 +1,6 @@
 {
   "name": "@urdira/plugin-javascript-typescript",
-  "version": "0.3.2",
+  "version": "0.3.4",
   "private": true,
   "type": "module",
   "files": [
@@ -19,6 +19,7 @@
     "build": "tsc --build"
   },
   "dependencies": {
+    "@urdira/canonical": "workspace:*",
     "@urdira/contracts": "workspace:*",
     "@urdira/plugin-sdk": "workspace:*",
     "typescript": "7.0.2"

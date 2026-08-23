@@ -268,6 +268,49 @@ describe("Phase 7 physical watcher adapters", () => {
     expect(errors).toEqual(["handler failed", "fake handler failed"]);
   });
 
+  it("coalesces a burst from one failed watcher subscription into one reset and one re-arm", async () => {
+    type Deliver = (error: Error | null, events: readonly PhysicalWatcherEvent[]) => unknown;
+    const delivers: Deliver[] = [];
+    const unsubscribed: number[] = [];
+    let subscribeCalls = 0;
+    const backend: ParcelWatcherBackend = {
+      subscribe: async (_root, callback) => {
+        const index = subscribeCalls++;
+        delivers.push(callback);
+        return { unsubscribe: async () => { unsubscribed.push(index); } };
+      },
+    };
+    const errors: string[] = [];
+    const received: string[] = [];
+    const adapter = new ParcelWatcherAdapter(directoryBinding, {
+      backend,
+      on_error: (error) => { errors.push(error.message); },
+      rearm_delay_ms: 0,
+    });
+    const subscription = await adapter.subscribe(async (batch) => {
+      received.push(...batch.events.map((event) => event.event_class));
+    });
+
+    const failedCallback = delivers[0];
+    failedCallback?.(new Error("FSEvents dropped events"), []);
+    failedCallback?.(new Error("duplicate backend notification"), []);
+    failedCallback?.(new Error("duplicate backend notification"), []);
+    await flushMicrotasks();
+    await adapter.idle();
+
+    expect(subscribeCalls).toBe(2);
+    expect(errors).toEqual(["FSEvents dropped events"]);
+    expect(received).toEqual(["provider_reset"]);
+    expect(unsubscribed).toEqual([0]);
+
+    delivers[1]?.(null, [{ type: "update", path: "/repo/after-burst.ts" }]);
+    await adapter.idle();
+    expect(received).toEqual(["provider_reset", "modify"]);
+
+    await subscription.unsubscribe();
+    expect(unsubscribed).toEqual([0, 1]);
+  });
+
   // Regression test for the "silently dead watcher" incident (see
   // `ParcelWatcherAdapter`'s doc comment, `packages/engine/src/watchers.ts`):
   // a `@parcel/watcher` backend error must not just deliver a
@@ -295,7 +338,11 @@ describe("Phase 7 physical watcher adapters", () => {
     };
     const errors: string[] = [];
     const received: string[] = [];
-    const adapter = new ParcelWatcherAdapter(directoryBinding, { backend, on_error: (error) => { errors.push(error.message); } });
+    const adapter = new ParcelWatcherAdapter(directoryBinding, {
+      backend,
+      on_error: (error) => { errors.push(error.message); },
+      rearm_delay_ms: 0,
+    });
     const subscription = await adapter.subscribe(async (batch) => { received.push(...batch.events.map((event) => event.normalized_uri)); });
 
     expect(subscribeCalls).toBe(1);
@@ -325,10 +372,14 @@ describe("Phase 7 physical watcher adapters", () => {
       await flushMicrotasks();
     }
     const subscribeCallsAtGiveUp = subscribeCalls;
+    const errorsAtGiveUp = errors.length;
+    const receivedAtGiveUp = received.length;
     // A few more errors past giving up must not resume re-arming.
     delivers[delivers.length - 1]?.(new Error("still failing"), []);
     await flushMicrotasks();
     expect(subscribeCalls).toBe(subscribeCallsAtGiveUp);
+    expect(errors).toHaveLength(errorsAtGiveUp);
+    expect(received).toHaveLength(receivedAtGiveUp);
 
     // `unsubscribe()` tears down whichever subscription is current (the last
     // one armed) without throwing, even after the give-up path.

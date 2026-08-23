@@ -8,9 +8,9 @@ describe("public npm package graph", () => {
   it("publishes only the production allowlist with exact internal versions", async () => {
     const versions = await productionPackageVersions();
     expect([...versions.keys()]).toEqual(PRODUCTION_PACKAGE_NAMES);
-    expect(versions.get("urdira")).toBe("0.2.0");
-    expect(versions.get("@urdira/runtime")).toBe("0.2.0");
-    expect(versions.get("@urdira/plugin-javascript-typescript")).toBe("0.3.2");
+    expect(versions.get("urdira")).toBe("0.2.2");
+    expect(versions.get("@urdira/runtime")).toBe("0.2.2");
+    expect(versions.get("@urdira/plugin-javascript-typescript")).toBe("0.3.4");
     expect(versions.has("@urdira/testkit")).toBe(false);
 
     const packages = [];
@@ -28,7 +28,7 @@ describe("public npm package graph", () => {
       expect(manifest).not.toHaveProperty("private");
       if (name === "urdira") {
         expect(manifest.dependencies).toBeUndefined();
-        expect(manifest).toHaveProperty("urdiraRuntime", { package: "@urdira/runtime", version: "0.2.0" });
+        expect(manifest).toHaveProperty("urdiraRuntime", { package: "@urdira/runtime", version: "0.2.2" });
       }
     }
     const order = publicationOrder(packages);

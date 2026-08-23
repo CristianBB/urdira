@@ -1,4 +1,5 @@
-import { computeDigest, computeDigestOverArrayPayload, digestBytes, digestCanonicalArray, encodeCanonical as encodeCanonicalBytes } from "@urdira/canonical";
+import { createHash } from "node:crypto";
+import { computeDigest, computeDigestOverArrayPayload, digestBytes, digestCanonicalArray, digestLogicalValue, digestMappedCanonicalArray, encodeArrayHeader, encodeCanonical as encodeCanonicalBytes, LogicalDigestWriter, memoizedCanonicalArrayDigest } from "@urdira/canonical";
 import type { CanonicalEncodingLimits } from "@urdira/canonical";
 import type { ProjectionSetDigestEntry, Snapshot, WorkspaceCurrentState, IndexCandidate, PluginResolutionLock, RegistrySnapshot, WorkspaceConfigurationRevision, WorkspaceFreshnessCheckpoint } from "@urdira/contracts";
 import { StorageError } from "./errors.js";
@@ -10,8 +11,10 @@ import { projectionSetDigestEntries, projectionSetDigestRowsByKind, type Project
 import { compactPublicationPhase } from "./publication-compaction.js";
 import type { SqliteDatabase, SqliteValue } from "./sqlite.js";
 import type { SqliteCommand } from "./sqlite.js";
+import { digestRelationalValue, iterateRelationalValue, RelationalValueBatchWriter } from "./relational-values.js";
 
 export type PublicationAuthorityMode = "compatibility" | "candidate";
+export type PublicationCommandStream = () => Iterable<SqliteCommand>;
 
 export interface PublicationCommandGroups {
   readonly mode: PublicationAuthorityMode;
@@ -25,6 +28,9 @@ export interface PublicationCommandGroups {
   readonly journal: readonly SqliteCommand[];
   readonly candidateFinalization: readonly SqliteCommand[];
   readonly current: readonly SqliteCommand[];
+  /** Internal large-publication stream. When present, it replaces the corresponding array. */
+  readonly canonicalStream?: PublicationCommandStream;
+  readonly projectionsStream?: PublicationCommandStream;
   /**
    * Set only by `buildCandidatePublicationPlan`: this publish's `sortedVisible`
    * (`computeSnapshotDigestFields`'s own output, bit-identical by construction)
@@ -141,7 +147,9 @@ export interface PublicationPhaseBuilders {
   readonly targetControls?: PublicationPhaseBuilder;
   readonly source?: PublicationPhaseBuilder;
   readonly canonical?: PublicationPhaseBuilder;
+  readonly canonicalStream?: PublicationCommandStream;
   readonly projections?: PublicationPhaseBuilder;
+  readonly projectionsStream?: PublicationCommandStream;
   readonly manifest?: PublicationPhaseBuilder;
   readonly snapshot?: PublicationPhaseBuilder;
   readonly journal?: PublicationPhaseBuilder;
@@ -166,8 +174,6 @@ export interface CompatibilityPublicationPlanInput {
 export function buildCompatibilityPublicationPlan(planInput: CompatibilityPublicationPlanInput): PublicationCommandGroups {
   const { workspaceId, input } = planInput;
       const { snapshot, current_state: currentState } = input;
-      const snapshotPayload = encodeCanonical(snapshot);
-      const currentPayload = encodeCanonical(currentState);
       const parentSnapshotId = snapshot.parent_snapshot_id ?? null;
       const expected = input.expected_current_state;
       const tupleAgreement = `
@@ -219,12 +225,12 @@ export function buildCompatibilityPublicationPlan(planInput: CompatibilityPublic
             AND stored.configuration_revision_id IS ? AND stored.source_state_digest IS ?
             AND stored.source_observation_watermarks IS ? AND stored.canonical_record_set_digest IS ?
             AND stored.projection_set_digests IS ? AND stored.capability_state_digest IS ?
-            AND stored.published_at IS ? AND stored.snapshot_digest IS ? AND stored.snapshot_payload IS ?)`;
+            AND stored.published_at IS ? AND stored.snapshot_digest IS ?)`;
       const snapshotExactParams: SqliteValue[] = [
         snapshot.snapshot_id, snapshot.workspace_id, snapshot.generation, parentSnapshotId, snapshot.generation_manifest_id,
         snapshot.registry_snapshot_id, snapshot.resolution_lock_id, snapshot.configuration_revision_id, snapshot.source_state_digest,
         snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.projection_set_digests,
-        snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest, snapshotPayload,
+        snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest,
       ];
       const currentTransition = `
         AND (
@@ -252,15 +258,15 @@ export function buildCompatibilityPublicationPlan(planInput: CompatibilityPublic
           kind: "run" as const,
           sql: `INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id,
             resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest,
-            projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            source_snapshot_id, snapshot_contract_version, publication_stage_id, publication_stage_ordinal, publication_stage_count, projection_set_digests, capability_state_digest, published_at, snapshot_digest)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (SELECT 1 FROM snapshots WHERE snapshot_id IS ?)
             ${tupleAgreement}${registryAgreement}${controlAgreement}${currentTransition}`,
           params: [
             snapshot.snapshot_id, snapshot.workspace_id, snapshot.generation, parentSnapshotId, snapshot.generation_manifest_id,
             snapshot.registry_snapshot_id, snapshot.resolution_lock_id, snapshot.configuration_revision_id, snapshot.source_state_digest,
-            snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.projection_set_digests,
-            snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest, snapshotPayload,
+            snapshot.source_observation_watermarks, snapshot.canonical_record_set_digest, snapshot.source_snapshot_id ?? null, snapshot.snapshot_contract_version ?? null, snapshot.publication_stage_id ?? null, snapshot.publication_stage_ordinal ?? null, snapshot.publication_stage_count ?? null, snapshot.projection_set_digests,
+            snapshot.capability_state_digest, snapshot.published_at, snapshot.snapshot_digest,
             snapshot.snapshot_id, ...tupleAgreementParams, ...registryParams, ...controlParams, ...currentTransitionParams,
           ] as readonly SqliteValue[],
         },
@@ -269,27 +275,27 @@ export function buildCompatibilityPublicationPlan(planInput: CompatibilityPublic
           kind: "run" as const,
           sql: `UPDATE workspace_current_state AS current SET current_snapshot_id = ?, current_generation = ?, current_registry_snapshot_id = ?,
             current_resolution_lock_id = ?, current_configuration_revision_id = ?, current_freshness_checkpoint_id = ?, state_revision = ?,
-            updated_at = ?, current_payload = ?
+            updated_at = ?
             WHERE current.workspace_id IS ? AND current.current_generation + 1 IS ? AND current.current_snapshot_id IS ?
               AND ? > current.state_revision${expectedClause}${tupleAgreement}${registryAgreement}${controlAgreement}${snapshotExact}`,
           params: [
             currentState.current_snapshot_id, currentState.current_generation, currentState.current_registry_snapshot_id,
             currentState.current_resolution_lock_id, currentState.current_configuration_revision_id, currentState.current_freshness_checkpoint_id,
-            currentState.state_revision, currentState.updated_at, currentPayload, workspaceId, snapshot.generation, parentSnapshotId,
+            currentState.state_revision, currentState.updated_at, workspaceId, snapshot.generation, parentSnapshotId,
             currentState.state_revision, ...expectedParams, ...tupleAgreementParams, ...registryParams, ...controlParams, ...snapshotExactParams,
           ] as readonly SqliteValue[],
         },
         {
           kind: "run" as const,
           sql: `INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id,
-            current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (SELECT 1 FROM workspace_current_state WHERE workspace_id IS ?)
               AND ? IS 1 AND ? IS NULL AND ? > 0${initialExpectedClause}${tupleAgreement}${registryAgreement}${controlAgreement}${snapshotExact}`,
           params: [
             workspaceId, currentState.current_snapshot_id, currentState.current_generation, currentState.current_registry_snapshot_id,
             currentState.current_resolution_lock_id, currentState.current_configuration_revision_id, currentState.current_freshness_checkpoint_id,
-            currentState.state_revision, currentState.updated_at, currentPayload, workspaceId, snapshot.generation, parentSnapshotId,
+            currentState.state_revision, currentState.updated_at, workspaceId, snapshot.generation, parentSnapshotId,
             currentState.state_revision, ...tupleAgreementParams, ...registryParams, ...controlParams, ...snapshotExactParams,
           ] as readonly SqliteValue[],
         },
@@ -371,7 +377,10 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
     // `record_occurrences` command build stays a separate, later step
     // (after `assertPublicationImmutableRows`) rather than being fused into
     // this same pass.
-    const { memo: recordOpenMemo, parsedByEntry: recordOpenParsedByEntry } = timedSync("publish_record_open_memo", () => parseRecordOpens(recordOpens));
+    const useStreamingPublication = recordOpens.length >= STREAMING_PUBLICATION_RECORD_THRESHOLD || projectionOpens.length >= STREAMING_PUBLICATION_RECORD_THRESHOLD;
+    const { memo: recordOpenMemo, parsedByEntry: recordOpenParsedByEntry } = timedSync("publish_record_open_memo", () => useStreamingPublication
+      ? { memo: memoizeRecordOpens(recordOpens), parsedByEntry: undefined }
+      : parseRecordOpens(recordOpens));
     const snapshotDigests = await timed("publish_snapshot_digest_fields", () => computeSnapshotDigestFields(database, workspaceId, current, generation, recordOpens, recordClosures, recordOpenMemo, recordSetDigestCorpus, artifactDependencies, projectionSetDigestCorpus));
     const manifestDescriptors = timedSync("publish_manifest_descriptors", () => buildManifestDescriptors(sourceTransitions, recordOpens, recordClosures, identityAssignments, projectionOpens, projectionClosures, { sourceTransitions: sourceTransitionsDigest, recordOpens: recordOpensDigest, recordClosures: recordClosuresDigest, identityAssignments: identityAssignmentsDigest }));
     const sourceWatermarks = JSON.stringify({ watermarks: materialization.source_observation_watermarks, source_observation_batch_ids: normalizedExpectedObservations });
@@ -409,57 +418,78 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
       updated_at: publishedAt,
     } satisfies WorkspaceCurrentState;
     const publicationPayload = encodeCanonical({ candidate: input.candidate, frozen_base: input.frozen_base });
-    const candidatePayload = encodeCanonical({ candidate: { ...storedCandidate, state: "publishing" }, frozen_base: input.frozen_base });
-    const finalCandidatePayload = encodeCanonical({ candidate: { ...storedCandidate, state: "published", published_snapshot_id: snapshotId, published_generation: generation, generation_manifest_id: generationManifestId, finished_at: publishedAt }, frozen_base: input.frozen_base });
     const candidateStateCommands: TransactionCommand[] = [
-      { kind: "run", sql: `INSERT INTO candidate_state (candidate_generation_id, workspace_id, base_snapshot_id, base_generation, base_registry_snapshot_id, target_registry_snapshot_id, base_configuration_revision_id, target_configuration_revision_id, trigger_kind, state, work_manifest_id, source_observation_batch_ids, retention_lease_id, candidate_materialization_id, candidate_digest, created_at, analysis_started_at, ready_at, finished_at, published_snapshot_id, published_generation, generation_manifest_id, stale_against_snapshot_id, failure_code, issue_ids, candidate_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(candidate_generation_id) DO UPDATE SET state = 'publishing' WHERE candidate_state.state IN ('queued', 'planning', 'analyzing', 'validating', 'projecting', 'ready', 'publishing')`, params: [candidateId, workspaceId, input.candidate.base_snapshot_id ?? null, input.candidate.base_generation ?? null, input.candidate.base_registry_snapshot_id ?? null, input.candidate.target_registry_snapshot_id, input.candidate.base_configuration_revision_id ?? null, input.candidate.target_configuration_revision_id, input.candidate.trigger_kind, null, JSON.stringify(input.candidate.source_observation_batch_ids), input.candidate.retention_lease_id ?? null, input.materialization.candidate_materialization_id, input.candidate.candidate_digest ?? null, input.candidate.created_at, input.candidate.analysis_started_at ?? null, input.candidate.ready_at ?? null, null, null, null, null, null, null, JSON.stringify(input.candidate.issue_ids), candidatePayload] },
+      { kind: "run", sql: `INSERT INTO candidate_state (candidate_generation_id, workspace_id, base_snapshot_id, base_generation, base_registry_snapshot_id, target_registry_snapshot_id, base_configuration_revision_id, target_configuration_revision_id, trigger_kind, state, work_manifest_id, source_observation_batch_ids, retention_lease_id, candidate_materialization_id, candidate_digest, created_at, analysis_started_at, ready_at, finished_at, published_snapshot_id, published_generation, generation_manifest_id, stale_against_snapshot_id, failure_code, issue_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(candidate_generation_id) DO UPDATE SET state = 'publishing' WHERE candidate_state.state IN ('queued', 'planning', 'analyzing', 'validating', 'projecting', 'ready', 'publishing')`, params: [candidateId, workspaceId, input.candidate.base_snapshot_id ?? null, input.candidate.base_generation ?? null, input.candidate.base_registry_snapshot_id ?? null, input.candidate.target_registry_snapshot_id, input.candidate.base_configuration_revision_id ?? null, input.candidate.target_configuration_revision_id, input.candidate.trigger_kind, null, JSON.stringify(input.candidate.source_observation_batch_ids), input.candidate.retention_lease_id ?? null, input.materialization.candidate_materialization_id, input.candidate.candidate_digest ?? null, input.candidate.created_at, input.candidate.analysis_started_at ?? null, input.candidate.ready_at ?? null, null, null, null, null, null, null, JSON.stringify(input.candidate.issue_ids)] },
       ...faultCommand(faults, "candidate_publication.after_validate_base"),
     ];
     const targetControlCommands: TransactionCommand[] = [
-      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(registry_snapshot_id) DO UPDATE SET registry_contract_version = excluded.registry_contract_version, core_registry_digest = excluded.core_registry_digest, resolution_lock_id = excluded.resolution_lock_id, registry_digest = excluded.registry_digest, registry_payload = excluded.registry_payload WHERE registry_snapshots.workspace_id = excluded.workspace_id AND registry_snapshots.registry_contract_version = excluded.registry_contract_version AND registry_snapshots.core_registry_digest = excluded.core_registry_digest AND registry_snapshots.resolution_lock_id = excluded.resolution_lock_id AND registry_snapshots.registry_digest = excluded.registry_digest AND registry_snapshots.registry_payload = excluded.registry_payload", params: [input.target_registry.registry_snapshot_id, workspaceId, input.target_registry.registry_contract_version, input.target_registry.core_registry_digest, input.target_resolution_lock.resolution_lock_id, input.target_registry.registry_digest, encodeCanonical(input.target_registry)] }),
-      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'plugin_resolution_lock', ?, NULL, NULL, NULL, ?) ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload WHERE control_plane_state.workspace_id = excluded.workspace_id AND control_plane_state.state_kind = excluded.state_kind AND control_plane_state.payload = excluded.payload AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest", params: [`plugin_resolution_lock:${input.target_resolution_lock.resolution_lock_id}`, workspaceId, encodeCanonical(input.target_resolution_lock), publishedAt] }),
-      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'workspace_configuration_revision', ?, NULL, NULL, NULL, ?) ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload WHERE control_plane_state.workspace_id = excluded.workspace_id AND control_plane_state.state_kind = excluded.state_kind AND control_plane_state.payload = excluded.payload AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest", params: [`workspace_configuration_revision:${input.target_configuration.configuration_revision_id}`, workspaceId, encodeCanonical(input.target_configuration), publishedAt] }),
-      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'workspace_freshness_checkpoint', ?, ?, ?, ?, ?) ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, reference_workspace_id = excluded.reference_workspace_id, reference_snapshot_id = excluded.reference_snapshot_id, reference_source_state_digest = excluded.reference_source_state_digest WHERE control_plane_state.workspace_id = excluded.workspace_id AND control_plane_state.state_kind = excluded.state_kind AND control_plane_state.payload = excluded.payload AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest", params: [`workspace_freshness_checkpoint:${input.freshness_checkpoint.freshness_checkpoint_id}`, workspaceId, encodeCanonical(input.freshness_checkpoint), workspaceId, input.source_snapshot_id ?? input.freshness_checkpoint.snapshot_id ?? snapshotParent ?? snapshotId, expected.source_state_digest, publishedAt] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(registry_snapshot_id) DO UPDATE SET registry_contract_version = excluded.registry_contract_version, core_registry_digest = excluded.core_registry_digest, resolution_lock_id = excluded.resolution_lock_id, registry_digest = excluded.registry_digest WHERE registry_snapshots.workspace_id IS excluded.workspace_id AND registry_snapshots.registry_contract_version IS excluded.registry_contract_version AND registry_snapshots.core_registry_digest IS excluded.core_registry_digest AND registry_snapshots.resolution_lock_id IS excluded.resolution_lock_id AND registry_snapshots.registry_digest IS excluded.registry_digest", params: [input.target_registry.registry_snapshot_id, workspaceId, input.target_registry.registry_contract_version, input.target_registry.core_registry_digest, input.target_resolution_lock.resolution_lock_id, input.target_registry.registry_digest] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'plugin_resolution_lock', ?, NULL, NULL, NULL, ?) ON CONFLICT(state_key) DO NOTHING", params: [`plugin_resolution_lock:${input.target_resolution_lock.resolution_lock_id}`, workspaceId, JSON.stringify(input.target_resolution_lock), publishedAt] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'workspace_configuration_revision', ?, NULL, NULL, NULL, ?) ON CONFLICT(state_key) DO NOTHING", params: [`workspace_configuration_revision:${input.target_configuration.configuration_revision_id}`, workspaceId, JSON.stringify(input.target_configuration), publishedAt] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'workspace_freshness_checkpoint', ?, ?, ?, ?, ?) ON CONFLICT(state_key) DO NOTHING", params: [`workspace_freshness_checkpoint:${input.freshness_checkpoint.freshness_checkpoint_id}`, workspaceId, JSON.stringify(input.freshness_checkpoint), workspaceId, input.source_snapshot_id ?? input.freshness_checkpoint.snapshot_id ?? snapshotParent ?? snapshotId, expected.source_state_digest, publishedAt] }),
     ];
     const sourceCommands: TransactionCommand[] = [
       ...timedSync("publish_source_commands", () => sourceTransitionCommands(sourceTransitions, workspaceId, generation)),
       ...faultCommand(faults, "candidate_publication.after_install_source"),
     ];
-    const canonicalCommands: TransactionCommand[] = [
-      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_payload) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET candidate_materialization_id = excluded.candidate_materialization_id, workspace_id = excluded.workspace_id, candidate_generation_id = excluded.candidate_generation_id, materialization_digest = excluded.materialization_digest, sealed_at = excluded.sealed_at, materialization_payload = excluded.materialization_payload WHERE candidate_materializations.candidate_materialization_id = excluded.candidate_materialization_id AND candidate_materializations.workspace_id = excluded.workspace_id AND candidate_materializations.candidate_generation_id IS excluded.candidate_generation_id AND candidate_materializations.materialization_digest = excluded.materialization_digest AND candidate_materializations.sealed_at IS excluded.sealed_at AND candidate_materializations.materialization_payload = excluded.materialization_payload", params: [input.materialization.candidate_materialization_id, workspaceId, candidateId, input.materialization.materialization_digest, resolvedMaterializationSealedAt, encodeCanonical(input.materialization)] }),
-      ...timedSync("publish_dependency_commands", () => [
-        ...artifactDependencyCommands(artifactDependencies, workspaceId, generation),
-        ...lookupDependencyCommands(lookupDependencies, lookupRevalidations, workspaceId, candidateId, generation, publishedAt),
-        ...capabilityStateCommands(materialization.capability_state_entries, workspaceId, candidateId, publishedAt),
-      ]),
+    const candidateMaterializationCommands: TransactionCommand[] = checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_contract_text) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET candidate_materialization_id = excluded.candidate_materialization_id, workspace_id = excluded.workspace_id, candidate_generation_id = excluded.candidate_generation_id, materialization_digest = excluded.materialization_digest, sealed_at = excluded.sealed_at, materialization_contract_text = excluded.materialization_contract_text WHERE candidate_materializations.candidate_materialization_id = excluded.candidate_materialization_id AND candidate_materializations.workspace_id = excluded.workspace_id AND candidate_materializations.candidate_generation_id IS excluded.candidate_generation_id AND candidate_materializations.materialization_digest = excluded.materialization_digest AND candidate_materializations.sealed_at IS excluded.sealed_at AND candidate_materializations.materialization_contract_text = excluded.materialization_contract_text", params: [input.materialization.candidate_materialization_id, workspaceId, candidateId, input.materialization.materialization_digest, resolvedMaterializationSealedAt, JSON.stringify(input.materialization)] });
+    const dependencyCommands: TransactionCommand[] = timedSync("publish_dependency_commands", () => [
+      ...artifactDependencyCommands(artifactDependencies, workspaceId, generation),
+      ...lookupDependencyCommands(lookupDependencies, lookupRevalidations, workspaceId, candidateId, generation, publishedAt),
+      ...capabilityStateCommands(materialization.capability_state_entries, workspaceId, candidateId, publishedAt),
+    ]);
+    const recordClosureCommandList = useStreamingPublication ? [] : timedSync("publish_record_closure_commands", () => recordClosureCommands(recordClosures, workspaceId, generation));
+    const identityCommandList = useStreamingPublication ? [] : timedSync("publish_identity_commands", () => identityCommands(identityAssignments, workspaceId, generation));
+    const canonicalFaultCommands = faultCommand(faults, "candidate_publication.after_install_canonical");
+    const projectionClosureCommandList = useStreamingPublication ? [] : timedSync("publish_projection_commands", () => projectionClosureCommands(projectionClosures, workspaceId, generation));
+    const projectionFaultCommands = faultCommand(faults, "candidate_publication.after_install_projections");
+    const canonicalCommands: TransactionCommand[] = useStreamingPublication ? [] : [
+      ...candidateMaterializationCommands,
+      ...dependencyCommands,
       ...timedSync("publish_record_open_commands", () => recordOpenCommands(recordOpens, workspaceId, generation, recordOpenMemo, recordOpenParsedByEntry)),
-      ...timedSync("publish_record_closure_commands", () => recordClosureCommands(recordClosures, workspaceId, generation)),
-      ...timedSync("publish_identity_commands", () => identityCommands(identityAssignments, workspaceId, generation)),
-      ...faultCommand(faults, "candidate_publication.after_install_canonical"),
+      ...recordClosureCommandList,
+      ...identityCommandList,
+      ...canonicalFaultCommands,
     ];
-    const projectionCommandsForPublication: TransactionCommand[] = [
+    const projectionCommandsForPublication: TransactionCommand[] = useStreamingPublication ? [] : [
       ...timedSync("publish_projection_commands", () => projectionCommands(projectionOpens, workspaceId, generation)),
-      ...timedSync("publish_projection_commands", () => projectionClosureCommands(projectionClosures, workspaceId, generation)),
-      ...faultCommand(faults, "candidate_publication.after_install_projections"),
+      ...projectionClosureCommandList,
+      ...projectionFaultCommands,
     ];
+    const canonicalStream = useStreamingPublication ? (): Iterable<TransactionCommand> => (function* (): Generator<TransactionCommand> {
+      yield* candidateMaterializationCommands;
+      yield* dependencyCommands;
+      const rebuildInitialCanonicalIndexes = current === undefined && recordOpens.length >= STREAMING_PUBLICATION_RECORD_THRESHOLD;
+      if (rebuildInitialCanonicalIndexes) yield { kind: "exec", sql: INITIAL_CANONICAL_INDEX_DROP_SQL };
+      yield* recordOpenCommandStream(recordOpens, workspaceId, generation, recordOpenMemo, recordOpenParsedByEntry);
+      yield* recordClosureCommandStream(recordClosures, workspaceId, generation);
+      yield* identityCommandStream(identityAssignments, workspaceId, generation);
+      if (rebuildInitialCanonicalIndexes) yield { kind: "exec", sql: INITIAL_CANONICAL_INDEX_BUILD_SQL };
+      yield* canonicalFaultCommands;
+    })() : undefined;
+    const projectionsStream = useStreamingPublication ? (): Iterable<TransactionCommand> => (function* (): Generator<TransactionCommand> {
+      yield* projectionCommandStream(projectionOpens, workspaceId, generation);
+      yield* projectionClosureCommandStream(projectionClosures, workspaceId, generation);
+      yield* projectionFaultCommands;
+    })() : undefined;
     const manifestCommands: TransactionCommand[] = [
-      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest, manifest_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET manifest_payload = excluded.manifest_payload WHERE generation_manifests.generation_manifest_id = excluded.generation_manifest_id AND generation_manifests.workspace_id = excluded.workspace_id AND generation_manifests.candidate_generation_id = excluded.candidate_generation_id AND generation_manifests.generation = excluded.generation AND generation_manifests.snapshot_id = excluded.snapshot_id AND generation_manifests.base_snapshot_id IS excluded.base_snapshot_id AND generation_manifests.registry_snapshot_id = excluded.registry_snapshot_id AND generation_manifests.publication_kind = excluded.publication_kind AND generation_manifests.published_at = excluded.published_at AND generation_manifests.artifact_change_set = excluded.artifact_change_set AND generation_manifests.record_open_set = excluded.record_open_set AND generation_manifests.record_closure_set = excluded.record_closure_set AND generation_manifests.identity_assignment_set = excluded.identity_assignment_set AND generation_manifests.projection_change_sets = excluded.projection_change_sets AND generation_manifests.manifest_digest = excluded.manifest_digest AND generation_manifests.manifest_payload = excluded.manifest_payload", params: [generationManifestId, workspaceId, candidateId, generation, snapshotId, input.frozen_base.snapshot_id ?? null, manifest.registry_snapshot_id, manifest.publication_kind, publishedAt, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, manifest.manifest_digest, encodeCanonical(manifest)] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [generationManifestId, workspaceId, candidateId, generation, snapshotId, input.frozen_base.snapshot_id ?? null, manifest.registry_snapshot_id, manifest.publication_kind, publishedAt, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, manifest.manifest_digest] }),
     ];
     const snapshotCommands: TransactionCommand[] = [
-      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET snapshot_payload = excluded.snapshot_payload WHERE snapshots.snapshot_id = excluded.snapshot_id AND snapshots.workspace_id = excluded.workspace_id AND snapshots.generation = excluded.generation AND snapshots.parent_snapshot_id IS excluded.parent_snapshot_id AND snapshots.generation_manifest_id = excluded.generation_manifest_id AND snapshots.registry_snapshot_id = excluded.registry_snapshot_id AND snapshots.resolution_lock_id = excluded.resolution_lock_id AND snapshots.configuration_revision_id = excluded.configuration_revision_id AND snapshots.source_state_digest = excluded.source_state_digest AND snapshots.source_observation_watermarks = excluded.source_observation_watermarks AND snapshots.canonical_record_set_digest = excluded.canonical_record_set_digest AND snapshots.projection_set_digests = excluded.projection_set_digests AND snapshots.capability_state_digest = excluded.capability_state_digest AND snapshots.published_at = excluded.published_at AND snapshots.snapshot_digest = excluded.snapshot_digest AND snapshots.snapshot_payload = excluded.snapshot_payload", params: [completedSnapshot.snapshot_id, completedSnapshot.workspace_id, completedSnapshot.generation, completedSnapshot.parent_snapshot_id ?? null, completedSnapshot.generation_manifest_id, completedSnapshot.registry_snapshot_id, completedSnapshot.resolution_lock_id, completedSnapshot.configuration_revision_id, completedSnapshot.source_state_digest, completedSnapshot.source_observation_watermarks, completedSnapshot.canonical_record_set_digest, completedSnapshot.projection_set_digests, completedSnapshot.capability_state_digest, completedSnapshot.published_at, completedSnapshot.snapshot_digest, encodeCanonical(completedSnapshot)] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_snapshot_id, snapshot_contract_version, publication_stage_id, publication_stage_ordinal, publication_stage_count, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [completedSnapshot.snapshot_id, completedSnapshot.workspace_id, completedSnapshot.generation, completedSnapshot.parent_snapshot_id ?? null, completedSnapshot.generation_manifest_id, completedSnapshot.registry_snapshot_id, completedSnapshot.resolution_lock_id, completedSnapshot.configuration_revision_id, completedSnapshot.source_state_digest, completedSnapshot.source_snapshot_id ?? null, completedSnapshot.snapshot_contract_version ?? null, completedSnapshot.publication_stage_id ?? null, completedSnapshot.publication_stage_ordinal ?? null, completedSnapshot.publication_stage_count ?? null, completedSnapshot.source_observation_watermarks, completedSnapshot.canonical_record_set_digest, completedSnapshot.projection_set_digests, completedSnapshot.capability_state_digest, completedSnapshot.published_at, completedSnapshot.snapshot_digest] }),
     ];
     const journalCommands: TransactionCommand[] = [
-      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_publication_journal (candidate_generation_id, workspace_id, status, snapshot_id, generation_manifest_id, generation, published_at, publication_digest, journal_payload) VALUES (?, ?, 'published', ?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET journal_payload = excluded.journal_payload WHERE candidate_publication_journal.candidate_generation_id = excluded.candidate_generation_id AND candidate_publication_journal.workspace_id = excluded.workspace_id AND candidate_publication_journal.status = excluded.status AND candidate_publication_journal.snapshot_id = excluded.snapshot_id AND candidate_publication_journal.generation_manifest_id = excluded.generation_manifest_id AND candidate_publication_journal.generation = excluded.generation AND candidate_publication_journal.published_at = excluded.published_at AND candidate_publication_journal.publication_digest = excluded.publication_digest AND candidate_publication_journal.journal_payload = excluded.journal_payload", params: [candidateId, workspaceId, snapshotId, generationManifestId, generation, publishedAt, canonicalSha256(publicationPayload), publicationPayload] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_publication_journal (candidate_generation_id, workspace_id, status, snapshot_id, generation_manifest_id, generation, published_at, publication_digest) VALUES (?, ?, 'published', ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [candidateId, workspaceId, snapshotId, generationManifestId, generation, publishedAt, canonicalSha256(publicationPayload)] }),
     ];
     const candidateFinalizationCommands: TransactionCommand[] = [
-      ...checkedPublicationCommand({ kind: "run", sql: "UPDATE candidate_state SET state = 'published', finished_at = ?, published_snapshot_id = ?, published_generation = ?, generation_manifest_id = ?, candidate_payload = ? WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'publishing'", params: [publishedAt, snapshotId, generation, generationManifestId, finalCandidatePayload, workspaceId, candidateId] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "UPDATE candidate_state SET state = 'published', finished_at = ?, published_snapshot_id = ?, published_generation = ?, generation_manifest_id = ? WHERE workspace_id = ? AND candidate_generation_id = ? AND state = 'publishing'", params: [publishedAt, snapshotId, generation, generationManifestId, workspaceId, candidateId] }),
       ...faultCommand(faults, "candidate_publication.after_install_manifest"),
       ...faultCommand(faults, "candidate_publication.before_swap_current"),
     ];
     const currentCommands: TransactionCommand[] = [
       ...(current === undefined
-        ? [{ kind: "transaction_checkpoint" as const }, { kind: "run" as const, sql: "INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM workspace_current_state WHERE workspace_id = ?)", params: [workspaceId, nextState.current_snapshot_id, nextState.current_generation, nextState.current_registry_snapshot_id, nextState.current_resolution_lock_id, nextState.current_configuration_revision_id, nextState.current_freshness_checkpoint_id, nextState.state_revision, nextState.updated_at, encodeCanonical({ ...nextState, source_state_digest: expected.source_state_digest }), workspaceId] }, { kind: "assert_transaction_changes" as const, expected: 1 }]
-        : [{ kind: "transaction_checkpoint" as const }, { kind: "run" as const, sql: "UPDATE workspace_current_state SET current_snapshot_id = ?, current_generation = ?, current_registry_snapshot_id = ?, current_resolution_lock_id = ?, current_configuration_revision_id = ?, current_freshness_checkpoint_id = ?, state_revision = ?, updated_at = ?, current_payload = ? WHERE workspace_id = ? AND current_snapshot_id = ? AND current_generation = ? AND current_registry_snapshot_id = ? AND current_resolution_lock_id = ? AND current_configuration_revision_id = ? AND state_revision = ?", params: [nextState.current_snapshot_id, nextState.current_generation, nextState.current_registry_snapshot_id, nextState.current_resolution_lock_id, nextState.current_configuration_revision_id, nextState.current_freshness_checkpoint_id, nextState.state_revision, nextState.updated_at, encodeCanonical({ ...nextState, source_state_digest: expected.source_state_digest }), workspaceId, current.current_snapshot_id, current.current_generation, current.current_registry_snapshot_id, current.current_resolution_lock_id, current.current_configuration_revision_id, current.state_revision] }, { kind: "assert_transaction_changes" as const, expected: 1 }]),
+        ? [{ kind: "transaction_checkpoint" as const }, { kind: "run" as const, sql: "INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM workspace_current_state WHERE workspace_id = ?)", params: [workspaceId, nextState.current_snapshot_id, nextState.current_generation, nextState.current_registry_snapshot_id, nextState.current_resolution_lock_id, nextState.current_configuration_revision_id, nextState.current_freshness_checkpoint_id, nextState.state_revision, nextState.updated_at, workspaceId] }, { kind: "assert_transaction_changes" as const, expected: 1 }]
+        : [{ kind: "transaction_checkpoint" as const }, { kind: "run" as const, sql: "UPDATE workspace_current_state SET current_snapshot_id = ?, current_generation = ?, current_registry_snapshot_id = ?, current_resolution_lock_id = ?, current_configuration_revision_id = ?, current_freshness_checkpoint_id = ?, state_revision = ?, updated_at = ? WHERE workspace_id = ? AND current_snapshot_id = ? AND current_generation = ? AND current_registry_snapshot_id = ? AND current_resolution_lock_id = ? AND current_configuration_revision_id = ? AND state_revision = ?", params: [nextState.current_snapshot_id, nextState.current_generation, nextState.current_registry_snapshot_id, nextState.current_resolution_lock_id, nextState.current_configuration_revision_id, nextState.current_freshness_checkpoint_id, nextState.state_revision, nextState.updated_at, workspaceId, current.current_snapshot_id, current.current_generation, current.current_registry_snapshot_id, current.current_resolution_lock_id, current.current_configuration_revision_id, current.state_revision] }, { kind: "assert_transaction_changes" as const, expected: 1 }]),
       ...faultCommand(faults, "candidate_publication.before_commit"),
     ];
     const plan = buildPublicationPlan({
@@ -470,6 +500,8 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
         source: () => sourceCommands,
         canonical: () => canonicalCommands,
         projections: () => projectionCommandsForPublication,
+        ...(canonicalStream === undefined ? {} : { canonicalStream }),
+        ...(projectionsStream === undefined ? {} : { projectionsStream }),
         manifest: () => manifestCommands,
         snapshot: () => snapshotCommands,
         journal: () => journalCommands,
@@ -487,7 +519,11 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
     // artifact-dependency opens merged in even though this publish's OWN
     // `projection_set_digests` field (above, in `snapshot`) deliberately does
     // not.
-    return { ...plan, recordSetDigestCorpusCandidate: { workspaceId, generation, sortedVisible: snapshotDigests.sortedVisible }, projectionSetDigestCorpusCandidate: { workspaceId, generation, sortedByKind: snapshotDigests.sortedProjectionsByKind } };
+    return {
+      ...plan,
+      ...(snapshotDigests.record_set_digest_corpus_complete ? { recordSetDigestCorpusCandidate: { workspaceId, generation, sortedVisible: snapshotDigests.sortedVisible } } : {}),
+      projectionSetDigestCorpusCandidate: { workspaceId, generation, sortedByKind: snapshotDigests.sortedProjectionsByKind },
+    };
 
 }
 
@@ -517,9 +553,38 @@ export async function computeForkSnapshotDigestFields(database: SqliteDatabase, 
     "SELECT record_id, record_digest FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?) ORDER BY record_id",
     [workspaceId, generation, generation],
   );
-  const canonicalRecordSetDigest = computeDigestOverArrayPayload("core:canonical_record_set", "core:snapshot_record_set_digest", 1, "core:SnapshotRecordSetDigestPayload", 1, visible);
+  const canonicalRecordSetDigest = logicalRecordSetDigest(visible);
   const projectionEntries = await projectionSetDigestEntries(database, workspaceId, generation, { digest_source: "stored" });
   return { canonical_record_set_digest: canonicalRecordSetDigest, projection_set_digests: JSON.stringify(projectionEntries), visible_records: visible };
+}
+
+export function logicalRecordSetDigest(rows: readonly { readonly record_id: string; readonly record_digest: string }[]): string {
+  const sorted = [...rows].sort((left, right) => left.record_id < right.record_id ? -1 : left.record_id > right.record_id ? 1 : 0);
+  return digestSortedRecordSet(sorted, sorted.length);
+}
+
+/**
+ * v3 is a destructive data format: the canonical record-set digest is the
+ * canonical array digest of its record-id-ordered identity/digest pairs.
+ * This is exact and order-independent at the API boundary (the exported
+ * wrapper sorts), but unlike the previous in-memory Merkle radix builder it
+ * needs O(1) auxiliary memory and O(n) hashes instead of materialising up to
+ * 64 prefix maps per record.
+ */
+/** @internal Exported for exact streaming-invariant tests. */
+export function digestSortedRecordSet(rows: Iterable<{ readonly record_id: string; readonly record_digest: string }>, count: number): string {
+  const hash = createHash("sha256");
+  hash.update(encodeArrayHeader(count));
+  let seen = 0;
+  let previous = "";
+  for (const row of rows) {
+    if (seen > 0 && row.record_id <= previous) throw new StorageError("storage:publication_invalid", "Canonical record-set rows must have unique ascending record ids.");
+    hash.update(encodeCanonicalBytes(row));
+    previous = row.record_id;
+    seen += 1;
+  }
+  if (seen !== count) throw new StorageError("storage:publication_invalid", "Canonical record-set row count changed during digesting.");
+  return `sha256:${hash.digest("hex")}`;
 }
 
 export interface ForkPublicationPlanInput {
@@ -543,7 +608,7 @@ export interface ForkPublicationPlanInput {
    * value the way `canonical_record_set_digest` is). A fork's per-generation
    * audit trail is therefore honest about *counts* and internally
    * consistent, but does not retain the full per-record open history the
-   * way `candidate_template_segments` would (this change deliberately does
+   * way the staged template rows do (this change deliberately does
    * not write those, to avoid re-canonical-encoding every copied row just
    * to store it a second time) -- see docs/decisions/12-workspace-fork.md.
    */
@@ -644,28 +709,7 @@ export function buildForkPublicationPlan(input: ForkPublicationPlanInput): Publi
     fork_bulk_copy: true,
   };
   const materializationDigest = canonicalSha256(materializationCore);
-  const materializationPayload = encodeCanonical({ ...materializationCore, materialization_digest: materializationDigest });
-
-  const candidatePayload = encodeCanonical({
-    candidate: {
-      candidate_generation_id: candidateId,
-      workspace_id: workspaceId,
-      target_registry_snapshot_id: input.targetRegistry.registry_snapshot_id,
-      target_configuration_revision_id: input.targetConfiguration.configuration_revision_id,
-      trigger_kind: "core:workspace_fork",
-      state: "published",
-      candidate_materialization_id: materializationId,
-      candidate_digest: materializationDigest,
-      source_observation_batch_ids: normalizedBatchIds,
-      created_at: publishedAt,
-      issue_ids: [] as readonly string[],
-      published_snapshot_id: snapshotId,
-      published_generation: generation,
-      generation_manifest_id: generationManifestId,
-      finished_at: publishedAt,
-    } satisfies IndexCandidate,
-    frozen_base: { source_state_digest: input.sourceStateDigest, source_observation_batch_ids: normalizedBatchIds },
-  });
+  const materializationContractText = JSON.stringify({ ...materializationCore, materialization_digest: materializationDigest });
 
   // Deliberately a plain INSERT, not the `ON CONFLICT ... DO UPDATE` pattern
   // the other rows below use: a fork candidate id is always genuinely new
@@ -677,32 +721,32 @@ export function buildForkPublicationPlan(input: ForkPublicationPlanInput): Publi
   // full scan", so failing loudly here is strictly better than silently
   // reusing a row that might not agree with this attempt's own generation.
   const candidateStateCommands: readonly SqliteCommand[] = [
-    { kind: "run", sql: "INSERT INTO candidate_state (candidate_generation_id, workspace_id, base_snapshot_id, base_generation, base_registry_snapshot_id, target_registry_snapshot_id, base_configuration_revision_id, target_configuration_revision_id, trigger_kind, state, work_manifest_id, source_observation_batch_ids, retention_lease_id, candidate_materialization_id, candidate_digest, created_at, analysis_started_at, ready_at, finished_at, published_snapshot_id, published_generation, generation_manifest_id, stale_against_snapshot_id, failure_code, issue_ids, candidate_payload) VALUES (?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, 'published', NULL, ?, NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?)", params: [candidateId, workspaceId, input.targetRegistry.registry_snapshot_id, input.targetConfiguration.configuration_revision_id, "core:workspace_fork", JSON.stringify(normalizedBatchIds), materializationId, materializationDigest, publishedAt, publishedAt, snapshotId, generation, generationManifestId, JSON.stringify([]), candidatePayload] },
+    { kind: "run", sql: "INSERT INTO candidate_state (candidate_generation_id, workspace_id, base_snapshot_id, base_generation, base_registry_snapshot_id, target_registry_snapshot_id, base_configuration_revision_id, target_configuration_revision_id, trigger_kind, state, work_manifest_id, source_observation_batch_ids, retention_lease_id, candidate_materialization_id, candidate_digest, created_at, analysis_started_at, ready_at, finished_at, published_snapshot_id, published_generation, generation_manifest_id, stale_against_snapshot_id, failure_code, issue_ids, frozen_source_state_digest, frozen_source_observation_batch_ids, frozen_tuple_digest) VALUES (?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, 'published', NULL, ?, NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)", params: [candidateId, workspaceId, input.targetRegistry.registry_snapshot_id, input.targetConfiguration.configuration_revision_id, "core:workspace_fork", JSON.stringify(normalizedBatchIds), materializationId, materializationDigest, publishedAt, publishedAt, snapshotId, generation, generationManifestId, JSON.stringify([]), input.sourceStateDigest, JSON.stringify(normalizedBatchIds), materializationDigest] },
   ];
 
   const targetControlCommands: readonly SqliteCommand[] = [
-    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(registry_snapshot_id) DO UPDATE SET registry_contract_version = excluded.registry_contract_version, core_registry_digest = excluded.core_registry_digest, resolution_lock_id = excluded.resolution_lock_id, registry_digest = excluded.registry_digest, registry_payload = excluded.registry_payload WHERE registry_snapshots.workspace_id = excluded.workspace_id AND registry_snapshots.registry_contract_version = excluded.registry_contract_version AND registry_snapshots.core_registry_digest = excluded.core_registry_digest AND registry_snapshots.resolution_lock_id = excluded.resolution_lock_id AND registry_snapshots.registry_digest = excluded.registry_digest AND registry_snapshots.registry_payload = excluded.registry_payload", params: [input.targetRegistry.registry_snapshot_id, workspaceId, input.targetRegistry.registry_contract_version, input.targetRegistry.core_registry_digest, input.targetResolutionLock.resolution_lock_id, input.targetRegistry.registry_digest, encodeCanonical(input.targetRegistry)] }),
-    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'plugin_resolution_lock', ?, NULL, NULL, NULL, ?) ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload WHERE control_plane_state.workspace_id = excluded.workspace_id AND control_plane_state.state_kind = excluded.state_kind AND control_plane_state.payload = excluded.payload AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest", params: [`plugin_resolution_lock:${input.targetResolutionLock.resolution_lock_id}`, workspaceId, encodeCanonical(input.targetResolutionLock), publishedAt] }),
-    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'workspace_configuration_revision', ?, NULL, NULL, NULL, ?) ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload WHERE control_plane_state.workspace_id = excluded.workspace_id AND control_plane_state.state_kind = excluded.state_kind AND control_plane_state.payload = excluded.payload AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest", params: [`workspace_configuration_revision:${input.targetConfiguration.configuration_revision_id}`, workspaceId, encodeCanonical(input.targetConfiguration), publishedAt] }),
-    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'workspace_freshness_checkpoint', ?, ?, ?, ?, ?) ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload, reference_workspace_id = excluded.reference_workspace_id, reference_snapshot_id = excluded.reference_snapshot_id, reference_source_state_digest = excluded.reference_source_state_digest WHERE control_plane_state.workspace_id = excluded.workspace_id AND control_plane_state.state_kind = excluded.state_kind AND control_plane_state.payload = excluded.payload AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest", params: [`workspace_freshness_checkpoint:${input.freshnessCheckpoint.freshness_checkpoint_id}`, workspaceId, encodeCanonical(input.freshnessCheckpoint), workspaceId, snapshotId, input.sourceStateDigest, publishedAt] }),
+      ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(registry_snapshot_id) DO UPDATE SET registry_contract_version = excluded.registry_contract_version, core_registry_digest = excluded.core_registry_digest, resolution_lock_id = excluded.resolution_lock_id, registry_digest = excluded.registry_digest WHERE registry_snapshots.workspace_id IS excluded.workspace_id AND registry_snapshots.registry_contract_version IS excluded.registry_contract_version AND registry_snapshots.core_registry_digest IS excluded.core_registry_digest AND registry_snapshots.resolution_lock_id IS excluded.resolution_lock_id AND registry_snapshots.registry_digest IS excluded.registry_digest", params: [input.targetRegistry.registry_snapshot_id, workspaceId, input.targetRegistry.registry_contract_version, input.targetRegistry.core_registry_digest, input.targetResolutionLock.resolution_lock_id, input.targetRegistry.registry_digest] }),
+    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'plugin_resolution_lock', ?, NULL, NULL, NULL, ?) ON CONFLICT(state_key) DO NOTHING", params: [`plugin_resolution_lock:${input.targetResolutionLock.resolution_lock_id}`, workspaceId, JSON.stringify(input.targetResolutionLock), publishedAt] }),
+    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'workspace_configuration_revision', ?, NULL, NULL, NULL, ?) ON CONFLICT(state_key) DO NOTHING", params: [`workspace_configuration_revision:${input.targetConfiguration.configuration_revision_id}`, workspaceId, JSON.stringify(input.targetConfiguration), publishedAt] }),
+    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'workspace_freshness_checkpoint', ?, ?, ?, ?, ?) ON CONFLICT(state_key) DO NOTHING", params: [`workspace_freshness_checkpoint:${input.freshnessCheckpoint.freshness_checkpoint_id}`, workspaceId, JSON.stringify(input.freshnessCheckpoint), workspaceId, snapshotId, input.sourceStateDigest, publishedAt] }),
     ...capabilityStateCommands(input.capabilityStateEntries ?? [], workspaceId, candidateId, publishedAt),
   ];
 
   const canonicalCommands: readonly SqliteCommand[] = [
-    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_payload) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET materialization_digest = excluded.materialization_digest, sealed_at = excluded.sealed_at, materialization_payload = excluded.materialization_payload WHERE candidate_materializations.candidate_materialization_id = excluded.candidate_materialization_id AND candidate_materializations.workspace_id = excluded.workspace_id AND candidate_materializations.candidate_generation_id IS excluded.candidate_generation_id AND candidate_materializations.materialization_digest = excluded.materialization_digest AND candidate_materializations.sealed_at IS excluded.sealed_at AND candidate_materializations.materialization_payload = excluded.materialization_payload", params: [materializationId, workspaceId, candidateId, materializationDigest, publishedAt, materializationPayload] }),
+    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_contract_text) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET materialization_digest = excluded.materialization_digest, sealed_at = excluded.sealed_at, materialization_contract_text = excluded.materialization_contract_text WHERE candidate_materializations.candidate_materialization_id = excluded.candidate_materialization_id AND candidate_materializations.workspace_id = excluded.workspace_id AND candidate_materializations.candidate_generation_id IS excluded.candidate_generation_id AND candidate_materializations.materialization_digest = excluded.materialization_digest AND candidate_materializations.sealed_at IS excluded.sealed_at AND candidate_materializations.materialization_contract_text = excluded.materialization_contract_text", params: [materializationId, workspaceId, candidateId, materializationDigest, publishedAt, materializationContractText] }),
   ];
 
   const manifestCommands: readonly SqliteCommand[] = [
-    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest, manifest_payload) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET manifest_payload = excluded.manifest_payload WHERE generation_manifests.generation_manifest_id = excluded.generation_manifest_id AND generation_manifests.workspace_id = excluded.workspace_id AND generation_manifests.candidate_generation_id = excluded.candidate_generation_id AND generation_manifests.generation = excluded.generation AND generation_manifests.snapshot_id = excluded.snapshot_id AND generation_manifests.base_snapshot_id IS NULL AND generation_manifests.registry_snapshot_id = excluded.registry_snapshot_id AND generation_manifests.publication_kind = excluded.publication_kind AND generation_manifests.published_at = excluded.published_at AND generation_manifests.artifact_change_set = excluded.artifact_change_set AND generation_manifests.record_open_set = excluded.record_open_set AND generation_manifests.record_closure_set = excluded.record_closure_set AND generation_manifests.identity_assignment_set = excluded.identity_assignment_set AND generation_manifests.projection_change_sets = excluded.projection_change_sets AND generation_manifests.manifest_digest = excluded.manifest_digest AND generation_manifests.manifest_payload = excluded.manifest_payload", params: [generationManifestId, workspaceId, candidateId, generation, snapshotId, manifest.registry_snapshot_id, manifest.publication_kind, publishedAt, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, manifest.manifest_digest, encodeCanonical(manifest)] }),
+    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [generationManifestId, workspaceId, candidateId, generation, snapshotId, manifest.registry_snapshot_id, manifest.publication_kind, publishedAt, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, manifest.manifest_digest] }),
   ];
 
   const snapshotCommands: readonly SqliteCommand[] = [
-    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET snapshot_payload = excluded.snapshot_payload WHERE snapshots.snapshot_id = excluded.snapshot_id AND snapshots.workspace_id = excluded.workspace_id AND snapshots.generation = excluded.generation AND snapshots.parent_snapshot_id IS NULL AND snapshots.generation_manifest_id = excluded.generation_manifest_id AND snapshots.registry_snapshot_id = excluded.registry_snapshot_id AND snapshots.resolution_lock_id = excluded.resolution_lock_id AND snapshots.configuration_revision_id = excluded.configuration_revision_id AND snapshots.source_state_digest = excluded.source_state_digest AND snapshots.source_observation_watermarks = excluded.source_observation_watermarks AND snapshots.canonical_record_set_digest = excluded.canonical_record_set_digest AND snapshots.projection_set_digests = excluded.projection_set_digests AND snapshots.capability_state_digest = excluded.capability_state_digest AND snapshots.published_at = excluded.published_at AND snapshots.snapshot_digest = excluded.snapshot_digest AND snapshots.snapshot_payload = excluded.snapshot_payload", params: [completedSnapshot.snapshot_id, completedSnapshot.workspace_id, completedSnapshot.generation, completedSnapshot.generation_manifest_id, completedSnapshot.registry_snapshot_id, completedSnapshot.resolution_lock_id, completedSnapshot.configuration_revision_id, completedSnapshot.source_state_digest, completedSnapshot.source_observation_watermarks, completedSnapshot.canonical_record_set_digest, completedSnapshot.projection_set_digests, completedSnapshot.capability_state_digest, completedSnapshot.published_at, completedSnapshot.snapshot_digest, encodeCanonical(completedSnapshot)] }),
+    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_snapshot_id, snapshot_contract_version, publication_stage_id, publication_stage_ordinal, publication_stage_count, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [completedSnapshot.snapshot_id, completedSnapshot.workspace_id, completedSnapshot.generation, completedSnapshot.generation_manifest_id, completedSnapshot.registry_snapshot_id, completedSnapshot.resolution_lock_id, completedSnapshot.configuration_revision_id, completedSnapshot.source_state_digest, completedSnapshot.source_snapshot_id ?? null, completedSnapshot.snapshot_contract_version ?? null, completedSnapshot.publication_stage_id ?? null, completedSnapshot.publication_stage_ordinal ?? null, completedSnapshot.publication_stage_count ?? null, completedSnapshot.source_observation_watermarks, completedSnapshot.canonical_record_set_digest, completedSnapshot.projection_set_digests, completedSnapshot.capability_state_digest, completedSnapshot.published_at, completedSnapshot.snapshot_digest] }),
   ];
 
   const publicationPayload = encodeCanonical({ candidate_generation_id: candidateId, workspace_id: workspaceId, trigger_kind: "core:workspace_fork", snapshot_id: snapshotId });
   const journalCommands: readonly SqliteCommand[] = [
-    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_publication_journal (candidate_generation_id, workspace_id, status, snapshot_id, generation_manifest_id, generation, published_at, publication_digest, journal_payload) VALUES (?, ?, 'published', ?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET journal_payload = excluded.journal_payload WHERE candidate_publication_journal.candidate_generation_id = excluded.candidate_generation_id AND candidate_publication_journal.workspace_id = excluded.workspace_id AND candidate_publication_journal.status = excluded.status AND candidate_publication_journal.snapshot_id = excluded.snapshot_id AND candidate_publication_journal.generation_manifest_id = excluded.generation_manifest_id AND candidate_publication_journal.generation = excluded.generation AND candidate_publication_journal.published_at = excluded.published_at AND candidate_publication_journal.publication_digest = excluded.publication_digest AND candidate_publication_journal.journal_payload = excluded.journal_payload", params: [candidateId, workspaceId, snapshotId, generationManifestId, generation, publishedAt, canonicalSha256(publicationPayload), publicationPayload] }),
+    ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_publication_journal (candidate_generation_id, workspace_id, status, snapshot_id, generation_manifest_id, generation, published_at, publication_digest) VALUES (?, ?, 'published', ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [candidateId, workspaceId, snapshotId, generationManifestId, generation, publishedAt, canonicalSha256(publicationPayload)] }),
   ];
 
   // A fork always mints workspace generation 1 -- `current` is always
@@ -711,7 +755,7 @@ export function buildForkPublicationPlan(input: ForkPublicationPlanInput): Publi
   // `currentCommands` applies; the "update if matches" branch never does.
   const currentCommands: readonly SqliteCommand[] = [
     { kind: "transaction_checkpoint" },
-    { kind: "run", sql: "INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM workspace_current_state WHERE workspace_id = ?)", params: [workspaceId, nextState.current_snapshot_id, nextState.current_generation, nextState.current_registry_snapshot_id, nextState.current_resolution_lock_id, nextState.current_configuration_revision_id, nextState.current_freshness_checkpoint_id, nextState.state_revision, nextState.updated_at, encodeCanonical({ ...nextState, source_state_digest: input.sourceStateDigest }), workspaceId] },
+    { kind: "run", sql: "INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM workspace_current_state WHERE workspace_id = ?)", params: [workspaceId, nextState.current_snapshot_id, nextState.current_generation, nextState.current_registry_snapshot_id, nextState.current_resolution_lock_id, nextState.current_configuration_revision_id, nextState.current_freshness_checkpoint_id, nextState.state_revision, nextState.updated_at, workspaceId] },
     { kind: "assert_transaction_changes", expected: 1 },
   ];
 
@@ -743,6 +787,8 @@ export function buildPublicationPlan(input: PublicationPlanInput): PublicationCo
     journal: input.phases.journal?.() ?? [],
     candidateFinalization: input.phases.candidateFinalization?.() ?? [],
     current: input.phases.current(),
+    ...(input.phases.canonicalStream === undefined ? {} : { canonicalStream: input.phases.canonicalStream }),
+    ...(input.phases.projectionsStream === undefined ? {} : { projectionsStream: input.phases.projectionsStream }),
   };
   validatePublicationCommandGroups(plan);
   return plan;
@@ -766,8 +812,8 @@ function publicationPhaseCommands(plan: PublicationCommandGroups): readonly Sqli
     ...compactPublicationPhase(plan.candidateState),
     ...compactPublicationPhase(plan.targetControls),
     ...compactPublicationPhase(plan.source),
-    ...compactPublicationPhase(plan.canonical),
-    ...compactPublicationPhase(plan.projections),
+    ...(plan.canonicalStream === undefined ? compactPublicationPhase(plan.canonical) : [...plan.canonicalStream()]),
+    ...(plan.projectionsStream === undefined ? compactPublicationPhase(plan.projections) : [...plan.projectionsStream()]),
     ...compactPublicationPhase(plan.manifest),
     ...compactPublicationPhase(plan.snapshot),
     ...compactPublicationPhase(plan.journal),
@@ -792,7 +838,18 @@ export function publicationTransactionCommands(plan: PublicationCommandGroups): 
   // back) but needlessly opens one.
   validatePublicationCommandGroups(plan);
   return (function* (): Generator<SqliteCommand> {
-    yield* publicationPhaseCommands(plan);
+    yield* compactPublicationPhase(plan.candidateState);
+    yield* compactPublicationPhase(plan.targetControls);
+    yield* compactPublicationPhase(plan.source);
+    if (plan.canonicalStream !== undefined) yield* plan.canonicalStream();
+    else yield* compactPublicationPhase(plan.canonical);
+    if (plan.projectionsStream !== undefined) yield* plan.projectionsStream();
+    else yield* compactPublicationPhase(plan.projections);
+    yield* compactPublicationPhase(plan.manifest);
+    yield* compactPublicationPhase(plan.snapshot);
+    yield* compactPublicationPhase(plan.journal);
+    yield* compactPublicationPhase(plan.candidateFinalization);
+    yield* compactPublicationPhase(plan.current);
   })();
 }
 
@@ -820,9 +877,8 @@ type TransactionCommand = Parameters<SqliteDatabase["transaction"]>[0][number];
 // generation's publication. `CandidateMaterialization`'s template-set fields now hold
 // only a small, bounded `OrderedSetDescriptor` (descriptor-as-text -- see
 // `packages/engine/src/candidate-materialization.ts`); the actual template arrays travel
-// out-of-band via `CandidatePublicationInput.template_sets` and are persisted as
-// CAS-backed segments (`packages/storage/src/candidates.ts`'s
-// `WorkspaceCandidateRepository.saveMaterialization`/`readTemplateSet`). No per-row
+// out-of-band via `CandidatePublicationInput.template_sets`; the repository stores
+// only the bounded descriptor and durable recovery replays confirmed FactDelta batches. No per-row
 // payload this module encodes is expected to exceed `@urdira/canonical`'s shared default
 // resource limits anymore, so every canonical encode and digest in this file uses those
 // defaults.
@@ -831,10 +887,78 @@ function encodeCanonical(value: unknown, limits?: CanonicalEncodingLimits): Uint
 }
 function canonicalSha256(value: unknown): string { return digestBytes(encodeCanonical(value)); }
 
+const PACKED_CREATED_IDENTITY_MARKER = "urdira:created-identity:v1";
+type PackedCreatedIdentityAssignment = readonly [
+  typeof PACKED_CREATED_IDENTITY_MARKER,
+  workspace_id: string,
+  identity_type: string,
+  identity_key: string,
+  record_id: string,
+  owner_artifact_id: string,
+  owner_artifact_version_id: string,
+];
+
+function isPackedCreatedIdentityAssignment(value: unknown): value is PackedCreatedIdentityAssignment {
+  return Array.isArray(value)
+    && value.length === 7
+    && value[0] === PACKED_CREATED_IDENTITY_MARKER
+    && value.every((entry) => typeof entry === "string");
+}
+
+function unpackCreatedIdentityAssignment(value: PackedCreatedIdentityAssignment): Record<string, unknown> {
+  const [, workspaceId, identityType, identityKey, recordId, ownerArtifactId, ownerArtifactVersionId] = value;
+  return {
+    identity_assignment_id: canonicalSha256({ record_id: recordId, identity_key: identityKey }),
+    workspace_id: workspaceId,
+    identity_type: identityType,
+    identity_id: `${identityType}:${canonicalSha256({ identity_key: identityKey }).slice("sha256:".length)}`,
+    assignment_kind: "created",
+    identity_key: identityKey,
+    identity_key_digest: canonicalSha256(identityKey),
+    record_id: recordId,
+    owner_artifact_id: ownerArtifactId,
+    owner_artifact_version_id: ownerArtifactVersionId,
+  };
+}
+
+function isPackedCandidateTemplate(value: unknown): boolean {
+  return isPackedCreatedIdentityAssignment(value)
+    || value !== null && typeof value === "object" && !Array.isArray(value) && typeof (value as Record<string, unknown>)["canonical_template"] === "string";
+}
+
+function candidateTemplateValue(value: unknown): unknown {
+  if (isPackedCreatedIdentityAssignment(value)) return unpackCreatedIdentityAssignment(value);
+  if (value !== null && typeof value === "object" && !Array.isArray(value) && typeof (value as Record<string, unknown>)["canonical_template"] === "string") {
+    try { return JSON.parse(String((value as Record<string, unknown>)["canonical_template"])); }
+    catch { throw new StorageError("storage:publication_invalid", "Packed candidate template is not valid JSON."); }
+  }
+  return value;
+}
+
+function digestCandidateTemplateArray(entries: readonly unknown[]): string {
+  // LogicalDigestWriter has its own domain and therefore cannot provide the
+  // byte-identical canonical-array digest. Use the ordinary canonical helper
+  // for uncompressed sets and a bounded decoded view for packed identities.
+  if (!entries.some(isPackedCandidateTemplate)) return digestCanonicalArray(entries);
+  return digestMappedCanonicalArray(entries, "urdira:candidate-template-logical-value:v2", candidateTemplateValue);
+}
+
 /** @internal Exported for exact-path authority validation tests. */
 export interface RecordOpenMemoEntry {
   readonly recordId: string;
   readonly recordDigest: string;
+}
+
+function promotedRecordOpen(entry: unknown): RecordOpenMemoEntry | undefined {
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+  const value = entry as Record<string, unknown>;
+  return typeof value["record_id_hint"] === "string" && typeof value["record_digest_hint"] === "string"
+    ? { recordId: value["record_id_hint"], recordDigest: value["record_digest_hint"] }
+    : undefined;
+}
+
+function recordOpenMemoEntry(entry: unknown, memo: ReadonlyMap<unknown, RecordOpenMemoEntry>): RecordOpenMemoEntry | undefined {
+  return promotedRecordOpen(entry) ?? memo.get(entry);
 }
 
 /**
@@ -871,6 +995,13 @@ function memoizeRecordOpens(opens: readonly unknown[]): ReadonlyMap<unknown, Rec
     // Digesting the whole parsed value, wrapped or not, re-derives the
     // identical id byte-for-byte -- this mechanic is unchanged by the wrapper.
     const recordDigest = canonicalSha256(record);
+    const promoted = promotedRecordOpen(entry);
+    if (promoted !== undefined) {
+      if (promoted.recordDigest !== recordDigest || promoted.recordId !== `record:${recordDigest.slice("sha256:".length)}`) {
+        throw new StorageError("storage:publication_invalid", "Promoted record-open identity does not match its canonical record.");
+      }
+      continue;
+    }
     memo.set(entry, { recordId: `record:${recordDigest.slice("sha256:".length)}`, recordDigest });
   }
   return memo;
@@ -1015,7 +1146,14 @@ export function jsonArray(value: unknown): unknown[] {
  * `buildCandidatePublicationPlan`'s call site.
  */
 function verifyTemplateSetAgainstDescriptor(descriptorText: string | undefined, entries: readonly unknown[], fieldName: string): string {
-  const expectedDigest = digestCanonicalArray(entries);
+  // The engine computes the descriptor over deeply frozen arrays and passes
+  // those exact identities to publication. Reuse the digest memoized by the
+  // canonical module in that trusted in-process path. Direct/recovery callers
+  // with reconstructed or mutable arrays still take the full fail-closed
+  // canonical verification below.
+  const expectedDigest = memoizedCanonicalArrayDigest(entries, "urdira:candidate-template-logical-value:v2")
+    ?? memoizedCanonicalArrayDigest(entries)
+    ?? digestCandidateTemplateArray(entries);
   if (descriptorText === undefined) {
     if (entries.length !== 0) throw new StorageError("storage:template_set_mismatch", `Template set ${fieldName} has no descriptor but ${entries.length} entries were supplied.`);
     return expectedDigest;
@@ -1056,7 +1194,7 @@ export function changeSetDescriptor(changeSetKind: string, entries: readonly unk
     comparator_id: "core:lexicographic_uri",
     comparator_version: "1",
     entry_count: entries.length,
-    content_digest: precomputedDigest ?? digestCanonicalArray(entries),
+    content_digest: precomputedDigest ?? digestCandidateTemplateArray(entries),
   };
 }
 
@@ -1206,7 +1344,7 @@ export function snapshotDigest(snapshot: Readonly<Record<string, unknown>>): str
  *   that array, via the same standalone `projectionSetDigestEntries` the verifier calls --
  *   this call site asks for `{ digest_source: "stored" }` (reads each row's
  *   precomputed `content_digest` column) where the verifier's always asks for
- *   `"recompute"` (re-hashes the payload BLOB), but both modes are defined to
+ *   `"recompute"` (recomputes from typed columns), but both modes are defined to
  *   produce byte-identical entries for the same visible rows, so the
  *   comparison still holds exactly. The three transactional kinds' row sets
  *   are this publish's pre-transaction visible rows (queried live, since this
@@ -1235,10 +1373,23 @@ export function snapshotDigest(snapshot: Readonly<Record<string, unknown>>): str
  *   both purposes, again mirroring `sortedVisible`.
  */
 /** @internal Exported for exact-path authority validation tests. */
-export async function computeSnapshotDigestFields(database: SqliteDatabase, workspaceId: string, current: CandidatePublicationPlanInput["current"], generation: number, recordOpens: readonly unknown[], recordClosures: readonly unknown[], recordOpenMemo?: ReadonlyMap<unknown, RecordOpenMemoEntry>, corpus?: RecordSetDigestCorpusEntry, artifactDependencies: readonly unknown[] = [], projectionCorpus?: ProjectionSetDigestCorpusEntry): Promise<{ readonly canonical_record_set_digest: string; readonly projection_set_digests: string; readonly sortedVisible: readonly { readonly record_id: string; readonly record_digest: string }[]; readonly sortedProjectionsByKind: Readonly<Record<ProjectionDigestKind, readonly ProjectionKindDigestRow[]>> }> {
+export async function computeSnapshotDigestFields(database: SqliteDatabase, workspaceId: string, current: CandidatePublicationPlanInput["current"], generation: number, recordOpens: readonly unknown[], recordClosures: readonly unknown[], recordOpenMemo?: ReadonlyMap<unknown, RecordOpenMemoEntry>, corpus?: RecordSetDigestCorpusEntry, artifactDependencies: readonly unknown[] = [], projectionCorpus?: ProjectionSetDigestCorpusEntry): Promise<{ readonly canonical_record_set_digest: string; readonly projection_set_digests: string; readonly sortedVisible: readonly { readonly record_id: string; readonly record_digest: string }[]; readonly record_set_digest_corpus_complete: boolean; readonly sortedProjectionsByKind: Readonly<Record<ProjectionDigestKind, readonly ProjectionKindDigestRow[]>> }> {
   const oldGeneration = current?.current_generation;
   let sortedVisible: readonly { readonly record_id: string; readonly record_digest: string }[] = [];
+  let recordSetDigestCorpusComplete = true;
   const canonicalRecordSetDigest = await timed("publish_record_set_digest", async () => {
+    const promotedFirstOpen = oldGeneration === undefined && recordClosures.length === 0 && recordOpens.every((entry) => promotedRecordOpen(entry) !== undefined);
+    if (promotedFirstOpen) {
+      const rows = function* (): Iterable<{ readonly record_id: string; readonly record_digest: string }> {
+        for (const entry of recordOpens) {
+          const opened = promotedRecordOpen(entry)!;
+          yield { record_id: opened.recordId, record_digest: opened.recordDigest };
+        }
+      };
+      if (recordOpens.length < STREAMING_PUBLICATION_RECORD_THRESHOLD) sortedVisible = [...rows()];
+      else recordSetDigestCorpusComplete = false;
+      return digestSortedRecordSet(rows(), recordOpens.length);
+    }
     // Corpus hit only when it is both for this exact workspace and for this
     // exact prior generation (`RecordSetDigestCorpusEntry`'s doc comment) --
     // a generation mismatch (stale entry, or no entry yet: daemon restart,
@@ -1262,7 +1413,7 @@ export async function computeSnapshotDigestFields(database: SqliteDatabase, work
     }
     const memo = recordOpenMemo ?? memoizeRecordOpens(recordOpens);
     for (const entry of recordOpens) {
-      const opened = memo.get(entry);
+      const opened = recordOpenMemoEntry(entry, memo);
       if (!opened) continue;
       visible.set(opened.recordId, opened.recordDigest);
     }
@@ -1271,7 +1422,7 @@ export async function computeSnapshotDigestFields(database: SqliteDatabase, work
       .sort((left, right) => (left.record_id < right.record_id ? -1 : left.record_id > right.record_id ? 1 : 0));
     // Streamed per element: the visible record set scales with workspace size and
     // a single-call encode would trip the default aggregate canonical limits.
-    return computeDigestOverArrayPayload("core:canonical_record_set", "core:snapshot_record_set_digest", 1, "core:SnapshotRecordSetDigestPayload", 1, sortedVisible);
+    return logicalRecordSetDigest(sortedVisible);
   });
   let sortedProjectionsByKind: Readonly<Record<ProjectionDigestKind, readonly ProjectionKindDigestRow[]>> = { graph: [], dependency: [], metric: [] };
   const projectionEntries: ReadonlyArray<ProjectionSetDigestEntry> = await timed("publish_projection_digests", async () => {
@@ -1303,7 +1454,7 @@ export async function computeSnapshotDigestFields(database: SqliteDatabase, work
     };
     return await projectionSetDigestEntries(database, workspaceId, generation, { digest_source: "stored", row_overrides: sortedProjectionsByKind });
   });
-  return { canonical_record_set_digest: canonicalRecordSetDigest, projection_set_digests: JSON.stringify(projectionEntries), sortedVisible, sortedProjectionsByKind };
+  return { canonical_record_set_digest: canonicalRecordSetDigest, projection_set_digests: JSON.stringify(projectionEntries), sortedVisible, record_set_digest_corpus_complete: recordSetDigestCorpusComplete, sortedProjectionsByKind };
 }
 
 /**
@@ -1322,7 +1473,7 @@ function artifactDependencyDigestOpens(artifactDependencies: readonly unknown[],
     if (!entry || typeof entry !== "object") continue;
     const id = (entry as Record<string, unknown>)["dependency_entry_id"];
     if (typeof id !== "string") continue;
-    rows.push({ projection_record_id: `${id}@${generation}`, content_digest: canonicalSha256(entry) });
+    rows.push({ projection_record_id: `${id}@${generation}`, content_digest: digestLogicalValue(entry, "urdira:artifact-dependency:v2") });
   }
   return rows;
 }
@@ -1408,7 +1559,6 @@ async function fetchExistingProjectionDependencies(database: SqliteDatabase, wor
 
 async function assertPublicationImmutableRows(database: SqliteDatabase, workspaceId: string, input: CandidatePublicationInput, sourceTransitions: readonly unknown[], recordOpens: readonly unknown[], identityAssignments: readonly unknown[], projectionOpens: readonly unknown[], artifactDependencies: readonly unknown[], lookupDependencies: readonly unknown[], lookupRevalidations: readonly unknown[], capabilityStates: readonly unknown[], generation: number, publishedAt: string, materializationSealedAt: string, manifest: GenerationManifestRow, completedSnapshot: SnapshotRow, recordOpenMemo: ReadonlyMap<unknown, RecordOpenMemoEntry>): Promise<void> {
   const conflict = (kind: string, id: string, table: string, row: Record<string, unknown>, expected: Record<string, unknown>): never => { throw new StorageError("storage:publication_conflict", `Authoritative ${kind} ${id} differs from the sealed publication payload.`, { table, row_id: id, mismatched_fields: mismatchedFields(row, expected).join(",") }); };
-  const registryPayload = encodeCanonical(input.target_registry);
   const registry = await database.get<Record<string, unknown>>("SELECT * FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [workspaceId, input.target_registry.registry_snapshot_id]);
   {
     const expected = {
@@ -1418,7 +1568,6 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
       core_registry_digest: input.target_registry.core_registry_digest,
       resolution_lock_id: input.target_resolution_lock.resolution_lock_id,
       registry_digest: input.target_registry.registry_digest,
-      registry_payload: registryPayload,
     };
     if (registry && !rowMatches(registry, expected)) conflict("registry snapshot", input.target_registry.registry_snapshot_id, "registry_snapshots", registry, expected);
   }
@@ -1434,12 +1583,12 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
       state_key: key,
       workspace_id: workspaceId,
       state_kind: isFreshness ? "workspace_freshness_checkpoint" : key.startsWith("plugin_resolution") ? "plugin_resolution_lock" : "workspace_configuration_revision",
-      payload: encodeCanonical(value),
+      state_json: JSON.stringify(value),
       ...(isFreshness ? { reference_workspace_id: workspaceId, reference_snapshot_id: input.source_snapshot_id ?? input.freshness_checkpoint.snapshot_id ?? input.frozen_base.snapshot_id ?? null, reference_source_state_digest: input.frozen_base.source_state_digest ?? null } : { reference_workspace_id: null, reference_snapshot_id: null, reference_source_state_digest: null }),
     };
     if (row && !rowMatches(row, expected)) conflict("control state", key, "control_plane_state", row, expected);
   }
-  const materializationPayload = encodeCanonical(input.materialization);
+  const materializationContractText = JSON.stringify(input.materialization);
   const materialization = await database.get<Record<string, unknown>>("SELECT * FROM candidate_materializations WHERE workspace_id = ? AND (candidate_materialization_id = ? OR materialization_digest = ?)", [workspaceId, input.materialization.candidate_materialization_id, input.materialization.materialization_digest]);
   {
     const expected = {
@@ -1448,7 +1597,7 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
       candidate_generation_id: input.candidate.candidate_generation_id,
       materialization_digest: input.materialization.materialization_digest,
       sealed_at: materializationSealedAt,
-      materialization_payload: materializationPayload,
+      materialization_contract_text: materializationContractText,
     };
     if (materialization && !rowMatches(materialization, expected)) conflict("candidate materialization", input.materialization.candidate_materialization_id, "candidate_materializations", materialization, expected);
   }
@@ -1470,9 +1619,18 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
     const version = value["target_artifact_version_without_generation"] as Record<string, any> | undefined;
     if (version && typeof version["artifact_version_id"] === "string") {
       const row = existingVersions.get(version["artifact_version_id"]);
+      const storedValidFrom = row === undefined ? generation : Number(row["valid_from_generation"]);
       const expected = {
-        artifact_version_id: version["artifact_version_id"], workspace_id: workspaceId, artifact_id: version["artifact_id"], content_blob_id: version["content_blob_id"], content_hash: version["content_hash"], byte_length: version["byte_length"], encoding: version["encoding"], language_hint: version["language_hint"] ?? null, analysis_metadata_digest: version["analysis_metadata_digest"], created_from_observation_id: version["created_from_observation_id"], valid_from_generation: generation, valid_to_generation: null, artifact_version_payload: encodeCanonical({ ...version, valid_from_generation: generation }),
+        artifact_version_id: version["artifact_version_id"], workspace_id: workspaceId, artifact_id: version["artifact_id"], content_blob_id: version["content_blob_id"], content_hash: version["content_hash"], byte_length: version["byte_length"], encoding: version["encoding"], language_hint: version["language_hint"] ?? null, analysis_metadata_digest: version["analysis_metadata_digest"], created_from_observation_id: version["created_from_observation_id"], valid_from_generation: Number.isSafeInteger(storedValidFrom) && storedValidFrom <= generation ? storedValidFrom : generation, valid_to_generation: null,
       };
+      // Stage-1 source cataloging commits independently before structural
+      // publication. If several scans are cancelled in that gap, unchanged
+      // current versions from earlier attempts legitimately carry an older
+      // valid_from_generation than the final catch-up snapshot. No snapshot
+      // was published at those intermediate generations, and the version is
+      // open and visible at the catch-up generation, so its original start is
+      // authoritative rather than a payload conflict. A future or closed row
+      // remains invalid and is rejected by the same exact comparison.
       if (row && !rowMatches(row, expected)) conflict("artifact version", version["artifact_version_id"], "artifact_versions", row, expected);
     }
     const tombstone = value["target_artifact_tombstone_without_generation"] as Record<string, any> | undefined;
@@ -1497,34 +1655,37 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
       // to different bytes (`canonicalize`, `packages/canonical/src/index.ts`,
       // only visits OWN enumerable keys). Mirrors the artifact_version
       // branch above, which already omits any such override.
+      const storedValidFrom = row === undefined ? generation : Number(row["valid_from_generation"]);
       const expected = {
-        artifact_tombstone_id: tombstone["artifact_tombstone_id"], workspace_id: workspaceId, artifact_id: tombstone["artifact_id"], absence_kind: tombstone["absence_kind"], absence_reason_code: tombstone["absence_reason_code"], last_artifact_version_id: tombstone["last_artifact_version_id"], valid_from_generation: generation, valid_to_generation: null, opening_artifact_change_id: tombstone["opening_artifact_change_id"] ?? null, closing_artifact_change_id: null, replacement_artifact_version_id: null, cause_references: tombstone["cause_references"] ?? "[]", lineage_evidence_record_ids: tombstone["lineage_evidence_record_ids"] ?? "[]", artifact_tombstone_payload: encodeCanonical({ ...tombstone, valid_from_generation: generation }),
+        artifact_tombstone_id: tombstone["artifact_tombstone_id"], workspace_id: workspaceId, artifact_id: tombstone["artifact_id"], absence_kind: tombstone["absence_kind"], absence_reason_code: tombstone["absence_reason_code"], last_artifact_version_id: tombstone["last_artifact_version_id"], valid_from_generation: Number.isSafeInteger(storedValidFrom) && storedValidFrom <= generation ? storedValidFrom : generation, valid_to_generation: null, opening_artifact_change_id: tombstone["opening_artifact_change_id"] ?? null, closing_artifact_change_id: null, replacement_artifact_version_id: null, cause_references: tombstone["cause_references"] ?? "[]", lineage_evidence_record_ids: tombstone["lineage_evidence_record_ids"] ?? "[]",
       };
       if (row && !rowMatches(row, expected)) conflict("artifact tombstone", tombstone["artifact_tombstone_id"], "artifact_tombstones", row, expected);
     }
   }
-  const recordIds: string[] = [];
-  for (const entry of recordOpens) {
-    const opened = recordOpenMemo.get(entry);
-    if (opened) recordIds.push(opened.recordId);
-  }
-  const existingRecords = await fetchExistingRowsById(database, "record_occurrences", workspaceId, "record_id", recordIds);
-  for (const entry of recordOpens) {
-    const opened = recordOpenMemo.get(entry);
-    if (!opened) continue;
-    const id = opened.recordId;
-    const row = existingRecords.get(id);
+  const recordCount = await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM record_occurrences WHERE workspace_id = ?", [workspaceId]);
+  if (recordCount?.count !== 0) {
+    const recordIds: string[] = [];
+    for (const entry of recordOpens) {
+      const opened = recordOpenMemoEntry(entry, recordOpenMemo);
+      if (opened) recordIds.push(opened.recordId);
+    }
+    const existingRecords = await fetchExistingRowsById(database, "record_occurrences", workspaceId, "record_id", recordIds);
+    for (const entry of recordOpens) {
+      const opened = recordOpenMemoEntry(entry, recordOpenMemo);
+      if (!opened) continue;
+      const id = opened.recordId;
+      const row = existingRecords.get(id);
     // The comparison record is only re-parsed here, in the rare (resumed
     // publication) branch where a row already exists -- on an ordinary,
     // non-resumed publication this whole block never runs, so `record` is
     // never reconstructed at all; `opened.recordId`/`recordDigest` (from
     // `memoizeRecordOpens`) already cover every other use in this loop.
-    if (!row) continue;
-    const wrapper = entry as Record<string, any>;
-    const record = unwrapRecordTemplate(JSON.parse(String(wrapper["record_without_validity"])));
-    const bodyPayload = encodeCanonical(record["body"] ?? null);
-    const expected = { record_id: id, workspace_id: workspaceId, category: record["category"] ?? "fact", kind: record["kind"] ?? "unknown", universal_kind: record["universal_kind"] ?? "unknown", schema_version: record["schema_version"] ?? 1, producer_id: "candidate", producer_version: "1", owner_artifact_id: wrapper["owner_artifact_id"], owner_artifact_version_id: wrapper["owner_artifact_version_id"], primary_source_span_artifact_version_id: recordPrimarySourceSpanValue(record, "artifact_version_id"), primary_source_span_start_byte: recordPrimarySourceSpanValue(record, "start_byte"), primary_source_span_end_byte: recordPrimarySourceSpanValue(record, "end_byte"), primary_source_span_start_line: recordPrimarySourceSpanValue(record, "start_line"), primary_source_span_end_line: recordPrimarySourceSpanValue(record, "end_line"), valid_from_generation: generation, valid_to_generation: null, record_digest: opened.recordDigest, payload_digest: canonicalSha256(record["body"] ?? null), payload_byte_length: bodyPayload.byteLength, payload_inline: bodyPayload, payload_cas_digest: null, record_payload: encodeCanonical(recordOccurrencePayload(record, id, opened.recordDigest, generation)) };
-    if (!rowMatches(row, expected)) {
+      if (!row) continue;
+      const wrapper = entry as Record<string, any>;
+      const record = unwrapRecordTemplate(JSON.parse(String(wrapper["record_without_validity"])));
+      const logicalPayload = digestRelationalValue(record["body"] ?? null);
+      const expected = { record_id: id, workspace_id: workspaceId, category: record["category"] ?? "fact", kind: record["kind"] ?? "unknown", universal_kind: record["universal_kind"] ?? "unknown", schema_version: record["schema_version"] ?? 1, producer_id: "candidate", producer_version: "1", owner_artifact_id: wrapper["owner_artifact_id"], owner_artifact_version_id: wrapper["owner_artifact_version_id"], primary_source_span_artifact_version_id: recordPrimarySourceSpanValue(record, "artifact_version_id"), primary_source_span_start_byte: recordPrimarySourceSpanValue(record, "start_byte"), primary_source_span_end_byte: recordPrimarySourceSpanValue(record, "end_byte"), primary_source_span_start_line: recordPrimarySourceSpanValue(record, "start_line"), primary_source_span_end_line: recordPrimarySourceSpanValue(record, "end_line"), valid_from_generation: generation, valid_to_generation: null, record_digest: opened.recordDigest, body_digest: logicalPayload.digest, body_byte_length: logicalPayload.byte_length, analysis_digest: String(record["analysis_digest"] ?? opened.recordDigest), analysis_configuration_digest: String(record["analysis_configuration_digest"] ?? opened.recordDigest), artifact_dependency_digest: String(record["artifact_dependency_digest"] ?? opened.recordDigest) };
+      if (!rowMatches(row, expected)) {
       // A row that already exists under this exact `record_id` but is a
       // CLOSED row (`valid_to_generation` set) opened in a strictly earlier
       // generation is not this publish replaying its own prior attempt (an
@@ -1550,22 +1711,32 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
           { table: "record_occurrences", row_id: id, closed_valid_from_generation: Number(row["valid_from_generation"]), closed_valid_to_generation: Number(closedValidTo), publishing_generation: generation },
         );
       }
-      conflict("record occurrence", id, "record_occurrences", row, expected);
+        conflict("record occurrence", id, "record_occurrences", row, expected);
+      }
     }
   }
-  const identityIds = identityAssignments.flatMap((entry) => (entry && typeof entry === "object" && typeof (entry as Record<string, any>)["identity_assignment_id"] === "string" ? [String((entry as Record<string, any>)["identity_assignment_id"])] : []));
-  const existingIdentityAssignments = await fetchExistingRowsById(database, "identity_assignments", workspaceId, "identity_assignment_id", identityIds, { column: "valid_from_generation", value: generation });
-  for (const entry of identityAssignments) {
-    if (!entry || typeof entry !== "object" || typeof (entry as Record<string, any>)["identity_assignment_id"] !== "string") continue;
-    const value = entry as Record<string, any>;
-    const id = String((entry as Record<string, any>)["identity_assignment_id"]);
-    const row = existingIdentityAssignments.get(id);
-    // On a fresh generation the identity_assignments table is empty, so
-    // every one of these `encodeCanonical` calls would be wasted -- check
-    // row existence first, mirroring the recordOpens loop above.
-    if (!row) continue;
-    const expected = { identity_assignment_id: id, workspace_id: workspaceId, identity_type: value["identity_type"] ?? "entity", identity_id: value["identity_id"] ?? "", assignment_kind: value["assignment_kind"] ?? "created", identity_key: value["identity_key"] ?? "", identity_key_digest: value["identity_key_digest"] ?? canonicalSha256(value["identity_key"] ?? ""), record_id: value["record_id"] ?? "", previous_record_id: value["previous_record_id"] ?? null, owner_artifact_id: value["owner_artifact_id"] ?? "", owner_artifact_version_id: value["owner_artifact_version_id"] ?? "", valid_from_generation: generation, valid_to_generation: null, assignment_payload: encodeCanonical(entry) };
-    if (!rowMatches(row, expected)) conflict("identity assignment", id, "identity_assignments", row, expected);
+  const identityCount = await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM identity_assignments WHERE workspace_id = ? AND valid_from_generation = ?", [workspaceId, generation]);
+  if (identityCount?.count !== 0) {
+    // Decode and query bounded chunks. The former flatMap retained every id
+    // (and packed identities would then be decoded a second time), adding a
+    // project-sized array at publication. A real first generation takes the
+    // count=0 fast path; retries/conflict tests retain exact validation.
+    for (let offset = 0; offset < identityAssignments.length; offset += 4_096) {
+      const chunk: { readonly value: Record<string, any>; readonly id: string }[] = [];
+      for (const entry of identityAssignments.slice(offset, offset + 4_096)) {
+        const unpacked = candidateTemplateValue(entry);
+        if (!unpacked || typeof unpacked !== "object" || typeof (unpacked as Record<string, any>)["identity_assignment_id"] !== "string") continue;
+        const value = unpacked as Record<string, any>;
+        chunk.push({ value, id: String(value["identity_assignment_id"]) });
+      }
+      const existingIdentityAssignments = await fetchExistingRowsById(database, "identity_assignments", workspaceId, "identity_assignment_id", chunk.map((entry) => entry.id), { column: "valid_from_generation", value: generation });
+      for (const { value, id } of chunk) {
+        const row = existingIdentityAssignments.get(id);
+        if (!row) continue;
+        const expected = { identity_assignment_id: id, workspace_id: workspaceId, identity_type: value["identity_type"] ?? "entity", identity_id: value["identity_id"] ?? "", assignment_kind: value["assignment_kind"] ?? "created", identity_key: value["identity_key"] ?? "", identity_key_digest: value["identity_key_digest"] ?? canonicalSha256(value["identity_key"] ?? ""), record_id: value["record_id"] ?? "", previous_record_id: value["previous_record_id"] ?? null, owner_artifact_id: null, owner_artifact_version_id: null, valid_from_generation: generation, valid_to_generation: null };
+        if (!rowMatches(row, expected)) conflict("identity assignment", id, "identity_assignments", row, expected);
+      }
+    }
   }
   const projectionIds = projectionOpens.flatMap((entry) => (entry && typeof entry === "object" && typeof (entry as Record<string, any>)["projection_record_id"] === "string" ? [String((entry as Record<string, any>)["projection_record_id"])] : []));
   const existingProjections = await fetchExistingRowsById(database, "projection_occurrences", workspaceId, "projection_record_id", projectionIds, { column: "valid_from_generation", value: generation });
@@ -1583,7 +1754,7 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
     // loops elsewhere in this function do.
     if (row) {
       const digest = canonicalSha256(projectionContentDigestInput(value));
-      const expectedProjection = { projection_record_id: id, workspace_id: workspaceId, projection_kind: value["projection_kind"] ?? "unknown", projection_key: value["projection_key"] ?? id, owner_artifact_id: value["owner_artifact_id"] ?? "", owner_artifact_version_id: value["owner_artifact_version_id"] ?? "", source_artifact_version_ids: JSON.stringify(Array.isArray(value["source_artifact_version_ids"]) ? value["source_artifact_version_ids"] : []), source_record_ids: JSON.stringify(Array.isArray(value["source_record_ids"]) ? value["source_record_ids"] : []), source_projection_record_ids: JSON.stringify(Array.isArray(value["source_projection_record_ids"]) ? value["source_projection_record_ids"] : []), generator: value["generator"] ?? "", generator_version: value["generator_version"] ?? "", generator_configuration_digest: value["generator_configuration_digest"] ?? "", valid_from_generation: generation, valid_to_generation: null, content_digest: digest, projection_payload: encodeCanonical(value["payload"] ?? null) };
+      const expectedProjection = { projection_record_id: id, workspace_id: workspaceId, projection_kind: value["projection_kind"] ?? "unknown", projection_key: value["projection_key"] ?? id, owner_artifact_id: value["owner_artifact_id"] ?? "", owner_artifact_version_id: value["owner_artifact_version_id"] ?? "", source_artifact_version_ids: JSON.stringify(Array.isArray(value["source_artifact_version_ids"]) ? value["source_artifact_version_ids"] : []), source_record_ids: JSON.stringify(Array.isArray(value["source_record_ids"]) ? value["source_record_ids"] : []), source_projection_record_ids: JSON.stringify(Array.isArray(value["source_projection_record_ids"]) ? value["source_projection_record_ids"] : []), generator: value["generator"] ?? "", generator_version: value["generator_version"] ?? "", generator_configuration_digest: value["generator_configuration_digest"] ?? "", valid_from_generation: generation, valid_to_generation: null, content_digest: digest };
       if (!rowMatches(row, expectedProjection)) conflict("projection occurrence", id, "projection_occurrences", row, expectedProjection);
     }
     for (const [sourceType, sourceValues] of [["artifact_version", value["source_artifact_version_ids"]], ["record", value["source_record_ids"]], ["projection", value["source_projection_record_ids"]]] as const) {
@@ -1591,8 +1762,7 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
       for (const sourceId of sourceValues) {
         const dependency = existingProjectionDependencies.get(JSON.stringify([id, sourceType, String(sourceId)]));
         if (!dependency) continue;
-        const dependencyPayload = encodeCanonical({ projection_record_id: id, valid_from_generation: generation, source_type: sourceType, source_id: String(sourceId) });
-        const expectedDependency = { workspace_id: workspaceId, projection_record_id: id, valid_from_generation: generation, source_type: sourceType, source_id: String(sourceId), dependency_payload: dependencyPayload };
+        const expectedDependency = { workspace_id: workspaceId, projection_record_id: id, valid_from_generation: generation, source_type: sourceType, source_id: String(sourceId) };
         if (!rowMatches(dependency, expectedDependency)) conflict("projection dependency", `${id}/${String(sourceId)}`, "projection_occurrence_dependencies", dependency, expectedDependency);
       }
     }
@@ -1606,7 +1776,7 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
     const row = existingArtifactDependencies.get(id);
     // Same fresh-generation shortcut as the identity assignments loop above.
     if (!row) continue;
-    const expected = { dependency_entry_id: id, workspace_id: workspaceId, record_id: value["record_id"] ?? "", owner_artifact_id: value["owner_artifact_id"] ?? "", owner_artifact_version_id: value["owner_artifact_version_id"] ?? "", dependency_artifact_id: value["dependency_artifact_id"] ?? "", dependency_artifact_version_id: value["dependency_artifact_version_id"] ?? "", dependency_role: value["dependency_role"] ?? "reference", producer_id: value["producer_id"] ?? "candidate", producer_version: value["producer_version"] ?? "1", valid_from_generation: generation, valid_to_generation: null, dependency_payload: encodeCanonical(value) };
+    const expected = { dependency_entry_id: id, workspace_id: workspaceId, record_id: value["record_id"] ?? "", owner_artifact_id: value["owner_artifact_id"] ?? "", owner_artifact_version_id: value["owner_artifact_version_id"] ?? "", dependency_artifact_id: value["dependency_artifact_id"] ?? "", dependency_artifact_version_id: value["dependency_artifact_version_id"] ?? "", dependency_role: value["dependency_role"] ?? "reference", producer_id: value["producer_id"] ?? "candidate", producer_version: value["producer_version"] ?? "1", valid_from_generation: generation, valid_to_generation: null, content_digest: digestLogicalValue(value, "urdira:artifact-dependency:v2") };
     if (!rowMatches(row, expected)) conflict("artifact dependency", id, "artifact_dependencies", row, expected);
   }
   const lookupDependencyIds = lookupDependencies.flatMap((entry) => (entry && typeof entry === "object" && typeof (entry as Record<string, unknown>)["lookup_dependency_id"] === "string" ? [String((entry as Record<string, unknown>)["lookup_dependency_id"])] : []));
@@ -1618,8 +1788,7 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
     const row = existingLookupDependencies.get(id);
     // Same fresh-generation shortcut as the identity assignments loop above.
     if (!row) continue;
-    const expectedPayload = encodeCanonical({ ...value, candidate_generation_id: input.candidate.candidate_generation_id });
-    const expected = { lookup_dependency_id: id, workspace_id: workspaceId, candidate_generation_id: input.candidate.candidate_generation_id, consumer_type: value["consumer_type"] ?? "unknown", consumer_id: value["consumer_id"] ?? "", owner_artifact_id: value["owner_artifact_id"] ?? null, owner_artifact_version_id: value["owner_artifact_version_id"] ?? null, operation: value["operation"] ?? "lookup", normalized_selector_or_address: value["normalized_selector_or_address"] ?? "", selector_digest: value["selector_digest"] ?? canonicalSha256(value["normalized_selector_or_address"] ?? ""), previous_result_set_digest: value["previous_result_set_digest"] ?? "", invalidation_scope: value["invalidation_scope"] ?? "candidate", valid_from_generation: generation, valid_to_generation: null, dependency_digest: typeof value["dependency_digest"] === "string" ? value["dependency_digest"] : canonicalSha256(value), dependency_payload: expectedPayload };
+    const expected = { lookup_dependency_id: id, workspace_id: workspaceId, candidate_generation_id: input.candidate.candidate_generation_id, consumer_type: value["consumer_type"] ?? "unknown", consumer_id: value["consumer_id"] ?? "", owner_artifact_id: value["owner_artifact_id"] ?? null, owner_artifact_version_id: value["owner_artifact_version_id"] ?? null, operation: value["operation"] ?? "lookup", normalized_selector_or_address: value["normalized_selector_or_address"] ?? "", selector_digest: value["selector_digest"] ?? canonicalSha256(value["normalized_selector_or_address"] ?? ""), previous_result_set_digest: value["previous_result_set_digest"] ?? "", invalidation_scope: value["invalidation_scope"] ?? "candidate", valid_from_generation: generation, valid_to_generation: null, dependency_digest: typeof value["dependency_digest"] === "string" ? value["dependency_digest"] : digestLogicalValue(value, "urdira:lookup-dependency:v2") };
     if (!rowMatches(row, expected)) conflict("lookup dependency", id, "candidate_lookup_dependencies", row, expected);
   }
   const lookupRevalidationKeys = lookupRevalidations.map((entry) => `lookup_revalidation:${input.candidate.candidate_generation_id}:${entry && typeof entry === "object" ? String((entry as Record<string, unknown>)["lookup_dependency_id"] ?? canonicalSha256(entry)) : canonicalSha256(entry)}`);
@@ -1631,15 +1800,14 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
     const id = String(value["lookup_dependency_id"] ?? canonicalSha256(value));
     const key = `lookup_revalidation:${input.candidate.candidate_generation_id}:${id}`;
     const row = existingControlState.get(key);
-    const expectedPayload = encodeCanonical({ ...value, candidate_generation_id: input.candidate.candidate_generation_id, valid_from_generation: generation });
-    const expected = { state_key: key, workspace_id: workspaceId, state_kind: "lookup_revalidation", payload: expectedPayload, reference_workspace_id: workspaceId, reference_snapshot_id: null, reference_source_state_digest: null };
+    const expected = { state_key: key, workspace_id: workspaceId, state_kind: "lookup_revalidation", state_json: JSON.stringify({ ...value, candidate_generation_id: input.candidate.candidate_generation_id, valid_from_generation: generation }), reference_workspace_id: workspaceId, reference_snapshot_id: null, reference_source_state_digest: null };
     if (row && !rowMatches(row, expected)) conflict("lookup revalidation", id, "control_plane_state", row, expected);
   }
   for (const value of capabilityStates) {
     const digest = canonicalSha256(value);
     const key = `capability_state:${input.candidate.candidate_generation_id}:${digest}`;
     const row = existingControlState.get(key);
-    const expected = { state_key: key, workspace_id: workspaceId, state_kind: "capability_state", payload: encodeCanonical(value), reference_workspace_id: workspaceId, reference_snapshot_id: null, reference_source_state_digest: null };
+    const expected = { state_key: key, workspace_id: workspaceId, state_kind: "capability_state", state_json: JSON.stringify(value), reference_workspace_id: workspaceId, reference_snapshot_id: null, reference_source_state_digest: null };
     if (row && !rowMatches(row, expected)) conflict("capability state", key, "control_plane_state", row, expected);
   }
   const candidateId = input.candidate.candidate_generation_id;
@@ -1647,10 +1815,10 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
   const generationManifestId = `generation-manifest:${candidateId}`;
   const snapshotParent = input.frozen_base.snapshot_id ?? null;
   const publicationPayload = encodeCanonical({ candidate: input.candidate, frozen_base: input.frozen_base });
-  const expectedManifest = { ...manifest, base_snapshot_id: input.frozen_base.snapshot_id ?? null, manifest_payload: encodeCanonical(manifest) };
+  const expectedManifest = { ...manifest, base_snapshot_id: input.frozen_base.snapshot_id ?? null };
   const manifestRows = await database.all<Record<string, unknown>>("SELECT * FROM generation_manifests WHERE (workspace_id = ? AND (generation_manifest_id = ? OR generation = ?)) OR manifest_digest = ?", [workspaceId, generationManifestId, generation, manifest.manifest_digest]);
   for (const manifestRow of manifestRows) if (!rowMatches(manifestRow, expectedManifest)) conflict("generation manifest", generationManifestId, "generation_manifests", manifestRow, expectedManifest);
-  const expectedSnapshot = { ...completedSnapshot, parent_snapshot_id: snapshotParent, snapshot_payload: encodeCanonical(completedSnapshot) };
+  const expectedSnapshot = { ...completedSnapshot, parent_snapshot_id: snapshotParent };
   const snapshotRows = await database.all<Record<string, unknown>>("SELECT * FROM snapshots WHERE (workspace_id = ? AND (snapshot_id = ? OR generation = ?)) OR snapshot_digest = ?", [workspaceId, snapshotId, generation, completedSnapshot.snapshot_digest]);
   for (const snapshotRow of snapshotRows) if (!rowMatches(snapshotRow, expectedSnapshot)) conflict("snapshot", snapshotId, "snapshots", snapshotRow, expectedSnapshot);
   const expectedJournal = {
@@ -1662,27 +1830,25 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
     generation,
     published_at: publishedAt,
     publication_digest: canonicalSha256(publicationPayload),
-    journal_payload: publicationPayload,
   };
   const journalRows = await database.all<Record<string, unknown>>("SELECT * FROM candidate_publication_journal WHERE workspace_id = ? AND (candidate_generation_id = ? OR snapshot_id = ? OR generation = ? OR publication_digest = ?)", [workspaceId, candidateId, snapshotId, generation, canonicalSha256(publicationPayload)]);
   for (const journalRow of journalRows) if (!rowMatches(journalRow, expectedJournal)) conflict("candidate publication journal", candidateId, "candidate_publication_journal", journalRow, expectedJournal);
 }
 
 
-function artifactDependencyCommands(values: readonly unknown[], workspaceId: string, generation: number): TransactionCommand[] {
-  return values.flatMap((entry) => {
-    if (!entry || typeof entry !== "object") return [];
+function* artifactDependencyCommandStream(values: readonly unknown[], workspaceId: string, generation: number): Generator<TransactionCommand> {
+  for (const entry of values) {
+    if (!entry || typeof entry !== "object") continue;
     const value = entry as Record<string, any>;
     const id = value["dependency_entry_id"];
-    if (typeof id !== "string") return [];
-    // `content_digest` is `digestBytes` of this exact `payload` -- computed
-    // once here at write time, never re-derived independently -- so it can
-    // never drift from what `projectionSetDigestEntries("recompute")` would
-    // hash from `dependency_payload` itself.
-    const payload = encodeCanonical(value);
-    const contentDigest = digestBytes(payload);
-    return checkedPublicationCommand({ kind: "run", sql: "INSERT INTO artifact_dependencies (dependency_entry_id, workspace_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, dependency_payload, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(workspace_id, dependency_entry_id, valid_from_generation) DO UPDATE SET dependency_payload = excluded.dependency_payload, content_digest = excluded.content_digest WHERE artifact_dependencies.workspace_id = excluded.workspace_id AND artifact_dependencies.record_id = excluded.record_id AND artifact_dependencies.owner_artifact_id = excluded.owner_artifact_id AND artifact_dependencies.owner_artifact_version_id = excluded.owner_artifact_version_id AND artifact_dependencies.dependency_artifact_id = excluded.dependency_artifact_id AND artifact_dependencies.dependency_artifact_version_id = excluded.dependency_artifact_version_id AND artifact_dependencies.dependency_role = excluded.dependency_role AND artifact_dependencies.producer_id = excluded.producer_id AND artifact_dependencies.producer_version = excluded.producer_version AND artifact_dependencies.valid_to_generation IS excluded.valid_to_generation AND artifact_dependencies.dependency_payload = excluded.dependency_payload", params: [id, workspaceId, String(value["record_id"] ?? ""), String(value["owner_artifact_id"] ?? ""), String(value["owner_artifact_version_id"] ?? ""), String(value["dependency_artifact_id"] ?? ""), String(value["dependency_artifact_version_id"] ?? ""), String(value["dependency_role"] ?? "reference"), String(value["producer_id"] ?? "candidate"), String(value["producer_version"] ?? "1"), generation, payload, contentDigest] });
-  });
+    if (typeof id !== "string") continue;
+    const contentDigest = digestLogicalValue(value, "urdira:artifact-dependency:v2");
+    yield* checkedPublicationCommand({ kind: "run", sql: "INSERT INTO artifact_dependencies (dependency_entry_id, workspace_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?) ON CONFLICT(workspace_id, dependency_entry_id, valid_from_generation) DO UPDATE SET content_digest = excluded.content_digest WHERE artifact_dependencies.workspace_id = excluded.workspace_id AND artifact_dependencies.record_id = excluded.record_id AND artifact_dependencies.owner_artifact_id = excluded.owner_artifact_id AND artifact_dependencies.owner_artifact_version_id = excluded.owner_artifact_version_id AND artifact_dependencies.dependency_artifact_id = excluded.dependency_artifact_id AND artifact_dependencies.dependency_artifact_version_id = excluded.dependency_artifact_version_id AND artifact_dependencies.dependency_role = excluded.dependency_role AND artifact_dependencies.producer_id = excluded.producer_id AND artifact_dependencies.producer_version = excluded.producer_version AND artifact_dependencies.valid_to_generation IS excluded.valid_to_generation", params: [id, workspaceId, String(value["record_id"] ?? ""), String(value["owner_artifact_id"] ?? ""), String(value["owner_artifact_version_id"] ?? ""), String(value["dependency_artifact_id"] ?? ""), String(value["dependency_artifact_version_id"] ?? ""), String(value["dependency_role"] ?? "reference"), String(value["producer_id"] ?? "candidate"), String(value["producer_version"] ?? "1"), generation, contentDigest] });
+  }
+}
+
+function artifactDependencyCommands(values: readonly unknown[], workspaceId: string, generation: number): TransactionCommand[] {
+  return [...artifactDependencyCommandStream(values, workspaceId, generation)];
 }
 
 function lookupDependencyCommands(values: readonly unknown[], revalidations: readonly unknown[], workspaceId: string, candidateId: string, generation: number, publishedAt: string): TransactionCommand[] {
@@ -1692,14 +1858,13 @@ function lookupDependencyCommands(values: readonly unknown[], revalidations: rea
     const value = entry as Record<string, any>;
     const id = value["lookup_dependency_id"];
     if (typeof id !== "string") continue;
-    const payload = encodeCanonical({ ...value, candidate_generation_id: candidateId });
-    commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_lookup_dependencies (lookup_dependency_id, workspace_id, candidate_generation_id, consumer_type, consumer_id, owner_artifact_id, owner_artifact_version_id, operation, normalized_selector_or_address, selector_digest, previous_result_set_digest, invalidation_scope, valid_from_generation, valid_to_generation, dependency_digest, dependency_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(lookup_dependency_id) DO UPDATE SET dependency_digest = excluded.dependency_digest, dependency_payload = excluded.dependency_payload WHERE candidate_lookup_dependencies.workspace_id = excluded.workspace_id AND candidate_lookup_dependencies.candidate_generation_id = excluded.candidate_generation_id AND candidate_lookup_dependencies.consumer_type = excluded.consumer_type AND candidate_lookup_dependencies.consumer_id = excluded.consumer_id AND candidate_lookup_dependencies.owner_artifact_id IS excluded.owner_artifact_id AND candidate_lookup_dependencies.owner_artifact_version_id IS excluded.owner_artifact_version_id AND candidate_lookup_dependencies.operation = excluded.operation AND candidate_lookup_dependencies.normalized_selector_or_address = excluded.normalized_selector_or_address AND candidate_lookup_dependencies.selector_digest = excluded.selector_digest AND candidate_lookup_dependencies.previous_result_set_digest = excluded.previous_result_set_digest AND candidate_lookup_dependencies.invalidation_scope = excluded.invalidation_scope AND candidate_lookup_dependencies.valid_from_generation = excluded.valid_from_generation AND candidate_lookup_dependencies.valid_to_generation IS excluded.valid_to_generation AND candidate_lookup_dependencies.dependency_digest = excluded.dependency_digest AND candidate_lookup_dependencies.dependency_payload = excluded.dependency_payload", params: [id, workspaceId, candidateId, String(value["consumer_type"] ?? "unknown"), String(value["consumer_id"] ?? ""), sqliteValue(value["owner_artifact_id"] ?? null), sqliteValue(value["owner_artifact_version_id"] ?? null), String(value["operation"] ?? "lookup"), String(value["normalized_selector_or_address"] ?? ""), String(value["selector_digest"] ?? canonicalSha256(value["normalized_selector_or_address"] ?? "")), String(value["previous_result_set_digest"] ?? ""), String(value["invalidation_scope"] ?? "candidate"), generation, String(value["dependency_digest"] ?? canonicalSha256(value)), payload] }));
+    commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_lookup_dependencies (lookup_dependency_id, workspace_id, candidate_generation_id, consumer_type, consumer_id, owner_artifact_id, owner_artifact_version_id, operation, normalized_selector_or_address, selector_digest, previous_result_set_digest, invalidation_scope, valid_from_generation, valid_to_generation, dependency_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?) ON CONFLICT(lookup_dependency_id) DO UPDATE SET dependency_digest = excluded.dependency_digest WHERE candidate_lookup_dependencies.workspace_id = excluded.workspace_id AND candidate_lookup_dependencies.candidate_generation_id = excluded.candidate_generation_id AND candidate_lookup_dependencies.consumer_type = excluded.consumer_type AND candidate_lookup_dependencies.consumer_id = excluded.consumer_id AND candidate_lookup_dependencies.owner_artifact_id IS excluded.owner_artifact_id AND candidate_lookup_dependencies.owner_artifact_version_id IS excluded.owner_artifact_version_id AND candidate_lookup_dependencies.operation = excluded.operation AND candidate_lookup_dependencies.normalized_selector_or_address = excluded.normalized_selector_or_address AND candidate_lookup_dependencies.selector_digest = excluded.selector_digest AND candidate_lookup_dependencies.previous_result_set_digest = excluded.previous_result_set_digest AND candidate_lookup_dependencies.invalidation_scope = excluded.invalidation_scope AND candidate_lookup_dependencies.valid_from_generation = excluded.valid_from_generation AND candidate_lookup_dependencies.valid_to_generation IS excluded.valid_to_generation", params: [id, workspaceId, candidateId, String(value["consumer_type"] ?? "unknown"), String(value["consumer_id"] ?? ""), sqliteValue(value["owner_artifact_id"] ?? null), sqliteValue(value["owner_artifact_version_id"] ?? null), String(value["operation"] ?? "lookup"), String(value["normalized_selector_or_address"] ?? ""), String(value["selector_digest"] ?? canonicalSha256(value["normalized_selector_or_address"] ?? "")), String(value["previous_result_set_digest"] ?? ""), String(value["invalidation_scope"] ?? "candidate"), generation, String(value["dependency_digest"] ?? digestLogicalValue(value, "urdira:lookup-dependency:v2"))] }));
   }
   for (const entry of revalidations) {
     if (!entry || typeof entry !== "object") continue;
     const value = entry as Record<string, any>;
     const id = String(value["lookup_dependency_id"] ?? canonicalSha256(value));
-    commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'lookup_revalidation', ?, ?, NULL, NULL, ?) ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload WHERE control_plane_state.workspace_id = excluded.workspace_id AND control_plane_state.state_kind = excluded.state_kind AND control_plane_state.payload = excluded.payload AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest", params: [`lookup_revalidation:${candidateId}:${id}`, workspaceId, encodeCanonical({ ...value, candidate_generation_id: candidateId, valid_from_generation: generation }), workspaceId, publishedAt] }));
+    commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'lookup_revalidation', ?, ?, NULL, NULL, ?) ON CONFLICT(state_key) DO NOTHING", params: [`lookup_revalidation:${candidateId}:${id}`, workspaceId, JSON.stringify({ ...value, candidate_generation_id: candidateId, valid_from_generation: generation }), workspaceId, publishedAt] }));
   }
   return commands;
 }
@@ -1707,7 +1872,7 @@ function lookupDependencyCommands(values: readonly unknown[], revalidations: rea
 function capabilityStateCommands(values: readonly unknown[], workspaceId: string, candidateId: string, publishedAt: string): TransactionCommand[] {
   return values.flatMap((value) => {
     const digest = canonicalSha256(value);
-    return checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'capability_state', ?, ?, NULL, NULL, ?) ON CONFLICT(state_key) DO UPDATE SET payload = excluded.payload WHERE control_plane_state.workspace_id = excluded.workspace_id AND control_plane_state.state_kind = excluded.state_kind AND control_plane_state.payload = excluded.payload AND control_plane_state.reference_workspace_id IS excluded.reference_workspace_id AND control_plane_state.reference_snapshot_id IS excluded.reference_snapshot_id AND control_plane_state.reference_source_state_digest IS excluded.reference_source_state_digest", params: [`capability_state:${candidateId}:${digest}`, workspaceId, encodeCanonical(value), workspaceId, publishedAt] });
+    return checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'capability_state', ?, ?, NULL, NULL, ?) ON CONFLICT(state_key) DO NOTHING", params: [`capability_state:${candidateId}:${digest}`, workspaceId, JSON.stringify(value), workspaceId, publishedAt] });
   });
 }
 
@@ -1721,8 +1886,7 @@ function sourceTransitionCommands(transitions: readonly unknown[], workspaceId: 
     if (change && typeof change["previous_artifact_version_id"] === "string") commands.push({ kind: "run", sql: "UPDATE artifact_versions SET valid_to_generation = ? WHERE workspace_id = ? AND artifact_version_id = ? AND valid_to_generation IS NULL", params: [generation, workspaceId, change["previous_artifact_version_id"]] });
     if (change && typeof change["previous_tombstone_id"] === "string") commands.push({ kind: "run", sql: "UPDATE artifact_tombstones SET valid_to_generation = ?, closing_artifact_change_id = ? WHERE workspace_id = ? AND artifact_tombstone_id = ? AND valid_to_generation IS NULL", params: [generation, sqliteValue(change["artifact_change_id"] ?? null), workspaceId, change["previous_tombstone_id"]] });
     if (version) {
-      const payload = encodeCanonical({ ...version, valid_from_generation: generation });
-      commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?) ON CONFLICT(artifact_version_id) DO UPDATE SET artifact_version_payload = excluded.artifact_version_payload WHERE artifact_versions.workspace_id = excluded.workspace_id AND artifact_versions.artifact_id = excluded.artifact_id AND artifact_versions.content_blob_id = excluded.content_blob_id AND artifact_versions.content_hash = excluded.content_hash AND artifact_versions.byte_length = excluded.byte_length AND artifact_versions.encoding = excluded.encoding AND artifact_versions.language_hint IS excluded.language_hint AND artifact_versions.analysis_metadata_digest = excluded.analysis_metadata_digest AND artifact_versions.created_from_observation_id = excluded.created_from_observation_id AND artifact_versions.valid_from_generation = excluded.valid_from_generation AND artifact_versions.valid_to_generation IS excluded.valid_to_generation AND artifact_versions.artifact_version_payload = excluded.artifact_version_payload", params: [sqliteValue(version["artifact_version_id"]), workspaceId, sqliteValue(version["artifact_id"]), sqliteValue(version["content_blob_id"]), sqliteValue(version["content_hash"]), sqliteValue(version["byte_length"]), sqliteValue(version["encoding"]), sqliteValue(version["language_hint"] ?? null), sqliteValue(version["analysis_metadata_digest"]), sqliteValue(version["created_from_observation_id"]), generation, payload] }));
+      commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) ON CONFLICT(artifact_version_id) DO UPDATE SET valid_to_generation = excluded.valid_to_generation WHERE artifact_versions.workspace_id = excluded.workspace_id AND artifact_versions.artifact_id = excluded.artifact_id AND artifact_versions.content_blob_id = excluded.content_blob_id AND artifact_versions.content_hash = excluded.content_hash AND artifact_versions.byte_length = excluded.byte_length AND artifact_versions.encoding = excluded.encoding AND artifact_versions.language_hint IS excluded.language_hint AND artifact_versions.analysis_metadata_digest = excluded.analysis_metadata_digest AND artifact_versions.created_from_observation_id = excluded.created_from_observation_id AND artifact_versions.valid_from_generation <= excluded.valid_from_generation AND artifact_versions.valid_to_generation IS excluded.valid_to_generation", params: [sqliteValue(version["artifact_version_id"]), workspaceId, sqliteValue(version["artifact_id"]), sqliteValue(version["content_blob_id"]), sqliteValue(version["content_hash"]), sqliteValue(version["byte_length"]), sqliteValue(version["encoding"]), sqliteValue(version["language_hint"] ?? null), sqliteValue(version["analysis_metadata_digest"]), sqliteValue(version["created_from_observation_id"]), generation] }));
     }
     const tombstone = transition["target_artifact_tombstone_without_generation"] as Record<string, unknown> | undefined;
     if (tombstone) {
@@ -1733,46 +1897,10 @@ function sourceTransitionCommands(transitions: readonly unknown[], workspaceId: 
       // never had -- both must exactly match what that check compares against,
       // since it is what makes a resumed/already-committed tombstone row
       // idempotent instead of a guaranteed conflict.
-      const payload = encodeCanonical({ ...tombstone, valid_from_generation: generation });
-      commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO artifact_tombstones (artifact_tombstone_id, workspace_id, artifact_id, absence_kind, absence_reason_code, last_artifact_version_id, valid_from_generation, valid_to_generation, opening_artifact_change_id, closing_artifact_change_id, replacement_artifact_version_id, cause_references, lineage_evidence_record_ids, artifact_tombstone_payload) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?, ?) ON CONFLICT(artifact_tombstone_id) DO UPDATE SET artifact_tombstone_payload = excluded.artifact_tombstone_payload WHERE artifact_tombstones.workspace_id = excluded.workspace_id AND artifact_tombstones.artifact_id = excluded.artifact_id AND artifact_tombstones.absence_kind = excluded.absence_kind AND artifact_tombstones.absence_reason_code = excluded.absence_reason_code AND artifact_tombstones.last_artifact_version_id = excluded.last_artifact_version_id AND artifact_tombstones.valid_from_generation = excluded.valid_from_generation AND artifact_tombstones.valid_to_generation IS excluded.valid_to_generation AND artifact_tombstones.opening_artifact_change_id = excluded.opening_artifact_change_id AND artifact_tombstones.closing_artifact_change_id IS excluded.closing_artifact_change_id AND artifact_tombstones.replacement_artifact_version_id IS excluded.replacement_artifact_version_id AND artifact_tombstones.cause_references = excluded.cause_references AND artifact_tombstones.lineage_evidence_record_ids = excluded.lineage_evidence_record_ids AND artifact_tombstones.artifact_tombstone_payload = excluded.artifact_tombstone_payload", params: [sqliteValue(tombstone["artifact_tombstone_id"]), workspaceId, sqliteValue(tombstone["artifact_id"]), sqliteValue(tombstone["absence_kind"]), sqliteValue(tombstone["absence_reason_code"]), sqliteValue(tombstone["last_artifact_version_id"]), generation, sqliteValue(tombstone["opening_artifact_change_id"] ?? change?.["artifact_change_id"]), sqliteValue(tombstone["cause_references"] ?? "[]"), sqliteValue(tombstone["lineage_evidence_record_ids"] ?? "[]"), payload] }));
+      commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO artifact_tombstones (artifact_tombstone_id, workspace_id, artifact_id, absence_kind, absence_reason_code, last_artifact_version_id, valid_from_generation, valid_to_generation, opening_artifact_change_id, closing_artifact_change_id, replacement_artifact_version_id, cause_references, lineage_evidence_record_ids) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?) ON CONFLICT(artifact_tombstone_id) DO UPDATE SET closing_artifact_change_id = excluded.closing_artifact_change_id, replacement_artifact_version_id = excluded.replacement_artifact_version_id WHERE artifact_tombstones.workspace_id = excluded.workspace_id AND artifact_tombstones.artifact_id = excluded.artifact_id AND artifact_tombstones.absence_kind = excluded.absence_kind AND artifact_tombstones.absence_reason_code = excluded.absence_reason_code AND artifact_tombstones.last_artifact_version_id = excluded.last_artifact_version_id AND artifact_tombstones.valid_from_generation <= excluded.valid_from_generation AND artifact_tombstones.valid_to_generation IS excluded.valid_to_generation AND artifact_tombstones.opening_artifact_change_id = excluded.opening_artifact_change_id AND artifact_tombstones.closing_artifact_change_id IS excluded.closing_artifact_change_id AND artifact_tombstones.replacement_artifact_version_id IS excluded.replacement_artifact_version_id AND artifact_tombstones.cause_references = excluded.cause_references AND artifact_tombstones.lineage_evidence_record_ids = excluded.lineage_evidence_record_ids", params: [sqliteValue(tombstone["artifact_tombstone_id"]), workspaceId, sqliteValue(tombstone["artifact_id"]), sqliteValue(tombstone["absence_kind"]), sqliteValue(tombstone["absence_reason_code"]), sqliteValue(tombstone["last_artifact_version_id"]), generation, sqliteValue(tombstone["opening_artifact_change_id"] ?? change?.["artifact_change_id"]), sqliteValue(tombstone["cause_references"] ?? "[]"), sqliteValue(tombstone["lineage_evidence_record_ids"] ?? "[]")] }));
     }
   }
   return commands;
-}
-
-/**
- * The stored `record_occurrences.record_payload`: every field of the
- * candidate-materialized record (`ProposedRecord`, whatever a real analyzer
- * put there -- `packages/engine/src/canonical-query-data-port.ts` reads
- * `.body` off exactly this decoded object to answer queries) plus the
- * occurrence identity fields that only exist once the record is opened
- * (`record_id`, `valid_from_generation`, `producer_id`, `producer_version`,
- * `record_digest`), plus a `payload` alias for `body`. No `workspace_id` /
- * `owner_artifact_id` / `owner_artifact_version_id` (decision 11: the
- * canonical layer's stored payloads are workspace-free; those live only as
- * row columns, sourced from the open template's own sibling fields --
- * `recordOpenCommands` below -- not from inside the record).
- * `StorageMaintenance.verify()` (`packages/storage/src/lifecycle.ts`)
- * recomputes exactly this occurrence-identity shape (including the `payload`
- * alias, for its payload-digest check) and compares it field-by-field
- * against the typed columns, so both this row's `record_payload` and
- * `assertPublicationImmutableRows`'s matching conflict check must store
- * precisely this object.
- */
-function recordOccurrencePayload(record: Record<string, unknown>, recordId: string, recordDigest: string, generation: number): Record<string, unknown> {
-  return {
-    ...record,
-    record_id: recordId,
-    category: record["category"] ?? "fact",
-    kind: record["kind"] ?? "unknown",
-    universal_kind: record["universal_kind"] ?? "unknown",
-    schema_version: record["schema_version"] ?? 1,
-    valid_from_generation: generation,
-    producer_id: "candidate",
-    producer_version: "1",
-    record_digest: recordDigest,
-    payload: record["body"] ?? null,
-  };
 }
 
 function recordPrimarySourceSpanValue(record: Record<string, unknown>, field: "artifact_version_id" | "start_byte" | "end_byte" | "start_line" | "end_line"): SqliteValue {
@@ -1786,7 +1914,7 @@ function recordPrimarySourceSpanValue(record: Record<string, unknown>, field: "a
  * `parsedByEntry` (from `parseRecordOpens`, called earlier in
  * `buildCandidatePublicationPlan`) supplies each entry's already-parsed,
  * already-unwrapped record, so this no longer re-`JSON.parse`s
- * `record_without_validity` a second time. `payload_digest` is computed as
+ * `record_without_validity` a second time. `body_digest` is computed as
  * `digestBytes(bodyPayload)` rather than a second, independent
  * `canonicalSha256(record["body"] ?? null)` call: byte-identical, not merely
  * equivalent, because this file's own `canonicalSha256` IS
@@ -1795,41 +1923,146 @@ function recordPrimarySourceSpanValue(record: Record<string, unknown>, field: "a
  * null)` -- reusing it just skips re-running that same encode over the same
  * bytes a second time.
  */
-function recordOpenCommands(opens: readonly unknown[], workspaceId: string, generation: number, recordOpenMemo: ReadonlyMap<unknown, RecordOpenMemoEntry>, parsedByEntry: ReadonlyMap<unknown, Record<string, unknown>>): TransactionCommand[] {
-  const commands: TransactionCommand[] = [];
+const STREAMING_PUBLICATION_RECORD_THRESHOLD = 2_048;
+const INITIAL_CANONICAL_INDEX_DROP_SQL = `
+DROP INDEX IF EXISTS record_occurrences_visible_idx;
+DROP INDEX IF EXISTS record_occurrences_workspace_owner_idx;
+DROP INDEX IF EXISTS identity_assignments_lookup_idx;
+DROP INDEX IF EXISTS identity_assignments_key_idx;
+DROP INDEX IF EXISTS identity_assignments_record_idx;`;
+const INITIAL_CANONICAL_INDEX_BUILD_SQL = `
+CREATE INDEX record_occurrences_visible_idx ON record_occurrences(workspace_id, valid_from_generation, valid_to_generation);
+CREATE INDEX record_occurrences_workspace_owner_idx ON record_occurrences(workspace_id, owner_artifact_id, valid_from_generation, valid_to_generation);
+CREATE INDEX identity_assignments_lookup_idx ON identity_assignments(workspace_id, identity_type, identity_id, valid_from_generation, valid_to_generation);
+CREATE INDEX identity_assignments_key_idx ON identity_assignments(workspace_id, identity_key_digest, valid_from_generation, identity_type, identity_key, record_id);
+CREATE INDEX identity_assignments_record_idx ON identity_assignments(workspace_id, record_id, valid_from_generation, valid_to_generation);`;
+
+// Fixed-width occurrence rows are batched at the producer, before commands
+// enter the transaction worker. This keeps the high-cardinality publication
+// path bounded without retaining or inspecting a corpus-sized command list.
+const STREAMING_OCCURRENCE_BATCH_MAX_ROWS = 512;
+const RECORD_OCCURRENCE_INSERT_SQL = "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES ";
+const RECORD_OCCURRENCE_INSERT_SUFFIX = " ON CONFLICT(record_id) DO NOTHING";
+const RECORD_OCCURRENCE_PLACEHOLDER = `(${Array.from({ length: 16 }, () => "?").join(", ")}, NULL, ${Array.from({ length: 7 }, () => "?").join(", ")})`;
+const PROJECTION_OCCURRENCE_INSERT_SQL = "INSERT INTO projection_occurrences (projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, valid_to_generation, content_digest) VALUES ";
+const PROJECTION_OCCURRENCE_INSERT_SUFFIX = " ON CONFLICT DO UPDATE SET content_digest = excluded.content_digest WHERE projection_occurrences.workspace_id = excluded.workspace_id AND projection_occurrences.projection_kind = excluded.projection_kind AND projection_occurrences.projection_key = excluded.projection_key AND projection_occurrences.owner_artifact_id = excluded.owner_artifact_id AND projection_occurrences.owner_artifact_version_id = excluded.owner_artifact_version_id AND projection_occurrences.source_artifact_version_ids = excluded.source_artifact_version_ids AND projection_occurrences.source_record_ids = excluded.source_record_ids AND projection_occurrences.source_projection_record_ids = excluded.source_projection_record_ids AND projection_occurrences.generator = excluded.generator AND projection_occurrences.generator_version = excluded.generator_version AND projection_occurrences.generator_configuration_digest = excluded.generator_configuration_digest AND projection_occurrences.valid_from_generation = excluded.valid_from_generation AND projection_occurrences.valid_to_generation IS excluded.valid_to_generation";
+const PROJECTION_OCCURRENCE_PLACEHOLDER = `(${Array.from({ length: 13 }, () => "?").join(", ")}, NULL, ?)`;
+
+type RecordOpenStreamEntry = {
+  readonly wrapper: Record<string, unknown>;
+  readonly opened: RecordOpenMemoEntry;
+  readonly record?: Record<string, unknown>;
+  readonly params: readonly SqliteValue[];
+};
+
+function recordOpenParams(wrapper: Record<string, unknown>, record: Record<string, unknown>, opened: RecordOpenMemoEntry, workspaceId: string, generation: number): SqliteValue[] {
+  const body = record["body"] ?? null;
+  const logicalPayload = digestRelationalValue(body);
+  return [opened.recordId, workspaceId, sqliteValue(record["category"] ?? "fact"), sqliteValue(record["kind"] ?? "unknown"), sqliteValue(record["universal_kind"] ?? "unknown"), sqliteValue(record["schema_version"] ?? 1), "candidate", "1", sqliteValue(wrapper["owner_artifact_id"]), sqliteValue(wrapper["owner_artifact_version_id"]), recordPrimarySourceSpanValue(record, "artifact_version_id"), recordPrimarySourceSpanValue(record, "start_byte"), recordPrimarySourceSpanValue(record, "end_byte"), recordPrimarySourceSpanValue(record, "start_line"), recordPrimarySourceSpanValue(record, "end_line"), generation, opened.recordDigest, logicalPayload.digest, logicalPayload.byte_length, encodeCanonical(body), String(record["analysis_digest"] ?? opened.recordDigest), String(record["analysis_configuration_digest"] ?? opened.recordDigest), String(record["artifact_dependency_digest"] ?? opened.recordDigest)];
+}
+
+function* flushRecordOpenWindow(entries: readonly RecordOpenStreamEntry[], workspaceId: string, generation: number): Generator<TransactionCommand> {
+  if (entries.length === 0) return;
+  yield { kind: "transaction_checkpoint" };
+  yield { kind: "run", sql: `${RECORD_OCCURRENCE_INSERT_SQL}${entries.map(() => RECORD_OCCURRENCE_PLACEHOLDER).join(", ")}${RECORD_OCCURRENCE_INSERT_SUFFIX}`, params: entries.flatMap((entry) => entry.params) };
+  yield { kind: "assert_transaction_changes", expected: entries.length };
+  for (const entry of entries) {
+    const record = entry.record ?? (() => {
+      const raw = entry.wrapper["record_without_validity"];
+      if (typeof raw !== "string") throw new StorageError("storage:publication_invalid", "Record open template is not valid JSON.");
+      try { return unwrapRecordTemplate(JSON.parse(raw)); } catch { throw new StorageError("storage:publication_invalid", "Record open template is not valid JSON."); }
+    })();
+    const facets = Array.isArray(record["facets"]) ? record["facets"] : [];
+    for (let facetOrdinal = 0; facetOrdinal < facets.length; facetOrdinal += 1) {
+      const facet = facets[facetOrdinal];
+      if (typeof facet !== "string") continue;
+      yield { kind: "run", sql: "INSERT INTO record_facets (workspace_id, record_id, valid_from_generation, facet_ordinal, facet) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [workspaceId, entry.opened.recordId, generation, facetOrdinal, facet] };
+    }
+  }
+}
+
+function* recordOpenCommandStream(opens: readonly unknown[], workspaceId: string, generation: number, recordOpenMemo: ReadonlyMap<unknown, RecordOpenMemoEntry>, parsedByEntry?: ReadonlyMap<unknown, Record<string, unknown>>, batch = true): Generator<TransactionCommand> {
+  const window: RecordOpenStreamEntry[] = [];
   for (const entry of opens) {
     if (!entry || typeof entry !== "object") continue;
     const wrapper = entry as Record<string, unknown>;
     const raw = wrapper["record_without_validity"];
     if (typeof raw !== "string") continue;
-    const opened = recordOpenMemo.get(entry);
+    const opened = recordOpenMemoEntry(entry, recordOpenMemo);
     if (!opened) continue;
-    const record = parsedByEntry.get(entry);
+    const record = parsedByEntry?.get(entry) ?? (() => {
+      try { return unwrapRecordTemplate(JSON.parse(raw)); } catch { throw new StorageError("storage:publication_invalid", "Record open template is not valid JSON."); }
+    })();
     if (!record) continue;
-    const recordId = opened.recordId;
-    const recordDigest = opened.recordDigest;
-    const bodyPayload = encodeCanonical(record["body"] ?? null);
-    const payloadDigest = digestBytes(bodyPayload);
-    commands.push(...checkedPublicationCommand({ kind: "run", sql: `INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?) ON CONFLICT(record_id) DO UPDATE SET record_payload = excluded.record_payload, record_digest = excluded.record_digest WHERE record_occurrences.workspace_id = excluded.workspace_id AND record_occurrences.category = excluded.category AND record_occurrences.kind = excluded.kind AND record_occurrences.universal_kind = excluded.universal_kind AND record_occurrences.schema_version = excluded.schema_version AND record_occurrences.producer_id = excluded.producer_id AND record_occurrences.producer_version = excluded.producer_version AND record_occurrences.owner_artifact_id = excluded.owner_artifact_id AND record_occurrences.owner_artifact_version_id = excluded.owner_artifact_version_id AND record_occurrences.primary_source_span_artifact_version_id IS excluded.primary_source_span_artifact_version_id AND record_occurrences.primary_source_span_start_byte IS excluded.primary_source_span_start_byte AND record_occurrences.primary_source_span_end_byte IS excluded.primary_source_span_end_byte AND record_occurrences.primary_source_span_start_line IS excluded.primary_source_span_start_line AND record_occurrences.primary_source_span_end_line IS excluded.primary_source_span_end_line AND record_occurrences.valid_from_generation = excluded.valid_from_generation AND record_occurrences.valid_to_generation IS excluded.valid_to_generation AND record_occurrences.record_digest = excluded.record_digest AND record_occurrences.payload_digest = excluded.payload_digest AND record_occurrences.payload_byte_length = excluded.payload_byte_length AND record_occurrences.payload_inline = excluded.payload_inline AND record_occurrences.payload_cas_digest IS excluded.payload_cas_digest AND record_occurrences.record_payload = excluded.record_payload`, params: [recordId, workspaceId, sqliteValue(record["category"] ?? "fact"), sqliteValue(record["kind"] ?? "unknown"), sqliteValue(record["universal_kind"] ?? "unknown"), sqliteValue(record["schema_version"] ?? 1), "candidate", "1", sqliteValue(wrapper["owner_artifact_id"]), sqliteValue(wrapper["owner_artifact_version_id"]), recordPrimarySourceSpanValue(record, "artifact_version_id"), recordPrimarySourceSpanValue(record, "start_byte"), recordPrimarySourceSpanValue(record, "end_byte"), recordPrimarySourceSpanValue(record, "start_line"), recordPrimarySourceSpanValue(record, "end_line"), generation, recordDigest, payloadDigest, bodyPayload.byteLength, bodyPayload, encodeCanonical(recordOccurrencePayload(record, recordId, recordDigest, generation))] }));
+    const cachedRecord = parsedByEntry?.get(entry);
+    const streamEntry = { wrapper, opened, ...(cachedRecord === undefined ? {} : { record: cachedRecord }), params: recordOpenParams(wrapper, record, opened, workspaceId, generation) } satisfies RecordOpenStreamEntry;
+    if (!batch) {
+      yield* checkedPublicationCommand({ kind: "run", sql: `${RECORD_OCCURRENCE_INSERT_SQL}${RECORD_OCCURRENCE_PLACEHOLDER}${RECORD_OCCURRENCE_INSERT_SUFFIX}`, params: streamEntry.params });
+      const facets = Array.isArray(record["facets"]) ? record["facets"] : [];
+      for (let facetOrdinal = 0; facetOrdinal < facets.length; facetOrdinal += 1) {
+        const facet = facets[facetOrdinal];
+        if (typeof facet !== "string") continue;
+        yield { kind: "run", sql: "INSERT INTO record_facets (workspace_id, record_id, valid_from_generation, facet_ordinal, facet) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [workspaceId, opened.recordId, generation, facetOrdinal, facet] };
+      }
+      continue;
+    }
+    window.push(streamEntry);
+    if (window.length >= STREAMING_OCCURRENCE_BATCH_MAX_ROWS) {
+      yield* flushRecordOpenWindow(window, workspaceId, generation);
+      window.length = 0;
+    }
   }
-  return commands;
+  if (batch) yield* flushRecordOpenWindow(window, workspaceId, generation);
+}
+
+function recordOpenCommands(opens: readonly unknown[], workspaceId: string, generation: number, recordOpenMemo: ReadonlyMap<unknown, RecordOpenMemoEntry>, parsedByEntry?: ReadonlyMap<unknown, Record<string, unknown>>): TransactionCommand[] {
+  return [...recordOpenCommandStream(opens, workspaceId, generation, recordOpenMemo, parsedByEntry, false)];
+}
+
+function* recordClosureCommandStream(closures: readonly unknown[], workspaceId: string, generation: number): Generator<TransactionCommand> {
+  for (const entry of closures) {
+    if (!entry || typeof entry !== "object") continue;
+    const recordId = (entry as Record<string, unknown>)["record_id"];
+    if (typeof recordId === "string") yield { kind: "run", sql: "UPDATE record_occurrences SET valid_to_generation = ? WHERE workspace_id = ? AND record_id = ? AND valid_to_generation IS NULL", params: [generation, workspaceId, recordId] } satisfies TransactionCommand;
+  }
 }
 
 function recordClosureCommands(closures: readonly unknown[], workspaceId: string, generation: number): TransactionCommand[] {
-  return closures.flatMap((entry) => {
-    if (!entry || typeof entry !== "object") return [];
-    const recordId = (entry as Record<string, unknown>)["record_id"];
-    return typeof recordId === "string" ? [{ kind: "run", sql: "UPDATE record_occurrences SET valid_to_generation = ? WHERE workspace_id = ? AND record_id = ? AND valid_to_generation IS NULL", params: [generation, workspaceId, recordId] } satisfies TransactionCommand] : [];
-  });
+  return [...recordClosureCommandStream(closures, workspaceId, generation)];
+}
+
+const IDENTITY_ASSIGNMENT_INSERT_SQL = "INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation) VALUES ";
+const IDENTITY_ASSIGNMENT_PLACEHOLDER = `(${Array.from({ length: 9 }, () => "?").join(", ")}, NULL, NULL, ?, NULL)`;
+
+function identityAssignmentParams(value: Record<string, any>, workspaceId: string, generation: number): SqliteValue[] {
+  return [sqliteValue(value["identity_assignment_id"]), workspaceId, sqliteValue(value["identity_type"] ?? "entity"), sqliteValue(value["identity_id"] ?? ""), sqliteValue(value["assignment_kind"] ?? "created"), sqliteValue(value["identity_key"] ?? ""), sqliteValue(value["identity_key_digest"] ?? canonicalSha256(value["identity_key"] ?? "")), sqliteValue(value["record_id"] ?? ""), sqliteValue(value["previous_record_id"] ?? null), generation];
+}
+
+function* flushIdentityWindow(params: readonly (readonly SqliteValue[])[]): Generator<TransactionCommand> {
+  if (params.length === 0) return;
+  yield { kind: "transaction_checkpoint" };
+  yield { kind: "run", sql: `${IDENTITY_ASSIGNMENT_INSERT_SQL}${params.map(() => IDENTITY_ASSIGNMENT_PLACEHOLDER).join(", ")} ON CONFLICT DO NOTHING`, params: params.flat() };
+  yield { kind: "assert_transaction_changes", expected: params.length };
+}
+
+function* identityCommandStream(assignments: readonly unknown[], workspaceId: string, generation: number): Generator<TransactionCommand> {
+  const window: SqliteValue[][] = [];
+  for (const entry of assignments) {
+    const unpacked = candidateTemplateValue(entry);
+    if (!unpacked || typeof unpacked !== "object") continue;
+    const value = unpacked as Record<string, any>;
+    if (typeof value["identity_assignment_id"] !== "string") continue;
+    window.push(identityAssignmentParams(value, workspaceId, generation));
+    if (window.length >= STREAMING_OCCURRENCE_BATCH_MAX_ROWS) {
+      yield* flushIdentityWindow(window);
+      window.length = 0;
+    }
+  }
+  yield* flushIdentityWindow(window);
 }
 
 function identityCommands(assignments: readonly unknown[], workspaceId: string, generation: number): TransactionCommand[] {
-  return assignments.flatMap((entry) => {
-    if (!entry || typeof entry !== "object") return [];
-    const value = entry as Record<string, any>;
-    if (typeof value["identity_assignment_id"] !== "string") return [];
-    return checkedPublicationCommand({ kind: "run", sql: "INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, assignment_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?) ON CONFLICT DO UPDATE SET assignment_payload = excluded.assignment_payload WHERE identity_assignments.workspace_id = excluded.workspace_id AND identity_assignments.identity_type = excluded.identity_type AND identity_assignments.identity_id = excluded.identity_id AND identity_assignments.assignment_kind = excluded.assignment_kind AND identity_assignments.identity_key = excluded.identity_key AND identity_assignments.identity_key_digest = excluded.identity_key_digest AND identity_assignments.record_id = excluded.record_id AND identity_assignments.previous_record_id IS excluded.previous_record_id AND identity_assignments.owner_artifact_id = excluded.owner_artifact_id AND identity_assignments.owner_artifact_version_id = excluded.owner_artifact_version_id AND identity_assignments.valid_from_generation = excluded.valid_from_generation AND identity_assignments.valid_to_generation IS excluded.valid_to_generation AND identity_assignments.assignment_payload = excluded.assignment_payload", params: [sqliteValue(value["identity_assignment_id"]), workspaceId, sqliteValue(value["identity_type"] ?? "entity"), sqliteValue(value["identity_id"] ?? ""), sqliteValue(value["assignment_kind"] ?? "created"), sqliteValue(value["identity_key"] ?? ""), sqliteValue(value["identity_key_digest"] ?? canonicalSha256(value["identity_key"] ?? "")), sqliteValue(value["record_id"] ?? ""), sqliteValue(value["previous_record_id"] ?? null), sqliteValue(value["owner_artifact_id"] ?? ""), sqliteValue(value["owner_artifact_version_id"] ?? ""), generation, encodeCanonical(value)] });
-  });
+  return [...identityCommandStream(assignments, workspaceId, generation)];
 }
 
 /**
@@ -1846,7 +2079,7 @@ const PROJECTION_CONTENT_DIGEST_FIELDS = ["projection_record_id", "projection_ki
 function projectionContentDigestInput(value: Record<string, unknown>): Record<string, unknown> {
   const input: Record<string, unknown> = {};
   // Omit a field entirely rather than setting it `undefined`: canonical
-  // encoding treats an explicit `undefined` value as an unsupported CBOR
+  // logical encoding treats an explicit `undefined` value as unsupported
   // feature (there is no null-vs-absent distinction to preserve here, unlike
   // JSON), so a sparse/malformed projection template must produce the same
   // "missing key" shape a real one's absent optional field would.
@@ -1854,24 +2087,72 @@ function projectionContentDigestInput(value: Record<string, unknown>): Record<st
   return input;
 }
 
-function projectionCommands(opens: readonly unknown[], workspaceId: string, generation: number): TransactionCommand[] {
-  const commands: TransactionCommand[] = [];
+type ProjectionOpenStreamEntry = {
+  readonly projection: Record<string, unknown>;
+  readonly id: string;
+  readonly artifacts: readonly unknown[];
+  readonly records: readonly unknown[];
+  readonly projections: readonly unknown[];
+  readonly params: readonly SqliteValue[];
+};
+
+function projectionOpenParams(projection: Record<string, unknown>, id: string, artifacts: readonly unknown[], records: readonly unknown[], projections: readonly unknown[], contentDigest: string, workspaceId: string, generation: number): SqliteValue[] {
+  return [id, workspaceId, sqliteValue(projection["projection_kind"] ?? "unknown"), sqliteValue(projection["projection_key"] ?? id), sqliteValue(projection["owner_artifact_id"] ?? ""), sqliteValue(projection["owner_artifact_version_id"] ?? ""), JSON.stringify(artifacts), JSON.stringify(records), JSON.stringify(projections), sqliteValue(projection["generator"] ?? ""), sqliteValue(projection["generator_version"] ?? ""), sqliteValue(projection["generator_configuration_digest"] ?? ""), generation, contentDigest];
+}
+
+function* flushProjectionOpenWindow(entries: readonly ProjectionOpenStreamEntry[], workspaceId: string, generation: number): Generator<TransactionCommand> {
+  if (entries.length === 0) return;
+  yield { kind: "transaction_checkpoint" };
+  yield { kind: "run", sql: `${PROJECTION_OCCURRENCE_INSERT_SQL}${entries.map(() => PROJECTION_OCCURRENCE_PLACEHOLDER).join(", ")}${PROJECTION_OCCURRENCE_INSERT_SUFFIX}`, params: entries.flatMap((entry) => entry.params) };
+  yield { kind: "assert_transaction_changes", expected: entries.length };
+  const valueBatches = new RelationalValueBatchWriter("projection_value_nodes");
+  for (const entry of entries) {
+    for (const [sourceType, sourceValues] of [["artifact_version", entry.artifacts], ["record", entry.records], ["projection", entry.projections]] as const) for (const sourceId of sourceValues) yield* checkedPublicationCommand({ kind: "run", sql: "INSERT OR IGNORE INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id) VALUES (?, ?, ?, ?, ?)", params: [workspaceId, entry.id, generation, sourceType, String(sourceId)] });
+    yield* valueBatches.push(iterateRelationalValue(workspaceId, entry.id, generation, entry.projection["payload"] ?? null));
+  }
+  yield* valueBatches.finish();
+}
+
+function* projectionCommandStream(opens: readonly unknown[], workspaceId: string, generation: number, batch = true): Generator<TransactionCommand> {
+  const window: ProjectionOpenStreamEntry[] = [];
+  const unbatchedValueBatches = batch ? undefined : new RelationalValueBatchWriter("projection_value_nodes");
   for (const value of opens) {
     if (!value || typeof value !== "object") continue;
     const projection = value as Record<string, unknown>;
-    const payload = projection["payload"];
     const id = projection["projection_record_id"];
     if (typeof id !== "string") continue;
     const contentDigest = canonicalSha256(projectionContentDigestInput(projection));
     const artifacts = Array.isArray(projection["source_artifact_version_ids"]) ? projection["source_artifact_version_ids"] : [];
     const records = Array.isArray(projection["source_record_ids"]) ? projection["source_record_ids"] : [];
     const projections = Array.isArray(projection["source_projection_record_ids"]) ? projection["source_projection_record_ids"] : [];
-    commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO projection_occurrences (projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, valid_to_generation, content_digest, projection_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT DO UPDATE SET projection_payload = excluded.projection_payload, content_digest = excluded.content_digest WHERE projection_occurrences.workspace_id = excluded.workspace_id AND projection_occurrences.projection_kind = excluded.projection_kind AND projection_occurrences.projection_key = excluded.projection_key AND projection_occurrences.owner_artifact_id = excluded.owner_artifact_id AND projection_occurrences.owner_artifact_version_id = excluded.owner_artifact_version_id AND projection_occurrences.source_artifact_version_ids = excluded.source_artifact_version_ids AND projection_occurrences.source_record_ids = excluded.source_record_ids AND projection_occurrences.source_projection_record_ids = excluded.source_projection_record_ids AND projection_occurrences.generator = excluded.generator AND projection_occurrences.generator_version = excluded.generator_version AND projection_occurrences.generator_configuration_digest = excluded.generator_configuration_digest AND projection_occurrences.valid_from_generation = excluded.valid_from_generation AND projection_occurrences.valid_to_generation IS excluded.valid_to_generation AND projection_occurrences.content_digest = excluded.content_digest AND projection_occurrences.projection_payload = excluded.projection_payload", params: [id, workspaceId, sqliteValue(projection["projection_kind"] ?? "unknown"), sqliteValue(projection["projection_key"] ?? id), sqliteValue(projection["owner_artifact_id"] ?? ""), sqliteValue(projection["owner_artifact_version_id"] ?? ""), JSON.stringify(artifacts), JSON.stringify(records), JSON.stringify(projections), sqliteValue(projection["generator"] ?? ""), sqliteValue(projection["generator_version"] ?? ""), sqliteValue(projection["generator_configuration_digest"] ?? ""), generation, contentDigest, encodeCanonical(payload ?? null)] }));
-    for (const [sourceType, sourceValues] of [["artifact_version", artifacts], ["record", records], ["projection", projections]] as const) for (const sourceId of sourceValues) commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id, dependency_payload) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, projection_record_id, valid_from_generation, source_type, source_id) DO UPDATE SET dependency_payload = excluded.dependency_payload WHERE projection_occurrence_dependencies.dependency_payload = excluded.dependency_payload", params: [workspaceId, id, generation, sourceType, String(sourceId), encodeCanonical({ projection_record_id: id, valid_from_generation: generation, source_type: sourceType, source_id: String(sourceId) })] }));
+    const streamEntry = { projection, id, artifacts, records, projections, params: projectionOpenParams(projection, id, artifacts, records, projections, contentDigest, workspaceId, generation) } satisfies ProjectionOpenStreamEntry;
+    if (!batch) {
+      yield* checkedPublicationCommand({ kind: "run", sql: `${PROJECTION_OCCURRENCE_INSERT_SQL}${PROJECTION_OCCURRENCE_PLACEHOLDER}${PROJECTION_OCCURRENCE_INSERT_SUFFIX}`, params: streamEntry.params });
+      for (const [sourceType, sourceValues] of [["artifact_version", artifacts], ["record", records], ["projection", projections]] as const) for (const sourceId of sourceValues) yield* checkedPublicationCommand({ kind: "run", sql: "INSERT OR IGNORE INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id) VALUES (?, ?, ?, ?, ?)", params: [workspaceId, id, generation, sourceType, String(sourceId)] });
+      yield* unbatchedValueBatches!.push(iterateRelationalValue(workspaceId, id, generation, projection["payload"] ?? null));
+      continue;
+    }
+    window.push(streamEntry);
+    if (window.length >= STREAMING_OCCURRENCE_BATCH_MAX_ROWS) {
+      yield* flushProjectionOpenWindow(window, workspaceId, generation);
+      window.length = 0;
+    }
   }
-  return commands;
+  if (batch) yield* flushProjectionOpenWindow(window, workspaceId, generation);
+  else yield* unbatchedValueBatches!.finish();
+}
+
+function projectionCommands(opens: readonly unknown[], workspaceId: string, generation: number): TransactionCommand[] {
+  return [...projectionCommandStream(opens, workspaceId, generation, false)];
+}
+
+function* projectionClosureCommandStream(closures: readonly Record<string, unknown>[], workspaceId: string, generation: number): Generator<TransactionCommand> {
+  for (const entry of closures) {
+    if (typeof entry["projection_record_id"] !== "string") continue;
+    yield { kind: "run", sql: "UPDATE projection_occurrences SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_to_generation IS NULL", params: [generation, workspaceId, entry["projection_record_id"]] } satisfies TransactionCommand;
+  }
 }
 
 function projectionClosureCommands(closures: readonly Record<string, unknown>[], workspaceId: string, generation: number): TransactionCommand[] {
-  return closures.flatMap((entry) => typeof entry["projection_record_id"] === "string" ? [{ kind: "run", sql: "UPDATE projection_occurrences SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_to_generation IS NULL", params: [generation, workspaceId, entry["projection_record_id"]] } satisfies TransactionCommand] : []);
+  return [...projectionClosureCommandStream(closures, workspaceId, generation)];
 }

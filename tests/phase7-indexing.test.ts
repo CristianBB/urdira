@@ -1,13 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
-import type { JsonValue, SourceProviderResponseEnvelope } from "@urdira/contracts";
+import { digestBytes } from "@urdira/canonical";
+import type { JsonValue, SourceProviderPayload, SourceProviderResponseEnvelope } from "@urdira/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GenericSourceIndexer, sourceObservationBatchDigest, type ProviderObservation, type SourceIndexWorkspacePort } from "../packages/engine/src/index.js";
 import { createDurableStorage, createFaultInjector, openSqliteDatabase } from "../packages/storage/src/index.js";
 
-// Lexical projections (lexical_documents/lexical_trigrams) are no longer
+// Lexical projections (lexical_documents/lexical_fts) are no longer
 // written by the scan path at all: they're built by an out-of-band
 // post-ready reconcile job from committed artifact_versions content,
 // decoupled entirely from GenericSourceIndexer (see the lexical-search
@@ -96,7 +96,7 @@ function envelope(
   workspaceId: string,
   call: string,
   outcome: string,
-  payload?: JsonValue,
+  payload?: SourceProviderPayload,
   componentId = "core:directory_source_provider",
 ): SourceProviderResponseEnvelope {
   return {
@@ -162,55 +162,10 @@ function batchResponse(
   }, sourceProvider);
 }
 
-async function installLegacySourceSchema(databasePath: string, workspaceId: string): Promise<{ readonly artifactSql: string; readonly tombstoneSql: string }> {
+async function markV1WorkspaceContract(databasePath: string): Promise<void> {
   const database = await openSqliteDatabase({ filename: databasePath });
-  await database.exec(`
-    PRAGMA foreign_keys = OFF;
-    DROP TABLE artifact_tombstones;
-    DROP TABLE source_artifacts;
-    CREATE TABLE source_artifacts (
-      artifact_id TEXT PRIMARY KEY,
-      workspace_id TEXT NOT NULL,
-      normalized_uri TEXT NOT NULL,
-      normalized_path TEXT,
-      display_path TEXT,
-      artifact_kind TEXT NOT NULL,
-      artifact_payload BLOB NOT NULL,
-      UNIQUE (workspace_id, artifact_id),
-      UNIQUE (workspace_id, normalized_uri)
-    ) STRICT;
-    CREATE INDEX source_artifacts_path_idx ON source_artifacts(workspace_id, normalized_path);
-    CREATE TABLE artifact_tombstones (
-      artifact_tombstone_id TEXT PRIMARY KEY,
-      workspace_id TEXT NOT NULL,
-      artifact_id TEXT NOT NULL,
-      absence_kind TEXT NOT NULL,
-      absence_reason_code TEXT NOT NULL,
-      last_artifact_version_id TEXT NOT NULL,
-      valid_from_generation INTEGER NOT NULL,
-      valid_to_generation INTEGER,
-      opening_artifact_change_id TEXT NOT NULL,
-      closing_artifact_change_id TEXT,
-      replacement_artifact_version_id TEXT,
-      cause_references TEXT NOT NULL,
-      lineage_evidence_record_ids TEXT NOT NULL,
-      artifact_tombstone_payload BLOB NOT NULL,
-      FOREIGN KEY (workspace_id, artifact_id) REFERENCES source_artifacts(workspace_id, artifact_id),
-      FOREIGN KEY (workspace_id, artifact_id, last_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id),
-      FOREIGN KEY (workspace_id, artifact_id, replacement_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id),
-      CHECK (valid_to_generation IS NULL OR valid_to_generation > valid_from_generation)
-    ) STRICT;
-    PRAGMA foreign_keys = ON;
-  `);
-  const sentinel = { artifact_id: "legacy-sentinel", workspace_id: workspaceId, normalized_uri: "sentinel.txt", normalized_path: "sentinel.txt", display_path: "sentinel.txt", artifact_kind: "physical_file" };
-  await database.run(
-    "INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [sentinel.artifact_id, sentinel.workspace_id, sentinel.normalized_uri, sentinel.normalized_path, sentinel.display_path, sentinel.artifact_kind, canonicalBytes(sentinel)],
-  );
-  const artifactSql = (await database.get<{ sql: string }>("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'source_artifacts'"))?.sql ?? "";
-  const tombstoneSql = (await database.get<{ sql: string }>("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'artifact_tombstones'"))?.sql ?? "";
+  await database.run("UPDATE workspace_meta SET value = ? WHERE key = 'index_contract'", [Uint8Array.of(0x31)]);
   await database.close();
-  return { artifactSql, tombstoneSql };
 }
 
 function readResponse(observation: ProviderObservation, bytes: Uint8Array, outcome = "success"): SourceProviderResponseEnvelope {
@@ -218,7 +173,7 @@ function readResponse(observation: ProviderObservation, bytes: Uint8Array, outco
   return envelope(observation.workspace_id, "read", "success", {
     artifact_id: observation.artifact_id,
     provider_version_token: observation.provider_version_token,
-    content_bytes: Buffer.from(bytes).toString("base64"),
+    content: bytes,
     content_hash: observation.observed_content_hash,
     byte_length: bytes.byteLength,
     metadata_digest: observation.observed_metadata_digest,
@@ -268,16 +223,53 @@ describe("Phase 7 generic source indexing", () => {
     await storage.close();
   });
 
-  // Regression test: a legitimately empty (0-byte) source file's `content_bytes`
-  // is base64-encoded to the empty string `""` (there are no bytes to encode).
-  // `readAll`'s validation previously used `requiredString`, which rejects any
-  // empty string as "missing", for this field -- conflating "the provider
-  // omitted content_bytes" with "the provider correctly reported a 0-byte
-  // file". This is not a synthetic edge case: real repositories routinely
-  // contain empty files (`.gitkeep`, empty `.d.ts`/ignore-file stubs), so a
-  // full real-workspace scan that observes even one of them used to throw
-  // `engine:source_index_result_invalid` and abort the whole scan.
-  it("indexes a legitimately empty (0-byte) source file instead of rejecting its empty content_bytes", async () => {
+  it("commits complete captures as bounded fragments and authorizes deletion only at completion", async () => {
+    const { storage } = await temporaryStorage();
+    const registration = workspace("workspace:fragmented-source");
+    await storage.catalog.registerWorkspace(registration);
+    const opened = await storage.openWorkspace(registration.workspace_id);
+    const contents = Array.from({ length: 4_097 }, (_, index) => new TextEncoder().encode(`export const value${index} = ${index};\n`));
+    const observations = Array.from({ length: 4_097 }, (_, index) => {
+      const uri = `src/file-${index}.ts`;
+      return providerObservation(registration.workspace_id, "batch:fragmented-source", uri, contents[index]!);
+    });
+    const entries = Object.fromEntries(observations.map((observation, index) => [observation.normalized_uri, contents[index]!]));
+    // The provider observations and read payloads intentionally use distinct
+    // buffers; the indexer must validate and persist each fragment without
+    // retaining the complete source capture as one transaction payload.
+    const result = await testIndexer(opened).apply({
+      response: batchResponse(registration.workspace_id, "batch:fragmented-source", observations),
+      read: readFixture(entries),
+    });
+
+    expect(result).toMatchObject({ status: "published", generation: 1 });
+    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM source_observation_batches"))?.count).toBe(3);
+    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM source_observations"))?.count).toBe(4_097);
+    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM artifact_versions WHERE valid_to_generation IS NULL"))?.count).toBe(4_097);
+    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM artifact_tombstones WHERE valid_to_generation IS NULL"))?.count).toBe(0);
+    expect(await opened.database.get<{ current_generation: number }>("SELECT current_generation FROM source_index_state")).toEqual({ current_generation: 1 });
+    await opened.close();
+    await storage.close();
+  }, 120_000);
+
+  it("validates multi-megabyte Uint8Array reads without creating an aggregate string", async () => {
+    const { storage } = await temporaryStorage();
+    const registration = workspace("workspace:large-bytes");
+    await storage.catalog.registerWorkspace(registration);
+    const opened = await storage.openWorkspace(registration.workspace_id);
+    const bytes = new Uint8Array(6_000_000);
+    const observation = providerObservation(registration.workspace_id, "batch:large-bytes", "large.ts", bytes);
+
+    await expect(testIndexer(opened).apply({
+      response: batchResponse(registration.workspace_id, "batch:large-bytes", [observation]),
+      read: readFixture({ "large.ts": bytes }),
+    })).resolves.toMatchObject({ status: "published", generation: 1 });
+    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM artifact_versions"))?.count).toBe(1);
+    await opened.close();
+    await storage.close();
+  });
+
+  it("indexes a legitimately empty (0-byte) source file", async () => {
     const { storage } = await temporaryStorage();
     const registration = workspace("workspace:empty-file");
     await storage.catalog.registerWorkspace(registration);
@@ -554,7 +546,7 @@ describe("Phase 7 generic source indexing", () => {
       return envelope(observation.workspace_id, "read", "success", {
         artifact_id: "provider-artifact:wrong-identity",
         provider_version_token: observation.provider_version_token,
-        content_bytes: Buffer.from(new TextEncoder().encode("mismatched")).toString("base64"),
+        content: new TextEncoder().encode("mismatched"),
         content_hash: observation.observed_content_hash,
         byte_length: new TextEncoder().encode("mismatched").byteLength,
         metadata_digest: observation.observed_metadata_digest,
@@ -726,48 +718,21 @@ describe("Phase 7 generic source indexing", () => {
     await storage.close();
   });
 
-  it("keeps the authoritative legacy source schema unchanged and reappears on the same artifact", async () => {
+  it("rejects a v1 workspace index before any source reader is invoked", async () => {
     const { root, storage } = await temporaryStorage();
     const registration = workspace("workspace:legacy-source-schema");
     const registered = await storage.catalog.registerWorkspace(registration);
     await storage.close();
-    const legacySchema = await installLegacySourceSchema(registered.database_path, registration.workspace_id);
+    await markV1WorkspaceContract(registered.database_path);
 
-    const restarted = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
-    const opened = await restarted.openWorkspace(registration.workspace_id);
-    const indexer = testIndexer(opened);
-    const bytes = new TextEncoder().encode("legacy returns");
-    const first = providerObservation(registration.workspace_id, "batch:legacy-first", "legacy.txt", bytes);
-    await indexer.apply({ response: batchResponse(registration.workspace_id, "batch:legacy-first", [first]), read: readFixture({ "legacy.txt": bytes }) });
-    await indexer.apply({ response: batchResponse(registration.workspace_id, "batch:legacy-absent", []), read: readFixture({}) });
-    const again = providerObservation(registration.workspace_id, "batch:legacy-again", "legacy.txt", bytes);
-
-    await expect(indexer.apply({ response: batchResponse(registration.workspace_id, "batch:legacy-again", [again]), read: readFixture({ "legacy.txt": bytes }) })).resolves.toMatchObject({ status: "published", generation: 3 });
-
-    expect((await opened.database.get<{ sql: string }>("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'source_artifacts'"))?.sql).toBe(legacySchema.artifactSql);
-    expect((await opened.database.get<{ sql: string }>("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'artifact_tombstones'"))?.sql).toBe(legacySchema.tombstoneSql);
-    const uniqueIndexes = await opened.database.all<{ name: string; unique: number }>("PRAGMA index_list(source_artifacts)");
-    const uniqueColumnSets = await Promise.all(uniqueIndexes.filter((index) => index.unique === 1).map(async (index) => (await opened.database.all<{ name: string }>(`PRAGMA index_info('${index.name.replaceAll("'", "''")}')`)).map((column) => column.name)));
-    expect(uniqueColumnSets).toContainEqual(["workspace_id", "normalized_uri"]);
-    const foreignKeys = await opened.database.all<{ id: number; table: string; from: string; to: string }>("PRAGMA foreign_key_list(artifact_tombstones)");
-    const replacement = foreignKeys.find((foreignKey) => foreignKey.from === "replacement_artifact_version_id");
-    expect(foreignKeys.filter((foreignKey) => foreignKey.id === replacement?.id).map(({ from, to }) => ({ from, to }))).toEqual(expect.arrayContaining([
-      { from: "workspace_id", to: "workspace_id" },
-      { from: "replacement_artifact_version_id", to: "artifact_version_id" },
-    ]));
-    expect(foreignKeys.filter((foreignKey) => foreignKey.id === replacement?.id).map(({ from }) => from)).toContain("artifact_id");
-    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM source_artifacts WHERE normalized_uri = 'legacy.txt'"))?.count).toBe(1);
-    expect((await opened.database.get<{ count: number }>("SELECT COUNT(DISTINCT artifact_id) AS count FROM artifact_versions WHERE workspace_id = ?", [registration.workspace_id]))?.count).toBe(1);
-    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM source_artifacts WHERE artifact_id = 'legacy-sentinel'"))?.count).toBe(1);
-    await opened.close();
-    await restarted.close();
+    await expect(createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 })).rejects.toMatchObject({ code: "core:index_contract_unsupported" });
   });
 
   // The scan path never writes lexical rows at all (see the top-of-file
   // comment): lexical projections are built entirely by an out-of-band
   // post-ready job from committed artifact_versions content, so a scan --
   // including one committing a single very large document -- must write
-  // zero rows to `lexical_documents`/`lexical_trigrams`, and the resulting
+  // zero rows to `lexical_documents`/`lexical_fts`, and the resulting
   // publication must still pass `StorageMaintenance.verify()` with zero
   // issues: `projectionSetDigestEntries` (`packages/storage/src/lifecycle.ts`)
   // live-queries those tables at both publish time and verify time, so an
@@ -790,7 +755,7 @@ describe("Phase 7 generic source indexing", () => {
     expect(result).toMatchObject({ status: "published", generation: 1 });
     expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM artifact_versions"))?.count).toBe(1);
     expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM lexical_documents"))?.count).toBe(0);
-    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM lexical_trigrams"))?.count).toBe(0);
+    expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM lexical_fts"))?.count).toBe(0);
     expect(await opened.projections.searchLiteral("needle")).toEqual([]);
     const report = await opened.maintenance.verify();
     expect(report.failures).toEqual([]);

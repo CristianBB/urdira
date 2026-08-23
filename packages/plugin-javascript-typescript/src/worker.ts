@@ -3,35 +3,68 @@ import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { gunzip as gunzipCallback, gzip as gzipCallback } from "node:zlib";
+import { LogicalDigestWriter } from "@urdira/canonical";
 import { canonicalSha256, type PluginWorkerRequestEnvelope, type WorkerTransport } from "@urdira/plugin-sdk";
-import { analyzeSyntaxProject, discoverProjects, JAVASCRIPT_TYPESCRIPT_CAPABILITIES, JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, JAVASCRIPT_TYPESCRIPT_VERSION, JsTsAnalysisSession, TYPESCRIPT_COMPILER_VERSION, type AnalyzerFile, type JsTsAnalysisResult } from "./analyzer.js";
+import { analyzeBoundedSyntaxProject, analyzeSyntaxDependencyGraph, analyzeSyntaxProject, discoverProjects, isLargeSyntaxCorpus, JAVASCRIPT_TYPESCRIPT_CAPABILITIES, JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, JAVASCRIPT_TYPESCRIPT_VERSION, JsTsAnalysisSession, TYPESCRIPT_COMPILER_VERSION, type AnalyzerFile, type JsTsAnalysisResult } from "./analyzer.js";
 import { buildJavascriptTypescriptFactDelta } from "./fact-delta.js";
+import { iterateNativeFactDeltaBatches } from "./native-batches.js";
 
 const gzip = promisify(gzipCallback);
 const gunzip = promisify(gunzipCallback);
 
-function filesFromPayload(payload: unknown): AnalyzerFile[] {
+async function filesFromPayload(payload: unknown, casRoot?: string, options: { readonly load_concurrency?: number; readonly max_in_flight_bytes?: number } = {}): Promise<AnalyzerFile[]> {
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) throw new Error("Worker payload must be an object.");
   const files = (payload as Record<string, unknown>)["files"];
   if (!Array.isArray(files)) throw new Error("Worker payload.files must be an array.");
-  const result = files.map((entry): AnalyzerFile => {
+  const concurrency = options.load_concurrency !== undefined && Number.isSafeInteger(options.load_concurrency) && options.load_concurrency > 0 ? options.load_concurrency : 16;
+  const maxInFlightBytes = options.max_in_flight_bytes !== undefined && Number.isSafeInteger(options.max_in_flight_bytes) && options.max_in_flight_bytes > 0 ? options.max_in_flight_bytes : 64 * 1024 * 1024;
+  const load = async (entry: unknown): Promise<AnalyzerFile> => {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)
-      || typeof (entry as Record<string, unknown>)["path"] !== "string"
-      || typeof (entry as Record<string, unknown>)["text"] !== "string") {
+      || typeof (entry as Record<string, unknown>)["path"] !== "string") {
       throw new Error("Worker payload.files contains an invalid source file.");
     }
-    const path = (entry as Record<string, unknown>)["path"] as string;
+    const source = entry as Record<string, unknown>;
+    const path = source["path"] as string;
     if (path.length === 0 || path.startsWith("/") || path.includes("\\") || path.split("/").some((part) => part === "" || part === "." || part === "..")) {
       throw new Error("Worker source paths must be normalized relative paths.");
     }
-    const artifactId = (entry as Record<string, unknown>)["artifact_id"];
-    const artifactVersionId = (entry as Record<string, unknown>)["artifact_version_id"];
-    const contentHash = (entry as Record<string, unknown>)["content_hash"];
+    const textValue = source["text"];
+    const byteValue = source["bytes"];
+    const contentHash = source["content_hash"];
+    const hasReference = typeof source["content_hash"] === "string" && typeof casRoot === "string";
+    if ((typeof textValue !== "string" && !(byteValue instanceof Uint8Array) && !hasReference) || (typeof textValue === "string" && byteValue !== undefined)) {
+      throw new Error("Worker payload.files must provide exactly one text, Uint8Array, or verified CAS source.");
+    }
+    let text: string;
+    if (typeof textValue === "string") text = textValue;
+    else if (byteValue instanceof Uint8Array) text = new TextDecoder("utf-8", { fatal: true }).decode(byteValue);
+    else {
+      const hash = contentHash as string;
+      if (!/^sha256:[0-9a-f]{64}$/u.test(hash)) throw new Error("Worker CAS source hash is invalid.");
+      const hex = hash.slice("sha256:".length);
+      // `readFile` already returns a Buffer (a Uint8Array view). Keep that
+      // native view; wrapping it in `new Uint8Array(...)` would copy every
+      // source before the single UTF-8 decode below.
+      const bytes = await readFile(join(casRoot!, "sha256", hex.slice(0, 2), hex.slice(2, 4), hex.slice(4)));
+      if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== hash) throw new Error(`Worker CAS source ${hash} failed digest verification.`);
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    }
+    const artifactId = source["artifact_id"];
+    const artifactVersionId = source["artifact_version_id"];
     for (const [field, value] of [["artifact_id", artifactId], ["artifact_version_id", artifactVersionId], ["content_hash", contentHash]] as const) {
       if (value !== undefined && (typeof value !== "string" || value.length === 0)) throw new Error(`Worker payload.files ${field} must be a non-empty string when present.`);
     }
-    return { path, text: (entry as Record<string, unknown>)["text"] as string, ...(typeof artifactId === "string" ? { artifact_id: artifactId } : {}), ...(typeof artifactVersionId === "string" ? { artifact_version_id: artifactVersionId } : {}), ...(typeof contentHash === "string" ? { content_hash: contentHash } : {}) };
-  });
+    return { path, text, ...(typeof artifactId === "string" ? { artifact_id: artifactId } : {}), ...(typeof artifactVersionId === "string" ? { artifact_version_id: artifactVersionId } : {}), ...(typeof contentHash === "string" ? { content_hash: contentHash } : {}) };
+  };
+  const result: AnalyzerFile[] = new Array(files.length);
+  for (let start = 0; start < files.length; start += concurrency) {
+    const end = Math.min(files.length, start + concurrency);
+    const loaded = await Promise.all(files.slice(start, end).map(load));
+    let batchBytes = 0;
+    for (const file of loaded) batchBytes += Buffer.byteLength(file.text, "utf8");
+    if (batchBytes > maxInFlightBytes) throw new Error(`Worker source batch exceeds the ${maxInFlightBytes}-byte in-flight limit.`);
+    for (let index = 0; index < loaded.length; index += 1) result[start + index] = loaded[index]!;
+  }
   return result.sort((left, right) => left.path.localeCompare(right.path));
 }
 
@@ -46,11 +79,18 @@ function response(request: PluginWorkerRequestEnvelope, payload: unknown): unkno
   };
 }
 
+/** Project the validated fixed fields into the native columnar hand-off. */
 export interface JavascriptTypescriptWorkerDescriptor {
   readonly compatibility_declaration_digest?: string;
   readonly registry_contribution_digest?: string;
   readonly analysis_digest?: string;
   readonly analysis_configuration_digest?: string;
+  /** Immutable CAS root used for native source-reference hydration inside the worker. */
+  readonly cas_root?: string;
+  /** Maximum concurrent CAS reads for one analyzer request. */
+  readonly source_load_concurrency?: number;
+  /** Maximum UTF-8 bytes decoded by one bounded source-read batch. */
+  readonly source_load_max_in_flight_bytes?: number;
   /**
    * Directory for the durable (on-disk, cross-process) whole-project analysis cache --
    * see the doc comment on `loadOrBuildAnalysis`, below, for the full design. Absent
@@ -72,6 +112,8 @@ export interface JavascriptTypescriptWorkerDescriptor {
    * different tree mints a disjoint durable key rather than overwriting an existing entry.
    */
   readonly analysis_cache_max_entries?: number;
+  /** Production hosts derive and persist native batches after raw-delta acceptance. */
+  readonly native_batch_transport?: "response" | "host";
   /**
    * Test-only instrumentation hook invoked whenever the worker actually rebuilds the
    * whole-project TypeScript analysis (a cache miss). Not part of the wire protocol and
@@ -144,7 +186,45 @@ interface AnalysisCacheEntry {
  * using exactly the files the request provided -- never a partial reuse,
  * never a guess.
  */
-function isSubsetOfCache(files: readonly AnalyzerFile[], compilerOptionsDigest: string, cache: AnalysisCacheEntry, memo: Map<string, { text: string; hash: string }>): boolean {
+const FILE_HASH_MEMO_MAX_ENTRIES = 512;
+const FILE_HASH_MEMO_MAX_TEXT_BYTES = 16 * 1024 * 1024;
+
+/** Bounded LRU-ish source hash memo; it must not retain an entire workspace. */
+class FileHashMemo {
+  private readonly entries = new Map<string, { text: string; hash: string }>();
+  private textBytes = 0;
+
+  get(path: string): { text: string; hash: string } | undefined {
+    const entry = this.entries.get(path);
+    if (entry !== undefined) {
+      this.entries.delete(path);
+      this.entries.set(path, entry);
+    }
+    return entry;
+  }
+
+  set(path: string, entry: { text: string; hash: string }): void {
+    const previous = this.entries.get(path);
+    if (previous !== undefined) this.textBytes -= Buffer.byteLength(previous.text, "utf8");
+    this.entries.delete(path);
+    this.entries.set(path, entry);
+    this.textBytes += Buffer.byteLength(entry.text, "utf8");
+    while (this.entries.size > FILE_HASH_MEMO_MAX_ENTRIES || this.textBytes > FILE_HASH_MEMO_MAX_TEXT_BYTES) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      const evicted = this.entries.get(oldest);
+      this.entries.delete(oldest);
+      if (evicted !== undefined) this.textBytes -= Buffer.byteLength(evicted.text, "utf8");
+    }
+  }
+
+  clear(): void {
+    this.entries.clear();
+    this.textBytes = 0;
+  }
+}
+
+function isSubsetOfCache(files: readonly AnalyzerFile[], compilerOptionsDigest: string, cache: AnalysisCacheEntry, memo: FileHashMemo): boolean {
   if (files.length === 0 || cache.compiler_options_digest !== compilerOptionsDigest) return false;
   return files.every((file) => cache.file_hashes.get(file.path) === fileContentHash(file, memo));
 }
@@ -160,7 +240,7 @@ function isSubsetOfCache(files: readonly AnalyzerFile[], compilerOptionsDigest: 
  * invokes the worker once per owner artifact, so hashing the full corpus here would be
  * O(corpus x owners) per scan.
  */
-function analysisCacheKey(files: readonly AnalyzerFile[], rootNames: readonly string[], compilerOptions: Readonly<Record<string, unknown>> | undefined, fileHashMemo: Map<string, { text: string; hash: string }>): string {
+function analysisCacheKey(files: readonly AnalyzerFile[], rootNames: readonly string[], compilerOptions: Readonly<Record<string, unknown>> | undefined, fileHashMemo: FileHashMemo): string {
   const sortedRootNames = [...rootNames].sort();
   const rootNameSet = new Set(sortedRootNames);
   const relevantFiles = files
@@ -170,7 +250,7 @@ function analysisCacheKey(files: readonly AnalyzerFile[], rootNames: readonly st
   return canonicalSha256({ root_names: sortedRootNames, file_hashes: relevantFiles, compiler_options: compilerOptions ?? null });
 }
 
-function fileContentHash(file: AnalyzerFile, memo: Map<string, { text: string; hash: string }>): string {
+function fileContentHash(file: AnalyzerFile, memo: FileHashMemo): string {
   if (file.content_hash !== undefined) return file.content_hash;
   const cached = memo.get(file.path);
   if (cached !== undefined && cached.text === file.text) return cached.hash;
@@ -198,7 +278,7 @@ function fileContentHash(file: AnalyzerFile, memo: Map<string, { text: string; h
  */
 function durableAnalysisCacheKey(cacheKey: string, descriptor: JavascriptTypescriptWorkerDescriptor, stage = "monolithic"): string {
   const digest = canonicalSha256({
-    format_version: stage === "monolithic" ? 1 : 2,
+    format_version: stage === "monolithic" ? 1 : 3,
     stage,
     cache_key: cacheKey,
     typescript_compiler_version: TYPESCRIPT_COMPILER_VERSION,
@@ -348,8 +428,8 @@ async function loadOrBuildAnalysis(descriptor: JavascriptTypescriptWorkerDescrip
 export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescriptWorkerDescriptor = {}): WorkerTransport {
   let terminated = false;
   let analysisCache: AnalysisCacheEntry | undefined;
-  const syntaxAnalysisCache = new Map<string, JsTsAnalysisResult>();
-  const fileHashMemo = new Map<string, { text: string; hash: string }>();
+  let stage1AnalysisCache: AnalysisCacheEntry | undefined;
+  const fileHashMemo = new FileHashMemo();
   // One incremental analysis session per worker instance: a per-scan worker
   // (today's default) only ever calls `session.analyze` at most once per
   // scan (see `loadOrBuildAnalysis`'s doc comment), so this session behaves
@@ -372,35 +452,70 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
         supported_calls: ["describe", "discover_partitions", "analyze_artifact", "analyze_closure", "generate_projection"],
         supported_contracts: JAVASCRIPT_TYPESCRIPT_CAPABILITIES,
       });
-      const files = filesFromPayload(request.payload);
+      const files = await filesFromPayload(request.payload, descriptor.cas_root, {
+        ...(descriptor.source_load_concurrency === undefined ? {} : { load_concurrency: descriptor.source_load_concurrency }),
+        ...(descriptor.source_load_max_in_flight_bytes === undefined ? {} : { max_in_flight_bytes: descriptor.source_load_max_in_flight_bytes }),
+      });
       if (request.call === "discover_partitions") return response(request, { partitions: discoverProjects(files), plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID });
       const rawPayload = request.payload as Record<string, unknown>;
       const rootNames = Array.isArray(rawPayload["root_names"]) && rawPayload["root_names"].every((value) => typeof value === "string")
         ? rawPayload["root_names"] as string[] : files.map((file) => file.path);
       const compilerOptions = rawPayload["compiler_options"] !== null && typeof rawPayload["compiler_options"] === "object" && !Array.isArray(rawPayload["compiler_options"])
         ? rawPayload["compiler_options"] as Record<string, unknown> : undefined;
+      const publicationStageId = typeof rawPayload["publication_stage_id"] === "string" ? rawPayload["publication_stage_id"] : undefined;
+      if (request.call === "analyze_closure" && publicationStageId === "jsts:structural_stage_1" && isLargeSyntaxCorpus({ files, root_names: rootNames })) {
+        // A project-sized stage-1 analysis used to remain reachable through
+        // `stage1AnalysisCache` for every owner request.  On VS Code that was
+        // already near the RSS guard before the first hundred owners.  The
+        // closure call only needs the direct graph; owner facts are built from
+        // bounded views below and this response deliberately warms no cache.
+        descriptor.on_analysis_build?.();
+        return response(request, {
+          plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
+          dependency_graph: analyzeSyntaxDependencyGraph({ files, root_names: rootNames }),
+        });
+      }
       const compilerOptionsDigest = canonicalSha256(compilerOptions ?? null);
       const cacheKey = analysisCacheKey(files, rootNames, compilerOptions, fileHashMemo);
       let analysis: JsTsAnalysisResult;
       let impactfulChangedPaths: readonly string[] | undefined;
-      const publicationStageId = typeof rawPayload["publication_stage_id"] === "string" ? rawPayload["publication_stage_id"] : undefined;
+      const boundedSyntax = rawPayload["bounded_syntax"] === true;
+      if (publicationStageId !== "jsts:structural_stage_1") stage1AnalysisCache = undefined;
       if (publicationStageId === "jsts:structural_stage_1") {
-        const syntaxCacheKey = `stage1:${cacheKey}`;
-        const cachedSyntax = syntaxAnalysisCache.get(syntaxCacheKey);
+        const cachedSyntax = stage1AnalysisCache?.key === cacheKey
+          ? stage1AnalysisCache
+          : stage1AnalysisCache !== undefined && isSubsetOfCache(files, compilerOptionsDigest, stage1AnalysisCache, fileHashMemo)
+            ? stage1AnalysisCache : undefined;
         if (cachedSyntax !== undefined) {
-          analysis = cachedSyntax;
+          analysis = cachedSyntax.analysis;
         } else {
-          const durableKey = descriptor.analysis_cache_dir === undefined ? undefined : durableAnalysisCacheKey(cacheKey, descriptor, "stage1");
-          const durableSyntax = descriptor.analysis_cache_dir === undefined || durableKey === undefined ? undefined : await readDurableAnalysisCache(descriptor.analysis_cache_dir, durableKey, 2);
+          // Per-owner bounded views are intentionally not written to the
+          // durable cache: a first scan can contain tens of thousands of
+          // distinct owners, and serializing/pruning one entry per owner would
+          // turn a memory fix into an O(owners) filesystem bottleneck.
+          const durableKey = boundedSyntax || descriptor.analysis_cache_dir === undefined ? undefined : durableAnalysisCacheKey(cacheKey, descriptor, "stage1");
+          const durableSyntax = descriptor.analysis_cache_dir === undefined || durableKey === undefined ? undefined : await readDurableAnalysisCache(descriptor.analysis_cache_dir, durableKey, 3);
           if (durableSyntax !== undefined) {
             analysis = durableSyntax;
             descriptor.on_analysis_cache_load?.();
           } else {
             descriptor.on_analysis_build?.();
-            analysis = analyzeSyntaxProject({ files, root_names: rootNames, ...(compilerOptions === undefined ? {} : { compiler_options: compilerOptions }) });
-            if (descriptor.analysis_cache_dir !== undefined && durableKey !== undefined) await writeDurableAnalysisCache(descriptor.analysis_cache_dir, durableKey, analysis, descriptor.analysis_cache_max_entries ?? 16, 2);
+            // Stage 1 is deliberately syntax-only.  In particular, large
+            // corpora must never enter JsTsAnalysisSession here: its full
+            // build constructs TypeScript's checker/program graph and can
+            // exhaust the worker heap before the first structural frontier.
+            // Later stages may opt into checker-backed analysis explicitly.
+            analysis = boundedSyntax
+              ? analyzeBoundedSyntaxProject({ files, root_names: rootNames })
+              : analyzeSyntaxProject({ files, root_names: rootNames, ...(compilerOptions === undefined ? {} : { compiler_options: compilerOptions }) });
+            if (descriptor.analysis_cache_dir !== undefined && durableKey !== undefined) await writeDurableAnalysisCache(descriptor.analysis_cache_dir, durableKey, analysis, descriptor.analysis_cache_max_entries ?? 16, 3);
           }
-          syntaxAnalysisCache.set(syntaxCacheKey, analysis);
+          stage1AnalysisCache = {
+            key: cacheKey,
+            analysis,
+            file_hashes: new Map(files.map((file) => [file.path, fileContentHash(file, fileHashMemo)])),
+            compiler_options_digest: compilerOptionsDigest,
+          };
         }
       } else if (analysisCache !== undefined && analysisCache.key === cacheKey) {
         analysis = analysisCache.analysis;
@@ -457,15 +572,20 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
           outcome: "success",
           result_type: "fact_delta",
           work_item_id: factDelta.work_item_id,
+          ...(descriptor.native_batch_transport === "host" ? {} : { fact_delta_batches: [...iterateNativeFactDeltaBatches(factDelta)] }),
           validation_input: { raw_delta: factDelta, accepted_manifest: acceptedManifest },
         });
       }
       const projections = analysis.entities.map((entity) => ({ projection_kind: "jsts:semantic_preparation", identity_key: entity.id, text: `${entity.kind} ${entity.qualified_name ?? entity.name}`, path: entity.path, start: entity.start, end: entity.end }));
-      const projectionDigest = `sha256:${createHash("sha256").update(JSON.stringify(projections)).digest("hex")}`;
+      // The public projection set is already an output array, but its digest
+      // must not create a second aggregate JSON representation.  Hash the
+      // logical fields directly with the v3 writer; validators accept the
+      // legacy canonical digest during the rolling wire migration.
+      const projectionDigest = new LogicalDigestWriter("urdira:projection-set:v3").value(projections).digest();
       return response(request, { projection_set: { projections, projection_set_digest: projectionDigest }, plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID });
     },
     async cancel(): Promise<void> { return; },
     async reset(): Promise<unknown> { return { state_reset: true }; },
-    async terminate(): Promise<void> { terminated = true; analysisCache = undefined; syntaxAnalysisCache.clear(); fileHashMemo.clear(); session.close(); },
+    async terminate(): Promise<void> { terminated = true; analysisCache = undefined; stage1AnalysisCache = undefined; fileHashMemo.clear(); session.close(); },
   };
 }

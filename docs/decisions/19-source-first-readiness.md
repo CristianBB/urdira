@@ -46,13 +46,16 @@ operations. Source-safe operations are `core:find_artifacts`, source-projection
 `core:search_text`, and artifact-selector `core:get_source`. Pipelines and
 recipes inherit the strongest layer required by any stage.
 
-## Compatibility
+## API v3 migration
 
-Index Status API v1 and v2 retain their existing structural-snapshot behavior.
-MCP defaults to v3 and does not advertise an output schema. Query API v1
-retains the structural-snapshot requirement. Query API v2 may bind source-safe
-operations to a `source-snapshot:<generation>` identifier; structural queries
-continue to require a structural snapshot.
+This decision authorizes the destructive wire migration to API v3. Index
+status, query, continuation, operation, and recipe requests accept only
+`api_version = 3`. The v3 contract carries all currently supported behavior,
+including source-snapshot bindings and layered readiness; v1/v2 aliases,
+normalizers, and legacy structural-snapshot fallbacks are removed. The v3
+runtime also rejects pre-v3 and early-preview v3 roots; it has no legacy reader
+or in-place migration, and activation requires a fresh data root plus source
+reindexing.
 
 The authoritative response shapes are `SourceSnapshot`,
 `WorkspaceReadinessView`, `IndexLayerReadinessView`, and

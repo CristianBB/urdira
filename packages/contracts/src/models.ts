@@ -2,6 +2,7 @@ export type Identifier = string;
 export type NamespacedIdentifier = string;
 export type Digest = string;
 export type JsonValue = string | number | boolean | null | ReadonlyArray<JsonValue> | { readonly [key: string]: JsonValue };
+export type SourceProviderPayload = JsonValue | Uint8Array | Readonly<Record<string, unknown>>;
 export type ClosedPayloadValue = string | number | boolean | null | ReadonlyArray<string | number | boolean | null> | Readonly<Record<string, string | number | boolean | null>>;
 export type OperationErrorDetails = Readonly<Record<string, ClosedPayloadValue>>;
 export type DiagnosticPayload = Readonly<Record<string, ClosedPayloadValue>>;
@@ -65,13 +66,27 @@ export interface QueryParticipant { workspace_id: string; role: string; snapshot
 export interface ComparisonScope { scope_type: "comparison"; participants: ReadonlyArray<QueryParticipant>; }
 export type QueryScope = SingleWorkspaceScope | ComparisonScope;
 export interface OperationExpression { expression_type: "operation"; operation: string; arguments: OperationArguments; }
+export interface PipelineBinding { stage_id: string; output: string; }
+export interface PipelineV3Stage {
+  stage_id: string;
+  stage_type: "operation" | "operator";
+  operation?: string;
+  operation_version?: number;
+  operator?: string;
+  arguments: Readonly<Record<string, unknown>>;
+  bindings?: Readonly<Record<string, PipelineBinding>>;
+  inputs?: ReadonlyArray<PipelineBinding>;
+}
+export interface PipelineV3Output { name: string; stage_id: string; output: string; }
+export interface PipelineV3Expression { expression_type: "pipeline"; stages: ReadonlyArray<PipelineV3Stage>; outputs: ReadonlyArray<PipelineV3Output>; }
 export interface PipelineExpression { expression_type: "pipeline"; stages: ReadonlyArray<QueryStage>; outputs: ReadonlyArray<StageOutputReference>; }
 export interface RecipeExpression { expression_type: "recipe"; recipe_id: string; recipe_version?: number; arguments: RecipeArguments; }
-export type QueryExpression = OperationExpression | PipelineExpression | RecipeExpression;
-export interface QueryStage { stage_id: string; operator: string; inputs: ReadonlyArray<StageOutputReference>; arguments: QueryStageArguments; }
-export interface StageOutputReference { stage_id: string; output: string; }
+export type QueryExpression = OperationExpression | PipelineExpression | PipelineV3Expression | RecipeExpression;
+export interface QueryStage { stage_id: string; operator: string; inputs: ReadonlyArray<StageOutputReference>; arguments: QueryStageArguments; operation_version?: number; }
+/** Internal normalized reference; v3 also preserves the public output alias. */
+export interface StageOutputReference { stage_id: string; output: string; name?: string; }
 export interface ResponseBudget { max_items: number; max_characters: number; }
-export interface QueryOptions { freshness: "snapshot" | "current" | "wait_for_current"; wait_timeout_ms: number; coverage_requirement: "accept_reported" | "require_complete"; evidence: EvidenceIncludeOptions; diagnostics: DiagnosticIncludeOptions; snippets: SourceIncludeOptions; registry: RegistryIncludeOptions; response_budget: ResponseBudget; }
+export interface QueryOptions { freshness: "snapshot" | "current" | "wait_for_current"; wait_timeout_ms: number; required_frontier?: "source" | "syntax" | "structural" | "semantic"; coverage_requirement: "accept_reported" | "require_complete"; evidence: EvidenceIncludeOptions; diagnostics: DiagnosticIncludeOptions; snippets: SourceIncludeOptions; registry: RegistryIncludeOptions; response_budget: ResponseBudget; }
 export interface QueryRequest { api_version: number; scope: QueryScope; expression: QueryExpression; options: QueryOptions; }
 export interface ContinuationRequest { api_version: number; scope: QueryScope; cursor: string; response_budget: ResponseBudget; }
 export interface DefinitionMatcher { text: string; mode: "exact" | "prefix" | "contains" | "semantic" | "hybrid"; definition_types?: ReadonlyArray<string>; namespaces?: ReadonlyArray<string>; limit?: number; }
@@ -84,7 +99,7 @@ export interface FindReferencesArguments { target: SubjectSelector; reference_ro
 export interface ExpandRelationsArguments { subjects: ReadonlyArray<SubjectSelector> | StageOutputSubjectSelector; direction: "inbound" | "outbound" | "both"; relations: RelationSelector; min_depth?: number; max_depth?: number; path_policy?: "simple_subjects" | "simple_relations"; filter?: StructuralFilter; }
 export interface FindPathsArguments { sources: ReadonlyArray<SubjectSelector> | StageOutputSubjectSelector; targets: ReadonlyArray<SubjectSelector> | StageOutputSubjectSelector; direction?: "outbound" | "inbound" | "both"; relations: RelationSelector; max_depth: number; all_shortest?: boolean; }
 export interface FindArtifactsArguments { filter?: StructuralFilter; }
-export interface SearchTextArguments { pattern: string; syntax?: "literal" | "safe_regex"; case_sensitive?: boolean; word_mode?: "substring" | "identifier" | "token"; filter?: StructuralFilter; result_projection?: "match" | "artifact" | "record" | "entity"; }
+export interface SearchTextArguments { pattern: string; syntax?: "literal" | "safe_regex"; case_sensitive?: boolean; word_mode?: "substring" | "identifier" | "token"; filter?: StructuralFilter; result_projection?: "match" | "artifact" | "record" | "entity"; subjects?: ReadonlyArray<SubjectSelector> | StageOutputSubjectSelector; }
 export interface SearchSemanticArguments { query_text: string; query_class: "natural_text" | "identifier" | "source_code" | "mixed"; filter?: StructuralFilter; require_structural_subject?: boolean; }
 export type SearchHybridArguments = SearchSemanticArguments;
 export interface GetSourceArguments { subjects: ReadonlyArray<SubjectSelector> | StageOutputSubjectSelector; source: SourceIncludeOptions; include_related_evidence?: boolean; }
@@ -459,7 +474,7 @@ export interface CanonicalEncodingConformanceCase {
   digest_recipe_id?: string;
   recipe_version?: string;
   expected_outcome: string;
-  expected_cbor_hex?: string;
+  expected_encoding_hex?: string;
   expected_digest_text?: string;
   expected_error_code?: string;
 }
@@ -496,7 +511,7 @@ export interface SourceProviderResponseEnvelope {
   component_id: string;
   component_version: string;
   outcome: string;
-  payload?: JsonValue;
+  payload?: SourceProviderPayload;
   error?: string;
 }
 export interface SourceProviderDescribeRequest {
@@ -528,7 +543,7 @@ export interface SourceProviderReadRequest {
 export interface SourceProviderReadResult {
   artifact_id: string;
   provider_version_token: string;
-  content_bytes: string;
+  content: Uint8Array;
   content_hash: string;
   byte_length: number;
   metadata_digest: string;
@@ -755,6 +770,7 @@ export interface NormalizedQueryPlan {
   normalized_expression: QueryExpression;
   freshness: "snapshot" | "current" | "wait_for_current";
   wait_timeout_ms: number;
+  required_frontier?: "source" | "syntax" | "structural" | "semantic";
   coverage_requirement: "accept_reported" | "require_complete";
   projection: NormalizedResultProjection;
   response_budget: NormalizedResponseBudget;
@@ -2589,7 +2605,7 @@ export interface ResultSetPage { result_set: string; confirmed: ResultStreamPage
 export interface ResultStreamPage { classification: "confirmed" | "possible"; page_mode: "hydrated" | "summary"; result_bundles: ReadonlyArray<ResultBundle>; total: number; next_cursor?: string; previous_cursor?: string; has_next: boolean; has_previous: boolean; }
 export interface QueryResultPage { query_execution_id: string; scope_kind: "single_workspace" | "comparison"; workspace_snapshot_bindings: ReadonlyArray<WorkspaceSnapshotBinding>; semantic_coverage_views: ReadonlyArray<SemanticCoverageView>; result_sets: ReadonlyArray<ResultSetPage>; expires_at: string; returned_items: number; returned_characters: number; estimated_tokens?: number; completeness_report: CompletenessReport; diagnostic_report: DiagnosticReport; registry_bundle?: RegistryBundle; }
 export type IndexStatusRequest = IndexStatusInitialRequest | IndexStatusInitialRequestV2 | IndexStatusInitialRequestV3 | IndexStatusInitialListRequestV3 | IndexStatusContinuationRequest;
-/** API v2 initial status request. A root lookup is intentionally disjoint from ID lookup. */
+/** Retained persistence type; new wire requests use the v3 root form. */
 export interface IndexStatusInitialRequestV2 {
   request_type: "initial";
   api_version: 2;
@@ -2688,7 +2704,7 @@ export type ReadinessFreshness = "equivalent" | "changes_pending" | "degraded";
 export interface SourceSnapshot { source_snapshot_id: string; workspace_id: string; generation: number; source_state_digest?: string; provider_watermarks: JsonValue; lexical_coverage: JsonValue; }
 export interface IndexLayerReadinessView { availability: ReadinessAvailability; completeness: ReadinessCompleteness; freshness?: ReadinessFreshness; build_state: ReadinessBuildState; snapshot_id?: string; based_on_source_snapshot_id?: string; based_on_structural_snapshot_id?: string; reason_codes: ReadonlyArray<string>; retry_after_ms?: number; }
 export interface WorkspaceReadinessView { source: IndexLayerReadinessView; structural: IndexLayerReadinessView; semantic: IndexLayerReadinessView; }
-export interface OperationAvailabilityView { available_now: ReadonlyArray<string>; blocked: ReadonlyArray<{ operation: string; required_layer: "source" | "structural" | "semantic"; retryable: boolean; reason_code: string; retry_after_ms?: number }>; }
+export interface OperationAvailabilityView { available_now: ReadonlyArray<string>; blocked: ReadonlyArray<{ operation: string; required_layer: "source" | "syntax" | "structural" | "semantic"; retryable: boolean; reason_code: string; retry_after_ms?: number }>; }
 export interface WorkspaceIndexStatusView {
   workspace_id: string;
   display_root: string;
@@ -2710,6 +2726,8 @@ export interface WorkspaceIndexStatusView {
   latest_activation_attempt?: string;
   /** Derived source-first readiness booleans. They are never persisted independently. */
   source_ready?: boolean;
+  syntax_ready?: boolean;
+  structural_stage_1_ready?: boolean;
   structural_ready?: boolean;
   semantic_ready?: boolean;
   source_snapshot_id?: string;

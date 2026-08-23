@@ -1,4 +1,4 @@
-import { decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
+import { digestBytes } from "@urdira/canonical";
 import type { ContentBlob, SourceArtifact } from "@urdira/contracts";
 import type { BlobStore } from "./cas.js";
 import { resetTimings, snapshotTimings, timed, timingEnabled } from "./debug-timing.js";
@@ -42,6 +42,14 @@ export interface SourceIndexContentInput {
   readonly media_type: string;
 }
 
+export interface SourceIndexContentStreamInput {
+  readonly content_blob_id: string;
+  readonly stream: AsyncIterable<Uint8Array>;
+  readonly content_hash: string;
+  readonly byte_length: number;
+  readonly media_type: string;
+}
+
 export interface SourceIndexCommitInput {
   readonly expected_state_revision: number;
   readonly state: SourceIndexState;
@@ -49,6 +57,7 @@ export interface SourceIndexCommitInput {
   readonly observations: readonly SourceObservationRecord[];
   readonly artifacts: readonly SourceArtifact[];
   readonly contents: readonly SourceIndexContentInput[];
+  readonly content_streams?: readonly SourceIndexContentStreamInput[];
   readonly version_closures: readonly ArtifactVersionRecord[];
   readonly versions: readonly ArtifactVersionRecord[];
   readonly tombstone_closures: readonly ArtifactTombstoneRecord[];
@@ -56,13 +65,79 @@ export interface SourceIndexCommitInput {
 }
 
 interface PresentRow extends Record<string, unknown> {
-  readonly artifact_payload: unknown;
-  readonly artifact_version_payload: unknown;
+  readonly artifact_id: string;
+  readonly workspace_id: string;
+  readonly normalized_uri: string;
+  readonly normalized_path: string | null;
+  readonly display_path: string | null;
+  readonly artifact_kind: string;
+  readonly artifact_version_id: string;
+  readonly content_blob_id: string;
+  readonly content_hash: string;
+  readonly byte_length: number;
+  readonly encoding: string;
+  readonly language_hint: string | null;
+  readonly analysis_metadata_digest: string;
+  readonly created_from_observation_id: string;
+  readonly valid_from_generation: number;
+  readonly valid_to_generation: number | null;
 }
 
 interface AbsentRow extends Record<string, unknown> {
-  readonly artifact_payload: unknown;
-  readonly artifact_tombstone_payload: unknown;
+  readonly artifact_id: string;
+  readonly workspace_id: string;
+  readonly normalized_uri: string;
+  readonly normalized_path: string | null;
+  readonly display_path: string | null;
+  readonly artifact_kind: string;
+  readonly artifact_tombstone_id: string;
+  readonly absence_kind: string;
+  readonly absence_reason_code: string;
+  readonly last_artifact_version_id: string;
+  readonly valid_from_generation: number;
+  readonly valid_to_generation: number | null;
+  readonly opening_artifact_change_id: string;
+  readonly closing_artifact_change_id: string | null;
+  readonly replacement_artifact_version_id: string | null;
+  readonly cause_references: string;
+  readonly lineage_evidence_record_ids: string;
+}
+
+interface TypedPresentRow extends Record<string, unknown> {
+  readonly artifact_id: string;
+  readonly workspace_id: string;
+  readonly normalized_uri: string;
+  readonly normalized_path: string | null;
+  readonly display_path: string | null;
+  readonly artifact_kind: string;
+  readonly artifact_version_id: string;
+  readonly content_blob_id: string;
+  readonly content_hash: string;
+  readonly byte_length: number;
+  readonly encoding: string;
+  readonly language_hint: string | null;
+  readonly analysis_metadata_digest: string;
+  readonly created_from_observation_id: string;
+  readonly valid_from_generation: number;
+  readonly valid_to_generation: number | null;
+}
+
+interface TypedAbsentRow extends Record<string, unknown> {
+  readonly artifact_id: string;
+  readonly workspace_id: string;
+  readonly normalized_uri: string;
+  readonly artifact_kind: string;
+  readonly artifact_tombstone_id: string;
+  readonly absence_kind: string;
+  readonly absence_reason_code: string;
+  readonly last_artifact_version_id: string;
+  readonly valid_from_generation: number;
+  readonly valid_to_generation: number | null;
+  readonly opening_artifact_change_id: string;
+  readonly closing_artifact_change_id: string | null;
+  readonly replacement_artifact_version_id: string | null;
+  readonly cause_references: string;
+  readonly lineage_evidence_record_ids: string;
 }
 
 /**
@@ -97,7 +172,7 @@ export interface SlimArtifactVersion {
  * object through wholesale as `SourceCandidatePresentObservation.artifact`,
  * which requires every `SourceArtifact` field. This costs nothing extra to
  * produce either way -- every `SourceArtifact` field is already a plain
- * typed `source_artifacts` column, not something a CBOR decode would have
+ * typed `source_artifacts` column, not something a generic payload decode would have
  * been needed for.
  */
 export interface SlimSourceOccurrence {
@@ -161,7 +236,9 @@ export class WorkspaceSourceIndexRepository {
 
   async currentOccurrences(sourceProviderBindingId: string): Promise<readonly CurrentSourceOccurrence[]> {
     const rows = await this.database.all<PresentRow>(
-      `SELECT artifact.artifact_payload, version.artifact_version_payload
+      `SELECT artifact.artifact_id, artifact.workspace_id, artifact.normalized_uri, artifact.normalized_path, artifact.display_path, artifact.artifact_kind,
+              version.artifact_version_id, version.content_blob_id, version.content_hash, version.byte_length, version.encoding, version.language_hint,
+              version.analysis_metadata_digest, version.created_from_observation_id, version.valid_from_generation, version.valid_to_generation
        FROM artifact_versions AS version
        JOIN source_artifacts AS artifact ON artifact.workspace_id = version.workspace_id AND artifact.artifact_id = version.artifact_id
        JOIN source_observations AS observation ON observation.workspace_id = version.workspace_id
@@ -171,14 +248,17 @@ export class WorkspaceSourceIndexRepository {
       [this.workspaceId, sourceProviderBindingId],
     );
     return rows.map((row) => ({
-      artifact: decodeCanonical(bytes(row.artifact_payload)) as SourceArtifact,
-      version: decodeCanonical(bytes(row.artifact_version_payload)) as ArtifactVersionRecord,
+      artifact: { artifact_id: row.artifact_id, workspace_id: row.workspace_id, normalized_uri: row.normalized_uri, ...(row.normalized_path == null ? {} : { normalized_path: row.normalized_path }), ...(row.display_path == null ? {} : { display_path: row.display_path }), artifact_kind: row.artifact_kind },
+      version: { artifact_version_id: row.artifact_version_id, workspace_id: row.workspace_id, artifact_id: row.artifact_id, content_blob_id: row.content_blob_id, content_hash: row.content_hash, byte_length: row.byte_length, encoding: row.encoding, ...(row.language_hint == null ? {} : { language_hint: row.language_hint }), analysis_metadata_digest: row.analysis_metadata_digest, created_from_observation_id: row.created_from_observation_id, valid_from_generation: row.valid_from_generation, ...(row.valid_to_generation == null ? {} : { valid_to_generation: row.valid_to_generation }) },
     }));
   }
 
   async currentAbsences(sourceProviderBindingId: string): Promise<readonly CurrentSourceAbsence[]> {
     const rows = await this.database.all<AbsentRow>(
-      `SELECT artifact.artifact_payload, tombstone.artifact_tombstone_payload
+      `SELECT artifact.artifact_id, artifact.workspace_id, artifact.normalized_uri, artifact.normalized_path, artifact.display_path, artifact.artifact_kind,
+              tombstone.artifact_tombstone_id, tombstone.absence_kind, tombstone.absence_reason_code, tombstone.last_artifact_version_id,
+              tombstone.valid_from_generation, tombstone.valid_to_generation, tombstone.opening_artifact_change_id, tombstone.closing_artifact_change_id,
+              tombstone.replacement_artifact_version_id, tombstone.cause_references, tombstone.lineage_evidence_record_ids
        FROM artifact_tombstones AS tombstone
        JOIN source_artifacts AS artifact ON artifact.workspace_id = tombstone.workspace_id AND artifact.artifact_id = tombstone.artifact_id
        JOIN artifact_versions AS version ON version.workspace_id = tombstone.workspace_id
@@ -190,8 +270,89 @@ export class WorkspaceSourceIndexRepository {
       [this.workspaceId, sourceProviderBindingId],
     );
     return rows.map((row) => ({
-      artifact: decodeCanonical(bytes(row.artifact_payload)) as SourceArtifact,
-      tombstone: decodeCanonical(bytes(row.artifact_tombstone_payload)) as ArtifactTombstoneRecord,
+      artifact: { artifact_id: row.artifact_id, workspace_id: row.workspace_id, normalized_uri: row.normalized_uri, ...(row.normalized_path == null ? {} : { normalized_path: row.normalized_path }), ...(row.display_path == null ? {} : { display_path: row.display_path }), artifact_kind: row.artifact_kind },
+      tombstone: { artifact_tombstone_id: row.artifact_tombstone_id, workspace_id: row.workspace_id, artifact_id: row.artifact_id, absence_kind: row.absence_kind as ArtifactTombstoneRecord["absence_kind"], absence_reason_code: row.absence_reason_code, last_artifact_version_id: row.last_artifact_version_id, valid_from_generation: row.valid_from_generation, ...(row.valid_to_generation == null ? {} : { valid_to_generation: row.valid_to_generation }), opening_artifact_change_id: row.opening_artifact_change_id, ...(row.closing_artifact_change_id == null ? {} : { closing_artifact_change_id: row.closing_artifact_change_id }), ...(row.replacement_artifact_version_id == null ? {} : { replacement_artifact_version_id: row.replacement_artifact_version_id }), cause_references: JSON.parse(row.cause_references), lineage_evidence_record_ids: JSON.parse(row.lineage_evidence_record_ids) },
+    }));
+  }
+
+  /**
+   * Bounded source-index reconciliation read. The legacy methods above are
+   * retained for compatibility, but the hot scan path must not decode a
+   * generic artifact/version payload for every file in a large workspace.
+   */
+  async currentOccurrencesForIndex(sourceProviderBindingId: string): Promise<readonly CurrentSourceOccurrence[]> {
+    const rows = await this.database.all<TypedPresentRow>(
+      `SELECT artifact.artifact_id, artifact.workspace_id, artifact.normalized_uri, artifact.normalized_path, artifact.display_path, artifact.artifact_kind,
+              version.artifact_version_id, version.content_blob_id, version.content_hash, version.byte_length, version.encoding, version.language_hint,
+              version.analysis_metadata_digest, version.created_from_observation_id, version.valid_from_generation, version.valid_to_generation
+       FROM artifact_versions AS version
+       JOIN source_artifacts AS artifact ON artifact.workspace_id = version.workspace_id AND artifact.artifact_id = version.artifact_id
+       JOIN source_observations AS observation ON observation.workspace_id = version.workspace_id
+         AND observation.artifact_id = version.artifact_id AND observation.source_observation_id = version.created_from_observation_id
+       WHERE version.workspace_id = ? AND observation.source_provider_binding_id = ? AND version.valid_to_generation IS NULL
+       ORDER BY artifact.normalized_uri, artifact.artifact_id`,
+      [this.workspaceId, sourceProviderBindingId],
+    );
+    return rows.map((row) => ({
+      artifact: {
+        artifact_id: row.artifact_id,
+        workspace_id: row.workspace_id,
+        normalized_uri: row.normalized_uri,
+        ...(row.normalized_path === null ? {} : { normalized_path: row.normalized_path }),
+        ...(row.display_path === null ? {} : { display_path: row.display_path }),
+        artifact_kind: row.artifact_kind,
+      },
+      version: {
+        artifact_version_id: row.artifact_version_id,
+        workspace_id: row.workspace_id,
+        artifact_id: row.artifact_id,
+        content_blob_id: row.content_blob_id,
+        content_hash: row.content_hash,
+        byte_length: row.byte_length,
+        encoding: row.encoding,
+        ...(row.language_hint === null ? {} : { language_hint: row.language_hint }),
+        analysis_metadata_digest: row.analysis_metadata_digest,
+        created_from_observation_id: row.created_from_observation_id,
+        valid_from_generation: row.valid_from_generation,
+        ...(row.valid_to_generation === null ? {} : { valid_to_generation: row.valid_to_generation }),
+      },
+    }));
+  }
+
+  async currentAbsencesForIndex(sourceProviderBindingId: string): Promise<readonly CurrentSourceAbsence[]> {
+    const rows = await this.database.all<TypedAbsentRow>(
+      `SELECT artifact.artifact_id, artifact.workspace_id, artifact.normalized_uri, artifact.artifact_kind,
+              tombstone.artifact_tombstone_id, tombstone.absence_kind, tombstone.absence_reason_code,
+              tombstone.last_artifact_version_id, tombstone.valid_from_generation, tombstone.valid_to_generation,
+              tombstone.opening_artifact_change_id, tombstone.closing_artifact_change_id,
+              tombstone.replacement_artifact_version_id, tombstone.cause_references, tombstone.lineage_evidence_record_ids
+       FROM artifact_tombstones AS tombstone
+       JOIN source_artifacts AS artifact ON artifact.workspace_id = tombstone.workspace_id AND artifact.artifact_id = tombstone.artifact_id
+       JOIN artifact_versions AS version ON version.workspace_id = tombstone.workspace_id
+         AND version.artifact_id = tombstone.artifact_id AND version.artifact_version_id = tombstone.last_artifact_version_id
+       JOIN source_observations AS observation ON observation.workspace_id = version.workspace_id
+         AND observation.artifact_id = version.artifact_id AND observation.source_observation_id = version.created_from_observation_id
+       WHERE tombstone.workspace_id = ? AND observation.source_provider_binding_id = ? AND tombstone.valid_to_generation IS NULL
+       ORDER BY artifact.normalized_uri, artifact.artifact_id`,
+      [this.workspaceId, sourceProviderBindingId],
+    );
+    return rows.map((row) => ({
+      artifact: { artifact_id: row.artifact_id, workspace_id: row.workspace_id, normalized_uri: row.normalized_uri, artifact_kind: row.artifact_kind },
+      tombstone: {
+        artifact_tombstone_id: row.artifact_tombstone_id,
+        workspace_id: row.workspace_id,
+        artifact_id: row.artifact_id,
+        absence_kind: row.absence_kind,
+        absence_reason_code: row.absence_reason_code,
+        last_artifact_version_id: row.last_artifact_version_id,
+        valid_from_generation: row.valid_from_generation,
+        ...(row.valid_to_generation === null ? {} : { valid_to_generation: row.valid_to_generation }),
+        opening_artifact_change_id: row.opening_artifact_change_id,
+        ...(row.closing_artifact_change_id === null ? {} : { closing_artifact_change_id: row.closing_artifact_change_id }),
+        ...(row.replacement_artifact_version_id === null ? {} : { replacement_artifact_version_id: row.replacement_artifact_version_id }),
+        cause_references: row.cause_references,
+        lineage_evidence_record_ids: row.lineage_evidence_record_ids,
+      },
     }));
   }
 
@@ -455,6 +616,25 @@ export class WorkspaceSourceIndexRepository {
           storage_reference: reference.storage_reference,
         });
       }
+      const streams = input.content_streams ?? [];
+      const streamReferences = await this.blobs.cas.putStreamsMany(streams.map((content) => ({
+        chunks: content.stream,
+        options: {
+          content_hash: content.content_hash,
+          byte_length: content.byte_length,
+          media_type: content.media_type,
+        },
+      })));
+      for (let index = 0; index < streams.length; index += 1) {
+        const content = streams[index] as NonNullable<SourceIndexCommitInput["content_streams"]>[number];
+        const reference = streamReferences[index] as ContentBlob;
+        stagedContents.set(content.content_blob_id, {
+        content_blob_id: content.content_blob_id,
+        content_hash: reference.content_hash,
+        byte_length: reference.byte_length,
+        storage_reference: reference.storage_reference,
+        });
+      }
     });
     await this.faults.hit("source_index.before_commit");
     // Commands are streamed to the SQLite worker in bounded chunks
@@ -489,20 +669,20 @@ export class WorkspaceSourceIndexRepository {
       kind: "run",
       sql: `INSERT OR IGNORE INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider,
         source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority,
-        provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest,
-        observation_batch_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       params: [value.observation_batch_id, value.workspace_id, value.source_provider_binding_id, value.source_provider, value.source_provider_version,
         value.ordering_domain, value.observation_mode, value.coverage_scopes, value.coverage_completeness, value.deletion_authority,
         optionalText(value.provider_cursor_before), optionalText(value.provider_cursor_after), value.started_at, value.completed_at,
-        value.observation_count, value.unavailable_count, value.batch_digest, encodeCanonical(value)],
+        value.observation_count, value.unavailable_count, value.batch_digest],
     };
   }
 
   private artifactCommand(value: SourceArtifact): SqliteCommand {
     return {
       kind: "run",
-      sql: "INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      params: [value.artifact_id, value.workspace_id, value.normalized_uri, optionalText(value.normalized_path), optionalText(value.display_path), value.artifact_kind, encodeCanonical(value)],
+      sql: "INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES (?, ?, ?, ?, ?, ?)",
+      params: [value.artifact_id, value.workspace_id, value.normalized_uri, optionalText(value.normalized_path), optionalText(value.display_path), value.artifact_kind],
     };
   }
 
@@ -519,12 +699,12 @@ export class WorkspaceSourceIndexRepository {
       kind: "run",
       sql: `INSERT OR IGNORE INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id,
         source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state,
-        observed_content_hash, observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at, observation_payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        observed_content_hash, observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       params: [value.source_observation_id, value.observation_batch_id, value.workspace_id, value.artifact_id, value.source_provider_binding_id,
         value.source_provider, value.source_provider_version, value.ordering_domain, value.observation_mode, value.observed_state,
         optionalText(value.observed_content_hash), optionalText(value.observed_metadata_digest), optionalText(value.provider_event_token),
-        optionalText(value.provider_sequence), value.observed_at, value.received_at, encodeCanonical(value)],
+        optionalText(value.provider_sequence), value.observed_at, value.received_at],
     };
   }
 
@@ -532,19 +712,19 @@ export class WorkspaceSourceIndexRepository {
     return {
       kind: "run",
       sql: `INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length,
-        encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation,
-        artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       params: [value.artifact_version_id, value.workspace_id, value.artifact_id, value.content_blob_id, value.content_hash, value.byte_length,
         value.encoding, optionalText(value.language_hint), value.analysis_metadata_digest, value.created_from_observation_id,
-        value.valid_from_generation, optionalNumber(value.valid_to_generation), encodeCanonical(value)],
+        value.valid_from_generation, optionalNumber(value.valid_to_generation)],
     };
   }
 
   private closeVersionCommand(value: ArtifactVersionRecord): SqliteCommand {
     return {
       kind: "run",
-      sql: "UPDATE artifact_versions SET valid_to_generation = ?, artifact_version_payload = ? WHERE workspace_id = ? AND artifact_version_id = ? AND valid_to_generation IS NULL",
-      params: [optionalNumber(value.valid_to_generation), encodeCanonical(value), this.workspaceId, value.artifact_version_id],
+      sql: "UPDATE artifact_versions SET valid_to_generation = ? WHERE workspace_id = ? AND artifact_version_id = ? AND valid_to_generation IS NULL",
+      params: [optionalNumber(value.valid_to_generation), this.workspaceId, value.artifact_version_id],
     };
   }
 
@@ -553,22 +733,21 @@ export class WorkspaceSourceIndexRepository {
       kind: "run",
       sql: `INSERT INTO artifact_tombstones (artifact_tombstone_id, workspace_id, artifact_id, absence_kind, absence_reason_code,
         last_artifact_version_id, valid_from_generation, valid_to_generation, opening_artifact_change_id, closing_artifact_change_id,
-        replacement_artifact_version_id, cause_references, lineage_evidence_record_ids, artifact_tombstone_payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        replacement_artifact_version_id, cause_references, lineage_evidence_record_ids)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       params: [value.artifact_tombstone_id, value.workspace_id, value.artifact_id, value.absence_kind, value.absence_reason_code,
         value.last_artifact_version_id, value.valid_from_generation, optionalNumber(value.valid_to_generation), value.opening_artifact_change_id,
         optionalText(value.closing_artifact_change_id), optionalText(value.replacement_artifact_version_id), value.cause_references,
-        value.lineage_evidence_record_ids, encodeCanonical(value)],
+        value.lineage_evidence_record_ids],
     };
   }
 
   private closeTombstoneCommand(value: ArtifactTombstoneRecord): SqliteCommand {
     return {
       kind: "run",
-      sql: `UPDATE artifact_tombstones SET valid_to_generation = ?, closing_artifact_change_id = ?, replacement_artifact_version_id = ?,
-        artifact_tombstone_payload = ? WHERE workspace_id = ? AND artifact_tombstone_id = ? AND valid_to_generation IS NULL`,
+      sql: "UPDATE artifact_tombstones SET valid_to_generation = ?, closing_artifact_change_id = ?, replacement_artifact_version_id = ? WHERE workspace_id = ? AND artifact_tombstone_id = ? AND valid_to_generation IS NULL",
       params: [optionalNumber(value.valid_to_generation), optionalText(value.closing_artifact_change_id), optionalText(value.replacement_artifact_version_id),
-        encodeCanonical(value), this.workspaceId, value.artifact_tombstone_id],
+        this.workspaceId, value.artifact_tombstone_id],
     };
   }
 

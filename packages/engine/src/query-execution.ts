@@ -7,6 +7,7 @@ import { evaluateOperation, type OperationEvaluation, type QueryDataPort, type Q
 import { executePipeline } from "./pipeline-executor.js";
 import { normalizeQueryRequest, type NormalizedQueryPlan } from "./query-plan.js";
 import { executeRecipe } from "./recipe-executor.js";
+import { SqliteStageSpool, type StageSpool } from "./pipeline-spool.js";
 
 export interface QueryExecutionOptions {
   readonly data_port: QueryDataPort;
@@ -14,6 +15,9 @@ export interface QueryExecutionOptions {
   readonly manifest_store?: QueryManifestStore;
   readonly now?: () => string;
   readonly execution_id_factory?: (plan: NormalizedQueryPlan) => string;
+  /** Factory for an execution-local relational pipeline spool. */
+  readonly stage_spool_factory?: () => Promise<StageSpool>;
+  readonly abort_signal?: AbortSignal;
 }
 
 export interface QueryContinuationRequest {
@@ -23,6 +27,10 @@ export interface QueryContinuationRequest {
 
 export interface QueryManifestStore {
   readonly append: (execution_id: string, result_stream: string, direction: CursorDirection, items: ReadonlyArray<QueryStreamItem>) => Promise<void>;
+  /** Streaming variant used by v3 pipelines. Implementations may choose a
+   * bounded persistence batch; callers must not materialize the whole stream
+   * merely to create the immutable cursor manifest. */
+  readonly appendIterable?: (execution_id: string, result_stream: string, direction: CursorDirection, items: AsyncIterable<QueryStreamItem>) => Promise<void>;
   readonly reader: ManifestStreamReader<QueryStreamItem>;
 }
 
@@ -52,6 +60,13 @@ class MemoryManifestStore implements QueryManifestStore {
     if (this.values.has(key)) return;
     this.values.set(key, [...items]);
   }
+  async appendIterable(executionId: string, resultStream: string, direction: CursorDirection, items: AsyncIterable<QueryStreamItem>): Promise<void> {
+    const key = `${executionId}\u0000${resultStream}\u0000${direction}`;
+    if (this.values.has(key)) return;
+    const values: QueryStreamItem[] = [];
+    for await (const value of items) values.push(value);
+    this.values.set(key, values);
+  }
   readonly reader: ManifestStreamReader<QueryStreamItem> = {
     read: async (request) => {
       const values = this.values.get(`${request.execution_id}\u0000${request.result_stream}\u0000${request.direction}`) ?? [];
@@ -68,6 +83,15 @@ export class DurableManifestStore implements QueryManifestStore {
   async append(executionId: string, resultStream: string, direction: CursorDirection, items: ReadonlyArray<QueryStreamItem>): Promise<void> {
     const segmentId = `${resultStream}\u0000${direction}`;
     await this.lifecycle.appendManifestSegment(executionId, segmentId, items.map((value, ordinal) => ({ ...value, stable_sort_key: String(ordinal), ordinal })));
+  }
+  async appendIterable(executionId: string, resultStream: string, direction: CursorDirection, items: AsyncIterable<QueryStreamItem>): Promise<void> {
+    // The durable CAS manifest format is one immutable canonical segment. It
+    // is therefore the deliberate final persistence boundary: streaming here
+    // avoids a pre-manifest array in the executor while this adapter collects
+    // only the segment that must be retained for cursor replay.
+    const values: QueryStreamItem[] = [];
+    for await (const value of items) values.push(value);
+    await this.append(executionId, resultStream, direction, values);
   }
   readonly reader: ManifestStreamReader<QueryStreamItem> = {
     read: async (request) => {
@@ -91,12 +115,28 @@ function streamItems(evaluation: OperationEvaluation): Readonly<Record<string, r
   return Object.fromEntries(Object.entries(evaluation.streams).map(([stream, values]) => [stream, values.map(item)]));
 }
 
+async function appendEvaluationStream(store: QueryManifestStore, executionId: string, stream: string, direction: CursorDirection, values: AsyncIterable<QueryStreamItem> | undefined, fallback: readonly QueryStreamItem[]): Promise<void> {
+  if (values !== undefined && store.appendIterable !== undefined) {
+    await store.appendIterable(executionId, stream, direction, values);
+    return;
+  }
+  if (values !== undefined) {
+    const collected: QueryStreamItem[] = [];
+    for await (const value of values) collected.push(value);
+    await store.append(executionId, stream, direction, collected);
+    return;
+  }
+  await store.append(executionId, stream, direction, fallback);
+}
+
 export class QueryEngine {
   private readonly dataPort: QueryDataPort;
   private readonly cursorCache: CursorCache;
   private readonly manifestStore: QueryManifestStore;
   private readonly now: () => string;
   private readonly idFactory: (plan: NormalizedQueryPlan) => string;
+  private readonly stageSpoolFactory: () => Promise<StageSpool>;
+  private readonly abortSignal: AbortSignal | undefined;
   private sequence = 0;
 
   constructor(options: QueryExecutionOptions) {
@@ -105,40 +145,74 @@ export class QueryEngine {
     this.manifestStore = options.manifest_store ?? new MemoryManifestStore();
     this.now = options.now ?? (() => new Date().toISOString());
     this.idFactory = options.execution_id_factory ?? ((plan) => `query-${plan.plan_digest.slice(-16)}-${this.sequence++}`);
+    // Every pipeline gets an execution-local relational spool by default. A
+    // daemon can still inject a file-backed instance rooted in its data root;
+    // the in-memory SQLite variant keeps ordinary calls isolated without
+    // retaining a second JavaScript representation after the stage is sealed.
+    this.stageSpoolFactory = options.stage_spool_factory ?? (async () => SqliteStageSpool.memory());
+    this.abortSignal = options.abort_signal;
   }
 
-  async execute(request: QueryRequest): Promise<QueryExecutionPage> {
+  /**
+   * Evaluates one normalized request exactly once, seals every result stream
+   * into immutable forward and reverse manifests, returns the first bounded
+   * page, and always releases the execution-local pipeline spool. Cursor
+   * continuations read those manifests through {@link continue}; they never
+   * re-evaluate this request.
+   */
+  async execute(request: QueryRequest, requestSignal?: AbortSignal): Promise<QueryExecutionPage> {
     const plan = normalizeQueryRequest(request);
     const executionId = this.idFactory(plan);
     const now = this.now();
     const expiresAt = new Date(Date.parse(now) + 15 * 60 * 1000).toISOString();
-    const evaluation = await this.evaluate(plan, request.scope);
-    if (request.options.coverage_requirement === "require_complete" && (evaluation.completeness as { overall_status?: string } | undefined)?.overall_status !== "complete") throw new EngineError("core:coverage_incomplete", "Complete coverage was required by the request.");
-    const streams = streamItems(evaluation);
-    const pages: Record<string, QueryStreamPage> = {};
-    for (const [stream, values] of Object.entries(streams)) {
-      await this.manifestStore.append(executionId, stream, "forward", values);
-      await this.manifestStore.append(executionId, stream, "backward", [...values].reverse());
-      const page = await this.cursorCache.readPage({ execution_id: executionId, result_stream: stream, direction: "forward", projection_digest: plan.plan_digest, ordering_digest: plan.plan_digest, scope_digest: scopeDigest(request.scope), response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.options.response_budget), frozen_snapshot_digest: scopeDigest(request.scope), frozen_status_digest: evaluation.semantic_state ?? "ready", expires_at: expiresAt, now, limit: request.options.response_budget.max_items, reader: this.manifestStore.reader });
-      pages[stream] = page;
+    const spool = plan.normalized_expression.expression_type === "pipeline" ? await this.stageSpoolFactory() : undefined;
+    const abortSignal = requestSignal ?? this.abortSignal;
+    if (abortSignal?.aborted) throw new EngineError("core:operation_cancelled", "Query execution was cancelled.");
+    let evaluation: OperationEvaluation;
+    try {
+      evaluation = await this.evaluate(plan, request.scope, executionId, spool, abortSignal);
+    } catch (error) {
+      if (spool) {
+        await spool.cleanup(executionId);
+        await spool.close();
+      }
+      throw error;
     }
-    return { query_execution_id: executionId, plan_digest: plan.plan_digest, streams: pages, completeness: (evaluation.completeness as QueryExecutionPage["completeness"]) ?? { overall_status: "complete", dimensions: [] }, diagnostics: request.options.diagnostics.diagnostics === "none" ? [] : evaluation.diagnostics ?? [], registry: { mode: request.options.registry.registry, operation_ids: request.options.registry.registry === "none" ? [] : [...plan.operation_versions].map((binding) => binding.operation_id), recipe_ids: request.options.registry.registry === "none" ? [] : [...plan.recipe_versions].map((binding) => binding.recipe_id) }, ...(evaluation.semantic_state === undefined ? {} : { semantic_state: evaluation.semantic_state }), expires_at: expiresAt };
+    try {
+      if (request.options.coverage_requirement === "require_complete" && (evaluation.completeness as { overall_status?: string } | undefined)?.overall_status !== "complete") throw new EngineError("core:coverage_incomplete", "Complete coverage was required by the request.");
+      const streams = streamItems(evaluation);
+      const pages: Record<string, QueryStreamPage> = {};
+      const streamNames = new Set([...Object.keys(streams), ...Object.keys(evaluation.stream_sources ?? {})]);
+      for (const stream of streamNames) {
+        const values = streams[stream] ?? [];
+        await appendEvaluationStream(this.manifestStore, executionId, stream, "forward", evaluation.stream_sources?.[stream], values);
+        await appendEvaluationStream(this.manifestStore, executionId, stream, "backward", evaluation.reverse_stream_sources?.[stream], [...values].reverse());
+        const page = await this.cursorCache.readPage({ execution_id: executionId, result_stream: stream, direction: "forward", projection_digest: plan.plan_digest, ordering_digest: plan.plan_digest, scope_digest: scopeDigest(request.scope), response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.options.response_budget), frozen_snapshot_digest: scopeDigest(request.scope), frozen_status_digest: evaluation.semantic_state ?? "ready", completeness: evaluation.completeness as QueryExecutionPage["completeness"] | undefined, expires_at: expiresAt, now, limit: request.options.response_budget.max_items, reader: this.manifestStore.reader });
+        pages[stream] = page;
+      }
+      return { query_execution_id: executionId, plan_digest: plan.plan_digest, streams: pages, completeness: (evaluation.completeness as QueryExecutionPage["completeness"]) ?? { overall_status: "unknown", dimensions: [] }, diagnostics: request.options.diagnostics.diagnostics === "none" ? [] : evaluation.diagnostics ?? [], registry: { mode: request.options.registry.registry, operation_ids: request.options.registry.registry === "none" ? [] : [...plan.operation_versions].map((binding) => binding.operation_id), recipe_ids: request.options.registry.registry === "none" ? [] : [...plan.recipe_versions].map((binding) => binding.recipe_id) }, ...(evaluation.semantic_state === undefined ? {} : { semantic_state: evaluation.semantic_state }), expires_at: expiresAt };
+    } finally {
+      if (spool) {
+        await spool.cleanup(executionId);
+        await spool.close();
+      }
+    }
   }
 
   async continue(request: QueryContinuationRequest): Promise<QueryExecutionPage> {
     const claims = this.cursorCache.decode(request.cursor);
     const page = await this.cursorCache.readPage({ cursor: request.cursor, limit: request.response_budget.max_items, reader: this.manifestStore.reader, now: this.now() });
-    return { query_execution_id: claims.execution_id, plan_digest: claims.projection_digest, streams: { [claims.result_stream]: page }, completeness: { overall_status: "complete", dimensions: [] }, diagnostics: [], registry: { mode: "none", operation_ids: [], recipe_ids: [] }, expires_at: claims.expires_at };
+    return { query_execution_id: claims.execution_id, plan_digest: claims.projection_digest, streams: { [claims.result_stream]: page }, completeness: claims.completeness ?? { overall_status: "unknown", dimensions: [] }, diagnostics: [], registry: { mode: "none", operation_ids: [], recipe_ids: [] }, expires_at: claims.expires_at };
   }
 
-  private async evaluate(plan: NormalizedQueryPlan, scope: QueryScope): Promise<OperationEvaluation> {
+  private async evaluate(plan: NormalizedQueryPlan, scope: QueryScope, executionId: string, spool?: StageSpool, abortSignal?: AbortSignal): Promise<OperationEvaluation> {
     const expression = plan.normalized_expression as unknown as QueryRequest["expression"];
     if (expression.expression_type === "operation") return evaluateOperation({ operation_id: expression.operation, arguments: expression.arguments, scope, port: this.dataPort });
     if (expression.expression_type === "recipe") {
       const recipe = recipeRegistry.find((candidate) => candidate.recipe_id === expression.recipe_id)!;
       return executeRecipe({ recipe, recipeArguments: expression.arguments as unknown as Readonly<Record<string, unknown>>, scope, port: this.dataPort });
     }
-    return executePipeline({ stages: expression.stages, outputs: expression.outputs, scope, port: this.dataPort });
+      return executePipeline({ execution_id: executionId, stages: expression.stages as ReadonlyArray<import("@urdira/contracts").QueryStage>, outputs: expression.outputs as ReadonlyArray<import("@urdira/contracts").StageOutputReference>, scope, port: this.dataPort, stream_final: true, ...(spool === undefined ? {} : { spool }), ...(abortSignal === undefined ? {} : { abort_signal: abortSignal }) });
   }
 }
 

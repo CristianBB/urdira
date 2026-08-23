@@ -400,7 +400,7 @@ async function addWorkspaceAndWait(harness: Harness, root: string): Promise<{ re
 
 async function findRecordNames(client: DaemonClient, workspaceId: string): Promise<readonly string[]> {
   const query = {
-    api_version: 1,
+    api_version: 3,
     scope: { scope_type: "single_workspace", workspace_id: workspaceId },
     expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"], kind_selector: { universal_kinds: ["core:type"] }, filter: { languages: ["typescript"] } } } },
     options: {
@@ -945,7 +945,6 @@ describe("Workspace fork publication-conflict regression (real-world e2e finding
         core_registry_digest: forkPlugin.registry.core_registry_digest,
         resolution_lock_id: forkPlugin.resolution_lock.resolution_lock_id,
         registry_digest: forkPlugin.registry.registry_digest,
-        registry_payload: encodeCanonical(forkPlugin.registry),
       };
       if (registryRow !== undefined && !rowMatches(registryRow, expectedRegistry)) throw new Error(`registry_snapshots diverges from the ordinary path's own expected encoding: ${mismatchedFields(registryRow, expectedRegistry).join(",")}`);
 
@@ -956,7 +955,7 @@ describe("Workspace fork publication-conflict regression (real-world e2e finding
       for (const [key, stateKind, value] of controlChecks) {
         const row = await forkDatabase.database.get<Record<string, unknown>>("SELECT * FROM control_plane_state WHERE workspace_id = ? AND state_key = ?", [workspaceId, key]);
         expect(row).toBeDefined();
-        const expected = { state_key: key, workspace_id: workspaceId, state_kind: stateKind, payload: encodeCanonical(value), reference_workspace_id: null, reference_snapshot_id: null, reference_source_state_digest: null };
+        const expected = { state_key: key, workspace_id: workspaceId, state_kind: stateKind, state_json: JSON.stringify(value), reference_workspace_id: null, reference_snapshot_id: null, reference_source_state_digest: null };
         if (row !== undefined && !rowMatches(row, expected)) throw new Error(`control_plane_state[${key}] diverges from the ordinary path's own expected encoding: ${mismatchedFields(row, expected).join(",")}`);
       }
     } finally {

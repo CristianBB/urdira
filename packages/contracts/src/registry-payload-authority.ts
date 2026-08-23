@@ -1177,6 +1177,12 @@ export const authoritativePayloadMetadata = {
   "core:request_invalid.violation": {
     "description": "The `violation` is the closed detail value for `core:request_invalid`; normative emission trigger: Input is not an instance of the selected closed request schema after JSON decoding. (source: protocol/core-operation-error-codes.md)."
   },
+  "core:request_invalid.received": {
+    "description": "A bounded JSON rendering of the received value at the failing schema pointer."
+  },
+  "core:request_invalid.example": {
+    "description": "The smallest valid JSON example for the failing field or expression."
+  },
   "core:api_version_unsupported.requested_version": {
     "description": "The `requested_version` is the closed detail value for `core:api_version_unsupported`; normative emission trigger: `api_version` is syntactically valid but not one of the server's exact supported versions. (source: protocol/core-operation-error-codes.md).",
     "type": "integer",
@@ -1190,6 +1196,9 @@ export const authoritativePayloadMetadata = {
   },
   "core:unknown_field.field_names": {
     "description": "The `field_names` is the closed detail value for `core:unknown_field`; normative emission trigger: A closed request object contains at least one undeclared field. (source: protocol/core-operation-error-codes.md)."
+  },
+  "core:unknown_field.suggested_pointer": {
+    "description": "An optional JSON Pointer to the registered field that most likely matches the received unknown field."
   },
   "core:option_conflict.option_pointers": {
     "description": "The `option_pointers` is the ordered pointer set for `core:option_conflict`; normative emission trigger: Individually valid options violate a documented presence or interaction rule. (source: protocol/core-operation-error-codes.md)."
@@ -1216,7 +1225,7 @@ export const authoritativePayloadMetadata = {
     "minimum": 0
   },
   "core:workspace_not_registered.registration_command": {
-    "description": "The `registration_command` is the closed detail value for `core:workspace_not_registered`; normative emission trigger: An explicit API v2 workspace root has no exact registered workspace after canonicalization. (source: protocol/core-operation-error-codes.md)."
+    "description": "The `registration_command` is the closed detail value for `core:workspace_not_registered`; normative emission trigger: An explicit API v3 workspace root has no exact registered workspace after canonicalization. (source: protocol/core-operation-error-codes.md)."
   },
   "core:workspace_not_found.workspace_id": {
     "description": "The `workspace_id` is the closed detail value for `core:workspace_not_found`; normative emission trigger: An explicit workspace ID has no registered workspace. (source: protocol/core-operation-error-codes.md)."
@@ -1454,6 +1463,30 @@ export const authoritativePayloadMetadata = {
     "description": "The `waited_ms` is the numeric measurement for `core:coverage_incomplete`; normative emission trigger: `require_complete` reaches its wait boundary while a non-semantic required capability remains non-complete. (source: protocol/core-operation-error-codes.md).",
     "type": "integer",
     "minimum": 0
+  },
+  "core:coverage_incomplete.required_frontier": {
+    "description": "The frontier required by the normalized query."
+  },
+  "core:coverage_incomplete.blocking_stage": {
+    "description": "The concrete pipeline stage or registry stage blocking complete coverage."
+  },
+  "core:coverage_incomplete.blocking_operation": {
+    "description": "The registered operation that requires the blocking stage."
+  },
+  "core:coverage_incomplete.retryable": {
+    "description": "Whether a retry can make progress without changing the query.",
+    "type": "boolean"
+  },
+  "core:ipc_timeout.deadline_at": {
+    "description": "The absolute deadline that expired while waiting for the IPC request."
+  },
+  "core:ipc_timeout.elapsed_ms": {
+    "description": "Elapsed transport/request time at the timeout boundary.",
+    "type": "integer",
+    "minimum": 0
+  },
+  "core:ipc_timeout.phase": {
+    "description": "The registered transport phase that exceeded the deadline."
   },
   "core:execution_resource_limit.limit_kind": {
     "description": "The `limit_kind` is the closed detail value for `core:execution_resource_limit`; normative emission trigger: Exact evaluation cannot finish within a declared hard work, memory, time, or intermediate-result limit. (source: protocol/core-operation-error-codes.md)."

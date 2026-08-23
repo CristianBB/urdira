@@ -28,7 +28,7 @@ MCP `2026-07-28` is the primary modern, stateless protocol era. Urdira implement
 - The adapter rejects an unsupported modern revision with MCP `UnsupportedProtocolVersionError`, including the exact supported revisions.
 - MCP request metadata selects protocol behavior only. It never selects a Urdira workspace, snapshot, query execution, cursor, plugin, or configuration.
 
-The initial stdio adapter is dual-era for coding-agent interoperability. It calls `serveStdio` with the legacy posture explicitly set to `serve`, rather than relying on an SDK default. A modern opening selects the `2026-07-28` per-request-metadata behavior; a legacy opening selects the SDK's supported 2025-era `initialize` lifecycle for that stdio connection. Both paths build the same four-tool server from the same factory and preserve identical Urdira domain semantics. Legacy connection state may select only MCP wire behavior and must never select a workspace, snapshot, query execution, cursor, plugin, or configuration.
+The initial stdio adapter is dual-era for coding-agent interoperability. It calls `serveStdio` with the legacy posture explicitly set to `serve`, rather than relying on an SDK default. A modern opening selects the `2026-07-28` per-request-metadata behavior; a legacy opening selects the SDK's supported 2025-era `initialize` lifecycle for that stdio connection. Both paths build the same five-tool server from the same factory and preserve identical Urdira domain semantics. Legacy connection state may select only MCP wire behavior and must never select a workspace, snapshot, query execution, cursor, plugin, or configuration.
 
 Removing legacy support or changing the selected legacy revisions is a release compatibility decision with explicit conformance evidence. It does not change the Urdira public query API, but it must be announced because it can prevent an older host from connecting.
 
@@ -40,9 +40,10 @@ The adapter also sets the top-level `instructions` field of the initialize/disco
 
 The tool set is static for the lifetime of an adapter release and is returned in deterministic name order. The adapter does not advertise `tools.listChanged`; tool additions, removals, or incompatible schema changes require a new adapter release and process restart. On modern connections, `tools/list` uses the MCP `2026-07-28` list-response shape, including `resultType`, cache metadata supported by the SDK, and MCP's opaque `nextCursor` when the catalog ever exceeds one page. The SDK emits the negotiated legacy list shape on legacy connections. Any MCP list cursor is a transport catalog cursor and has no relationship to Urdira query cursors.
 
-The four tool names are:
+The five tool names are:
 
 - `urdira_query`
+- `urdira_context`
 - `urdira_analyze_change`
 - `urdira_build_context`
 - `urdira_index_status`
@@ -68,10 +69,13 @@ structural snapshot. `availability`, `completeness`, `freshness`, and
 `build_state` use the closed values documented by the source-first readiness
 decision. Agents should follow `operation_availability`; they must not infer
 that `partial` means unavailable or that `unknown` is queryable.
+The compact rendering includes a copy-ready `query_scope` object for every
+workspace. Clients reuse that object byte-for-byte; `workspace_id` is opaque
+and must not be retyped, abbreviated, normalized, or synthesized.
 
 The `inputSchema` uses JSON Schema 2020-12. Every object is closed with `additionalProperties: false`, every union has an explicit discriminator, and every agent-visible field has the description required by the public query contract. The generated schema is validated using the SDK's supported schema integration and retained as a release fixture so that SDK upgrades cannot alter it silently.
 
-MCP annotations are descriptive hints, not the security boundary. The daemon protocol and Urdira authorization rules independently enforce that all four operations are read-only.
+MCP annotations are descriptive hints, not the security boundary. The daemon protocol and Urdira authorization rules independently enforce that all five operations are read-only.
 
 ## Tool calls and results
 

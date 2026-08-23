@@ -17,7 +17,7 @@ import type {
   SourceProviderWatchResult,
   VcsState,
 } from "@urdira/contracts";
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { digestBytes, digestLogicalValue } from "@urdira/canonical";
 import { canonicalizePath, evaluateInclusion, normalizeWorkspacePath, type GitIgnoreRules, type InclusionRules } from "@urdira/security";
 import {
   DirectorySourceProvider,
@@ -120,7 +120,7 @@ const DEFAULT_INCLUSION: InclusionRules = { include: [], exclude: [], allow_exte
 const DEFAULT_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
 
 function jsonDigest(value: unknown): string {
-  return digestBytes(canonicalBytes(value));
+  return digestLogicalValue(value);
 }
 
 function rawDigest(bytes: Uint8Array): string {
@@ -491,7 +491,7 @@ export class GitReferenceSourceProvider implements SourceProvider {
       return {
         artifact_id: payload.artifact_id,
         provider_version_token: afterToken,
-        content_bytes: Buffer.from(bytes).toString("base64"),
+        content: bytes,
         content_hash: contentHash,
         byte_length: bytes.byteLength,
         metadata_digest: metadataDigest,

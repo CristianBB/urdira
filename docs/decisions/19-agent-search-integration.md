@@ -1,6 +1,6 @@
 # Coding-agent search integration and context isolation
 
-Status: **Approved for implementation**
+Status: **Approved and implemented**
 
 Urdira remains a read-only, explicitly scoped intelligence surface. The first
 native search adapters are Claude Code, Codex, OpenCode, Cursor, and VS Code
@@ -9,7 +9,15 @@ Adapters translate supported lexical, file-discovery, and semantic search calls
 to the corresponding Urdira
 operations; every uncertain, stale,
 unsupported, out-of-scope, timed-out, or over-budget case falls back to the
-native host operation. No fifth MCP tool is introduced.
+native host operation. These native host hooks are optional integrations and
+do not weaken the MCP contract: an agent validating or benchmarking Urdira
+must use an available Urdira operation for repository discovery and source
+reading rather than silently degrading to host tools.
+
+The public MCP surface also exposes `urdira_context` as its fifth read-only
+tool. It lowers to the registered `core:build_context` operation with a bounded
+structural-readiness wait by default, so it adds a task-oriented entry point
+without adding a second context semantic.
 
 Urdira's MCP server is also a supported local stdio integration for Cursor,
 Cursor Agent CLI, VS Code with GitHub Copilot Chat, Cline, Roo Code, and Claude

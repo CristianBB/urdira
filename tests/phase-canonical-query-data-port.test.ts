@@ -2,9 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { encodeCanonical } from "@urdira/canonical";
+import { digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { QueryScope } from "@urdira/contracts";
-import { createDurableStorage, type SqliteCommand, type SqliteDatabase, type SqliteRunResult, type SqliteValue } from "../packages/storage/src/index.js";
+import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type SqliteCommand, type SqliteDatabase, type SqliteRunResult, type SqliteValue } from "../packages/storage/src/index.js";
 import {
   CanonicalRecordQueryDataPort,
   QueryPlanError,
@@ -46,27 +46,28 @@ async function withWorkspace(test: (opened: Awaited<ReturnType<Awaited<ReturnTyp
 async function seedBaseline(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>): Promise<void> {
   const db = opened.database;
   await db.exec("PRAGMA foreign_keys = OFF");
-  await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", ["registry-1", workspace.workspace_id, "1", "core-digest", "lock-1", "registry-digest-1", new Uint8Array([1])]);
-  await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["snapshot-1", workspace.workspace_id, 0, "manifest-1", "registry-1", "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, "snapshot-digest-1", new Uint8Array([1])]);
-  await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspace.workspace_id, "snapshot-1", 1, "registry-1", "lock-1", "configuration-1", "freshness-1", 1, now, new Uint8Array([1])]);
+  await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", ["registry-1", workspace.workspace_id, "1", "core-digest", "lock-1", "registry-digest-1"]);
+  await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["snapshot-1", workspace.workspace_id, 0, "manifest-1", "registry-1", "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, "snapshot-digest-1"]);
+  await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspace.workspace_id, "snapshot-1", 1, "registry-1", "lock-1", "configuration-1", "freshness-1", 1, now]);
 }
 
 function recordPayload(body: Readonly<Record<string, unknown>>): Uint8Array {
-  return encodeCanonical({ body });
+  return encodeCanonical(body);
 }
 
 async function insertRecordOccurrence(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, recordId: string, ownerArtifactVersionId: string, validFromGeneration: number, body: Readonly<Record<string, unknown>>): Promise<void> {
-  const payload = recordPayload(body);
+  const payload = encodeCanonical(body);
   await opened.database.run(
-    "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES (?, ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, 'payload-digest', ?, ?, NULL, ?)",
-    [recordId, workspace.workspace_id, ownerArtifactVersionId, validFromGeneration, `digest-${recordId}`, payload.byteLength, payload, payload],
+    "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES (?, ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, 'analysis', 'configuration', 'dependencies')",
+    [recordId, workspace.workspace_id, ownerArtifactVersionId, validFromGeneration, `digest-${recordId}`, digestBytes(payload), payload.byteLength],
   );
+  await opened.database.transaction(relationalValueCommands(flattenRelationalValue(workspace.workspace_id, recordId, validFromGeneration, body)));
 }
 
 async function insertArtifactVersion(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, artifactVersionId: string, contentHash: string, encoding: string, artifactId = "art-1", normalizedPath = "src/index.ts", artifactKind = "source_file", languageHint: string | null = null): Promise<void> {
-  await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [artifactId, workspace.workspace_id, `file:///canonical-query/${normalizedPath}`, normalizedPath, normalizedPath, artifactKind, new Uint8Array([1])]);
+  await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES (?, ?, ?, ?, ?, ?)", [artifactId, workspace.workspace_id, `file:///canonical-query/${normalizedPath}`, normalizedPath, normalizedPath, artifactKind]);
   await opened.database.run("INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [`blob-${artifactVersionId}`, contentHash, 0, "inline"]);
-  await opened.database.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'metadata-digest', 'observation-1', 0, NULL, ?)", [artifactVersionId, workspace.workspace_id, artifactId, `blob-${artifactVersionId}`, contentHash, encoding, languageHint, new Uint8Array([1])]);
+  await opened.database.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'metadata-digest', 'observation-1', 0, NULL)", [artifactVersionId, workspace.workspace_id, artifactId, `blob-${artifactVersionId}`, contentHash, encoding, languageHint]);
 }
 
 // Bulk variant of `insertRecordOccurrence`, batched (100 rows/statement,
@@ -76,21 +77,13 @@ async function insertRecordOccurrencesBulk(opened: Awaited<ReturnType<Awaited<Re
   const BATCH = 100;
   for (let start = 0; start < count; start += BATCH) {
     const rows = Array.from({ length: Math.min(BATCH, count - start) }, (_unused, offset) => start + offset);
-    const params = rows.flatMap((index) => {
-      const recordId = `bulk-rec-${String(index).padStart(6, "0")}`;
-      const payload = recordPayload({ name: `bulk-${index}` });
-      return [recordId, workspace.workspace_id, ownerArtifactVersionId, validFromGeneration, `digest-${recordId}`, payload.byteLength, payload, payload];
-    });
-    await opened.database.run(
-      `INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES ${rows.map(() => "(?, ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, 'payload-digest', ?, ?, NULL, ?)").join(", ")}`,
-      params,
-    );
+    for (const index of rows) await insertRecordOccurrence(opened, `bulk-rec-${String(index).padStart(6, "0")}`, ownerArtifactVersionId, validFromGeneration, { name: `bulk-${index}` });
   }
 }
 
 async function insertCapabilityState(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, stateKey: string, providerId: string, status: string, affectedArtifactIds: readonly string[] = []): Promise<void> {
   const payload = encodeCanonical({ capability: "core:symbol_resolution", capability_contract_version: "1", provider_id: providerId, provider_version: "1", status, reason_codes: [], affected_artifact_ids: affectedArtifactIds, diagnostic_record_ids: [] });
-  await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'capability_state', ?, NULL, NULL, NULL, ?)", [stateKey, workspace.workspace_id, payload, now]);
+  await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'capability_state', ?, NULL, NULL, NULL, ?)", [stateKey, workspace.workspace_id, JSON.stringify({ capability: "core:symbol_resolution", capability_contract_version: "1", provider_id: providerId, provider_version: "1", status, reason_codes: [], affected_artifact_ids: affectedArtifactIds, diagnostic_record_ids: [] }), now]);
 }
 
 const scope: QueryScope = { scope_type: "single_workspace", workspace_id: workspace.workspace_id };
@@ -194,15 +187,15 @@ describe("SqliteCanonicalQuerySnapshotPort scope.snapshot_id pin", () => {
   async function seedTwoGenerations(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>): Promise<void> {
     const db = opened.database;
     await db.exec("PRAGMA foreign_keys = OFF");
-    await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", ["registry-1", workspace.workspace_id, "1", "core-digest", "lock-1", "registry-digest-1", new Uint8Array([1])]);
+    await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", ["registry-1", workspace.workspace_id, "1", "core-digest", "lock-1", "registry-digest-1"]);
     // Two real, permanently-recorded snapshots for this workspace: an old
     // one ("snapshot-0", generation 0) that is no longer current, and the
     // current one ("snapshot-1", generation 1) `workspace_current_state`
     // actually points at.
     for (const [snapshotId, generation] of [["snapshot-0", 0], ["snapshot-1", 1]] as const) {
-      await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshotId, workspace.workspace_id, generation, `manifest-${generation}`, "registry-1", "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest-${generation}`, new Uint8Array([1])]);
+      await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshotId, workspace.workspace_id, generation, `manifest-${generation}`, "registry-1", "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest-${generation}`]);
     }
-    await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspace.workspace_id, "snapshot-1", 1, "registry-1", "lock-1", "configuration-1", "freshness-1", 1, now, new Uint8Array([1])]);
+    await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspace.workspace_id, "snapshot-1", 1, "registry-1", "lock-1", "configuration-1", "freshness-1", 1, now]);
   }
 
   it("proceeds normally when scope.snapshot_id matches the workspace's current snapshot", async () => {
@@ -317,10 +310,9 @@ const isFullLoadCall = (call: SqlCall): boolean => call.sql.includes(FULL_LOAD_M
 const isCountCall = (call: SqlCall): boolean => call.sql.startsWith("SELECT COUNT(*)");
 
 async function insertIdentityAssignment(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, options: { readonly assignmentId: string; readonly identityId: string; readonly identityKey: string; readonly recordId: string; readonly ownerArtifactVersionId: string; readonly validFromGeneration: number; readonly validToGeneration?: number }): Promise<void> {
-  const payload = encodeCanonical({ identity_id: options.identityId });
   await opened.database.run(
-    "INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, assignment_payload) VALUES (?, ?, 'entity', ?, 'created', ?, ?, ?, NULL, 'art-1', ?, ?, ?, ?)",
-    [options.assignmentId, workspace.workspace_id, options.identityId, options.identityKey, `digest-${options.identityKey}`, options.recordId, options.ownerArtifactVersionId, options.validFromGeneration, options.validToGeneration ?? null, payload],
+    "INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation) VALUES (?, ?, 'entity', ?, 'created', ?, ?, ?, NULL, 'art-1', ?, ?, ?)",
+    [options.assignmentId, workspace.workspace_id, options.identityId, options.identityKey, `digest-${options.identityKey}`, options.recordId, options.ownerArtifactVersionId, options.validFromGeneration, options.validToGeneration ?? null],
   );
 }
 
@@ -446,7 +438,7 @@ describe("SqliteCanonicalQuerySnapshotPort incremental delta maintenance", () =>
 // Same pattern as the lexical reconciler's own event-loop-stall fix
 // (`packages/engine/src/lexical-reconciler.ts`): a periodic `setImmediate`
 // yield, batched every `RECORDS_YIELD_BATCH_SIZE` records rather than every
-// single one (unlike the reconciler's per-document trigram computation,
+// single one (unlike the reconciler's per-document normalization/FTS5 insertion,
 // decoding one record here is cheap enough that yielding on every record
 // would add far more relative overhead than it saves).
 describe("SqliteCanonicalQuerySnapshotPort corpus-load event-loop yielding", () => {
@@ -486,7 +478,27 @@ describe("SqliteCanonicalQuerySnapshotPort corpus-load event-loop yielding", () 
       expect(yieldCount).toBeGreaterThan(0);
       expect(yieldCount).toBeLessThan(recordCount / 10);
     });
-  }, 30_000);
+  // V8 coverage instrumentation roughly triples the cost of the synthetic
+  // 4,500-row SQLite fixture; keep the behavioral assertion intact without
+  // turning a coverage run into a false timeout.
+  }, 60_000);
+
+  it("exposes bounded query batches without retaining a second complete corpus", async () => {
+    await withWorkspace(async (opened) => {
+      await seedBaseline(opened);
+      await insertArtifactVersion(opened, "artv-1", "sha256:aaaa", "utf-8");
+      await insertRecordOccurrencesBulk(opened, 1_025, "artv-1", 1);
+      const port = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const sizes: number[] = [];
+      let total = 0;
+      for await (const batch of port.records_for_query_batches(scope, 256)) {
+        sizes.push(batch.length);
+        total += batch.length;
+      }
+      expect(sizes).toEqual([256, 256, 256, 256, 1]);
+      expect(total).toBe(1_025);
+    });
+  }, 60_000);
 });
 
 // Companion regression coverage for the two other full-corpus synchronous
@@ -500,8 +512,8 @@ describe("SqliteCanonicalQuerySnapshotPort corpus-load event-loop yielding", () 
 // yield point of its own, a stall on top of (not fixed by) the decode loop's
 // yielding. Both are now yielded/paginated the same way, same
 // `RECORDS_YIELD_BATCH_SIZE`/`ROW_FETCH_BATCH_SIZE` constants.
-describe("SqliteCanonicalQuerySnapshotPort/CanonicalRecordQueryDataPort corpus-scale yielding beyond the decode loop", () => {
-  it("cachedIdentityMaps yields to the event loop periodically while indexing a large corpus, batched rather than once per record", async () => {
+describe("SqliteCanonicalQuerySnapshotPort/CanonicalRecordQueryDataPort corpus-scale behavior", () => {
+  it("warm-up does not load or traverse the record corpus", async () => {
     await withWorkspace(async (opened) => {
       await seedBaseline(opened);
       await insertArtifactVersion(opened, "artv-1", "sha256:aaaa", "utf-8");
@@ -510,15 +522,6 @@ describe("SqliteCanonicalQuerySnapshotPort/CanonicalRecordQueryDataPort corpus-s
 
       const snapshot = new SqliteCanonicalQuerySnapshotPort(opened.database);
       const dataPort = new CanonicalRecordQueryDataPort(snapshot);
-
-      // Warms the records cache first, UNINSTRUMENTED -- this makes the
-      // *next* `records()` call (inside `warm()` below) a synchronous cache
-      // hit, so none of `decodeRows`'s own yields (already covered by the
-      // test above) get counted here. That isolates `cachedIdentityMaps`'s
-      // yield loop, which only runs on `warm()`'s subsequent
-      // `cachedIdentityMaps(records)` call -- the array is fresh to that
-      // WeakMap-keyed cache, so it must actually build (and yield).
-      await snapshot.records(scope);
 
       const realSetImmediate = globalThis.setImmediate;
       let yieldCount = 0;
@@ -533,14 +536,13 @@ describe("SqliteCanonicalQuerySnapshotPort/CanonicalRecordQueryDataPort corpus-s
         globalThis.setImmediate = realSetImmediate;
       }
 
-      // Same load-bearing shape as the decode-loop test above: more than
-      // zero yields (not one long synchronous pass building `by_any_id` plus
-      // the `entities`/`relations` slices) but far fewer than the record
-      // count (batched, not a yield per record).
-      expect(yieldCount).toBeGreaterThan(0);
-      expect(yieldCount).toBeLessThan(recordCount / 10);
+      // The new query warm-up is metadata-only. The first real query owns
+      // bounded SQL reads and selected hydration; startup never traverses
+      // the full corpus or builds a global identity map.
+      expect(yieldCount).toBe(0);
+      expect(await snapshot.has_warm_records(scope)).toBe(false);
     });
-  }, 30_000);
+  }, 60_000);
 
   it("loadAllRecords round-trips a corpus spanning multiple SQL row-fetch batches, in exact record_id order, with nothing dropped, duplicated, or corrupted at the batch boundary", async () => {
     await withWorkspace(async (opened) => {
@@ -671,6 +673,37 @@ function sourceBundles(evaluation: { readonly streams: Readonly<Record<string, r
 }
 
 describe("CanonicalRecordQueryDataPort core:get_source", () => {
+  it.each([
+    { subject_type: "artifact", path: "src/a.ts" },
+    { subject_type: "artifact", artifact_id: "art-1" },
+  ])("resolves a direct artifact selector from the source catalog without reading the structural corpus: $subject_type $path$artifact_id", async (selector) => {
+    const artifact: CanonicalQueryRecord = {
+      record_id: "artifact-record:artv-1",
+      workspace_id: workspace.workspace_id,
+      category: "artifact_subject",
+      kind: "core:source_file",
+      universal_kind: "core:artifact",
+      owner_artifact_id: "art-1",
+      owner_artifact_version_id: "artv-1",
+      body: { path: "src/a.ts", artifact_id: "art-1", artifact_version_id: "artv-1" },
+    };
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records_by_ids: async () => [],
+      artifacts_by_filter: async () => [artifact],
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_for_query: async () => { throw new Error("query corpus must not be read"); },
+    }));
+    const evaluation = await port.execute({
+      operation_id: "core:get_source",
+      result_streams: ["sources"],
+      arguments: { subjects: [selector], source: { mode: "body", max_characters_per_snippet: 4000, max_total_characters: 16000, context_lines: 0 } },
+      scope,
+    });
+    const bundles = sourceBundles(evaluation);
+    expect(bundles).toHaveLength(1);
+    expect(bundles[0]!.optional_source_snippets[0]!.text).toBe(FILE_TEXT);
+  });
+
   it("hydrates a pipeline artifact selector by artifact_version_id", async () => {
     const artifact: CanonicalQueryRecord = {
       record_id: "artifact-record:artv-1",
@@ -801,12 +834,13 @@ describe("CanonicalRecordQueryDataPort core:get_source", () => {
 // actually populated the generation cache.
 async function seedEntity(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, options: { readonly recordId: string; readonly name: string; readonly kind: string; readonly universalKind: string; readonly path: string; readonly start: number; readonly language: string; readonly qualifiedName?: string }): Promise<void> {
   await opened.database.run(
-    "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES (?, ?, 'entity', ?, ?, 1, 'test', '1', 'art-1', 'artv-1', NULL, NULL, NULL, NULL, NULL, 1, NULL, ?, 'payload-digest', ?, ?, NULL, ?)",
+      "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES (?, ?, 'entity', ?, ?, 1, 'test', '1', 'art-1', 'artv-1', NULL, NULL, NULL, NULL, NULL, 1, NULL, ?, ?, ?, 'analysis', 'configuration', 'dependencies')",
     (() => {
       const payload = recordPayload({ name: options.name, language: options.language, ...(options.qualifiedName === undefined ? {} : { qualified_name: options.qualifiedName }) });
-      return [options.recordId, workspace.workspace_id, options.kind, options.universalKind, `digest-${options.recordId}`, payload.byteLength, payload, payload];
+      return [options.recordId, workspace.workspace_id, options.kind, options.universalKind, `digest-${options.recordId}`, digestBytes(payload), payload.byteLength];
     })(),
   );
+  await opened.database.transaction(relationalValueCommands(flattenRelationalValue(workspace.workspace_id, options.recordId, 1, { name: options.name, language: options.language, ...(options.qualifiedName === undefined ? {} : { qualified_name: options.qualifiedName }) })));
   await insertIdentityAssignment(opened, {
     assignmentId: `assign-${options.recordId}`, identityId: `id-${options.recordId}`,
     identityKey: `jsts:${options.kind}:${options.path}:${options.start}:${options.name}`,
@@ -870,7 +904,8 @@ describe("CanonicalRecordQueryDataPort cold-path pushdown equivalence", () => {
   it("core:resolve_symbol: a dotted (qualified-name-shaped) reference falls back to the full path on the cold port, and still matches the warmed path", async () => {
     await withWorkspace(async (opened) => {
       await seedPushdownWorkspace(opened);
-      await opened.database.run("UPDATE record_occurrences SET record_payload = ? WHERE record_id = ?", [recordPayload({ name: "exportToCanvas", language: "typescript", qualified_name: "export.ts.exportToCanvas" }), "rec-export-canvas"]);
+      await opened.database.run("DELETE FROM record_value_nodes WHERE record_id = ?", ["rec-export-canvas"]);
+      await opened.database.transaction(relationalValueCommands(flattenRelationalValue(workspace.workspace_id, "rec-export-canvas", 1, { name: "exportToCanvas", language: "typescript", qualified_name: "export.ts.exportToCanvas" })));
       const { cold, warm } = pushdownPorts(opened.database);
       await warm.data.warm(scope);
 
@@ -879,8 +914,9 @@ describe("CanonicalRecordQueryDataPort cold-path pushdown equivalence", () => {
       const warmResult = await warm.data.execute(operation);
       expect(coldResult).toEqual(warmResult);
       expect((coldResult.streams["declarations"] as readonly unknown[]).length).toBe(1);
-      // Falling back means the cold port's cache is now populated too.
-      expect(await cold.snapshot.has_warm_records(scope)).toBe(true);
+      // Complex fallback queries use the uncached v2 SQL path; they do not
+      // turn a one-off graph/name lookup into a retained corpus.
+      expect(await cold.snapshot.has_warm_records(scope)).toBe(false);
     });
   });
 
@@ -1025,37 +1061,78 @@ describe("SqliteCanonicalQuerySnapshotPort pushdown methods", () => {
   });
 });
 
+describe("CanonicalRecordQueryDataPort core:build_context", () => {
+  it("resolves task identifiers through bounded point lookups without materializing the full corpus", async () => {
+    const registry = stubRecord("rec-registry", "artv-1", { path: "src/languageFeatureRegistry.ts", name: "LanguageFeatureRegistry", start: GREET_START, end: GREET_END });
+    const event = stubRecord("rec-event", "artv-1", { path: "src/languageFeatureRegistry.ts", name: "onDidChange", start: FAREWELL_START, end: FAREWELL_END });
+    const lookedUp: string[] = [];
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_for_query: async () => { throw new Error("query corpus must not be read"); },
+      records_by_name: async (_scope, name) => {
+        lookedUp.push(name);
+        return name === "LanguageFeatureRegistry" ? [registry] : name === "onDidChange" ? [event] : [];
+      },
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: {
+        task: "Improve LanguageFeatureRegistry notifications when onDidChange ordering changes",
+        query_class: "source_code",
+        facets: ["definitions", "implementations", "tests"],
+      },
+      scope,
+    });
+
+    expect(lookedUp).toContain("LanguageFeatureRegistry");
+    expect(lookedUp).toContain("onDidChange");
+    const contextItems = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: unknown }>;
+    const bundles = contextItems.map((entry) => entry.value as { readonly result_set: string; readonly primary_result: { readonly record_id?: string }; readonly optional_source_snippets: readonly unknown[] });
+    expect(bundles.map((bundle) => bundle.primary_result.record_id)).toEqual(["rec-registry", "rec-event"]);
+    expect(bundles.every((bundle) => bundle.result_set === "context")).toBe(true);
+    expect(bundles.every((bundle) => bundle.optional_source_snippets.length > 0)).toBe(true);
+  });
+
+  it("returns a bounded empty context when no point-lookup capability is available", async () => {
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_for_query: async () => { throw new Error("query corpus must not be read"); },
+    }));
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Improve registry notifications", facets: ["definitions"] },
+      scope,
+    });
+    expect(evaluation.streams["context"]).toEqual([]);
+  });
+});
+
 // --- D6: core:search_text lexical pushdown ------------------------------
 //
 // `search_literal` / `records_by_artifact_versions` let `core:search_text`
-// answer straight from the trigram-backed lexical projection
-// (`lexical_documents`/`lexical_trigrams`, built out-of-band by
+// answer straight from the FTS5-backed lexical projection
+// (`lexical_documents`/`lexical_fts`, built out-of-band by
 // `reconcileLexicalProjection` -- see `tests/lexical-maintenance.test.ts` for
 // that side) instead of the in-memory corpus scan, which only ever matches
 // against RECORD BODY JSON, never real file text. `records_by_artifact_versions`
-// synthesizes its `category: "artifact"` records purely from `artifact_versions`
+// synthesizes its `category: "artifact_subject"` records purely from `artifact_versions`
 // joined with `source_artifacts` (see its doc comment in
 // `canonical-query-data-port.ts` -- `record_occurrences.category` has a real
 // `CHECK` constraint that makes a persisted `'artifact'` category impossible),
 // so these tests never seed `record_occurrences` at all: the in-memory corpus
 // is genuinely empty, so any non-empty `matches`/`subjects` stream is direct
 // proof pushdown -- not a corpus scan that got lucky -- produced it.
-function trigramsOf(text: string): readonly string[] {
-  const source = new TextEncoder().encode(text.normalize("NFKC").toLocaleLowerCase("en-US"));
-  const result = new Set<string>();
-  for (let index = 0; index + 3 <= source.length; index += 1) result.add(Array.from(source.slice(index, index + 3), (value) => value.toString(16).padStart(2, "0")).join(""));
-  return [...result].sort();
-}
-
 async function insertLexicalDocument(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, artifactId: string, artifactVersionId: string, text: string, validFromGeneration: number, validToGeneration?: number): Promise<void> {
-  const payload = encodeCanonical({ artifact_id: artifactId, artifact_version_id: artifactVersionId, text, valid_from_generation: validFromGeneration, ...(validToGeneration === undefined ? {} : { valid_to_generation: validToGeneration }) });
   await opened.database.run(
-    "INSERT INTO lexical_documents (artifact_id, workspace_id, artifact_version_id, content_hash, byte_length, storage_reference, valid_from_generation, valid_to_generation, document_payload) VALUES (?, ?, ?, 'sha256:lexical-doc', 0, 'inline', ?, ?, ?)",
-    [artifactId, workspace.workspace_id, artifactVersionId, validFromGeneration, validToGeneration ?? null, payload],
+    "INSERT INTO lexical_documents (artifact_id, workspace_id, artifact_version_id, content_hash, byte_length, storage_reference, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, 'sha256:lexical-doc', ?, 'cas:sha256:lexical-doc', ?, ?)",
+    [artifactId, workspace.workspace_id, artifactVersionId, new TextEncoder().encode(text).byteLength, validFromGeneration, validToGeneration ?? null],
   );
-  for (const trigram of trigramsOf(text)) {
-    await opened.database.run("INSERT INTO lexical_trigrams (workspace_id, trigram, artifact_id, artifact_version_id, trigram_payload) VALUES (?, ?, ?, ?, ?)", [workspace.workspace_id, trigram, artifactId, artifactVersionId, encodeCanonical({ trigram })]);
-  }
+  await opened.database.run("INSERT INTO lexical_fts (workspace_id, artifact_id, artifact_version_id, content) VALUES (?, ?, ?, ?)", [workspace.workspace_id, artifactId, artifactVersionId, text.normalize("NFKC").toLocaleLowerCase("en-US")]);
 }
 
 async function markLexicalComplete(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, generation: number): Promise<void> {
@@ -1068,15 +1145,15 @@ async function markLexicalComplete(opened: Awaited<ReturnType<Awaited<ReturnType
 // so the D6 tests below seed it explicitly.
 async function insertSourceArtifact(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, artifactId: string, normalizedPath: string): Promise<void> {
   await opened.database.run(
-    "INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, 'physical_file', ?)",
-    [artifactId, workspace.workspace_id, normalizedPath, normalizedPath, normalizedPath, new Uint8Array([1])],
+    "INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES (?, ?, ?, ?, ?, 'physical_file')",
+    [artifactId, workspace.workspace_id, normalizedPath, normalizedPath, normalizedPath],
   );
 }
 
 const NEEDLE_FILE_TEXT = "const value = 1;\nconst needleHere = value + 1;\nconst NeedleHere = value + 2;\n";
 
 function searchTextOperation(args: Readonly<Record<string, unknown>>): { readonly operation_id: string; readonly result_streams: readonly string[]; readonly arguments: unknown; readonly scope: QueryScope } {
-  return { operation_id: "core:search_text", result_streams: ["matches", "subjects"], arguments: { pattern: "needleHere", ...args }, scope };
+  return { operation_id: "core:search_text", result_streams: ["matches", "subjects"], arguments: { pattern: "needleHere", case_sensitive: false, ...args }, scope };
 }
 
 async function seedSearchTextWorkspace(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>): Promise<void> {
@@ -1107,16 +1184,16 @@ describe("SqliteCanonicalQuerySnapshotPort D6 pushdown methods", () => {
     });
   });
 
-  it("search_literal returns undefined before lexical_index_state's completed_generation reaches the current generation", async () => {
+  it("search_literal scans the exact current source generation until lexical_index_state reaches it", async () => {
     await withWorkspace(async (opened) => {
       await seedSearchTextWorkspace(opened);
       await insertLexicalDocument(opened, "art-1", "artv-search", NEEDLE_FILE_TEXT, 1);
       const port = new SqliteCanonicalQuerySnapshotPort(opened.database, needleContent());
-      await expect(port.search_literal(scope, "needleHere", {})).resolves.toBeUndefined();
+      await expect(port.search_literal(scope, "needleHere", {})).resolves.toHaveLength(1);
 
       // Marking a DIFFERENT (older) generation complete must not count either.
       await markLexicalComplete(opened, 0);
-      await expect(port.search_literal(scope, "needleHere", {})).resolves.toBeUndefined();
+      await expect(port.search_literal(scope, "needleHere", {})).resolves.toHaveLength(1);
     });
   });
 
@@ -1150,7 +1227,7 @@ describe("SqliteCanonicalQuerySnapshotPort D6 pushdown methods", () => {
 
       const resolved = await port.records_by_artifact_versions(scope, ["artv-search"]);
       expect(resolved).toHaveLength(1);
-      expect(resolved[0]?.category).toBe("artifact");
+      expect(resolved[0]?.category).toBe("artifact_subject");
       expect(resolved[0]?.owner_artifact_id).toBe("art-1");
       expect(resolved[0]?.owner_artifact_version_id).toBe("artv-search");
       expect(resolved[0]?.body["path"]).toBe("src/search.ts");
@@ -1188,40 +1265,98 @@ describe("CanonicalRecordQueryDataPort core:search_text lexical pushdown", () =>
     });
   });
 
-  it("keeps lexical pushdown for a path-only filter so pipelines can narrow discovery before hydration", async () => {
+  it("keeps lexical pushdown for the normalized public path filter with explicit generated and external exclusions", async () => {
     await withWorkspace(async (opened) => {
       await seedSearchTextWorkspace(opened);
+      await insertArtifactVersion(opened, "artv-generated", "sha256:generated-search", "utf-8", "art-generated", "src/generated.ts", "generated_file");
+      await insertArtifactVersion(opened, "artv-external", "sha256:external-search", "utf-8", "art-external", "src/external.ts", "external_file");
       await insertLexicalDocument(opened, "art-1", "artv-search", NEEDLE_FILE_TEXT, 1);
+      await insertLexicalDocument(opened, "art-generated", "artv-generated", NEEDLE_FILE_TEXT, 1);
+      await insertLexicalDocument(opened, "art-external", "artv-external", NEEDLE_FILE_TEXT, 1);
       await markLexicalComplete(opened, 1);
-      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, needleContent()));
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, {
+        async read(hash: string) {
+          return new TextEncoder().encode(["sha256:needle-file", "sha256:generated-search", "sha256:external-search"].includes(hash) ? NEEDLE_FILE_TEXT : "");
+        },
+      }));
 
-      const evaluation = await dataPort.execute(searchTextOperation({ syntax: "literal", filter: { paths: ["src/search.ts"] } }));
+      const evaluation = await dataPort.execute(searchTextOperation({
+        syntax: "literal",
+        filter: { paths: ["src/**"], include_generated: false, include_external: false },
+      }));
       const matches = evaluation.streams["matches"] as ReadonlyArray<{ readonly value: { readonly source_span?: { readonly start_line?: string } } }>;
       expect(matches).toHaveLength(2);
       expect(matches.every((entry) => entry.value.source_span?.start_line !== undefined)).toBe(true);
+
+      const included = await dataPort.execute(searchTextOperation({
+        syntax: "literal",
+        filter: { paths: ["src/**"], include_generated: true, include_external: true },
+      }));
+      expect(included.streams["matches"]).toHaveLength(6);
     });
   });
 
-  it("falls back to the corpus scan (byte-for-byte, no source_span) when lexical maintenance has not completed yet", async () => {
+  it("honors an exact path filter and identifier boundaries together instead of widening the lexical search", async () => {
+    await withWorkspace(async (opened) => {
+      await seedBaseline(opened);
+      const targetText = "const TranspileOptions = 1;\nconst TranspileOptionsExtra = 2;\n";
+      const outsideText = "const TranspileOptions = 3;\n";
+      await insertArtifactVersion(opened, "artv-target", "sha256:target-search", "utf-8", "art-target", "src/services/transpile.ts", "source_file", "typescript");
+      await insertArtifactVersion(opened, "artv-outside", "sha256:outside-search", "utf-8", "art-outside", "src/other.ts", "source_file", "typescript");
+      await insertLexicalDocument(opened, "art-target", "artv-target", targetText, 1);
+      await insertLexicalDocument(opened, "art-outside", "artv-outside", outsideText, 1);
+      await markLexicalComplete(opened, 1);
+      const content = {
+        async read(hash: string) {
+          return new TextEncoder().encode(hash === "sha256:target-search" ? targetText : hash === "sha256:outside-search" ? outsideText : "");
+        },
+      };
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, content));
+
+      const evaluation = await dataPort.execute({
+        operation_id: "core:search_text",
+        result_streams: ["matches", "subjects"],
+        arguments: {
+          pattern: "TranspileOptions",
+          syntax: "literal",
+          case_sensitive: true,
+          word_mode: "identifier",
+          filter: { paths: ["src/services/transpile.ts"] },
+          result_projection: "artifact",
+        },
+        scope,
+      });
+      const matches = evaluation.streams["matches"] as ReadonlyArray<{ readonly value: { readonly path?: string } }>;
+      const subjects = evaluation.streams["subjects"] as ReadonlyArray<{ readonly value: { readonly path?: string; readonly match_count?: number } }>;
+      expect(matches).toHaveLength(1);
+      expect(matches[0]?.value.path).toBe("src/services/transpile.ts");
+      expect(subjects).toHaveLength(1);
+      expect(subjects[0]?.value).toMatchObject({ path: "src/services/transpile.ts", match_count: 1 });
+    });
+  });
+
+  it("uses an exact source-catalog scan instead of the structural corpus while lexical maintenance is incomplete", async () => {
     await withWorkspace(async (opened) => {
       await seedSearchTextWorkspace(opened);
       await insertLexicalDocument(opened, "art-1", "artv-search", NEEDLE_FILE_TEXT, 1);
       // Deliberately never mark lexical maintenance complete.
       const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, needleContent()));
       const evaluation = await dataPort.execute(searchTextOperation({ syntax: "literal" }));
-      expect(evaluation.streams["matches"]).toEqual([]);
-      expect(evaluation.streams["subjects"]).toEqual([]);
+      const matches = evaluation.streams["matches"] as ReadonlyArray<{ readonly value: { readonly source_span?: unknown } }>;
+      expect(matches).toHaveLength(2);
+      expect(evaluation.streams["subjects"]).toHaveLength(1);
+      expect(matches[0]?.value.source_span).toBeDefined();
     });
   });
 
-  it("falls back to the corpus scan for syntax: safe_regex, an explicit word_mode, or a non-empty filter, even once lexical maintenance is complete", async () => {
+  it("falls back to the corpus scan for syntax: safe_regex or a non-path filter, even once lexical maintenance is complete", async () => {
     await withWorkspace(async (opened) => {
       await seedSearchTextWorkspace(opened);
       await insertLexicalDocument(opened, "art-1", "artv-search", NEEDLE_FILE_TEXT, 1);
       await markLexicalComplete(opened, 1);
       const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, needleContent()));
 
-      for (const args of [{ syntax: "safe_regex" }, { word_mode: "identifier" }, { filter: { languages: ["typescript"] } }]) {
+      for (const args of [{ syntax: "safe_regex" }, { filter: { languages: ["typescript"] } }]) {
         const evaluation = await dataPort.execute(searchTextOperation(args));
         expect(evaluation.streams["matches"]).toEqual([]);
         expect(evaluation.streams["subjects"]).toEqual([]);
@@ -1293,8 +1428,8 @@ async function insertSemanticArtifactVersion(opened: OpenedWorkspace, options: {
   const blobId = `blob-${options.versionId}`;
   await opened.database.run("INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [blobId, `sha256:${options.versionId}`, options.byteLength, "inline"]);
   await opened.database.run(
-    "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'metadata-digest', 'observation-1', ?, ?, ?)",
-    [options.versionId, workspace.workspace_id, options.artifactId, blobId, `sha256:${options.versionId}`, options.byteLength, options.encoding ?? "utf-8", options.validFromGeneration, options.validToGeneration ?? null, new Uint8Array([1])],
+    "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'metadata-digest', 'observation-1', ?, ?)",
+    [options.versionId, workspace.workspace_id, options.artifactId, blobId, `sha256:${options.versionId}`, options.byteLength, options.encoding ?? "utf-8", options.validFromGeneration, options.validToGeneration ?? null],
   );
 }
 
@@ -1450,16 +1585,16 @@ describe("CanonicalRecordQueryDataPort core:search_semantic ranking", () => {
         const artifactId = `art-noise-${index}`;
         const versionId = `artv-noise-${index}`;
         const path = `src/noise/${index}.ts`;
-        noiseValues.push("(?, ?, ?, ?, ?, ?, ?)");
-        noiseParams.push(artifactId, workspace.workspace_id, path, path, path, "physical_file", new Uint8Array([1]));
+        noiseValues.push("(?, ?, ?, ?, ?, ?)");
+        noiseParams.push(artifactId, workspace.workspace_id, path, path, path, "physical_file");
         blobValues.push("(?, ?, ?, ?)");
         blobParams.push(`blob-${versionId}`, `sha256:${versionId}`, 0, "inline");
-        versionValues.push("(?, ?, ?, ?, ?, ?, ?, NULL, 'metadata-digest', 'observation-1', ?, NULL, ?)");
-        versionParams.push(versionId, workspace.workspace_id, artifactId, `blob-${versionId}`, `sha256:${versionId}`, 0, "utf-8", 1, new Uint8Array([1]));
+        versionValues.push("(?, ?, ?, ?, ?, ?, ?, NULL, 'metadata-digest', 'observation-1', ?, NULL)");
+        versionParams.push(versionId, workspace.workspace_id, artifactId, `blob-${versionId}`, `sha256:${versionId}`, 0, "utf-8", 1);
       }
-      await opened.database.run(`INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES ${noiseValues.join(",")}`, noiseParams);
+      await opened.database.run(`INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES ${noiseValues.join(",")}`, noiseParams);
       await opened.database.run(`INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES ${blobValues.join(",")}`, blobParams);
-      await opened.database.run(`INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES ${versionValues.join(",")}`, versionParams);
+      await opened.database.run(`INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES ${versionValues.join(",")}`, versionParams);
 
       // Every noise vector is IDENTICAL to the query text -- distance 0,
       // tied for the closest possible match -- so all 105 of them sort ahead
@@ -1977,19 +2112,20 @@ describe("RecordBodyInterner cross-workspace body sharing", () => {
   async function seedSharedRecord(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, workspaceId: string, body: Readonly<Record<string, unknown>>): Promise<void> {
     const db = opened.database;
     await db.exec("PRAGMA foreign_keys = OFF");
-    await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [`registry:${workspaceId}`, workspaceId, "1", "core-digest", "lock-1", "registry-digest-1", new Uint8Array([1])]);
-    await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [`snapshot:${workspaceId}`, workspaceId, 1, `manifest:${workspaceId}`, `registry:${workspaceId}`, "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest:${workspaceId}`, new Uint8Array([1])]);
-    await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspaceId, `snapshot:${workspaceId}`, 1, `registry:${workspaceId}`, "lock-1", "configuration-1", "freshness-1", 1, now, new Uint8Array([1])]);
+    await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [`registry:${workspaceId}`, workspaceId, "1", "core-digest", "lock-1", "registry-digest-1"]);
+    await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [`snapshot:${workspaceId}`, workspaceId, 1, `manifest:${workspaceId}`, `registry:${workspaceId}`, "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest:${workspaceId}`]);
+    await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspaceId, `snapshot:${workspaceId}`, 1, `registry:${workspaceId}`, "lock-1", "configuration-1", "freshness-1", 1, now]);
     await db.run("INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [`blob:${workspaceId}`, `sha256:${workspaceId}`, 0, "inline"]);
-    await db.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, 'art-1', ?, ?, 0, 'utf-8', NULL, 'metadata-digest', 'observation-1', 0, NULL, ?)", [`artv:${workspaceId}`, workspaceId, `blob:${workspaceId}`, `sha256:${workspaceId}`, new Uint8Array([1])]);
+    await db.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, 'art-1', ?, ?, 0, 'utf-8', NULL, 'metadata-digest', 'observation-1', 0, NULL)", [`artv:${workspaceId}`, workspaceId, `blob:${workspaceId}`, `sha256:${workspaceId}`]);
     // The SAME `record_id` bytes AND the SAME payload bytes in both
     // workspaces -- exactly the "content-derived id => identical payload
     // bytes" premise `RecordBodyInterner` relies on (decision 11).
     const payload = recordPayload(body);
     await db.run(
-      "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES ('rec-shared', ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, 1, NULL, 'digest-rec-shared', 'payload-digest', ?, ?, NULL, ?)",
-      [workspaceId, `artv:${workspaceId}`, payload.byteLength, payload, payload],
+      "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES ('rec-shared', ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, 1, NULL, 'digest-rec-shared', ?, ?, 'analysis', 'configuration', 'dependencies')",
+      [workspaceId, `artv:${workspaceId}`, digestBytes(payload), payload.byteLength],
     );
+    await db.transaction(relationalValueCommands(flattenRelationalValue(workspaceId, "rec-shared", 1, body)));
   }
 
   it("two ports over different workspaces sharing one interner decode a shared record_id into the literal same body object", async () => {
@@ -2044,19 +2180,24 @@ describe("RecordBodyInterner cross-workspace body sharing", () => {
       // reuses the same interner (under a derived key) so a hit can skip
       // `decodeCanonical` entirely rather than only replacing `body` after
       // paying for a decode anyway.
-      const payloadWithFacets = encodeCanonical({ body: { name: "shared-record" }, facets: JSON.stringify(["facet-one", "facet-two"]) });
+      const bodyWithFacets = { name: "shared-record" };
       for (const [opened, workspaceId] of [[openedA, "ws-interner-a"], [openedB, "ws-interner-b"]] as const) {
         const targetDb = opened.database;
         await targetDb.exec("PRAGMA foreign_keys = OFF");
-        await targetDb.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [`registry:${workspaceId}`, workspaceId, "1", "core-digest", "lock-1", "registry-digest-1", new Uint8Array([1])]);
-        await targetDb.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [`snapshot:${workspaceId}`, workspaceId, 1, `manifest:${workspaceId}`, `registry:${workspaceId}`, "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest:${workspaceId}`, new Uint8Array([1])]);
-        await targetDb.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspaceId, `snapshot:${workspaceId}`, 1, `registry:${workspaceId}`, "lock-1", "configuration-1", "freshness-1", 1, now, new Uint8Array([1])]);
+        await targetDb.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [`registry:${workspaceId}`, workspaceId, "1", "core-digest", "lock-1", "registry-digest-1"]);
+        await targetDb.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [`snapshot:${workspaceId}`, workspaceId, 1, `manifest:${workspaceId}`, `registry:${workspaceId}`, "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest:${workspaceId}`]);
+        await targetDb.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspaceId, `snapshot:${workspaceId}`, 1, `registry:${workspaceId}`, "lock-1", "configuration-1", "freshness-1", 1, now]);
         await targetDb.run("INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [`blob:${workspaceId}`, `sha256:${workspaceId}`, 0, "inline"]);
-        await targetDb.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, 'art-1', ?, ?, 0, 'utf-8', NULL, 'metadata-digest', 'observation-1', 0, NULL, ?)", [`artv:${workspaceId}`, workspaceId, `blob:${workspaceId}`, `sha256:${workspaceId}`, new Uint8Array([1])]);
+        await targetDb.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, 'art-1', ?, ?, 0, 'utf-8', NULL, 'metadata-digest', 'observation-1', 0, NULL)", [`artv:${workspaceId}`, workspaceId, `blob:${workspaceId}`, `sha256:${workspaceId}`]);
         await targetDb.run(
-          "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES ('rec-shared', ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, 1, NULL, 'digest-rec-shared', 'payload-digest', ?, ?, NULL, ?)",
-          [workspaceId, `artv:${workspaceId}`, payloadWithFacets.byteLength, payloadWithFacets, payloadWithFacets],
+          "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES ('rec-shared', ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, 1, NULL, 'digest-rec-shared', ?, ?, 'analysis', 'configuration', 'dependencies')",
+          [workspaceId, `artv:${workspaceId}`, digestBytes(encodeCanonical(bodyWithFacets)), encodeCanonical(bodyWithFacets).byteLength],
         );
+        await targetDb.transaction([
+          ...relationalValueCommands(flattenRelationalValue(workspaceId, "rec-shared", 1, bodyWithFacets)),
+          { kind: "run", sql: "INSERT INTO record_facets (workspace_id, record_id, valid_from_generation, facet_ordinal, facet) VALUES (?, ?, ?, ?, ?)", params: [workspaceId, "rec-shared", 1, 0, "facet-one"] },
+          { kind: "run", sql: "INSERT INTO record_facets (workspace_id, record_id, valid_from_generation, facet_ordinal, facet) VALUES (?, ?, ?, ?, ?)", params: [workspaceId, "rec-shared", 1, 1, "facet-two"] },
+        ]);
       }
 
       const interner = new RecordBodyInterner();

@@ -3,7 +3,7 @@ import { CursorCache, QueryEngine, type QueryDataPort } from "../packages/engine
 import type { QueryRequest } from "@urdira/contracts";
 
 const request = (max_items = 2): QueryRequest => ({
-  api_version: 1,
+  api_version: 3,
   scope: { scope_type: "single_workspace", workspace_id: "w" },
   expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "x", syntax: "literal", word_mode: "substring" } },
   options: {

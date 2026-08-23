@@ -17,8 +17,12 @@ export interface JavascriptTypescriptThreadDescriptor {
   readonly registry_contribution_digest?: string;
   readonly analysis_digest?: string;
   readonly analysis_configuration_digest?: string;
+  readonly cas_root?: string;
+  readonly source_load_concurrency?: number;
+  readonly source_load_max_in_flight_bytes?: number;
   readonly analysis_cache_dir?: string;
   readonly analysis_cache_max_entries?: number;
+  readonly native_batch_transport?: "response" | "host";
 }
 
 interface ThreadResponseMessage {
@@ -86,7 +90,7 @@ export function createJavascriptTypescriptThreadTransport(descriptor: Javascript
     nextId += 1;
     return new Promise<unknown>((resolve, reject) => {
       pending.set(id, { resolve, reject });
-      worker.postMessage({ id, kind, payload });
+      worker.postMessage({ id, kind, payload }, transferableBuffers(payload));
     });
   }
 
@@ -107,4 +111,22 @@ export function createJavascriptTypescriptThreadTransport(descriptor: Javascript
       await worker.terminate();
     },
   };
+}
+
+/** Collects complete, private ArrayBuffers owned by a one-shot request. */
+function transferableBuffers(value: unknown): ArrayBuffer[] {
+  const buffers: ArrayBuffer[] = [];
+  const seen = new Set<object>();
+  const add = (current: unknown): void => {
+    if (ArrayBuffer.isView(current)) {
+      if (current.byteOffset === 0 && current.byteLength === current.buffer.byteLength && current.buffer instanceof ArrayBuffer) buffers.push(current.buffer);
+      return;
+    }
+    if (current === null || typeof current !== "object" || seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) { for (const item of current) add(item); return; }
+    for (const item of Object.values(current)) add(item);
+  };
+  add(value);
+  return [...new Set(buffers)];
 }

@@ -7,7 +7,10 @@ export {
   encodeCanonical,
   encodeFloat64,
   type CanonicalEncodingLimits,
-} from "./cbor.js";
+} from "./logical-encoding.js";
+export { SparseMerkleSet } from "./sparse-merkle.js";
+export { MerkleRadixSet } from "./merkle-radix.js";
+export { digestLogicalValue, LogicalDigestWriter } from "./logical-digest-writer.js";
 export {
   canonicalSetValues,
   compareCanonicalValues,
@@ -41,13 +44,11 @@ export {
   documentedDigestRecipeCoordinates,
   phase3DigestFieldContractRows,
   terminalDigestRecipeDefinitions,
-  canonicalEncodingConformanceCases,
-  canonicalTypedConformanceCases,
   type DigestFieldContract,
 } from "./registries.js";
 export {
   encodeCanonical as encodeCanonicalValue,
-} from "./cbor.js";
+} from "./logical-encoding.js";
 export {
   decodeTypedValue,
   encodeSchemaValueTyped,
@@ -62,7 +63,6 @@ export {
   normalizeTimestamp,
   timestampNanoseconds,
   timestampFromNanoseconds,
-  toBase64Url,
   toBigIntegerText,
 } from "./scalars.js";
 export {
@@ -74,6 +74,9 @@ export {
   digestBytes,
   digestCanonical,
   digestCanonicalArray,
+  digestMappedCanonicalArray,
+  digestCanonicalMapWithArrayField,
+  digestCanonicalMapWithArrayFields,
   digestEnvelope,
   digestPayloadBytes,
   digestToBytes,
@@ -82,6 +85,7 @@ export {
   validateDigestEnvelope,
   validateDigestRecipeGraph,
   verifyDigest,
+  memoizedCanonicalArrayDigest,
   type DigestOptions,
   type DigestEnvelopeValidationContext,
   type DigestRecipe,

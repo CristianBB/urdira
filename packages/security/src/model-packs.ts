@@ -18,14 +18,14 @@ const operationalRoles = new Set(["model_manifest", "model_weight", "model_confi
 const assetRoleOrder = ["model_manifest", "model_weight", "model_configuration", "tokenizer_manifest", "tokenizer_data", "input_template", "segmentation_configuration", "generator_configuration", "license", "provenance", "evaluation"] as const;
 const runtimeRoleOrder = ["document_renderer", "query_renderer", "segmenter", "generator"] as const;
 const requiredAssetMedia: Readonly<Record<string, string>> = {
-  model_manifest: "application/vnd.urdira.model-asset-manifest+cbor",
+  model_manifest: "application/vnd.urdira.model-asset-manifest",
   model_weight: "application/octet-stream",
   model_configuration: "application/octet-stream",
-  tokenizer_manifest: "application/vnd.urdira.tokenizer-asset-manifest+cbor",
+  tokenizer_manifest: "application/vnd.urdira.tokenizer-asset-manifest",
   tokenizer_data: "application/octet-stream",
   input_template: "text/plain",
-  segmentation_configuration: "application/vnd.urdira.model-pack-runtime-configuration+cbor",
-  generator_configuration: "application/vnd.urdira.model-pack-runtime-configuration+cbor",
+  segmentation_configuration: "application/vnd.urdira.model-pack-runtime-configuration",
+  generator_configuration: "application/vnd.urdira.model-pack-runtime-configuration",
 };
 const profileElementTypes = new Set(["float32", "float16", "int8", "uint8"]);
 const profileVectorEncodings: Readonly<Record<string, string>> = { float32: "float32-le", float16: "float16-le", int8: "int8", uint8: "uint8" };

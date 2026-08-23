@@ -9,6 +9,7 @@ import type {
   PluginResolutionLock,
   PluginStructuralStageDeclaration,
   RegistrySnapshot,
+  ReplacementScope,
   SnapshotCapabilityStateEntry,
   SourceProviderRequestEnvelope,
   WorkspaceConfigurationRevision,
@@ -30,7 +31,8 @@ import {
   type ProviderObservation,
 } from "./directory-provider.js";
 import { EngineError } from "./errors.js";
-import type { AcceptedFactDelta } from "./fact-delta.js";
+import type { MaterializationAcceptedFactDelta } from "./fact-delta.js";
+import type { FactDeltaBatch } from "@urdira/contracts";
 import { GenericSourceIndexer, type SourceIndexApplyResult } from "./source-indexer.js";
 import { sourceProviderRequestDigest } from "./source-provider.js";
 import type { SourceCandidateBase, SourceCandidateBaseAbsence, SourceCandidateBaseOccurrence, SourceCandidateObservationSet, SourceCandidatePresentObservation } from "./source-candidate-planning.js";
@@ -44,7 +46,8 @@ import { createWorkspaceCandidatePort } from "./workspace-indexing-port.js";
  */
 export interface WorkspaceScanSourceArtifact {
   readonly path: string;
-  readonly text: string;
+  /** Present for legacy/in-process plugin providers; native providers read from CAS in the worker. */
+  readonly text?: string;
   readonly artifact_id: string;
   readonly artifact_version_id: string;
   readonly content_blob_id: string;
@@ -53,8 +56,10 @@ export interface WorkspaceScanSourceArtifact {
 }
 
 export interface WorkspaceScanAnalysisOutcome {
-  readonly accepted_deltas: readonly AcceptedFactDelta[];
+  readonly accepted_deltas: readonly MaterializationAcceptedFactDelta[];
   readonly capability_state_entries: readonly SnapshotCapabilityStateEntry[];
+  /** Native batches accepted by the core before materialisation. */
+  readonly native_batches?: readonly { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[];
 }
 
 /**
@@ -66,6 +71,8 @@ export interface WorkspaceScanAnalysisOutcome {
  * generic source cataloging and candidate orchestration.
  */
 export interface WorkspaceScanPluginProvider {
+  /** The provider accepts CAS references and performs its own bounded native reads. */
+  readonly supports_native_content_refs?: boolean;
   /** Providers opt into staged calls after validating stage coordinates end-to-end. */
   readonly supports_progressive_publication?: boolean;
   readonly registry_snapshot_id: string;
@@ -138,6 +145,10 @@ export interface RunFullWorkspaceScanInput {
   readonly on_prepared_scan?: (scan: PreparedWorkspaceScan) => void;
   /** Called after each atomic structural publication in a progressive scan. */
   readonly on_stage_published?: (stage: PluginStructuralStageDeclaration, result: CandidateRunResult) => void | Promise<void>;
+  /** Safe watcher hints for narrowing analysis; omitted means a full reconcile. */
+  readonly changed_uris?: readonly string[];
+  /** Cancels a superseded generation before analysis or publication. */
+  readonly signal?: AbortSignal;
 }
 
 export interface PreparedWorkspaceScan {
@@ -190,6 +201,7 @@ export interface RunSourceOnlyWorkspaceScanInput {
   readonly scan_budget?: WorkspaceScanBudget;
   readonly now?: () => string;
   readonly io_concurrency?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface SourceOnlyWorkspaceScanResult {
@@ -200,6 +212,7 @@ export interface SourceOnlyWorkspaceScanResult {
 
 /** Publishes only the generic source catalog when no language plugin is available. */
 export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceScanInput): Promise<SourceOnlyWorkspaceScanResult> {
+  if (input.signal?.aborted) throw new EngineError("core:operation_cancelled", "Workspace source scan generation was superseded.");
   const now = input.now ?? (() => new Date().toISOString());
   const workspaceId = input.workspace_id;
   const bindingId = input.source_provider_binding_id ?? "provider:filesystem";
@@ -213,13 +226,13 @@ export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceSc
     now,
   });
   const scope = { scope_type: "source_root" as const, source_provider_binding_id: bindingId, source_provider: provider.component_id, normalized_scope_key: "" };
-  const response = await provider.enumerate(providerRequest({
+  const enumeration = await provider.enumerateNativeBatches(providerRequest({
     call: "enumerate", workspaceId, bindingId, componentId: provider.component_id, componentVersion: provider.component_version,
     payload: { coverage_scopes: [scope] }, ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }), now,
   }));
-  if (response.outcome !== "success" || response.payload === undefined) throw new EngineError("engine:workspace_scan_enumeration_failed", `Directory enumeration for ${input.root} did not succeed (outcome ${response.outcome}).`);
-  const payload = response.payload as { readonly observation_batch: string; readonly watermark: string };
-  const parsedBatch = JSON.parse(payload.observation_batch) as EncodedObservationBatch;
+  if (input.signal?.aborted) throw new EngineError("core:operation_cancelled", "Workspace source scan generation was superseded.");
+  const response = enumeration.response;
+  if (response.outcome !== "success") throw new EngineError("engine:workspace_scan_enumeration_failed", `Directory enumeration for ${input.root} did not succeed (outcome ${response.outcome}).`);
   const read = async (observation: ProviderObservation) => await provider.read(providerRequest({
     call: "read", workspaceId, bindingId, componentId: provider.component_id, componentVersion: provider.component_version,
     payload: {
@@ -233,7 +246,7 @@ export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceSc
   const current = await input.database.repositories.snapshots.getCurrent();
   const result = await new GenericSourceIndexer(input.database).apply({
     response,
-    parsed_batch: parsedBatch,
+    native_batches: enumeration.batches,
     read,
     publication_current_generation: current?.current_generation ?? 0,
     ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }),
@@ -313,7 +326,7 @@ function priorProviderWatermarks(providerWatermarks: string | undefined): Record
  * therefore changes nothing about what `seal` produces -- it only changes
  * how many rows get read to produce it.
  */
-function replacementScopeOwnerArtifactIds(acceptedDeltas: readonly AcceptedFactDelta[]): readonly string[] {
+function replacementScopeOwnerArtifactIds(acceptedDeltas: readonly MaterializationAcceptedFactDelta[]): readonly string[] {
   const owners = new Set<string>();
   for (const delta of acceptedDeltas) for (const set of delta.replacement_sets) owners.add(set.scope.owner_artifact_id);
   return [...owners];
@@ -390,6 +403,8 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // writes). Stages nest: `publish` spans `plugin_analyze` and `seal`, so its
   // storage-write share is `publish - plugin_analyze - seal`.
   const scanStartedAt = performance.now();
+  const throwIfCancelled = (): void => { if (input.signal?.aborted) throw new EngineError("core:operation_cancelled", "Workspace scan generation was superseded."); };
+  throwIfCancelled();
   const stageTimings: Record<string, number> = {};
   const timed = async <T>(stage: string, action: () => Promise<T>): Promise<T> => {
     const startedAt = performance.now();
@@ -511,7 +526,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   });
 
   const scope = { scope_type: "source_root" as const, source_provider_binding_id: bindingId, source_provider: provider.component_id, normalized_scope_key: "" };
-  const enumerateResponse = await timed("enumerate", () => provider.enumerate(providerRequest({
+  const enumeration = await timed("enumerate", async () => { throwIfCancelled(); return provider.enumerateNativeBatches(providerRequest({
     call: "enumerate",
     workspaceId,
     bindingId,
@@ -520,14 +535,21 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     payload: { coverage_scopes: [scope] },
     ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }),
     now,
-  })));
-  if (enumerateResponse.outcome !== "success" || enumerateResponse.payload === undefined) {
+  })); });
+  const enumerateResponse = enumeration.response;
+  if (enumerateResponse.outcome !== "success") {
     throw new EngineError("engine:workspace_scan_enumeration_failed", `Directory enumeration for ${input.root} did not succeed (outcome ${enumerateResponse.outcome}).`);
   }
-  const enumeratePayload = enumerateResponse.payload as { readonly observation_batch: string; readonly watermark: string };
-  const encodedBatch = JSON.parse(enumeratePayload.observation_batch) as EncodedObservationBatch;
+  let enumeratedArtifactCount = 0;
+  let completedEnumerationBatch: EncodedObservationBatch | undefined;
+  const nativeBatches = (async function* (): AsyncGenerator<EncodedObservationBatch> {
+    for await (const batch of enumeration.batches) {
+      enumeratedArtifactCount += batch.observations.length;
+      if (batch.batch.coverage_completeness === "complete") completedEnumerationBatch = batch;
+      yield batch;
+    }
+  })();
 
-  const texts = new Map<string, string>();
   const readObservation = async (observation: ProviderObservation) => {
     const response = await provider.read(providerRequest({
       call: "read",
@@ -545,12 +567,15 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
       ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }),
       now,
     }));
-    if (response.outcome === "success" && response.payload !== undefined) {
-      const payload = response.payload as { readonly content_bytes: string };
-      texts.set(observation.normalized_uri, Buffer.from(payload.content_bytes, "base64").toString("utf8"));
-    }
     return response;
   };
+  const readStream = async (observation: ProviderObservation) => provider.readStream({
+    artifact_id: observation.artifact_id,
+    normalized_uri: observation.normalized_uri,
+    observed_content_hash: observation.observed_content_hash,
+    observed_metadata_digest: observation.observed_metadata_digest,
+    provider_version_token: observation.provider_version_token,
+  });
 
   // `currentState` (`workspace_current_state`, read above -- before this
   // scan's own source cataloging -- as `currentState`/`database.repositories.snapshots.getCurrent()`)
@@ -562,7 +587,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // and on `applyBatch`'s `generation` computation
   // (`packages/engine/src/source-indexer.ts`) for why the stage-1 source
   // counter alone drifts behind this after a plugin-upgrade generation.
-  sourceIndexResult = await timed("source_catalog", () => new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, parsed_batch: encodedBatch, publication_current_generation: currentState?.current_generation ?? 0, ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }) }));
+  sourceIndexResult = await timed("source_catalog", () => { throwIfCancelled(); return new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, publication_current_generation: currentState?.current_generation ?? 0, ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }) }); });
   if (sourceIndexResult.status !== "published" && sourceIndexResult.status !== "equivalent") {
     throw new EngineError("engine:workspace_scan_source_index_degraded", `Source cataloging of ${input.root} did not complete (status ${sourceIndexResult.status}, error ${sourceIndexResult.error_code ?? "none"}).`);
   }
@@ -572,11 +597,23 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   stageTimings["source_ready_ms"] = Math.round(performance.now() - scanStartedAt);
 
   const occurrences = await database.sourceIndex.currentOccurrencesSlim(bindingId);
-  stageTimings["enumerated_artifact_count"] = encodedBatch.observations.length;
+  stageTimings["enumerated_artifact_count"] = enumeratedArtifactCount;
   stageTimings["cataloged_artifact_count"] = occurrences.length;
   if (occurrences.length === 0) throw new EngineError("engine:workspace_scan_empty", `No eligible source files were found under ${input.root}.`);
 
   scannedArtifacts = [];
+  const nativeContentRefs = input.plugin.supports_native_content_refs === true;
+  // Native plugin providers receive only immutable CAS coordinates. This
+  // keeps the daemon from building a second workspace-wide byte/text map;
+  // the worker re-reads and verifies each blob inside its own process. Legacy
+  // in-process providers retain the hydrated text contract for compatibility.
+  const verifiedContent = nativeContentRefs ? undefined : await database.sourceIndex.readVerifiedContentBlobs(occurrences.map((occurrence) => ({
+    artifact_id: occurrence.artifact.artifact_id,
+    content_blob_id: occurrence.version.content_blob_id,
+    content_hash: occurrence.version.content_hash,
+    byte_length: occurrence.version.byte_length,
+  })));
+  const decoder = nativeContentRefs ? undefined : new TextDecoder("utf-8", { fatal: true });
   const presentObservations: SourceCandidatePresentObservation[] = [];
   for (const occurrence of occurrences) {
     presentObservations.push({
@@ -590,11 +627,16 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
       ...(occurrence.version.language_hint === undefined ? {} : { language_hint: occurrence.version.language_hint }),
       analysis_metadata_digest: occurrence.version.analysis_metadata_digest,
     });
-    const text = texts.get(occurrence.artifact.normalized_uri);
-    if (text === undefined) continue;
+    const bytes = verifiedContent?.get(occurrence.artifact.artifact_id);
+    if (!nativeContentRefs && bytes === undefined) throw new EngineError("engine:workspace_scan_stale", `CAS omitted ${occurrence.artifact.artifact_id} after source cataloging.`);
+    let text: string | undefined;
+    if (!nativeContentRefs) {
+      try { text = decoder!.decode(bytes!); }
+      catch { continue; }
+    }
     scannedArtifacts.push({
       path: occurrence.artifact.normalized_path ?? occurrence.artifact.normalized_uri,
-      text,
+      ...(text === undefined ? {} : { text }),
       artifact_id: occurrence.artifact.artifact_id,
       artifact_version_id: occurrence.version.artifact_version_id,
       content_blob_id: occurrence.version.content_blob_id,
@@ -602,11 +644,6 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
       byte_length: occurrence.version.byte_length,
     });
   }
-  // Every `scannedArtifacts[i].text` is now also referenced from `texts`
-  // (keyed by URI); the map itself is never read again, so it can be
-  // released immediately instead of outliving the (much larger) analysis
-  // stage below.
-  texts.clear();
   // `seal` (below) only ever needs these three fields, computed here from
   // data that is already fully known before `plugin.analyze` runs, so that
   // `scannedArtifacts` itself (and the source text each entry carries) can be
@@ -616,12 +653,12 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     outcome: "success",
     stable: true,
     workspace_id: workspaceId,
-    observation_batch_id: encodedBatch.batch.observation_batch_id,
+    observation_batch_id: completedEnumerationBatch?.batch.observation_batch_id ?? "",
     source_provider_binding_id: bindingId,
     source_provider: provider.component_id,
     source_provider_version: provider.component_version,
-    watermark: enumeratePayload.watermark,
-    completed_at: encodedBatch.batch.completed_at,
+    watermark: (enumerateResponse.payload as { readonly watermark?: string }).watermark ?? "",
+    completed_at: completedEnumerationBatch?.batch.completed_at ?? now(),
     observation_mode: "scan",
     coverage_completeness: "complete",
     deletion_authority: "authoritative",
@@ -632,20 +669,31 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   } else {
     sourceIndexResult = { status: "equivalent", generation: preparedScan.source_index_generation };
     preparedScan.captured_byte_lease.renew();
-    console.error(`[urdira] captured bytes verify start workspace=${workspaceId} artifacts=${preparedScan.source_artifacts.length}`);
-    const capturedVerifyStartedAt = performance.now();
-    const verifiedBytes = await preparedScan.captured_byte_lease.verify(database);
-    stageTimings["captured_verify_ms"] = Math.round(performance.now() - capturedVerifyStartedAt);
-    console.error(`[urdira] captured bytes verify complete workspace=${workspaceId} ms=${stageTimings["captured_verify_ms"]}`);
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    const capturedHydrationStartedAt = performance.now();
-    scannedArtifacts = preparedScan.source_artifacts.map((artifact) => {
-      const bytes = verifiedBytes.get(artifact.artifact_id);
-      if (bytes === undefined) throw new EngineError("engine:workspace_scan_stale", `Captured-byte lease ${preparedScan.captured_byte_lease.lease_id} omitted ${artifact.artifact_id}.`);
-      return { ...artifact, text: decoder.decode(bytes) };
-    });
-    stageTimings["captured_hydration_ms"] = Math.round(performance.now() - capturedHydrationStartedAt);
-    console.error(`[urdira] captured bytes hydration complete workspace=${workspaceId} ms=${stageTimings["captured_hydration_ms"]}`);
+    if (input.plugin.supports_native_content_refs === true) {
+      // Native providers receive the immutable content hash/CAS reference and
+      // verify it in their isolated worker immediately before parsing. Reading,
+      // hashing, and UTF-8 decoding the same complete corpus in the host first
+      // doubled progressive-stage I/O and retained a second text copy. The
+      // source catalog already validated these bytes on capture; the consumer
+      // remains the final integrity boundary.
+      scannedArtifacts = preparedScan.source_artifacts.map((artifact) => ({ ...artifact }));
+      stageTimings["captured_native_refs_ms"] = 0;
+    } else {
+      console.error(`[urdira] captured bytes verify start workspace=${workspaceId} artifacts=${preparedScan.source_artifacts.length}`);
+      const capturedVerifyStartedAt = performance.now();
+      const verifiedBytes = await preparedScan.captured_byte_lease.verify(database);
+      stageTimings["captured_verify_ms"] = Math.round(performance.now() - capturedVerifyStartedAt);
+      console.error(`[urdira] captured bytes verify complete workspace=${workspaceId} ms=${stageTimings["captured_verify_ms"]}`);
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const capturedHydrationStartedAt = performance.now();
+      scannedArtifacts = preparedScan.source_artifacts.map((artifact) => {
+        const bytes = verifiedBytes.get(artifact.artifact_id);
+        if (bytes === undefined) throw new EngineError("engine:workspace_scan_stale", `Captured-byte lease ${preparedScan.captured_byte_lease.lease_id} omitted ${artifact.artifact_id}.`);
+        return { ...artifact, text: decoder.decode(bytes) };
+      });
+      stageTimings["captured_hydration_ms"] = Math.round(performance.now() - capturedHydrationStartedAt);
+      console.error(`[urdira] captured bytes hydration complete workspace=${workspaceId} ms=${stageTimings["captured_hydration_ms"]}`);
+    }
     observations = preparedScan.observations;
     stageTimings["source_ready_ms"] = Math.round(performance.now() - scanStartedAt);
     stageTimings["enumerated_artifact_count"] = scannedArtifacts.length;
@@ -795,7 +843,13 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     // even reach `publish()` for a plugin upgrade scan that touched no
     // files, silently leaving the workspace's records on the OLD analyzer's
     // output forever.
-    force_candidate: lockChanged || (input.publication_stage_ordinal !== undefined && input.publication_stage_ordinal > 1),
+    // Source-first publication can survive a cancelled structural pass. In
+    // that state the source planner quite correctly reports an equivalent
+    // catalog, but there is still no structural snapshot to return from the
+    // ordinary no-op path. Force the first structural candidate so recovery
+    // publishes the missing snapshot instead of returning an empty id to the
+    // progressive-stage callback.
+    force_candidate: currentState === undefined || lockChanged || (input.publication_stage_ordinal !== undefined && input.publication_stage_ordinal > 1),
     trigger: {
       candidate,
       frozen_base: frozenBase,
@@ -816,9 +870,40 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         // so an unchanged file's records under the OLD analyzer are stale
         // and must not survive via incremental reuse, exactly like a first
         // scan (docs/decisions/14-plugin-upgrade-relock.md).
-        const changedArtifactIds = currentState === undefined || lockChanged || input.publication_stage_id !== undefined ? undefined : [...new Set(staged.plan.transitions.map((transition) => transition.artifact_change.artifact_id))];
-        analysis = await timed("plugin_analyze", () => input.plugin.analyze({ workspace_id: workspaceId, candidate: executingCandidate, artifacts: scannedArtifacts, ...(changedArtifactIds === undefined ? {} : { changed_artifact_ids: changedArtifactIds }), ...(input.publication_stage_id === undefined ? {} : { publication_stage_id: input.publication_stage_id }) }));
-        stageTimings["analyzed_artifact_count"] = scannedArtifacts.length;
+        // Progressive publication stages share the same candidate base.  The
+        // stage ordinal is not an invalidation signal: passing `undefined`
+        // here used to make every later stage re-analyse the complete
+        // workspace (and re-stage all records) even when only one artifact had
+        // changed.  A full pass remains correct for a first scan or a changed
+        // analyzer/lock; otherwise the planner's exact transition set is the
+        // only work that may be sent to the plugin.
+        const changedArtifactIds = currentState === undefined || lockChanged ? undefined : [...new Set(staged.plan.transitions.map((transition) => transition.artifact_change.artifact_id))];
+        // Watch batches carry normalized URIs.  Keep the source reconciliation
+        // authoritative (it still observes the complete tree so deletions are
+        // represented exactly), but narrow the expensive plugin input to the
+        // changed closure for an incremental generation.  The plugin receives
+        // the exact artifact ids from the staged source plan as an additional
+        // guard; a missing URI therefore never causes an unchanged artifact to
+        // be re-analysed, while a deleted URI remains handled by the source
+        // planner without a synthetic parse.
+        const incrementalArtifacts = currentState === undefined || lockChanged || input.changed_uris === undefined
+          ? scannedArtifacts
+          : (() => {
+            const normalizeUri = (uri: string): string => {
+              const normalized = uri.replaceAll("\\", "/");
+              return normalized.startsWith("./") ? normalized.slice(2) : normalized;
+            };
+            const changedUris = new Set(input.changed_uris.map(normalizeUri));
+            const selected = scannedArtifacts.filter((artifact) => changedUris.has(normalizeUri(artifact.path)));
+            stageTimings["changed_uri_count"] = changedUris.size;
+            stageTimings["analyzed_artifact_count_before_plugin"] = selected.length;
+            return selected;
+          })();
+        analysis = await timed("plugin_analyze", () => input.plugin.analyze({ workspace_id: workspaceId, candidate: executingCandidate, artifacts: incrementalArtifacts, ...(changedArtifactIds === undefined ? {} : { changed_artifact_ids: changedArtifactIds }), ...(input.publication_stage_id === undefined ? {} : { publication_stage_id: input.publication_stage_id }) }));
+        for (const native of analysis.native_batches ?? []) {
+          await database.candidates.acceptNativeFactDeltaBatch(executingCandidate.candidate_generation_id, native.fact_delta_id, native.batch);
+        }
+        stageTimings["analyzed_artifact_count"] = incrementalArtifacts.length;
         stageTimings["accepted_delta_count"] = analysis.accepted_deltas.length;
         // `seal` (below) only reads `knownArtifactVersions`, precomputed
         // above, so nothing past this point needs the scanned source text
@@ -857,28 +942,37 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         // actually-changed records are. On a genuine first scan (no current
         // generation yet) there is nothing to reuse, so both stay empty.
         const ownerArtifactIds = replacementScopeOwnerArtifactIds(sealedAnalysis.accepted_deltas);
-        const replacementScopes = sealedAnalysis.accepted_deltas.flatMap((delta) => delta.replacement_sets.map((set) => set.scope));
+        // Avoid a project-sized flattening allocation while accepted deltas
+        // remain live for candidate sealing.
+        const replacementScopes: ReplacementScope[] = [];
+        for (const delta of sealedAnalysis.accepted_deltas) for (const set of delta.replacement_sets) replacementScopes.push(set.scope);
         const baseRecords = currentState === undefined ? [] : await timed("prior_state_base_records", () => input.publication_stage_ordinal === undefined || input.publication_stage_ordinal === 1
           ? database.repositories.canonicalOccurrences.currentlyVisibleForOwners(currentState.current_generation, ownerArtifactIds)
           : database.repositories.canonicalOccurrences.currentlyVisibleForReplacementScopes(currentState.current_generation, replacementScopes));
         const baseProjections = currentState === undefined ? [] : await timed("prior_state_base_projections", () => database.projectionOccurrences.currentlyVisibleForOwnersSlim(currentState.current_generation, ownerArtifactIds));
-        const identityKeys = [...new Map(sealedAnalysis.accepted_deltas
-          .flatMap((delta) => delta.replacement_sets.flatMap((set) => set.records))
-          .filter((record) => record.category === "entity" || record.category === "relation" || record.category === "diagnostic")
-          .map((record) => [
-            `${record.category}\0${record.identity_key}`,
-            { identity_type: record.category, identity_key: record.identity_key },
-          ])).values()];
-        // Stage 1 is the ownership boundary: it replaces every record family
-        // and validates the complete identity set. Later progressive stages
-        // replace disjoint capability families over that published stage-1
-        // base; re-reading every global identity assignment for each stage
-        // only recreates the same cross-owner map (hundreds of thousands of
-        // rows on the benchmark corpus). Keep the global lookup for the
-        // non-progressive/first-stage path, while later stages reuse their
-        // owner-scoped base records and retain stage-1 identity ownership.
-        const laterProgressiveStage = input.publication_stage_ordinal !== undefined && input.publication_stage_ordinal > 1;
-        const globalIdentityRecords = currentState === undefined || identityKeys.length === 0 || laterProgressiveStage ? [] : await timed("prior_state_identity_records", () => database.repositories.canonicalOccurrences.currentlyVisibleForIdentityKeys(currentState.current_generation, identityKeys, { exclude_owner_artifact_ids: ownerArtifactIds }));
+        // A first publication has no prior identity or absence authority to
+        // query. Building this project-wide map anyway retained one entry per
+        // record at exactly the point where all accepted deltas were already
+        // live; VS Code exhausted V8 growing this unused Map before seal.
+        // Incremental scans still build the exact same deduplicated key set.
+        const identityKeys = currentState === undefined ? [] : (() => {
+          const identityKeyMap = new Map<string, { readonly identity_type: "entity" | "relation" | "diagnostic"; readonly identity_key: string }>();
+          for (const delta of sealedAnalysis.accepted_deltas) for (const set of delta.replacement_sets) for (const record of set.records) {
+            if (record.category !== "entity" && record.category !== "relation" && record.category !== "diagnostic") continue;
+            identityKeyMap.set(`${record.category}\0${record.identity_key}`, { identity_type: record.category, identity_key: record.identity_key });
+          }
+          return [...identityKeyMap.values()];
+        })();
+        // Exact identity lookup also includes the affected owners. One
+        // content-derived record may carry multiple identity assignments;
+        // the owner-scoped base-record read intentionally returns each
+        // physical record only once and therefore cannot represent every
+        // alias by itself. Keeping all requested exact aliases here prevents
+        // a later scan from mistaking an already-open record for a new open.
+        // The lookup remains bounded by the identities proposed by this
+        // candidate and uses the exact digest/key index; first scans still
+        // skip it because they have no current state.
+        const globalIdentityRecords = currentState === undefined || identityKeys.length === 0 ? [] : await timed("prior_state_identity_records", () => database.repositories.canonicalOccurrences.currentlyVisibleForIdentityKeys(currentState.current_generation, identityKeys));
         // Closed identities for the same owner scope, as of the same frozen
         // base generation: the production source of `absence_barriers`
         // (`CanonicalOccurrenceRepository.closedIdentitiesForOwners`,
@@ -961,7 +1055,8 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   }
 
   if (input.publication_stage_id !== undefined) console.error(`[urdira] progressive stage publish start workspace=${workspaceId} stage=${input.publication_stage_id}`);
-  const result = await timed("publish", () => staged.publish());
+  throwIfCancelled();
+  const result = await timed("publish", () => { throwIfCancelled(); return staged.publish(); });
   if (input.publication_stage_id !== undefined) console.error(`[urdira] progressive stage publish complete workspace=${workspaceId} stage=${input.publication_stage_id}`);
   if (!("state" in result)) throw new EngineError("engine:workspace_scan_no_changes", `No candidate changes were staged for workspace ${workspaceId}; nothing was published.`);
   stageTimings[input.publication_stage_id === undefined ? "structural_ready_ms" : `structural_stage_${input.publication_stage_ordinal ?? 0}_ready_ms`] = Math.round(performance.now() - scanStartedAt);
@@ -986,6 +1081,7 @@ export async function runProgressiveWorkspaceScan(input: RunFullWorkspaceScanInp
   let preparedScan: PreparedWorkspaceScan | undefined = input.prepared_scan;
   try {
   for (const [index, stage] of stages.entries()) {
+    if (input.signal?.aborted) throw new EngineError("core:operation_cancelled", `Structural scan generation for ${input.workspace_id} was superseded before stage ${stage.stage_id}.`);
     console.error(`[urdira] progressive stage start workspace=${input.workspace_id} stage=${stage.stage_id} ordinal=${stage.ordinal}`);
     if (index > 0 && result !== undefined) {
       // A later stage is valid only as the direct successor of the snapshot
@@ -1013,6 +1109,14 @@ export async function runProgressiveWorkspaceScan(input: RunFullWorkspaceScanInp
       ...(index === 0 && preparedScan === undefined ? { on_prepared_scan: (scan: PreparedWorkspaceScan) => { preparedScan = scan; } } : {}),
     });
     await input.on_stage_published?.(stage, result);
+    // The expanded agent benchmark measures the source-first structural
+    // readiness boundary. Keep later stages available in normal runtime, but
+    // allow that benchmark control to stop after the first atomic publication
+    // instead of retaining a second whole-project result graph while the
+    // agent is already working against the published stage.
+    // Readiness is an observation boundary, not a scan cancellation request.
+    // Source-ready consumers may start immediately while later structural
+    // stages continue in this same background generation.
     if (result.status === "already_published") {
       const currentSnapshot = await input.database.repositories.snapshots.get(result.snapshot_id);
       // An equivalent source rescan can legitimately return the already

@@ -4,7 +4,12 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const docsRoot = join(repositoryRoot, "docs");
-const normativeAuthority = JSON.parse(readFileSync(join(repositoryRoot, "tests/fixtures/contracts/v7-normative-authority.json"), "utf8"));
+const normativeAuthorityPath = "tests/fixtures/contracts/v7-normative-authority.json";
+const modelSourcePath = join(repositoryRoot, "packages", "contracts", "src", `model-${"contract-source.ts"}`);
+const modelSourceText = readFileSync(modelSourcePath, "utf8");
+const modelSourceMatch = modelSourceText.match(/export const authoritativeModelSourceFields = (\{[\s\S]*\}) as const;/);
+if (!modelSourceMatch) throw new Error("Could not read generated model source authority");
+const modelSourceFields = JSON.parse(modelSourceMatch[1]);
 const udmText = readFileSync(join(docsRoot, "decisions/01-universal-data-model.md"), "utf8");
 const inventoryStart = udmText.indexOf("## Model inventory and traceability");
 const inventoryEnd = udmText.indexOf("\n## ", inventoryStart + 3);
@@ -16,7 +21,7 @@ const models = modelNames.map((name) => {
   return {
     name,
     owner_decision: "decisions/01-universal-data-model.md",
-    fields: normativeAuthority.record_variants[name] ? normativeAuthority.record_envelope_fields.map((field) => ({ name: field, presence: "required", logical_type: "normative", description: "Normative inherited envelope field.", source: "decisions/01-universal-data-model.md" })) : [],
+    fields: (modelSourceFields[name] ?? []).map((field) => ({ ...field, description: "Source-backed model field.", source: "decisions/01-universal-data-model.md" })),
   };
 });
 
@@ -38,6 +43,7 @@ const payloads = {
 const schemas = [...new Map([...canonicalSchemaText.matchAll(/core:([A-Za-z][A-Za-z0-9_]*)@(\d+)/g)].filter((match) => !match[1].endsWith("_order")).map((match) => [`core:${match[1]}@${match[2]}`, { schema_id: `core:${match[1]}`, schema_version: Number(match[2]) }])).values()];
 const fixture = {
   generated_from: [
+    normativeAuthorityPath,
     "docs/decisions/01-universal-data-model.md",
     "docs/serialization/core-canonical-schemas.md",
     "docs/protocol/public-query-contract.md",

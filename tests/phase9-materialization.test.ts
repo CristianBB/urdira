@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { LogicalDigestWriter } from "@urdira/canonical";
 
 import type { CandidateMaterialization, CandidateProjectionTemplate, IndexCandidate, ProjectionWorkItem, ProposedRecord } from "@urdira/contracts";
 import { canonicalBytes, digestBytes } from "@urdira/canonical";
 import { canonicalSha256 as pluginCanonicalSha256 } from "@urdira/plugin-sdk";
-import { CandidateMaterializer, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
+import { CandidateMaterializer, compactAcceptedFactDelta, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
 
 const candidate = (): IndexCandidate => ({ candidate_generation_id: "candidate:materialization", workspace_id: "workspace:1", target_registry_snapshot_id: "registry:target", target_configuration_revision_id: "config:target", trigger_kind: "source_change", state: "ready", source_observation_batch_ids: [], issue_ids: [], created_at: "2026-08-10T00:00:00.000Z" });
 
@@ -62,6 +63,36 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     expect(sealed.materialization.materialization_digest).toMatch(/^sha256:/u);
   });
 
+  it("compacts validated records without changing sealed materialization", () => {
+    const source = acceptedDelta([record("packed", "a deliberately nested body")]);
+    const accepted = {
+      ...source,
+      delta: { ...source.delta, fact_delta_id: "delta:packed", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta;
+    const compact = compactAcceptedFactDelta(accepted);
+    expect(compact.replacement_sets[0]!.records[0]).toMatchObject({ proposal_record_key: "proposal:packed", identity_key: "packed" });
+    expect(compact.replacement_sets[0]!.records[0]).toHaveProperty("canonical_record");
+    expect(compact.replacement_sets[0]!.records[0]).not.toHaveProperty("body");
+    const fullSeal = new CandidateMaterializer().seal(input({ accepted_deltas: [accepted] }));
+    const compactSeal = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }));
+    expect(compactSeal).toEqual(fullSeal);
+  });
+
+  it("retains large initial identity sets as compact tuples while preserving their logical descriptor", () => {
+    const records = Array.from({ length: 10_000 }, (_, index) => record(`packed-${index}`, `body-${index}`));
+    const source = acceptedDelta(records);
+    const compact = compactAcceptedFactDelta({
+      ...source,
+      delta: { ...source.delta, fact_delta_id: "delta:packed-large", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+    const sealed = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }));
+    expect(sealed.identity_assignments).toHaveLength(records.length);
+    expect(sealed.identity_assignments[0]).toSatisfy((entry: unknown) => Array.isArray(entry) && entry[0] === "urdira:created-identity:v1");
+    const descriptor = JSON.parse(sealed.materialization.identity_assignment_template_set) as { entry_count: number; content_digest: string };
+    expect(descriptor.entry_count).toBe(records.length);
+    expect(descriptor.content_digest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+  });
+
   it("reuses identical records and replaces changed or missing authoritative members", () => {
     const same = record("same", "same");
     const changed = record("changed", "new");
@@ -115,11 +146,19 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
   it("preserves dependency, lookup, and projection source bindings and rejects a projection digest mismatch", () => {
     const projection: CandidateProjectionTemplate = { projection_record_id: "projection:1", projection_kind: "core:graph", projection_key: "key", workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", source_artifact_version_ids: ["version:owner", "version:source"], source_record_ids: ["record:same"], source_projection_record_ids: [], generator: "core:test", generator_version: "1.0.0", generator_configuration_digest: digest("config"), payload: { edge: "value" } };
     const projectionWork: ProjectionWorkItem = { projection_work_item_id: "projection-work", workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", projection_kind: "core:graph", operation: "rebuild", generator: "core:test", generator_version: "1.0.0", generator_configuration_digest: digest("config"), source_selection: {}, base_projection_set_digest: digest("base"), reason_codes: [], cause_references: [], work_item_digest: digest("work") };
-    const projectionInput = input({ accepted_projection_sets: [{ work_item: projectionWork as never, projections: [projection], projection_set_digest: digest([projection]) }], base_records: [{ record_id: "record:same", record_digest: digest("record:same"), workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", category: "entity", kind: "test:symbol", universal_kind: "definition", valid_from_generation: 1 }], record_dependencies: [{ dependency_entry_id: "dependency:1", workspace_id: "workspace:1", record_id: "record:same", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", dependency_artifact_id: "artifact:source", dependency_artifact_version_id: "version:source", dependency_role: "references", producer_id: "plugin:test", producer_version: "1.0.0", valid_from_generation: 1 }], lookup_bindings: [{ lookup_dependency_id: "lookup:1", workspace_id: "workspace:1", consumer_id: "record:same", consumer_type: "record_set", operation: "record_query", normalized_selector_or_address: "{}", selector_digest: selectorDigest("record_query", "{}"), previous_result_set_digest: digest("lookup"), invalidation_scope: "exact_selector", valid_from_generation: 1 }], known_artifact_versions: [{ artifact_id: "artifact:owner", artifact_version_id: "version:owner", content_digest: digest("owner") }, { artifact_id: "artifact:source", artifact_version_id: "version:source", content_digest: digest("source") }], known_dependency_roles: ["references"], known_lookup_dependencies: [{ lookup_dependency_id: "lookup:1", workspace_id: "workspace:1", consumer_type: "record_set", consumer_id: "record:same", operation: "record_query", normalized_selector_or_address: "{}", selector_digest: selectorDigest("record_query", "{}"), previous_result_set_digest: digest("lookup"), invalidation_scope: "exact_selector" }] } as never);
+    const logicalProjectionDigest = new LogicalDigestWriter("urdira:projection-set:v3").value([projection]).digest();
+    const projectionInput = input({ accepted_projection_sets: [{ work_item: projectionWork as never, projections: [projection], projection_set_digest: logicalProjectionDigest }], base_records: [{ record_id: "record:same", record_digest: digest("record:same"), workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", category: "entity", kind: "test:symbol", universal_kind: "definition", valid_from_generation: 1 }], record_dependencies: [{ dependency_entry_id: "dependency:1", workspace_id: "workspace:1", record_id: "record:same", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", dependency_artifact_id: "artifact:source", dependency_artifact_version_id: "version:source", dependency_role: "references", producer_id: "plugin:test", producer_version: "1.0.0", valid_from_generation: 1 }], lookup_bindings: [{ lookup_dependency_id: "lookup:1", workspace_id: "workspace:1", consumer_id: "record:same", consumer_type: "record_set", operation: "record_query", normalized_selector_or_address: "{}", selector_digest: selectorDigest("record_query", "{}"), previous_result_set_digest: digest("lookup"), invalidation_scope: "exact_selector", valid_from_generation: 1 }], known_artifact_versions: [{ artifact_id: "artifact:owner", artifact_version_id: "version:owner", content_digest: digest("owner") }, { artifact_id: "artifact:source", artifact_version_id: "version:source", content_digest: digest("source") }], known_dependency_roles: ["references"], known_lookup_dependencies: [{ lookup_dependency_id: "lookup:1", workspace_id: "workspace:1", consumer_type: "record_set", consumer_id: "record:same", operation: "record_query", normalized_selector_or_address: "{}", selector_digest: selectorDigest("record_query", "{}"), previous_result_set_digest: digest("lookup"), invalidation_scope: "exact_selector" }] } as never);
     const sealed = new CandidateMaterializer().seal(projectionInput);
     expect(sealed.record_dependencies).toHaveLength(1);
     expect(sealed.lookup_bindings).toHaveLength(1);
     expect(sealed.record_dependencies[0]?.dependency_artifact_version_id).toBe("version:source");
+    const withProjectionDependency = new CandidateMaterializer().seal(input({
+      accepted_projection_sets: [{ work_item: projectionWork as never, projections: [projection], projection_set_digest: logicalProjectionDigest }],
+      base_records: [{ record_id: "record:same", record_digest: digest("record:same"), workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", category: "entity", kind: "test:symbol", universal_kind: "definition", valid_from_generation: 1 }],
+      known_artifact_versions: [{ artifact_id: "artifact:owner", artifact_version_id: "version:owner", content_digest: digest("owner") }, { artifact_id: "artifact:source", artifact_version_id: "version:source", content_digest: digest("source") }],
+      projection_dependencies: [{ projection_record_id: "projection:1", source_type: "record", source_id: "record:same" }],
+    } as never));
+    expect(withProjectionDependency.projection_dependencies).toHaveLength(1);
     expect(() => new CandidateMaterializer().seal(input({ accepted_projection_sets: [{ work_item: projectionWork as never, projections: [projection], projection_set_digest: digest("wrong") }] }))).toThrowError(expect.objectContaining({ code: "core:projection_digest_mismatch" }));
   });
 
@@ -251,7 +290,7 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
   // `body` (standing in for a real plugin's per-record source `text`, per
   // `packages/plugin-javascript-typescript/src/analyzer.ts`). Confirmed against real
   // excalidraw code: the `packages/math` package alone (26 files) produces ~6,022,461
-  // aggregate code points, over `packages/canonical/src/cbor.ts`'s default
+  // aggregate code points, over the canonical logical-value decoder's default
   // `max_text_code_points` (4 * 1024 * 1024), which applies per encoded Text field, not
   // just per source file -- and that giant string was also the whole-workspace memory
   // blow-up this phase replaces. Now `record_open_template_set` holds only a small,

@@ -126,15 +126,15 @@ function makeClosedTypedPack() {
   const segmenterConfigurationDigest = digestBytes(segmenterConfigurationBytes);
   const generatorConfigurationDigest = digestBytes(generatorConfigurationBytes);
   const assets = [
-    { content_digest: modelManifestDigest, decoded_byte_length: modelManifestBytes.byteLength, media_type: "application/vnd.urdira.model-asset-manifest+cbor", semantic_role: "model_manifest" },
+    { content_digest: modelManifestDigest, decoded_byte_length: modelManifestBytes.byteLength, media_type: "application/vnd.urdira.model-asset-manifest", semantic_role: "model_manifest" },
     { content_digest: modelWeightDigest, decoded_byte_length: modelWeight.byteLength, media_type: "application/octet-stream", semantic_role: "model_weight" },
     { content_digest: modelConfigurationDigest, decoded_byte_length: modelConfiguration.byteLength, media_type: "application/octet-stream", semantic_role: "model_configuration" },
-    { content_digest: tokenizerManifestDigest, decoded_byte_length: tokenizerManifestBytes.byteLength, media_type: "application/vnd.urdira.tokenizer-asset-manifest+cbor", semantic_role: "tokenizer_manifest" },
+    { content_digest: tokenizerManifestDigest, decoded_byte_length: tokenizerManifestBytes.byteLength, media_type: "application/vnd.urdira.tokenizer-asset-manifest", semantic_role: "tokenizer_manifest" },
     { content_digest: tokenizerDataDigest, decoded_byte_length: tokenizerData.byteLength, media_type: "application/octet-stream", semantic_role: "tokenizer_data" },
     { content_digest: queryTemplateDigest, decoded_byte_length: queryTemplate.byteLength, media_type: "text/plain", semantic_role: "input_template" },
     { content_digest: documentTemplateDigest, decoded_byte_length: documentTemplate.byteLength, media_type: "text/plain", semantic_role: "input_template" },
-    { content_digest: segmenterConfigurationDigest, decoded_byte_length: segmenterConfigurationBytes.byteLength, media_type: "application/vnd.urdira.model-pack-runtime-configuration+cbor", semantic_role: "segmentation_configuration" },
-    { content_digest: generatorConfigurationDigest, decoded_byte_length: generatorConfigurationBytes.byteLength, media_type: "application/vnd.urdira.model-pack-runtime-configuration+cbor", semantic_role: "generator_configuration" },
+    { content_digest: segmenterConfigurationDigest, decoded_byte_length: segmenterConfigurationBytes.byteLength, media_type: "application/vnd.urdira.model-pack-runtime-configuration", semantic_role: "segmentation_configuration" },
+    { content_digest: generatorConfigurationDigest, decoded_byte_length: generatorConfigurationBytes.byteLength, media_type: "application/vnd.urdira.model-pack-runtime-configuration", semantic_role: "generator_configuration" },
     { content_digest: digestBytes(new Uint8Array([6])), decoded_byte_length: 1, media_type: "text/plain", semantic_role: "license" },
   ];
   const body = { manifest_schema_version: "1", model_pack_id: "core:test", model_pack_version: "1.0.0", embedding_profiles: [profile], assets, required_runtime_components: requirements };
@@ -277,7 +277,7 @@ describe("Phase 6 review regressions", () => {
     const cycleB = "sha256:" + "b".repeat(64);
     const cycleABytes = canonicalBytes({ schema_version: 1, model_provider_id: "core:provider", model_id: "model-a", model_revision: "1", architecture_id: "core:test-architecture", model_format: "core:test-format", configuration_asset_digests: [], weight_asset_digests: [cycleB], model_identity_digest: typed.manifest.embedding_profiles[0]!.model_identity_digest });
     const cycleBBytes = canonicalBytes({ schema_version: 1, model_provider_id: "core:provider", model_id: "model-b", model_revision: "1", architecture_id: "core:test-architecture", model_format: "core:test-format", configuration_asset_digests: [], weight_asset_digests: [cycleA], model_identity_digest: typed.manifest.embedding_profiles[0]!.model_identity_digest });
-    const cycleBody = { ...typed.manifest, assets: [...typed.manifest.assets.filter((asset) => asset.semantic_role !== "model_manifest"), { content_digest: cycleA, decoded_byte_length: cycleABytes.byteLength, media_type: "application/vnd.urdira.model-asset-manifest+cbor", semantic_role: "model_manifest" }, { content_digest: cycleB, decoded_byte_length: cycleBBytes.byteLength, media_type: "application/vnd.urdira.model-asset-manifest+cbor", semantic_role: "model_manifest" }] };
+    const cycleBody = { ...typed.manifest, assets: [...typed.manifest.assets.filter((asset) => asset.semantic_role !== "model_manifest"), { content_digest: cycleA, decoded_byte_length: cycleABytes.byteLength, media_type: "application/vnd.urdira.model-asset-manifest", semantic_role: "model_manifest" }, { content_digest: cycleB, decoded_byte_length: cycleBBytes.byteLength, media_type: "application/vnd.urdira.model-asset-manifest", semantic_role: "model_manifest" }] };
     const { manifest_digest: _cycleDigest, ...cycleWithoutDigest } = cycleBody;
     const cycleManifest = { ...cycleBody, manifest_digest: digestBytes(canonicalBytes(cycleWithoutDigest)) };
     const cycleBlobs = new Map([...typed.blobs].filter(([digest]) => digest !== typed.manifest.assets.find((asset) => asset.semantic_role === "model_manifest")!.content_digest));
@@ -561,7 +561,7 @@ describe("Phase 6 review regressions", () => {
   it("enforces exact template/runtime media and template reference retention semantics", () => {
     const typed = makeClosedTypedPack();
     const template = typed.manifest.assets.find((asset) => asset.semantic_role === "input_template")!;
-    const wrongTemplateMedia = { ...typed.manifest, assets: typed.manifest.assets.map((asset) => asset === template ? { ...asset, media_type: "application/cbor" } : asset) };
+    const wrongTemplateMedia = { ...typed.manifest, assets: typed.manifest.assets.map((asset) => asset === template ? { ...asset, media_type: "application/octet-stream" } : asset) };
     const { manifest_digest: _wrongDigest, ...wrongWithoutDigest } = wrongTemplateMedia;
     expect(inspectModelPack({ ...wrongTemplateMedia, manifest_digest: digestBytes(canonicalBytes(wrongWithoutDigest)) }, typed.blobs).issues.map((item) => item.code)).toContain("security:model_media_type_invalid");
     const orphanBytes = new Uint8Array([11]);
@@ -569,7 +569,7 @@ describe("Phase 6 review regressions", () => {
     const orphanBody = { ...typed.manifest, assets: [...typed.manifest.assets, { content_digest: orphanDigest, decoded_byte_length: 1, media_type: "text/plain", semantic_role: "input_template" }] };
     const { manifest_digest: _orphanDigest, ...orphanWithoutDigest } = orphanBody;
     expect(inspectModelPack({ ...orphanBody, manifest_digest: digestBytes(canonicalBytes(orphanWithoutDigest)) }, new Map([...typed.blobs, [orphanDigest, orphanBytes]])).issues.map((item) => item.code)).toContain("security:model_closure_reference_invalid");
-    const genericManifestMedia = { ...typed.manifest, assets: typed.manifest.assets.map((asset) => asset.semantic_role === "model_manifest" || asset.semantic_role === "tokenizer_manifest" ? { ...asset, media_type: "application/cbor" } : asset) };
+    const genericManifestMedia = { ...typed.manifest, assets: typed.manifest.assets.map((asset) => asset.semantic_role === "model_manifest" || asset.semantic_role === "tokenizer_manifest" ? { ...asset, media_type: "application/octet-stream" } : asset) };
     const { manifest_digest: _genericDigest, ...genericWithoutDigest } = genericManifestMedia;
     expect(inspectModelPack({ ...genericManifestMedia, manifest_digest: digestBytes(canonicalBytes(genericWithoutDigest)) }, typed.blobs).issues.map((item) => item.code)).toContain("security:model_media_type_invalid");
   });

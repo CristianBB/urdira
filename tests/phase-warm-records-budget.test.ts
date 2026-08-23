@@ -2,9 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { encodeCanonical } from "@urdira/canonical";
+import { digestBytes, encodeCanonical } from "@urdira/canonical";
 import { WorkspaceRegistry, type RegisteredWorkspace } from "../packages/engine/src/index.js";
-import { createDurableStorage, type DurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
+import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type DurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
 import { DaemonClient, DaemonRuntime, type DaemonRuntimeOptions } from "../packages/daemon/src/index.js";
 
 /**
@@ -43,12 +43,12 @@ function registerReadyWorkspace(registry: WorkspaceRegistry, label: string): Reg
     description: { provider_kind: "core:directory_source_provider", immutable_binding_identity: `identity:${label}`, features: "{}", source_state_fingerprint: `fingerprint:${label}` },
   });
   registry.beginReconciliation(workspace.workspace_id);
-  registry.markReady(workspace.workspace_id, `snapshot:${label}`, "ready");
+  registry.markReady(workspace.workspace_id, `snapshot:${workspace.workspace_id}`, "ready");
   return registry.get(workspace.workspace_id)!;
 }
 
 function recordPayload(body: Readonly<Record<string, unknown>>): Uint8Array {
-  return encodeCanonical({ body });
+  return encodeCanonical(body);
 }
 
 /**
@@ -61,9 +61,10 @@ function recordPayload(body: Readonly<Record<string, unknown>>): Uint8Array {
 async function seedLargeReadyWorkspace(database: WorkspaceDatabase, workspaceId: string, recordCount: number, bodyBytes: number): Promise<void> {
   const db = database.database;
   await db.exec("PRAGMA foreign_keys = OFF");
-  await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [`registry:${workspaceId}`, workspaceId, "1", "core-digest", "lock-1", "registry-digest-1", new Uint8Array([1])]);
-  await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [`snapshot:${workspaceId}`, workspaceId, 1, `manifest:${workspaceId}`, `registry:${workspaceId}`, "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest:${workspaceId}`, new Uint8Array([1])]);
-  await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspaceId, `snapshot:${workspaceId}`, 1, `registry:${workspaceId}`, "lock-1", "configuration-1", "freshness-1", 1, now, new Uint8Array([1])]);
+  await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [`registry:${workspaceId}`, workspaceId, "1", "core-digest", "lock-1", "registry-digest-1"]);
+  await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [`snapshot:${workspaceId}`, workspaceId, 1, `manifest:${workspaceId}`, `registry:${workspaceId}`, "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest:${workspaceId}`]);
+  await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspaceId, `snapshot:${workspaceId}`, 1, `registry:${workspaceId}`, "lock-1", "configuration-1", "freshness-1", 1, now]);
+  await db.run("INSERT INTO source_index_state (workspace_id, current_generation, state_revision, checkpoint_id, provider_watermarks, source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [workspaceId, 1, 1, `checkpoint:${workspaceId}`, "{}", "source-digest", now]);
   await db.run("INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [`blob:${workspaceId}`, `sha256:${workspaceId}`, 0, "inline"]);
   // `artifact_versions`/`record_occurrences` both have a real FK to
   // `source_artifacts(workspace_id, artifact_id)` -- `PRAGMA foreign_keys =
@@ -75,23 +76,24 @@ async function seedLargeReadyWorkspace(database: WorkspaceDatabase, workspaceId:
   // optional, unlike this file's single-open-handle sibling
   // (`tests/phase-canonical-query-data-port.test.ts`), which never
   // re-triggers that check.
-  await db.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES ('art-1', ?, ?, ?, ?, 'source_file', ?)", [workspaceId, `file:///warm-budget/${workspaceId}.ts`, `${workspaceId}.ts`, `${workspaceId}.ts`, new Uint8Array([1])]);
+  await db.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES ('art-1', ?, ?, ?, ?, 'source_file')", [workspaceId, `file:///warm-budget/${workspaceId}.ts`, `${workspaceId}.ts`, `${workspaceId}.ts`]);
   // `artifact_versions.created_from_observation_id` has a real FK to
   // `source_observations(workspace_id, artifact_id, source_observation_id)`,
   // which in turn FKs to `source_observation_batches` -- both required for
   // the same "a later fresh openWorkspace() re-checks all FKs" reason as
   // `source_artifacts` above.
-  await db.run("INSERT INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, started_at, completed_at, observation_count, unavailable_count, batch_digest, observation_batch_payload) VALUES (?, ?, 'binding-1', 'core:directory_source_provider', '1', 'domain-1', 'full', '[]', 'complete', 'authoritative', ?, ?, 1, 0, ?, ?)", [`batch:${workspaceId}`, workspaceId, now, now, `batch-digest:${workspaceId}`, new Uint8Array([1])]);
-  await db.run("INSERT INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_at, received_at, observation_payload) VALUES ('observation-1', ?, ?, 'art-1', 'binding-1', 'core:directory_source_provider', '1', 'domain-1', 'full', 'present', ?, ?, ?)", [`batch:${workspaceId}`, workspaceId, now, now, new Uint8Array([1])]);
-  await db.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, 'art-1', ?, ?, 0, 'utf-8', NULL, 'metadata-digest', 'observation-1', 0, NULL, ?)", [`artv:${workspaceId}`, workspaceId, `blob:${workspaceId}`, `sha256:${workspaceId}`, new Uint8Array([1])]);
+  await db.run("INSERT INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, started_at, completed_at, observation_count, unavailable_count, batch_digest) VALUES (?, ?, 'binding-1', 'core:directory_source_provider', '1', 'domain-1', 'full', '[]', 'complete', 'authoritative', ?, ?, 1, 0, ?)", [`batch:${workspaceId}`, workspaceId, now, now, `batch-digest:${workspaceId}`]);
+  await db.run("INSERT INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_at, received_at) VALUES ('observation-1', ?, ?, 'art-1', 'binding-1', 'core:directory_source_provider', '1', 'domain-1', 'full', 'present', ?, ?)", [`batch:${workspaceId}`, workspaceId, now, now]);
+  await db.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, 'art-1', ?, ?, 0, 'utf-8', NULL, 'metadata-digest', 'observation-1', 0, NULL)", [`artv:${workspaceId}`, workspaceId, `blob:${workspaceId}`, `sha256:${workspaceId}`]);
   const filler = "x".repeat(bodyBytes);
   for (let index = 0; index < recordCount; index += 1) {
     const recordId = `rec:${workspaceId}:${String(index).padStart(4, "0")}`;
     const payload = recordPayload({ name: `record-${index}`, filler });
     await db.run(
-      "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES (?, ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, 1, NULL, ?, 'payload-digest', ?, ?, NULL, ?)",
-      [recordId, workspaceId, `artv:${workspaceId}`, `digest-${recordId}`, payload.byteLength, payload, payload],
+      "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES (?, ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, 1, NULL, ?, ?, ?, 'analysis', 'configuration', 'dependencies')",
+      [recordId, workspaceId, `artv:${workspaceId}`, `digest-${recordId}`, digestBytes(payload), payload.byteLength],
     );
+    await db.transaction(relationalValueCommands(flattenRelationalValue(workspaceId, recordId, 1, { name: `record-${index}`, filler })));
   }
 }
 
@@ -104,12 +106,12 @@ async function seedLargeReadyWorkspace(database: WorkspaceDatabase, workspaceId:
  * only bounds item count/snippet characters, not an individual record
  * body's own size) -- returning every seeded record here would multiply
  * `bodyBytes` by `recordCount` in the IPC response, overflowing the
- * daemon's 256KB default UCE frame size. One item is all this test needs to
+ * daemon's 256KB default IPC frame size. One item is all this test needs to
  * prove a post-eviction reload decodes correctly.
  */
 async function findFirstRecordName(client: DaemonClient, workspaceId: string): Promise<string | undefined> {
   const response = await client.call("core:query", {
-    api_version: 1,
+    api_version: 3,
     scope: { scope_type: "single_workspace", workspace_id: workspaceId },
     expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } },
     options: {
@@ -153,7 +155,7 @@ describe("Daemon warm-records LRU byte budget (URDIRA_WARM_RECORDS_BUDGET_MB)", 
         await seedStorage.catalog.registerWorkspace({ workspace_id: workspace.workspace_id, canonical_root: workspace.canonical_root, display_root: workspace.display_root, source_provider_bindings: [workspace.provider], status: "registered", registered_at: workspace.registered_at });
         const database = await seedStorage.openWorkspace(workspace.workspace_id);
         try {
-          // 500 records * 4,000 chars ~= 2MB of record_payload per
+          // 500 records * 4,000 chars ~= 2MB of relational record body per
           // workspace -- comfortably under a 3MB budget alone, but two
           // together (~4MB) exceed it. Deliberately many SMALL records
           // rather than few LARGE ones: `core:find_records`' response
@@ -161,7 +163,7 @@ describe("Daemon warm-records LRU byte budget (URDIRA_WARM_RECORDS_BUDGET_MB)", 
           // `response_budget` (see `findFirstRecordName`'s own doc
           // comment), so keeping each individual record small keeps the
           // verification query's own response comfortably under the
-          // daemon's 256KB default UCE frame size.
+          // daemon's 256KB default IPC frame size.
           await seedLargeReadyWorkspace(database, workspace.workspace_id, 500, 4_000);
         } finally {
           await database.close();
@@ -192,13 +194,11 @@ describe("Daemon warm-records LRU byte budget (URDIRA_WARM_RECORDS_BUDGET_MB)", 
       // chain (and any other tracked warm) to fully settle before asserting.
       await runtime.debugFlushPendingWarms();
 
-      // Workspace A warmed first (bytes(A) alone < 3MB budget, so the
-      // startup chain did not stop after it), then workspace B warmed
-      // second, pushing the combined total over budget -- B is now the
-      // most-recently-used workspace and is spared; A (least-recently-used)
-      // was evicted.
+      // Startup warm-up is metadata-only in v2. Neither workspace loads its
+      // record corpus merely because the daemon starts, so the byte budget
+      // cannot be consumed by an implicit global materialization.
       expect(await runtime.debugHasWarmRecords(workspaceA.workspace_id)).toBe(false);
-      expect(await runtime.debugHasWarmRecords(workspaceB.workspace_id)).toBe(true);
+      expect(await runtime.debugHasWarmRecords(workspaceB.workspace_id)).toBe(false);
 
       // The `queryEngines` entry itself (and A's open database handle) must
       // still exist -- only the decoded corpus was dropped, per

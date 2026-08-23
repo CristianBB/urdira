@@ -14,7 +14,7 @@ const options = {
 };
 
 function request(expression: QueryExpression): QueryRequest {
-  return { api_version: 1, scope: { scope_type: "single_workspace", workspace_id: "workspace-1", snapshot_id: "snapshot-1" }, expression, options };
+  return { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1", snapshot_id: "snapshot-1" }, expression, options };
 }
 
 const operation = (operationName = "core:find_records"): QueryExpression => ({
@@ -34,8 +34,15 @@ const reference = (stage_id: string, output: string) => ({ stage_id, output });
 
 const pipeline = (stages: readonly object[], outputs: readonly object[]): QueryExpression => ({
   expression_type: "pipeline" as const,
-  stages,
-  outputs,
+  stages: stages.map((stage) => {
+    const value = stage as Record<string, unknown>;
+    if (value["operator"] === "source.operation") {
+      const argumentsValue = value["arguments"] as Record<string, unknown>;
+      return { stage_id: value["stage_id"], stage_type: "operation", operation: (argumentsValue["operation"] as string), operation_version: 3, arguments: argumentsValue["operation_arguments"] };
+    }
+    return { stage_id: value["stage_id"], stage_type: "operator", operator: value["operator"], arguments: value["arguments"], inputs: value["inputs"] };
+  }),
+  outputs: outputs.map((output) => ({ ...(output as Record<string, unknown>), name: `${String((output as Record<string, unknown>)["stage_id"])}-${String((output as Record<string, unknown>)["output"])}` })),
 } as unknown as QueryExpression);
 
 const recipe = (recipe_id = "core:locate_implementation", recipe_version?: number): QueryExpression => ({
@@ -58,7 +65,7 @@ function expectCode(action: () => unknown, code: string): void {
 describe("Phase 11 query plan normalization", () => {
   it("normalizes a registered operation into a digest-addressed plan", () => {
     const plan = normalizeQueryRequest(request(operation()));
-    expect(plan.api_version).toBe("1");
+    expect(plan.api_version).toBe("3");
     expect(plan.operation_versions).toEqual([{ operation_id: "core:find_records", operation_version: 1 }]);
     expect(plan.recipe_versions).toEqual([]);
     expect(plan.plan_digest).toMatch(/^sha256:[0-9a-f]{64}$/);
@@ -75,7 +82,7 @@ describe("Phase 11 query plan normalization", () => {
   });
 
   it("rejects an unsupported public API version", () => {
-    expectCode(() => normalizeQueryRequest({ ...request(operation()), api_version: 3 }), "core:api_version_unsupported");
+    expectCode(() => normalizeQueryRequest({ ...request(operation()), api_version: 1 }), "core:api_version_unsupported");
   });
 
   it("rejects an unknown recipe and recipe version", () => {

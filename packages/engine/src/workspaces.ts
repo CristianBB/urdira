@@ -102,7 +102,7 @@ export type WorkspaceRootResolution =
   | { readonly error: { readonly code: "core:workspace_not_registered"; readonly details: { readonly registration_command: "urdira workspace add <workspace-root>" } } };
 export type WorkspaceIndexStatusResolution =
   | { readonly workspace_id: string; readonly current_snapshot_id?: string; readonly workspace_status: WorkspaceStatus }
-  | { readonly error: { readonly code: "core:workspace_not_registered" | "core:workspace_not_found" | "core:index_unavailable"; readonly details: Readonly<Record<string, string>> } };
+  | { readonly error: { readonly code: "core:workspace_not_registered" | "core:workspace_not_found" | "core:index_unavailable"; readonly details: Readonly<Record<string, unknown>> } };
 
 function validateReconciliationResult(result: unknown, operationId: string): asserts result is WorkspaceReconciliationResult {
   if (result === null || typeof result !== "object"
@@ -503,7 +503,7 @@ export class WorkspaceRegistry {
   }
 }
 
-/** Resolve the v2 status root without ever returning the absolute path in protocol data. */
+/** Resolve the v3 status root without ever returning the absolute path in protocol data. */
 export function resolveWorkspaceRoot(registry: WorkspaceRegistry, workspaceRoot: string): WorkspaceRootResolution {
   const workspace = registry.findByCanonicalRoot(workspaceRoot);
   return workspace === undefined
@@ -512,18 +512,22 @@ export function resolveWorkspaceRoot(registry: WorkspaceRegistry, workspaceRoot:
 }
 
 export function resolveIndexStatusRequest(registry: WorkspaceRegistry, request: { readonly api_version: number; readonly workspace_ids: ReadonlyArray<string>; readonly workspace_root?: string }): WorkspaceIndexStatusResolution {
+  if (request.api_version !== 3) return { error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>", requested_version: request.api_version, supported_versions: [3] } } };
   let workspace: RegisteredWorkspace | undefined;
-  if (request.api_version === 2 || request.api_version === 3) {
-    if (request.workspace_ids.length !== 0 || request.workspace_root === undefined || request.workspace_root.length === 0) return { error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>" } } };
-    workspace = registry.findByCanonicalRoot(request.workspace_root);
-    if (workspace === undefined) return { error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>" } } };
-  } else {
-    workspace = request.workspace_ids.length === 1 ? registry.get(request.workspace_ids[0]!) : undefined;
-    if (workspace === undefined) return { error: { code: "core:workspace_not_found", details: { workspace_id: request.workspace_ids[0] ?? "" } } };
+  if (request.api_version === 3) {
+    if (request.workspace_root !== undefined) {
+      if (request.workspace_ids.length !== 0 || request.workspace_root.length === 0) return { error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>" } } };
+      workspace = registry.findByCanonicalRoot(request.workspace_root);
+      if (workspace === undefined) return { error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>" } } };
+    } else if (request.workspace_ids.length === 1) {
+      workspace = registry.get(request.workspace_ids[0]!);
+      if (workspace === undefined) return { error: { code: "core:workspace_not_found", details: { workspace_id: request.workspace_ids[0]! } } };
+    } else {
+      return { error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>" } } };
+    }
   }
-  // v1/v2 preserve their historical structural-snapshot requirement. v3 is
-  // the layered status surface and must remain queryable while source-only
+  if (workspace === undefined) return { error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>" } } };
+  // v3 is the layered status surface and remains queryable while source-only
   // indexing is available but structural publication is still in progress.
-  if (request.api_version !== 3 && workspace.status !== "ready" && workspace.status !== "degraded") return { error: { code: "core:index_unavailable", details: { workspace_id: workspace.workspace_id, index_state: workspace.status } } };
   return { workspace_id: workspace.workspace_id, ...(workspace.current_snapshot_id === undefined ? {} : { current_snapshot_id: workspace.current_snapshot_id }), workspace_status: workspace.status };
 }

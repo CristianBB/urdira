@@ -1,5 +1,5 @@
 import { readFile, rm } from "node:fs/promises";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   classifyWorkspaceConfigurationImpact,
   detectWorkspaceTechnologies,
@@ -58,12 +58,12 @@ describe("workspace configuration impact", () => {
   });
 });
 
-describe("MCP index status v2", () => {
+describe("MCP index status v3", () => {
   test("resolves an explicit root and normalizes away a redundant workspace id list", async () => {
     const calls: unknown[] = [];
     const tools = createUrdiraToolDefinitions({ client: { call: async (_name: string, payload: unknown) => { calls.push(payload); return { protocol_version: 1, request_id: "request-1", outcome: "success", payload: { workspaces: [{ workspace_id: "workspace-1", workspace_root: "/tmp/example", display_root: "project" }] } }; } } });
     const status = tools.find((tool) => tool.name === "urdira_index_status")!;
-    const response = await status.invoke({ requestType: "initial", apiVersion: 2, workspaceIds: [], workspaceRoot: "/tmp/example", includeCapabilities: false, includePlugins: false, includeActivationIssues: false, includeCandidateIssues: false, includeConfigurationIssues: false, responseBudget: { maxItems: 10, maxCharacters: 1000 }, render: "json" });
+    const response = await status.invoke({ requestType: "initial", apiVersion: 3, workspaceIds: [], workspaceRoot: "/tmp/example", includeCapabilities: false, includePlugins: false, includeActivationIssues: false, includeCandidateIssues: false, includeConfigurationIssues: false, responseBudget: { maxItems: 10, maxCharacters: 1000 }, render: "json" });
     // No outputSchema is registered for any Urdira tool (a live benchmark
     // found Claude Code's MCP client reads only structuredContent instead
     // of content[0].text when an outputSchema is declared, so the fix
@@ -72,17 +72,17 @@ describe("MCP index status v2", () => {
     expect(response.structuredContent).toBeUndefined();
     const responseBlock = response.content.find((block): block is { type: "text"; text: string } => block.type === "text")!;
     expect(JSON.parse(responseBlock.text)).toEqual({ page: { workspaces: [{ workspace_id: "workspace-1", display_root: "project" }] } });
-    // A v2 request's workspace_root is authoritative; a caller-supplied
+    // A v3 request's workspace_root is authoritative; a caller-supplied
     // workspace_ids is redundant for this variant and is normalized to []
     // rather than rejected -- the adapter's server-side defaulting layer
     // does not force an agent to get this exactly right.
-    const secondResponse = await status.invoke({ requestType: "initial", apiVersion: 2, workspaceIds: ["workspace-1"], workspaceRoot: "/tmp/example", includeCapabilities: false, includePlugins: false, includeActivationIssues: false, includeCandidateIssues: false, includeConfigurationIssues: false, responseBudget: { maxItems: 10, maxCharacters: 1000 }, render: "json" });
+    const secondResponse = await status.invoke({ requestType: "initial", apiVersion: 3, workspaceIds: ["workspace-1"], workspaceRoot: "/tmp/example", includeCapabilities: false, includePlugins: false, includeActivationIssues: false, includeCandidateIssues: false, includeConfigurationIssues: false, responseBudget: { maxItems: 10, maxCharacters: 1000 }, render: "json" });
     expect(secondResponse.structuredContent).toBeUndefined();
     const secondBlock = secondResponse.content.find((block): block is { type: "text"; text: string } => block.type === "text")!;
     expect(JSON.parse(secondBlock.text)).toEqual({ page: { workspaces: [{ workspace_id: "workspace-1", display_root: "project" }] } });
     expect(calls).toEqual([
-      { request_type: "initial", api_version: 2, workspace_ids: [], include_capabilities: false, include_plugins: false, include_activation_issues: false, include_candidate_issues: false, response_budget: { max_items: 10, max_characters: 1000 }, workspace_root: "/tmp/example", include_configuration_issues: false },
-      { request_type: "initial", api_version: 2, workspace_ids: [], include_capabilities: false, include_plugins: false, include_activation_issues: false, include_candidate_issues: false, response_budget: { max_items: 10, max_characters: 1000 }, workspace_root: "/tmp/example", include_configuration_issues: false },
+      { request_type: "initial", api_version: 3, workspace_ids: [], include_capabilities: false, include_plugins: false, include_activation_issues: false, include_candidate_issues: false, response_budget: { max_items: 10, max_characters: 1000 }, workspace_root: "/tmp/example", include_configuration_issues: false },
+      { request_type: "initial", api_version: 3, workspace_ids: [], include_capabilities: false, include_plugins: false, include_activation_issues: false, include_candidate_issues: false, response_budget: { max_items: 10, max_characters: 1000 }, workspace_root: "/tmp/example", include_configuration_issues: false },
     ]);
   });
 
@@ -121,13 +121,39 @@ describe("workspace administration CLI", () => {
 
   test("supports the interactive add assistant after detection preview", async () => {
     const calls: string[] = [];
+    const prompts: string[] = [];
     const result = await runCli(["workspace", "add", "/tmp/project"], {
       client: { call: async (call) => { calls.push(call); return { outcome: "success", payload: { workspace_id: "workspace-1" } }; } },
-      preview_admin: async () => ({ proposal_id: "proposal-1", technologies: ["typescript"] }),
-      prompt: async (question) => question.includes("Configure Urdira") ? "no" : "yes",
+      preview_admin: async () => ({ proposal_id: "proposal-1", technologies: [{ technology_id: "typescript", kind: "language", confidence: 1, compatible_plugin_ids: ["urdira:javascript_typescript"], evidence: [{ path: "src/index.ts", rule: "extension.typescript" }] }] }),
+      prompt: async (question) => { prompts.push(question); return question.includes("Configure Urdira") ? "no" : "yes"; },
     });
     expect(result.exit_code).toBe(0);
     expect(calls).toEqual(["core:workspace_add"]);
+    expect(prompts[0]).toContain("Detected technologies and compatible plugins:");
+    expect(prompts[0]).toContain("typescript, language, confidence 100%");
+    expect(prompts[0]).toContain("compatible plugins: urdira:javascript_typescript");
+    expect(prompts[0]).toContain("src/index.ts (extension.typescript)");
+    expect(prompts[1]).toContain("Compatible plugins to activate: urdira:javascript_typescript");
+    expect(prompts[1]).toContain("Activate these plugins and start observation?");
+  });
+
+  test("explains the exact target instead of inventing a technology proposal for configure", async () => {
+    const prompts: string[] = [];
+    const result = await runCli(["workspace", "configure", "workspace-1"], {
+      client: { call: async () => ({ outcome: "success", payload: { applied: true } }) },
+      prompt: async (question) => { prompts.push(question); return "yes"; },
+    });
+    expect(result.exit_code).toBe(0);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("Workspace configuration target: workspace-1.");
+    expect(prompts[0]).toContain("No technology detection is performed");
+    expect(prompts[0]).toContain("Apply this configuration?");
+  });
+
+  test("rejects workspace add without a workspace path before prompting", async () => {
+    const prompt = vi.fn();
+    await expect(runCli(["workspace", "add"], { client: { call: async () => ({ outcome: "success", payload: {} }) }, prompt })).rejects.toMatchObject({ code: "cli:command_invalid" });
+    expect(prompt).not.toHaveBeenCalled();
   });
 
   test("offers native agent installation after interactive workspace registration", async () => {
@@ -182,7 +208,7 @@ describe("workspace root resolution", () => {
     expect(typeof registry.findByCanonicalRoot).toBe("function");
     expect(registry.findByCanonicalRoot("/tmp/project/")).toBeUndefined();
     expect(resolveWorkspaceRoot(registry, "/tmp/project")).toEqual({ error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>" } } });
-    expect(resolveIndexStatusRequest(registry, { api_version: 2, workspace_ids: [], workspace_root: "/tmp/project" })).toEqual({ error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>" } } });
+    expect(resolveIndexStatusRequest(registry, { api_version: 2, workspace_ids: [], workspace_root: "/tmp/project" })).toEqual({ error: { code: "core:workspace_not_registered", details: { registration_command: "urdira workspace add <workspace-root>", requested_version: 2, supported_versions: [3] } } });
   });
 });
 

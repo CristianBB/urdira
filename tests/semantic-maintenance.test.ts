@@ -2,8 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { encodeCanonical } from "@urdira/canonical";
-import { createDurableStorage, type ContentAddressedStore, type WorkspaceDatabase } from "../packages/storage/src/index.js";
+import { digestBytes, encodeCanonical } from "@urdira/canonical";
+import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type ContentAddressedStore, type WorkspaceDatabase } from "../packages/storage/src/index.js";
 import { createHttpEmbeddingProvider, createLocalHashProvider, reconcileSemanticProjection, type ResolvedSemanticProvider, type SemanticReconcilerContentReader } from "../packages/engine/src/index.js";
 
 // `reconcileSemanticProjection` is typed against `@urdira/storage`'s
@@ -53,33 +53,33 @@ async function withWorkspace(workspaceId: string, test: (opened: WorkspaceDataba
 // lookup finds a real, matching `artifact_versions` row.
 async function seedTextVersion(opened: WorkspaceDatabase, cas: ContentAddressedStore, workspaceId: string, options: { readonly artifactId: string; readonly artifactVersionId: string; readonly text: string; readonly validFromGeneration: number; readonly validToGeneration?: number; readonly displayPath?: string }): Promise<void> {
   await opened.database.exec("PRAGMA foreign_keys = OFF");
-  await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, 'physical_file', ?)", [options.artifactId, workspaceId, options.artifactId, options.artifactId, options.displayPath ?? options.artifactId, new Uint8Array([1])]);
+  await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES (?, ?, ?, ?, ?, 'physical_file')", [options.artifactId, workspaceId, options.artifactId, options.artifactId, options.displayPath ?? options.artifactId]);
   const blob = await cas.put(new TextEncoder().encode(options.text), { media_type: "text/plain; charset=utf-8" });
   await opened.database.run("INSERT OR IGNORE INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [blob.content_blob_id, blob.content_hash, blob.byte_length, blob.storage_reference]);
   await opened.database.run(
-    "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, 'utf-8', 'text', 'digest', 'obs-1', ?, ?, ?)",
-    [options.artifactVersionId, workspaceId, options.artifactId, blob.content_blob_id, blob.content_hash, blob.byte_length, options.validFromGeneration, options.validToGeneration ?? null, new Uint8Array([1])],
+    "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, 'utf-8', 'text', 'digest', 'obs-1', ?, ?)",
+    [options.artifactVersionId, workspaceId, options.artifactId, blob.content_blob_id, blob.content_hash, blob.byte_length, options.validFromGeneration, options.validToGeneration ?? null],
   );
 }
 
 /** A version whose declared `encoding` is `binary` -- `reconcileSemanticProjection` must never embed it. */
 async function seedBinaryVersion(opened: WorkspaceDatabase, cas: ContentAddressedStore, workspaceId: string, artifactId: string, artifactVersionId: string, validFromGeneration: number): Promise<void> {
   await opened.database.exec("PRAGMA foreign_keys = OFF");
-  await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, 'physical_file', ?)", [artifactId, workspaceId, artifactId, artifactId, artifactId, new Uint8Array([1])]);
+  await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES (?, ?, ?, ?, ?, 'physical_file')", [artifactId, workspaceId, artifactId, artifactId, artifactId]);
   const blob = await cas.put(new Uint8Array([0, 1, 2, 3]));
   await opened.database.run("INSERT OR IGNORE INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [blob.content_blob_id, blob.content_hash, blob.byte_length, blob.storage_reference]);
   await opened.database.run(
-    "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, 'binary', NULL, 'digest', 'obs-1', ?, NULL, ?)",
-    [artifactVersionId, workspaceId, artifactId, blob.content_blob_id, blob.content_hash, blob.byte_length, validFromGeneration, new Uint8Array([1])],
+    "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, 'binary', NULL, 'digest', 'obs-1', ?, NULL)",
+    [artifactVersionId, workspaceId, artifactId, blob.content_blob_id, blob.content_hash, blob.byte_length, validFromGeneration],
   );
 }
 
 async function setCurrentGeneration(opened: WorkspaceDatabase, workspaceId: string, generation: number): Promise<void> {
   await opened.database.run(
-    `INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at, current_payload)
-     VALUES (?, 'snapshot-1', ?, 'registry-1', 'lock-1', 'configuration-1', 'freshness-1', 1, ?, ?)
+    `INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at)
+     VALUES (?, 'snapshot-1', ?, 'registry-1', 'lock-1', 'configuration-1', 'freshness-1', 1, ?)
      ON CONFLICT(workspace_id) DO UPDATE SET current_generation = excluded.current_generation`,
-    [workspaceId, generation, now, new Uint8Array([1])],
+    [workspaceId, generation, now],
   );
 }
 
@@ -87,14 +87,8 @@ async function closeVersion(opened: WorkspaceDatabase, artifactVersionId: string
   await opened.database.run("UPDATE artifact_versions SET valid_to_generation = ? WHERE artifact_version_id = ?", [validToGeneration, artifactVersionId]);
 }
 
-// Decision 17 (entity-grain semantic documents) fixture helpers -- mirror
-// `tests/phase-canonical-query-data-port.test.ts`'s `recordPayload`/
-// `insertRecordOccurrence` exactly: `record_occurrences.record_payload`
-// stores `encodeCanonical({ body })`, the minimal wrapper
-// `decodeEntityRecordBody` (`semantic-reconciler.ts`) decodes back down to
-// just `body`.
 function entityRecordPayload(body: Readonly<Record<string, unknown>>): Uint8Array {
-  return encodeCanonical({ body });
+  return encodeCanonical(body);
 }
 
 async function seedEntityRecord(opened: WorkspaceDatabase, workspaceId: string, options: {
@@ -109,9 +103,10 @@ async function seedEntityRecord(opened: WorkspaceDatabase, workspaceId: string, 
   const payload = entityRecordPayload(options.body);
   await opened.database.exec("PRAGMA foreign_keys = OFF");
   await opened.database.run(
-    "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest, payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES (?, ?, 'entity', ?, 'core:construct', 1, 'test', '1', ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, 'payload-digest', ?, ?, NULL, ?)",
-    [options.recordId, workspaceId, options.recordKind, options.ownerArtifactId, options.ownerArtifactVersionId, options.validFromGeneration, options.validToGeneration ?? null, `digest-${options.recordId}`, payload.byteLength, payload, payload],
+    "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES (?, ?, 'entity', ?, 'core:construct', 1, 'test', '1', ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, 'analysis', 'configuration', 'dependencies')",
+    [options.recordId, workspaceId, options.recordKind, options.ownerArtifactId, options.ownerArtifactVersionId, options.validFromGeneration, options.validToGeneration ?? null, `digest-${options.recordId}`, digestBytes(payload), payload.byteLength],
   );
+  await opened.database.transaction(relationalValueCommands(flattenRelationalValue(workspaceId, options.recordId, options.validFromGeneration, options.body)));
 }
 
 async function closeEntityRecord(opened: WorkspaceDatabase, recordId: string, validToGeneration: number): Promise<void> {
@@ -286,13 +281,13 @@ describe("reconcileSemanticProjection", () => {
       await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-empty", artifactVersionId: "artv-empty", text: "  !  ", validFromGeneration: 1 });
 
       await opened.database.exec("PRAGMA foreign_keys = OFF");
-      await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES ('art-corrupt', ?, 'art-corrupt', 'art-corrupt', 'art-corrupt', 'physical_file', ?)", [workspaceId, new Uint8Array([1])]);
+      await opened.database.run("INSERT OR IGNORE INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES ('art-corrupt', ?, 'art-corrupt', 'art-corrupt', 'art-corrupt', 'physical_file')", [workspaceId]);
       const corruptBytes = new Uint8Array([0xff, 0xfe, 0x00]);
       const corruptBlob = await cas.put(corruptBytes);
       await opened.database.run("INSERT OR IGNORE INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [corruptBlob.content_blob_id, corruptBlob.content_hash, corruptBlob.byte_length, corruptBlob.storage_reference]);
       await opened.database.run(
-        "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES ('artv-corrupt', ?, 'art-corrupt', ?, ?, ?, 'utf-8', 'text', 'digest', 'obs-1', 1, NULL, ?)",
-        [workspaceId, corruptBlob.content_blob_id, corruptBlob.content_hash, corruptBlob.byte_length, new Uint8Array([1])],
+        "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES ('artv-corrupt', ?, 'art-corrupt', ?, ?, ?, 'utf-8', 'text', 'digest', 'obs-1', 1, NULL)",
+        [workspaceId, corruptBlob.content_blob_id, corruptBlob.content_hash, corruptBlob.byte_length],
       );
       await setCurrentGeneration(opened, workspaceId, 1);
 

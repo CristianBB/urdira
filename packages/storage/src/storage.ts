@@ -6,7 +6,7 @@ import type { ModelPackInstallation, Workspace, WorkspaceCurrentState, Snapshot,
 import { BlobStore, ContentAddressedStore, type BlobReference } from "./cas.js";
 import { resetTimings, snapshotTimings, timed, timingEnabled } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
-import { CATALOG_SCHEMA, WORKSPACE_SCHEMA, ensureWorkspaceSchemaCompatibility, initializeSchema } from "./schema.js";
+import { CATALOG_SCHEMA, WORKSPACE_SCHEMA, ensureCatalogSchemaCompatibility, ensureWorkspaceSchemaCompatibility, initializeSchema } from "./schema.js";
 import { createWorkspaceRepositories, type WorkspaceRepositories } from "./repositories.js";
 import { openSqliteDatabase, type SqliteCommand, type SqliteDatabase, type SqliteValue } from "./sqlite.js";
 import { noFaults, type FaultBoundary, type FaultInjector } from "./faults.js";
@@ -16,6 +16,7 @@ import { WorkspaceSourceIndexRepository, type SourceIndexCommitInput } from "./s
 import { WorkspaceCandidateRepository, frozenCandidateBaseTupleDigest, normalizeObservationBatchIds, sameFrozenCandidateBaseTuple, type CandidatePublicationInput, type CandidatePublicationResult } from "./candidates.js";
 import { buildCandidatePublicationPlan, buildCompatibilityPublicationPlan, buildPublicationTransactionCommands, publicationTransactionCommands, type ProjectionSetDigestCorpusEntry, type RecordSetDigestCorpusEntry } from "./publication-authority.js";
 import { WorkspaceProjectionOccurrenceRepository } from "./projection-occurrences.js";
+import { ByteBoundaryTelemetry } from "./byte-telemetry.js";
 
 export interface DurableStorageOptions {
   readonly rootDir: string;
@@ -179,10 +180,11 @@ interface WorkspaceRegistrationRow extends Record<string, unknown> {
   readonly workspace_id: string;
   readonly canonical_root: string;
   readonly display_root: string;
+  readonly status: "registered" | "removed";
+  readonly source_provider_bindings: string;
   readonly database_path: string;
   readonly registered_at: string;
   readonly removed_at: string | null;
-  readonly workspace_payload: unknown;
 }
 
 export class SerializedSqliteDatabase implements SqliteDatabase {
@@ -239,18 +241,14 @@ export class InstallationCatalog {
     return await this.writer.run(async () => {
       const existing = await this.getWorkspaceRegistration(workspace.workspace_id);
       if (!existing) return false;
-      const storedWorkspace = decodeCanonical(toBytes(existing.workspace_payload)) as Workspace;
       if (existing.removed_at !== null) return true;
-      if (storedWorkspace.workspace_id !== workspace.workspace_id
-        || storedWorkspace.canonical_root !== workspace.canonical_root
-        || storedWorkspace.registered_at !== workspace.registered_at) {
+      if (existing.canonical_root !== workspace.canonical_root || existing.registered_at !== workspace.registered_at) {
         throw new StorageError("storage:immutable_workspace", `Workspace ${workspace.workspace_id} has immutable identity fields that conflict.`);
       }
       const removedAt = workspace.removed_at ?? new Date().toISOString();
-      const removedPayload = encodeCanonical({ ...storedWorkspace, status: "removed", removed_at: removedAt });
       const closed = await this.database.run(
-        "UPDATE installation_workspaces SET removed_at = ?, workspace_payload = ? WHERE workspace_id = ? AND removed_at IS NULL AND workspace_payload = ?",
-        [removedAt, removedPayload, workspace.workspace_id, toBytes(existing.workspace_payload)],
+        "UPDATE installation_workspaces SET removed_at = ?, status = 'removed' WHERE workspace_id = ? AND removed_at IS NULL AND canonical_root = ? AND registered_at = ?",
+        [removedAt, workspace.workspace_id, existing.canonical_root, existing.registered_at],
       );
       if (closed.changes !== 1) {
         const raced = await this.getWorkspaceRegistration(workspace.workspace_id);
@@ -262,9 +260,8 @@ export class InstallationCatalog {
 
   private async registerWorkspaceSerialized(workspace: Workspace, databasePath: string): Promise<RegisteredWorkspace> {
     const absolutePath = resolve(databasePath);
-    const encodedWorkspace = encodeCanonical(workspace);
     const existing = await this.getWorkspaceRegistration(workspace.workspace_id);
-    if (existing) return await this.resolveWorkspaceRegistration(workspace, absolutePath, encodedWorkspace, existing);
+    if (existing) return await this.resolveWorkspaceRegistration(workspace, absolutePath, existing);
     await mkdir(dirname(absolutePath), { recursive: true });
     const workspaceDatabase = await openSqliteDatabase({ filename: absolutePath, busy_timeout_ms: this.busyTimeoutMs });
     try {
@@ -275,54 +272,53 @@ export class InstallationCatalog {
       await workspaceDatabase.close();
     }
     const inserted = await this.database.run(
-      `INSERT INTO installation_workspaces (workspace_id, canonical_root, display_root, database_path, registered_at, removed_at, workspace_payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO installation_workspaces (workspace_id, canonical_root, display_root, status, source_provider_bindings, database_path, registered_at, removed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(workspace_id) DO NOTHING`,
-      [workspace.workspace_id, workspace.canonical_root, workspace.display_root, absolutePath, workspace.registered_at, workspace.removed_at ?? null, encodedWorkspace],
+      [workspace.workspace_id, workspace.canonical_root, workspace.display_root, workspace.status, JSON.stringify(workspace.source_provider_bindings), absolutePath, workspace.registered_at, workspace.removed_at ?? null],
     );
     if (inserted.changes !== 1) {
       const raced = await this.getWorkspaceRegistration(workspace.workspace_id);
       if (!raced) throw new StorageError("storage:workspace_registration_conflict", `Workspace ${workspace.workspace_id} lost an atomic registration race.`);
-      return await this.resolveWorkspaceRegistration(workspace, absolutePath, encodedWorkspace, raced);
+      return await this.resolveWorkspaceRegistration(workspace, absolutePath, raced);
     }
     return { ...workspace, database_path: absolutePath };
   }
 
   private async getWorkspaceRegistration(workspaceId: string): Promise<WorkspaceRegistrationRow | undefined> {
-    return await this.database.get<WorkspaceRegistrationRow>("SELECT workspace_id, canonical_root, display_root, database_path, registered_at, removed_at, workspace_payload FROM installation_workspaces WHERE workspace_id = ?", [workspaceId]);
+    return await this.database.get<WorkspaceRegistrationRow>("SELECT workspace_id, canonical_root, display_root, status, source_provider_bindings, database_path, registered_at, removed_at FROM installation_workspaces WHERE workspace_id = ?", [workspaceId]);
   }
 
-  private async resolveWorkspaceRegistration(workspace: Workspace, absolutePath: string, encodedWorkspace: Uint8Array, existing: WorkspaceRegistrationRow): Promise<RegisteredWorkspace> {
+  private async resolveWorkspaceRegistration(workspace: Workspace, absolutePath: string, existing: WorkspaceRegistrationRow): Promise<RegisteredWorkspace> {
     if (existing.database_path !== absolutePath) throw new StorageError("storage:immutable_workspace", `Workspace ${workspace.workspace_id} database path is immutable; use relocation.`);
-    if (sameBytes(toBytes(existing.workspace_payload), encodedWorkspace)) return { ...workspace, database_path: absolutePath };
-    const storedWorkspace = decodeCanonical(toBytes(existing.workspace_payload)) as Workspace;
     if (existing.removed_at !== null) throw new StorageError("storage:workspace_lifecycle", `Workspace ${workspace.workspace_id} is removed and cannot be reopened.`);
-    if (existing.canonical_root !== workspace.canonical_root || existing.registered_at !== workspace.registered_at
-      || !sameCanonicalExcept(storedWorkspace, workspace, ["status", "removed_at"])) {
+    if (existing.canonical_root !== workspace.canonical_root || existing.display_root !== workspace.display_root
+      || existing.registered_at !== workspace.registered_at || existing.source_provider_bindings !== JSON.stringify(workspace.source_provider_bindings)) {
       throw new StorageError("storage:immutable_workspace", `Workspace ${workspace.workspace_id} has immutable identity fields that conflict.`);
     }
+    if (workspace.status === "registered" && workspace.removed_at === undefined) return { ...workspace, database_path: absolutePath };
     if (workspace.removed_at === undefined || workspace.status !== "removed") throw new StorageError("storage:immutable_workspace", `Workspace ${workspace.workspace_id} can only change through its one-way removal transition.`);
     const closed = await this.database.run(
-      `UPDATE installation_workspaces SET removed_at = ?, workspace_payload = ?
+      `UPDATE installation_workspaces SET removed_at = ?, status = 'removed'
        WHERE workspace_id = ? AND canonical_root = ? AND display_root = ? AND database_path = ?
-         AND registered_at = ? AND removed_at IS NULL AND workspace_payload = ?`,
-      [workspace.removed_at, encodedWorkspace, workspace.workspace_id, existing.canonical_root, existing.display_root, existing.database_path, existing.registered_at, toBytes(existing.workspace_payload)],
+         AND registered_at = ? AND removed_at IS NULL AND status = 'registered'`,
+      [workspace.removed_at, workspace.workspace_id, existing.canonical_root, existing.display_root, existing.database_path, existing.registered_at],
     );
     if (closed.changes === 1) return { ...workspace, database_path: absolutePath };
     const raced = await this.getWorkspaceRegistration(workspace.workspace_id);
-    if (raced && sameBytes(toBytes(raced.workspace_payload), encodedWorkspace)) return { ...workspace, database_path: absolutePath };
+    if (raced && raced.removed_at !== null && raced.status === "removed") return { ...workspace, database_path: absolutePath };
     throw new StorageError("storage:workspace_registration_conflict", `Workspace ${workspace.workspace_id} changed while its lifecycle transition was being applied.`);
   }
 
   async getWorkspace(workspaceId: string): Promise<RegisteredWorkspace | undefined> {
-    const row = await this.database.get<{ database_path: string; workspace_payload: unknown }>("SELECT database_path, workspace_payload FROM installation_workspaces WHERE workspace_id = ? AND removed_at IS NULL", [workspaceId]);
+    const row = await this.database.get<WorkspaceRegistrationRow>("SELECT workspace_id, canonical_root, display_root, status, source_provider_bindings, database_path, registered_at, removed_at FROM installation_workspaces WHERE workspace_id = ? AND removed_at IS NULL", [workspaceId]);
     if (!row) return undefined;
-    return { ...decodeCanonical(toBytes(row.workspace_payload)) as Workspace, database_path: row.database_path };
+    return { workspace_id: row.workspace_id, canonical_root: row.canonical_root, display_root: row.display_root, status: row.status, source_provider_bindings: JSON.parse(row.source_provider_bindings), registered_at: row.registered_at, ...(row.removed_at === null ? {} : { removed_at: row.removed_at }), database_path: row.database_path } as RegisteredWorkspace;
   }
 
   async listWorkspaces(): Promise<readonly RegisteredWorkspace[]> {
-    const rows = await this.database.all<{ database_path: string; workspace_payload: unknown }>("SELECT database_path, workspace_payload FROM installation_workspaces WHERE removed_at IS NULL ORDER BY workspace_id");
-    return rows.map((row) => ({ ...decodeCanonical(toBytes(row.workspace_payload)) as Workspace, database_path: row.database_path }));
+    const rows = await this.database.all<WorkspaceRegistrationRow>("SELECT workspace_id, canonical_root, display_root, status, source_provider_bindings, database_path, registered_at, removed_at FROM installation_workspaces WHERE removed_at IS NULL ORDER BY workspace_id");
+    return rows.map((row) => ({ workspace_id: row.workspace_id, canonical_root: row.canonical_root, display_root: row.display_root, status: row.status, source_provider_bindings: JSON.parse(row.source_provider_bindings), registered_at: row.registered_at, ...(row.removed_at === null ? {} : { removed_at: row.removed_at }), database_path: row.database_path } as RegisteredWorkspace));
   }
 
   /**
@@ -560,7 +556,6 @@ export class InstallationCatalog {
   }
 
   private async putModelPackInstallationSerialized(value: ModelPackInstallation): Promise<void> {
-    const encoded = encodeCanonical(value);
     const existing = await this.database.get<{
       schema_version: number;
       model_pack_id: string;
@@ -569,47 +564,43 @@ export class InstallationCatalog {
       installed_at: string;
       removed_at: string | null;
       removal_reason_code: string | null;
-      installation_payload: unknown;
-    }>("SELECT schema_version, model_pack_id, model_pack_version, manifest_digest, installed_at, removed_at, removal_reason_code, installation_payload FROM installation_model_pack_installations WHERE model_pack_installation_id = ?", [value.model_pack_installation_id]);
+    }>("SELECT schema_version, model_pack_id, model_pack_version, manifest_digest, installed_at, removed_at, removal_reason_code FROM installation_model_pack_installations WHERE model_pack_installation_id = ?", [value.model_pack_installation_id]);
     if (existing) {
-      if (sameBytes(toBytes(existing.installation_payload), encoded)) return;
       if (existing.removed_at !== null && value.removed_at === undefined) throw new StorageError("storage:model_pack_lifecycle", `Model-pack installation ${value.model_pack_installation_id} is removed and cannot be reopened.`);
       if (existing.schema_version !== value.schema_version || existing.model_pack_id !== value.model_pack_id
         || existing.model_pack_version !== value.model_pack_version || existing.manifest_digest !== value.manifest_digest
-        || existing.installed_at !== value.installed_at
-        || !sameCanonicalExcept(decodeCanonical(toBytes(existing.installation_payload)), value, ["removed_at", "removal_reason_code"])) {
+        || existing.installed_at !== value.installed_at) {
         throw new StorageError("storage:immutable_model_pack_installation", `Model-pack installation ${value.model_pack_installation_id} has immutable identity fields that conflict.`);
       }
       if (existing.removed_at === null && value.removed_at !== undefined) {
         const closed = await this.database.run(
-          `UPDATE installation_model_pack_installations SET removed_at = ?, removal_reason_code = ?, installation_payload = ?
+          `UPDATE installation_model_pack_installations SET removed_at = ?, removal_reason_code = ?
            WHERE model_pack_installation_id = ? AND schema_version = ? AND model_pack_id = ? AND model_pack_version = ?
-             AND manifest_digest = ? AND installed_at = ? AND removed_at IS NULL AND installation_payload = ?`,
-          [value.removed_at, value.removal_reason_code ?? null, encoded, value.model_pack_installation_id, existing.schema_version, existing.model_pack_id, existing.model_pack_version, existing.manifest_digest, existing.installed_at, toBytes(existing.installation_payload)],
+             AND manifest_digest = ? AND installed_at = ? AND removed_at IS NULL`,
+          [value.removed_at, value.removal_reason_code ?? null, value.model_pack_installation_id, existing.schema_version, existing.model_pack_id, existing.model_pack_version, existing.manifest_digest, existing.installed_at],
         );
         if (closed.changes === 1) return;
-        const raced = await this.database.get<{ installation_payload: unknown }>("SELECT installation_payload FROM installation_model_pack_installations WHERE model_pack_installation_id = ?", [value.model_pack_installation_id]);
-        if (raced && sameBytes(toBytes(raced.installation_payload), encoded)) return;
+        const raced = await this.database.get<{ removed_at: string | null }>("SELECT removed_at FROM installation_model_pack_installations WHERE model_pack_installation_id = ?", [value.model_pack_installation_id]);
+        if (raced?.removed_at !== null && raced !== undefined) return;
         throw new StorageError("storage:model_pack_installation_conflict", `Model-pack installation ${value.model_pack_installation_id} changed during its lifecycle transition.`);
       }
       throw new StorageError("storage:immutable_model_pack_installation", `Model-pack installation ${value.model_pack_installation_id} is immutable.`);
     }
     const inserted = await this.database.run(
       `INSERT INTO installation_model_pack_installations (model_pack_installation_id, schema_version, model_pack_id, model_pack_version,
-       manifest_digest, installed_at, removed_at, removal_reason_code, installation_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       manifest_digest, installed_at, removed_at, removal_reason_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(model_pack_installation_id) DO NOTHING`,
-      [value.model_pack_installation_id, value.schema_version, value.model_pack_id, value.model_pack_version, value.manifest_digest, value.installed_at, value.removed_at ?? null, value.removal_reason_code ?? null, encoded],
+      [value.model_pack_installation_id, value.schema_version, value.model_pack_id, value.model_pack_version, value.manifest_digest, value.installed_at, value.removed_at ?? null, value.removal_reason_code ?? null],
     );
     if (inserted.changes !== 1) {
-      const raced = await this.database.get<{ installation_payload: unknown }>("SELECT installation_payload FROM installation_model_pack_installations WHERE model_pack_installation_id = ?", [value.model_pack_installation_id]);
-      if (raced && sameBytes(toBytes(raced.installation_payload), encoded)) return;
+      const raced = await this.database.get<{ model_pack_installation_id: string }>("SELECT model_pack_installation_id FROM installation_model_pack_installations WHERE model_pack_installation_id = ?", [value.model_pack_installation_id]);
+      if (raced) return;
       throw new StorageError("storage:model_pack_installation_conflict", `Model-pack installation ${value.model_pack_installation_id} lost an atomic registration race.`);
     }
   }
 
   async getModelPackInstallation(installationId: string): Promise<ModelPackInstallation | undefined> {
-    const row = await this.database.get<{ installation_payload: unknown }>("SELECT installation_payload FROM installation_model_pack_installations WHERE model_pack_installation_id = ?", [installationId]);
-    return row ? decodeCanonical(toBytes(row.installation_payload)) as ModelPackInstallation : undefined;
+    return await this.database.get<ModelPackInstallation & Record<string, unknown>>("SELECT model_pack_installation_id, schema_version, model_pack_id, model_pack_version, manifest_digest, installed_at, removed_at, removal_reason_code FROM installation_model_pack_installations WHERE model_pack_installation_id = ?", [installationId]);
   }
 
   async recordCasObject(content: { content_blob_id: string; content_hash: string; byte_length: number; storage_reference: string }, mediaType?: string): Promise<void> {
@@ -739,9 +730,12 @@ export class WorkspaceDatabase {
   readonly projectionOccurrences: WorkspaceProjectionOccurrenceRepository;
   readonly database: SqliteDatabase;
   readonly workspaceId: string;
+  /** Absolute CAS root used by native analyzer workers to re-read immutable source bytes. */
+  readonly casRoot: string;
   private readonly rawDatabase: SqliteDatabase;
   private readonly writer: SerializedWriter;
   private closed = false;
+  private readonly stagingCleanups = new Set<Promise<void>>();
   // Warm digest corpus (`RecordSetDigestCorpusEntry`,
   // `publication-authority.ts`): `computeSnapshotDigestFields`'s own
   // `sortedVisible` output for the generation most recently committed
@@ -782,6 +776,7 @@ export class WorkspaceDatabase {
     const rootDir = typeof rootDirOrReleaseLease === "string" ? rootDirOrReleaseLease : dirname(database.filename);
     const releaseLease = typeof rootDirOrReleaseLease === "function" ? rootDirOrReleaseLease : releaseLeaseMaybe ?? (async () => undefined);
     this.workspaceId = workspaceId;
+    this.casRoot = join(rootDir, "cas");
     this.rawDatabase = database;
     this.writer = workspaceWriter(database.filename);
     const serializedDatabase = new SerializedSqliteDatabase(database, this.writer);
@@ -972,7 +967,7 @@ export class WorkspaceDatabase {
       }
     } catch (error) {
       if (error instanceof StorageError && error.code === "storage:transaction_assertion_failed") throw new StorageError("storage:publication_conflict", "The workspace current tuple changed or the publication generation is not gapless.");
-      if (error instanceof StorageError && error.code === "ERR_SQLITE_ERROR" && /UNIQUE|constraint/i.test(error.message)) throw new StorageError("storage:publication_conflict", "An immutable publication uniqueness collision was detected.");
+      if (error instanceof StorageError && error.code === "ERR_SQLITE_ERROR" && /UNIQUE|constraint/i.test(error.message)) throw new StorageError("storage:publication_conflict", `An immutable publication uniqueness collision was detected: ${error.message}`);
       throw error;
     }
     // Commit-hook placement for the warm digest corpus (`RecordSetDigestCorpusEntry`):
@@ -983,12 +978,15 @@ export class WorkspaceDatabase {
     // `try` block and skips this assignment entirely, leaving whatever
     // corpus this handle already had (still valid for its own generation) in
     // place instead of poisoning it with this failed attempt's never-
-    // committed candidate. `plan.recordSetDigestCorpusCandidate` is always
-    // set by `buildCandidatePublicationPlan` for a candidate-mode plan.
-    if (plan.recordSetDigestCorpusCandidate) this.recordSetDigestCorpus = plan.recordSetDigestCorpusCandidate;
+    // committed candidate. Large publications deliberately omit the warm
+    // corpus rather than retain a project-sized record array in the daemon;
+    // assigning `undefined` also clears a prior generation so it cannot be
+    // reused against this newer snapshot.
+    this.recordSetDigestCorpus = plan.recordSetDigestCorpusCandidate;
     // Same commit-hook placement, same reasoning, for the projection-set
     // digest corpus (`ProjectionSetDigestCorpusEntry`).
     if (plan.projectionSetDigestCorpusCandidate) this.projectionSetDigestCorpus = plan.projectionSetDigestCorpusCandidate;
+    this.scheduleCandidateStagingCleanup(candidateId);
     await this.faults.hit("candidate_publication.after_commit_ack");
     return { candidate_generation_id: candidateId, snapshot_id: `snapshot:${candidateId}`, generation_manifest_id: `generation-manifest:${candidateId}`, generation, published_at: publishedAt, status: "published" };
   }
@@ -1001,6 +999,46 @@ export class WorkspaceDatabase {
     await this.rawDatabase.transaction(commands);
   }
 
+  /**
+   * Published FactDelta rows are recovery-only data. Reclaim them after the
+   * visible commit in small, low-priority transactions: deleting a
+   * million-row staging corpus inside publication rewrote the entire corpus
+   * into the WAL and delayed readiness by minutes. Each batch yields back to
+   * the foreground writer lane, so queries and subsequent publications are
+   * never queued behind the full cleanup.
+   */
+  private scheduleCandidateStagingCleanup(candidateId: string): void {
+    const cleanup = (async () => {
+      while (true) {
+        const removed = await this.writer.run(async () => {
+          const batches = await this.rawDatabase.all<{ fact_delta_id: string }>(
+            "SELECT fact_delta_id FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY sequence, fact_delta_id LIMIT 64",
+            [this.workspaceId, candidateId],
+          );
+          if (batches.length === 0) {
+            await this.rawDatabase.run("DELETE FROM candidate_fact_delta_namespaces WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
+            return false;
+          }
+          const ids = batches.map((batch) => batch.fact_delta_id);
+          const placeholders = ids.map(() => "?").join(", ");
+          const params: readonly SqliteValue[] = [this.workspaceId, candidateId, ...ids];
+          await this.rawDatabase.transaction([
+            ...["candidate_staged_records", "candidate_staged_graph_edges", "candidate_staged_identities", "candidate_staged_dependencies"].map((table) => ({ kind: "run" as const, sql: `DELETE FROM ${table} WHERE fact_delta_key IN (SELECT fact_delta_key FROM candidate_fact_delta_namespaces WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id IN (${placeholders}))`, params })),
+            { kind: "run", sql: `DELETE FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id IN (${placeholders})`, params },
+            { kind: "run", sql: `DELETE FROM candidate_fact_delta_namespaces WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id IN (${placeholders})`, params },
+          ]);
+          return true;
+        }, "background");
+        if (!removed) return;
+        await new Promise<void>((resolveCleanupYield) => setTimeout(resolveCleanupYield, 0));
+      }
+    })();
+    this.stagingCleanups.add(cleanup);
+    void cleanup.catch((error: unknown) => {
+      if (timingEnabled()) console.error(`[urdira] background staging cleanup failed workspace:${this.workspaceId} candidate:${candidateId}: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => this.stagingCleanups.delete(cleanup));
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -1009,7 +1047,10 @@ export class WorkspaceDatabase {
     // of the module-level stores (the daemon publishes through a fresh
     // handle per scan), and each entry's own generation key makes a stale
     // survivor harmless -- see `workspaceDigestCorpora`'s comment.
-    try { await this.database.close(); } finally {
+    try {
+      await Promise.allSettled([...this.stagingCleanups]);
+      await this.writer.run(() => this.rawDatabase.close());
+    } finally {
       decrementWorkspaceHandle(this.rawDatabase.filename);
       await this.releaseLease();
     }
@@ -1021,6 +1062,7 @@ export class DurableStorage {
   readonly cas: ContentAddressedStore;
   readonly blobs: BlobStore;
   readonly sqliteCapabilities = sqliteCapabilities;
+  readonly byteTelemetry: ByteBoundaryTelemetry;
   private readonly rootDir: string;
   private readonly busyTimeoutMs: number;
   private readonly openedWorkspaces = new Set<WorkspaceDatabase>();
@@ -1028,13 +1070,14 @@ export class DurableStorage {
   private readonly ownerPid: number;
   private readonly faults: FaultInjector;
 
-  private constructor(rootDir: string, busyTimeoutMs: number, catalog: InstallationCatalog, cas: ContentAddressedStore, blobs: BlobStore, faults: FaultInjector) {
+  private constructor(rootDir: string, busyTimeoutMs: number, catalog: InstallationCatalog, cas: ContentAddressedStore, blobs: BlobStore, faults: FaultInjector, byteTelemetry: ByteBoundaryTelemetry) {
     this.rootDir = rootDir;
     this.busyTimeoutMs = busyTimeoutMs;
     this.catalog = catalog;
     this.cas = cas;
     this.blobs = blobs;
     this.faults = faults;
+    this.byteTelemetry = byteTelemetry;
     this.ownerId = `handle-owner:${randomUUID()}`;
     this.ownerPid = process.pid;
   }
@@ -1046,19 +1089,21 @@ export class DurableStorage {
     await mkdir(join(rootDir, "cas"), { recursive: true });
     const catalogDatabase = await openSqliteDatabase({ filename: join(rootDir, "catalog.sqlite"), busy_timeout_ms: busyTimeoutMs });
     await initializeSchema(catalogDatabase, CATALOG_SCHEMA);
+    await ensureCatalogSchemaCompatibility(catalogDatabase);
     const catalog = new InstallationCatalog(catalogDatabase, rootDir, busyTimeoutMs);
     if (!options.skip_startup_recovery) {
       await catalog.recoverRelocations();
       await catalog.recoverGcBarriers();
     }
+    const byteTelemetry = new ByteBoundaryTelemetry();
     const cas = new ContentAddressedStore(
       join(rootDir, "cas"),
       (blob, mediaType) => catalog.recordCasObject(blob, mediaType),
-      {},
+      { telemetry: byteTelemetry },
       (entries) => catalog.recordCasObjectsBatch(entries.map((entry) => (entry.media_type === undefined ? { content: entry.blob } : { content: entry.blob, media_type: entry.media_type }))),
     );
     const blobs = new BlobStore(cas, options.inlineThresholdBytes ?? 16 * 1024);
-    const storage = new DurableStorage(rootDir, busyTimeoutMs, catalog, cas, blobs, options.fault_injector ?? noFaults);
+    const storage = new DurableStorage(rootDir, busyTimeoutMs, catalog, cas, blobs, options.fault_injector ?? noFaults, byteTelemetry);
     if (!options.skip_startup_recovery) {
       await storage.recoverMigrations();
       await storage.recoverWorkspaceGcEpochs();
@@ -1090,7 +1135,7 @@ export class DurableStorage {
       try {
         await initializeSchema(database, WORKSPACE_SCHEMA);
         await ensureWorkspaceSchemaCompatibility(database);
-        await database.run("UPDATE garbage_collection_epochs SET state = 'recovered', completed_at = COALESCE(completed_at, ?), failure_code = 'storage:gc_recovered_after_restart', epoch_payload = ? WHERE workspace_id = ? AND state IN ('marking', 'sweeping')", [recoveredAt, encodeCanonical({ state: "recovered", recovered_at: recoveredAt }), workspace.workspace_id]);
+        await database.run("UPDATE garbage_collection_epochs SET state = 'recovered', completed_at = COALESCE(completed_at, ?), failure_code = 'storage:gc_recovered_after_restart' WHERE workspace_id = ? AND state IN ('marking', 'sweeping')", [recoveredAt, workspace.workspace_id]);
       } finally { await database.close(); }
     }
   }
@@ -1171,7 +1216,6 @@ async function assertExistingPublicationJournal(database: SqliteDatabase, worksp
     generation: priorPublication.generation,
     published_at: priorPublication.published_at,
     publication_digest: canonicalSha256(payload),
-    journal_payload: payload,
   })) throw new StorageError("storage:publication_conflict", `Candidate publication journal ${input.candidate.candidate_generation_id} differs from the sealed publication payload.`);
 }
 
@@ -1300,11 +1344,7 @@ function sameCandidateImmutablePayload(left: IndexCandidate, right: IndexCandida
     base_configuration_revision_id: candidate.base_configuration_revision_id,
     target_configuration_revision_id: candidate.target_configuration_revision_id,
     trigger_kind: candidate.trigger_kind,
-    work_manifest_id: candidate.work_manifest_id,
     source_observation_batch_ids: normalizeObservationBatchIds(candidate.source_observation_batch_ids),
-    retention_lease_id: candidate.retention_lease_id,
-    candidate_materialization_id: candidate.candidate_materialization_id,
-    candidate_digest: candidate.candidate_digest,
     created_at: candidate.created_at,
   }).filter(([, value]) => value !== undefined));
   return sameCandidateBytes(encodeCanonical(immutable(left)), encodeCanonical(immutable(right)));

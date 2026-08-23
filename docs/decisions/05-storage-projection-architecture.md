@@ -1,8 +1,8 @@
 # Storage and Projection Architecture
 
-Status: **Approved**  
-Last updated: 2026-08-08  
-Depends on: Universal data model and incremental indexing semantics
+Status: **Approved and implemented for Urdira v3**
+Last updated: 2026-08-20
+Depends on: Universal data model, incremental indexing semantics, and [Decision 21](21-native-pipeline-relational-storage.md)
 
 ## Decision objective
 
@@ -15,8 +15,13 @@ Map the canonical logical model to local persistent storage and rebuildable spec
 - All knowledge projections support invalidation by owner artifact.
 - Query executions retain compact manifests rather than complete rendered responses.
 - The product is local and open source.
-- Physical schema migrations may change storage encoding only through deterministic lossless adapters. Portable logical persistence and integrity remain governed by [Urdira Canonical Encoding](../serialization/urdira-canonical-encoding.md); migrations cannot change logical identity or retained meaning.
-- Before write activation, an engine upgrade verifies decoder or adapter coverage for every retained snapshot and active query execution.
+- The destructive v3 data root has no v1, v2, or early-preview v3 decoder or
+  in-place migration. Portable logical persistence is relational and digests
+  are generated from Schema IR fields.
+- Before write activation, the engine verifies the exact v3 application ID,
+  format marker, schema fingerprint, and required SQLite features. Any
+  unsupported root remains unopened and returns
+  `core:index_contract_unsupported`.
 
 ## Approved decisions
 
@@ -27,7 +32,7 @@ All logical model fields live exclusively in the [universal data model](01-unive
 - An unchanged projection remains open. Source, owner, generator, generator-version, configuration, or payload changes close it and create another occurrence.
 - Historical snapshots retain the exact projections, generator identities, and configuration required to answer their advertised capabilities. A newer generator is never substituted silently.
 - Current-only physical indexes may optimize open-record lookup without changing historical semantics.
-- Generation manifests reference digest-covered, pageable change sets rather than embedding unbounded arrays.
+- Generation manifests reference digest-covered, pageable change sets rather than embedding unbounded arrays. Candidate templates use bounded ordered staging rows instead of aggregate segment blobs.
 - Query executions retain one snapshot lease per immutable workspace binding and stable result manifests. Cursor expiry atomically releases the complete lease set and never switches any participant to another snapshot.
 - Physical deletion is mark-and-sweep reachability collection. Current snapshots, pins, leases, active candidates, and recovery checkpoints are roots.
 - GC uses an epoch and lease-acquisition barrier, waits for earlier readers, and is resumable and idempotent.
@@ -51,13 +56,13 @@ SQLite requirements are WAL journaling, full synchronous durability for publicat
 
 ## Physical canonical layout
 
-Common record-envelope columns are stored as typed columns: workspace, record, category, concrete and universal kind, owner artifact and version, source-span coordinates, producer and versions, schema version, valid-from and valid-to generation, record digest, and canonical payload digest. Every owner and dependency lookup required by the logical model has a covering index.
+Common record-envelope columns are stored as typed columns: workspace, record, category, concrete and universal kind, owner artifact and version, source-span coordinates, producer and versions, schema version, valid-from and valid-to generation, record digest, logical-body digest and logical-body byte length. In v3 the logical body itself is one deterministic canonical payload on the occurrence; queries decode only selected bodies. Facets, identities and dependencies remain relational and indexed, and every owner and dependency lookup required by the logical model has a covering index.
 
-Closed category tables store entity identity, relation identity, fact subject, evidence subjects, and diagnostic identity. Repeated typed values use child tables with explicit canonical ordinals or canonical-set keys; semantics never depend on SQLite row order. The complete Schema-IR-validated canonical CBOR payload is retained for digest verification and lossless decoding. Queryable scalar columns and child rows are checked projections of that payload, not an alternate source of truth.
+Closed category tables store entity identity, relation identity, fact subject, evidence subjects, and diagnostic identity. Repeated typed values use child tables with explicit ordinals or set keys; semantics never depend on SQLite row order. Schema-IR-owned columns and child rows are the operational source of truth; no duplicate generic project payload is retained.
 
-Identity tables separate lifecycle identity from immutable record occurrences. Open-current partial indexes accelerate `valid_to_generation IS NULL`; historical queries use generation interval indexes. Closing a record updates only its lifecycle interval under the publication transaction; immutable occurrence payload and digest never change.
+Identity tables separate lifecycle identity from immutable record occurrences. Their physical rows reference the immutable record and derive owner artifact/version through it instead of duplicating both strings. Open-current partial indexes accelerate `valid_to_generation IS NULL`; historical queries use generation interval indexes. Closing a record updates only its lifecycle interval under the publication transaction; immutable occurrence payload and digest never change.
 
-Source artifacts, versions, tombstones, observations, reverse dependencies, generation manifests, and projection envelopes follow the same layout rule: identity and high-selectivity coordinates are typed columns, complete logical payload is canonical CBOR, and generated columns or projection tables are verified against it.
+Source artifacts, versions, tombstones, observations, reverse dependencies, generation manifests, and projection envelopes use typed columns and child tables. Large immutable source content belongs in CAS, while logical digests are recomputed incrementally from the relational values.
 
 ## Graph projection
 
@@ -69,11 +74,11 @@ Shortest-path operations use breadth-first expansion over the exact eligible gra
 
 ## Lexical and regular-expression indexes
 
-Exact artifact text remains in the CAS. Urdira builds deterministic term, identifier, normalized-path, and UTF-8 trigram postings in SQLite. Tokenization pins its Unicode tables, case-folding behavior, normalization form, and language-neutral boundary version. Language plugins may contribute canonical symbol names and aliases but cannot supply the public lexical matcher or ranking.
+Exact artifact text remains in the CAS. Urdira builds a deterministic FTS5 trigram candidate index in SQLite. Tokenization pins its Unicode tables, case-folding behavior, normalization form, and language-neutral boundary version. Language plugins may contribute canonical symbol names and aliases but cannot supply the public lexical matcher or ranking.
 
-Literal search uses postings as a candidate accelerator and verifies every match against exact pinned bytes. Safe regular expressions use a core-owned linear-time engine with a versioned dialect; unsupported constructs are rejected. Required literal trigrams may prefilter candidates, but every candidate is verified and expressions without a safe prefilter scan the complete selected text scope. Therefore indexes cannot create false negatives.
+Literal search uses FTS5 as a candidate accelerator and verifies every match against exact pinned bytes. Safe regular expressions use a core-owned linear-time engine with a versioned dialect; unsupported constructs are rejected. FTS5 candidates are always verified, and expressions without a safe FTS5 prefilter scan the complete selected text scope. Therefore the derived index cannot change public matching semantics.
 
-FTS5 may be used as a non-authoritative implementation accelerator only after conformance proves identical membership and ordering. Native BM25 values, locale collation, and database row order never determine public ordering. The core calculates versioned lexical ranks using deterministic integer or exact-rational features.
+FTS5 is the v3 implementation accelerator for literal candidates. Native BM25 values, locale collation, and database row order never determine public ordering. The core calculates versioned lexical ranks using deterministic integer or exact-rational features.
 
 ## Content-addressed storage
 
@@ -81,7 +86,7 @@ The CAS key is the approved digest algorithm plus digest of exact decoded bytes.
 
 Writes stream to a private temporary file in the CAS filesystem, compute digest and length, fsync the file, atomically install it without replacing conflicting content, durably flush the installed namespace entry, then publish references in SQLite. The same platform durability adapter protects staging catalogs and backup/restore publication. POSIX adapters fsync each containing directory once per batch. The Windows adapter reopens a newly installed file with write access and flushes that file handle because the Node runtime cannot obtain the `FILE_FLAG_BACKUP_SEMANTICS` directory handle required by Win32 for a directory flush. Either adapter treats a flush failure as a storage error before publishing any reference in SQLite. An existing key is reused only after length and digest verification. A key containing different bytes is an integrity failure, never an overwrite.
 
-Canonical record payloads below a configurable threshold may remain inline in SQLite. Source content, model assets, tokenizer data, large canonical payloads, vector shards, and query hydration blobs use the CAS. The logical digest and lifecycle are identical regardless of inline or external placement.
+Source content, model assets, tokenizer data, vector shards, and other immutable large blobs use the CAS. Operational record tables retain no aggregate project payload: each occurrence stores only its own bounded canonical body, which is independently digest-checked against the typed envelope.
 
 ## Exact vector boundary
 
@@ -121,17 +126,27 @@ Commit is the visibility and recovery authority. Any failure rolls back the enti
 
 ## Physical schema migrations
 
-Storage format has an independent monotonic version. Startup first opens databases read-only, verifies application ID, format, required SQLite features, and decoder coverage, then chooses `compatible`, `migrate`, or `unsupported`. It never lets SQLite perform implicit type or collation changes.
+Storage format has an independent monotonic version. The implemented v3
+startup path verifies application ID, format, required SQLite features, and
+schema fingerprint, then chooses only `compatible` or `unsupported`. It never
+lets SQLite perform implicit type or collation changes and does not attach a
+legacy root.
 
-Small additive migrations run in one transaction after an automatic verified backup. Rewrite migrations create a shadow database, copy and decode every reachable logical object through approved lossless adapters, recompute indexes and projections, verify all logical digests and snapshot manifests, fsync, then atomically swap files. The old database remains a recovery checkpoint until the new one has reopened and passed verification.
+There is no current small-additive, rewrite, shadow-copy, or table-backfill
+migration lane into v3. An operator may inventory and back up a legacy root out
+of process, but activation requires a fresh v3 root and source reindexing. CAS
+objects may be reused only after complete workspace-scope, byte-length, and
+SHA-256 verification.
 
-Logical migration and administrative operation IDs are never used directly as filesystem entry names. Physical staging, backup, and shadow entries use deterministic digest-derived names containing only portable filename characters, while SQLite and canonical payloads retain the complete logical ID.
-
-A migration may change tables, indexes, compression, sharding, and cache encoding. It cannot change logical IDs, canonical bytes, digests, validity intervals, result order, or retained interpretation. If any required decoder or adapter is missing, startup remains read-only and reports `core:index_contract_unsupported`.
+Any future in-place migration capability requires a new approved decision and
+lossless adapters for every reachable logical value. Such a future migration
+could change physical tables, indexes, compression, sharding, or cache
+encoding, but could not change logical IDs, digests, validity intervals,
+result order, or retained interpretation.
 
 ## Integrity, repair, backup, and rebuild
 
-Cheap integrity checks run at every open: SQLite quick check, schema fingerprint, current-tuple references, WAL state, CAS length, and manifest roots. Full verification recomputes canonical payload digests, set digests, dependency closure, projection digests, CAS hashes, vector-shard mappings, and snapshot manifests. A background scrub verifies a rotating sample daily and every reachable object at least once per configurable 30-day interval.
+Cheap integrity checks run at every open: SQLite quick check, schema fingerprint, current-tuple references, WAL state, CAS length, and manifest roots. Full verification recomputes relational logical-value digests, set roots, dependency closure, projection digests, CAS hashes, vector-shard mappings, and snapshot manifests. A background scrub verifies a rotating sample daily and every reachable object at least once per configurable 30-day interval.
 
 Corrupt mandatory data makes the affected snapshot unavailable; Urdira never serves unchecked substitutes. Repair proceeds in this order:
 

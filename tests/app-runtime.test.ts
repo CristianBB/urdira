@@ -65,7 +65,7 @@ async function pollUntilReady(client: DaemonClient, workspaceId: string, timeout
 
 function findRecordsQuery(workspaceId: string): Readonly<Record<string, unknown>> {
   return {
-    api_version: 1,
+    api_version: 3,
     scope: { scope_type: "single_workspace", workspace_id: workspaceId },
     expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"], kind_selector: { universal_kinds: ["core:type", "core:callable"] }, filter: { languages: ["typescript"] } } } },
     options: { freshness: "current", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: true }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "used", include_payload_schemas: false }, response_budget: { max_items: 1_000, max_characters: 1_000_000 } },
@@ -90,7 +90,7 @@ async function queryAfterStagedPublication(client: DaemonClient, workspaceId: st
 
 describe("Urdira application runner", () => {
   it("publishes stable version and help output without starting the daemon", () => {
-    expect(URDIRA_VERSION).toBe("0.2.0");
+    expect(URDIRA_VERSION).toBe("0.2.2");
     expect(urdiraHelp()).toContain("urdira mcp");
     expect(urdiraHelp()).toContain("explicit workspace scope");
   });
@@ -124,6 +124,55 @@ describe("Urdira application runner", () => {
       });
       expect(result.exit_code).toBe(0);
       expect(result.data).toMatchObject({ state: "ready", engine_build_id: "build-app-start" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("starts a persistent daemon directly, reports startup phases, and leaves it running until an explicit stop", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-start-persistent-"));
+    const progress: string[] = [];
+    try {
+      const started = await runUrdira(["daemon", "start"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-app-start-persistent",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+        on_startup_progress: (phase) => progress.push(phase),
+      });
+      expect(started.exit_code).toBe(0);
+      expect(started.data).toMatchObject({ command: "start", result: { state: "already_running" } });
+      expect(progress).toEqual(["locking", "catalog_verification", "workspace_recovery", "provider_reconciliation", "ready"]);
+
+      const status = await runUrdira(["status"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-app-start-persistent",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+      });
+      expect(status.data).toMatchObject({ state: "ready", engine_build_id: "build-app-start-persistent" });
+
+      const stopped = await runUrdira(["daemon", "stop"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-app-start-persistent",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+      });
+      expect(stopped.data).toMatchObject({ command: "stop", result: { state: "stopping" } });
+      const endpoint = (started.data as { readonly result: { readonly endpoint: string } }).result.endpoint;
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        try {
+          await new DaemonClient(endpoint).call("core:status", {});
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+        } catch {
+          break;
+        }
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

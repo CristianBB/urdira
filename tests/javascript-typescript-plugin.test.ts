@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   analyzeProject,
@@ -5,6 +9,8 @@ import {
   bundledPluginCatalogEntry,
   createJavascriptTypescriptWorker,
   discoverProjects,
+  assertNativeFactDeltaBatchBudget,
+  iterateNativeFactDeltaBatches,
   languageForPath,
   scriptKindForPath,
   JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES,
@@ -178,6 +184,40 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
     await worker.terminate();
   });
 
+  it("hydrates a verified source reference directly from CAS", async () => {
+    const casRoot = await mkdtemp(join(tmpdir(), "urdira-jsts-cas-"));
+    const source = new TextEncoder().encode("export const value = 1;\n");
+    const hex = createHash("sha256").update(source).digest("hex");
+    const casPath = join(casRoot, "sha256", hex.slice(0, 2), hex.slice(2, 4), hex.slice(4));
+    await mkdir(join(casRoot, "sha256", hex.slice(0, 2), hex.slice(2, 4)), { recursive: true });
+    await writeFile(casPath, source);
+    const worker = createJavascriptTypescriptWorker({ cas_root: casRoot });
+    try {
+      const result = await worker.invoke({
+        protocol_version: "1.0.0",
+        request_id: "request-cas-reference",
+        request_digest: "digest-cas-reference",
+        call: "discover_partitions",
+        deadline: "2030-01-01T00:00:00.000Z",
+        cancellation_id: "cancel-cas-reference",
+        payload: { files: [{ path: "src/main.ts", content_hash: `sha256:${hex}` }] },
+      }) as { readonly payload: { readonly partitions: readonly unknown[] } };
+      expect(result.payload.partitions).toHaveLength(1);
+      await expect(worker.invoke({
+        protocol_version: "1.0.0",
+        request_id: "request-cas-reference-invalid",
+        request_digest: "digest-cas-reference-invalid",
+        call: "discover_partitions",
+        deadline: "2030-01-01T00:00:00.000Z",
+        cancellation_id: "cancel-cas-reference-invalid",
+        payload: { files: [{ path: "src/main.ts", content_hash: `sha256:${"0".repeat(64)}` }] },
+      })).rejects.toThrow(/failed digest verification|ENOENT/);
+    } finally {
+      await worker.terminate();
+      await rm(casRoot, { recursive: true, force: true });
+    }
+  });
+
   it("returns a FactDelta validation envelope for production-shaped analysis work", async () => {
     const worker = createJavascriptTypescriptWorker();
     const request = {
@@ -208,6 +248,17 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
     expect(result.payload.validation_input.raw_delta.proposed_records.length).toBeGreaterThan(0);
     expect(result.payload.validation_input.raw_delta.replacement_scopes).toHaveLength(1);
     expect(result.payload.validation_input.accepted_manifest).toMatchObject({ manifest_digest: "sha256:manifest" });
+    expect((result.payload as { readonly fact_delta_batches?: readonly unknown[] }).fact_delta_batches?.length).toBeGreaterThan(0);
+    const rawDelta = result.payload.validation_input.raw_delta as Parameters<typeof iterateNativeFactDeltaBatches>[0];
+    const hostBatches = [...iterateNativeFactDeltaBatches(rawDelta)];
+    expect(hostBatches.length).toBeGreaterThan(0);
+    for (const batch of hostBatches) assertNativeFactDeltaBatchBudget(batch);
+    expect(() => assertNativeFactDeltaBatchBudget({ ...hostBatches[0]!, byte_length: 4 * 1024 * 1024 + 1 })).toThrow(/bounded memory budget/);
+    const hostWorker = createJavascriptTypescriptWorker({ native_batch_transport: "host" });
+    const hostResult = await hostWorker.invoke(request) as { readonly payload: { readonly fact_delta_batches?: readonly unknown[]; readonly validation_input: { readonly raw_delta: unknown } } };
+    expect(hostResult.payload.fact_delta_batches).toBeUndefined();
+    expect(hostResult.payload.validation_input.raw_delta).toEqual(result.payload.validation_input.raw_delta);
+    await hostWorker.terminate();
     await expect(worker.invoke({
       ...request,
       payload: {

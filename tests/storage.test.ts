@@ -276,7 +276,7 @@ describe("Phase 4 durable storage", () => {
     await Promise.all([first, second, foreground]);
     expect(order).toEqual(["background-1", "foreground", "background-2"]);
   });
-  it("atomically migrates old candidate manifest and delta tables and enforces their foreign keys", async () => {
+  it("rejects old candidate layouts at the destructive v3 boundary", async () => {
     const root = await mkdtemp(join(tmpdir(), "urdira-candidate-schema-migration-"));
     const oldStorage = await createDurableStorage({ rootDir: root });
     const candidate = { candidate_generation_id: "candidate-old-schema", workspace_id: workspace.workspace_id, target_registry_snapshot_id: "registry-old", target_configuration_revision_id: "configuration-old", trigger_kind: "test", state: "queued", source_observation_batch_ids: [], created_at: "2026-08-09T00:00:00.000000000Z", issue_ids: [] } as Record<string, unknown>;
@@ -293,21 +293,12 @@ describe("Phase 4 durable storage", () => {
     } finally { await oldStorage.close(); }
 
     const databasePath = join(root, "workspaces", "ws-one.sqlite");
-    await expect(createDurableStorage({ rootDir: root, fault_injector: createFaultInjector(["migration.candidate_fk_rebuild"]) })).rejects.toMatchObject({ code: "storage:fault_injected" });
+    await expect(createDurableStorage({ rootDir: root, fault_injector: createFaultInjector(["migration.candidate_fk_rebuild"]) })).rejects.toMatchObject({ code: "core:index_contract_unsupported" });
     const beforeRecovery = await openSqliteDatabase({ filename: databasePath });
     expect(await beforeRecovery.all("PRAGMA foreign_key_list(candidate_work_manifests)")).toEqual([]);
     expect(await beforeRecovery.all("PRAGMA foreign_key_list(candidate_fact_deltas)")).toEqual([]);
     await beforeRecovery.close();
-    const recoveredStorage = await createDurableStorage({ rootDir: root });
-    try {
-      const recovered = await recoveredStorage.openWorkspace(workspace.workspace_id);
-      expect(await recovered.database.all<{ table: string; from: string; to: string }>("PRAGMA foreign_key_list(candidate_work_manifests)")).toEqual([expect.objectContaining({ table: "candidate_state", from: "candidate_generation_id", to: "candidate_generation_id" })]);
-      expect(await recovered.database.all<{ table: string; from: string; to: string }>("PRAGMA foreign_key_list(candidate_fact_deltas)")).toEqual([expect.objectContaining({ table: "candidate_state", from: "candidate_generation_id", to: "candidate_generation_id" })]);
-      expect(await recovered.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM candidate_work_manifests WHERE work_manifest_id = 'manifest-old'")).toEqual({ count: 1 });
-      expect(await recovered.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM candidate_fact_deltas WHERE fact_delta_id = 'delta-old'")).toEqual({ count: 1 });
-      await expect(recovered.database.run("INSERT INTO candidate_fact_deltas (fact_delta_id, workspace_id, candidate_generation_id, delta_digest, accepted_at, delta_payload) VALUES (?, ?, ?, ?, ?, ?)", ["delta-orphan", workspace.workspace_id, "missing-candidate", "digest", "2026-08-09T00:00:00.000000000Z", new Uint8Array([3])])).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR" });
-      await recovered.close();
-    } finally { await recoveredStorage.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("opens SQLite with durable publication settings and strict tables", async () => {
@@ -422,9 +413,9 @@ describe("Phase 4 durable storage", () => {
       for (const recordId of recordIds) {
         await opened.repositories.canonicalOccurrences.put({ ...record, record_id: recordId, record_digest: `sha256:digest-${recordId}` });
         await opened.database.run(
-          `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, assignment_payload)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [`assignment-${recordId}`, workspace.workspace_id, "entity", `identity-${recordId}`, "created", `key-${recordId}`, `key-digest-${recordId}`, recordId, null, artifact.artifact_id, artifactVersion.artifact_version_id, 1, null, new Uint8Array([1])],
+          `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [`assignment-${recordId}`, workspace.workspace_id, "entity", `identity-${recordId}`, "created", `key-${recordId}`, `key-digest-${recordId}`, recordId, null, artifact.artifact_id, artifactVersion.artifact_version_id, 1, null],
         );
       }
 
@@ -483,40 +474,40 @@ describe("Phase 4 durable storage", () => {
           kind: "run",
           sql: `INSERT INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version,
             ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, provider_cursor_before, provider_cursor_after,
-            started_at, completed_at, observation_count, unavailable_count, batch_digest, observation_batch_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          params: ["batch:owners", workspace.workspace_id, "provider-one", "directory", "1.0.0", "filesystem", "full_scan", "all", "complete", "authoritative", null, null, "2026-08-09T00:00:00.000000000Z", "2026-08-09T00:00:01.000000000Z", ownerCount, 0, `sha256:${"0".repeat(64)}`, new Uint8Array([1])],
+            started_at, completed_at, observation_count, unavailable_count, batch_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: ["batch:owners", workspace.workspace_id, "provider-one", "directory", "1.0.0", "filesystem", "full_scan", "all", "complete", "authoritative", null, null, "2026-08-09T00:00:00.000000000Z", "2026-08-09T00:00:01.000000000Z", ownerCount, 0, `sha256:${"0".repeat(64)}`],
         };
         yield { kind: "run", sql: "INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", params: ["blob:shared", `sha256:${"1".repeat(64)}`, 3, "cas:shared"] };
         for (let index = 0; index < ownerCount; index += 1) {
           const ownerId = `owner-${index}`;
-          yield { kind: "run", sql: "INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", params: [ownerId, workspace.workspace_id, `file:///owner-${index}.ts`, `owner-${index}.ts`, `owner-${index}.ts`, "source_file", new Uint8Array([1])] };
+          yield { kind: "run", sql: "INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES (?, ?, ?, ?, ?, ?)", params: [ownerId, workspace.workspace_id, `file:///owner-${index}.ts`, `owner-${index}.ts`, `owner-${index}.ts`, "source_file"] };
           yield {
             kind: "run",
             sql: `INSERT INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider,
               source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash, observed_metadata_digest, provider_event_token,
-              provider_sequence, observed_at, received_at, observation_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            params: [`obs-${index}`, "batch:owners", workspace.workspace_id, ownerId, "provider-one", "directory", "1.0.0", "filesystem", "full_scan", "present", null, null, null, null, "2026-08-09T00:00:00.000000000Z", "2026-08-09T00:00:00.000000000Z", new Uint8Array([1])],
+              provider_sequence, observed_at, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [`obs-${index}`, "batch:owners", workspace.workspace_id, ownerId, "provider-one", "directory", "1.0.0", "filesystem", "full_scan", "present", null, null, null, null, "2026-08-09T00:00:00.000000000Z", "2026-08-09T00:00:00.000000000Z"],
           };
           yield {
             kind: "run",
             sql: `INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint,
-              analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            params: [`version-${index}`, workspace.workspace_id, ownerId, "blob:shared", `sha256:${"1".repeat(64)}`, 3, "utf-8", null, `sha256:${"2".repeat(64)}`, `obs-${index}`, 1, null, new Uint8Array([1])],
+              analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [`version-${index}`, workspace.workspace_id, ownerId, "blob:shared", `sha256:${"1".repeat(64)}`, 3, "utf-8", null, `sha256:${"2".repeat(64)}`, `obs-${index}`, 1, null],
           };
           yield {
             kind: "run",
             sql: `INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, owner_artifact_id, owner_artifact_version_id, schema_version,
               producer_id, producer_version, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte,
-              primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, payload_digest,
-              payload_byte_length, payload_inline, payload_cas_digest, record_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            params: [`record-${index}`, workspace.workspace_id, "entity", "core:definition", "core:definition", ownerId, `version-${index}`, 1, "test", "1.0.0", null, null, null, null, null, 1, null, `sha256:digest-${index}`, `sha256:payload-${index}`, 1, new Uint8Array([9]), null, new Uint8Array([1])],
+              primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest,
+              body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [`record-${index}`, workspace.workspace_id, "entity", "core:definition", "core:definition", ownerId, `version-${index}`, 1, "test", "1.0.0", null, null, null, null, null, 1, null, `sha256:digest-${index}`, `sha256:payload-${index}`, 1, `sha256:analysis-${index}`, `sha256:configuration-${index}`, `sha256:dependencies-${index}`],
           };
           yield {
             kind: "run",
             sql: `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest,
-              record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, assignment_payload)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            params: [`assignment-${index}`, workspace.workspace_id, "entity", `identity-${index}`, "created", `key-${index}`, digestBytes(encodeCanonical(`key-${index}`)), `record-${index}`, null, ownerId, `version-${index}`, 1, null, new Uint8Array([1])],
+              record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [`assignment-${index}`, workspace.workspace_id, "entity", `identity-${index}`, "created", `key-${index}`, digestBytes(encodeCanonical(`key-${index}`)), `record-${index}`, null, ownerId, `version-${index}`, 1, null],
           };
         }
       }
@@ -547,6 +538,26 @@ describe("Phase 4 durable storage", () => {
 
       const byIdentity = await opened.repositories.canonicalOccurrences.currentlyVisibleForIdentityKeys(1, allVisible.flatMap((row) => row.identity_type === undefined ? [] : [{ identity_type: row.identity_type, identity_key: row.identity_key! }]));
       expect(byIdentity).toEqual(allVisible);
+
+      // A content-derived record may legitimately have more than one exact
+      // identity assignment. Exact-key lookup must preserve every requested
+      // alias instead of collapsing rows only by record_id; candidate sealing
+      // relies on this when an incremental scan re-proposes one alias after a
+      // workspace fork.
+      await opened.database.run(
+        `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest,
+          record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ["assignment-0-alias", workspace.workspace_id, "entity", "identity-0-alias", "created", "key-0-alias", digestBytes(encodeCanonical("key-0-alias")), "record-0", null, "owner-0", "version-0", 1, null],
+      );
+      const aliases = await opened.repositories.canonicalOccurrences.currentlyVisibleForIdentityKeys(1, [
+        { identity_type: "entity", identity_key: "key-0" },
+        { identity_type: "entity", identity_key: "key-0-alias" },
+      ]);
+      expect(aliases.map((row) => [row.identity_key, row.record_id])).toEqual([
+        ["key-0", "record-0"],
+        ["key-0-alias", "record-0"],
+      ]);
 
       await opened.close();
     });
@@ -675,7 +686,7 @@ describe("Phase 4 durable storage", () => {
       const opened = await storage.openWorkspace(workspace.workspace_id);
       await expect(opened.database.transaction([
         { kind: "run", sql: "INSERT INTO workspace_meta (key, value) VALUES (?, ?)", params: ["rollback-marker", new Uint8Array([1])] },
-        { kind: "run", sql: "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: ["bad-version", workspace.workspace_id, "missing-artifact", "missing-blob", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, "utf-8", null, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null, 1, null, new Uint8Array([1])] },
+        { kind: "run", sql: "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: ["bad-version", workspace.workspace_id, "missing-artifact", "missing-blob", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, "utf-8", null, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null, 1, null] },
       ])).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR" });
       expect(await opened.database.get("SELECT key FROM workspace_meta WHERE key = ?", ["rollback-marker"])).toBeUndefined();
       await opened.close();
@@ -798,8 +809,8 @@ describe("Phase 4 durable storage", () => {
         // same shape as the single-message rollback test above.
         yield {
           kind: "run" as const,
-          sql: "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          params: ["bad-chunked-version", workspace.workspace_id, "missing-artifact", "missing-blob", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, "utf-8", null, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null, 1, null, new Uint8Array([1])],
+          sql: "INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          params: ["bad-chunked-version", workspace.workspace_id, "missing-artifact", "missing-blob", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, "utf-8", null, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null, 1, null],
         };
       }
       // chunkSize 1 guarantees the first two INSERTs are each committed to the
@@ -1194,8 +1205,8 @@ describe("Phase 4 durable storage", () => {
       expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining([
         "schema_version", "producer_id", "producer_version", "primary_source_span_artifact_version_id", "primary_source_span_start_byte", "primary_source_span_end_byte",
       ]));
-      await expect(opened.database.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", ["bad-artifact", workspace.workspace_id, "file:///bad", null, null, new Uint8Array([1]), new Uint8Array([1])])).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR" });
-      await expect(opened.database.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["bad-version", workspace.workspace_id, "missing-artifact", "missing-blob", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, "utf-8", null, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null, 1, null, new Uint8Array([1])])).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR" });
+      await expect(opened.database.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, normalized_path, display_path, artifact_kind) VALUES (?, ?, ?, ?, ?, ?)", ["bad-artifact", workspace.workspace_id, "file:///bad", null, null, "physical_file"])).resolves.toMatchObject({ changes: 1 });
+      await expect(opened.database.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["bad-version", workspace.workspace_id, "missing-artifact", "missing-blob", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, "utf-8", null, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null, 1, null])).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR" });
       await opened.repositories.sourceCatalog.putArtifact(artifact);
       await opened.repositories.sourceCatalog.putContentBlob(contentBlob);
       await opened.repositories.sourceCatalog.putObservationBatch(observationBatch);
@@ -1396,11 +1407,11 @@ describe("Phase 4 durable storage", () => {
       await opened.repositories.sourceCatalog.putArtifactVersion(artifactVersion);
       const closedVersion = { ...artifactVersion, valid_to_generation: 2 };
       await opened.repositories.sourceCatalog.putArtifactVersion(closedVersion);
-      await expect(opened.repositories.sourceCatalog.putArtifactVersion({ ...closedVersion, payload_conflict: true } as typeof closedVersion & { payload_conflict: boolean })).rejects.toMatchObject({ code: "storage:artifact_version_immutable" });
+      await expect(opened.repositories.sourceCatalog.putArtifactVersion({ ...closedVersion, language_hint: "conflict" })).rejects.toMatchObject({ code: "storage:artifact_version_immutable" });
       await opened.repositories.sourceCatalog.putTombstone(openTombstone);
       const closedTombstone = { ...openTombstone, valid_to_generation: 3, closing_artifact_change_id: "change-close", replacement_artifact_version_id: artifactVersion.artifact_version_id };
       await opened.repositories.sourceCatalog.putTombstone(closedTombstone);
-      await expect(opened.repositories.sourceCatalog.putTombstone({ ...closedTombstone, payload_conflict: true } as typeof closedTombstone & { payload_conflict: boolean })).rejects.toMatchObject({ code: "storage:tombstone_immutable" });
+      await expect(opened.repositories.sourceCatalog.putTombstone({ ...closedTombstone, absence_reason_code: "conflict" })).rejects.toMatchObject({ code: "storage:tombstone_immutable" });
       await opened.close();
     });
   });
@@ -1536,7 +1547,7 @@ describe("Phase 4 durable storage", () => {
       const opened = await storage.openWorkspace(workspace.workspace_id);
       const foreignArtifact = { ...artifact, artifact_id: "foreign-artifact", workspace_id: "ws-two", normalized_uri: "file:///other" };
       await expect(opened.repositories.sourceCatalog.putArtifact(foreignArtifact)).rejects.toMatchObject({ code: "storage:workspace_mismatch" });
-      await opened.database.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?)", [foreignArtifact.artifact_id, foreignArtifact.workspace_id, foreignArtifact.normalized_uri, foreignArtifact.artifact_kind, new Uint8Array([1])]);
+      await opened.database.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, artifact_kind) VALUES (?, ?, ?, ?)", [foreignArtifact.artifact_id, foreignArtifact.workspace_id, foreignArtifact.normalized_uri, foreignArtifact.artifact_kind]);
       expect(await opened.repositories.sourceCatalog.getArtifact(foreignArtifact.artifact_id)).toBeUndefined();
       expect((await opened.repositories.sourceCatalog.listArtifacts()).some((entry) => entry.artifact_id === foreignArtifact.artifact_id)).toBe(false);
       await expect(opened.repositories.canonicalOccurrences.put({ ...record, workspace_id: "ws-two" })).rejects.toMatchObject({ code: "storage:workspace_mismatch" });

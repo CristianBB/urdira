@@ -9,10 +9,14 @@ describe("Phase 12 closed CLI", () => {
     expect(() => parseCliArgs(["status", "--shell=rm -rf"])).toThrowError(CliError);
   });
 
-  it("uses direct execution for daemon stop and explicit confirmation for other mutations", async () => {
+  it("uses direct execution for daemon start/stop and explicit confirmation for other mutations", async () => {
     for (const command of MUTATING_COMMANDS) {
-      if (command === "stop") {
+      if (command === "start" || command === "stop") {
         await expect(runCli([command], { client })).resolves.toMatchObject({ exit_code: 0, data: { command, confirmed: true } });
+        continue;
+      }
+      if (command === "workspace-add") {
+        await expect(runCli([command], { client })).rejects.toMatchObject({ code: "cli:command_invalid" });
         continue;
       }
       await expect(runCli([command], { client })).rejects.toMatchObject({ code: "cli:dry_run_required" });

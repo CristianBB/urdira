@@ -67,9 +67,27 @@ port.on("message", (message: ThreadRequestMessage) => {
       if (message.kind === "invoke") result = await worker.invoke(message.payload as PluginWorkerRequestEnvelope);
       else if (message.kind === "cancel") result = await worker.cancel(message.payload as { readonly cancellation_id: string });
       else result = await worker.reset();
-      port.postMessage({ id: message.id, kind: "result", result } satisfies ThreadResponseMessage);
+      port.postMessage({ id: message.id, kind: "result", result } satisfies ThreadResponseMessage, transferableBuffers(result));
     } catch (error) {
       port.postMessage({ id: message.id, kind: "error", error: errorDetails(error) } satisfies ThreadResponseMessage);
     }
   })();
 });
+
+/** Transfer complete native arenas; never transfer a partial view or shared buffer. */
+function transferableBuffers(value: unknown): ArrayBuffer[] {
+  const result: ArrayBuffer[] = [];
+  const seen = new Set<object>();
+  const visit = (current: unknown): void => {
+    if (ArrayBuffer.isView(current)) {
+      if (current.buffer instanceof ArrayBuffer && current.byteOffset === 0 && current.byteLength === current.buffer.byteLength) result.push(current.buffer);
+      return;
+    }
+    if (current === null || typeof current !== "object" || seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) { for (const item of current) visit(item); return; }
+    for (const item of Object.values(current)) visit(item);
+  };
+  visit(value);
+  return [...new Set(result)];
+}

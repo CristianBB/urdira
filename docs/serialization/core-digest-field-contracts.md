@@ -211,7 +211,7 @@ Each row is one `DigestReferenceDefinition`. For every row, `digest_reference_id
 | `SourceProviderDescribeRequest.binding_configuration_digest` | `core:source_provider_configuration_digest` | Exact `WorkspaceSourceProviderBinding.configuration_digest` selected by the request binding ID. |
 | `SourceProviderReadRequest.observed_content_hash` | `core:raw_artifact_content_digest` | Optional exact digest from the accepted source observation being read. |
 | `SourceProviderReadRequest.observed_metadata_digest` | `core:artifact_analysis_metadata_digest` | Optional exact metadata digest from the accepted source observation being read. |
-| `SourceProviderReadResult.content_hash` | `core:raw_artifact_content_digest` | Exact `content_bytes` returned by the stable successful read; the core recomputes it before acceptance. |
+| `SourceProviderReadResult.content_hash` | `core:raw_artifact_content_digest` | Exact `content` bytes returned by the stable successful read; the core recomputes it before acceptance. |
 | `SourceProviderReadResult.metadata_digest` | `core:artifact_analysis_metadata_digest` | Exact normalized provider metadata returned by the stable successful read; the core recomputes it before acceptance. |
 | `WorkspaceFreshnessCheckpoint.source_state_digest` | `core:source_state_digest` | Complete normalized observed source state compared with the selected snapshot. |
 

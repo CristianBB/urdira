@@ -278,7 +278,7 @@ export const authoritativeRegistryDescriptions = {
   "core:value": "An identifiable value, binding, or storage location, including variables, constants, fields, properties, parameters, and enum members.",
   "core:work_manifest_inconsistent": "The frozen work manifest violates a structural or context invariant.",
   "core:workspace_not_found": "An explicit workspace ID has no registered workspace.",
-  "core:workspace_not_registered": "An explicit API v2 workspace root has no exact registered workspace after canonicalization.",
+  "core:workspace_not_registered": "An explicit API v3 workspace root has no exact registered workspace after canonicalization.",
   "core:write": "`context E:callable,container 1`; `write_site E:operation+write_site 1`; `target E:value,resource,U 1..*`; `value E:value,operation,resource,L,U 0..1`",
   "core:write_site": "operation"
 } as const;

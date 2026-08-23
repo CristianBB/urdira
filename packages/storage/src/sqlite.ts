@@ -1,4 +1,5 @@
 import { Worker } from "node:worker_threads";
+import type { FactDeltaBatch } from "@urdira/contracts";
 import { timedSync } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
 
@@ -16,6 +17,7 @@ export type SqliteCommand =
   | { readonly kind: "run"; readonly sql: string; readonly params?: readonly SqliteValue[] }
   | { readonly kind: "get"; readonly sql: string; readonly params?: readonly SqliteValue[] }
   | { readonly kind: "all"; readonly sql: string; readonly params?: readonly SqliteValue[] }
+  | { readonly kind: "staged_fact_delta_batch"; readonly workspace_id: string; readonly candidate_generation_id: string; readonly fact_delta_id: string; readonly accepted_at: string; readonly batch: FactDeltaBatch }
   | { readonly kind: "transaction_checkpoint" }
   | { readonly kind: "fault"; readonly boundary: string }
   | { readonly kind: "assert_transaction_changes"; readonly expected: number; readonly context?: string };
@@ -240,7 +242,127 @@ const SQLITE_WORKER_SOURCE = String.raw`
     return discard ? null : statement.all(...params);
   }
 
+  const FACT_DELTA_SECTIONS = ["records", "graph_edges", "identities", "dependencies"];
+  // The bundled SQLite build may expose either the historical 999-variable
+  // limit or a newer compile-time limit.  Use the conservative value for
+  // generated multi-row statements; single-row statements can still use the
+  // full typed-column shape without risking the SQLite variable error.
+  const SQLITE_SAFE_VARIABLE_LIMIT = 999;
+  const FACT_DELTA_UTF8 = new TextDecoder("utf-8", { fatal: true });
+  // A section may contain several scalar values per logical row (for example
+  // five record strings), so the row budget is not a sufficient namespace
+  // stride. The byte budget bounds every arena index well below this value.
+  const FACT_DELTA_ROW_STRIDE = 4 * 1024 * 1024;
+  // Receipt insertion and staging rows share the same SQLite transaction. A
+  // committed receipt makes a retry a no-op; a failed transaction rolls back
+  // every row. One relational row now represents one logical batch row. The
+  // typed columns are promoted from the Schema IR shape instead of storing a
+  // generic value-slot row for every scalar.
+  const STAGED_TYPED_COLUMNS = [
+    "fact_delta_key", "row_ordinal",
+    "text_0", "text_1", "text_2", "text_3", "text_4", "text_5", "text_6", "text_7",
+    "real_0", "real_1", "real_2", "real_3",
+    "integer_0", "integer_1", "integer_2", "integer_3",
+    "enum_0", "enum_1", "enum_2", "enum_3",
+    "presence_0", "presence_1", "presence_2", "presence_3", "presence_4", "presence_5", "presence_6", "presence_7",
+  ];
+  const STAGED_TYPED_TABLES = { records: "candidate_staged_records", graph_edges: "candidate_staged_graph_edges", identities: "candidate_staged_identities", dependencies: "candidate_staged_dependencies" };
+  const FACT_DELTA_RECEIPT_SQL = "SELECT byte_length, is_final FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ? AND sequence = ?";
+  const FACT_DELTA_LATEST_SQL = "SELECT MAX(sequence) AS sequence, MAX(is_final) AS is_final FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?";
+  const FACT_DELTA_INSERT_SQL = "INSERT INTO candidate_fact_delta_batches (workspace_id, candidate_generation_id, fact_delta_id, sequence, byte_length, is_final, accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+  const FACT_DELTA_NAMESPACE_INSERT_SQL = "INSERT INTO candidate_fact_delta_namespaces (workspace_id, candidate_generation_id, fact_delta_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING";
+  const FACT_DELTA_KEY_SQL = "SELECT fact_delta_key FROM candidate_fact_delta_namespaces WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?";
+
+  // This is deliberately executed inside the SQLite worker. The parent only
+  // validates ownership and transfers the seven arenas per section; it does
+  // not decode UTF-8 or build one SQL command per value on the hot path.
+  function executeStagedFactDeltaBatch(command) {
+    const batch = command.batch;
+    const receipt = prepareCached(FACT_DELTA_RECEIPT_SQL).get(command.workspace_id, command.candidate_generation_id, command.fact_delta_id, batch.sequence);
+    if (receipt !== undefined) {
+      if (Number(receipt.byte_length) !== Number(batch.byte_length) || Number(receipt.is_final) !== (batch.final ? 1 : 0)) {
+        const conflict = new Error("FactDelta batch receipt conflicts with the transferred batch.");
+        conflict.code = "storage:fact_delta_batch_conflict";
+        throw conflict;
+      }
+      return { status: "already_accepted" };
+    }
+    const latest = prepareCached(FACT_DELTA_LATEST_SQL).get(command.workspace_id, command.candidate_generation_id, command.fact_delta_id);
+    const latestSequence = latest?.sequence === null || latest?.sequence === undefined ? undefined : Number(latest.sequence);
+    if ((latestSequence === undefined && batch.sequence !== 0) || (latestSequence !== undefined && batch.sequence !== latestSequence + 1)) {
+      const sequenceError = new Error("FactDelta batches must be accepted in sequence order.");
+      sequenceError.code = "storage:fact_delta_sequence_invalid";
+      throw sequenceError;
+    }
+    if (latest?.is_final !== null && latest?.is_final !== undefined && Number(latest.is_final) === 1) {
+      const finalError = new Error("A final FactDelta batch cannot be followed by another batch.");
+      finalError.code = "storage:fact_delta_sequence_invalid";
+      throw finalError;
+    }
+    prepareCached(FACT_DELTA_NAMESPACE_INSERT_SQL).run(command.workspace_id, command.candidate_generation_id, command.fact_delta_id);
+    const parentDelta = prepareCached(FACT_DELTA_KEY_SQL).get(command.workspace_id, command.candidate_generation_id, command.fact_delta_id);
+    if (parentDelta === undefined) {
+      const parentError = new Error("A staged FactDelta batch could not allocate its compact namespace.");
+      parentError.code = "storage:fact_delta_batch_invalid";
+      throw parentError;
+    }
+    const factDeltaKey = Number(parentDelta.fact_delta_key);
+    for (const sectionName of FACT_DELTA_SECTIONS) {
+      const section = batch[sectionName];
+      const typedTable = STAGED_TYPED_TABLES[sectionName];
+      const insertPrefix = "INSERT INTO " + typedTable + " (" + STAGED_TYPED_COLUMNS.join(", ") + ") VALUES ";
+      const columnCount = STAGED_TYPED_COLUMNS.length;
+      // Amortise the native SQLite statement boundary. The old loop called
+      // sqlite3_step once per scalar (millions of calls for a large TS
+      // workspace); bounded multi-row INSERTs retain relational storage while
+      // keeping the parameter vector comfortably below SQLite's variable cap.
+      const pending = [];
+      const flush = () => {
+        if (pending.length === 0) return;
+        const placeholders = pending.map(() => "(" + candidateStagedRowPlaceholders(columnCount) + ")").join(",");
+        prepareCached(insertPrefix + placeholders).run(...pending.flat());
+        pending.length = 0;
+      };
+      const queue = (rowOrdinal, values) => {
+        pending.push([factDeltaKey, rowOrdinal, ...values]);
+        const rowsPerStatement = Math.max(1, Math.floor(SQLITE_SAFE_VARIABLE_LIMIT / columnCount));
+        if (pending.length >= rowsPerStatement) flush();
+      };
+      for (let row = 0; row < section.row_count; row += 1) {
+        const values = new Array(28).fill(null);
+        const textStart = Number(section.strings.row_offsets[row]);
+        const textEnd = Number(section.strings.row_offsets[row + 1]);
+        if (textEnd - textStart > 8) throw new Error("FactDelta row contains more than eight text values.");
+        for (let value = textStart; value < textEnd; value += 1) {
+          const start = Number(section.strings.offsets[value]);
+          const length = Number(section.strings.lengths[value]);
+          values[value - textStart] = FACT_DELTA_UTF8.decode(section.strings.bytes.subarray(start, start + length));
+        }
+        appendTypedValues(values, section.numbers, section.number_row_offsets, row, 8, 4);
+        appendTypedValues(values, section.ordinals, section.ordinal_row_offsets, row, 12, 4);
+        appendTypedValues(values, section.enums, section.enum_row_offsets, row, 16, 4);
+        appendTypedValues(values, section.presence, section.presence_row_offsets, row, 20, 8);
+        queue(batch.sequence * FACT_DELTA_ROW_STRIDE + row, values);
+      }
+      flush();
+    }
+    prepareCached(FACT_DELTA_INSERT_SQL).run(command.workspace_id, command.candidate_generation_id, command.fact_delta_id, batch.sequence, batch.byte_length, batch.final ? 1 : 0, command.accepted_at);
+    return { status: "inserted" };
+  }
+
+  function candidateStagedRowPlaceholders(columnCount = STAGED_TYPED_COLUMNS.length) {
+    return new Array(columnCount).fill("?").join(",");
+  }
+
+  function appendTypedValues(target, source, offsets, row, targetOffset, maxValues) {
+    const start = Number(offsets[row]);
+    const end = Number(offsets[row + 1]);
+    if (end - start > maxValues) throw new Error("FactDelta row exceeds its promoted typed-column budget.");
+    for (let index = start; index < end; index += 1) target[targetOffset + index - start] = source[index];
+  }
+
   function execute(command, sqls, discard) {
+    if (command.kind === "staged_fact_delta_batch") return discard ? null : executeStagedFactDeltaBatch(command);
     if (command.kind === "exec") {
       database.exec(resolveSql(command, sqls));
       return null;
@@ -347,7 +469,7 @@ const SQLITE_WORKER_SOURCE = String.raw`
           // always returns \`undefined\` in this mode) -- and the reply carries
           // just the command count, a number, so there is nothing for
           // \`postMessage\` to structured-clone beyond one scalar.
-          if (message.discard) {
+      if (message.discard) {
             for (const command of message.commands) runChunkCommand(command, activeTransaction, message.sqls, true);
             port.postMessage({ id: message.id, kind: "result", result: message.commands.length });
           } else {
@@ -435,8 +557,8 @@ const SQLITE_WORKER_SOURCE = String.raw`
 `;
 
 /**
- * Collects the distinct `ArrayBuffer`s backing `commands`' `Uint8Array`
- * params that are safe to hand to `postMessage`'s transfer list -- see
+ * Collects the distinct `ArrayBuffer`s backing command params and native
+ * FactDelta arenas that are safe to hand to `postMessage`'s transfer list -- see
  * `TransactionChunkedOptions.transfer_params`'s doc comment for the exact
  * eligibility rule (plain `ArrayBuffer`, not shared; the view covers the
  * whole buffer) and why ineligible params are simply left out (they are
@@ -448,16 +570,17 @@ const SQLITE_WORKER_SOURCE = String.raw`
  */
 function collectTransferableBuffers(commands: readonly SqliteCommand[]): ArrayBuffer[] {
   const buffers = new Set<ArrayBuffer>();
-  for (const command of commands) {
-    const params = (command as { readonly params?: readonly SqliteValue[] }).params;
-    if (!params) continue;
-    for (const param of params) {
-      if (!(param instanceof Uint8Array)) continue;
-      const buffer = param.buffer;
-      if (!(buffer instanceof ArrayBuffer)) continue; // Excludes SharedArrayBuffer views.
-      if (param.byteOffset !== 0 || param.byteLength !== buffer.byteLength) continue;
-      buffers.add(buffer);
+  const visit = (value: unknown): void => {
+    if (ArrayBuffer.isView(value)) {
+      const view = value as ArrayBufferView;
+      if (view.buffer instanceof ArrayBuffer && view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) buffers.add(view.buffer);
+      return;
     }
+    if (Array.isArray(value)) { for (const item of value) visit(item); return; }
+    if (value && typeof value === "object") for (const item of Object.values(value)) visit(item);
+  };
+  for (const command of commands) {
+    visit(command);
   }
   return [...buffers];
 }
@@ -487,7 +610,7 @@ function collectTransferableBuffers(commands: readonly SqliteCommand[]): ArrayBu
  * `transactionChunked`-shaped command to begin with (`backup`,
  * `replace_database`, which never appear inside a chunked transaction).
  */
-const DISCARD_ALLOWED_KINDS: ReadonlySet<SqliteCommand["kind"]> = new Set(["run", "exec", "transaction_checkpoint", "fault", "assert_transaction_changes"]);
+const DISCARD_ALLOWED_KINDS: ReadonlySet<SqliteCommand["kind"]> = new Set(["run", "exec", "staged_fact_delta_batch", "transaction_checkpoint", "fault", "assert_transaction_changes"]);
 
 function dedupCommandSqls(commands: readonly SqliteCommand[]): { readonly sqls: readonly string[]; readonly commands: readonly unknown[] } {
   const sqls: string[] = [];

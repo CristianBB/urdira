@@ -26,6 +26,7 @@ import {
   candidateTargetRegistryFromSnapshot,
   createCanonicalPluginDigestAuthority,
   runFullWorkspaceScan,
+  runSourceOnlyWorkspaceScan,
   type AcceptedFactDelta,
   type WorkspaceScanPluginProvider,
   type WorkspaceScanSourceArtifact,
@@ -386,7 +387,7 @@ function buildLockChangeTrackingProvider(prepared: PreparedRegistry, workspaceId
 
 function query(workspaceId: string, operation: string, args: Readonly<Record<string, unknown>>): QueryRequest {
   return {
-    api_version: 1, scope: { scope_type: "single_workspace", workspace_id: workspaceId }, expression: { expression_type: "operation", operation, arguments: args },
+    api_version: 3, scope: { scope_type: "single_workspace", workspace_id: workspaceId }, expression: { expression_type: "operation", operation, arguments: args },
     options: { freshness: "current", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: true }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "used", include_payload_schemas: false }, response_budget: { max_items: 1_000, max_characters: 1_000_000 } },
   };
 }
@@ -517,6 +518,34 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
       await storage.close();
       await rm(root, { recursive: true, force: true });
       await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("publishes the first structural snapshot after an equivalent source-only catalog already exists", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-source-first-recovery";
+    const prepared = await prepareRegistry(workspaceId);
+    const plugin = buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`);
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-source-first-recovery-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: fixtureRoot, display_root: fixtureRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const database = asStorageDatabase(opened);
+        const source = await runSourceOnlyWorkspaceScan({ root: fixtureRoot, database, workspace_id: workspaceId, inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false }, now: () => now });
+        expect(source.status).toBe("source_ready");
+        expect(await opened.repositories.snapshots.getCurrent()).toBeUndefined();
+
+        const structural = await runFullWorkspaceScan({ root: fixtureRoot, database, workspace_id: workspaceId, plugin, inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false }, now: () => now });
+        expect(structural.status).toBe("published");
+        expect(structural.snapshot_id).not.toBe("");
+        expect((await opened.repositories.snapshots.getCurrent())?.current_snapshot_id).toBe(structural.snapshot_id);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
     }
   }, 60_000);
 
@@ -1106,6 +1135,40 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
         expect(afterSecondEdit.status).toBe("published");
         expect(afterSecondEdit.state).toBe("published");
         expect(afterSecondEdit.generation).toBeGreaterThan(afterFirstEdit.generation);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("publishes the immediate successor generation after a cancelled scan cataloged an unpublished edit", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-cancelled-source-ahead";
+    const prepared = await prepareRegistry(workspaceId);
+    const plugin = buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`);
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-cancelled-source-ahead-root-"));
+    await cp(fixtureRoot, workspaceRoot, { recursive: true });
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-cancelled-source-ahead-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: workspaceRoot, display_root: workspaceRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const baseOptions = { root: workspaceRoot, database: asStorageDatabase(opened), workspace_id: workspaceId, inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false }, now: () => now };
+        const first = await runFullWorkspaceScan({ ...baseOptions, plugin });
+        expect(first.generation).toBe(1);
+
+        await writeFile(join(workspaceRoot, "cancelled.ts"), "export const cancelled = 1;\n", "utf8");
+        const controller = new AbortController();
+        await expect(runFullWorkspaceScan({ ...baseOptions, plugin, signal: controller.signal, on_prepared_scan: () => controller.abort() })).rejects.toMatchObject({ code: "core:operation_cancelled" });
+
+        await writeFile(join(workspaceRoot, "after-cancel.ts"), "export const afterCancel = 2;\n", "utf8");
+        const recovered = await runFullWorkspaceScan({ ...baseOptions, plugin });
+        expect(recovered.status).toBe("published");
+        expect(recovered.generation).toBe(3);
       } finally {
         await opened.close();
       }

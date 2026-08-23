@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { QueryExpression, QueryRequest, QueryScope } from "@urdira/contracts";
-import { CursorCache, QueryEngine, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem } from "../packages/engine/src/index.js";
+import { CanonicalRecordQueryDataPort, CursorCache, QueryEngine, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem } from "../packages/engine/src/index.js";
 import { executePipeline } from "../packages/engine/src/pipeline-executor.js";
+import { stageSetHandle } from "../packages/engine/src/stage-set-handle.js";
 import { PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES, PIPELINE_EXAMPLE_SEARCH_TO_SOURCE } from "../packages/mcp/src/index.js";
 import { buildTaskPlannerWorkspace } from "./support/task-planner-workspace.js";
 
@@ -36,10 +37,31 @@ const options = {
 };
 
 function pipelineQuery(stages: readonly unknown[], outputs: readonly { readonly stage_id: string; readonly output: string }[], workspaceId = "workspace:pipeline-test"): QueryRequest {
+  const publicStages = stages.map((stage) => {
+    const value = stage as Record<string, unknown>;
+    if (value["operator"] === "source.operation" || value["operator"] === "expand.operation") {
+      const stageArguments = value["arguments"] as Record<string, unknown>;
+      const operationArguments = (stageArguments["operation_arguments"] ?? {}) as Record<string, unknown>;
+      return {
+        stage_id: value["stage_id"],
+        stage_type: "operation",
+        operation: operationArguments["operation"] ?? stageArguments["operation"],
+        operation_version: 3,
+        arguments: operationArguments,
+      };
+    }
+    return {
+      stage_id: value["stage_id"],
+      stage_type: "operator",
+      operator: value["operator"],
+      inputs: value["inputs"],
+      arguments: value["arguments"],
+    };
+  });
   return {
-    api_version: 1,
+    api_version: 3,
     scope: scope(workspaceId),
-    expression: { expression_type: "pipeline", stages, outputs } as unknown as QueryExpression,
+    expression: { expression_type: "pipeline", stages: publicStages, outputs: outputs.map((output) => ({ ...output, name: output.output })) } as unknown as QueryExpression,
     options,
   };
 }
@@ -68,6 +90,33 @@ function items(page: Awaited<ReturnType<QueryEngine["execute"]>>, stream: string
 }
 
 describe("pipeline executor: stage_output resolution", () => {
+  it("executes a v3 dependent chain and preserves declared output aliases", async () => {
+    const calls: string[] = [];
+    const engine = engineFor({
+      "core:search_text": () => { calls.push("search"); return { streams: { matches: [], subjects: [subj({ subject_type: "record", record_id: "rec-root" }, "1")] } }; },
+      "core:find_related_tests": (operation) => { calls.push("tests"); expect(operation.arguments).toMatchObject({ subjects: [{ subject_type: "record", record_id: "rec-root" }] }); expect(operation.input_handles?.has("find.subjects")).toBe(true); return { streams: { tests: [subj({ subject_type: "record", record_id: "rec-test" }, "2")], fixtures: [], mocks: [], helpers: [] } }; },
+      "core:get_source": (operation) => { calls.push("source"); expect(operation.arguments).toMatchObject({ subjects: [{ subject_type: "record", record_id: "rec-test" }] }); expect(operation.input_handles?.has("tests.tests")).toBe(true); return { streams: { sources: [subj({ subject_type: "artifact", artifact_id: "art-1" }, "3")] } }; },
+    });
+    const request: QueryRequest = {
+      api_version: 3,
+      scope: scope("workspace:pipeline-v3"),
+      expression: {
+        expression_type: "pipeline",
+        stages: [
+          { stage_id: "find", stage_type: "operation", operation: "core:search_text", operation_version: 3, arguments: { pattern: "formatWireName" } },
+          { stage_id: "tests", stage_type: "operation", operation: "core:find_related_tests", arguments: { relationship_scope: "both", include_fixtures: true }, bindings: { subjects: { stage_id: "find", output: "subjects" } } },
+          { stage_id: "source", stage_type: "operation", operation: "core:get_source", arguments: { source: { mode: "relevant", max_characters_per_snippet: 100, max_total_characters: 1000, context_lines: 1 } }, bindings: { subjects: { stage_id: "tests", output: "tests" } } },
+        ],
+        outputs: [{ name: "test_sources", stage_id: "source", output: "sources" }],
+      } as unknown as QueryExpression,
+      options,
+    };
+    const page = await engine.execute(request);
+    expect(calls).toEqual(["search", "tests", "source"]);
+    expect(items(page, "test_sources").map((item) => item.stable_sort_key)).toEqual(["3"]);
+    expect(page.streams["sources"]).toBeUndefined();
+  });
+
   it("preserves lexical artifact identity when binding a stage output into get_source", async () => {
     const received: { source?: unknown } = {};
     const engine = engineFor({
@@ -173,6 +222,32 @@ describe("pipeline executor: stage_output resolution", () => {
 });
 
 describe("pipeline executor: algebra operators", () => {
+  it("passes execution-local stage handles to a handle-native relation join", async () => {
+    const calls: string[] = [];
+    const port: QueryDataPort = {
+      execute: async (operation) => operation.operation_id === "core:find_records"
+        ? { streams: { records: [subj({ subject_type: "record", record_id: "left" }, "left")] } }
+        : { streams: { subjects: [subj({ subject_type: "record", record_id: "right" }, "right")] } },
+      relation_exists: async () => false,
+      relation_pairs_handles: async (_scope, left, right) => {
+        calls.push(`${left.stage_id}.${left.output}->${right.stage_id}.${right.output}`);
+        return new Set(["left\u0000right"]);
+      },
+    };
+    const evaluation = await executePipeline({
+      stages: [
+        { stage_id: "left", operator: "source.operation", inputs: [], arguments: { operation: "core:find_records", operation_arguments: { selector: { record_categories: ["entity"] } } } },
+        { stage_id: "right", operator: "source.operation", inputs: [], arguments: { operation: "core:search_text", operation_arguments: { pattern: "right" } } },
+        { stage_id: "joined", operator: "join", inputs: [{ stage_id: "left", output: "records" }, { stage_id: "right", output: "subjects" }], arguments: { predicate: "relation_exists", relation_selector: {}, direction: "outbound", output: "pairs" } },
+      ] as never,
+      outputs: [{ stage_id: "joined", output: "pairs" }],
+      scope: scope("workspace:pipeline-handles"),
+      port,
+    });
+    expect(calls).toEqual(["left.records->right.subjects"]);
+    expect(evaluation.streams["pairs"]).toHaveLength(1);
+  });
+
   it("set.union still combines two earlier stages' streams", async () => {
     const engine = engineFor({
       "core:find_records": () => ({ streams: { records: [subj({ subject_type: "record", record_id: "rec-a" }, "1")] } }),
@@ -212,12 +287,74 @@ describe("pipeline executor: algebra operators", () => {
     const page = await engine.execute(request);
     expect(items(page, "subjects").map((entry) => (entry.value as { record_id: string }).record_id).sort()).toEqual(["rec-cls", "rec-fn"]);
   });
+
+  it("executes intersection, difference, deduplicate and select from sealed iterators", async () => {
+    const engine = engineFor({
+      "core:search_text": (operation) => String((operation.arguments as Record<string, unknown>)["pattern"]) === "left"
+        ? { streams: { subjects: [subj({ subject_type: "record", record_id: "a" }, "a"), subj({ subject_type: "record", record_id: "shared" }, "s"), subj({ subject_type: "record", record_id: "a" }, "a-duplicate")] } }
+        : { streams: { subjects: [subj({ subject_type: "record", record_id: "shared" }, "s"), subj({ subject_type: "record", record_id: "b" }, "b")] } },
+    });
+    const page = await engine.execute(pipelineQuery([
+      { stage_id: "left", operator: "source.operation", inputs: [], arguments: { operation: "core:search_text", operation_arguments: { pattern: "left" } } },
+      { stage_id: "right", operator: "source.operation", inputs: [], arguments: { operation: "core:search_text", operation_arguments: { pattern: "right" } } },
+      { stage_id: "intersection", operator: "set.intersection", inputs: [{ stage_id: "left", output: "subjects" }, { stage_id: "right", output: "subjects" }], arguments: {} },
+      { stage_id: "difference", operator: "set.difference", inputs: [{ stage_id: "left", output: "subjects" }, { stage_id: "right", output: "subjects" }], arguments: {} },
+      { stage_id: "dedup", operator: "deduplicate", inputs: [{ stage_id: "left", output: "subjects" }], arguments: { identity: "subject" } },
+      { stage_id: "selected", operator: "select", inputs: [{ stage_id: "intersection", output: "subjects" }, { stage_id: "difference", output: "subjects" }, { stage_id: "dedup", output: "subjects" }], arguments: { outputs: [
+        { name: "intersection", input: { stage_id: "intersection", output: "subjects" }, projection: "subjects" },
+        { name: "difference", input: { stage_id: "difference", output: "subjects" }, projection: "subjects" },
+        { name: "dedup", input: { stage_id: "dedup", output: "subjects" }, projection: "subjects" },
+      ] } },
+    ], [{ stage_id: "selected", output: "intersection" }, { stage_id: "selected", output: "difference" }, { stage_id: "selected", output: "dedup" }]));
+    expect(items(page, "intersection").map((entry) => (entry.value as { record_id: string }).record_id)).toEqual(["shared"]);
+    expect(items(page, "difference").map((entry) => (entry.value as { record_id: string }).record_id)).toEqual(["a"]);
+    expect(items(page, "dedup").map((entry) => (entry.value as { record_id: string }).record_id)).toEqual(["a", "shared"]);
+  });
+});
+
+describe("canonical handle binding boundary", () => {
+  it("materializes only the bound selector required by a legacy operation", async () => {
+    const record = {
+      record_id: "bound-record",
+      workspace_id: "workspace:handle-boundary",
+      category: "entity",
+      kind: "function_declaration",
+      universal_kind: "core:function",
+      owner_artifact_id: "artifact-1",
+      owner_artifact_version_id: "artifact-version-1",
+      body: { name: "bound" },
+    };
+    const snapshot = { records: async () => [record] } as never;
+    const port = new CanonicalRecordQueryDataPort(snapshot);
+    const handle = stageSetHandle("execution-boundary", "find", "subjects", [subj({ subject_type: "record", record_id: "bound-record" }, "bound")]);
+    const evaluation = await port.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "stage_output", stage_id: "find", output: "subjects" } }, scope: scope("workspace:handle-boundary"), input_handles: new Map([["find.subjects", handle]]) });
+    expect(evaluation.streams["references"]).toEqual([]);
+  });
+});
+
+describe("pipeline final-manifest and continuation invariants", () => {
+  it("streams the final pipeline handle into the manifest and preserves non-complete coverage on continuation", async () => {
+    const engine = engineFor({
+      "core:search_text": () => ({ streams: { subjects: [subj({ subject_type: "record", record_id: "r1" }, "1"), subj({ subject_type: "record", record_id: "r2" }, "2")] } }),
+    });
+    const request = pipelineQuery([
+      { stage_id: "search", operator: "source.operation", inputs: [], arguments: { operation: "core:search_text", operation_arguments: { pattern: "x" } } },
+    ], [{ stage_id: "search", output: "subjects" }]);
+    const page = await engine.execute({ ...request, options: { ...request.options, response_budget: { max_items: 1, max_characters: 10_000 } } });
+    expect(page.completeness.overall_status).toBe("unknown");
+    expect(page.streams["subjects"]?.items).toHaveLength(1);
+    const cursor = page.streams["subjects"]?.next_cursor;
+    expect(cursor).toBeDefined();
+    const continuation = await engine.continue({ cursor: cursor!, response_budget: { max_items: 1, max_characters: 10_000 } });
+    expect(continuation.completeness.overall_status).toBe("unknown");
+    expect(continuation.streams["subjects"]?.items[0]?.stable_sort_key).toBe("2");
+  });
 });
 
 describe("pipeline MCP instruction examples verified against a real workspace", () => {
   function pipelineRequest(workspaceId: string, expression: unknown): QueryRequest {
     return {
-      api_version: 1,
+      api_version: 3,
       scope: scope(workspaceId),
       expression: expression as QueryExpression,
       options: { ...options, diagnostics: { diagnostics: "relevant", diagnostic_detail: true }, registry: { registry: "used", include_payload_schemas: false } },

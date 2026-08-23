@@ -1,4 +1,4 @@
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { digestLogicalValue, digestCanonicalMapWithArrayField } from "@urdira/canonical";
 import type {
   ArtifactChange,
   CandidateArtifactTombstoneTemplate,
@@ -121,7 +121,7 @@ export interface SourceCandidatePlan {
 }
 
 function stableId(kind: string, value: unknown): string {
-  return `${kind}:${digestBytes(canonicalBytes(value)).slice("sha256:".length)}`;
+  return `${kind}:${digestLogicalValue(value).slice("sha256:".length)}`;
 }
 
 function scopeContainsUri(scope: SourceCandidateCoverageScope, uri: string): boolean {
@@ -221,7 +221,11 @@ export class SourceCandidatePlanner {
     const equivalent = usable && complete && transitions.length === 0;
     const verificationStatus = equivalent ? "equivalent" : usable && transitions.length > 0 ? "changes_pending" : "degraded";
     const providerWatermarks = { ...base.provider_watermarks, ...(usable ? { [observations.source_provider_binding_id]: observations.watermark } : {}) };
-    const nextSourceStateDigest = transitions.length === 0 ? base.source_state_digest : digestBytes(canonicalBytes({ base: base.source_state_digest, transitions }));
+    // Keep the exact canonical map digest, but stream the large transitions
+    // array one element at a time. A full reconciliation of a large repository
+    // can exceed the canonical encoder's aggregate 16 MiB safety bound even
+    // though every individual transition is valid.
+    const nextSourceStateDigest = transitions.length === 0 ? base.source_state_digest : digestCanonicalMapWithArrayField({ base: base.source_state_digest }, "transitions", transitions);
     const checkpointPayload = {
       workspace_id: observations.workspace_id,
       source_state_digest: nextSourceStateDigest,
@@ -233,7 +237,7 @@ export class SourceCandidatePlanner {
     const nextFreshnessCheckpoint = {
       freshness_checkpoint_id: stableId("freshness-checkpoint", { ...checkpointPayload, batch_id: observations.observation_batch_id }),
       ...checkpointPayload,
-      checkpoint_digest: digestBytes(canonicalBytes(checkpointPayload)),
+      checkpoint_digest: digestLogicalValue(checkpointPayload),
     } as unknown as WorkspaceFreshnessCheckpoint;
     return { transitions, seeds, equivalent, next_freshness_checkpoint: nextFreshnessCheckpoint };
   }

@@ -77,7 +77,10 @@ describe("symbol selectors, get_outline containers, and inbound expand_relations
 
   it("multi-hop inbound core:expand_relations honors max_depth and populates paths when path_policy is set", async () => {
     const resolved = await workspace.engine.execute(taskPlannerQuery(workspace.workspaceId, "core:resolve_symbol", { reference: "findById" }));
-    const declaration = resolved.streams["declarations"]?.items.find((entry) => (entry.value as { body?: { name?: string } }).body?.name === "findById")?.value as { entity_id: string } | undefined;
+    const declaration = resolved.streams["declarations"]?.items.find((entry) => {
+      const value = entry.value as { body?: { name?: string; path?: string } };
+      return value.body?.name === "findById" && value.body.path === "src/repository/task-repository.ts";
+    })?.value as { entity_id: string } | undefined;
     expect(declaration).toBeDefined();
     const expanded = await workspace.engine.execute(taskPlannerQuery(workspace.workspaceId, "core:expand_relations", {
       subjects: [{ subject_type: "entity", entity_id: declaration!.entity_id }],

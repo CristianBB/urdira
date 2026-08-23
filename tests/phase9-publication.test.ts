@@ -7,6 +7,7 @@ import {
   createDurableStorage,
   createFaultInjector,
   canonicalFrozenCandidateBaseTuple,
+  digestRelationalValue,
   frozenCandidateBaseTupleDigest,
   normalizeObservationBatchIds,
   projectionSetDigestEntries,
@@ -18,7 +19,7 @@ import {
   type SqliteValue,
   type WorkspaceDatabase,
 } from "../packages/storage/src/index.js";
-import { buildCandidatePublicationPlan, buildForkPublicationPlan, buildManifestDescriptors, buildPublicationPlan, buildPublicationTransactionCommands, checkedPublicationCommand, computeSnapshotDigestFields, jsonArray, manifestRow, publicationFaultCommand, rowMatches, sameBytes, snapshotDigest, sqliteValue, toBytes, translateCompatibilityPublication, type ProjectionSetDigestCorpusEntry, type RecordSetDigestCorpusEntry } from "../packages/storage/src/publication-authority.js";
+import { buildCandidatePublicationPlan, buildForkPublicationPlan, buildManifestDescriptors, buildPublicationPlan, buildPublicationTransactionCommands, checkedPublicationCommand, computeSnapshotDigestFields, digestSortedRecordSet, jsonArray, logicalRecordSetDigest, manifestRow, publicationFaultCommand, publicationTransactionCommands, rowMatches, sameBytes, snapshotDigest, sqliteValue, toBytes, translateCompatibilityPublication, type ProjectionSetDigestCorpusEntry, type RecordSetDigestCorpusEntry } from "../packages/storage/src/publication-authority.js";
 import { compactPublicationPhase } from "../packages/storage/src/publication-compaction.js";
 
 const workspace = {
@@ -47,6 +48,39 @@ it("bounds compacted publication INSERT parameters below SQLite's variable limit
   expect(runs.every((command) => (command.params?.length ?? 0) <= 30_000)).toBe(true);
 });
 
+it("streams large canonical and projection phases without changing phase order", () => {
+  const run = (label: string) => ({ kind: "run" as const, sql: label });
+  const phases = buildPublicationPlan({
+    mode: "candidate",
+    phases: {
+      candidateState: () => [run("candidate")],
+      targetControls: () => [run("target")],
+      source: () => [run("source")],
+      canonical: () => [],
+      canonicalStream: function* () { yield run("canonical-1"); yield run("canonical-2"); },
+      projections: () => [],
+      projectionsStream: function* () { yield run("projection-1"); },
+      manifest: () => [run("manifest")],
+      snapshot: () => [run("snapshot")],
+      journal: () => [run("journal")],
+      candidateFinalization: () => [run("final")],
+      current: () => [run("current")],
+    },
+  });
+  expect(phases.canonical).toEqual([]);
+  expect(phases.projections).toEqual([]);
+  const materialized = buildPublicationTransactionCommands(phases).map((command) => (command as { sql: string }).sql);
+  const streamed = Array.from(publicationTransactionCommands(phases), (command) => (command as { sql: string }).sql);
+  expect(streamed).toEqual(materialized);
+  expect(streamed).toEqual(["candidate", "target", "source", "canonical-1", "canonical-2", "projection-1", "manifest", "snapshot", "journal", "final", "current"]);
+});
+
+it("rejects duplicate, out-of-order, and count-divergent streaming record-set inputs", () => {
+  const row = (recordId: string) => ({ record_id: recordId, record_digest: digest(recordId) });
+  expect(() => logicalRecordSetDigest([row("record:b"), row("record:a"), row("record:a")])).toThrowError(expect.objectContaining({ code: "storage:publication_invalid" }));
+  expect(() => digestSortedRecordSet([row("record:a")], 2)).toThrowError(expect.objectContaining({ code: "storage:publication_invalid" }));
+});
+
 type CandidateRepositoryShape = {
   acceptDelta(value: Record<string, unknown>): Promise<{ status: string }>;
 };
@@ -55,7 +89,24 @@ type CandidateRepositoryShape = {
 // `CandidateMaterialization`'s template-set fields carry a small, bounded
 // `OrderedSetDescriptor` (descriptor-as-text), not the template array itself.
 function orderedSetDescriptorJson(elementType: string, entries: readonly unknown[]): string {
-  const contentDigest = digestCanonicalArray(entries);
+  const canonicalDigest = (value: unknown): string => digestBytes(canonicalBytes(value));
+  const logicalEntries = entries.map((entry) => {
+    if (!Array.isArray(entry) || entry[0] !== "urdira:created-identity:v1" || entry.length !== 7) return entry;
+    const [, workspaceId, identityType, identityKey, recordId, ownerArtifactId, ownerArtifactVersionId] = entry as readonly string[];
+    return {
+      identity_assignment_id: canonicalDigest({ record_id: recordId, identity_key: identityKey }),
+      workspace_id: workspaceId,
+      identity_type: identityType,
+      identity_id: `${identityType}:${canonicalDigest({ identity_key: identityKey }).slice("sha256:".length)}`,
+      assignment_kind: "created",
+      identity_key: identityKey,
+      identity_key_digest: canonicalDigest(identityKey),
+      record_id: recordId,
+      owner_artifact_id: ownerArtifactId,
+      owner_artifact_version_id: ownerArtifactVersionId,
+    };
+  });
+  const contentDigest = digestCanonicalArray(logicalEntries);
   return JSON.stringify({
     descriptor_id: `set:${contentDigest.slice("sha256:".length)}`,
     element_type: elementType,
@@ -244,10 +295,13 @@ it("builds fork snapshots both with and without optional v2 stage and capability
 
   const withoutOptionals = buildForkPublicationPlan(base as never);
   const withoutSnapshotRun = withoutOptionals.snapshot.find((command) => command.kind === "run");
-  const withoutSnapshot = decodeCanonical(withoutSnapshotRun?.params?.at(-1) as Uint8Array) as Record<string, unknown>;
-  expect(withoutSnapshot).not.toHaveProperty("source_snapshot_id");
-  expect(withoutSnapshot).not.toHaveProperty("publication_stage_id");
-  expect(withoutSnapshot["capability_state_digest"]).toBe(digestCanonicalArray([]));
+  const withoutSnapshotParams = withoutSnapshotRun?.params as readonly unknown[];
+  expect(withoutSnapshotParams[8]).toBeNull();
+  expect(withoutSnapshotParams[9]).toBeNull();
+  expect(withoutSnapshotParams[10]).toBeNull();
+  expect(withoutSnapshotParams[11]).toBeNull();
+  expect(withoutSnapshotParams[12]).toBeNull();
+  expect(withoutSnapshotParams[16]).toBe(digestCanonicalArray([]));
 
   const capabilityStateEntries = [{ capability_id: "capability:fork-plan", availability: "available" }];
   const withOptionals = buildForkPublicationPlan({
@@ -260,14 +314,12 @@ it("builds fork snapshots both with and without optional v2 stage and capability
     capabilityStateEntries,
   } as never);
   const withSnapshotRun = withOptionals.snapshot.find((command) => command.kind === "run");
-  const withSnapshot = decodeCanonical(withSnapshotRun?.params?.at(-1) as Uint8Array) as Record<string, unknown>;
-  expect(withSnapshot).toMatchObject({
-    source_snapshot_id: "source-snapshot:fork-plan",
-    snapshot_contract_version: 2,
-    publication_stage_id: "jsts:structural_stage_1",
-    publication_stage_ordinal: 1,
-    publication_stage_count: 3,
-  });
+  const withSnapshotParams = withSnapshotRun?.params as readonly unknown[];
+  expect(withSnapshotParams[8]).toBe("source-snapshot:fork-plan");
+  expect(withSnapshotParams[9]).toBe(2);
+  expect(withSnapshotParams[10]).toBe("jsts:structural_stage_1");
+  expect(withSnapshotParams[11]).toBe(1);
+  expect(withSnapshotParams[12]).toBe(3);
   expect(withOptionals.targetControls.length).toBeGreaterThan(withoutOptionals.targetControls.length);
 });
 
@@ -511,7 +563,7 @@ describe("Phase 9 durable candidate publication", () => {
     expect(() => jsonArray("{")).toThrowError(/template set/);
   });
 
-  it("rejects a non-binary authoritative payload while validating the publication plan", async () => {
+  it("accepts typed registry authority without a serialized payload", async () => {
     await withWorkspace(async (opened) => {
       const input = publication("candidate-authority-invalid-row", "authority-invalid-row", initialBase);
       await opened.candidates.insert(input.candidate, input.frozen_base);
@@ -525,7 +577,6 @@ describe("Phase 9 durable candidate publication", () => {
             core_registry_digest: input.target_registry.core_registry_digest,
             resolution_lock_id: input.target_resolution_lock.resolution_lock_id,
             registry_digest: input.target_registry.registry_digest,
-            registry_payload: "not-binary",
           } as unknown as T;
           return row;
         },
@@ -539,7 +590,7 @@ describe("Phase 9 durable candidate publication", () => {
         faults: createFaultInjector([]),
         generation: 1,
         publishedAt: now,
-      })).rejects.toMatchObject({ code: "storage:publication_conflict" });
+      })).resolves.toBeDefined();
     });
   });
 
@@ -679,11 +730,11 @@ describe("Phase 9 durable candidate publication", () => {
         valid_from_generation: 1,
         valid_to_generation: 3,
         record_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        payload_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        payload_byte_length: 0,
-        payload_inline: new Uint8Array(),
-        payload_cas_digest: null,
-        record_payload: new Uint8Array(),
+        body_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        body_byte_length: 0,
+        analysis_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        analysis_configuration_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        artifact_dependency_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       }] as T[] : [] as T[]),
     };
     await expect(buildCandidatePublicationPlan({
@@ -781,7 +832,6 @@ describe("Phase 9 durable candidate publication", () => {
       valid_from_generation: 1,
       valid_to_generation: null,
       content_digest: digestBytes(canonicalBytes(projection)),
-      projection_payload: encodeCanonical(projection.payload),
     };
     const run = async (dependencyRow: Record<string, unknown> | undefined) => {
       // The authority builder batches both the top-level projection existence
@@ -974,42 +1024,49 @@ describe("Phase 9 durable candidate publication", () => {
     });
   });
 
-  // Regression test for a confirmed real-world bug: `CandidateMaterializer.seal()`
-  // (`packages/engine/src/candidate-materialization.ts`) used to embed every newly
-  // opened record's full body directly inside `CandidateMaterialization.record_open_template_set`,
-  // one aggregate Text field holding every record of the *whole candidate*, which crashed
-  // full-repo indexing. Phase 2 replaces that with a small `OrderedSetDescriptor` (see
-  // `packages/engine/src/candidate-materialization.ts`'s `orderedSetDescriptor`) and
-  // carries the real array out-of-band: `WorkspaceCandidateRepository.saveMaterialization`
-  // (`packages/storage/src/candidates.ts`) now chunks it into bounded CAS-backed
-  // segments (`candidate_template_segments`) instead of inlining it into the
-  // materialization blob. This synthesizes a `record_opens` array whose aggregate text
-  // (10,000,000+ characters across several records, each individually bounded) is exactly
-  // the kind of aggregate that used to overflow a single canonical-encoding call, and
-  // proves the segmented persist + `readTemplateSet` round trip is lossless.
-  it("persists a large record-open template set as CAS-backed segments and reads it back losslessly", async () => {
+  it("persists only the bounded materialization descriptor, not a generic template copy", async () => {
     await withWorkspace(async (opened) => {
-      const input = publication("candidate-materialization-large-text", "materialization-large-text", initialBase);
-      const bigBody = "x".repeat(500_000);
-      const recordOpens = Array.from({ length: 20 }, (_, index) => ({ record_without_validity: JSON.stringify({ owner_artifact_id: "artifact-large-text", owner_artifact_version_id: "version-large-text", body: { index, text: bigBody } }), open_reason_code: "core:record_created", cause_references: [] }));
+      const input = publication("candidate-materialization-descriptor-only", "materialization-descriptor-only", initialBase);
+      const recordOpens = [{ record_without_validity: JSON.stringify({ owner_artifact_id: "artifact-descriptor-only", owner_artifact_version_id: "version-descriptor-only", body: { value: "kept out-of-band" } }), open_reason_code: "core:record_created", cause_references: [] }];
       const templateSets: CandidateTemplateSets = { ...emptyTemplateSets, record_opens: recordOpens };
       const materialization = { ...input.materialization, record_open_template_set: orderedSetDescriptorJson("core:CandidateRecordOpenTemplate", recordOpens) };
       await opened.candidates.insert(input.candidate, input.frozen_base);
       await expect(opened.candidates.saveMaterialization(input.candidate.candidate_generation_id, materialization as never, templateSets)).resolves.toBe("inserted");
       await expect(opened.candidates.getMaterialization(input.candidate.candidate_generation_id)).resolves.toMatchObject({ record_open_template_set: materialization.record_open_template_set });
-      const roundTripped = await opened.candidates.readTemplateSet(materialization["candidate_materialization_id"] as string, "record_opens");
-      expect(roundTripped).toEqual(recordOpens);
-      const segmentCount = await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM candidate_template_segments WHERE candidate_materialization_id = ? AND set_kind = 'record_opens'", [materialization["candidate_materialization_id"]]);
-      expect(segmentCount?.count).toBeGreaterThan(1); // Exercises the batched `putMany` persist path (Fix B) over more than one segment, not just a single-segment shortcut.
-      // Re-saving is idempotent (regression for the batched `cas.putMany`
-      // persist path replacing the old per-segment serial `cas.put` loop):
-      // the second call must still return "already_present", write no
-      // duplicate rows, and leave every row's bytes untouched.
       await expect(opened.candidates.saveMaterialization(input.candidate.candidate_generation_id, materialization as never, templateSets)).resolves.toBe("already_present");
-      const segmentCountAfterReplay = await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM candidate_template_segments WHERE candidate_materialization_id = ? AND set_kind = 'record_opens'", [materialization["candidate_materialization_id"]]);
-      expect(segmentCountAfterReplay?.count).toBe(segmentCount?.count);
-      const roundTrippedAfterReplay = await opened.candidates.readTemplateSet(materialization["candidate_materialization_id"] as string, "record_opens");
-      expect(roundTrippedAfterReplay).toEqual(recordOpens);
+      expect(await opened.database.get<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'candidate_staged_template_rows'")).toBeUndefined();
+    });
+  });
+
+  it("releases confirmed columnar FactDelta staging incrementally after the visible publication commit", async () => {
+    await withWorkspace(async (opened) => {
+      const input = publication("candidate-release-staging", "release-staging", initialBase);
+      await opened.candidates.insert(input.candidate, input.frozen_base);
+      await opened.candidates.acceptDelta({ fact_delta_id: "delta-release-staging", workspace_id: workspace.workspace_id, candidate_generation_id: input.candidate.candidate_generation_id, delta_digest: digest("delta-release-staging") });
+      await opened.database.run("INSERT INTO candidate_staged_records (fact_delta_key, row_ordinal, text_0) SELECT fact_delta_key, ?, ? FROM candidate_fact_delta_namespaces WHERE fact_delta_id = ?", [0, "transient", "delta-release-staging"]);
+      await opened.database.run("INSERT INTO candidate_fact_delta_batches (workspace_id, candidate_generation_id, fact_delta_id, sequence, byte_length, is_final, accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [workspace.workspace_id, input.candidate.candidate_generation_id, "delta-release-staging", 0, 9, 1, now]);
+
+      await expect(opened.publishCandidate(input)).resolves.toMatchObject({ status: "published" });
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const pending = await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ?", [workspace.workspace_id, input.candidate.candidate_generation_id]);
+        if (pending?.count === 0) break;
+        await new Promise((resolveCleanup) => setTimeout(resolveCleanup, 5));
+      }
+      expect(await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM candidate_staged_records")).toEqual({ count: 0 });
+      expect(await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ?", [workspace.workspace_id, input.candidate.candidate_generation_id])).toEqual({ count: 0 });
+    });
+  });
+
+  it("does not retain redundant unique indexes on v3 WITHOUT ROWID staging lanes", async () => {
+    await withWorkspace(async (opened) => {
+      const lanes = ["candidate_staged_graph_edges", "candidate_staged_identities", "candidate_staged_dependencies"];
+      for (const lane of lanes) {
+        const indexes = await opened.database.all<{ name: string }>(`PRAGMA index_list(${lane})`);
+        expect(indexes.some((index) => index.name === `${lane}_pk`)).toBe(false);
+        const columns = await opened.database.all<{ name: string }>(`PRAGMA table_info(${lane})`);
+        expect(columns.slice(0, 2).map((column) => column.name)).toEqual(["fact_delta_key", "row_ordinal"]);
+        expect(columns.some((column) => ["workspace_id", "candidate_generation_id", "fact_delta_id"].includes(column.name))).toBe(false);
+      }
     });
   });
 
@@ -1052,20 +1109,104 @@ describe("Phase 9 durable candidate publication", () => {
     expect(plan.canonical.some((command) => command.kind === "run" && command.sql.includes("record_occurrences"))).toBe(true);
   });
 
-  // Regression test for the record-open fusion (`buildRecordOpens` in
-  // `packages/storage/src/publication-authority.ts`): `memoizeRecordOpens`
-  // (id/digest over the whole parsed `record_without_validity`) and
-  // `recordOpenCommands` (the `record_occurrences` row, including a SECOND
-  // independent re-encode+re-hash of the body for `payload_digest`) used to
-  // be two separate passes. This recomputes every id/digest/row-byte field
-  // using the OLD formula's primitives directly (`JSON.parse` +
-  // `canonicalBytes`/`digestBytes`, exactly as `memoizeRecordOpens` and
-  // `recordOpenCommands` used to call them, inlined here rather than through
-  // the fused implementation) and asserts the fused pass's actual
-  // `record_occurrences` INSERT commands match byte-for-byte -- covering
-  // both a bare record entry and a `{record, previous_record_id}`-wrapped
-  // replacement entry (decision 11's two `record_without_validity` shapes).
-  it("computes record-open ids/digests/row bytes identical to the pre-fusion two-pass formula", async () => {
+  it("keeps a large record publication lazy while preserving its canonical command stream", async () => {
+    const input = publication("candidate-authority-streaming", "authority-streaming", initialBase);
+    const records = Array.from({ length: 2_050 }, (_, index) => {
+      const record_without_validity = JSON.stringify({ category: "fact", kind: "streaming", universal_kind: "streaming", schema_version: 1, body: { index } });
+      const record_digest_hint = digestBytes(canonicalBytes(JSON.parse(record_without_validity)));
+      return {
+        record_without_validity,
+        owner_artifact_id: "artifact-streaming",
+        owner_artifact_version_id: "version-streaming",
+        record_id_hint: `record:${record_digest_hint.slice("sha256:".length)}`,
+        record_digest_hint,
+      };
+    }).sort((left, right) => left.record_id_hint.localeCompare(right.record_id_hint));
+    const identities = Array.from({ length: 2_050 }, (_, index) => [
+      "urdira:created-identity:v1",
+      workspace.workspace_id,
+      "entity",
+      `key-streaming-${index}`,
+      records[index]!.record_id_hint,
+      "artifact-streaming",
+      "version-streaming",
+    ] as const);
+    const templatedInput = withTemplateSets(input, { record_opens: records, identity_assignments: identities });
+    const plan = await buildCandidatePublicationPlan({
+      input: templatedInput,
+      storedCandidate: input.candidate as never,
+      workspaceId: workspace.workspace_id,
+      database: { get: async () => undefined, all: async () => [] } as never,
+      faults: createFaultInjector([]),
+      generation: 1,
+      publishedAt: now,
+    });
+    expect(plan.canonical).toEqual([]);
+    expect(plan.canonicalStream).toBeDefined();
+    const streamed = Array.from(publicationTransactionCommands(plan));
+    const bulkIndexDrop = streamed.findIndex((command) => command.kind === "exec" && command.sql.includes("DROP INDEX IF EXISTS record_occurrences_visible_idx"));
+    const bulkIndexBuild = streamed.findIndex((command) => command.kind === "exec" && command.sql.includes("CREATE INDEX record_occurrences_visible_idx"));
+    const recordOccurrenceRuns = streamed.filter((command) => command.kind === "run" && command.sql.includes("record_occurrences"));
+    expect(recordOccurrenceRuns.length).toBe(Math.ceil(2_050 / 512));
+    expect(recordOccurrenceRuns.every((command) => command.kind === "run" && (command.params?.length ?? 0) <= 512 * 23)).toBe(true);
+    expect(recordOccurrenceRuns.reduce((total, command) => total + (command.kind === "run" ? command.params?.length ?? 0 : 0), 0)).toBe(2_050 * 23);
+    expect(streamed.some((command) => command.kind === "run" && command.sql.includes("record_value_nodes"))).toBe(false);
+    const identityRuns = streamed.filter((command) => command.kind === "run" && command.sql.includes("INSERT INTO identity_assignments"));
+    expect(identityRuns.length).toBe(Math.ceil(2_050 / 512));
+    expect(identityRuns.every((command) => command.kind === "run" && (command.params?.length ?? 0) <= 512 * 10)).toBe(true);
+    expect(identityRuns.reduce((total, command) => total + (command.kind === "run" ? command.params?.length ?? 0 : 0), 0)).toBe(2_050 * 10);
+    expect(identityRuns[0]?.kind === "run" ? identityRuns[0].params?.slice(0, 3) : []).toEqual([
+      digestBytes(canonicalBytes({ record_id: records[0]!.record_id_hint, identity_key: "key-streaming-0" })),
+      workspace.workspace_id,
+      "entity",
+    ]);
+    expect(plan.recordSetDigestCorpusCandidate).toBeUndefined();
+    expect(bulkIndexDrop).toBeGreaterThanOrEqual(0);
+    expect(bulkIndexDrop).toBeLessThan(streamed.findIndex((command) => command === recordOccurrenceRuns[0]));
+    expect(bulkIndexBuild).toBeGreaterThan(streamed.findIndex((command) => command === identityRuns.at(-1)));
+  });
+
+  it("bounds large projection occurrence batches without dropping dependent values", async () => {
+    const input = publication("candidate-authority-projection-streaming", "authority-projection-streaming", initialBase);
+    const projections = Array.from({ length: 2_050 }, (_, index) => ({
+      projection_record_id: `projection-streaming-${index}`,
+      projection_kind: "generic",
+      projection_key: `projection-streaming-${index}`,
+      owner_artifact_id: "artifact-streaming",
+      owner_artifact_version_id: "version-streaming",
+      source_artifact_version_ids: [],
+      source_record_ids: [],
+      source_projection_record_ids: [],
+      generator: "test",
+      generator_version: "1",
+      generator_configuration_digest: digest("projection-streaming-config"),
+      payload: { index },
+    }));
+    const templatedInput = { ...input, materialization: { ...input.materialization, projection_open_template_sets: [JSON.stringify(projections)] } } as unknown as CandidatePublicationInput;
+    const plan = await buildCandidatePublicationPlan({
+      input: templatedInput,
+      storedCandidate: input.candidate as never,
+      workspaceId: workspace.workspace_id,
+      database: { get: async () => undefined, all: async () => [] } as never,
+      faults: createFaultInjector([]),
+      generation: 1,
+      publishedAt: now,
+    });
+    expect(plan.projections).toEqual([]);
+    expect(plan.projectionsStream).toBeDefined();
+    const streamed = Array.from(publicationTransactionCommands(plan));
+    const projectionOccurrenceRuns = streamed.filter((command) => command.kind === "run" && command.sql.includes("projection_occurrences"));
+    expect(projectionOccurrenceRuns.length).toBe(Math.ceil(2_050 / 512));
+    expect(projectionOccurrenceRuns.every((command) => command.kind === "run" && (command.params?.length ?? 0) <= 512 * 14)).toBe(true);
+    expect(projectionOccurrenceRuns.reduce((total, command) => total + (command.kind === "run" ? command.params?.length ?? 0 : 0), 0)).toBe(2_050 * 14);
+    expect(streamed.some((command) => command.kind === "run" && command.sql.includes("projection_value_nodes"))).toBe(true);
+  });
+
+  // Regression test for record-open publication: record identity remains
+  // content-derived, while the body is represented by relational value rows
+  // and its digest is calculated from the logical value rather than a
+  // serialized payload.
+  it("computes record-open ids and logical body digests", async () => {
     const input = publication("candidate-record-open-fusion", "record-open-fusion", initialBase);
     const generation = 1;
     const bareRecord = { category: "fact", kind: "fusion-kind", universal_kind: "fusion-universal", schema_version: 1, primary_source_span: { artifact_version_id: "version-fusion-a", start_byte: "10", end_byte: "24", start_line: "4", end_line: "5" }, body: { text: "hello", n: 1 } };
@@ -1094,24 +1235,7 @@ describe("Phase 9 durable candidate publication", () => {
       const expectedRecordId = `record:${expectedRecordDigest.slice("sha256:".length)}`;
       const innerRecord = parsed["record"];
       const unwrapped = (innerRecord !== null && typeof innerRecord === "object" && !Array.isArray(innerRecord) ? innerRecord : parsed) as Record<string, unknown>;
-      const expectedBodyPayload = canonicalBytes(unwrapped["body"] ?? null);
-      // Old formula (`recordOpenCommands`): payload_digest was a SECOND,
-      // independent `canonicalSha256(record["body"] ?? null)` call, re-encoding
-      // the same body a second time rather than reusing `bodyPayload`.
-      const expectedPayloadDigest = digestBytes(canonicalBytes(unwrapped["body"] ?? null));
-      const expectedRecordPayload = canonicalBytes({
-        ...unwrapped,
-        record_id: expectedRecordId,
-        category: unwrapped["category"] ?? "fact",
-        kind: unwrapped["kind"] ?? "unknown",
-        universal_kind: unwrapped["universal_kind"] ?? "unknown",
-        schema_version: unwrapped["schema_version"] ?? 1,
-        valid_from_generation: generation,
-        producer_id: "candidate",
-        producer_version: "1",
-        record_digest: expectedRecordDigest,
-        payload: unwrapped["body"] ?? null,
-      });
+      const expectedLogicalBody = digestRelationalValue(unwrapped["body"] ?? null);
       const command = recordOccurrenceInserts.find((candidate) => candidate.params[0] === expectedRecordId);
       expect(command).toBeDefined();
       const params = command!.params;
@@ -1125,14 +1249,16 @@ describe("Phase 9 durable candidate publication", () => {
       expect(params[14]).toBe(expectedSpan?.["end_line"] ?? null); // primary_source_span_end_line
       expect(params[15]).toBe(generation); // valid_from_generation
       expect(params[16]).toBe(expectedRecordDigest); // record_digest
-      expect(params[17]).toBe(expectedPayloadDigest); // payload_digest
-      expect(params[18]).toBe(expectedBodyPayload.byteLength); // payload_byte_length
-      expect(new Uint8Array(params[19] as Uint8Array)).toEqual(expectedBodyPayload); // payload_inline
-      expect(new Uint8Array(params[20] as Uint8Array)).toEqual(expectedRecordPayload); // record_payload
+      expect(params[17]).toBe(expectedLogicalBody.digest); // logical body digest
+      expect(params[18]).toBe(expectedLogicalBody.byte_length); // logical body byte length
+      expect(decodeCanonical(params[19] as Uint8Array)).toEqual(unwrapped["body"] ?? null); // canonical body payload
+      expect(params[20]).toBe(expectedRecordDigest); // analysis_digest default
+      expect(params[21]).toBe(expectedRecordDigest); // analysis_configuration_digest default
+      expect(params[22]).toBe(expectedRecordDigest); // artifact_dependency_digest default
     }
   });
 
-  it.each(["metadata", "payload"] as const)("rejects a persisted materialization %s conflict", async (variant) => {
+  it.each(["metadata", "typed"] as const)("rejects a persisted materialization %s conflict", async (variant) => {
     await withWorkspace(async (opened) => {
       const input = publication(`candidate-materialization-conflict-${variant}`, `materialization-conflict-${variant}`, initialBase);
       await opened.candidates.insert(input.candidate, input.frozen_base);
@@ -1140,7 +1266,7 @@ describe("Phase 9 durable candidate publication", () => {
       if (variant === "metadata") {
         await expect(opened.publishCandidate({ ...input, materialization: { ...input.materialization, materialization_digest: digest("different-materialization") } } as CandidatePublicationInput)).rejects.toMatchObject({ code: "storage:publication_conflict" });
       } else {
-        await opened.database.run("UPDATE candidate_materializations SET materialization_payload = ? WHERE workspace_id = ? AND candidate_materialization_id = ?", [new Uint8Array([8]), workspace.workspace_id, input.materialization.candidate_materialization_id]);
+        await opened.database.run("UPDATE candidate_materializations SET materialization_contract_text = ? WHERE workspace_id = ? AND candidate_materialization_id = ?", ["{corrupted}", workspace.workspace_id, input.materialization.candidate_materialization_id]);
         await expect(opened.publishCandidate(input)).rejects.toMatchObject({ code: "storage:publication_conflict" });
       }
       expect(await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM snapshots"))?.toEqual({ count: 0 });
@@ -1148,9 +1274,9 @@ describe("Phase 9 durable candidate publication", () => {
   });
 
   it.each([
-    ["generation_manifests", "metadata"], ["generation_manifests", "payload"],
-    ["snapshots", "metadata"], ["snapshots", "payload"],
-    ["candidate_publication_journal", "metadata"], ["candidate_publication_journal", "payload"],
+    ["generation_manifests", "metadata"], ["generation_manifests", "typed"],
+    ["snapshots", "metadata"], ["snapshots", "typed"],
+    ["candidate_publication_journal", "metadata"], ["candidate_publication_journal", "typed"],
   ] as const)("maps a pre-existing %s %s mismatch to a typed publication conflict", async (table, variant) => {
     await withWorkspace(async (opened) => {
       const input = publication(`candidate-${table}-${variant}`, `${table}-${variant}`, initialBase);
@@ -1158,14 +1284,13 @@ describe("Phase 9 durable candidate publication", () => {
       const snapshotId = `snapshot:${candidateId}`;
       const manifestId = `generation-manifest:${candidateId}`;
       await opened.candidates.insert(input.candidate, input.frozen_base);
-      await opened.database.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [input.target_registry.registry_snapshot_id, workspace.workspace_id, input.target_registry.registry_contract_version, input.target_registry.core_registry_digest, input.target_resolution_lock.resolution_lock_id, input.target_registry.registry_digest, encodeCanonical(input.target_registry)]);
-      const payload = variant === "payload" ? new Uint8Array([9]) : new Uint8Array([1]);
+      await opened.database.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [input.target_registry.registry_snapshot_id, workspace.workspace_id, input.target_registry.registry_contract_version, input.target_registry.core_registry_digest, input.target_resolution_lock.resolution_lock_id, input.target_registry.registry_digest]);
       if (table === "generation_manifests") {
-        await opened.database.run("INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest, manifest_payload) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [manifestId, workspace.workspace_id, candidateId, variant === "metadata" ? 99 : 1, snapshotId, input.target_registry.registry_snapshot_id, input.publication_kind, now, "[]", "[]", "[]", "[]", "{}", "manifest-conflict", payload]);
+        await opened.database.run("INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [manifestId, workspace.workspace_id, candidateId, variant === "metadata" ? 99 : 1, snapshotId, input.target_registry.registry_snapshot_id, input.publication_kind, now, "[]", "[]", "[]", "[]", "{}", "manifest-conflict"]);
       } else if (table === "snapshots") {
-        await opened.database.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshotId, workspace.workspace_id, variant === "metadata" ? 99 : 1, manifestId, input.target_registry.registry_snapshot_id, input.target_resolution_lock.resolution_lock_id, input.target_configuration.configuration_revision_id, initialBase.source_state_digest, "{}", "records", "projections", "capabilities", now, "snapshot-conflict", payload]);
+        await opened.database.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [snapshotId, workspace.workspace_id, variant === "metadata" ? 99 : 1, manifestId, input.target_registry.registry_snapshot_id, input.target_resolution_lock.resolution_lock_id, input.target_configuration.configuration_revision_id, initialBase.source_state_digest, "{}", "records", "projections", "capabilities", now, "snapshot-conflict"]);
       } else {
-        await opened.database.run("INSERT INTO candidate_publication_journal (candidate_generation_id, workspace_id, status, snapshot_id, generation_manifest_id, generation, published_at, publication_digest, journal_payload) VALUES (?, ?, 'published', ?, ?, ?, ?, ?, ?)", [candidateId, workspace.workspace_id, snapshotId, manifestId, variant === "metadata" ? 99 : 1, now, "journal-conflict", payload]);
+        await opened.database.run("INSERT INTO candidate_publication_journal (candidate_generation_id, workspace_id, status, snapshot_id, generation_manifest_id, generation, published_at, publication_digest) VALUES (?, ?, 'published', ?, ?, ?, ?, ?)", [candidateId, workspace.workspace_id, snapshotId, manifestId, variant === "metadata" ? 99 : 1, now, "journal-conflict"]);
       }
       await expect(opened.publishCandidate(input)).rejects.toMatchObject({ code: "storage:publication_conflict" });
       expect(await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM snapshots"))?.toEqual({ count: table === "snapshots" ? 1 : 0 });
@@ -1193,18 +1318,18 @@ describe("Phase 9 durable candidate publication", () => {
         // same-digest, different-identity collision using the authoritative formula.
         const descriptors = buildManifestDescriptors([], [], [], [], [], []);
         if (kind === "materialization") {
-          await opened.database.run("INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_payload) VALUES (?, ?, NULL, ?, ?, ?)", ["materialization:different-id", workspace.workspace_id, input.materialization.materialization_digest, now, encodeCanonical(input.materialization)]);
+          await opened.database.run("INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_contract_text) VALUES (?, ?, NULL, ?, ?, ?)", ["materialization:different-id", workspace.workspace_id, input.materialization.materialization_digest, now, JSON.stringify(input.materialization)]);
         } else if (kind === "manifest") {
           // The digest payload must embed the *real* identity (`manifestId`/`snapshotId`/
           // generation 1) -- that is exactly what makes this a same-digest, *different*
           // stored-identity collision once the row is inserted under generation 99 and
           // `*:different-id` below.
           const manifest = manifestRow(manifestId, workspace.workspace_id, candidateId, 1, snapshotId, undefined, input.target_registry.registry_snapshot_id, input.publication_kind, "2026-08-10T00:00:00.000Z", descriptors);
-          await opened.database.run("INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest, manifest_payload) VALUES (?, ?, ?, 99, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["generation-manifest:different-id", workspace.workspace_id, candidateId, "snapshot:different-id", input.target_registry.registry_snapshot_id, input.publication_kind, now, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, manifest.manifest_digest, new Uint8Array([1])]);
+          await opened.database.run("INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest) VALUES (?, ?, ?, 99, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["generation-manifest:different-id", workspace.workspace_id, candidateId, "snapshot:different-id", input.target_registry.registry_snapshot_id, input.publication_kind, now, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, manifest.manifest_digest]);
         } else {
           const manifest = manifestRow("generation-manifest:different-id", workspace.workspace_id, candidateId, 1, "snapshot:different-id", undefined, input.target_registry.registry_snapshot_id, input.publication_kind, "2026-08-10T00:00:00.000Z", descriptors);
-          await opened.database.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [input.target_registry.registry_snapshot_id, workspace.workspace_id, input.target_registry.registry_contract_version, input.target_registry.core_registry_digest, input.target_resolution_lock.resolution_lock_id, input.target_registry.registry_digest, encodeCanonical(input.target_registry)]);
-          await opened.database.run("INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest, manifest_payload) VALUES (?, ?, ?, 99, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["generation-manifest:different-id", workspace.workspace_id, candidateId, "snapshot:different-id", input.target_registry.registry_snapshot_id, input.publication_kind, now, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, "manifest-for-snapshot-collision", new Uint8Array([1])]);
+          await opened.database.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [input.target_registry.registry_snapshot_id, workspace.workspace_id, input.target_registry.registry_contract_version, input.target_registry.core_registry_digest, input.target_resolution_lock.resolution_lock_id, input.target_registry.registry_digest]);
+          await opened.database.run("INSERT INTO generation_manifests (generation_manifest_id, workspace_id, candidate_generation_id, generation, snapshot_id, base_snapshot_id, registry_snapshot_id, publication_kind, published_at, artifact_change_set, record_open_set, record_closure_set, identity_assignment_set, projection_change_sets, manifest_digest) VALUES (?, ?, ?, 99, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["generation-manifest:different-id", workspace.workspace_id, candidateId, "snapshot:different-id", input.target_registry.registry_snapshot_id, input.publication_kind, now, manifest.artifact_change_set, manifest.record_open_set, manifest.record_closure_set, manifest.identity_assignment_set, manifest.projection_change_sets, "manifest-for-snapshot-collision"]);
           const sourceWatermarks = JSON.stringify({ watermarks: [], source_observation_batch_ids: [] });
           const snapshotDigests = await computeSnapshotDigestFields(opened.database, workspace.workspace_id, undefined, 1, [], []);
           const snapshotWithoutDigest = {
@@ -1223,7 +1348,7 @@ describe("Phase 9 durable candidate publication", () => {
             published_at: "2026-08-10T00:00:00.000Z",
             snapshot_digest: "",
           };
-          await opened.database.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest, snapshot_payload) VALUES (?, ?, 99, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["snapshot:different-id", workspace.workspace_id, "generation-manifest:different-id", input.target_registry.registry_snapshot_id, input.target_resolution_lock.resolution_lock_id, input.target_configuration.configuration_revision_id, initialBase.source_state_digest, sourceWatermarks, snapshotWithoutDigest.canonical_record_set_digest, snapshotWithoutDigest.projection_set_digests, snapshotWithoutDigest.capability_state_digest, snapshotWithoutDigest.published_at, snapshotDigest(snapshotWithoutDigest), new Uint8Array([1])]);
+          await opened.database.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, 99, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ["snapshot:different-id", workspace.workspace_id, "generation-manifest:different-id", input.target_registry.registry_snapshot_id, input.target_resolution_lock.resolution_lock_id, input.target_configuration.configuration_revision_id, initialBase.source_state_digest, sourceWatermarks, snapshotWithoutDigest.canonical_record_set_digest, snapshotWithoutDigest.projection_set_digests, snapshotWithoutDigest.capability_state_digest, snapshotWithoutDigest.published_at, snapshotDigest(snapshotWithoutDigest)]);
         }
 
         await expect(opened.publishCandidate(input)).rejects.toMatchObject({ code: "storage:publication_conflict" });
@@ -1262,11 +1387,11 @@ describe("Phase 9 durable candidate publication", () => {
         cause_references: [],
         lineage_evidence_record_ids: [],
       };
-      await expect(opened.database.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, artifact_kind, artifact_payload) VALUES (?, ?, ?, ?, ?)", ["artifact-delete", workspace.workspace_id, "file:///delete", "file", new Uint8Array([1])])).resolves.toBeDefined();
+      await expect(opened.database.run("INSERT INTO source_artifacts (artifact_id, workspace_id, normalized_uri, artifact_kind) VALUES (?, ?, ?, ?)", ["artifact-delete", workspace.workspace_id, "file:///delete", "file"])).resolves.toBeDefined();
       await opened.database.run("INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", ["blob-delete", "hash-delete", 0, "inline"]);
-      await opened.database.run("INSERT INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest, observation_batch_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)", ["batch-delete", workspace.workspace_id, "binding-delete", "test", "1", "test", "full", "[]", "complete", "authoritative", now, now, 1, 0, digest("batch-delete"), new Uint8Array([3])]);
-      await opened.database.run("INSERT INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash, observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at, observation_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)", ["observation-delete", "batch-delete", workspace.workspace_id, "artifact-delete", "binding-delete", "test", "1", "test", "full", "present", "hash-delete", "metadata-delete", now, now, new Uint8Array([4])]);
-      await opened.database.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation, artifact_version_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)", ["version-delete", workspace.workspace_id, "artifact-delete", "blob-delete", "hash-delete", 0, "utf8", null, "metadata-delete", "observation-delete", 0, new Uint8Array([2])]);
+      await opened.database.run("INSERT INTO source_observation_batches (observation_batch_id, workspace_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, coverage_scopes, coverage_completeness, deletion_authority, provider_cursor_before, provider_cursor_after, started_at, completed_at, observation_count, unavailable_count, batch_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)", ["batch-delete", workspace.workspace_id, "binding-delete", "test", "1", "test", "full", "[]", "complete", "authoritative", now, now, 1, 0, digest("batch-delete")]);
+      await opened.database.run("INSERT INTO source_observations (source_observation_id, observation_batch_id, workspace_id, artifact_id, source_provider_binding_id, source_provider, source_provider_version, ordering_domain, observation_mode, observed_state, observed_content_hash, observed_metadata_digest, provider_event_token, provider_sequence, observed_at, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)", ["observation-delete", "batch-delete", workspace.workspace_id, "artifact-delete", "binding-delete", "test", "1", "test", "full", "present", "hash-delete", "metadata-delete", now, now]);
+      await opened.database.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)", ["version-delete", workspace.workspace_id, "artifact-delete", "blob-delete", "hash-delete", 0, "utf8", null, "metadata-delete", "observation-delete", 0]);
       const templatedInput = withTemplateSets(input, { source_transitions: [{ artifact_change: change, target_artifact_tombstone_without_generation: tombstone }] }, { materialization_digest: digest("delete-materialization") });
       await expect(publishStoredCandidate(opened, templatedInput)).resolves.toMatchObject({ generation: 1 });
       const tombstoneCount = await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM artifact_tombstones WHERE artifact_tombstone_id = ?", ["tombstone-delete"]);
@@ -1278,7 +1403,7 @@ describe("Phase 9 durable candidate publication", () => {
     await withWorkspace(async (opened) => {
       const input = publication("candidate-authority-conflict", "authority-conflict", initialBase);
       await opened.candidates.insert(input.candidate, input.frozen_base);
-      await opened.database.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest, registry_payload) VALUES (?, ?, ?, ?, ?, ?, ?)", [input.target_registry.registry_snapshot_id, workspace.workspace_id, input.target_registry.registry_contract_version, input.target_registry.core_registry_digest, input.target_resolution_lock.resolution_lock_id, "different-digest", new Uint8Array([9])]);
+      await opened.database.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [input.target_registry.registry_snapshot_id, workspace.workspace_id, input.target_registry.registry_contract_version, input.target_registry.core_registry_digest, input.target_resolution_lock.resolution_lock_id, "different-digest"]);
       await expect(opened.publishCandidate(input)).rejects.toMatchObject({ code: "storage:publication_conflict" });
       expect(await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM snapshots"))?.toEqual({ count: 0 });
     });
@@ -1304,10 +1429,10 @@ describe("Phase 9 durable candidate publication", () => {
       const input = publication("candidate-immutable-dependencies", "immutable-dependencies", initialBase);
       await opened.candidates.insert(input.candidate, input.frozen_base);
       const capabilityKey = `capability_state:${input.candidate.candidate_generation_id}:${digestBytes(canonicalBytes({ capability_id: "capability:test" }))}`;
-      await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'capability_state', ?, ?, NULL, NULL, ?)", [capabilityKey, workspace.workspace_id, new Uint8Array([8]), workspace.workspace_id, now]);
+      await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'capability_state', ?, ?, NULL, NULL, ?)", [capabilityKey, workspace.workspace_id, JSON.stringify({ capability_id: "capability:test", state: "corrupted" }), workspace.workspace_id, now]);
       const materialization = { ...input.materialization, capability_state_entries: [{ capability_id: "capability:test" }], materialization_digest: digest("immutable-dependencies") };
       await expect(opened.publishCandidate({ ...input, materialization } as unknown as CandidatePublicationInput)).rejects.toMatchObject({ code: "storage:publication_conflict" });
-      expect(await opened.database.get<{ payload: Uint8Array }>("SELECT payload FROM control_plane_state WHERE state_key = ?", [capabilityKey])).toMatchObject({ payload: new Uint8Array([8]) });
+      expect(await opened.database.get<{ state_json: string }>("SELECT state_json FROM control_plane_state WHERE state_key = ?", [capabilityKey])).toMatchObject({ state_json: JSON.stringify({ capability_id: "capability:test", state: "corrupted" }) });
     });
   });
 
@@ -1317,7 +1442,7 @@ describe("Phase 9 durable candidate publication", () => {
       await opened.candidates.insert(input.candidate, input.frozen_base);
       const capability = { capability_id: "capability:reference", state: "complete" };
       const capabilityKey = `capability_state:${input.candidate.candidate_generation_id}:${digestBytes(canonicalBytes(capability))}`;
-      await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, payload, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'capability_state', ?, ?, 'tampered-snapshot', 'tampered-source', ?)", [capabilityKey, workspace.workspace_id, encodeCanonical(capability), workspace.workspace_id, now]);
+      await opened.database.run("INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'capability_state', ?, ?, 'tampered-snapshot', 'tampered-source', ?)", [capabilityKey, workspace.workspace_id, JSON.stringify(capability), workspace.workspace_id, now]);
       const materialization = { ...input.materialization, capability_state_entries: [capability], materialization_digest: digest("reference-conflict") };
       await expect(opened.publishCandidate({ ...input, materialization } as unknown as CandidatePublicationInput)).rejects.toMatchObject({ code: "storage:publication_conflict" });
     });
@@ -1479,38 +1604,7 @@ async function seedReconciliationOwner(opened: WorkspaceDatabase, workspaceId: s
   await opened.repositories.sourceCatalog.putArtifactVersion({ artifact_version_id: artifactVersionId, workspace_id: workspaceId, artifact_id: artifactId, content_blob_id: `blob-${artifactVersionId}`, content_hash: digest(`content-${artifactVersionId}`), byte_length: 0, encoding: "utf-8", analysis_metadata_digest: digest(`analysis-${artifactVersionId}`), created_from_observation_id: observationId, valid_from_generation: 1 } as never);
 }
 
-describe("Phase 2 template-set descriptors, segments, and verifyIntegrity reconciliation", () => {
-  it("rejects re-persisting a candidate template segment with different content at the same ordinal (immutability conflict)", async () => {
-    await withWorkspace(async (opened) => {
-      const input = publication("candidate-segment-immutable", "segment-immutable", initialBase);
-      await opened.candidates.insert(input.candidate, input.frozen_base);
-      const entries = [{ record_without_validity: JSON.stringify({ owner_artifact_id: "artifact-segment", owner_artifact_version_id: "version-segment", body: null }), open_reason_code: "core:record_created", cause_references: [] }];
-      const templateSets: CandidateTemplateSets = { ...emptyTemplateSets, record_opens: entries };
-      const materialization = { ...input.materialization, record_open_template_set: orderedSetDescriptorJson("core:CandidateRecordOpenTemplate", entries) };
-      await expect(opened.candidates.saveMaterialization(input.candidate.candidate_generation_id, materialization as never, templateSets)).resolves.toBe("inserted");
-      const conflictingEntries = [{ record_without_validity: JSON.stringify({ owner_artifact_id: "artifact-segment", owner_artifact_version_id: "version-segment", body: { changed: true } }), open_reason_code: "core:record_created", cause_references: [] }];
-      const conflictingTemplateSets: CandidateTemplateSets = { ...emptyTemplateSets, record_opens: conflictingEntries };
-      await expect(opened.candidates.saveMaterialization(input.candidate.candidate_generation_id, materialization as never, conflictingTemplateSets)).rejects.toMatchObject({ code: "storage:candidate_digest_conflict" });
-      // The original segment survives untouched.
-      await expect(opened.candidates.readTemplateSet(materialization["candidate_materialization_id"] as string, "record_opens")).resolves.toEqual(entries);
-    });
-  });
-
-  it("detects a tampered candidate template segment blob during verifyIntegrity", async () => {
-    await withWorkspace(async (opened) => {
-      const input = publication("candidate-segment-tamper", "segment-tamper", initialBase);
-      await opened.candidates.insert(input.candidate, input.frozen_base);
-      const entries = [{ record_without_validity: JSON.stringify({ owner_artifact_id: "artifact-tamper", owner_artifact_version_id: "version-tamper", body: null }), open_reason_code: "core:record_created", cause_references: [] }];
-      const templateSets: CandidateTemplateSets = { ...emptyTemplateSets, record_opens: entries };
-      const materialization = { ...input.materialization, record_open_template_set: orderedSetDescriptorJson("core:CandidateRecordOpenTemplate", entries) };
-      await opened.candidates.saveMaterialization(input.candidate.candidate_generation_id, materialization as never, templateSets);
-      expect((await opened.maintenance.verify()).ok).toBe(true);
-      await opened.database.run("UPDATE candidate_template_segments SET content_digest = ? WHERE candidate_materialization_id = ? AND set_kind = 'record_opens'", ["sha256:0000000000000000000000000000000000000000000000000000000000000000", materialization["candidate_materialization_id"]]);
-      const report = await opened.maintenance.verify();
-      expect(report.ok).toBe(false);
-      expect(report.failures).toEqual(expect.arrayContaining([expect.objectContaining({ component_id: expect.stringContaining("record_opens") })]));
-    });
-  });
+describe("Phase 2 template-set descriptors and verifyIntegrity reconciliation", () => {
 
   it("throws storage:template_set_mismatch when a supplied template array does not match its committed descriptor", async () => {
     const input = publication("candidate-template-set-mismatch", "template-set-mismatch", initialBase);
@@ -1590,15 +1684,7 @@ describe("Phase 2 template-set descriptors, segments, and verifyIntegrity reconc
     });
   });
 
-  // Decision 05 (content-derived record identity): record_payload no longer
-  // embeds workspace_id/owner_artifact_id/owner_artifact_version_id -- those
-  // are row columns only, sourced from the open template's own sibling
-  // fields. Publishes a real record end-to-end, decodes the persisted
-  // record_payload directly, and asserts it round-trips with the record's
-  // content plus occurrence-identity fields but none of the three removed
-  // ones, while verifyIntegrity still finds zero issues (proving the
-  // verifier's own recomputed occurrence-identity shape agrees).
-  it("persists record_payload without workspace_id or owner fields, and verifyIntegrity still passes", async () => {
+  it("persists the logical body in relational value rows and verifyIntegrity passes", async () => {
     await withWorkspace(async (opened) => {
       const draftInput = publication("candidate-payload-shape", "payload-shape", initialBase);
       const realSnapshotId = `snapshot:${draftInput.candidate.candidate_generation_id}`;
@@ -1635,18 +1721,15 @@ describe("Phase 2 template-set descriptors, segments, and verifyIntegrity reconc
         identity_assignments: [identity],
       });
       await expect(opened.publishCandidate(templatedInput)).resolves.toMatchObject({ status: "published", generation: 1 });
-      const row = await opened.database.get<{ workspace_id: string; owner_artifact_id: string; owner_artifact_version_id: string; record_payload: Uint8Array }>("SELECT workspace_id, owner_artifact_id, owner_artifact_version_id, record_payload FROM record_occurrences WHERE workspace_id = ? AND record_id = ?", [workspace.workspace_id, recordId]);
+      const row = await opened.database.get<{ workspace_id: string; owner_artifact_id: string; owner_artifact_version_id: string; body_digest: string; body_payload: Uint8Array }>("SELECT workspace_id, owner_artifact_id, owner_artifact_version_id, body_digest, body_payload FROM record_occurrences WHERE workspace_id = ? AND record_id = ?", [workspace.workspace_id, recordId]);
       expect(row).toBeDefined();
-      // The row columns are still fully populated...
       expect(row!.workspace_id).toBe(workspace.workspace_id);
       expect(row!.owner_artifact_id).toBe("artifact-payload-shape");
       expect(row!.owner_artifact_version_id).toBe("version-payload-shape");
-      // ...but the stored payload never carries them.
-      const decoded = decodeCanonical(row!.record_payload instanceof Uint8Array ? row!.record_payload : new Uint8Array(row!.record_payload)) as Record<string, unknown>;
-      expect(decoded).not.toHaveProperty("workspace_id");
-      expect(decoded).not.toHaveProperty("owner_artifact_id");
-      expect(decoded).not.toHaveProperty("owner_artifact_version_id");
-      expect(decoded).toMatchObject({ record_id: recordId, category: "entity", kind: "test:symbol", universal_kind: "definition", body: { name: "PayloadShape" }, payload: { name: "PayloadShape" } });
+      expect(decodeCanonical(row!.body_payload)).toEqual({ name: "PayloadShape" });
+      const valueRows = await opened.database.all("SELECT value_path FROM record_value_nodes WHERE workspace_id = ? AND record_id = ?", [workspace.workspace_id, recordId]);
+      expect(valueRows).toEqual([]);
+      expect(row!.body_digest).toBe(digestRelationalValue({ name: "PayloadShape" }).digest);
       const report = await opened.maintenance.verify();
       expect(report.failures).toEqual([]);
       expect(report.ok).toBe(true);

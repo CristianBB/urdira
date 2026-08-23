@@ -29,7 +29,7 @@ export interface LexicalThreadRun {
    * partial `{ ..., aborted: true }` result through the normal `result`
    * settlement path). If the worker does not respond within the grace
    * period below (e.g. it is wedged inside one document's own synchronous
-   * trigram computation), it is hard-terminated and `result` resolves with a
+   * normalization/FTS5 insertion), it is hard-terminated and `result` resolves with a
    * synthetic `{ aborted: true }` result instead of rejecting -- a
    * hard-terminate following an explicit abort request is an expected,
    * successful cancellation outcome, not a failure, so callers (`submitLexicalMaintenance`

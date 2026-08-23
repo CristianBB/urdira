@@ -12,10 +12,11 @@ CREATE TABLE IF NOT EXISTS installation_workspaces (
   workspace_id TEXT PRIMARY KEY,
   canonical_root TEXT NOT NULL,
   display_root TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('registered', 'removed')),
+  source_provider_bindings TEXT NOT NULL,
   database_path TEXT NOT NULL UNIQUE,
   registered_at TEXT NOT NULL,
-  removed_at TEXT,
-  workspace_payload BLOB NOT NULL
+  removed_at TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS installation_model_pack_installations (
   model_pack_installation_id TEXT PRIMARY KEY,
@@ -25,8 +26,7 @@ CREATE TABLE IF NOT EXISTS installation_model_pack_installations (
   manifest_digest TEXT NOT NULL,
   installed_at TEXT NOT NULL,
   removed_at TEXT,
-  removal_reason_code TEXT,
-  installation_payload BLOB NOT NULL
+  removal_reason_code TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS installation_cas_objects (
   content_hash TEXT PRIMARY KEY,
@@ -71,7 +71,6 @@ CREATE TABLE IF NOT EXISTS installation_gc_roots (
   root_id TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  root_payload BLOB NOT NULL,
   PRIMARY KEY (root_kind, root_id, content_hash)
 ) STRICT;
 `;
@@ -88,7 +87,6 @@ CREATE TABLE IF NOT EXISTS source_artifacts (
   normalized_path TEXT,
   display_path TEXT,
   artifact_kind TEXT NOT NULL,
-  artifact_payload BLOB NOT NULL,
   UNIQUE (workspace_id, artifact_id),
   UNIQUE (workspace_id, normalized_uri)
 ) STRICT;
@@ -119,7 +117,6 @@ CREATE TABLE IF NOT EXISTS source_observation_batches (
   observation_count INTEGER NOT NULL CHECK (observation_count >= 0),
   unavailable_count INTEGER NOT NULL CHECK (unavailable_count >= 0),
   batch_digest TEXT NOT NULL UNIQUE,
-  observation_batch_payload BLOB NOT NULL,
   UNIQUE (observation_batch_id, workspace_id)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS artifact_versions (
@@ -135,7 +132,6 @@ CREATE TABLE IF NOT EXISTS artifact_versions (
   created_from_observation_id TEXT NOT NULL,
   valid_from_generation INTEGER NOT NULL,
   valid_to_generation INTEGER,
-  artifact_version_payload BLOB NOT NULL,
   FOREIGN KEY (workspace_id, artifact_id) REFERENCES source_artifacts(workspace_id, artifact_id),
   FOREIGN KEY (workspace_id, artifact_id, created_from_observation_id) REFERENCES source_observations(workspace_id, artifact_id, source_observation_id),
   UNIQUE (workspace_id, artifact_version_id),
@@ -161,7 +157,6 @@ CREATE TABLE IF NOT EXISTS artifact_tombstones (
   replacement_artifact_version_id TEXT,
   cause_references TEXT NOT NULL,
   lineage_evidence_record_ids TEXT NOT NULL,
-  artifact_tombstone_payload BLOB NOT NULL,
   FOREIGN KEY (workspace_id, artifact_id) REFERENCES source_artifacts(workspace_id, artifact_id),
   FOREIGN KEY (workspace_id, artifact_id, last_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id),
   FOREIGN KEY (workspace_id, artifact_id, replacement_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id),
@@ -185,7 +180,6 @@ CREATE TABLE IF NOT EXISTS source_observations (
   provider_sequence TEXT,
   observed_at TEXT NOT NULL,
   received_at TEXT NOT NULL,
-  observation_payload BLOB NOT NULL,
   FOREIGN KEY (observation_batch_id) REFERENCES source_observation_batches(observation_batch_id),
   FOREIGN KEY (observation_batch_id, workspace_id) REFERENCES source_observation_batches(observation_batch_id, workspace_id),
   FOREIGN KEY (workspace_id, artifact_id) REFERENCES source_artifacts(workspace_id, artifact_id),
@@ -225,21 +219,35 @@ CREATE TABLE IF NOT EXISTS record_occurrences (
   -- and a live row that share record_digest with distinct, chain-salted
   -- record_ids -- see docs/decisions/11-content-derived-record-identity.md.
   record_digest TEXT NOT NULL,
-  payload_digest TEXT NOT NULL,
-  payload_byte_length INTEGER NOT NULL CHECK (payload_byte_length >= 0),
-  payload_inline BLOB,
-  payload_cas_digest TEXT,
-  record_payload BLOB NOT NULL,
-  CHECK ((payload_inline IS NOT NULL AND payload_cas_digest IS NULL) OR (payload_inline IS NULL AND payload_cas_digest IS NOT NULL)),
+  body_digest TEXT NOT NULL,
+  body_byte_length INTEGER NOT NULL CHECK (body_byte_length >= 0),
+  -- v3 stores the canonical body once. The former record_value_nodes
+  -- projection multiplied every small body into several wide rows and made
+  -- first publication of million-record workspaces both disk- and
+  -- write-amplification bound.
+  body_payload BLOB,
+  analysis_digest TEXT NOT NULL,
+  analysis_configuration_digest TEXT NOT NULL,
+  artifact_dependency_digest TEXT NOT NULL,
   FOREIGN KEY (workspace_id, owner_artifact_id) REFERENCES source_artifacts(workspace_id, artifact_id),
   FOREIGN KEY (workspace_id, owner_artifact_id, owner_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id),
   FOREIGN KEY (workspace_id, primary_source_span_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_version_id)
 ) STRICT;
-CREATE INDEX IF NOT EXISTS record_occurrences_owner_idx ON record_occurrences(owner_artifact_id, owner_artifact_version_id, valid_from_generation);
 CREATE INDEX IF NOT EXISTS record_occurrences_visible_idx ON record_occurrences(workspace_id, valid_from_generation, valid_to_generation);
+CREATE TABLE IF NOT EXISTS record_facets (
+  workspace_id TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  valid_from_generation INTEGER NOT NULL,
+  facet_ordinal INTEGER NOT NULL CHECK (facet_ordinal >= 0),
+  facet TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, record_id, valid_from_generation, facet_ordinal),
+  FOREIGN KEY (record_id) REFERENCES record_occurrences(record_id)
+) STRICT;
 -- Serves currentlyVisibleForOwners's owner-narrowed record read
--- (packages/storage/src/repositories.ts). record_occurrences_owner_idx above
--- cannot: it does not lead with workspace_id, so the planner prefers
+-- (packages/storage/src/repositories.ts). A non-workspace owner index
+-- cannot reliably win over the visibility index, so the sole owner access
+-- path leads with workspace_id and avoids maintaining two equivalent trees.
+-- Without this shape the planner prefers
 -- record_occurrences_visible_idx instead -- whose (workspace_id,
 -- valid_from_generation <= current) prefix matches essentially EVERY row of
 -- a mature workspace, degenerating into a full-workspace scan with a
@@ -250,7 +258,45 @@ CREATE INDEX IF NOT EXISTS record_occurrences_visible_idx ON record_occurrences(
 -- owner-scoped rows. Same lesson as identity_assignments_owner_idx below:
 -- every index on these tables must lead with workspace_id to be usable.
 CREATE INDEX IF NOT EXISTS record_occurrences_workspace_owner_idx ON record_occurrences(workspace_id, owner_artifact_id, valid_from_generation, valid_to_generation);
-CREATE INDEX IF NOT EXISTS record_occurrences_workspace_owner_kind_idx ON record_occurrences(workspace_id, owner_artifact_id, category, kind, valid_from_generation, valid_to_generation);
+-- v2 logical record values.  This table stores typed scalar columns and
+-- explicit container edges; it is not a serialized record payload.
+CREATE TABLE IF NOT EXISTS record_value_nodes (
+  workspace_id TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  valid_from_generation INTEGER NOT NULL,
+  value_path TEXT NOT NULL,
+  parent_path TEXT,
+  sequence_ordinal INTEGER,
+  map_key TEXT,
+  value_kind TEXT NOT NULL CHECK (value_kind IN ('null', 'boolean', 'integer', 'real', 'text', 'bytes', 'object', 'array')),
+  text_value TEXT,
+  integer_value INTEGER,
+  real_value REAL,
+  bool_value INTEGER,
+  bytes_value BLOB,
+  PRIMARY KEY (workspace_id, record_id, valid_from_generation, value_path),
+  FOREIGN KEY (record_id) REFERENCES record_occurrences(record_id)
+) STRICT, WITHOUT ROWID;
+-- The WITHOUT-ROWID primary key is the covering access path for every
+-- reconstruction query on workspace_id, record_id, valid_from_generation,
+-- and value_path.  No production query filters arbitrary values or traverses
+-- parent_path; the two former secondary indexes duplicated most of this
+-- table and made every FactDelta publish write hundreds of megabytes of
+-- redundant B-trees.  Keep the logical columns relational, but do not index
+-- columns that are not query predicates.
+DROP INDEX IF EXISTS record_value_nodes_record_idx;
+DROP INDEX IF EXISTS record_value_nodes_text_idx;
+CREATE TABLE IF NOT EXISTS set_merkle_nodes (
+  workspace_id TEXT NOT NULL,
+  set_kind TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  node_prefix TEXT NOT NULL,
+  node_digest TEXT NOT NULL,
+  member_digest TEXT,
+  logical_digest TEXT,
+  PRIMARY KEY (workspace_id, set_kind, generation, node_prefix)
+) STRICT;
+CREATE INDEX IF NOT EXISTS set_merkle_nodes_leaf_idx ON set_merkle_nodes(workspace_id, set_kind, generation, member_digest);
 CREATE TABLE IF NOT EXISTS registry_snapshots (
   registry_snapshot_id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
@@ -258,7 +304,6 @@ CREATE TABLE IF NOT EXISTS registry_snapshots (
   core_registry_digest TEXT NOT NULL,
   resolution_lock_id TEXT NOT NULL,
   registry_digest TEXT NOT NULL UNIQUE,
-  registry_payload BLOB NOT NULL,
   UNIQUE (workspace_id, registry_snapshot_id)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS registry_namespace_bindings (
@@ -285,13 +330,17 @@ CREATE TABLE IF NOT EXISTS snapshots (
   resolution_lock_id TEXT NOT NULL,
   configuration_revision_id TEXT NOT NULL,
   source_state_digest TEXT NOT NULL,
+  source_snapshot_id TEXT,
+  snapshot_contract_version INTEGER,
+  publication_stage_id TEXT,
+  publication_stage_ordinal INTEGER,
+  publication_stage_count INTEGER,
   source_observation_watermarks TEXT NOT NULL,
   canonical_record_set_digest TEXT NOT NULL,
   projection_set_digests TEXT NOT NULL,
   capability_state_digest TEXT NOT NULL,
   published_at TEXT NOT NULL,
   snapshot_digest TEXT NOT NULL UNIQUE,
-  snapshot_payload BLOB NOT NULL,
   UNIQUE (workspace_id, generation),
   UNIQUE (workspace_id, snapshot_id),
   FOREIGN KEY (workspace_id, parent_snapshot_id) REFERENCES snapshots(workspace_id, snapshot_id),
@@ -307,7 +356,6 @@ CREATE TABLE IF NOT EXISTS workspace_current_state (
   current_freshness_checkpoint_id TEXT NOT NULL,
   state_revision INTEGER NOT NULL,
   updated_at TEXT NOT NULL,
-  current_payload BLOB NOT NULL,
   FOREIGN KEY (workspace_id, current_snapshot_id) REFERENCES snapshots(workspace_id, snapshot_id),
   FOREIGN KEY (workspace_id, current_registry_snapshot_id) REFERENCES registry_snapshots(workspace_id, registry_snapshot_id)
 ) STRICT;
@@ -315,7 +363,7 @@ CREATE TABLE IF NOT EXISTS control_plane_state (
   state_key TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
   state_kind TEXT NOT NULL,
-  payload BLOB NOT NULL,
+  state_json TEXT NOT NULL,
   reference_workspace_id TEXT,
   reference_snapshot_id TEXT,
   reference_source_state_digest TEXT,
@@ -336,21 +384,14 @@ CREATE TABLE IF NOT EXISTS graph_edges (
   owner_artifact_version_id TEXT NOT NULL,
   valid_from_generation INTEGER NOT NULL,
   valid_to_generation INTEGER,
-  edge_payload BLOB NOT NULL,
-  -- digestBytes(edge_payload), computed once at write time by every writer
-  -- (WorkspaceProjectionRepository.putGraphEdge) instead of re-hashed by
-  -- every projectionSetDigestEntries("stored") scan. Nullable so a
-  -- pre-migration database can ALTER TABLE ... ADD COLUMN this in and
-  -- backfill lazily (ensureWorkspaceSchemaCompatibility); a NULL here is a
-  -- transient backfill state, never a legitimate steady-state value, and the
-  -- "stored" read path falls back to hashing edge_payload for any row that
-  -- still has one.
-  content_digest TEXT,
+  content_digest TEXT NOT NULL,
   PRIMARY KEY (workspace_id, edge_id, valid_from_generation),
   FOREIGN KEY (workspace_id, owner_artifact_id, owner_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS graph_edges_outbound_idx ON graph_edges(workspace_id, source_subject_id, valid_from_generation, edge_id);
 CREATE INDEX IF NOT EXISTS graph_edges_inbound_idx ON graph_edges(workspace_id, target_subject_id, valid_from_generation, edge_id);
+CREATE INDEX IF NOT EXISTS graph_edges_outbound_visible_idx ON graph_edges(workspace_id, source_subject_id, valid_from_generation, valid_to_generation, target_subject_id, relation_kind, edge_id);
+CREATE INDEX IF NOT EXISTS graph_edges_inbound_visible_idx ON graph_edges(workspace_id, target_subject_id, valid_from_generation, valid_to_generation, source_subject_id, relation_kind, edge_id);
 CREATE TABLE IF NOT EXISTS lexical_documents (
   artifact_id TEXT NOT NULL,
   workspace_id TEXT NOT NULL,
@@ -360,29 +401,30 @@ CREATE TABLE IF NOT EXISTS lexical_documents (
   storage_reference TEXT NOT NULL,
   valid_from_generation INTEGER NOT NULL,
   valid_to_generation INTEGER,
-  document_payload BLOB NOT NULL,
   PRIMARY KEY (workspace_id, artifact_id, artifact_version_id),
   FOREIGN KEY (workspace_id, artifact_id, artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id)
 ) STRICT;
--- lexical_terms (per-token positional index) is retired: no reader ever
--- queried it, and search_text runs entirely off lexical_trigrams. These two
--- statements shed the table/index from databases created before this
--- change; nothing below ever recreates them.
+-- FTS5 is the candidate generator for literal search. The trigram tokenizer
+-- keeps substring semantics while exact CAS verification below remains the
+-- authority for offsets and case sensitivity.
+CREATE VIRTUAL TABLE IF NOT EXISTS lexical_fts USING fts5(
+  workspace_id UNINDEXED,
+  artifact_id UNINDEXED,
+  artifact_version_id UNINDEXED,
+  content,
+  tokenize = 'trigram'
+);
+-- lexical_terms (per-token positional index) was retired before the v3 schema.
 DROP TABLE IF EXISTS lexical_terms;
 DROP INDEX IF EXISTS lexical_terms_lookup_idx;
-CREATE TABLE IF NOT EXISTS lexical_trigrams (
-  workspace_id TEXT NOT NULL,
-  trigram TEXT NOT NULL,
-  artifact_id TEXT NOT NULL,
-  artifact_version_id TEXT NOT NULL,
-  trigram_payload BLOB NOT NULL,
-  PRIMARY KEY (workspace_id, trigram, artifact_id, artifact_version_id)
-) STRICT;
-CREATE INDEX IF NOT EXISTS lexical_trigrams_lookup_idx ON lexical_trigrams(workspace_id, trigram, artifact_id);
+-- v3 is destructive: the legacy relational trigram projection and its index
+-- are removed rather than migrated. FTS5 is the sole lexical candidate index.
+DROP INDEX IF EXISTS lexical_trigrams_lookup_idx;
+DROP TABLE IF EXISTS lexical_trigrams;
 -- Marks the last generation for which the async post-ready lexical
--- maintenance job (documents + trigrams) fully caught up with
+-- maintenance job (documents + FTS5) fully caught up with
 -- artifact_versions. Query pushdown for core:search_text only trusts the
--- trigram index when completed_generation equals the workspace's current
+-- FTS5 index when completed_generation equals the workspace's current
 -- generation; otherwise it falls back to a corpus scan. One row per
 -- workspace, replaced wholesale on each successful reconcile pass.
 CREATE TABLE IF NOT EXISTS lexical_index_state (
@@ -442,14 +484,14 @@ CREATE TABLE IF NOT EXISTS artifact_dependencies (
   producer_version TEXT NOT NULL,
   valid_from_generation INTEGER NOT NULL,
   valid_to_generation INTEGER,
-  dependency_payload BLOB NOT NULL,
-  -- Same digestBytes(dependency_payload) precomputation as graph_edges.content_digest above; see that column's comment.
-  content_digest TEXT,
+  content_digest TEXT NOT NULL,
   PRIMARY KEY (workspace_id, dependency_entry_id, valid_from_generation),
   FOREIGN KEY (workspace_id, owner_artifact_id, owner_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id),
   FOREIGN KEY (workspace_id, dependency_artifact_id, dependency_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS artifact_dependencies_reverse_idx ON artifact_dependencies(workspace_id, dependency_artifact_id, dependency_artifact_version_id, valid_from_generation, dependency_entry_id);
+CREATE INDEX IF NOT EXISTS artifact_dependencies_direct_idx ON artifact_dependencies(workspace_id, record_id, valid_from_generation, valid_to_generation, dependency_artifact_id, dependency_artifact_version_id, dependency_role);
+CREATE INDEX IF NOT EXISTS artifact_dependencies_digest_scan_idx ON artifact_dependencies(workspace_id, valid_from_generation, valid_to_generation, dependency_entry_id, content_digest);
 CREATE TABLE IF NOT EXISTS metric_projections (
   metric_id TEXT NOT NULL,
   workspace_id TEXT NOT NULL,
@@ -460,9 +502,7 @@ CREATE TABLE IF NOT EXISTS metric_projections (
   owner_artifact_version_id TEXT NOT NULL,
   valid_from_generation INTEGER NOT NULL,
   valid_to_generation INTEGER,
-  metric_payload BLOB NOT NULL,
-  -- Same digestBytes(metric_payload) precomputation as graph_edges.content_digest above; see that column's comment.
-  content_digest TEXT,
+  content_digest TEXT NOT NULL,
   PRIMARY KEY (workspace_id, metric_id, valid_from_generation),
   FOREIGN KEY (workspace_id, owner_artifact_id, owner_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id)
 ) STRICT;
@@ -480,8 +520,7 @@ CREATE TABLE IF NOT EXISTS vector_shards (
   byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
   content_hash TEXT NOT NULL UNIQUE,
   storage_reference TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  shard_payload BLOB NOT NULL
+  created_at TEXT NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS vector_projection_rows (
   projection_record_id TEXT NOT NULL,
@@ -501,7 +540,6 @@ CREATE TABLE IF NOT EXISTS vector_projection_rows (
   distance_metric TEXT NOT NULL,
   valid_from_generation INTEGER NOT NULL,
   valid_to_generation INTEGER,
-  vector_payload BLOB NOT NULL,
   -- Decision 17 (entity-grain semantic documents): NULL/absent means
   -- "artifact" -- every legacy row, and every row this table has ever held
   -- before this column existed -- "entity" marks a row produced by the
@@ -516,6 +554,7 @@ CREATE TABLE IF NOT EXISTS vector_projection_rows (
   FOREIGN KEY (workspace_id, owner_artifact_id, owner_artifact_version_id) REFERENCES artifact_versions(workspace_id, artifact_id, artifact_version_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS vector_projection_lookup_idx ON vector_projection_rows(workspace_id, profile_id, executable_binding_id, projection_record_id);
+CREATE INDEX IF NOT EXISTS vector_projection_visible_idx ON vector_projection_rows(workspace_id, profile_id, executable_binding_id, valid_from_generation, valid_to_generation, projection_record_id);
 -- NOTE: vector_projection_document_ref_idx (the entity pass's stale-close
 -- join / entity-lane scan index over (workspace_id, document_grain,
 -- document_ref)) is deliberately NOT created here: initializeSchema runs
@@ -539,7 +578,6 @@ CREATE TABLE IF NOT EXISTS retention_leases (
   absolute_expires_at TEXT NOT NULL,
   released_at TEXT,
   release_reason TEXT,
-  lease_payload BLOB NOT NULL,
   UNIQUE (workspace_id, retention_lease_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS retention_leases_active_idx ON retention_leases(workspace_id, snapshot_id, released_at, absolute_expires_at);
@@ -553,7 +591,7 @@ CREATE TABLE IF NOT EXISTS retention_pins (
   expires_at TEXT NOT NULL,
   released_at TEXT,
   release_reason TEXT,
-  pin_payload BLOB NOT NULL,
+  source_reference_json TEXT NOT NULL,
   UNIQUE (workspace_id, retention_pin_id)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS snapshot_expiration_markers (
@@ -565,7 +603,6 @@ CREATE TABLE IF NOT EXISTS snapshot_expiration_markers (
   expiration_reason_code TEXT NOT NULL,
   garbage_collection_epoch_id TEXT NOT NULL,
   snapshot_digest TEXT NOT NULL,
-  marker_payload BLOB NOT NULL,
   UNIQUE (workspace_id, snapshot_id)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS lifecycle_cas_pins (
@@ -584,8 +621,7 @@ CREATE TABLE IF NOT EXISTS query_executions (
   retention_lease_ids TEXT NOT NULL,
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  execution_status TEXT NOT NULL,
-  execution_payload BLOB NOT NULL
+  execution_status TEXT NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS query_manifest_segments (
   query_execution_id TEXT NOT NULL REFERENCES query_executions(query_execution_id),
@@ -597,7 +633,7 @@ CREATE TABLE IF NOT EXISTS query_manifest_segments (
   content_digest TEXT NOT NULL,
   storage_reference TEXT NOT NULL,
   byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
-  segment_payload BLOB NOT NULL,
+  -- The durable segment lives in CAS; the table stores only its reference.
   PRIMARY KEY (query_execution_id, segment_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS query_manifest_segments_order_idx ON query_manifest_segments(query_execution_id, segment_ordinal);
@@ -610,7 +646,7 @@ CREATE TABLE IF NOT EXISTS storage_migrations (
   backup_path TEXT,
   started_at TEXT NOT NULL,
   completed_at TEXT,
-  migration_payload BLOB NOT NULL,
+  migration_state_json TEXT NOT NULL,
   shadow_database_path TEXT,
   shadow_database_digest TEXT
 ) STRICT;
@@ -620,7 +656,6 @@ CREATE TABLE IF NOT EXISTS lifecycle_roots (
   root_id TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  root_payload BLOB NOT NULL,
   PRIMARY KEY (workspace_id, root_kind, root_id, content_hash)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS backup_barriers (
@@ -628,8 +663,7 @@ CREATE TABLE IF NOT EXISTS backup_barriers (
   workspace_id TEXT NOT NULL,
   state TEXT NOT NULL,
   started_at TEXT NOT NULL,
-  completed_at TEXT,
-  backup_payload BLOB NOT NULL
+  completed_at TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS garbage_collection_epochs (
   garbage_collection_epoch_id TEXT PRIMARY KEY,
@@ -643,7 +677,9 @@ CREATE TABLE IF NOT EXISTS garbage_collection_epochs (
   candidate_object_count INTEGER NOT NULL,
   deleted_object_count INTEGER NOT NULL,
   failure_code TEXT,
-  epoch_payload BLOB NOT NULL
+  workspace_boundaries TEXT NOT NULL,
+  candidate_object_digest TEXT NOT NULL,
+  deleted_object_digest TEXT NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS garbage_collection_candidates (
   garbage_collection_epoch_id TEXT NOT NULL REFERENCES garbage_collection_epochs(garbage_collection_epoch_id),
@@ -677,7 +713,14 @@ CREATE TABLE IF NOT EXISTS candidate_state (
   stale_against_snapshot_id TEXT,
   failure_code TEXT,
   issue_ids TEXT NOT NULL,
-  candidate_payload BLOB NOT NULL,
+  frozen_snapshot_id TEXT,
+  frozen_generation INTEGER,
+  frozen_registry_snapshot_id TEXT,
+  frozen_resolution_lock_id TEXT,
+  frozen_configuration_revision_id TEXT,
+  frozen_source_state_digest TEXT,
+  frozen_source_observation_batch_ids TEXT,
+  frozen_tuple_digest TEXT,
   UNIQUE (workspace_id, candidate_generation_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS candidate_state_recovery_idx ON candidate_state(workspace_id, state, created_at, candidate_generation_id);
@@ -691,8 +734,10 @@ CREATE TABLE IF NOT EXISTS candidate_work_manifests (
   invalidation_plan_id TEXT NOT NULL,
   target_registry_snapshot_id TEXT NOT NULL,
   target_configuration_revision_id TEXT NOT NULL,
+  artifact_work_set TEXT NOT NULL,
+  projection_work_set TEXT NOT NULL,
+  created_at TEXT NOT NULL,
   work_digest TEXT NOT NULL,
-  work_manifest_payload BLOB NOT NULL,
   UNIQUE (workspace_id, work_digest),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
 ) STRICT;
@@ -703,36 +748,74 @@ CREATE TABLE IF NOT EXISTS candidate_fact_deltas (
   candidate_generation_id TEXT NOT NULL,
   delta_digest TEXT NOT NULL,
   accepted_at TEXT NOT NULL,
-  delta_payload BLOB NOT NULL,
   UNIQUE (workspace_id, candidate_generation_id, fact_delta_id),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS candidate_fact_deltas_recovery_idx ON candidate_fact_deltas(workspace_id, candidate_generation_id, accepted_at);
+CREATE TABLE IF NOT EXISTS candidate_fact_delta_namespaces (
+  fact_delta_key INTEGER PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  candidate_generation_id TEXT NOT NULL,
+  fact_delta_id TEXT NOT NULL,
+  UNIQUE (workspace_id, candidate_generation_id, fact_delta_id),
+  FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS candidate_fact_delta_batches (
+  workspace_id TEXT NOT NULL,
+  candidate_generation_id TEXT NOT NULL,
+  fact_delta_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK (sequence >= 0),
+  byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+  is_final INTEGER NOT NULL CHECK (is_final IN (0, 1)),
+  accepted_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, candidate_generation_id, fact_delta_id, sequence),
+  FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
+) STRICT, WITHOUT ROWID;
+-- v3 typed staging lanes. Each lane has the promoted scalar layout without a
+-- section discriminator. Keep the DDL explicit: CREATE TABLE AS SELECT would
+-- silently drop STRICT/WITHOUT ROWID and leave SQLite with dynamic affinity.
+CREATE TABLE IF NOT EXISTS candidate_staged_records (
+  fact_delta_key INTEGER NOT NULL, row_ordinal INTEGER NOT NULL,
+  text_0 TEXT, text_1 TEXT, text_2 TEXT, text_3 TEXT, text_4 TEXT, text_5 TEXT, text_6 TEXT, text_7 TEXT,
+  real_0 REAL, real_1 REAL, real_2 REAL, real_3 REAL,
+  integer_0 INTEGER, integer_1 INTEGER, integer_2 INTEGER, integer_3 INTEGER,
+  enum_0 INTEGER, enum_1 INTEGER, enum_2 INTEGER, enum_3 INTEGER,
+  presence_0 INTEGER, presence_1 INTEGER, presence_2 INTEGER, presence_3 INTEGER, presence_4 INTEGER, presence_5 INTEGER, presence_6 INTEGER, presence_7 INTEGER,
+  PRIMARY KEY (fact_delta_key, row_ordinal),
+  FOREIGN KEY (fact_delta_key) REFERENCES candidate_fact_delta_namespaces(fact_delta_key) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS candidate_staged_graph_edges (
+  fact_delta_key INTEGER NOT NULL, row_ordinal INTEGER NOT NULL,
+  text_0 TEXT, text_1 TEXT, text_2 TEXT, text_3 TEXT, text_4 TEXT, text_5 TEXT, text_6 TEXT, text_7 TEXT,
+  real_0 REAL, real_1 REAL, real_2 REAL, real_3 REAL, integer_0 INTEGER, integer_1 INTEGER, integer_2 INTEGER, integer_3 INTEGER,
+  enum_0 INTEGER, enum_1 INTEGER, enum_2 INTEGER, enum_3 INTEGER, presence_0 INTEGER, presence_1 INTEGER, presence_2 INTEGER, presence_3 INTEGER, presence_4 INTEGER, presence_5 INTEGER, presence_6 INTEGER, presence_7 INTEGER,
+  PRIMARY KEY (fact_delta_key, row_ordinal), FOREIGN KEY (fact_delta_key) REFERENCES candidate_fact_delta_namespaces(fact_delta_key) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS candidate_staged_identities (
+  fact_delta_key INTEGER NOT NULL, row_ordinal INTEGER NOT NULL,
+  text_0 TEXT, text_1 TEXT, text_2 TEXT, text_3 TEXT, text_4 TEXT, text_5 TEXT, text_6 TEXT, text_7 TEXT,
+  real_0 REAL, real_1 REAL, real_2 REAL, real_3 REAL, integer_0 INTEGER, integer_1 INTEGER, integer_2 INTEGER, integer_3 INTEGER,
+  enum_0 INTEGER, enum_1 INTEGER, enum_2 INTEGER, enum_3 INTEGER, presence_0 INTEGER, presence_1 INTEGER, presence_2 INTEGER, presence_3 INTEGER, presence_4 INTEGER, presence_5 INTEGER, presence_6 INTEGER, presence_7 INTEGER,
+  PRIMARY KEY (fact_delta_key, row_ordinal), FOREIGN KEY (fact_delta_key) REFERENCES candidate_fact_delta_namespaces(fact_delta_key) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS candidate_staged_dependencies (
+  fact_delta_key INTEGER NOT NULL, row_ordinal INTEGER NOT NULL,
+  text_0 TEXT, text_1 TEXT, text_2 TEXT, text_3 TEXT, text_4 TEXT, text_5 TEXT, text_6 TEXT, text_7 TEXT,
+  real_0 REAL, real_1 REAL, real_2 REAL, real_3 REAL, integer_0 INTEGER, integer_1 INTEGER, integer_2 INTEGER, integer_3 INTEGER,
+  enum_0 INTEGER, enum_1 INTEGER, enum_2 INTEGER, enum_3 INTEGER, presence_0 INTEGER, presence_1 INTEGER, presence_2 INTEGER, presence_3 INTEGER, presence_4 INTEGER, presence_5 INTEGER, presence_6 INTEGER, presence_7 INTEGER,
+  PRIMARY KEY (fact_delta_key, row_ordinal), FOREIGN KEY (fact_delta_key) REFERENCES candidate_fact_delta_namespaces(fact_delta_key) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS candidate_materializations (
   candidate_materialization_id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
   candidate_generation_id TEXT,
   materialization_digest TEXT NOT NULL,
   sealed_at TEXT NOT NULL,
-  materialization_payload BLOB NOT NULL,
+  materialization_contract_text TEXT NOT NULL,
   UNIQUE (workspace_id, materialization_digest),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS candidate_materializations_candidate_idx ON candidate_materializations(workspace_id, candidate_generation_id, sealed_at);
-CREATE TABLE IF NOT EXISTS candidate_template_segments (
-  workspace_id TEXT NOT NULL,
-  candidate_materialization_id TEXT NOT NULL,
-  set_kind TEXT NOT NULL,
-  segment_ordinal INTEGER NOT NULL,
-  entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
-  first_ordinal INTEGER NOT NULL,
-  last_ordinal INTEGER NOT NULL,
-  content_digest TEXT NOT NULL,
-  storage_reference TEXT NOT NULL,
-  byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
-  PRIMARY KEY (workspace_id, candidate_materialization_id, set_kind, segment_ordinal)
-) STRICT;
-CREATE INDEX IF NOT EXISTS candidate_template_segments_order_idx ON candidate_template_segments(workspace_id, candidate_materialization_id, set_kind, segment_ordinal);
 CREATE TABLE IF NOT EXISTS candidate_issues (
   candidate_issue_id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
@@ -741,11 +824,11 @@ CREATE TABLE IF NOT EXISTS candidate_issues (
   phase TEXT NOT NULL,
   severity TEXT NOT NULL,
   retryability TEXT NOT NULL,
-  scope_payload BLOB NOT NULL,
+  scope_json TEXT NOT NULL,
   summary TEXT NOT NULL,
   detail TEXT NOT NULL,
   cause_references TEXT NOT NULL,
-  payload BLOB NOT NULL,
+  issue_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   UNIQUE (workspace_id, candidate_generation_id, candidate_issue_id),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
@@ -767,7 +850,6 @@ CREATE TABLE IF NOT EXISTS candidate_lookup_dependencies (
   valid_from_generation INTEGER,
   valid_to_generation INTEGER,
   dependency_digest TEXT NOT NULL,
-  dependency_payload BLOB NOT NULL,
   UNIQUE (workspace_id, candidate_generation_id, lookup_dependency_id),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
 ) STRICT;
@@ -780,7 +862,6 @@ CREATE TABLE IF NOT EXISTS candidate_retention_leases (
   state TEXT NOT NULL,
   acquired_at TEXT NOT NULL,
   released_at TEXT,
-  lease_payload BLOB NOT NULL,
   UNIQUE (workspace_id, candidate_generation_id),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
 ) STRICT;
@@ -791,17 +872,31 @@ CREATE TABLE IF NOT EXISTS candidate_roots (
   resource_type TEXT NOT NULL,
   content_digest TEXT NOT NULL,
   state TEXT NOT NULL,
-  root_payload BLOB NOT NULL,
   UNIQUE (workspace_id, candidate_generation_id, resource_type, content_digest),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS candidate_value_nodes (
+  workspace_id TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  valid_from_generation INTEGER NOT NULL,
+  value_path TEXT NOT NULL,
+  parent_path TEXT,
+  sequence_ordinal INTEGER,
+  map_key TEXT,
+  value_kind TEXT NOT NULL CHECK (value_kind IN ('null', 'boolean', 'integer', 'real', 'text', 'bytes', 'object', 'array')),
+  text_value TEXT,
+  integer_value INTEGER,
+  real_value REAL,
+  bool_value INTEGER,
+  bytes_value BLOB,
+  PRIMARY KEY (workspace_id, record_id, valid_from_generation, value_path)
+) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS candidate_cleanup_markers (
   candidate_generation_id TEXT NOT NULL,
   resource_type TEXT NOT NULL,
   resource_id TEXT NOT NULL,
   state TEXT NOT NULL,
   marked_at TEXT NOT NULL,
-  marker_payload BLOB NOT NULL,
   PRIMARY KEY (candidate_generation_id, resource_type, resource_id),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
 ) STRICT;
@@ -815,7 +910,6 @@ CREATE TABLE IF NOT EXISTS candidate_publication_journal (
   generation INTEGER NOT NULL,
   published_at TEXT NOT NULL,
   publication_digest TEXT NOT NULL,
-  journal_payload BLOB NOT NULL,
   UNIQUE (workspace_id, snapshot_id),
   UNIQUE (workspace_id, generation),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
@@ -837,7 +931,6 @@ CREATE TABLE IF NOT EXISTS generation_manifests (
   identity_assignment_set TEXT NOT NULL,
   projection_change_sets TEXT NOT NULL,
   manifest_digest TEXT NOT NULL UNIQUE,
-  manifest_payload BLOB NOT NULL,
   UNIQUE (workspace_id, generation),
   UNIQUE (workspace_id, generation_manifest_id),
   FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
@@ -859,7 +952,6 @@ CREATE TABLE IF NOT EXISTS projection_occurrences (
   valid_from_generation INTEGER NOT NULL,
   valid_to_generation INTEGER,
   content_digest TEXT NOT NULL,
-  projection_payload BLOB NOT NULL,
   PRIMARY KEY (workspace_id, projection_record_id, valid_from_generation),
   UNIQUE (workspace_id, projection_key, valid_from_generation)
 ) STRICT;
@@ -872,11 +964,27 @@ CREATE TABLE IF NOT EXISTS projection_occurrence_dependencies (
   valid_from_generation INTEGER NOT NULL,
   source_type TEXT NOT NULL CHECK (source_type IN ('artifact_version', 'record', 'projection')),
   source_id TEXT NOT NULL,
-  dependency_payload BLOB NOT NULL,
   PRIMARY KEY (workspace_id, projection_record_id, valid_from_generation, source_type, source_id),
   FOREIGN KEY (workspace_id, projection_record_id, valid_from_generation) REFERENCES projection_occurrences(workspace_id, projection_record_id, valid_from_generation)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS projection_occurrence_dependencies_reverse_idx ON projection_occurrence_dependencies(workspace_id, source_type, source_id, valid_from_generation);
+CREATE TABLE IF NOT EXISTS projection_value_nodes (
+  workspace_id TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  valid_from_generation INTEGER NOT NULL,
+  value_path TEXT NOT NULL,
+  parent_path TEXT,
+  sequence_ordinal INTEGER,
+  map_key TEXT,
+  value_kind TEXT NOT NULL CHECK (value_kind IN ('null', 'boolean', 'integer', 'real', 'text', 'bytes', 'object', 'array')),
+  text_value TEXT,
+  integer_value INTEGER,
+  real_value REAL,
+  bool_value INTEGER,
+  bytes_value BLOB,
+  PRIMARY KEY (workspace_id, record_id, valid_from_generation, value_path)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS projection_value_nodes_parent_idx ON projection_value_nodes(workspace_id, record_id, valid_from_generation, parent_path, sequence_ordinal, map_key);
 CREATE TABLE IF NOT EXISTS identity_assignments (
   identity_assignment_id TEXT NOT NULL,
   workspace_id TEXT NOT NULL,
@@ -887,13 +995,14 @@ CREATE TABLE IF NOT EXISTS identity_assignments (
   identity_key_digest TEXT NOT NULL,
   record_id TEXT NOT NULL,
   previous_record_id TEXT,
-  owner_artifact_id TEXT NOT NULL,
-  owner_artifact_version_id TEXT NOT NULL,
+  -- Derived from the immutable record occurrence in v3. Nullable only so
+  -- direct low-level fixtures can still exercise historical row shapes;
+  -- production publication leaves both fields NULL and never indexes them.
+  owner_artifact_id TEXT,
+  owner_artifact_version_id TEXT,
   valid_from_generation INTEGER NOT NULL,
   valid_to_generation INTEGER,
-  assignment_payload BLOB NOT NULL,
-  PRIMARY KEY (workspace_id, identity_assignment_id, valid_from_generation),
-  UNIQUE (workspace_id, identity_id, record_id, valid_from_generation)
+  PRIMARY KEY (workspace_id, identity_assignment_id, valid_from_generation)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS identity_assignments_lookup_idx ON identity_assignments(workspace_id, identity_type, identity_id, valid_from_generation, valid_to_generation);
 -- Serves currentlyVisibleForOwners's owner-narrowed assignment read
@@ -905,7 +1014,6 @@ CREATE INDEX IF NOT EXISTS identity_assignments_lookup_idx ON identity_assignmen
 -- create inline here (unlike vector_projection_document_ref_idx below):
 -- every column named has been part of the base CREATE TABLE since the table
 -- first shipped, so no pre-migration database can lack them.
-CREATE INDEX IF NOT EXISTS identity_assignments_owner_idx ON identity_assignments(workspace_id, owner_artifact_id, valid_from_generation, valid_to_generation);
 -- Serves workspace-wide owner-migration identity lookups by exact key digest.
 CREATE INDEX IF NOT EXISTS identity_assignments_key_idx ON identity_assignments(workspace_id, identity_key_digest, valid_from_generation, identity_type, identity_key, record_id);
 -- CanonicalOccurrenceRepository.currentlyVisible (packages/storage/src/repositories.ts)
@@ -933,6 +1041,18 @@ export async function initializeSchema(database: SqliteDatabase, schema: string)
 }
 
 export async function ensureWorkspaceSchemaCompatibility(database: SqliteDatabase, faults?: FaultInjector): Promise<void> {
+  const contract = await database.get<{ value: unknown }>("SELECT value FROM workspace_meta WHERE key = 'index_contract'");
+  const previousFormat = await database.get<{ value: unknown }>("SELECT value FROM workspace_meta WHERE key = 'storage_format_version'");
+  if (contract === undefined) {
+    const populated = await database.get<{ count: number }>("SELECT (SELECT COUNT(*) FROM source_artifacts) + (SELECT COUNT(*) FROM record_occurrences) + (SELECT COUNT(*) FROM candidate_state) AS count");
+    if (previousFormat !== undefined || (populated?.count ?? 0) > 0) {
+      throw new StorageError("core:index_contract_unsupported", "The workspace uses an unsupported pre-v3 index contract; run the explicit v3 migration and re-register the workspace.", { contract_kind: "workspace_index", data_format_version: 3 });
+    }
+    await database.run("INSERT INTO workspace_meta (key, value) VALUES ('index_contract', ?)", [Uint8Array.of(0x33)]);
+  } else {
+    const bytes = contract.value instanceof Uint8Array ? contract.value : new Uint8Array(contract.value as ArrayBuffer);
+    if (bytes.byteLength !== 1 || bytes[0] !== 0x33) throw new StorageError("core:index_contract_unsupported", "The workspace index contract is not supported by this Urdira v3 runtime; migrate to a fresh v3 data root and reindex.", { contract_kind: "workspace_index", data_format_version: 3 });
+  }
   const columns = await database.all<{ name: string }>("PRAGMA table_info(storage_migrations)");
   const names = new Set(columns.map((column) => column.name));
   if (!names.has("shadow_database_path")) await database.exec("ALTER TABLE storage_migrations ADD COLUMN shadow_database_path TEXT");
@@ -950,74 +1070,58 @@ export async function ensureWorkspaceSchemaCompatibility(database: SqliteDatabas
   const semanticIndexStateColumns = await database.all<{ name: string }>("PRAGMA table_info(semantic_index_state)");
   if (!semanticIndexStateColumns.some((column) => column.name === "document_grains")) await database.exec("ALTER TABLE semantic_index_state ADD COLUMN document_grains TEXT");
   if (!semanticIndexStateColumns.some((column) => column.name === "entity_policy_digest")) await database.exec("ALTER TABLE semantic_index_state ADD COLUMN entity_policy_digest TEXT");
-  await ensureProjectionContentDigests(database);
+  // v3 has no generic staging representation. It was present only in early
+  // previews; drop it on open so old workspaces cannot keep paying its
+  // storage/index cost.
+  await database.exec("DROP TABLE IF EXISTS candidate_staged_rows");
+  // This v3 boundary is deliberately destructive. Early v3 preview roots
+  // repeated three long ownership keys in every staged logical row. They are
+  // not migrated: require a fresh v3 index so the compact fact_delta_key
+  // layout is guaranteed for every lane.
+  for (const lane of ["candidate_staged_records", "candidate_staged_graph_edges", "candidate_staged_identities", "candidate_staged_dependencies"]) {
+    const stagedColumns = await database.all<{ name: string }>(`PRAGMA table_info(${lane})`);
+    if (stagedColumns.some((column) => column.name === "workspace_id" || column.name === "fact_delta_rowid")) {
+      throw new StorageError("core:index_contract_unsupported", "The workspace uses an unsupported early-v3 staging layout; create a fresh v3 data root and reindex.", { contract_kind: "workspace_index", data_format_version: 3, table: lane });
+    }
+  }
+  const factDeltaNamespaceColumns = await database.all<{ name: string }>("PRAGMA table_info(candidate_fact_delta_namespaces)");
+  if (!factDeltaNamespaceColumns.some((column) => column.name === "fact_delta_key")) {
+    throw new StorageError("core:index_contract_unsupported", "The workspace uses an unsupported early-v3 FactDelta staging layout; create a fresh v3 data root and reindex.", { contract_kind: "workspace_index", data_format_version: 3, table: "candidate_fact_delta_namespaces" });
+  }
+  const factDeltaColumns = await database.all<{ name: string }>("PRAGMA table_info(candidate_fact_deltas)");
+  if (factDeltaColumns.some((column) => column.name === "delta_payload")) {
+    throw new StorageError("core:index_contract_unsupported", "The workspace uses an unsupported pre-v3 FactDelta payload layout; create a fresh v3 data root and reindex.", { contract_kind: "workspace_index", data_format_version: 3, table: "candidate_fact_deltas" });
+  }
+  // v3 typed staging lanes are WITHOUT ROWID tables whose declared primary
+  // key is already the covering b-tree. Older v3 previews accidentally added
+  // a second UNIQUE index over that same key, doubling write and storage cost.
+  // Drop those redundant indexes on open; this is idempotent and preserves the
+  // primary-key uniqueness contract.
+  await database.exec("DROP INDEX IF EXISTS candidate_staged_graph_edges_pk; DROP INDEX IF EXISTS candidate_staged_identities_pk; DROP INDEX IF EXISTS candidate_staged_dependencies_pk");
+  // Early v3 previews retained a wide metadata covering tree from the
+  // relational-body format. Body hydration now reads record_occurrences, so
+  // the narrower visibility tree is the real plan and the old tree is pure
+  // write/storage amplification.
+  await database.exec("DROP INDEX IF EXISTS record_occurrences_query_cover_idx; DROP INDEX IF EXISTS record_occurrences_owner_idx; DROP INDEX IF EXISTS record_occurrences_workspace_owner_kind_idx; DROP INDEX IF EXISTS record_facets_lookup_idx; DROP INDEX IF EXISTS identity_assignments_owner_idx");
   await database.exec("CREATE INDEX IF NOT EXISTS identity_assignments_key_idx ON identity_assignments(workspace_id, identity_key_digest, valid_from_generation, identity_type, identity_key, record_id)");
   await ensureCandidateForeignKeys(database, faults);
 }
 
-// The three transactional projection tables `projectionSetDigestEntries`
-// digests every publish (`packages/storage/src/lifecycle.ts`), each with its
-// own row-id column but an otherwise identical `content_digest` story: a
-// nullable `TEXT` column added by `ALTER TABLE` on a pre-migration database,
-// backfilled from the still-present payload BLOB, then covered by an index
-// that lets the "stored" read path answer `projectionSetDigestEntries`
-// without visiting a payload page at all.
-const PROJECTION_CONTENT_DIGEST_TABLES = [
-  { table: "graph_edges", idColumn: "edge_id", payloadColumn: "edge_payload", index: "graph_edges_digest_scan_idx" },
-  { table: "artifact_dependencies", idColumn: "dependency_entry_id", payloadColumn: "dependency_payload", index: "artifact_dependencies_digest_scan_idx" },
-  { table: "metric_projections", idColumn: "metric_id", payloadColumn: "metric_payload", index: "metric_projections_digest_scan_idx" },
-] as const;
-
-async function ensureProjectionContentDigests(database: SqliteDatabase): Promise<void> {
-  for (const { table, idColumn, payloadColumn, index } of PROJECTION_CONTENT_DIGEST_TABLES) {
-    const columns = await database.all<{ name: string }>(`PRAGMA table_info(${table})`);
-    if (!columns.some((column) => column.name === "content_digest")) await database.exec(`ALTER TABLE ${table} ADD COLUMN content_digest TEXT`);
-    await backfillProjectionContentDigests(database, table, idColumn, payloadColumn);
-    // Covers exactly what `projectionSetDigestEntries("stored")` selects
-    // (`packages/storage/src/lifecycle.ts`) -- id, generation validity, and
-    // the digest itself -- so that scan is answered entirely from this
-    // index, never touching a `${payloadColumn}` BLOB page. Created here
-    // (after the column is guaranteed to exist) rather than inline in
-    // `WORKSPACE_SCHEMA` above, because `initializeSchema` runs that raw
-    // schema string unconditionally on every open, including a
-    // pre-migration database that has not yet had `content_digest` added --
-    // an index referencing that column would fail on such a database if it
-    // lived there instead of here.
-    await database.exec(`CREATE INDEX IF NOT EXISTS ${index} ON ${table}(workspace_id, valid_from_generation, valid_to_generation, ${idColumn}, content_digest)`);
+/** The catalog is a destructive v3 boundary; legacy catalogs are never reinterpreted. */
+export async function ensureCatalogSchemaCompatibility(database: SqliteDatabase): Promise<void> {
+  const contract = await database.get<{ value: unknown }>("SELECT value FROM storage_meta WHERE key = 'index_contract'");
+  const workspaceCount = await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM installation_workspaces");
+  if (contract === undefined) {
+    if ((workspaceCount?.count ?? 0) > 0) {
+      throw new StorageError("core:index_contract_unsupported", "The catalog uses an unsupported pre-v3 index contract; run the explicit v3 migration and re-register workspaces.", { contract_kind: "catalog", data_format_version: 3 });
+    }
+    await database.run("INSERT INTO storage_meta (key, value) VALUES ('index_contract', ?)", [Uint8Array.of(0x33)]);
+    return;
   }
-}
-
-function blobBytes(table: string, rowId: unknown, validFromGeneration: unknown, value: unknown): Uint8Array {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  throw new StorageError("storage:invalid_blob", `${table} row ${String(rowId)}@${String(validFromGeneration)} has a non-binary payload during content_digest backfill.`);
-}
-
-/**
- * Idempotent and re-runnable: only rows whose `content_digest` is still NULL
- * are selected, so a crash mid-backfill (or simply re-opening an
- * already-backfilled database) finds nothing left to do. The digest recipe
- * -- `digestBytes` of the exact stored payload bytes -- is identical to the
- * one every write site now computes at insert time
- * (`WorkspaceProjectionRepository.putGraphEdge`/`putMetric`,
- * `artifactDependencyCommands` in `./publication-authority.js`) and the one
- * `projectionSetDigestEntries("recompute")` uses, so a backfilled column can
- * never disagree with a freshly recomputed hash of the same bytes.
- */
-async function backfillProjectionContentDigests(database: SqliteDatabase, table: string, idColumn: string, payloadColumn: string): Promise<void> {
-  const rows = await database.all<{ workspace_id: string; row_id: string; valid_from_generation: number; payload: unknown }>(`SELECT workspace_id, ${idColumn} AS row_id, valid_from_generation, ${payloadColumn} AS payload FROM ${table} WHERE content_digest IS NULL`);
-  if (rows.length === 0) return;
-  // The UPDATE's WHERE must lead with workspace_id: every index on these
-  // tables (the PRIMARY KEY included) has it as the leading column, so an
-  // update keyed by (idColumn, valid_from_generation) alone cannot use any
-  // of them and degrades to one full table scan PER ROW -- quadratic over
-  // the table, minutes of CPU on a real workspace during daemon startup.
-  const commands: SqliteCommand[] = rows.map((row) => ({
-    kind: "run" as const,
-    sql: `UPDATE ${table} SET content_digest = ? WHERE workspace_id = ? AND ${idColumn} = ? AND valid_from_generation = ?`,
-    params: [digestBytes(blobBytes(table, row.row_id, row.valid_from_generation, row.payload)), row.workspace_id, row.row_id, row.valid_from_generation],
-  }));
-  await database.transactionChunked(commands);
+  const value = contract.value instanceof Uint8Array ? contract.value : new Uint8Array(contract.value as ArrayBuffer);
+  if (value.byteLength !== 1 || value[0] !== 0x33) {
+    throw new StorageError("core:index_contract_unsupported", "The catalog index contract is not supported by this Urdira v3 runtime; migrate to a fresh v3 data root and reindex.", { contract_kind: "catalog", data_format_version: 3 });
+  }
 }
 
 async function ensureCandidateForeignKeys(database: SqliteDatabase, faults?: FaultInjector): Promise<void> {
@@ -1029,21 +1133,22 @@ async function ensureCandidateForeignKeys(database: SqliteDatabase, faults?: Fau
         work_manifest_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, candidate_generation_id TEXT NOT NULL,
         supersedes_work_manifest_id TEXT, base_snapshot_id TEXT, invalidation_plan_id TEXT NOT NULL,
         target_registry_snapshot_id TEXT NOT NULL, target_configuration_revision_id TEXT NOT NULL,
-        work_digest TEXT NOT NULL, work_manifest_payload BLOB NOT NULL, UNIQUE (workspace_id, work_digest),
+        artifact_work_set TEXT NOT NULL, projection_work_set TEXT NOT NULL, created_at TEXT NOT NULL,
+        work_digest TEXT NOT NULL, UNIQUE (workspace_id, work_digest),
         FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
       ) STRICT`,
-      columns: "work_manifest_id, workspace_id, candidate_generation_id, supersedes_work_manifest_id, base_snapshot_id, invalidation_plan_id, target_registry_snapshot_id, target_configuration_revision_id, work_digest, work_manifest_payload",
+      columns: "work_manifest_id, workspace_id, candidate_generation_id, supersedes_work_manifest_id, base_snapshot_id, invalidation_plan_id, target_registry_snapshot_id, target_configuration_revision_id, artifact_work_set, projection_work_set, created_at, work_digest",
     },
     {
       name: "candidate_fact_deltas",
       index: "candidate_fact_deltas_recovery_idx",
       create: `CREATE TABLE candidate_fact_deltas (
         fact_delta_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, candidate_generation_id TEXT NOT NULL,
-        delta_digest TEXT NOT NULL, accepted_at TEXT NOT NULL, delta_payload BLOB NOT NULL,
+        delta_digest TEXT NOT NULL, accepted_at TEXT NOT NULL,
         UNIQUE (workspace_id, candidate_generation_id, fact_delta_id),
         FOREIGN KEY (candidate_generation_id) REFERENCES candidate_state(candidate_generation_id)
       ) STRICT`,
-      columns: "fact_delta_id, workspace_id, candidate_generation_id, delta_digest, accepted_at, delta_payload",
+      columns: "fact_delta_id, workspace_id, candidate_generation_id, delta_digest, accepted_at",
     },
   ] as const;
   const rebuildCommands: SqliteCommand[] = [];
@@ -1053,7 +1158,11 @@ async function ensureCandidateForeignKeys(database: SqliteDatabase, faults?: Fau
     const orphan = await database.get<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table.name} AS child WHERE NOT EXISTS (SELECT 1 FROM candidate_state AS candidate WHERE candidate.candidate_generation_id = child.candidate_generation_id)`);
     if ((orphan?.count ?? 0) !== 0) throw new StorageError("storage:schema_migration_failed", `${table.name} contains orphaned candidate rows and cannot be rebuilt safely.`);
     const legacy = `${table.name}__legacy`;
-    const rebuildSql = `DROP INDEX IF EXISTS ${table.index}; ALTER TABLE ${table.name} RENAME TO ${legacy}; ${table.create}; INSERT INTO ${table.name} (${table.columns}) SELECT ${table.columns} FROM ${legacy}; DROP TABLE ${legacy}; CREATE INDEX ${table.index} ON ${table.name}(workspace_id, candidate_generation_id, ${table.name === "candidate_work_manifests" ? "work_manifest_id" : "accepted_at"});`;
+    const legacyColumns = new Set((await database.all<{ name: string }>(`PRAGMA table_info(${table.name})`)).map((column) => column.name));
+    const sourceColumns = table.name === "candidate_work_manifests"
+      ? ["work_manifest_id", "workspace_id", "candidate_generation_id", "supersedes_work_manifest_id", "base_snapshot_id", "invalidation_plan_id", "target_registry_snapshot_id", "target_configuration_revision_id", legacyColumns.has("artifact_work_set") ? "artifact_work_set" : "'[]'", legacyColumns.has("projection_work_set") ? "projection_work_set" : "'[]'", legacyColumns.has("created_at") ? "created_at" : "''", "work_digest"]
+      : ["fact_delta_id", "workspace_id", "candidate_generation_id", "delta_digest", "accepted_at"];
+    const rebuildSql = `DROP INDEX IF EXISTS ${table.index}; ALTER TABLE ${table.name} RENAME TO ${legacy}; ${table.create}; INSERT INTO ${table.name} (${table.columns}) SELECT ${sourceColumns.join(", ")} FROM ${legacy}; DROP TABLE ${legacy}; CREATE INDEX ${table.index} ON ${table.name}(workspace_id, candidate_generation_id, ${table.name === "candidate_work_manifests" ? "work_manifest_id" : "accepted_at"});`;
     rebuildCommands.push({ kind: "exec", sql: rebuildSql });
   }
   if (rebuildCommands.length > 0) await database.transaction([

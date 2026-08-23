@@ -1,6 +1,6 @@
 # Release Process
 
-This document is the operational checklist for Urdira 0.1.x. The normative
+This document is the operational checklist for Urdira 0.2.x. The normative
 distribution contract is [decision 10](decisions/10-daemon-mcp-packaging.md);
 the non-waivable qualification gates are [decision 08](decisions/08-performance-reliability-evaluation.md).
 
@@ -17,6 +17,28 @@ The source manifests remain private to prevent an accidental publish from a
 workspace directory. `pnpm package:npm` creates clean public manifests in
 `release/npm/staging`, packs them into `release/npm/tarballs`, and writes a
 machine-readable manifest containing integrity values and publication order.
+
+Urdira v3 release qualification also verifies the native indexing boundary:
+CAS stream length/hash checks, transferable `FactDeltaBatch` arenas, atomic
+SQLite staging and retry recovery, relational logical digests, the streaming
+record-set digest, IPC Protobuf framing budgets, and explicit rejection of
+pre-v3 and early-preview v3 roots. No CBOR or Base64 integration is part of
+the release surface.
+
+The current expanded TypeScript evidence report records one sequential sample
+for each of 32 cells across TypeScript, Playwright, Prisma, and VS Code. The
+Urdira arm was rerun with the final v3 implementation; baseline, codebase-memory, and
+CodeGraph rows are reused from the prior audited campaign and are marked as
+such. A readiness control is not a successful agent task: every Urdira run
+must be accompanied by stage timings, peak RSS, SQLite/CAS sizes, copy
+telemetry when available, and a repository grader result before it enters the
+release aggregate.
+
+The accepted Urdira rerun completed 8/8 tasks. Transcript-by-transcript review
+confirmed API v3, explicit workspace scope, Urdira discovery before editing,
+post-edit rediscovery through Urdira, and no degradation to native source
+reading in all eight cells. The exact comparison and limitations are recorded
+in the [expanded agent report](../release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.md).
 
 ## One-time external setup
 
