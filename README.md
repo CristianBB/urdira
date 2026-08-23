@@ -23,6 +23,9 @@ Core properties:
 - immutable snapshots and persistent cursors, including after daemon restart;
 - exact owner artifact, version, source span, evidence, and completeness data;
 - near-real-time working-tree updates backed by authoritative reconciliation;
+- changed-file watcher updates use a safe targeted capture when possible, with
+  complete reconciliation retained as the fallback for deletes, renames, and
+  ambiguous events;
 - deterministic ordering with no hidden approximate fallback;
 - concurrent workspaces, Git worktrees, detached checkouts, clones, ordinary
   directories, and read-only Git references; and

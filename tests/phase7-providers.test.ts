@@ -155,6 +155,33 @@ describe("Phase 7 five-call source providers", () => {
     for (const provider of providers.slice(1)) expect(methodNames(provider)).toEqual(["describe", "enumerate", "read", "reconcile", "watch"]);
   });
 
+  it("captures only changed files and falls back to a complete capture for unsafe events", async () => {
+    const root = await temporaryDirectory();
+    await writeFile(join(root, "alpha.ts"), "alpha\n");
+    await writeFile(join(root, "beta.ts"), "beta\n");
+    const provider = new DirectorySourceProvider({ ...boundProvider, root, now: () => instant });
+    const envelope = request("enumerate", { coverage_scopes: completeScope });
+    const initial = await provider.enumerateNativeBatches(envelope);
+    const initialObservations: ProviderObservation[] = [];
+    for await (const batch of initial.batches) initialObservations.push(...batch.observations);
+    expect(initial.incremental).toBe(false);
+    expect(initialObservations.map((entry) => entry.normalized_uri)).toEqual(["alpha.ts", "beta.ts"]);
+
+    await writeFile(join(root, "alpha.ts"), "alpha changed\n");
+    const changed = await provider.enumerateNativeBatches(envelope, { changed_uris: ["alpha.ts"] });
+    const changedObservations: ProviderObservation[] = [];
+    for await (const batch of changed.batches) changedObservations.push(...batch.observations);
+    expect(changed.incremental).toBe(true);
+    expect(changedObservations.map((entry) => entry.normalized_uri)).toEqual(["alpha.ts"]);
+
+    await unlink(join(root, "beta.ts"));
+    const deleted = await provider.enumerateNativeBatches(envelope, { changed_uris: ["beta.ts"] });
+    const deletedObservations: ProviderObservation[] = [];
+    for await (const batch of deleted.batches) deletedObservations.push(...batch.observations);
+    expect(deleted.incremental).toBe(false);
+    expect(deletedObservations.map((entry) => entry.normalized_uri)).toEqual(["alpha.ts"]);
+  });
+
   it("rejects a mismatched request digest for every call before provider IO", async () => {
     const root = await temporaryDirectory();
     let ioCalls = 0;

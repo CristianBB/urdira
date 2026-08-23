@@ -467,7 +467,15 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
     const prepared = await prepareRegistry(workspaceId);
     const registrySnapshotId = prepared.registry.registry_snapshot_id;
     const configurationRevisionId = `configuration:${workspaceId}`;
-    const plugin = buildPluginProvider(prepared, workspaceId, registrySnapshotId, configurationRevisionId);
+    const analyzedArtifactCounts: number[] = [];
+    const basePlugin = buildPluginProvider(prepared, workspaceId, registrySnapshotId, configurationRevisionId);
+    const plugin: WorkspaceScanPluginProvider = {
+      ...basePlugin,
+      analyze: async (input) => {
+        analyzedArtifactCounts.push(input.artifacts.length);
+        return basePlugin.analyze(input);
+      },
+    };
 
     // Unlike the read-only scan above, this test mutates its source root
     // between scans (to prove a genuine content change reaches a new
@@ -506,11 +514,12 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
         // A third scan after a real content change: this must reach a new,
         // strictly-incremented generation.
         await writeFile(join(workspaceRoot, "extra.ts"), "export class ExtraRescanMarker {}\n", "utf8");
-        const third = await runFullWorkspaceScan(scanOptions);
+        const third = await runFullWorkspaceScan({ ...scanOptions, changed_uris: ["extra.ts"] });
         expect(third.status).toBe("published");
         expect(third.state).toBe("published");
         expect(third.generation).toBe(2);
         expect(third.snapshot_id).not.toBe(first.snapshot_id);
+        expect(analyzedArtifactCounts.at(-1)).toBe(1);
       } finally {
         await opened.close();
       }

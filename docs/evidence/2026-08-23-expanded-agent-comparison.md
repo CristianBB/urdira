@@ -134,3 +134,23 @@ The accepted campaign includes the resulting fixes:
 This campaign is a functional and comparative observation, not a P95
 measurement. P95 remains ineligible until at least three independent campaigns
 are available.
+
+## Incremental changed-file capture (post-campaign implementation)
+
+The campaign measurements above are full-readiness measurements and predate the
+changed-file source-capture path. The implementation now consumes watcher
+`changed_uris` in the directory provider: an existing, stable, eligible file is
+captured and streamed as one partial source batch, while the source index keeps
+the prior generation and disables deletion authority. The candidate planner
+diffs that batch against the existing catalog, and the plugin receives only the
+targeted artifact set. Missing paths, deletes, renames, directories, excluded
+files, and unstable boundaries deliberately fall back to complete
+reconciliation; those hints also retain full plugin analysis so no dependency
+closure is silently skipped.
+
+Focused evidence: `tests/phase7-providers.test.ts` verifies one-file capture and
+complete fallback after deletion; the rescan integration in
+`tests/phase-workspace-indexing-session.test.ts` verifies a new-file update and
+observes one analyzed artifact. These are correctness/regression measurements,
+not a new VS Code readiness benchmark. A fresh large-repository campaign is
+still required to quantify the absolute one-file latency and memory reduction.

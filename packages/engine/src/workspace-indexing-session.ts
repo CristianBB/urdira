@@ -201,6 +201,8 @@ export interface RunSourceOnlyWorkspaceScanInput {
   readonly scan_budget?: WorkspaceScanBudget;
   readonly now?: () => string;
   readonly io_concurrency?: number;
+  /** Safe watcher hints; missing/unsafe paths fall back to full reconciliation. */
+  readonly changed_uris?: readonly string[];
   readonly signal?: AbortSignal;
 }
 
@@ -229,7 +231,7 @@ export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceSc
   const enumeration = await provider.enumerateNativeBatches(providerRequest({
     call: "enumerate", workspaceId, bindingId, componentId: provider.component_id, componentVersion: provider.component_version,
     payload: { coverage_scopes: [scope] }, ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }), now,
-  }));
+  }), { ...(input.changed_uris === undefined ? {} : { changed_uris: input.changed_uris }) });
   if (input.signal?.aborted) throw new EngineError("core:operation_cancelled", "Workspace source scan generation was superseded.");
   const response = enumeration.response;
   if (response.outcome !== "success") throw new EngineError("engine:workspace_scan_enumeration_failed", `Directory enumeration for ${input.root} did not succeed (outcome ${response.outcome}).`);
@@ -247,6 +249,7 @@ export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceSc
   const result = await new GenericSourceIndexer(input.database).apply({
     response,
     native_batches: enumeration.batches,
+    allow_partial: enumeration.incremental,
     read,
     publication_current_generation: current?.current_generation ?? 0,
     ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }),
@@ -490,6 +493,10 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // read (`packages/storage/src/source-index.ts`) rather than `currentOccurrences`/
   // `currentAbsences`.
   const currentState = await timed("prior_state_current", () => database.repositories.snapshots.getCurrent());
+  // Incremental source capture is safe only when the analyzer lock is the
+  // same as the published one. A lock change requires a full source context
+  // and full plugin re-analysis even if the tree bytes are unchanged.
+  const lockChanged = currentState !== undefined && currentState.current_resolution_lock_id !== input.plugin.resolution_lock.resolution_lock_id;
   if (preparedScan !== undefined) console.error(`[urdira] progressive stage prior-state complete workspace=${workspaceId} stage=${input.publication_stage_id ?? "unknown"}`);
   const currentSnapshot = currentState === undefined ? undefined : await timed("prior_state_snapshot", () => database.repositories.snapshots.get(currentState.current_snapshot_id));
   const priorOccurrences = await timed("prior_state_occurrences", () => currentState === undefined
@@ -516,6 +523,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   let sourceIndexResult: SourceIndexApplyResult;
   let scannedArtifacts: WorkspaceScanSourceArtifact[];
   let observations: SourceCandidateObservationSet;
+  let incrementalSourceCapture = preparedScan?.observations.coverage_completeness === "partial";
   if (preparedScan === undefined) {
   const provider = new DirectorySourceProvider({
     root: input.root,
@@ -528,6 +536,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   });
 
   const scope = { scope_type: "source_root" as const, source_provider_binding_id: bindingId, source_provider: provider.component_id, normalized_scope_key: "" };
+  const incrementalRequested = input.changed_uris !== undefined && input.changed_uris.length > 0 && currentState !== undefined && !lockChanged;
   const enumeration = await timed("enumerate", async () => { throwIfCancelled(); return provider.enumerateNativeBatches(providerRequest({
     call: "enumerate",
     workspaceId,
@@ -537,7 +546,8 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     payload: { coverage_scopes: [scope] },
     ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }),
     now,
-  })); });
+  }), incrementalRequested ? { changed_uris: input.changed_uris } : undefined); });
+  incrementalSourceCapture = enumeration.incremental;
   const enumerateResponse = enumeration.response;
   if (enumerateResponse.outcome !== "success") {
     throw new EngineError("engine:workspace_scan_enumeration_failed", `Directory enumeration for ${input.root} did not succeed (outcome ${enumerateResponse.outcome}).`);
@@ -547,7 +557,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   const nativeBatches = (async function* (): AsyncGenerator<EncodedObservationBatch> {
     for await (const batch of enumeration.batches) {
       enumeratedArtifactCount += batch.observations.length;
-      if (batch.batch.coverage_completeness === "complete") completedEnumerationBatch = batch;
+      if (batch.batch.coverage_completeness === "complete" || enumeration.incremental) completedEnumerationBatch = batch;
       yield batch;
     }
   })();
@@ -589,7 +599,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // and on `applyBatch`'s `generation` computation
   // (`packages/engine/src/source-indexer.ts`) for why the stage-1 source
   // counter alone drifts behind this after a plugin-upgrade generation.
-  sourceIndexResult = await timed("source_catalog", () => { throwIfCancelled(); return new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, publication_current_generation: currentState?.current_generation ?? 0, ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }) }); });
+  sourceIndexResult = await timed("source_catalog", () => { throwIfCancelled(); return new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, allow_partial: enumeration.incremental, publication_current_generation: currentState?.current_generation ?? 0, ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }) }); });
   if (sourceIndexResult.status !== "published" && sourceIndexResult.status !== "equivalent") {
     throw new EngineError("engine:workspace_scan_source_index_degraded", `Source cataloging of ${input.root} did not complete (status ${sourceIndexResult.status}, error ${sourceIndexResult.error_code ?? "none"}).`);
   }
@@ -662,8 +672,8 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     watermark: (enumerateResponse.payload as { readonly watermark?: string }).watermark ?? "",
     completed_at: completedEnumerationBatch?.batch.completed_at ?? now(),
     observation_mode: "scan",
-    coverage_completeness: "complete",
-    deletion_authority: "authoritative",
+    coverage_completeness: enumeration.incremental ? "partial" : "complete",
+    deletion_authority: enumeration.incremental ? "none" : "authoritative",
     coverage_scopes: [{ scope_type: "source_root", normalized_scope_key: "" }],
     supports_authoritative_delete_events: false,
     observations: presentObservations,
@@ -734,7 +744,6 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // both the candidate id (below) and the analysis scope (`changedArtifactIds`,
   // below) must treat it like a first scan: a fresh candidate identity, and
   // full re-analysis, even over an otherwise byte-identical tree.
-  const lockChanged = currentState !== undefined && currentState.current_resolution_lock_id !== input.plugin.resolution_lock.resolution_lock_id;
   // The target lock id is folded into the candidate id's salt alongside the
   // observation batch id: `observation_batch_id` is content-derived and
   // repeats for an identical tree (see the comment on `baseObservationBatchIds`
@@ -838,6 +847,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   const staged = await indexer.stageSourceBatch({
     observations,
     base,
+    allow_partial_coverage: incrementalSourceCapture,
     // A target-lock change must publish a new generation even over a
     // byte-identical tree (docs/decisions/09's upgrade clause: an upgrade
     // flows through the normal candidate pipeline). Without this,
@@ -880,15 +890,15 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         // analyzer/lock; otherwise the planner's exact transition set is the
         // only work that may be sent to the plugin.
         const changedArtifactIds = currentState === undefined || lockChanged ? undefined : [...new Set(staged.plan.transitions.map((transition) => transition.artifact_change.artifact_id))];
-        // Watch batches carry normalized URIs.  Keep the source reconciliation
-        // authoritative (it still observes the complete tree so deletions are
-        // represented exactly), but narrow the expensive plugin input to the
-        // changed closure for an incremental generation.  The plugin receives
-        // the exact artifact ids from the staged source plan as an additional
-        // guard; a missing URI therefore never causes an unchanged artifact to
-        // be re-analysed, while a deleted URI remains handled by the source
-        // planner without a synthetic parse.
-        const incrementalArtifacts = currentState === undefined || lockChanged || input.changed_uris === undefined
+        // A successful targeted provider capture contains only concrete,
+        // stable changed files, so narrow the expensive plugin input to those
+        // paths. If the provider fell back to a complete reconciliation (for
+        // example a delete, rename, directory event, or missing path), retain
+        // the full plugin corpus: the hint is no longer sufficient to prove
+        // the affected closure and correctness is more important than the
+        // optimization. The plugin still receives exact changed artifact ids
+        // from the source plan as an additional guard.
+        const incrementalArtifacts = currentState === undefined || lockChanged || !incrementalSourceCapture || input.changed_uris === undefined
           ? scannedArtifacts
           : (() => {
             const normalizeUri = (uri: string): string => {

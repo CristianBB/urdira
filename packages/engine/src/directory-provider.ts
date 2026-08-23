@@ -132,6 +132,8 @@ export interface EncodedObservationBatch {
 export interface NativeDirectoryEnumeration {
   readonly response: SourceProviderResponseEnvelope;
   readonly batches: AsyncIterable<EncodedObservationBatch>;
+  /** True when the enumeration is a safe changed-file-only capture. */
+  readonly incremental: boolean;
 }
 
 /** Native internal source boundary. The stream is consumed exactly once. */
@@ -357,13 +359,29 @@ export class DirectorySourceProvider implements SourceProvider {
    * as partial fragments and a final empty complete fragment so the core can
    * apply deletion authority without constructing a giant response payload.
    */
-  async enumerateNativeBatches(request: SourceProviderRequestEnvelope): Promise<NativeDirectoryEnumeration> {
+  async enumerateNativeBatches(request: SourceProviderRequestEnvelope, options?: { readonly changed_uris?: readonly string[] }): Promise<NativeDirectoryEnumeration> {
     let capture: Capture | undefined;
     let budgetMaxObservations = 0;
+    let incremental = false;
     const response = await executeProviderCall(request, "enumerate", this.#requestExpectations, this.#runtime, async (budget) => {
       const payload = parseProviderPayload<SourceProviderEnumerateRequest>(request);
       const scopes = parseScopes(payload, request.source_provider_binding_id, this.#providerKind);
-      capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
+      const changedUris = options?.changed_uris?.filter((uri) => typeof uri === "string" && uri.length > 0) ?? [];
+      if (changedUris.length > 0) {
+        const changedCapture = await this.#captureChangedUris(changedUris);
+        if (changedCapture !== undefined) {
+          capture = changedCapture;
+          incremental = true;
+        } else {
+          // A missing path, directory event, excluded file, or unstable
+          // boundary cannot authorize an incremental publication. Fall back
+          // to the existing complete capture so deletion/rename handling
+          // remains authoritative and safe.
+          capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
+        }
+      } else {
+        capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
+      }
       if (!capture.stable) throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The source changed during enumeration.");
       if (capture.files.length > budget.max_observations) throw new SourceProviderOutcomeError("resource_exhausted", "core:source_provider_observations_exhausted", "retryable", "The observation budget was exhausted.");
       budgetMaxObservations = budget.max_observations;
@@ -375,6 +393,11 @@ export class DirectorySourceProvider implements SourceProvider {
       const payload = request.payload as unknown as SourceProviderEnumerateRequest;
       const scopes = parseScopes(payload, request.source_provider_binding_id, provider.#providerKind);
       const maxRows = 4096;
+      if (incremental) {
+        const part = provider.#enumerationRecord(request, payload.previous_watermark, scopes, captured, { max_observations: budgetMaxObservations } as SourceProviderResourceBudget, "scan", true, false);
+        yield part.encoded;
+        return;
+      }
       for (let offset = 0, fragment = 0; offset < captured.files.length; fragment += 1) {
         const files = captured.files.slice(offset, offset + maxRows);
         offset += files.length;
@@ -384,7 +407,7 @@ export class DirectorySourceProvider implements SourceProvider {
       const completion = provider.#enumerationRecord(request, payload.previous_watermark, scopes, { ...captured, files: [] }, { max_observations: budgetMaxObservations } as SourceProviderResourceBudget, "scan", true, true);
       yield completion.encoded;
     })(this);
-    return { response, batches };
+    return { response, batches, incremental };
   }
 
   read(request: SourceProviderRequestEnvelope): Promise<SourceProviderResponseEnvelope> {
@@ -536,6 +559,44 @@ export class DirectorySourceProvider implements SourceProvider {
     };
   }
 
+  /**
+   * Captures only concrete changed files. This intentionally refuses missing
+   * paths, directories, and ineligible files: those events can represent a
+   * deletion, rename, exclusion, or subtree change and therefore require the
+   * complete reconciliation path above to preserve deletion authority.
+   */
+  async #captureChangedUris(changedUris: readonly string[]): Promise<Capture | undefined> {
+    const files: CapturedFile[] = [];
+    const normalizedUris = [...new Set(changedUris)].sort();
+    if (normalizedUris.length === 0) return undefined;
+    try {
+      for (const uri of normalizedUris) {
+        const normalized = normalizeWorkspacePath(this.#root, uri);
+        if (normalized !== uri || normalized.length === 0) return undefined;
+        const path = resolve(this.#root, normalized);
+        if (!isWithinRoot(this.#root, path)) return undefined;
+        const fileStat = await this.#fileSystem.lstat(path);
+        if (fileStat.is_directory || fileStat.is_special) return undefined;
+        const included = await this.#captureFile(normalized, path, fileStat, files, true);
+        if (!included) return undefined;
+      }
+    } catch (error) {
+      // ENOENT is the normal delete/rename race; all other filesystem
+      // failures are also delegated to a full reconciliation for safety.
+      if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return undefined;
+      return undefined;
+    }
+    const unique = [...new Map(files.map((file) => [file.uri, file])).values()].sort((left, right) => left.uri.localeCompare(right.uri));
+    const beforeFingerprint = digestFields(unique.flatMap((file) => [file.uri, file.token_before]));
+    const afterFingerprint = digestFields(unique.flatMap((file) => [file.uri, file.token_after]));
+    return {
+      files: unique,
+      start_fingerprint: beforeFingerprint,
+      end_fingerprint: afterFingerprint,
+      stable: unique.length > 0 && unique.every((file) => file.token_before === file.token_after),
+    };
+  }
+
   async #inventory(scopeKeys: readonly string[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<Inventory> {
     const files: CapturedFile[] = [];
     try {
@@ -596,8 +657,8 @@ export class DirectorySourceProvider implements SourceProvider {
     });
   }
 
-  async #captureFile(uri: string, path: string, initial: DirectoryFileStat, files: CapturedFile[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<void> {
-    if (initial.is_directory || initial.is_special) return;
+  async #captureFile(uri: string, path: string, initial: DirectoryFileStat, files: CapturedFile[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<boolean> {
+    if (initial.is_directory || initial.is_special) return false;
     const before = await this.#inspectBoundary(uri, path);
     if (metadataOnly) {
       // Existing eligible files are checked with the same boundary token. A
@@ -606,12 +667,12 @@ export class DirectorySourceProvider implements SourceProvider {
       // silently publishing an incomplete capture.
       const after = await this.#inspectBoundary(uri, path);
       files.push({ uri, content_hash: knownUris?.has(uri) ? "metadata-only" : "new-file", metadata_digest: before.metadata_digest, token_before: before.token, token_after: after.included ? after.token : `ineligible:${after.token}` });
-      return;
+      return after.included;
     }
-    if (!before.included) return;
+    if (!before.included) return false;
     const digest = await this.#digestFile(before.target_path);
     const mediaBytes = digest.has_nul || !digest.valid_utf8 ? Uint8Array.of(0) : new Uint8Array();
-    if (!this.#included(uri, before, mediaBytes)) return;
+    if (!this.#included(uri, before, mediaBytes)) return false;
     const after = await this.#inspectBoundary(uri, path, mediaBytes);
     files.push({
       uri,
@@ -624,6 +685,7 @@ export class DirectorySourceProvider implements SourceProvider {
       token_before: before.token,
       token_after: after.included ? after.token : `ineligible:${after.token}`,
     });
+    return after.included && before.token === after.token;
   }
 
   async #digestFile(path: string): Promise<{ readonly content_hash: string; readonly byte_length: number; readonly has_nul: boolean; readonly valid_utf8: boolean }> {

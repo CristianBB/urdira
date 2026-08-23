@@ -279,6 +279,8 @@ export interface StageSourceBatchInput {
    * `publish()` at all.
    */
   readonly force_candidate?: boolean;
+  /** Internal opt-in for a stable changed-file-only source capture. */
+  readonly allow_partial_coverage?: boolean;
 }
 
 export class CandidateIndexer {
@@ -348,7 +350,9 @@ export class CandidateIndexer {
 
   async stageSourceBatch(input: StageSourceBatchInput): Promise<StagedSourceBatch> {
     const plan = new SourceCandidatePlanner().plan(input.observations, input.base);
-    if (input.observations.outcome !== "success" || !input.observations.stable || input.observations.coverage_completeness !== "complete") {
+    const coverageUsable = input.observations.coverage_completeness === "complete"
+      || (input.allow_partial_coverage === true && input.observations.coverage_completeness === "partial");
+    if (input.observations.outcome !== "success" || !input.observations.stable || !coverageUsable) {
       return { status: "degraded", plan, publish: async () => ({ status: "equivalent", generation: input.base.present.length + input.base.absent.length }) };
     }
     if (plan.equivalent && !input.force_candidate) {

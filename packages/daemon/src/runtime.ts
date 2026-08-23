@@ -1544,6 +1544,7 @@ export class DaemonRuntime {
                       inclusion_rules: { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false },
                       ...(options.scan_budget === undefined ? {} : { scan_budget: options.scan_budget }),
                       ...(options.scan_io_concurrency === undefined ? {} : { io_concurrency: options.scan_io_concurrency }),
+                      ...(requestedUris === undefined ? {} : { changed_uris: requestedUris }),
                       signal: scanController.signal,
                     });
                     console.error(`[urdira] source catalog ready for ${workspaceId}; no compatible language plugin is active`);

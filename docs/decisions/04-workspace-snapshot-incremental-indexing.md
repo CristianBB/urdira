@@ -1,7 +1,7 @@
 # Workspace, Snapshot, and Incremental Indexing
 
 Status: **Approved**  
-Last updated: 2026-08-08  
+Last updated: 2026-08-23
 Depends on: Universal data model and plugin contract
 
 ## Decision objective
@@ -83,7 +83,7 @@ The Git-reference provider resolves a branch or tag to an exact commit before en
 
 Watcher events are low-latency hints. The default scheduler begins a workspace batch after 50 ms without another related event and forces a capture after 250 ms of continuous activity. These defaults are configurable within safety bounds and do not affect logical output. Deletion, exclusion, provider reset, and explicit freshness barriers bypass ordinary debounce.
 
-Coalescing may collapse repeated modify hints for the same path before stable capture. It may not erase an authoritative absence barrier, reorder provider watermarks, or merge events across different provider bindings. Rename hints are normalized to absence plus presence with optional lineage metadata. The stable reconciliation result, not watcher event shape, determines content updates.
+Coalescing may collapse repeated modify hints for the same path before stable capture. For a concrete existing file, the directory provider may perform a stable targeted capture containing only that file; the source index applies it as partial coverage, without deletion authority, and the candidate planner diffs it against the existing catalog. It may not erase an authoritative absence barrier, reorder provider watermarks, or merge events across different provider bindings. Rename, delete, directory, excluded, missing, or otherwise ambiguous hints fall back to a complete reconciliation, normalized to absence plus presence with optional lineage metadata. The stable reconciliation result, not watcher event shape, determines content updates.
 
 A physical watcher backend error invalidates that underlying subscription and emits one provider-reset barrier. Urdira closes the failed subscription and serially installs one replacement after bounded exponential backoff. Repeated callbacks from the invalidated subscription are stale and cannot consume additional retry attempts or start concurrent replacements. A successful event resets the consecutive-failure count; bounded exhaustion leaves the periodic authoritative reconciliation as the recovery backstop.
 

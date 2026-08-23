@@ -66,6 +66,12 @@ export interface SourceIndexApplyInput {
   /** Native provider stream; the response envelope carries only control metadata. */
   readonly native_batches?: AsyncIterable<EncodedObservationBatch>;
   /**
+   * Accept one stable partial native batch as an incremental source update.
+   * Partial updates never authorize deletion and keep the prior source
+   * generation until the surrounding candidate publication completes.
+   */
+  readonly allow_partial?: boolean;
+  /**
    * Maximum number of `read` provider calls in flight at once (default 16).
    * Purely a concurrency bound: the observations actually read, and the
    * result (or thrown error) `readAll` produces, are identical to what a
@@ -437,6 +443,7 @@ export class GenericSourceIndexer {
     let changed = false;
     let final: SourceIndexApplyResult | undefined;
     const seenUris = new Set<string>();
+    let acceptedPartial = false;
     for await (const encoded of input.native_batches!) {
       const batch = encoded.batch as SourceObservationBatchRecord;
       if (batch.workspace_id !== input.response.workspace_id || batch.source_provider_binding_id !== input.response.source_provider_binding_id
@@ -468,6 +475,13 @@ export class GenericSourceIndexer {
       const complete = batch.coverage_completeness === "complete";
       if (complete) {
         final = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0, seenUris, changed);
+        state = await this.workspace.sourceIndex.getState();
+        break;
+      }
+      if (input.allow_partial) {
+        if (acceptedPartial) return this.degraded(state, "core:source_provider_partial_coverage");
+        final = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0, undefined, false, true);
+        acceptedPartial = true;
         state = await this.workspace.sourceIndex.getState();
         break;
       }
@@ -606,6 +620,7 @@ export class GenericSourceIndexer {
     publicationCurrentGeneration: number,
     completeObservedUris?: ReadonlySet<string>,
     stagedChanges = false,
+    allowPartial = false,
   ): Promise<SourceIndexApplyResult> {
     const current = await (this.workspace.sourceIndex.currentOccurrencesForIndex
       ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
@@ -711,7 +726,7 @@ export class GenericSourceIndexer {
     // state must not advertise that generation until the completion fragment
     // has reconciled deletions and the complete capture has been confirmed.
     const committedGeneration = complete && changed ? generation : priorState?.current_generation ?? 0;
-    const status = complete ? (changed ? "published" : "equivalent") : "degraded";
+    const status = complete ? (changed ? "published" : "equivalent") : allowPartial ? (changed ? "published" : "equivalent") : "degraded";
     const state = this.nextState(priorState, batch.source_provider_binding_id, watermark, committedGeneration, batch.completed_at, planned, batch.observation_batch_id);
     const commitInput: SourceIndexCommitInput = {
       expected_state_revision: priorState?.state_revision ?? 0,
