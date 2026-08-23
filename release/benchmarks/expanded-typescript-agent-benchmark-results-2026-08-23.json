@@ -5298,6 +5298,35 @@
     "measurement_kind": "clean_host_only_control",
     "transcript_correctness_included": false
   },
+  "optimized_vscode_control": {
+    "commit": "1d34426fbedbbc8f4d0f2fe3af783755831ec75e",
+    "cas_put_concurrency": 16,
+    "source_ready_ms": 171058,
+    "structural_stage_1_ready_ms": 420645,
+    "structural_ready_ms": 441362,
+    "source_catalog_ms": 162375,
+    "plugin_analysis_ms": 59514,
+    "seal_ms": 78671,
+    "publish_ms": 248623,
+    "publish_plan_build_ms": 33597,
+    "publish_sql_transaction_ms": 76813,
+    "measurement_kind": "clean_host_only_control",
+    "transcript_correctness_included": false,
+    "host_log": "/tmp/urdira-vscode-optimized.WZG55p/runner.log"
+  },
+  "optimized_vscode_full_reindex": {
+    "commit": "1d34426fbedbbc8f4d0f2fe3af783755831ec75e",
+    "cas_put_concurrency": 16,
+    "status": "equivalent",
+    "total_ms": 99146,
+    "enumerate_ms": 8537,
+    "source_catalog_ms": 90110,
+    "cas_put_ms": 0,
+    "sqlite_transaction_ms": 24,
+    "measurement_kind": "same_data_root_forced_core_reindex",
+    "transcript_correctness_included": false,
+    "host_log": "/tmp/urdira-vscode-optimized.WZG55p/runner2.log"
+  },
   "campaign_gate": {
     "expected_runs": 32,
     "observed_runs": 32,
