@@ -203,6 +203,11 @@ function rawDigest(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
+/** Provider version tokens bind both the filesystem boundary and exact bytes. */
+function contentVersionToken(boundaryToken: string, contentHash: string): string {
+  return jsonDigest({ boundary_token: boundaryToken, content_hash: contentHash });
+}
+
 /** Incremental logical digest for large ordered metadata collections. */
 function digestFields(fields: readonly string[]): string {
   const hash = createHash("sha256");
@@ -428,19 +433,19 @@ export class DirectorySourceProvider implements SourceProvider {
       try {
         const before = await this.#inspectBoundary(uri, path);
         if (!before.included) throw new SourceProviderOutcomeError("failed", "core:source_provider_artifact_ineligible", "never", "The requested URI is not an eligible source artifact.");
-        if (before.token !== payload.provider_version_token || before.metadata_digest !== payload.observed_metadata_digest) {
+        if (contentVersionToken(before.token, payload.observed_content_hash) !== payload.provider_version_token || before.metadata_digest !== payload.observed_metadata_digest) {
           throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed before reading.");
         }
         const bytes = await this.#fileSystem.read_file(before.target_path);
         if (!this.#included(uri, before, bytes)) throw new SourceProviderOutcomeError("failed", "core:source_provider_artifact_ineligible", "never", "The requested URI is not an eligible source artifact.");
         const after = await this.#inspectBoundary(uri, path, bytes);
         const contentHash = rawDigest(bytes);
-        if (!after.included || before.token !== after.token || after.token !== payload.provider_version_token || contentHash !== payload.observed_content_hash) {
+        if (!after.included || before.token !== after.token || contentVersionToken(after.token, contentHash) !== payload.provider_version_token || contentHash !== payload.observed_content_hash) {
           throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed while reading.");
         }
         return {
           artifact_id: payload.artifact_id,
-          provider_version_token: after.token,
+          provider_version_token: payload.provider_version_token,
           content: bytes,
           content_hash: contentHash,
           byte_length: bytes.byteLength,
@@ -467,7 +472,7 @@ export class DirectorySourceProvider implements SourceProvider {
     if (!isWithinRoot(this.#root, path)) throw new SourceProviderOutcomeError("failed", "core:source_provider_uri_invalid", "never", "The normalized URI escapes the root.");
     const before = await this.#inspectBoundary(uri, path);
     if (!before.included) throw new SourceProviderOutcomeError("failed", "core:source_provider_artifact_ineligible", "never", "The requested URI is not an eligible source artifact.");
-    if (before.token !== input.provider_version_token || before.metadata_digest !== input.observed_metadata_digest) {
+    if (contentVersionToken(before.token, input.observed_content_hash) !== input.provider_version_token || before.metadata_digest !== input.observed_metadata_digest) {
       throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed before reading.");
     }
     if (options.reuse_existing === true) {
@@ -476,7 +481,7 @@ export class DirectorySourceProvider implements SourceProvider {
       // metadata here avoids opening/reading unchanged bytes on a full reindex.
       return {
         artifact_id: input.artifact_id,
-        provider_version_token: before.token,
+        provider_version_token: input.provider_version_token,
         content_hash: input.observed_content_hash,
         byte_length: before.target_stat.size,
         metadata_digest: before.metadata_digest,
@@ -523,7 +528,7 @@ export class DirectorySourceProvider implements SourceProvider {
       after_read: async (contentHash, byteLength) => {
         const after = await this.#inspectBoundary(uri, path);
         const mediaBytes = streamHasNul || !streamValidUtf8 ? new Uint8Array([0]) : new Uint8Array();
-        if (!this.#included(uri, before, mediaBytes) || !after.included || before.token !== after.token || after.token !== input.provider_version_token || contentHash !== input.observed_content_hash || byteLength !== after.target_stat.size) {
+        if (!this.#included(uri, before, mediaBytes) || !after.included || before.token !== after.token || contentVersionToken(after.token, contentHash) !== input.provider_version_token || contentHash !== input.observed_content_hash || byteLength !== after.target_stat.size) {
           throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed while reading.");
         }
       },
@@ -697,6 +702,7 @@ export class DirectorySourceProvider implements SourceProvider {
     const mediaBytes = digest.has_nul || !digest.valid_utf8 ? Uint8Array.of(0) : new Uint8Array();
     if (!this.#included(uri, before, mediaBytes)) return false;
     const after = await this.#inspectBoundary(uri, path, mediaBytes);
+    const versionToken = contentVersionToken(before.token, digest.content_hash);
     files.push({
       uri,
       // Native enumeration is digest-only. The optional byte retention is
@@ -705,8 +711,8 @@ export class DirectorySourceProvider implements SourceProvider {
       ...(digestOnly ? {} : {}),
       content_hash: digest.content_hash,
       metadata_digest: before.metadata_digest,
-      token_before: before.token,
-      token_after: after.included ? after.token : `ineligible:${after.token}`,
+      token_before: versionToken,
+      token_after: after.included ? contentVersionToken(after.token, digest.content_hash) : `ineligible:${after.token}`,
     });
     return after.included && before.token === after.token;
   }
