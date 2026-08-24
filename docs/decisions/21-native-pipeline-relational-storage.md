@@ -85,16 +85,15 @@ in-flight budgets. Closed messages reject duplicate or unknown fields. Boundary
 counters report bytes read, transferred, copied, decoded, and retained; an
 acceptance run fails when a copy is not declared.
 
-## Compatibility and migration
+## Supported data-root boundary
 
-This v2 transport/storage decision is superseded by the destructive v3 data
-root. A v3 daemon has no reader for v1, v2, or early-preview v3 indexes and
+A v3 daemon has no reader for earlier or preview index formats and
 rejects an unsupported index contract with
-`core:index_contract_unsupported`. Legacy inventory and backup are external
+`core:index_contract_unsupported`. Inventory and backup of unsupported roots are external
 administrative actions; activation requires a fresh v3 root and source
 reindexing. CAS content may be reused only when its complete workspace scope,
-length, and digest are verified. No legacy catalog, cursor, staging table, or
-compatibility decoder is opened by the v3 runtime.
+length, and digest are verified. No incompatible catalog, cursor, staging table, or
+compatibility decoder is opened by the current runtime.
 
 ## Readiness and isolation
 
@@ -117,7 +116,7 @@ Large streaming publications apply the same producer-side rule to fixed-width
 `record_occurrences` and `projection_occurrences`: at most 512 occurrence rows
 are assembled per statement, followed by their foreign-key-dependent values,
 facets, and dependencies. Checkpoints and row-change assertions cover the
-whole bounded statement. The legacy small-publication path keeps its shared
+whole bounded statement. The small-publication path keeps its shared
 value writer and one-row occurrence commands, so this optimization changes no
 ordering, conflict, provenance, or replay semantics.
 

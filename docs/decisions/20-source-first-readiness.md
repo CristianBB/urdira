@@ -1,4 +1,4 @@
-# Source-First Readiness and Layered Publication
+# Decision 20: Source-First Readiness and Layered Publication
 
 Status: **Approved**
 
@@ -51,16 +51,15 @@ operations. Source-safe operations are `core:find_artifacts`, source-projection
 `core:search_text`, and artifact-selector `core:get_source`. Pipelines and
 recipes inherit the strongest layer required by any stage.
 
-## API v3 migration
+## Supported API and data-root boundary
 
-This decision authorizes the destructive wire migration to API v3. Index
-status, query, continuation, operation, and recipe requests accept only
+Index status, query, continuation, operation, and recipe requests accept only
 `api_version = 3`. The v3 contract carries all currently supported behavior,
-including source-snapshot bindings and layered readiness; v1/v2 aliases,
-normalizers, and legacy structural-snapshot fallbacks are removed. The v3
-runtime also rejects pre-v3 and early-preview v3 roots; it has no legacy reader
-or in-place migration, and activation requires a fresh data root plus source
-reindexing.
+including source-snapshot bindings and layered readiness; earlier aliases,
+normalizers, and alternate structural-snapshot fallbacks are not accepted. The v3
+runtime also rejects unsupported or preview roots; it has no compatibility
+reader or in-place migration mode, and activation requires a supported data
+root or a fresh source reindex.
 
 The authoritative response shapes are `SourceSnapshot`,
 `WorkspaceReadinessView`, `IndexLayerReadinessView`, and

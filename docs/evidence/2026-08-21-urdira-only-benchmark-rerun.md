@@ -163,7 +163,7 @@ the two VS Code cells were stopped before readiness to avoid an OOM.
 | VS Code / provider idempotence | 56.7 s | not reached; 4,100/12,944 owners | 4.68 GiB | incomplete | stopped before OOM |
 
 The updated four-arm derived report is
-`release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-21.{json,md}`.
+`release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-21.json`.
 Its baseline, codebase-memory, and CodeGraph rows are reused from the previous
 audited campaign; only the eight Urdira rows were replaced by v13 observations.
 The campaign is intentionally non-passing (24/32 overall comparison rows,
@@ -179,7 +179,7 @@ campaign was rerun sequentially on 2026-08-21 with Node `v24.18.1`, model
 5,000,000 KiB. Raw audit: `/tmp/urdira-expanded-urdira-v14-20260821/audit.json`.
 The historical baseline, Codebase Memory, and CodeGraph rows were retained;
 the regenerated report contains the new Urdira observations in
-`release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-21.{json,md}`.
+`release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-21.json`.
 
 | Cell | Source ready | Readiness | Peak RSS | SQLite + CAS | Outcome |
 |---|---:|---:|---:|---:|---|
@@ -241,7 +241,7 @@ source artifacts or 128 MiB of source bytes. The campaign uses Node `v24.18.1`,
 the same model and semantic-index setting as v15, and the 5,000,000 KiB RSS
 guard. Raw audit: `/tmp/urdira-expanded-urdira-v16-20260822/audit.json`.
 The merged report was regenerated from this audit and the historical arms in
-`release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-21.{json,md}`.
+`release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-21.json`.
 
 | Cell | Source ready | Readiness | Peak RSS | Outcome |
 |---|---:|---:|---:|---|

@@ -63,8 +63,10 @@ const discoveryPattern = /urdira_(?:query|context|benchmark_discover)/u;
 // `git diff/status` are explicitly allowed after an edit. A pager such as
 // `git diff ... | head` is still diff review, not repository discovery, so
 // only treat head/tail/awk as fallback readers when they are not a pipeline
-// consumer. Commands that obtain source first (cat/rg/etc.) remain blocked.
-const shellDiscoveryPattern = /(?:^|[\s;&|('"])(?:rg|grep|find|cat)(?=\s)|(?:^|[\s;&|('"])ls\s+-|git\s+ls-files|sed\s+-n|(?<![|]\s)(?:head|tail|awk)\s+/mu;
+// consumer. Commands that obtain source first (cat/rg/etc.) remain blocked,
+// including less-common readers (bat/less/more/nl/strings/xxd/od) and
+// one-liner script readers (python -c/node -e that call open()/readFile*).
+const shellDiscoveryPattern = /(?:^|[\s;&|('"])(?:rg|grep|find|cat|bat|less|more|nl|strings|xxd|od)(?=\s)|(?:^|[\s;&|('"])ls\s+-|git\s+ls-files|sed\s+-n|(?<![|]\s)(?:head|tail|awk)\s+|(?:python3?\s+-c|node\s+-e).*(?:open\(|readFileSync\(|readFile\()/mu;
 const firstEdit = eventIndex(editPattern);
 const firstDiscovery = eventIndex(discoveryPattern);
 const editIndices = transcript.map((event, index) => editPattern.test(JSON.stringify(event)) ? index : -1).filter((index) => index >= 0);

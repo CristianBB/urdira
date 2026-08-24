@@ -27,18 +27,20 @@ the release surface.
 
 The current expanded TypeScript evidence report records one sequential sample
 for each of 32 cells across TypeScript, Playwright, Prisma, and VS Code. The
-Urdira arm was rerun with the final v3 implementation; baseline, codebase-memory, and
-CodeGraph rows are reused from the prior audited campaign and are marked as
-such. A readiness control is not a successful agent task: every Urdira run
-must be accompanied by stage timings, peak RSS, SQLite/CAS sizes, copy
-telemetry when available, and a repository grader result before it enters the
-release aggregate.
+Urdira arm was rerun on 2026-08-24; baseline, codebase-memory, and CodeGraph
+rows are reused from the prior audited campaign and are marked as such. A
+readiness control is not a successful agent task: every Urdira run must be
+accompanied by stage timings, peak RSS, SQLite/CAS sizes, copy telemetry when
+available, a repository grader result, and transcript attribution before it
+enters the release aggregate.
 
-The accepted Urdira rerun completed 8/8 tasks. Transcript-by-transcript review
-confirmed API v3, explicit workspace scope, Urdira discovery before editing,
-post-edit rediscovery through Urdira, and no degradation to native source
-reading in all eight cells. The exact comparison and limitations are recorded
-in the [expanded agent report](../release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.md).
+The Urdira rerun completed 8/8 graded tasks and materially reduced readiness,
+but five discovery calls failed and two cells used narrow native source
+inspection afterward. It is therefore performance evidence, not accepted
+code-intelligence-replacement evidence. The combined 32-cell gate also remains
+false because five reused comparison rows failed. The exact comparison and
+limitations are recorded in the
+[expanded agent report](../release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-24.md).
 
 ## One-time external setup
 

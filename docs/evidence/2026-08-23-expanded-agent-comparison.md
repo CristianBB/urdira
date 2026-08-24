@@ -2,6 +2,11 @@
 
 Date: 2026-08-23
 
+Historical evidence: this report remains the provenance source for comparison
+rows reused by the [2026-08-24 report](../../release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-24.md).
+Its functional-viability conclusion does not describe the later rerun, whose
+native-source fallbacks require the more limited attribution stated there.
+
 ## Scope and provenance
 
 This comparison reruns only the `urdira-typescript` arm with the latest Urdira
@@ -128,7 +133,6 @@ The accepted campaign includes the resulting fixes:
 ## Report artifacts
 
 - `release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.json`;
-- `release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.md`;
 - `release/benchmarks/expanded-typescript-agent-benchmark.json`.
 
 This campaign is a functional and comparative observation, not a P95

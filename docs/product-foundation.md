@@ -1,27 +1,22 @@
 # Urdira Product Foundation
 
-Status: Living decision record  
-Last updated: 2026-08-23
+Status: Current product contract
+Last updated: 2026-08-24
 
 ## Purpose of this document
 
-This document records the product decisions agreed during Urdira's initial architecture definition and links to their authoritative specifications. Release-bound component selections remain governed by explicit evaluation gates rather than being mistaken for architectural gaps.
+This document defines the current product boundary and links to the active
+architecture specifications. It does not retain rejected proposals, superseded
+designs, or implementation diaries.
 
 For a map of the repository documentation and the authority rules between
 decisions, registries, audits, evidence, and implementation records, see the
 [documentation guide](README.md).
 
-## Decision specification index
+## Current specification index
 
-Detailed decisions are maintained as separate specifications so that every unresolved design area has an explicit scope and completion state.
-
-Status meanings:
-
-- **In progress**: the design is actively being defined and contains approved decisions, but it is not complete.
-- **Pending definition**: the decision area and constraints are known, but its formal design has not started.
-- **Approved and implemented**: the specification is normative and represented
-  by the current production code. Historical rejected or superseded outcomes
-  remain labelled explicitly.
+Each linked specification describes behavior implemented or required by the
+current architecture.
 
 | Order | Decision area | Status | Specification |
 |---:|---|---|---|
@@ -35,30 +30,25 @@ Status meanings:
 | 8 | Performance, reliability, and evaluation | Approved | [Performance, reliability, and evaluation](decisions/08-performance-reliability-evaluation.md) |
 | 9 | Configuration, security, and lifecycle | Approved | [Configuration, security, and lifecycle](decisions/09-configuration-security-lifecycle.md) |
 | 10 | Daemon, MCP integration, and packaging | Approved | [Daemon, MCP integration, and packaging](decisions/10-daemon-mcp-packaging.md) |
-| 11 | Content-derived record identity | Approved | [Content-derived record identity](decisions/11-content-derived-record-identity.md) |
-| 12 | Workspace fork | Approved | [Workspace fork](decisions/12-workspace-fork.md) |
-| 13 | Transactional projection digests | Approved | [Transactional projection digests](decisions/13-transactional-projection-digests.md) |
-| 14 | Plugin upgrade relock | Approved | [Plugin upgrade relock](decisions/14-plugin-upgrade-relock.md) |
-| 15 | Durable analysis cache | Approved | [Durable analysis cache](decisions/15-durable-analysis-cache.md) |
-| 16 | Semantic search wiring | Approved | [Semantic search wiring](decisions/16-semantic-search-wiring.md) |
-| 17 | Entity-grain semantic documents | Approved | [Entity-grain semantic documents](decisions/17-entity-grain-semantic-documents.md) |
-| 18 | Evaluated semantic model pack | Rejected; outcome recorded | [Evaluated semantic model pack](decisions/18-semantic-model-pack.md) |
+| 11 | Content-derived record identity | Approved and implemented | [Content-derived record identity](decisions/11-content-derived-record-identity.md) |
+| 12 | Workspace fork | Approved and implemented | [Workspace fork](decisions/12-workspace-fork.md) |
+| 13 | Transactional projection digests | Approved and implemented | [Transactional projection digests](decisions/13-transactional-projection-digests.md) |
+| 14 | Plugin resolution continuity | Approved and implemented | [Plugin resolution continuity](decisions/14-plugin-upgrade-relock.md) |
+| 15 | Durable JavaScript/TypeScript analysis cache | Approved and implemented | [Durable analysis cache](decisions/15-durable-analysis-cache.md) |
+| 16 | Semantic search runtime | Approved and implemented | [Semantic search runtime](decisions/16-semantic-search-wiring.md) |
+| 17 | Entity-grain semantic documents | Approved and implemented | [Entity-grain semantic documents](decisions/17-entity-grain-semantic-documents.md) |
+| 18 | Semantic model provisioning | Approved and implemented | [Semantic model provisioning](decisions/18-semantic-model-provisioning.md) |
 | 19 | Coding-agent search integration | Approved and implemented | [Coding-agent search integration](decisions/19-agent-search-integration.md) |
-| 20 | Source-first readiness and layered publication | Approved | [Source-first readiness and layered publication](decisions/19-source-first-readiness.md) |
+| 20 | Source-first readiness and layered publication | Approved and implemented | [Source-first readiness and layered publication](decisions/20-source-first-readiness.md) |
 | 21 | Native pipeline and relational storage | Approved and implemented in v3 | [Native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md) |
 | 22 | v3 bounded pipelines, incremental digests, and destructive data-root boundary | Approved and implemented | [v3 optimization](decisions/22-v3-optimization.md) |
+| 23 | Cross-machine index pack bootstrap | Approved and implemented | [Index pack](decisions/23-index-pack.md) |
 
-The order reflects design dependencies, not implementation sequencing. A later specification may be explored early, but it cannot be marked approved while it relies on an unresolved upstream contract.
-
-Decision 21 supersedes the previous universal byte-serialization assumptions.
-Its native buffers, relational rows, logical digest writer, and explicit
-process-boundary policy are authoritative for the current v3 indexing
-pipeline. Decision 22 defines the destructive v3 wire/index boundary while
-retaining all public operations and evidence guarantees. The
-[current architecture](architecture.md) maps these decisions to the production
-composition roots.
-
-The final pre-implementation consistency review passed with no remaining blocking definitions. Its non-authoritative evidence and exact counts are recorded in the [final architecture consistency audit](audits/2026-08-08-final-architecture-audit.md).
+The order expresses dependency between current specifications. Decisions 21
+and 22 define the v3 native pipeline, relational authority, logical digests,
+and data-root boundary. Decision 23 defines optional verified index-pack
+bootstrap. The [current architecture](architecture.md) maps these contracts to
+the production composition roots.
 
 `decisions/01-universal-data-model.md` is the complete inventory and source of truth for shared logical model names and shapes. Operation-specific public argument schemas are linked from that inventory to the single authoritative [Public query contract](protocol/public-query-contract.md); no document may define a parallel or legacy variant.
 
@@ -73,11 +63,11 @@ Stable registries governed by the decision specifications are documented separat
 | Plugin compatibility issue codes | Approved initial registry | Universal data model | [Plugin compatibility issue codes](compatibility/plugin-compatibility-issue-codes.md) |
 | Core candidate issue codes | Approved initial registry | Universal data model | [Core candidate issue codes](indexing/core-candidate-issue-codes.md) |
 | Core semantic registry | Approved initial registry | Semantic search and ranking | [Core semantic registry](semantic/core-semantic-reasons.md) |
-| Urdira v3 native pipeline and logical digests | Approved and implemented; supersedes universal byte serialization | Native pipeline and relational storage | [Native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md) |
-| Core digest field contracts | Historical v1 reference; not used by the v3 hot path | Native pipeline and relational storage | [Core digest field contracts](serialization/core-digest-field-contracts.md) |
-| Core canonical schemas | Historical v1 reference; not used by the v3 hot path | Native pipeline and relational storage | [Core canonical schemas](serialization/core-canonical-schemas.md) |
-| Core canonical comparators | Historical v1 reference; not used by the v3 hot path | Native pipeline and relational storage | [Core canonical comparators](serialization/core-canonical-comparators.md) |
-| Core canonical encoding errors | Historical v1 reference; not emitted by v3 storage/IPC | Native pipeline and relational storage | [Core canonical encoding errors](serialization/core-canonical-encoding-error-codes.md) |
+| Urdira v3 native pipeline and logical digests | Approved and implemented | Native pipeline and relational storage | [Native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md) |
+| Logical digest field contracts | Current logical registry | Native pipeline and relational storage | [Core digest field contracts](serialization/core-digest-field-contracts.md) |
+| Logical schemas | Current logical registry | Native pipeline and relational storage | [Core canonical schemas](serialization/core-canonical-schemas.md) |
+| Logical comparators | Current logical registry | Native pipeline and relational storage | [Core canonical comparators](serialization/core-canonical-comparators.md) |
+| Logical value and digest errors | Current logical registry | Native pipeline and relational storage | [Logical value error codes](serialization/core-canonical-encoding-error-codes.md) |
 | Core operation error codes | Approved initial registry | Query algebra and public API | [Core operation error codes](protocol/core-operation-error-codes.md) |
 | Public query contract | Approved initial contract | Query algebra and public API | [Public query contract](protocol/public-query-contract.md) |
 | Core intent recipes | Approved initial registry | Query algebra and public API | [Core intent recipes](protocol/core-intent-recipes.md) |
@@ -365,60 +355,41 @@ The agent should not need a separate code-search or repository-exploration tool 
 
 ## Search strategy
 
-Urdira will combine complementary retrieval mechanisms:
+Urdira combines four current retrieval mechanisms:
 
-- **Lexical search** for names, exact text, and regular expressions.
-- **Semantic search** for concepts, intent, and similar implementations when vocabulary differs.
-- **Structural analysis** for resolved symbols and demonstrable relationships.
-- **Structural ranking** for architectural importance, proximity, and relevance.
+- **Lexical search** for exact text, names, and regular expressions.
+- **Semantic search** for concepts and vocabulary-independent discovery.
+- **Structural analysis** for resolved symbols and proven relationships.
+- **Structural ranking** for deterministic relevance and proximity.
 
-Semantic search is a discovery mechanism, not a source of structural truth. A semantic match may identify candidate entities, after which Urdira resolves them against the structured model and expands their verified relationships.
+Semantic similarity is discovery evidence, never proof of a structural
+relationship. Structural claims remain backed by canonical records,
+dependencies, relations, and exact source evidence.
 
-Embeddings must never be presented as proof that two code elements are structurally related.
+Eligible textual artifacts and source entities have separate semantic
+documents. Profile-specific vectors are rebuildable projections pinned to one
+structural generation and one exact provider identity. Source changes close
+obsolete semantic rows before replacements become current, and every query
+reports semantic coverage.
 
-Every indexed textual artifact has a complete artifact-level semantic view, while source entities have additional precise views. Documents are model-independent; profile-specific segments and canonical vector bytes are rebuildable projections. Source changes remove obsolete semantic projections immediately, and newly scheduled vectors may arrive through later projection-only generations. Queries always report semantic coverage so an agent can distinguish a complete empty result from temporarily incomplete retrieval.
+Urdira owns rendering, windowing, embedding, exact vector retrieval, lane
+fusion, ranking, caching, and pagination. Language plugins contribute
+model-independent semantic preparation with exact source mappings; they do not
+execute models or receive query text.
 
-Urdira owns every embedding profile, model, tokenizer, renderer, segmenter, generator, inference runtime, asset, and vector-space contract. The 0.1 line uses the core-owned local `Xenova/all-MiniLM-L6-v2` profile. Its weights are not shipped: a confirmed configuration operation downloads them with a visible notice, after which startup, indexing, querying, pagination, and replay remain offline. Language plugins contribute model-independent semantic sections, language-aware regions, exact source mappings, and an optional ordered list recommending core profiles; they never declare profile compatibility, package, or execute embedding infrastructure. Profile contracts are the sole compatibility source. The core alone constructs model input, generates and stores vectors, performs exact retrieval, fuses and ranks lanes, caches executions, and paginates results. No query input is sent to plugin code.
+The default local provider uses `Xenova/all-MiniLM-L6-v2`. Its assets are not
+part of Urdira release archives and are acquired only through an explicit
+configuration operation with a visible provisioning result. Startup,
+indexing, querying, pagination, replay, and maintenance remain offline. The
+complete rule is [semantic model provisioning](decisions/18-semantic-model-provisioning.md).
 
-The model-pack schemas and lifecycle rules below remain implemented compatibility and storage contracts, but no model pack is bundled, published, or active in the 0.1 distribution. The explicit rejection and permanent configure-time acquisition flow are recorded in [decision 18](decisions/18-semantic-model-pack.md). Reintroducing a distributed pack requires a new owner decision.
+Provider identity pins every output-affecting model/runtime/configuration
+coordinate. A provider change creates a new semantic materialization; vectors
+from another identity are never silently reused or mixed. Missing model assets
+degrade only semantic availability and never disable source or structural
+indexing.
 
-A model pack has one delivery-independent identity: a deterministic canonical manifest committing to the complete set of digest-addressed assets. Identical blobs are stored once in Urdira's local content-addressed store. Offline bundles include the manifest and every required blob; an explicitly requested online installation may obtain the same blobs through non-authoritative external delivery locators. URLs, mirrors, credentials, compression, and archive layout never affect identity. Installation becomes visible atomically only after complete local verification. Indexing and queries never download or lazily fetch model content.
-
-Model packs use no signing keys, signatures, trust store, certificates, or authenticated publisher identity. An administrator authorizes one exact manifest digest explicitly. Digests prove byte identity and integrity, not authorship or endorsement; publisher, provenance, license, evaluation, catalog, and source-location claims remain unauthenticated metadata. The same pack ID and version with another manifest digest is a hard collision and cannot replace or outrank the approved content implicitly.
-
-The canonical identity of a pack is `model_pack_id + model_pack_version + manifest_digest`. The ID is stable and namespaced within an installation, the version is normalized SemVer 2.0.0, and the digest covers the complete immutable canonical manifest except itself. Reinstalling the exact triple is idempotent. Any canonical change requires another version; the same coordinates with different content are invalid.
-
-Each manifest embeds one or more complete `EmbeddingProfile` definitions in canonical profile-ID order. Definitions are validated and their `profile_digest` values recomputed before model assets are opened; they are never indirect files or remotely resolved metadata. Several packs may contain the same exact profile only when its complete four-role runtime requirements and its segmenter and generator runtime configurations also match; Urdira then deduplicates the portable binding while retaining pack references. Reusing a profile ID with another definition, runtime requirement, or runtime configuration is an activation collision.
-
-Each asset is represented by `ModelPackAssetEntry` and identified only by the digest of its exact decoded bytes. Byte length, canonical media type, and a closed semantic role are validation metadata; asset IDs, names, paths, URLs, archive members, and CAS locations have no canonical meaning. Declarative model/tokenizer manifests reference same-pack subordinate blobs by digest and make shard order explicit. Identical blobs are physically shared even when used by several packs.
-
-The closed `ModelPackManifest` contains exactly seven fields: its schema version, pack ID, immutable SemVer, complete embedded profiles, complete assets, complete required core runtime components, and its self-excluding digest. No publisher, signature, descriptive, timestamp, delivery, filesystem, or installation-state field belongs to the canonical manifest.
-
-For each embedded profile, four `ModelPackRuntimeRequirement` entries pin the exact platform-neutral document renderer, query renderer, segmenter, and generator behavior by component ID, behavior release, behavior digest, and contract version. All four roles are mandatory and unique; packs contain no operating-system or architecture-specific build identity and cannot express alternatives, ranges, fallbacks, dynamic discovery, or executable implementations.
-
-Each profile also has exactly two typed `ModelPackRuntimeConfiguration` assets: one for its segmenter and one for its generator. Each envelope repeats the exact profile, role, component, version, and contract binding; selects the closed configuration schema already registered by that exact core component; contains a fully Schema-IR-validated typed value; and commits everything through `configuration_digest`. The segmenter digest equals the profile's segmentation contract. The generator digest is copied into indexed vectors, semantic materializations, and query-vector bindings, so indexing and querying cannot diverge. Environment variables, paths, arbitrary flags, platform probing, and adaptive defaults are forbidden.
-
-If model-pack delivery is approved in a future version, pack ID/version coordinates permanently reserve one manifest digest locally. Each uninterrupted installation and each installation-to-profile supply are monotonic occurrences; removal followed by reinstall creates new occurrences without allowing another manifest to reuse the version.
-
-Installation derives one canonical portable binding per profile from its profile digest, four runtime requirements, two runtime configurations, and complete operational asset closure. Exact portable bindings deduplicate across packs. Active supplies make one eligible for new workspace configurations; existing configurations, materializations, snapshots, and query executions can retain their exact executable binding after the last supply is removed. Active packs root every asset, while retained bindings root only operational assets and resolved runtime builds. Removal releases roots and global reachability collection performs physical deletion safely.
-
-The portable profile binding is resolved against four exact locally installed Urdira runtime builds only when a workspace configuration is activated. The resulting executable binding pins every build and implementation digest. Therefore one model pack works across supported systems while existing vectors are never silently reinterpreted: moving an index to a host without the exact builds requires rebuilding its semantic materialization, while canonical structural knowledge remains portable.
-
-Each profile's model identity resolves to one same-pack `ModelAssetManifest`. It fixes provider, model, immutable revision, core-supported architecture and format, ordered configuration assets, and non-empty ordered weight shards. The logical `model_identity_digest` covers those logical fields; the separate asset content digest covers the immutable CAS bytes. No loader code, path, implicit sidecar, or cross-pack asset lookup is permitted.
-
-Each tokenizer identity similarly resolves to one same-pack `TokenizerAssetManifest`. It fixes tokenizer ID, immutable revision, core-supported format, optional ordered configuration assets, and non-empty ordered tokenizer data. The two lists are disjoint and their positions are format-defined. Segmenter and generator must support that exact format; no environment vocabulary, sidecar, path, download, or tokenizer code is allowed.
-
-Document and query input templates are direct strict UTF-8 `text/plain` assets rather than nested manifests. Storage and template domains independently digest the same bytes. The exact core renderer contract defines a closed placeholder and escaping vocabulary; templates cannot import files or assets, access environment or network state, or contain executable expressions.
-
-Embedding profiles declare indexed programming or content languages separately from supported structural query classes (`natural_text`, `identifier`, `source_code`, and `mixed`). Urdira never attempts to infer whether a project, comment, identifier, or query is written in English, Spanish, or another human language. Multilingual quality is evaluated as a model property and cannot create a routing or completeness claim.
-
-Generic-versus-specialized embedding fallback is resolved only through versioned workspace configuration before indexing. For each plugin semantic scope, the default resolver chooses the first available, allowed recommendation compatible under the profile's own contract; when none qualifies, it chooses Urdira's compatible generic profile. Explicit workspace policy may replace that default. Once a snapshot and materialization pin a profile, asset or generator failure cannot substitute another model silently. It degrades semantic coverage for that profile; a generic profile can continue only when it was already activated as its own independently identified lane. Switching future work requires another configuration revision and new materialization.
-
-Normal agent queries never select embedding profiles. Urdira automatically uses every active profile compatible with the pinned source scope and structural query class, searches each vector space independently, and fuses the resulting lanes in the core. Installed inactive profiles are ignored. Every selected lane contributes independently to completeness, so another profile covering the same artifacts cannot hide a pending or failed lane. The complete lane set and its coverage remain fixed through all cursor pages.
-
-Core embedding profiles are activated independently from language plugins. Missing or unhealthy model assets never disable otherwise valid parsing, symbol resolution, evidence, or structural indexing. A configuration that requires a profile is validated atomically before publication; failures after successful activation affect semantic coverage only.
-
-## Initial operation families
+## Public operation families
 
 The approved stable operation registry covers the following families. Exact operation identifiers and request contracts are defined in the [query algebra and public API](decisions/03-query-algebra-public-api.md).
 
@@ -601,7 +572,7 @@ Stable operations should share a common response envelope. Where applicable, a r
 
 The API must distinguish compiler- or analyzer-proven facts from heuristic or semantic inferences.
 
-## Approved model direction
+## Current model
 
 The logical model is an extensible, source-owned, temporally versioned record system. It represents small composable knowledge rather than storing precomputed answers to every possible agent question.
 
@@ -618,17 +589,14 @@ Language-specific extensions use registered namespaced kinds, facets, relations,
 
 Relational persistence, native worker transfer, and incremental logical digest computation are governed by Decision 21. Public MCP requests and responses remain concise JSON projections and are never hashed directly. Every digest field has one explicit computed or referenced contract pinned by the registry snapshot.
 
-## Architecture definition status
+## Contract maintenance
 
-The 22 linked decision specifications and recorded outcomes collectively define
-the implemented architecture. Concrete release artifacts—such as the exact
-bundled model-pack coordinate, TypeScript compiler release, supported minimum
-operating-system versions, and benchmark corpus commits—are selected by the
-documented release gates and recorded in release manifests; they are not
-unresolved architectural behavior.
+The 23 linked specifications collectively define the current implemented
+architecture. Exact compiler/runtime versions, supported release targets, and
+benchmark corpus commits are recorded in release manifests and evidence.
 
-The current milestone is qualification of the implemented v3 system against
-these contracts. Any implementation discovery that would change identity,
-ownership, exactness, evidence, completeness, plugin isolation, query
-semantics, storage durability, privacy, or compatibility requires a new
-decision revision rather than an undocumented implementation shortcut.
+A change to identity, ownership, exactness, evidence, completeness, plugin
+isolation, query semantics, storage durability, privacy, or compatibility must
+update its owning specification in the same change. The public documentation
+retains the resulting current contract, not superseded drafts or decision
+debate.

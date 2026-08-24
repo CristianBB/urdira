@@ -35,8 +35,9 @@ describe("Phase 12 closed CLI", () => {
     expect(() => parseCliArgs(["status", "--payload", "{}"])).toThrowError(CliError);
   });
 
-  // Owner decision 2026-08-13 (docs/decisions/18-semantic-model-pack.md
-  // Outcome): a configure RPC that downloads the embedding model must print
+  // The current provisioning contract
+  // (`docs/decisions/18-semantic-model-provisioning.md`) requires a configure
+  // RPC that downloads the embedding model to print
   // a clear notice, never download silently. The daemon (`runtime.ts`)
   // attaches a `semantic_model` field to `core:workspace_add`/
   // `core:workspace_configure`/`core:configuration_set` responses whenever

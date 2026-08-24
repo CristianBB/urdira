@@ -60,4 +60,26 @@ describe("API v3 query admission", () => {
       expect(details["example"]).toBeTruthy();
     }
   });
+
+  it("rejects bindings nested inside a stage's arguments with a pointer back to the sibling-field fix", () => {
+    try {
+      buildQueryAdmissionPlan(request({
+        expression_type: "pipeline",
+        stages: [
+          { stage_id: "search", stage_type: "operation", operation: "core:search_text", arguments: { pattern: "needle", syntax: "literal", word_mode: "substring" } },
+          { stage_id: "source", stage_type: "operation", operation: "core:get_source", arguments: { source: { mode: "relevant", max_characters_per_snippet: 1000, max_total_characters: 1000, context_lines: 0 }, bindings: { subjects: { stage_id: "search", output: "subjects" } } } },
+        ],
+        outputs: [{ name: "sources", stage_id: "source", output: "sources" }],
+      } as never));
+      throw new Error("expected validation error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(QueryPlanError);
+      const details = (error as QueryPlanError).details;
+      expect((error as QueryPlanError).code).toBe("core:stage_reference_invalid");
+      expect((error as QueryPlanError).message).toContain("sibling field of arguments");
+      expect(details["object_pointer"]).toBe("/stages/1/arguments/bindings");
+      expect(details["received"]).toEqual({ subjects: { stage_id: "search", output: "subjects" } });
+      expect(details["example"]).toBeTruthy();
+    }
+  });
 });

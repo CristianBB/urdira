@@ -322,47 +322,42 @@ and [protocol](release/benchmarks/vite-agent-lifecycle-map-benchmark.md).
 The expanded campaign covers four frozen GitHub repositories—TypeScript,
 Playwright, Prisma, and VS Code—with two implementation tasks per repository
 and four arms: baseline, Urdira with the JavaScript/TypeScript engine,
-codebase-memory MCP, and CodeGraph. The current comparison reran only Urdira
-with the final v3 build on Node `v24.18.1`; the 24 baseline,
-codebase-memory, and CodeGraph rows are unchanged reused results from the
-original audited comparison and are explicitly marked as not re-executed.
+codebase-memory MCP, and CodeGraph. The 2026-08-24 comparison reran only Urdira
+on Node `v24.18.1`; the 24 baseline, codebase-memory, and CodeGraph rows are
+unchanged reused results from the prior audited comparison and are explicitly
+marked as not re-executed.
 
 | Arm | Correct | Median total time | Median tokens | Median estimated cost | Discovery MCP passed |
 |---|---:|---:|---:|---:|---:|
 | Baseline | 6/8 | 172.2 s | 2.06 M | $4.27 | n/a |
-| Urdira TypeScript v3 | 8/8 | 504.8 s | 2.41 M | $4.94 | 380/388 |
+| Urdira TypeScript v3 | 8/8 | 369.4 s | 2.00 M | $4.08 | 206/211 |
 | Codebase-memory MCP | 6/8 | 212.6 s | 4.01 M | $8.20 | historical metric unavailable |
 | CodeGraph | 7/8 | 259.5 s | 2.67 M | $5.61 | historical metric unavailable |
 
-Urdira reached the complete structural frontier in every repository, from
-38.8 s for TypeScript to 472.6 s for VS Code. The VS Code cells peaked at
-4,483,904 and 4,550,176 KiB RSS, below the 5,000,000 KiB guard. Transcript
-review confirmed 380 directly completed discovery operations and eight typed
-`core:selector_ambiguous` narrowing responses, with no unexpected MCP failure.
-All 388 requests used API v3 and an explicit workspace. Every agent used
-Urdira before editing and rediscovered the changed code through Urdira; none
-degraded to native source-reading tools.
+Urdira reached the benchmark readiness boundary in every repository, from
+30.7 s for TypeScript to 316.2 s for VS Code. The VS Code cells peaked at
+4,921,168 and 4,804,240 KiB RSS, below the 5,000,000 KiB guard. Relative to the
+2026-08-23 Urdira rerun, median total time fell from 504.8 s to 369.4 s and
+median token use from 2.41 M to 2.00 M.
 
-The accepted rerun therefore supports Urdira as a functionally viable
-code-intelligence alternative for this protocol, and it was the only arm to
-pass 8/8 tasks. It is not yet performance-competitive: its median total time
-was 504.8 s, about 193% slower than baseline, and VS Code readiness alone took
-about 7.8 minutes. Median token use and estimated cost were about 40% lower
-than codebase-memory and about 10% and 12% lower than CodeGraph, but about 17%
-and 16% higher than baseline.
+The correctness and attribution result is more limited than the timing result.
+All eight repository graders passed, but five of 211 discovery calls failed;
+two were request-validation failures, and two cells used narrow native source
+inspection after an MCP failure. There were no IPC timeouts or
+incomplete-coverage responses. Because the graded changes cannot all be
+attributed to successful Urdira retrieval, this rerun does not support a claim
+that Urdira is a code-intelligence replacement under this protocol. It is also
+one sample per cell, not a P95 result.
 
 The campaign also records missing repository dependencies such as `vitest` or
 Playwright build artifacts; these do not turn a grader result into a test-pass
 claim. Setup time, per-run tokens, estimated cost, MCP failure counts,
 correctness evidence, readiness, and both provenance digests are in the
-[expanded JSON report](release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.json)
-and [expanded Markdown report](release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.md),
+[expanded JSON report](release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-24.json)
+and [expanded Markdown report](release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-24.md),
 with the [benchmark corpus and task contract](release/benchmarks/expanded-typescript-agent-benchmark.json).
-This is one sequential sample per cell and therefore establishes observed
-behavior, not a P95 claim. Each Urdira transcript was accepted before the next
-cell started; rejected attempts drove fixes to bounded source retrieval,
-lexical fallback, MCP rendering and request guidance, watcher rearming, and
-post-edit freshness waits. P95 fields remain ineligible until three independent
+The combined 32-cell gate remains false because five reused comparison rows
+failed their graders. P95 fields remain ineligible until three independent
 campaigns are explicitly supplied.
 
 These agent campaigns are comparative product evidence. Stable release

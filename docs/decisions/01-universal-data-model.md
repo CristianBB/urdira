@@ -2497,7 +2497,7 @@ PluginAnalysisChange
 - `to_plugin_version` is present when the plugin exists in the candidate lock.
 - `from_analysis_digest` is present when the base plugin can produce canonical output.
 - `to_analysis_digest` is present when the candidate plugin can produce canonical output.
-- `reanalysis_scope` is `none`, `affected_artifacts`, or `all_plugin_artifacts`. `all_plugin_artifacts` means every source artifact selected by the plugin's base or candidate applicability rules, including newly applicable artifacts. The first implementation uses it whenever `analysis_digest` changes; future component-level digests may safely narrow it.
+- `reanalysis_scope` is `none`, `affected_artifacts`, or `all_plugin_artifacts`. `all_plugin_artifacts` means every source artifact selected by the plugin's base or candidate applicability rules, including newly applicable artifacts. The current contract uses it whenever `analysis_digest` changes.
 - `reason_codes` is the non-empty deduplicated set explaining the selected scope, including unchanged entries only when another dependency or configuration change invalidates their output.
 
 ### Normative compatibility matrix

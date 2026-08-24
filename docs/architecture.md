@@ -2,7 +2,7 @@
 
 Status: Implemented Urdira v3 architecture
 
-Last updated: 2026-08-23
+Last updated: 2026-08-24
 
 This guide is the implementation map for the current Urdira v3 codebase. It
 does not introduce product behavior: the linked decisions and protocols remain
@@ -17,6 +17,8 @@ The system has three invariants that explain most design choices:
   structural, and semantic readiness may advance independently; and
 - query stages exchange bounded, sealed sets rather than retaining another
   in-memory copy of the indexed corpus.
+- every performance shortcut has the same verified result and an explicit
+  fallback to the authoritative synchronous or from-source path.
 
 ## Package and dependency direction
 
@@ -40,6 +42,7 @@ flowchart TD
   Engine --> PluginSDK["@urdira/plugin-sdk"]
   Engine --> Contracts["@urdira/contracts"]
   Engine --> Canonical["@urdira/canonical"]
+  Engine -. "bounded worker threads" .-> Workers["digest and pack-verification workers"]
   Storage --> Security["@urdira/security"]
   Storage --> Contracts
   Storage --> Canonical
@@ -54,19 +57,26 @@ flowchart TD
 `runFullWorkspaceScan` is the composition root for one scan. It captures a
 stable source observation, updates the source catalog, analyzes only the
 required artifact closure, accepts bounded FactDelta batches, seals a
-candidate, and asks storage to publish it atomically. Source bytes are streamed
-to CAS and worker boundaries transfer native buffers; JSON is not a persistence
-or digest representation.
+candidate, and asks storage to publish it atomically. The directory provider's
+bounded prefetch hand-off lets cataloging consume the bytes already captured by
+native enumeration. Native plugin workers then read immutable CAS references;
+JSON is not a persistence or digest representation.
 
 ```mermaid
 flowchart LR
-  Observe["Directory or Git provider\nAsyncIterable bytes"] --> Catalog["GenericSourceIndexer\nsource catalog and CAS"]
+  Observe["Directory or Git provider\nnative batches and bounded byte hand-off"] --> Catalog["GenericSourceIndexer\nsource catalog and CAS"]
   Catalog --> SourceReady["source snapshot\nsource_ready"]
   Catalog --> Plan["candidate plan\nchanged owner closure"]
   Plan --> Analyze["language plugin\nFactDelta"]
   Analyze --> Batch["bounded FactDeltaBatch\n4 MiB or 4096 rows"]
+  Analyze -. "compacted record strings" .-> RecordDigests["MaterializationRecordDigestPipeline\none bounded worker"]
   Batch --> Stage["SQLite candidate staging\nreceipt and sequence checks"]
-  Stage --> Seal["CandidateMaterializer.seal\ncounts, digests, templates"]
+  Batch --> Accumulate["record template accumulator"]
+  RecordDigests --> Accumulate
+  Stage --> Seal["CandidateMaterializer.sealAsync\ncounts, digests, templates"]
+  Accumulate --> Seal
+  Seal -. "two corpus-scale ordered sets" .-> SealWorkers["MaterializationDigestOffload\nbounded workers or sync fallback"]
+  SealWorkers --> Publish
   Seal --> Publish["atomic publication\nimmutable generation"]
   Publish --> StructuralReady["structural snapshot\nstructural_ready"]
   Publish --> Lexical["FTS5 reconciliation\nexact byte verification"]
@@ -79,13 +89,52 @@ from the last actually published generation and republishes the uncommitted
 source transition; it never mistakes the catalog's newest row for published
 structural state.
 
+The digest workers are scheduling optimizations, not authorities. The record
+pipeline returns only successful batches to the accumulator; every skipped or
+failed batch is hashed synchronously. `sealAsync` similarly falls back to the
+same in-process recipes. Count and digest checks still run before publication.
+
+## First-generation acceleration and fallback
+
+New workspaces keep one correctness path even when reuse is available. A local
+fork reuses a verified donor inside the same installation. An explicitly
+supplied index pack crosses a trust boundary, so `attemptIndexPackImport`
+validates its manifest and local source multiset, verifies record bodies while
+streaming into an isolated scratch database, then reuses the fork copy and
+publication machinery. Any failure rolls back before the ordinary scan starts.
+
+```mermaid
+flowchart TD
+  Add["workspace-add with explicit root"] --> Fork{"compatible local donor?"}
+  Fork -->|yes| LocalVerify["local fork copy and verify"]
+  LocalVerify --> Ready["ready generation"]
+  Fork -->|no| Pack{"explicit index pack?"}
+  Pack -->|yes| Import["attemptIndexPackImport\nmanifest + local multiset"]
+  Import --> StreamVerify["stream scratch rows\nrecord verification workers"]
+  StreamVerify --> Copy["bounded bulk copy\npost-copy anchors and ownership"]
+  Copy -->|verified| Ready
+  Import -->|skip or failure| Rollback["rollback scratch/target attempt"]
+  StreamVerify -->|corrupt| Rollback
+  Copy -->|mismatch| Rollback
+  Pack -->|no| Scan["runProgressiveWorkspaceScan"]
+  Rollback --> Scan
+  Scan --> Ready
+```
+
+Pack export and import are defined by [Decision 23](decisions/23-index-pack.md).
+The pack carrier is portable gzip/NDJSON, but imported knowledge becomes normal
+relational/CAS state; queries never read from the pack itself.
+
 ## Watchers, reconciliation, and progressive publication
 
 The daemon coalesces filesystem events and supersedes an older scan with a new
-cancellation signal. `runProgressiveWorkspaceScan` reuses one prepared source
-capture across the ordered plugin stages. Every stage checks that its direct
-predecessor is still current before publishing, so a concurrent source change
-cannot append structural facts to the wrong snapshot.
+cancellation signal. A workspace whose first scan has not yet reached
+`ready`/`degraded` stays protected from its own trailing initial watcher backlog,
+even after an intermediate stage has published a snapshot.
+`runProgressiveWorkspaceScan` reuses one prepared source capture across the
+ordered plugin stages. Every stage checks that its direct predecessor is still
+current before publishing, so a concurrent source change cannot append
+structural facts to the wrong snapshot.
 
 ```mermaid
 sequenceDiagram
@@ -216,8 +265,11 @@ itself.
 | Concern | Primary code | What to read there |
 |---|---|---|
 | Scan composition | `packages/engine/src/workspace-indexing-session.ts` | `runFullWorkspaceScan` documents the frozen base, source catalog, candidate, seal, and publish phases. `runProgressiveWorkspaceScan` owns ordered structural stages. |
+| JavaScript/TypeScript extraction | `packages/plugin-javascript-typescript/src/analyzer.ts` | `analyzeProject` creates one immutable TypeScript project, `walkFiles` owns per-file extraction, and `assembleAnalysis` owns global covers, sorting, and dependency closures. Incremental sessions reuse the same two extraction phases. |
 | Source catalog and CAS | `packages/engine/src/source-indexer.ts` | `GenericSourceIndexer` validates stable observations and commits source occurrences. |
 | Candidate lifecycle | `packages/engine/src/candidate-indexer.ts` and `candidate-materialization.ts` | Candidate state transitions, replacement scopes, immutable templates, and sealing. |
+| Digest scheduling | `packages/engine/src/materialization-record-digest-pipeline.ts` and `materialization-digest-offload.ts` | Fail-safe record-digest overlap, ordered-set worker offload, batching, and synchronous fallbacks. |
+| Index pack bootstrap | `packages/engine/src/index-pack.ts`, `index-pack-verify-core.ts`, and `workspace-fork.ts` | Portable streaming carrier, untrusted verification, bounded copy, rollback, and scan fallback. |
 | Atomic storage publication | `packages/storage/src/publication-authority.ts` | Bounded command streams, phase checkpoints, immutable-row assertions, and current-pointer swap. |
 | Query admission | `packages/engine/src/query-plan.ts` | API v3 normalization, stage dependency validation, operation versions, budgets, and plan digest. |
 | Query lifecycle | `packages/engine/src/query-execution.ts` | `QueryEngine.execute` evaluates once, persists both manifest directions, pages, and cleans up the spool. |
@@ -230,6 +282,8 @@ itself.
 
 For normative detail, read [Decision 04](decisions/04-workspace-snapshot-incremental-indexing.md),
 [Decision 05](decisions/05-storage-projection-architecture.md),
+[Decision 20](decisions/20-source-first-readiness.md),
 [Decision 21](decisions/21-native-pipeline-relational-storage.md),
-[Decision 22](decisions/22-v3-optimization.md), and the
+[Decision 22](decisions/22-v3-optimization.md),
+[Decision 23](decisions/23-index-pack.md), and the
 [public query contract](protocol/public-query-contract.md).

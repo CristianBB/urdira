@@ -412,8 +412,9 @@ describe("ensureLocalEmbeddingModel (configure-time model provisioning)", () => 
   });
 
   it("calls on_download_start exactly once, with the resolved model_id and cache_dir, right before the allow_download: true attempt -- never when the offline attempt alone succeeds", async () => {
-    // Owner decision 2026-08-13 (docs/decisions/18-semantic-model-pack.md
-    // Outcome): a configure RPC must observe "a download is starting" BEFORE
+    // Current provisioning contract
+    // (docs/decisions/18-semantic-model-provisioning.md): a configure RPC must
+    // observe "a download is starting" BEFORE
     // it happens, so it can log it and never let it run silently. This is
     // the exact seam that observability hangs off -- see
     // `packages/daemon/src/semantic-provider-runtime.ts`'s `ensureSemanticAssets`.

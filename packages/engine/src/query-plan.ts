@@ -150,9 +150,24 @@ function validatePipelineContract(expression: QueryExpression): void {
  * they are never expanded into the upstream result array.
  */
 function normalizePipelineV3(expression: PipelineV3Expression): QueryExpression {
-  const stages = expression.stages.map((stage) => {
+  const stages = expression.stages.map((stage, stageIndex) => {
     if (!isRecord(stage) || typeof stage.stage_id !== "string" || typeof stage.stage_type !== "string" || !isRecord(stage.arguments)) {
       invalid("core:request_invalid", "Every v3 pipeline stage requires stage_id, stage_type and arguments.");
+    }
+    // `bindings` is a stage-level sibling of `arguments`, never a key inside
+    // it -- but an object shaped like `{arguments: {..., bindings: {...}}}`
+    // parses fine as a closed operation-argument object with an extra
+    // field, so a misplaced `bindings` silently vanishes into `{}` here and
+    // only resurfaces many lines later as a confusing "operation_arguments.
+    // <field> is required" error that never mentions bindings at all. Catch
+    // the exact misplacement at the door with a pointer back to the fix.
+    const misplacedBindings = (stage.arguments as Record<string, unknown>)["bindings"];
+    if (!isRecord(stage.bindings) && isRecord(misplacedBindings)) {
+      invalid("core:stage_reference_invalid", `Stage ${String(stage.stage_id)} has bindings nested inside arguments; bindings must be a sibling field of arguments at the stage level, not a key inside it.`, {
+        object_pointer: `/stages/${stageIndex}/arguments/bindings`,
+        received: misplacedBindings,
+        example: { stage_id: stage.stage_id, stage_type: stage.stage_type, operation: (stage as Record<string, unknown>)["operation"], arguments: Object.fromEntries(Object.entries(stage.arguments as Record<string, unknown>).filter(([key]) => key !== "bindings")), bindings: misplacedBindings },
+      });
     }
     const bindings = isRecord(stage.bindings) ? stage.bindings : {};
     const bindingSelector = (binding: unknown): unknown => {

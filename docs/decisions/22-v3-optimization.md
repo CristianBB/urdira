@@ -45,8 +45,8 @@ reverse iterator for backward cursors), so the executor does not first build a
 JavaScript array for the complete result. Only the final response page is
 hydrated. A stage without an explicit completeness report is `unknown`, never
 implicitly `complete`, and signed cursor claims preserve that report across
-continuations. Legacy `QueryDataPort` adapters that
-do not advertise `consumes_stage_handles` retain the v2 selector-array
+continuations. `QueryDataPort` adapters that do not advertise
+`consumes_stage_handles` retain the selector-array
 compatibility path; the canonical SQLite adapter consumes stage-output tokens
 with the execution-local handles, and relation joins retain only identity and
 stable-key maps rather than duplicating full payload arrays.
@@ -57,9 +57,8 @@ incremental writers. The canonical record-set digest streams the exact
 canonical array recipe. The first publication consumes already ordered record
 opens directly; later publications merge the prior ordered corpus with opens
 and closures. This uses O(1) digest-writer auxiliary memory and one hash per
-visible member, avoiding the prefix-map allocation and repeated hashing of the
-superseded fanout-16 Merkle radix implementation. No aggregate JSON array is
-materialized. v2 index, cursor and plan formats are not binary-compatible.
+visible member. No aggregate JSON array is materialized. Earlier index, cursor,
+and plan formats are not accepted by the current runtime.
 
 Plugin projection sets use the same v3 logical writer at the worker boundary.
 The execution and materialisation validators accept the pre-existing canonical
@@ -77,6 +76,16 @@ computed. The canonical package memoizes a digest only for that exact frozen
 array identity and mapping. Publication may reuse that seal-time digest for
 the in-process array; reconstructed, mutable and recovery inputs still undergo
 complete canonical verification.
+
+On an eligible first publication, record-body digests may be computed by one
+bounded worker while plugin analysis is still producing compact FactDeltas.
+The main thread retains digest strings only and assembles templates after
+analysis, preserving the analysis-memory boundary. At seal time the two
+corpus-scale ordered-set digests may run on two bounded workers while the main
+thread prepares the remaining materialization. Both optimizations fail closed
+to the synchronous recipes: a skipped delta, worker error, count mismatch, or
+disabled worker leaves the logical bytes, descriptor, and publication checks
+unchanged.
 
 For a large initial identity set, materialisation may replace the full
 assignment object with the closed
@@ -103,14 +112,14 @@ pointer swap remain in the same publication transaction; rollback restores the
 empty indexed schema. Incremental generations keep every index online and use
 the ordinary point-update path.
 
-## Migration
+## Supported data-root boundary
 
-On startup a v3 daemon rejects every pre-v3 or early-preview v3 data root with
-typed `core:index_contract_unsupported`. There is no legacy reader,
+On startup a v3 daemon rejects every unsupported or preview data root with
+typed `core:index_contract_unsupported`. There is no compatibility reader,
 compatibility adapter, in-place upgrade or table backfill. An operator may
-inventory and back up a legacy root out of process, but the runtime requires a
+inventory and back up an unsupported root out of process, but the runtime requires a
 fresh v3 root and reindexes source observations from scratch. CAS objects may
-be reused only when scope, byte length and SHA-256 digest all verify. A legacy
+be reused only when scope, byte length and SHA-256 digest all verify. An unsupported
 root is never attached to the v3 daemon.
 
 ## Operational budgets
@@ -124,8 +133,8 @@ independently, so semantic materialization never blocks source or structural
 queries.
 
 Lexical candidate generation uses SQLite FTS5 with the trigram tokenizer and
-always verifies candidates against the stored document bytes. The v3 schema is
-destructive: the historical relational trigram projection and its indexes are
-not migrated or recreated. If FTS5 is not complete for a generation, the
+always verifies candidates against the stored document bytes. Relational
+trigram projection tables are not part of the current schema. If FTS5 is not
+complete for a generation, the
 query falls back to an exact selected-scope scan and reports the corresponding
 freshness/completeness state; it never returns an approximate result.

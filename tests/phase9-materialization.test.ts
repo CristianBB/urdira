@@ -5,6 +5,7 @@ import type { CandidateMaterialization, CandidateProjectionTemplate, IndexCandid
 import { canonicalBytes, digestBytes, digestCanonicalArray, memoizedCanonicalArrayDigest, memoizedPackedIdentityTriple } from "@urdira/canonical";
 import { canonicalSha256 as pluginCanonicalSha256 } from "@urdira/plugin-sdk";
 import { CandidateMaterializer, CandidateRecordTemplateAccumulator, MaterializationDigestOffload, compactAcceptedFactDelta, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
+import { MaterializationRecordDigestPipeline } from "../packages/engine/src/materialization-record-digest-pipeline.js";
 
 const candidate = (): IndexCandidate => ({ candidate_generation_id: "candidate:materialization", workspace_id: "workspace:1", target_registry_snapshot_id: "registry:target", target_configuration_revision_id: "config:target", trigger_kind: "source_change", state: "ready", source_observation_batch_ids: [], issue_ids: [], created_at: "2026-08-10T00:00:00.000Z" });
 
@@ -526,6 +527,36 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     const fallbackSealed = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }), mismatched);
     expect(fallbackSealed.materialization).toEqual(syncSealed.materialization);
   }, 30_000);
+
+  it("keeps record-digest batching and worker failure fallback outside workspace scan orchestration", async () => {
+    const first = compactAcceptedFactDelta({
+      ...acceptedDelta([record("pipeline-a", "body-a")]),
+      delta: { ...acceptedDelta([]).delta, fact_delta_id: "delta:pipeline-a", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+    const second = compactAcceptedFactDelta({
+      ...acceptedDelta([record("pipeline-b", "body-b")]),
+      delta: { ...acceptedDelta([]).delta, fact_delta_id: "delta:pipeline-b", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+    let calls = 0;
+    let closed = false;
+    const pipeline = new MaterializationRecordDigestPipeline({
+      digestRecords: async (records) => {
+        calls += 1;
+        if (calls === 2) throw new Error("synthetic worker failure");
+        return records.map(() => `sha256:${"1".repeat(64)}`);
+      },
+      close: () => { closed = true; },
+    }, 1);
+
+    pipeline.accept(first);
+    pipeline.accept(second);
+    const completed = await pipeline.drain();
+    pipeline.close();
+
+    expect(completed).toEqual([{ delta: first, digests: [`sha256:${"1".repeat(64)}`] }]);
+    expect(pipeline.completedFactDeltaIds).toEqual(new Set(["delta:pipeline-a"]));
+    expect(closed).toBe(true);
+  });
 
   // (1c) The packed-identity triple memo: seal() memoizes
   // `identity_assignment_id`/`identity_id`'s hex suffix/`identity_key_digest`

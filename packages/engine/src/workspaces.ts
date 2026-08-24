@@ -30,6 +30,22 @@ export interface RegisteredWorkspace {
   readonly selected_plugin_ids?: ReadonlyArray<string>;
   readonly reconciliation_operation_id?: string;
   readonly current_snapshot_id?: string;
+  // Distinct from `current_snapshot_id`: that field is already set by
+  // `markStructuralStagePublished` the moment the FIRST intermediate
+  // structural stage of the workspace's very first scan publishes, while
+  // `status` stays `"indexing"` for the rest of that same scan. A caller
+  // (`packages/daemon/src/runtime.ts`'s `scheduleWorkspaceScan`) that reads
+  // `current_snapshot_id === undefined` to mean "this is the first scan,
+  // protect it from being aborted by its own checkout's trailing watcher
+  // events" stops being protected the instant stage 1 publishes -- the
+  // scan's own later stages then race the tail of that initial checkout's
+  // watcher backlog and can lose repeatedly, never converging on a large
+  // enough repository. This field stays false until `markReady` (or
+  // `resume`) completes a scan to `"ready"`/`"degraded"` for the first
+  // time, and never resets afterward, so it identifies "no scan has EVER
+  // fully finished" for the workspace's whole lifetime, not just "no
+  // snapshot has published yet within the current scan attempt."
+  readonly has_completed_first_scan?: boolean;
   readonly status: WorkspaceStatus;
   readonly registered_at: string;
   readonly relocated_at?: string;
@@ -335,7 +351,7 @@ export class WorkspaceRegistry {
     // (`packages/daemon/src/runtime.ts`'s catch block calls
     // `recordScanFailure` before this) -- so those fields must survive.
     const { last_scan_error: _error, last_scan_error_at: _errorAt, ...cleared } = publishable;
-    return this.replace(workspaceId, { ...(status === "ready" ? cleared : publishable), current_snapshot_id: snapshotId, status });
+    return this.replace(workspaceId, { ...(status === "ready" ? cleared : publishable), current_snapshot_id: snapshotId, status, has_completed_first_scan: true });
   }
 
   /**
@@ -409,6 +425,7 @@ export class WorkspaceRegistry {
         source_state_fingerprint: result.source_state_fingerprint,
         current_snapshot_id: result.snapshot_id,
         status: result.status,
+        has_completed_first_scan: true,
       });
     });
   }

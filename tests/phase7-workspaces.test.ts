@@ -273,8 +273,31 @@ describe("Phase 7 workspace lifecycle", () => {
       status: "degraded",
       current_snapshot_id: "snapshot:two",
       source_state_fingerprint: "fingerprint:two",
+      has_completed_first_scan: true,
     });
     expect(resumed).not.toHaveProperty("reconciliation_operation_id");
+  });
+
+  // Regression for the initial-scan livelock: a large first checkout's own
+  // watcher backlog can keep arriving after structural stage 1 progressively
+  // publishes (which already sets `current_snapshot_id` while `status` is
+  // still `"indexing"`). `packages/daemon/src/runtime.ts`'s
+  // `scheduleWorkspaceScan` must keep treating the scan as "first ever" for
+  // its whole duration -- reading `current_snapshot_id === undefined` instead
+  // of this field would flip that protection off the moment stage 1
+  // publishes, letting the checkout's own trailing events abort stage 2+.
+  it("keeps has_completed_first_scan false through an intermediate structural stage publish, true only once markReady runs", () => {
+    const workspaces = registry();
+    const workspace = workspaces.register(registration("/repo"));
+    workspaces.beginReconciliation(workspace.workspace_id);
+
+    const midScan = workspaces.markStructuralStagePublished(workspace.workspace_id, "snapshot:stage-1");
+    expect(midScan).toMatchObject({ status: "indexing", current_snapshot_id: "snapshot:stage-1" });
+    expect(midScan.has_completed_first_scan).toBeFalsy();
+    expect(workspaces.get(workspace.workspace_id)?.has_completed_first_scan).toBeFalsy();
+
+    const ready = workspaces.markReady(workspace.workspace_id, "snapshot:final");
+    expect(ready.has_completed_first_scan).toBe(true);
   });
 
   it("does not expose a resumed workspace as queryable without a snapshot", async () => {

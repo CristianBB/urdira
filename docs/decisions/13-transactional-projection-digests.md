@@ -1,34 +1,36 @@
 # Transactional Projection Digests
 
-Status: **Approved**
-Last updated: 2026-08-13
-Depends on: [Storage/projection architecture](05-storage-projection-architecture.md), [Workspace fork](12-workspace-fork.md)
+Status: **Approved and implemented**
+Last updated: 2026-08-24
+Depends on: [Storage architecture](05-storage-projection-architecture.md) and [workspace fork](12-workspace-fork.md)
 
-## Decision objective
+## Current contract
 
-Stop `projectionSetDigestEntries` (`packages/storage/src/lifecycle.ts`) from re-digesting the "lexical" projection kind at every candidate publish. Lexical rows are maintained asynchronously, after the publish transaction commits, so a publish-time digest of them was stale by construction the moment the post-`ready` rebuild landed — this was pure wasted work paid on every incremental publish, not a correctness feature.
+`Snapshot.projection_set_digests` covers only projection families committed in
+the snapshot publication transaction: `graph`, `dependency`, `metric`, and
+`vector`. All four entries are present even when their row count is zero.
 
-## Context
+Lexical FTS rows are maintained asynchronously after structural publication
+and are therefore excluded from snapshot projection digests. Their integrity
+is checked against document CAS content and their generation-specific
+reconciliation state.
 
-`buildCandidatePublicationPlan` calls `computeSnapshotDigestFields`, which calls `projectionSetDigestEntries` to compute the `projection_set_digests` field stored on every new snapshot. The historical implementation measured on a real 981-file workspace (177k records, 1.32M visible lexical trigram rows) spent ~35-40s of a publish's fixed cost scanning and digesting the redundant lexical projection.
+Within a projection family, entries are ordered by the plain UTF-16 code-unit
+ordering of `projection_record_id`. Locale-sensitive comparison is forbidden.
+Each `content_digest` covers the exact stored deterministic logical payload;
+the implementation does not decode and re-encode an already verified payload
+merely to calculate the same digest.
 
-This cost bought nothing: `lexical_documents`/`lexical_fts` are not written inside the publish transaction at all. They are rewritten afterward, by the post-`ready` lexical reconciler (`packages/engine/src/lexical-reconciler.ts`, now running in a worker thread), which reconciles the FTS5 index against whatever generation is current at the time it runs. A `projection_set_digests` value computed at publish time therefore describes rows that are guaranteed to be rewritten shortly after, and does not describe what the reconciler actually leaves behind. `verify()` independently validates lexical document CAS content; snapshot projection digests remain limited to transactional projections.
-
-## Decision
-
-- `projectionSetDigestEntries` now covers **transactional** projection kinds only: `graph`, `dependency`, `metric`, `vector`. All four are still always present as entries, even with zero rows, preserving the existing shape consumers expect. The `lexical` entry and its supporting query are removed entirely.
-- Entries within a kind are ordered by plain UTF-16 code-unit comparison of `projection_record_id`, not `String.prototype.localeCompare`. `localeCompare` was both the slower comparator at this scale and locale-dependent, which made the digest value liable to vary by machine locale — a defect independent of the lexical-exclusion change, fixed alongside it since it touches the same sort call.
-- `content_digest` for each entry is now `digestBytes(bytes(payload))` — the digest of the exact stored canonical bytes — instead of `digestBytes(encodeCanonical(decodeCanonical(bytes(payload))))`. Every payload in these tables is written via `encodeCanonical` at publish (`artifactDependencyCommands`/`projectionCommands`, `packages/storage/src/publication-authority.ts`), copied byte-for-byte by a workspace fork's bulk copy, and re-encoded canonically by migration adapters — so for every payload actually reachable through this function, decode-then-re-encode is an identity transform. Skipping it removes a full decode+encode+hash pass over every transactional projection row, on top of dropping the lexical rows entirely.
+Ordinary publication and workspace-fork publication both use the shared
+`projectionSetDigestEntries` recipe. Verification recomputes the same four
+transactional entries, so later lexical reconciliation cannot invalidate a
+published snapshot anchor.
 
 ## Consequences
 
-- A freshly published snapshot's `projection_set_digests` now verifies cleanly against `verify()`'s own recomputation, and **stays** clean across any number of subsequent lexical reconciler rebuilds — the previous behavior was clean only until the next lexical rebuild landed.
-- Snapshots published *before* this change stored a 5-entry array (lexical included) computed against whatever lexical rows existed at that publish moment. `verify()` recomputes only 4 entries now, so it reports `storage:projection_set_digest_corrupt` for every such older snapshot unconditionally. This is not a regression: any of those snapshots whose lexical index was rebuilt even once after its own publish (the normal case for a `ready` workspace) already failed this check under the old scheme too. `isKnownPreexistingVerifyGap` already excuses this error code for exactly this reason and needs no change.
-- Incremental candidate publish drops roughly 35-40s of fixed cost per publish on a large workspace (measured on the 981-file/177k-record/1.3M-trigram benchmark), independent of how many records actually changed.
-- `computeForkSnapshotDigestFields` (`packages/storage/src/publication-authority.ts`), which also calls `projectionSetDigestEntries` for a workspace fork's generation-1 publish, gets the identical benefit with no code change of its own — it already deferred entirely to this shared function.
-
-## Non-goals
-
-- The v3 lexical reconciler maintains `lexical_documents`/`lexical_fts`; the legacy relational trigram projection is not migrated or recreated. Its post-ready scheduling remains unchanged.
-- No new integrity check for lexical content. Lexical rows remain excluded from snapshot-level integrity the same way `graph_edges`/`metric_projections`/`vector_*` were already excluded from a fork's bulk-copy set (decision 12) for being non-authoritative or independently rebuildable.
-- No backfill or migration of existing snapshots' stored `projection_set_digests`. The pre-existing verify gap already covers them, and rewriting historical snapshot rows is out of scope.
+- Snapshot integrity describes only rows that are transactionally stable with
+  that snapshot.
+- Lexical correctness is explicit and independently rebuildable.
+- Ordering and digest output are deterministic across host locales.
+- No query or publication path may treat an asynchronous cache as part of an
+  immutable snapshot digest.

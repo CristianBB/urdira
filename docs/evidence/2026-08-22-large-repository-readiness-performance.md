@@ -34,7 +34,7 @@ The campaign gate passed with `expected_runs=8`, `successful_runs=8`, and
 `f005f58bd7add8c496ab060e185be78c101ed466daf995c7f3a7fc078630693a`.
 Raw transcripts and host logs remain outside the repository; the derived,
 sanitized report is committed as
-`release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-22.{json,md}`.
+`release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-22.json`.
 
 ## Final measurements
 

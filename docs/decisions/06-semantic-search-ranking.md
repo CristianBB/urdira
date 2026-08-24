@@ -42,7 +42,9 @@ Physical indexes, caches, pruning strategies, and parallel execution are impleme
 
 Exact retrieval is distinct from semantic coverage and evidentiary certainty. When embeddings are pending, unsupported, or failed, an accepted partial-coverage query evaluates exactly over the vectors that the pinned materialization declares available and reports the missing scope through `SemanticCoverageView` and `CompletenessReport`. It must not imply that the candidate set is exhaustive for the intended source scope. A request requiring complete semantic coverage follows the approved wait-and-error behavior. Semantic similarity remains candidate discovery even when both retrieval and coverage are complete; structural claims still require independent evidence.
 
-An explicitly non-authoritative exploratory retrieval operation may be considered in a future contract if measured repository-scale requirements justify it. It is not part of the initial agent-facing API and cannot be introduced as a physical optimization beneath an existing exact operation.
+There is no non-authoritative exploratory or approximate retrieval operation in
+the public contract, and a physical optimization cannot introduce one beneath
+an exact operation.
 
 ## Deterministic hybrid rank fusion
 
@@ -60,7 +62,11 @@ Urdira does not use one universal ranking configuration for every investigation.
 
 The normalized operation plan resolves exactly one ranking profile for each ranked result set. The selected profile pins its identifier, version, definition digest, base-fusion contract, lane roles and parameters, structural and architectural features, calibration rules, and canonical ordering tuple. A named recipe version resolves the same profile version until the recipe itself is versioned; a stable operation resolves through the execution's pinned API and configuration revisions. Any change capable of changing membership or order requires a new profile version and therefore changes the normalized query-plan hash.
 
-The initial agent-facing API does not accept arbitrary lane weights, rank constants, feature coefficients, or calibration functions. The agent states intent through the stable operation or recipe and may use its declared semantic filters and options; it does not construct a numeric ranking model. This keeps MCP requests concise and prevents accidental selection of incomparable or unevaluated weights. Future expert customization would require a core-owned, validated, and versioned query profile through a contract explicitly separate from language-plugin contributions; a plugin can never supply or override ranking behavior.
+The agent-facing API does not accept arbitrary lane weights, rank constants,
+feature coefficients, or calibration functions. The agent states intent
+through the stable operation or recipe and may use its declared semantic
+filters and options; it does not construct a numeric ranking model. Plugins
+cannot supply or override ranking behavior.
 
 Normal agent requests and responses contain no ranking-profile selector, profile identity, score, weight, feature value, calibration value, or contribution field. Query materialization pins the exact profile binding internally until execution expiry, while the immutable result manifests preserve only the final order and the non-ranking data required for hydration. Intermediate ranking values may be discarded once materialization succeeds.
 
@@ -106,7 +112,8 @@ Rational values use a canonical reduced signed-numerator and positive-denominato
 
 During materialization, every computed contribution is bound to its feature code and version, raw typed value or declared missing state, calibrated value, profile weight, and exact contribution. The profile definition and digest pin the ordered feature set, coefficients, fusion parameters, aggregation rule, and canonical tie-breaking tuple. Changing any of those values creates a new profile version. These intermediate values are validated before ordering but need not be persisted or exposed after the ordered manifest is committed.
 
-Learned rerankers are outside the initial public contract. A future learned profile would require a separately versioned deterministic model contract, pinned model assets, reproducible inference, evaluation thresholds, and an explanation contract; it cannot replace a transparent profile beneath the same identifier or version.
+Learned rerankers are not part of the public contract and cannot replace a
+transparent profile beneath an existing identifier or version.
 
 ### Artifact and entity candidate normalization
 
@@ -205,7 +212,7 @@ Embedding fallback is a configuration-resolution decision made before indexing, 
 
 Once a profile has been selected for a materialization, missing assets, runtime incompatibility, generation failure, or temporary unavailability cannot cause Urdira to emit vectors from another profile under that materialization. A generic vector is not a substitute for a specialized vector even when both cover the same source language. Their profile identifiers, input contracts, dimensions, bytes, metrics, and vector spaces remain distinct.
 
-A selected-profile failure therefore produces `pending`, `failed`, `unsupported`, or `unavailable` semantic state under the approved coverage rules. Queries may continue only with other profiles that were already independently activated and materialized, and their lanes remain explicit. Moving future work to a generic or replacement profile requires another configuration revision and new materialization; retained snapshots and cursor-pinned executions keep their original profile bindings.
+A selected-profile failure therefore produces `pending`, `failed`, `unsupported`, or `unavailable` semantic state under the approved coverage rules. Queries may continue only with other profiles that were already independently activated and materialized, and their lanes remain explicit. Selecting a generic or replacement profile requires another configuration revision and new materialization; retained snapshots and cursor-pinned executions keep their original profile bindings.
 
 ### Automatic active-lane selection
 

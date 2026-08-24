@@ -17,7 +17,7 @@ Define the local process architecture, MCP adapter, workspace registry access, i
 - Urdira does not modify source files or expose arbitrary commands.
 - MCP exposes active plugin, resolution-lock, capability, and activation-attempt status but cannot mutate plugin state.
 - Runtime plugin contracts, registry contracts, package versions, capability contracts, stored-index decoders, and public query API versions negotiate independently under exact persisted locks.
-- Urdira ships one core-owned local code embedding provider, but no model weights or preinstalled model pack. The approved 0.1 flow downloads `Xenova/all-MiniLM-L6-v2` only during an explicitly confirmed configuration operation, reports the download to the user, and remains offline during startup, indexing, querying, pagination, and replay. This 2026-08-13 owner decision in [decision 18](18-semantic-model-pack.md) supersedes earlier preinstalled-pack requirements. Language-plugin packages cannot contain embedding models, tokenizers, renderers, segmenters, generators, or inference runtimes.
+- Urdira ships one core-owned local code embedding provider, but no model weights or preinstalled model pack. The current flow downloads `Xenova/all-MiniLM-L6-v2` only during an explicitly confirmed configuration operation, reports the download to the user, and remains offline during startup, indexing, querying, pagination, and replay, as defined by [semantic model provisioning](18-semantic-model-provisioning.md). Language-plugin packages cannot contain embedding models, tokenizers, renderers, segmenters, generators, or inference runtimes.
 - One canonical deterministic model-pack manifest and its digest-addressed asset set define the logical installation independent of delivery. Every asset records its exact digest, decoded byte length, media type, and semantic role, and every declared asset is mandatory for that pack identity. The local content-addressed store deduplicates identical blobs across packs.
 - An offline distribution may bundle the manifest and all blobs. An explicit online administrative installation may retrieve the same blobs using delivery locators stored outside the canonical manifest. URLs, mirrors, credentials, transport headers, compression, and archive layout are non-authoritative and cannot change pack identity.
 - Pack publication is atomic after complete local verification. The daemon never downloads models during startup, indexing, query execution, pagination, or replay; missing local content produces explicit unavailable state until administrative repair.
@@ -79,7 +79,8 @@ Over stdio, `notifications/cancelled` maps the referenced MCP request to its pri
 
 Modern MCP request metadata is carried in every JSON-RPC request; it selects MCP behavior only and never supplies hidden Urdira scope. The adapter implements `server/discover`, advertises only the static tools capability, and uses no `initialize`/`initialized` handshake or MCP session identifier on modern connections. A legacy opening uses the initialization lifecycle required by its negotiated 2025-era revision through the official v2 SDK path, pins that connection's wire era, and remains isolated from modern behavior and Urdira scope.
 
-An optional future network MCP transport must be a separate security design. The initial daemon does not bind TCP, HTTP, WebSocket, or a remotely reachable MCP endpoint.
+The daemon does not bind TCP, HTTP, WebSocket, or any remotely reachable MCP
+endpoint.
 
 ## Progress and cancellation
 
@@ -137,7 +138,8 @@ Neither npm package bundles Node.js. During confirmed runtime preparation, platf
 
 Publication is staged from the production allowlist rather than from the workspace manifests directly. The runtime package and complete dependency closure publish before the bootstrap, whose embedded runtime coordinate must match exactly. The staging gate rejects bootstrap dependencies, `workspace:*` ranges, private or test-only dependencies, missing license/readme files, source/test payloads, and version drift. Official npm publication uses npm trusted publishing with provenance after the package namespace and workflow are configured; the initial namespace bootstrap may require a one-time interactive publish by an organization owner.
 
-No model pack is published or bundled in the 0.1 line. A future proposal to reintroduce one must first supersede the explicit rejection in decision 18.
+No model pack is published or bundled. Release inspection rejects model assets
+inside production archives.
 
 Plugin packages contain one logical manifest and may contain several explicitly listed executable builds. Installation selects one verified compatible build; package and build digests are pinned separately. The initial project publishes no implicit online plugin dependency resolver. Administrators install an explicit local `.urdira-plugin` bundle whose complete closure is present.
 

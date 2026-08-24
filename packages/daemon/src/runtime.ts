@@ -1676,7 +1676,22 @@ export class DaemonRuntime {
           // starve a workspace whose sweep interval is shorter than a scan.
           // Keep an authoritative-delete scan alive so its tombstone can be
           // published before a queued successor presence.
-          const initialScan = registry.get(workspaceId)?.current_snapshot_id === undefined;
+          //
+          // Deliberately `has_completed_first_scan`, not `current_snapshot_id
+          // === undefined`: a large first checkout (tens of thousands of
+          // files) delivers its own creation events to the watcher in many
+          // chunks over many seconds, sometimes well after the workspace's
+          // first structural stage has already progressively published (which
+          // sets `current_snapshot_id` while `status` is still `"indexing"`).
+          // Reading `current_snapshot_id` here would let a later chunk of that
+          // SAME checkout's own backlog masquerade as a real edit and abort
+          // stage 2+ of the very scan it belongs to -- repeatedly, since each
+          // retry republishes stage 1 and races the next backlog chunk again,
+          // sometimes for longer than a scan takes to finish. Gating on
+          // "has any scan for this workspace EVER reached ready/degraded"
+          // instead keeps the whole first scan protected regardless of how
+          // many intermediate stages it progressively publishes along the way.
+          const initialScan = !(registry.get(workspaceId)?.has_completed_first_scan);
           if (changedUris !== undefined && changedUris.length > 0 && !initialScan && pending.authoritativeDeletes.size === 0 && !activeAuthoritativeDeletePhases.has(workspaceId)) scanControllers.get(workspaceId)?.abort();
           return;
         }

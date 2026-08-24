@@ -1121,8 +1121,8 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       // time this response has landed, the fake `build`'s SECOND (successful)
       // attempt must already have run and activated the provider.
       expect(buildAttempts).toBe(2);
-      // The visible download notice (owner decision 2026-08-13,
-      // docs/decisions/18-semantic-model-pack.md Outcome): the fake `ensure`
+      // The visible download notice from the current provisioning contract
+      // (`docs/decisions/18-semantic-model-provisioning.md`): the fake `ensure`
       // above reports `"downloaded"`, so this same response -- the RPC that
       // triggered the download -- must carry it back verbatim.
       expect((added.payload as { readonly semantic_model?: unknown }).semantic_model).toEqual({ status: "downloaded", model_id: "fake/hash-model" });
@@ -1252,8 +1252,9 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
   }, 120_000);
 });
 
-// Owner decision 2026-08-13 (docs/decisions/18-semantic-model-pack.md
-// Outcome): a configure RPC that needs to download the embedding model must
+// The current provisioning contract
+// (`docs/decisions/18-semantic-model-provisioning.md`) requires a configure RPC
+// that needs to download the embedding model to
 // carry a visible notice, never download silently. The "fresh-install
 // activation" test above already covers the absent-model/"downloaded" case
 // end-to-end (including a real first scan); these tests isolate the

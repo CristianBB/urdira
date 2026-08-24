@@ -1,0 +1,5279 @@
+{
+  "report_version": 1,
+  "generated_at": "2026-08-24T15:16:21.186Z",
+  "benchmark": {
+    "campaign_id": "expanded-typescript-agent-2026-08-24T13:57:06.329Z",
+    "generated_at": "2026-08-24T13:57:06.329Z",
+    "corpus": "release/benchmarks/expanded-typescript-agent-benchmark.json",
+    "model": "gpt-5.6-luna",
+    "node": "v24.18.1",
+    "samples_per_cell": 1,
+    "independent_campaigns": 1,
+    "arms": [
+      "baseline",
+      "urdira-typescript",
+      "codebase-memory",
+      "codegraph"
+    ],
+    "repositories": [
+      {
+        "id": "typescript",
+        "repository": "microsoft/TypeScript",
+        "commit": "b465fdbfe175304d9b977da137b2c178ae1091d3",
+        "tasks": [
+          {
+            "id": "transpile-diagnostic-callback",
+            "complexity": "medium"
+          },
+          {
+            "id": "session-project-event-hook",
+            "complexity": "high"
+          }
+        ]
+      },
+      {
+        "id": "playwright",
+        "repository": "microsoft/playwright",
+        "commit": "644132a6326cb12b0549b0f3c57071143c22b2bb",
+        "tasks": [
+          {
+            "id": "affected-tests-deterministic",
+            "complexity": "medium"
+          },
+          {
+            "id": "reporter-error-isolation",
+            "complexity": "high"
+          }
+        ]
+      },
+      {
+        "id": "prisma",
+        "repository": "prisma/prisma",
+        "commit": "0f37454eec96b193e8b20e8f569e453acd2af644",
+        "tasks": [
+          {
+            "id": "wire-name-validation",
+            "complexity": "medium"
+          },
+          {
+            "id": "mongo-value-set-transform",
+            "complexity": "high"
+          }
+        ]
+      },
+      {
+        "id": "vscode",
+        "repository": "microsoft/vscode",
+        "commit": "038b9225c82c6b75172beda6081c64887692538c",
+        "tasks": [
+          {
+            "id": "language-registry-change-notification",
+            "complexity": "medium"
+          },
+          {
+            "id": "language-provider-registration-idempotence",
+            "complexity": "high"
+          }
+        ]
+      }
+    ],
+    "successful_runs": 27,
+    "failed_runs": 5,
+    "expected_runs": 32,
+    "campaign_gate": {
+      "passed": false
+    },
+    "reused_arms": [
+      "baseline",
+      "codebase-memory",
+      "codegraph"
+    ],
+    "rerun_status": "complete",
+    "rerun_observed_runs": 8,
+    "rerun_expected_runs": 8
+  },
+  "price_card_usd_per_million_tokens": {
+    "input": 2,
+    "output": 8,
+    "reasoning": 8
+  },
+  "source_audit": {
+    "sha256": "sha256:d8d50123add436434057db73b3e4938a007944c9ac0a74b949a72d3b36c0e018",
+    "raw_evidence": "Raw transcripts and host logs remain outside the repository; this report contains their derived metrics and grader evidence."
+  },
+  "reused_comparison": {
+    "report": "release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-23.json",
+    "source_audit": {
+      "sha256": "sha256:75f502b1163a4123c37ee153e7fec5c0a7a913adbff5d8d2ec5e03c7c6a4f61f",
+      "raw_evidence": "Raw transcripts and host logs remain outside the repository; this report contains their derived metrics and grader evidence."
+    }
+  },
+  "groups": {
+    "typescript:transpile-diagnostic-callback:baseline": {
+      "count": 1,
+      "successful": 0,
+      "setup_elapsed_ms": {
+        "median": 647,
+        "mean": 647
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 52940,
+        "mean": 52940,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 207961,
+        "mean": 207961,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 0.433706,
+        "mean": 0.433706,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "typescript:transpile-diagnostic-callback:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 32389,
+        "mean": 32389
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 337041,
+        "mean": 337041,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2445798,
+        "mean": 2445798,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 4.98618,
+        "mean": 4.98618,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 30,
+        "mean": 30
+      },
+      "mcp_failed_calls": {
+        "median": 1,
+        "mean": 1
+      },
+      "mcp_discovery_calls": {
+        "median": 26,
+        "mean": 26
+      },
+      "mcp_discovery_successful_calls": {
+        "median": 25,
+        "mean": 25
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": 1,
+        "mean": 1
+      },
+      "mcp_empty_discovery_calls": {
+        "median": 1,
+        "mean": 1
+      },
+      "mcp_useful_discovery_calls": {
+        "median": 24,
+        "mean": 24
+      },
+      "core_ipc_timeouts": {
+        "median": 0,
+        "mean": 0
+      },
+      "core_coverage_incomplete": {
+        "median": 0,
+        "mean": 0
+      },
+      "request_validation_failures": {
+        "median": 1,
+        "mean": 1
+      }
+    },
+    "typescript:transpile-diagnostic-callback:codebase-memory": {
+      "count": 1,
+      "successful": 0,
+      "setup_elapsed_ms": {
+        "median": 48644,
+        "mean": 48644
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 67957,
+        "mean": 67957,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 345075,
+        "mean": 345075,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 0.711834,
+        "mean": 0.711834,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 11,
+        "mean": 11
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "typescript:transpile-diagnostic-callback:codegraph": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 86618,
+        "mean": 86618
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 204772,
+        "mean": 204772,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2585203,
+        "mean": 2585203,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 5.332856,
+        "mean": 5.332856,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 7,
+        "mean": 7
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "typescript:session-project-event-hook:baseline": {
+      "count": 1,
+      "successful": 0,
+      "setup_elapsed_ms": {
+        "median": 561,
+        "mean": 561
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 239102,
+        "mean": 239102,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 3503306,
+        "mean": 3503306,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 7.213678,
+        "mean": 7.213678,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "typescript:session-project-event-hook:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 31811,
+        "mean": 31811
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 682670,
+        "mean": 682670,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 4377568,
+        "mean": 4377568,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 8.930546,
+        "mean": 8.930546,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 67,
+        "mean": 67
+      },
+      "mcp_failed_calls": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_discovery_calls": {
+        "median": 64,
+        "mean": 64
+      },
+      "mcp_discovery_successful_calls": {
+        "median": 61,
+        "mean": 61
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_empty_discovery_calls": {
+        "median": 4,
+        "mean": 4
+      },
+      "mcp_useful_discovery_calls": {
+        "median": 57,
+        "mean": 57
+      },
+      "core_ipc_timeouts": {
+        "median": 0,
+        "mean": 0
+      },
+      "core_coverage_incomplete": {
+        "median": 0,
+        "mean": 0
+      },
+      "request_validation_failures": {
+        "median": 0,
+        "mean": 0
+      }
+    },
+    "typescript:session-project-event-hook:codebase-memory": {
+      "count": 1,
+      "successful": 0,
+      "setup_elapsed_ms": {
+        "median": 44459,
+        "mean": 44459
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 233295,
+        "mean": 233295,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 7042049,
+        "mean": 7042049,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 14.274916,
+        "mean": 14.274916,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 30,
+        "mean": 30
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "typescript:session-project-event-hook:codegraph": {
+      "count": 1,
+      "successful": 0,
+      "setup_elapsed_ms": {
+        "median": 85135,
+        "mean": 85135
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 317544,
+        "mean": 317544,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 6711991,
+        "mean": 6711991,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 13.668572,
+        "mean": 13.668572,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 10,
+        "mean": 10
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "playwright:affected-tests-deterministic:baseline": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 50,
+        "mean": 50
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 172297,
+        "mean": 172297,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2057856,
+        "mean": 2057856,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 4.270446,
+        "mean": 4.270446,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "playwright:affected-tests-deterministic:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 36359,
+        "mean": 36359
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 274834,
+        "mean": 274834,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 1580542,
+        "mean": 1580542,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 3.244916,
+        "mean": 3.244916,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 26,
+        "mean": 26
+      },
+      "mcp_failed_calls": {
+        "median": 1,
+        "mean": 1
+      },
+      "mcp_discovery_calls": {
+        "median": 22,
+        "mean": 22
+      },
+      "mcp_discovery_successful_calls": {
+        "median": 21,
+        "mean": 21
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": 1,
+        "mean": 1
+      },
+      "mcp_empty_discovery_calls": {
+        "median": 1,
+        "mean": 1
+      },
+      "mcp_useful_discovery_calls": {
+        "median": 20,
+        "mean": 20
+      },
+      "core_ipc_timeouts": {
+        "median": 0,
+        "mean": 0
+      },
+      "core_coverage_incomplete": {
+        "median": 0,
+        "mean": 0
+      },
+      "request_validation_failures": {
+        "median": 1,
+        "mean": 1
+      }
+    },
+    "playwright:affected-tests-deterministic:codebase-memory": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 5981,
+        "mean": 5981
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 215310,
+        "mean": 215310,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 4006620,
+        "mean": 4006620,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 8.203308,
+        "mean": 8.203308,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 26,
+        "mean": 26
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "playwright:affected-tests-deterministic:codegraph": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 11444,
+        "mean": 11444
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 185059,
+        "mean": 185059,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2917732,
+        "mean": 2917732,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 5.995052,
+        "mean": 5.995052,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 10,
+        "mean": 10
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "playwright:reporter-error-isolation:baseline": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 869,
+        "mean": 869
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 169460,
+        "mean": 169460,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 1705956,
+        "mean": 1705956,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 3.583266,
+        "mean": 3.583266,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "playwright:reporter-error-isolation:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 37210,
+        "mean": 37210
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 345055,
+        "mean": 345055,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2437140,
+        "mean": 2437140,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 4.990044,
+        "mean": 4.990044,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 35,
+        "mean": 35
+      },
+      "mcp_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_discovery_calls": {
+        "median": 32,
+        "mean": 32
+      },
+      "mcp_discovery_successful_calls": {
+        "median": 32,
+        "mean": 32
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_empty_discovery_calls": {
+        "median": 8,
+        "mean": 8
+      },
+      "mcp_useful_discovery_calls": {
+        "median": 24,
+        "mean": 24
+      },
+      "core_ipc_timeouts": {
+        "median": 0,
+        "mean": 0
+      },
+      "core_coverage_incomplete": {
+        "median": 0,
+        "mean": 0
+      },
+      "request_validation_failures": {
+        "median": 0,
+        "mean": 0
+      }
+    },
+    "playwright:reporter-error-isolation:codebase-memory": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 5631,
+        "mean": 5631
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 199508,
+        "mean": 199508,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 4232360,
+        "mean": 4232360,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 8.660716,
+        "mean": 8.660716,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 31,
+        "mean": 31
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "playwright:reporter-error-isolation:codegraph": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 11288,
+        "mean": 11288
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 248216,
+        "mean": 248216,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2666029,
+        "mean": 2666029,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 5.608898,
+        "mean": 5.608898,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 5,
+        "mean": 5
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "prisma:wire-name-validation:baseline": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 107,
+        "mean": 107
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 172117,
+        "mean": 172117,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2108846,
+        "mean": 2108846,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 4.397602,
+        "mean": 4.397602,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "prisma:wire-name-validation:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 59178,
+        "mean": 59178
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 252021,
+        "mean": 252021,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 1570430,
+        "mean": 1570430,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 3.221392,
+        "mean": 3.221392,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 21,
+        "mean": 21
+      },
+      "mcp_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_discovery_calls": {
+        "median": 18,
+        "mean": 18
+      },
+      "mcp_discovery_successful_calls": {
+        "median": 18,
+        "mean": 18
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_empty_discovery_calls": {
+        "median": 1,
+        "mean": 1
+      },
+      "mcp_useful_discovery_calls": {
+        "median": 17,
+        "mean": 17
+      },
+      "core_ipc_timeouts": {
+        "median": 0,
+        "mean": 0
+      },
+      "core_coverage_incomplete": {
+        "median": 0,
+        "mean": 0
+      },
+      "request_validation_failures": {
+        "median": 0,
+        "mean": 0
+      }
+    },
+    "prisma:wire-name-validation:codebase-memory": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 8167,
+        "mean": 8167
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 204453,
+        "mean": 204453,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 3287321,
+        "mean": 3287321,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 6.776878,
+        "mean": 6.776878,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 24,
+        "mean": 24
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "prisma:wire-name-validation:codegraph": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 12135,
+        "mean": 12135
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 157160,
+        "mean": 157160,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2371730,
+        "mean": 2371730,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 4.887586,
+        "mean": 4.887586,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 6,
+        "mean": 6
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "prisma:mongo-value-set-transform:baseline": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 305,
+        "mean": 305
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 151714,
+        "mean": 151714,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 1468030,
+        "mean": 1468030,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 3.067712,
+        "mean": 3.067712,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "prisma:mongo-value-set-transform:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 59686,
+        "mean": 59686
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 200391,
+        "mean": 200391,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 1059619,
+        "mean": 1059619,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 2.177822,
+        "mean": 2.177822,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 12,
+        "mean": 12
+      },
+      "mcp_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_discovery_calls": {
+        "median": 9,
+        "mean": 9
+      },
+      "mcp_discovery_successful_calls": {
+        "median": 9,
+        "mean": 9
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_empty_discovery_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_useful_discovery_calls": {
+        "median": 9,
+        "mean": 9
+      },
+      "core_ipc_timeouts": {
+        "median": 0,
+        "mean": 0
+      },
+      "core_coverage_incomplete": {
+        "median": 0,
+        "mean": 0
+      },
+      "request_validation_failures": {
+        "median": 0,
+        "mean": 0
+      }
+    },
+    "prisma:mongo-value-set-transform:codebase-memory": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 8528,
+        "mean": 8528
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 143002,
+        "mean": 143002,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 3168886,
+        "mean": 3168886,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 6.452114,
+        "mean": 6.452114,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 26,
+        "mean": 26
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "prisma:mongo-value-set-transform:codegraph": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 12826,
+        "mean": 12826
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 173493,
+        "mean": 173493,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2550210,
+        "mean": 2550210,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 5.23485,
+        "mean": 5.23485,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 7,
+        "mean": 7
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "vscode:language-registry-change-notification:baseline": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 991,
+        "mean": 991
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 296348,
+        "mean": 296348,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 3765815,
+        "mean": 3765815,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 7.844524,
+        "mean": 7.844524,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "vscode:language-registry-change-notification:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 293450,
+        "mean": 293450
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 477192,
+        "mean": 477192,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2536450,
+        "mean": 2536450,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 5.172194,
+        "mean": 5.172194,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 24,
+        "mean": 24
+      },
+      "mcp_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_discovery_calls": {
+        "median": 21,
+        "mean": 21
+      },
+      "mcp_discovery_successful_calls": {
+        "median": 21,
+        "mean": 21
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_empty_discovery_calls": {
+        "median": 2,
+        "mean": 2
+      },
+      "mcp_useful_discovery_calls": {
+        "median": 19,
+        "mean": 19
+      },
+      "core_ipc_timeouts": {
+        "median": 0,
+        "mean": 0
+      },
+      "core_coverage_incomplete": {
+        "median": 0,
+        "mean": 0
+      },
+      "request_validation_failures": {
+        "median": 0,
+        "mean": 0
+      }
+    },
+    "vscode:language-registry-change-notification:codebase-memory": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 77429,
+        "mean": 77429
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 380214,
+        "mean": 380214,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 6153542,
+        "mean": 6153542,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 12.584134,
+        "mean": 12.584134,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 26,
+        "mean": 26
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "vscode:language-registry-change-notification:codegraph": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 82945,
+        "mean": 82945
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 297003,
+        "mean": 297003,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 4248636,
+        "mean": 4248636,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 8.715858,
+        "mean": 8.715858,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 13,
+        "mean": 13
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "vscode:language-provider-registration-idempotence:baseline": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 1242,
+        "mean": 1242
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 188859,
+        "mean": 188859,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 2158052,
+        "mean": 2158052,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 4.507342,
+        "mean": 4.507342,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "vscode:language-provider-registration-idempotence:urdira-typescript": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 318742,
+        "mean": 318742
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 475098,
+        "mean": 475098,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 1997645,
+        "mean": 1997645,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 4.081396,
+        "mean": 4.081396,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 22,
+        "mean": 22
+      },
+      "mcp_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_discovery_calls": {
+        "median": 19,
+        "mean": 19
+      },
+      "mcp_discovery_successful_calls": {
+        "median": 19,
+        "mean": 19
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": 0,
+        "mean": 0
+      },
+      "mcp_empty_discovery_calls": {
+        "median": 1,
+        "mean": 1
+      },
+      "mcp_useful_discovery_calls": {
+        "median": 18,
+        "mean": 18
+      },
+      "core_ipc_timeouts": {
+        "median": 0,
+        "mean": 0
+      },
+      "core_coverage_incomplete": {
+        "median": 0,
+        "mean": 0
+      },
+      "request_validation_failures": {
+        "median": 0,
+        "mean": 0
+      }
+    },
+    "vscode:language-provider-registration-idempotence:codebase-memory": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 78036,
+        "mean": 78036
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 314356,
+        "mean": 314356,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 5509441,
+        "mean": 5509441,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 11.225306,
+        "mean": 11.225306,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 33,
+        "mean": 33
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    },
+    "vscode:language-provider-registration-idempotence:codegraph": {
+      "count": 1,
+      "successful": 1,
+      "setup_elapsed_ms": {
+        "median": 82488,
+        "mean": 82488
+      },
+      "elapsed_ms_from_first_instruction": {
+        "median": 293939,
+        "mean": 293939,
+        "p95": null
+      },
+      "total_tokens": {
+        "median": 3940417,
+        "mean": 3940417,
+        "p95": null
+      },
+      "estimated_cost_usd": {
+        "median": 8.118554,
+        "mean": 8.118554,
+        "p95": null
+      },
+      "outer_turns": {
+        "median": 3,
+        "mean": 3
+      },
+      "mcp_calls": {
+        "median": 11,
+        "mean": 11
+      },
+      "mcp_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_discovery_successful_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_selector_ambiguous_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_unexpected_failed_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_empty_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "mcp_useful_discovery_calls": {
+        "median": null,
+        "mean": null
+      },
+      "core_ipc_timeouts": {
+        "median": null,
+        "mean": null
+      },
+      "core_coverage_incomplete": {
+        "median": null,
+        "mean": null
+      },
+      "request_validation_failures": {
+        "median": null,
+        "mean": null
+      }
+    }
+  },
+  "runs": [
+    {
+      "run_id": "typescript-transpile-diagnostic-callback-baseline-1",
+      "repository": "typescript",
+      "task": "transpile-diagnostic-callback",
+      "arm": "baseline",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 1,
+      "process_completed_successfully": false,
+      "completed_successfully": false,
+      "setup_elapsed_ms": 647,
+      "elapsed_ms_from_first_instruction": 52940,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 4,
+        "command_actions": 5,
+        "mcp_calls": 0,
+        "file_change_batches": 0,
+        "input_tokens": 204997,
+        "cached_input_tokens": 172288,
+        "uncached_input_tokens": 32709,
+        "output_tokens": 2245,
+        "reasoning_tokens": 719,
+        "total_tokens": 207961,
+        "estimated_cost_usd": 0.433706
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [],
+        "changed_paths": false,
+        "required_patterns": {
+          "src/services/transpile.ts": true
+        },
+        "focused_test_changed": false,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "none",
+        "indexed": false,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "typescript-transpile-diagnostic-callback-urdira-typescript-1",
+      "repository": "typescript",
+      "task": "transpile-diagnostic-callback",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 1,
+      "process_completed_successfully": false,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 32389,
+      "elapsed_ms_from_first_instruction": 337041,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 10,
+        "mcp_calls": 30,
+        "mcp_failed_calls": 1,
+        "mcp_discovery_calls": 26,
+        "mcp_discovery_successful_calls": 25,
+        "mcp_selector_ambiguous_calls": 0,
+        "mcp_unexpected_failed_calls": 1,
+        "mcp_empty_discovery_calls": 1,
+        "mcp_useful_discovery_calls": 24,
+        "api_v3_discovery_calls": 26,
+        "explicit_workspace_discovery_calls": 26,
+        "first_discovery_before_edit": true,
+        "first_discovery_elapsed_ms": null,
+        "post_edit_discovery_calls": 15,
+        "rediscovery_after_each_edit": true,
+        "core_ipc_timeouts": 0,
+        "core_coverage_incomplete": 0,
+        "request_validation_failures": 1,
+        "file_change_batches": 3,
+        "input_tokens": 2430034,
+        "cached_input_tokens": 2338816,
+        "uncached_input_tokens": 91218,
+        "output_tokens": 12127,
+        "reasoning_tokens": 3637,
+        "total_tokens": 2445798,
+        "estimated_cost_usd": 4.98618
+      },
+      "host_metrics": {
+        "peak_rss_kib": 1797888,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": null,
+        "sample_count": 734,
+        "duration_ms": 368684,
+        "sqlite_bytes": 493177536,
+        "cas_bytes": 37227184,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 31317,
+        "readiness_events": [
+          {
+            "elapsed_ms": 103,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "unknown",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 3307,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 22856,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 23426,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 2,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 23947,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 31317,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": true,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "complete",
+            "structural_availability": "available",
+            "source_completeness": "complete",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "ready"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 1211,
+          "source_catalog": 1864,
+          "source_ready_ms": 3077,
+          "enumerated_artifact_count": 852,
+          "cataloged_artifact_count": 852,
+          "stage_plan": 46,
+          "plugin_analyze": 6044,
+          "analyzed_artifact_count": 852,
+          "accepted_delta_count": 756,
+          "seal": 5186,
+          "publish": 18763,
+          "structural_stage_1_ready_ms": 21894,
+          "total": 21894
+        },
+        "analysis_timings": {
+          "closure": 145,
+          "worker_wait": 5880,
+          "acceptance": 5880,
+          "shards": 1,
+          "plan_mode": "materialized"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 37227705,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 37227705,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "src/services/transpile.ts",
+          "src/testRunner/unittests/services/transpile.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/services/transpile.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true,
+        "discovery_status": "fallback-completed",
+        "first_discovery_before_edit": true,
+        "rediscovery_after_edit": true,
+        "edit_count": 6,
+        "discovery_count": 52,
+        "fallback_shell": true,
+        "unexpected_errors": {
+          "tool_call": true,
+          "validation": true,
+          "coverage": false,
+          "ipc": false
+        }
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "typescript-transpile-diagnostic-callback-codebase-memory-1",
+      "repository": "typescript",
+      "task": "transpile-diagnostic-callback",
+      "arm": "codebase-memory",
+      "sample": 1,
+      "order_index": 2,
+      "process_exit_code": 1,
+      "process_completed_successfully": false,
+      "completed_successfully": false,
+      "setup_elapsed_ms": 48644,
+      "elapsed_ms_from_first_instruction": 67957,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 4,
+        "command_actions": 3,
+        "mcp_calls": 11,
+        "file_change_batches": 0,
+        "input_tokens": 341461,
+        "cached_input_tokens": 277248,
+        "uncached_input_tokens": 64213,
+        "output_tokens": 2631,
+        "reasoning_tokens": 983,
+        "total_tokens": 345075,
+        "estimated_cost_usd": 0.711834
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [],
+        "changed_paths": false,
+        "required_patterns": {
+          "src/services/transpile.ts": true
+        },
+        "focused_test_changed": false,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codebase-memory",
+        "indexed": true,
+        "project": "typescript-transpile-diagnostic-callback-codebase-memory-1",
+        "elapsed_ms": 47847,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "typescript-transpile-diagnostic-callback-codegraph-1",
+      "repository": "typescript",
+      "task": "transpile-diagnostic-callback",
+      "arm": "codegraph",
+      "sample": 1,
+      "order_index": 3,
+      "process_exit_code": 1,
+      "process_completed_successfully": false,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 86618,
+      "elapsed_ms_from_first_instruction": 204772,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 11,
+        "mcp_calls": 7,
+        "file_change_batches": 2,
+        "input_tokens": 2558128,
+        "cached_input_tokens": 2396416,
+        "uncached_input_tokens": 161712,
+        "output_tokens": 18834,
+        "reasoning_tokens": 8241,
+        "total_tokens": 2585203,
+        "estimated_cost_usd": 5.332856
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "src/services/transpile.ts",
+          "src/testRunner/unittests/services/transpile.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/services/transpile.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": false
+      },
+      "setup": {
+        "kind": "codegraph",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": 85989,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "typescript-session-project-event-hook-baseline-1",
+      "repository": "typescript",
+      "task": "session-project-event-hook",
+      "arm": "baseline",
+      "sample": 1,
+      "order_index": 3,
+      "process_exit_code": 1,
+      "process_completed_successfully": false,
+      "completed_successfully": false,
+      "setup_elapsed_ms": 561,
+      "elapsed_ms_from_first_instruction": 239102,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 27,
+        "mcp_calls": 0,
+        "file_change_batches": 5,
+        "input_tokens": 3468795,
+        "cached_input_tokens": 3267840,
+        "uncached_input_tokens": 200955,
+        "output_tokens": 24673,
+        "reasoning_tokens": 9838,
+        "total_tokens": 3503306,
+        "estimated_cost_usd": 7.213678
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "src/server/editorServices.ts",
+          "src/server/project.ts",
+          "src/server/session.ts",
+          "src/testRunner/unittests/tsserver/projects.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/server/session.ts": false,
+          "src/server/editorServices.ts": false
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "none",
+        "indexed": false,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "typescript-session-project-event-hook-urdira-typescript-1",
+      "repository": "typescript",
+      "task": "session-project-event-hook",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 31811,
+      "elapsed_ms_from_first_instruction": 682670,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 14,
+        "mcp_calls": 67,
+        "mcp_failed_calls": 3,
+        "mcp_discovery_calls": 64,
+        "mcp_discovery_successful_calls": 61,
+        "mcp_selector_ambiguous_calls": 3,
+        "mcp_unexpected_failed_calls": 0,
+        "mcp_empty_discovery_calls": 4,
+        "mcp_useful_discovery_calls": 57,
+        "api_v3_discovery_calls": 64,
+        "explicit_workspace_discovery_calls": 64,
+        "first_discovery_before_edit": true,
+        "first_discovery_elapsed_ms": null,
+        "post_edit_discovery_calls": 23,
+        "rediscovery_after_each_edit": true,
+        "core_ipc_timeouts": 0,
+        "core_coverage_incomplete": 0,
+        "request_validation_failures": 0,
+        "file_change_batches": 8,
+        "input_tokens": 4348333,
+        "cached_input_tokens": 4219392,
+        "uncached_input_tokens": 128941,
+        "output_tokens": 21674,
+        "reasoning_tokens": 7561,
+        "total_tokens": 4377568,
+        "estimated_cost_usd": 8.930546
+      },
+      "host_metrics": {
+        "peak_rss_kib": 1761232,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": null,
+        "sample_count": 1421,
+        "duration_ms": 713663,
+        "sqlite_bytes": 674352880,
+        "cas_bytes": 38941597,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 30682,
+        "readiness_events": [
+          {
+            "elapsed_ms": 70,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "unknown",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 3146,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 21933,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 22483,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 2,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 23006,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 30682,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": true,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "complete",
+            "structural_availability": "available",
+            "source_completeness": "complete",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "ready"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 1183,
+          "source_catalog": 1778,
+          "source_ready_ms": 2962,
+          "enumerated_artifact_count": 852,
+          "cataloged_artifact_count": 852,
+          "stage_plan": 41,
+          "plugin_analyze": 5688,
+          "analyzed_artifact_count": 852,
+          "accepted_delta_count": 756,
+          "seal": 5274,
+          "publish": 18027,
+          "structural_stage_1_ready_ms": 21038,
+          "total": 21038
+        },
+        "analysis_timings": {
+          "closure": 128,
+          "worker_wait": 5543,
+          "acceptance": 5543,
+          "shards": 1,
+          "plan_mode": "materialized"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 38942118,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 38942118,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "src/server/editorServices.ts",
+          "src/server/session.ts",
+          "src/testRunner/unittests/tsserver/session.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/server/session.ts": true,
+          "src/server/editorServices.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true,
+        "discovery_status": "urdira-completed",
+        "first_discovery_before_edit": true,
+        "rediscovery_after_edit": true,
+        "edit_count": 16,
+        "discovery_count": 128,
+        "fallback_shell": false,
+        "unexpected_errors": {
+          "tool_call": false,
+          "validation": false,
+          "coverage": false,
+          "ipc": false
+        }
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "typescript-session-project-event-hook-codebase-memory-1",
+      "repository": "typescript",
+      "task": "session-project-event-hook",
+      "arm": "codebase-memory",
+      "sample": 1,
+      "order_index": 1,
+      "process_exit_code": 1,
+      "process_completed_successfully": false,
+      "completed_successfully": false,
+      "setup_elapsed_ms": 44459,
+      "elapsed_ms_from_first_instruction": 233295,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 9,
+        "command_actions": 12,
+        "mcp_calls": 30,
+        "file_change_batches": 2,
+        "input_tokens": 7010246,
+        "cached_input_tokens": 6663680,
+        "uncached_input_tokens": 346566,
+        "output_tokens": 23219,
+        "reasoning_tokens": 8584,
+        "total_tokens": 7042049,
+        "estimated_cost_usd": 14.274916
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "src/server/editorServices.ts",
+          "src/server/session.ts",
+          "src/testRunner/unittests/tsserver/session.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/server/session.ts": false,
+          "src/server/editorServices.ts": false
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codebase-memory",
+        "indexed": true,
+        "project": "typescript-session-project-event-hook-codebase-memory-1",
+        "elapsed_ms": 43559,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "typescript-session-project-event-hook-codegraph-1",
+      "repository": "typescript",
+      "task": "session-project-event-hook",
+      "arm": "codegraph",
+      "sample": 1,
+      "order_index": 2,
+      "process_exit_code": 1,
+      "process_completed_successfully": false,
+      "completed_successfully": false,
+      "setup_elapsed_ms": 85135,
+      "elapsed_ms_from_first_instruction": 317544,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 12,
+        "command_actions": 21,
+        "mcp_calls": 10,
+        "file_change_batches": 7,
+        "input_tokens": 6671226,
+        "cached_input_tokens": 6384896,
+        "uncached_input_tokens": 286330,
+        "output_tokens": 29202,
+        "reasoning_tokens": 11563,
+        "total_tokens": 6711991,
+        "estimated_cost_usd": 13.668572
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "src/server/editorServices.ts",
+          "src/server/session.ts",
+          "src/testRunner/unittests/tsserver/session.ts",
+          "tests/baselines/reference/api/typescript.d.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/server/session.ts": false,
+          "src/server/editorServices.ts": false
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codegraph",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": 84463,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-affected-tests-deterministic-baseline-1",
+      "repository": "playwright",
+      "task": "affected-tests-deterministic",
+      "arm": "baseline",
+      "sample": 1,
+      "order_index": 3,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 50,
+      "elapsed_ms_from_first_instruction": 172297,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 9,
+        "command_actions": 18,
+        "mcp_calls": 0,
+        "file_change_batches": 3,
+        "input_tokens": 2032067,
+        "cached_input_tokens": 1850112,
+        "uncached_input_tokens": 181955,
+        "output_tokens": 18611,
+        "reasoning_tokens": 7178,
+        "total_tokens": 2057856,
+        "estimated_cost_usd": 4.270446
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/runner/testRunner.ts",
+          "packages/playwright/src/transform/compilationCache.ts",
+          "tests/playwright-test/test-server.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/transform/compilationCache.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "none",
+        "indexed": false,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-affected-tests-deterministic-urdira-typescript-1",
+      "repository": "playwright",
+      "task": "affected-tests-deterministic",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 1,
+      "process_completed_successfully": false,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 36359,
+      "elapsed_ms_from_first_instruction": 274834,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 12,
+        "command_actions": 6,
+        "mcp_calls": 26,
+        "mcp_failed_calls": 1,
+        "mcp_discovery_calls": 22,
+        "mcp_discovery_successful_calls": 21,
+        "mcp_selector_ambiguous_calls": 0,
+        "mcp_unexpected_failed_calls": 1,
+        "mcp_empty_discovery_calls": 1,
+        "mcp_useful_discovery_calls": 20,
+        "api_v3_discovery_calls": 22,
+        "explicit_workspace_discovery_calls": 22,
+        "first_discovery_before_edit": true,
+        "first_discovery_elapsed_ms": null,
+        "post_edit_discovery_calls": 13,
+        "rediscovery_after_each_edit": true,
+        "core_ipc_timeouts": 0,
+        "core_coverage_incomplete": 0,
+        "request_validation_failures": 1,
+        "file_change_batches": 2,
+        "input_tokens": 1566570,
+        "cached_input_tokens": 1496320,
+        "uncached_input_tokens": 70250,
+        "output_tokens": 11360,
+        "reasoning_tokens": 2612,
+        "total_tokens": 1580542,
+        "estimated_cost_usd": 3.244916
+      },
+      "host_metrics": {
+        "peak_rss_kib": 2083200,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": null,
+        "sample_count": 618,
+        "duration_ms": 310702,
+        "sqlite_bytes": 604284264,
+        "cas_bytes": 29190907,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 35506,
+        "readiness_events": [
+          {
+            "elapsed_ms": 55,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "unknown",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 9548,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 34307,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 34985,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 2,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 35506,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": true,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "complete",
+            "structural_availability": "available",
+            "source_completeness": "complete",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "ready"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 2594,
+          "source_catalog": 6691,
+          "source_ready_ms": 9286,
+          "enumerated_artifact_count": 2657,
+          "cataloged_artifact_count": 2657,
+          "stage_plan": 108,
+          "plugin_analyze": 9110,
+          "analyzed_artifact_count": 2657,
+          "accepted_delta_count": 1560,
+          "seal": 5964,
+          "publish": 23685,
+          "structural_stage_1_ready_ms": 33108,
+          "total": 33108
+        },
+        "analysis_timings": {
+          "closure": 137,
+          "worker_wait": 8917,
+          "acceptance": 8917,
+          "shards": 1,
+          "plan_mode": "materialized"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 31259067,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 31259067,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/transform/compilationCache.ts",
+          "tests/playwright-test/watch.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/transform/compilationCache.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true,
+        "discovery_status": "urdira-completed",
+        "first_discovery_before_edit": true,
+        "rediscovery_after_edit": true,
+        "edit_count": 4,
+        "discovery_count": 44,
+        "fallback_shell": false,
+        "unexpected_errors": {
+          "tool_call": true,
+          "validation": true,
+          "coverage": false,
+          "ipc": false
+        }
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-affected-tests-deterministic-codebase-memory-1",
+      "repository": "playwright",
+      "task": "affected-tests-deterministic",
+      "arm": "codebase-memory",
+      "sample": 1,
+      "order_index": 1,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 5981,
+      "elapsed_ms_from_first_instruction": 215310,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 13,
+        "command_actions": 10,
+        "mcp_calls": 26,
+        "file_change_batches": 3,
+        "input_tokens": 3974942,
+        "cached_input_tokens": 3767808,
+        "uncached_input_tokens": 207134,
+        "output_tokens": 22054,
+        "reasoning_tokens": 9624,
+        "total_tokens": 4006620,
+        "estimated_cost_usd": 8.203308
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/transform/compilationCache.ts",
+          "tests/playwright-test/affected-test-files.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/transform/compilationCache.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codebase-memory",
+        "indexed": true,
+        "project": "playwright-affected-tests-deterministic-codebase-memory-1",
+        "elapsed_ms": 5062,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-affected-tests-deterministic-codegraph-1",
+      "repository": "playwright",
+      "task": "affected-tests-deterministic",
+      "arm": "codegraph",
+      "sample": 1,
+      "order_index": 2,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 11444,
+      "elapsed_ms_from_first_instruction": 185059,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 10,
+        "mcp_calls": 10,
+        "file_change_batches": 2,
+        "input_tokens": 2891134,
+        "cached_input_tokens": 2677248,
+        "uncached_input_tokens": 213886,
+        "output_tokens": 18740,
+        "reasoning_tokens": 7858,
+        "total_tokens": 2917732,
+        "estimated_cost_usd": 5.995052
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/transform/compilationCache.ts",
+          "tests/playwright-test/only-changed.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/transform/compilationCache.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codegraph",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": 10578,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-reporter-error-isolation-baseline-1",
+      "repository": "playwright",
+      "task": "reporter-error-isolation",
+      "arm": "baseline",
+      "sample": 1,
+      "order_index": 2,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 869,
+      "elapsed_ms_from_first_instruction": 169460,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 12,
+        "mcp_calls": 0,
+        "file_change_batches": 3,
+        "input_tokens": 1677397,
+        "cached_input_tokens": 1530112,
+        "uncached_input_tokens": 147285,
+        "output_tokens": 20200,
+        "reasoning_tokens": 8359,
+        "total_tokens": 1705956,
+        "estimated_cost_usd": 3.583266
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/reporters/multiplexer.ts",
+          "tests/playwright-test/reporter-onend.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/reporters/multiplexer.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "none",
+        "indexed": false,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-reporter-error-isolation-urdira-typescript-1",
+      "repository": "playwright",
+      "task": "reporter-error-isolation",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 37210,
+      "elapsed_ms_from_first_instruction": 345055,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 8,
+        "mcp_calls": 35,
+        "mcp_failed_calls": 0,
+        "mcp_discovery_calls": 32,
+        "mcp_discovery_successful_calls": 32,
+        "mcp_selector_ambiguous_calls": 0,
+        "mcp_unexpected_failed_calls": 0,
+        "mcp_empty_discovery_calls": 8,
+        "mcp_useful_discovery_calls": 24,
+        "api_v3_discovery_calls": 32,
+        "explicit_workspace_discovery_calls": 32,
+        "first_discovery_before_edit": true,
+        "first_discovery_elapsed_ms": null,
+        "post_edit_discovery_calls": 14,
+        "rediscovery_after_each_edit": true,
+        "core_ipc_timeouts": 0,
+        "core_coverage_incomplete": 0,
+        "request_validation_failures": 0,
+        "file_change_batches": 6,
+        "input_tokens": 2417846,
+        "cached_input_tokens": 2260224,
+        "uncached_input_tokens": 157622,
+        "output_tokens": 15043,
+        "reasoning_tokens": 4251,
+        "total_tokens": 2437140,
+        "estimated_cost_usd": 4.990044
+      },
+      "host_metrics": {
+        "peak_rss_kib": 1881200,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": null,
+        "sample_count": 759,
+        "duration_ms": 381476,
+        "sqlite_bytes": 599900736,
+        "cas_bytes": 29310206,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 36051,
+        "readiness_events": [
+          {
+            "elapsed_ms": 53,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "unknown",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 9634,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 34873,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 35528,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 2,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 36051,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": true,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "complete",
+            "structural_availability": "available",
+            "source_completeness": "complete",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "ready"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 2651,
+          "source_catalog": 6711,
+          "source_ready_ms": 9363,
+          "enumerated_artifact_count": 2657,
+          "cataloged_artifact_count": 2657,
+          "stage_plan": 109,
+          "plugin_analyze": 9327,
+          "analyzed_artifact_count": 2657,
+          "accepted_delta_count": 1560,
+          "seal": 6073,
+          "publish": 24275,
+          "structural_stage_1_ready_ms": 33777,
+          "total": 33777
+        },
+        "analysis_timings": {
+          "closure": 141,
+          "worker_wait": 9131,
+          "acceptance": 9131,
+          "shards": 1,
+          "plan_mode": "materialized"
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 31378366,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 31378366,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/reporters/multiplexer.ts",
+          "tests/playwright-test/reporter.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/reporters/multiplexer.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true,
+        "discovery_status": "urdira-completed",
+        "first_discovery_before_edit": true,
+        "rediscovery_after_edit": true,
+        "edit_count": 12,
+        "discovery_count": 64,
+        "fallback_shell": false,
+        "unexpected_errors": {
+          "tool_call": false,
+          "validation": false,
+          "coverage": false,
+          "ipc": false
+        }
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-reporter-error-isolation-codebase-memory-1",
+      "repository": "playwright",
+      "task": "reporter-error-isolation",
+      "arm": "codebase-memory",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 5631,
+      "elapsed_ms_from_first_instruction": 199508,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 10,
+        "mcp_calls": 31,
+        "file_change_batches": 2,
+        "input_tokens": 4199694,
+        "cached_input_tokens": 3931904,
+        "uncached_input_tokens": 267790,
+        "output_tokens": 22845,
+        "reasoning_tokens": 9821,
+        "total_tokens": 4232360,
+        "estimated_cost_usd": 8.660716
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/reporters/multiplexer.ts",
+          "tests/playwright-test/reporter.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/reporters/multiplexer.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codebase-memory",
+        "indexed": true,
+        "project": "playwright-reporter-error-isolation-codebase-memory-1",
+        "elapsed_ms": 4769,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "playwright-reporter-error-isolation-codegraph-1",
+      "repository": "playwright",
+      "task": "reporter-error-isolation",
+      "arm": "codegraph",
+      "sample": 1,
+      "order_index": 1,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 11288,
+      "elapsed_ms_from_first_instruction": 248216,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 11,
+        "mcp_calls": 5,
+        "file_change_batches": 5,
+        "input_tokens": 2619889,
+        "cached_input_tokens": 2437376,
+        "uncached_input_tokens": 182513,
+        "output_tokens": 29442,
+        "reasoning_tokens": 16698,
+        "total_tokens": 2666029,
+        "estimated_cost_usd": 5.608898
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/playwright/src/reporters/multiplexer.ts",
+          "tests/playwright-test/reporter-multiplexer.spec.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/playwright/src/reporters/multiplexer.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codegraph",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": 10418,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-wire-name-validation-baseline-1",
+      "repository": "prisma",
+      "task": "wire-name-validation",
+      "arm": "baseline",
+      "sample": 1,
+      "order_index": 2,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 107,
+      "elapsed_ms_from_first_instruction": 172117,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 9,
+        "command_actions": 13,
+        "mcp_calls": 0,
+        "file_change_batches": 4,
+        "input_tokens": 2078861,
+        "cached_input_tokens": 1930752,
+        "uncached_input_tokens": 148109,
+        "output_tokens": 20833,
+        "reasoning_tokens": 9152,
+        "total_tokens": 2108846,
+        "estimated_cost_usd": 4.397602
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/2-sql/1-core/schema-ir/src/exports/naming.ts",
+          "packages/2-sql/1-core/schema-ir/src/naming.ts",
+          "packages/2-sql/1-core/schema-ir/test/naming.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-sql/1-core/schema-ir/src/naming.ts": true,
+          "packages/2-sql/1-core/schema-ir/test/": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "none",
+        "indexed": false,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-wire-name-validation-urdira-typescript-1",
+      "repository": "prisma",
+      "task": "wire-name-validation",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 59178,
+      "elapsed_ms_from_first_instruction": 252021,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 12,
+        "command_actions": 9,
+        "mcp_calls": 21,
+        "mcp_failed_calls": 0,
+        "mcp_discovery_calls": 18,
+        "mcp_discovery_successful_calls": 18,
+        "mcp_selector_ambiguous_calls": 0,
+        "mcp_unexpected_failed_calls": 0,
+        "mcp_empty_discovery_calls": 1,
+        "mcp_useful_discovery_calls": 17,
+        "api_v3_discovery_calls": 18,
+        "explicit_workspace_discovery_calls": 18,
+        "first_discovery_before_edit": true,
+        "first_discovery_elapsed_ms": null,
+        "post_edit_discovery_calls": 12,
+        "rediscovery_after_each_edit": true,
+        "core_ipc_timeouts": 0,
+        "core_coverage_incomplete": 0,
+        "request_validation_failures": 0,
+        "file_change_batches": 3,
+        "input_tokens": 1557008,
+        "cached_input_tokens": 1476352,
+        "uncached_input_tokens": 80656,
+        "output_tokens": 10235,
+        "reasoning_tokens": 3187,
+        "total_tokens": 1570430,
+        "estimated_cost_usd": 3.221392
+      },
+      "host_metrics": {
+        "peak_rss_kib": 2288944,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": null,
+        "sample_count": 619,
+        "duration_ms": 311108,
+        "sqlite_bytes": 943864688,
+        "cas_bytes": 45458916,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 58654,
+        "readiness_events": [
+          {
+            "elapsed_ms": 51,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "unknown",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 17239,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 57332,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 58130,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 2,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 58654,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": true,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "complete",
+            "structural_availability": "available",
+            "source_completeness": "complete",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "ready"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 6731,
+          "source_catalog": 19248,
+          "source_ready_ms": 25980,
+          "enumerated_artifact_count": 7203,
+          "cataloged_artifact_count": 7203,
+          "stage_plan": 269,
+          "plugin_analyze": 11476,
+          "analyzed_artifact_count": 7203,
+          "accepted_delta_count": 4510,
+          "seal": 7476,
+          "publish": 29693,
+          "structural_stage_1_ready_ms": 56027,
+          "total": 56027
+        },
+        "analysis_timings": {
+          "closure": 139,
+          "worker_wait": 11302,
+          "acceptance": 11302,
+          "shards": 1,
+          "plan_mode": "stream",
+          "shards_used": 1,
+          "demotions": 0,
+          "per_shard_completed": [
+            4510
+          ]
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 47113150,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 47113150,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "packages/2-sql/1-core/schema-ir/src/exports/naming.ts",
+          "packages/2-sql/1-core/schema-ir/src/naming.ts",
+          "packages/2-sql/1-core/schema-ir/test/naming.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-sql/1-core/schema-ir/src/naming.ts": true,
+          "packages/2-sql/1-core/schema-ir/test/": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true,
+        "discovery_status": "urdira-completed",
+        "first_discovery_before_edit": true,
+        "rediscovery_after_edit": true,
+        "edit_count": 6,
+        "discovery_count": 36,
+        "fallback_shell": false,
+        "unexpected_errors": {
+          "tool_call": false,
+          "validation": false,
+          "coverage": false,
+          "ipc": false
+        }
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-wire-name-validation-codebase-memory-1",
+      "repository": "prisma",
+      "task": "wire-name-validation",
+      "arm": "codebase-memory",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 8167,
+      "elapsed_ms_from_first_instruction": 204453,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 7,
+        "mcp_calls": 24,
+        "file_change_batches": 3,
+        "input_tokens": 3253615,
+        "cached_input_tokens": 3004928,
+        "uncached_input_tokens": 248687,
+        "output_tokens": 23699,
+        "reasoning_tokens": 10007,
+        "total_tokens": 3287321,
+        "estimated_cost_usd": 6.776878
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/2-sql/1-core/schema-ir/src/exports/naming.ts",
+          "packages/2-sql/1-core/schema-ir/src/naming.ts",
+          "packages/2-sql/1-core/schema-ir/test/naming.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-sql/1-core/schema-ir/src/naming.ts": true,
+          "packages/2-sql/1-core/schema-ir/test/": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codebase-memory",
+        "indexed": true,
+        "project": "prisma-wire-name-validation-codebase-memory-1",
+        "elapsed_ms": 7669,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-wire-name-validation-codegraph-1",
+      "repository": "prisma",
+      "task": "wire-name-validation",
+      "arm": "codegraph",
+      "sample": 1,
+      "order_index": 1,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 12135,
+      "elapsed_ms_from_first_instruction": 157160,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 9,
+        "command_actions": 8,
+        "mcp_calls": 6,
+        "file_change_batches": 2,
+        "input_tokens": 2347709,
+        "cached_input_tokens": 2160128,
+        "uncached_input_tokens": 187581,
+        "output_tokens": 16936,
+        "reasoning_tokens": 7085,
+        "total_tokens": 2371730,
+        "estimated_cost_usd": 4.887586
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/2-sql/1-core/schema-ir/src/exports/naming.ts",
+          "packages/2-sql/1-core/schema-ir/src/naming.ts",
+          "packages/2-sql/1-core/schema-ir/test/naming.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-sql/1-core/schema-ir/src/naming.ts": true,
+          "packages/2-sql/1-core/schema-ir/test/": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codegraph",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": 11672,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-mongo-value-set-transform-baseline-1",
+      "repository": "prisma",
+      "task": "mongo-value-set-transform",
+      "arm": "baseline",
+      "sample": 1,
+      "order_index": 1,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 305,
+      "elapsed_ms_from_first_instruction": 151714,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 13,
+        "mcp_calls": 0,
+        "file_change_batches": 3,
+        "input_tokens": 1446088,
+        "cached_input_tokens": 1330432,
+        "uncached_input_tokens": 115656,
+        "output_tokens": 16747,
+        "reasoning_tokens": 5195,
+        "total_tokens": 1468030,
+        "estimated_cost_usd": 3.067712
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts",
+          "packages/2-mongo-family/1-foundation/mongo-contract/test/entity-kinds.test.ts",
+          "packages/2-mongo-family/1-foundation/mongo-contract/test/ir/mongo-value-set.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts": true,
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/index.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "none",
+        "indexed": false,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-mongo-value-set-transform-urdira-typescript-1",
+      "repository": "prisma",
+      "task": "mongo-value-set-transform",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 59686,
+      "elapsed_ms_from_first_instruction": 200391,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 6,
+        "mcp_calls": 12,
+        "mcp_failed_calls": 0,
+        "mcp_discovery_calls": 9,
+        "mcp_discovery_successful_calls": 9,
+        "mcp_selector_ambiguous_calls": 0,
+        "mcp_unexpected_failed_calls": 0,
+        "mcp_empty_discovery_calls": 0,
+        "mcp_useful_discovery_calls": 9,
+        "api_v3_discovery_calls": 9,
+        "explicit_workspace_discovery_calls": 9,
+        "first_discovery_before_edit": true,
+        "first_discovery_elapsed_ms": null,
+        "post_edit_discovery_calls": 6,
+        "rediscovery_after_each_edit": true,
+        "core_ipc_timeouts": 0,
+        "core_coverage_incomplete": 0,
+        "request_validation_failures": 0,
+        "file_change_batches": 4,
+        "input_tokens": 1049855,
+        "cached_input_tokens": 989696,
+        "uncached_input_tokens": 60159,
+        "output_tokens": 7623,
+        "reasoning_tokens": 2141,
+        "total_tokens": 1059619,
+        "estimated_cost_usd": 2.177822
+      },
+      "host_metrics": {
+        "peak_rss_kib": 2350800,
+        "memory_budget_kib": 5000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": null,
+        "sample_count": 516,
+        "duration_ms": 259509,
+        "sqlite_bytes": 992890008,
+        "cas_bytes": 45400441,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 58689,
+        "readiness_events": [
+          {
+            "elapsed_ms": 49,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "unknown",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 17313,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 57370,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 58167,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 2,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 58689,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": true,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "complete",
+            "structural_availability": "available",
+            "source_completeness": "complete",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "ready"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 6598,
+          "source_catalog": 19434,
+          "source_ready_ms": 26033,
+          "enumerated_artifact_count": 7203,
+          "cataloged_artifact_count": 7203,
+          "stage_plan": 276,
+          "plugin_analyze": 11181,
+          "analyzed_artifact_count": 7203,
+          "accepted_delta_count": 4510,
+          "seal": 7543,
+          "publish": 29602,
+          "structural_stage_1_ready_ms": 55997,
+          "total": 55997
+        },
+        "analysis_timings": {
+          "closure": 140,
+          "worker_wait": 11005,
+          "acceptance": 11005,
+          "shards": 1,
+          "plan_mode": "stream",
+          "shards_used": 1,
+          "demotions": 0,
+          "per_shard_completed": [
+            4510
+          ]
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 47054675,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 47054675,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts",
+          "packages/2-mongo-family/1-foundation/mongo-contract/test/ir/mongo-value-set.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts": true,
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/index.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true,
+        "discovery_status": "urdira-completed",
+        "first_discovery_before_edit": true,
+        "rediscovery_after_edit": true,
+        "edit_count": 8,
+        "discovery_count": 18,
+        "fallback_shell": false,
+        "unexpected_errors": {
+          "tool_call": false,
+          "validation": false,
+          "coverage": false,
+          "ipc": false
+        }
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-mongo-value-set-transform-codebase-memory-1",
+      "repository": "prisma",
+      "task": "mongo-value-set-transform",
+      "arm": "codebase-memory",
+      "sample": 1,
+      "order_index": 3,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 8528,
+      "elapsed_ms_from_first_instruction": 143002,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 8,
+        "mcp_calls": 26,
+        "file_change_batches": 1,
+        "input_tokens": 3149829,
+        "cached_input_tokens": 2916352,
+        "uncached_input_tokens": 233477,
+        "output_tokens": 14367,
+        "reasoning_tokens": 4690,
+        "total_tokens": 3168886,
+        "estimated_cost_usd": 6.452114
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts",
+          "packages/2-mongo-family/1-foundation/mongo-contract/test/ir/mongo-value-set.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts": true,
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/index.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codebase-memory",
+        "indexed": true,
+        "project": "prisma-mongo-value-set-transform-codebase-memory-1",
+        "elapsed_ms": 7829,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "prisma-mongo-value-set-transform-codegraph-1",
+      "repository": "prisma",
+      "task": "mongo-value-set-transform",
+      "arm": "codegraph",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 12826,
+      "elapsed_ms_from_first_instruction": 173493,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 13,
+        "mcp_calls": 7,
+        "file_change_batches": 3,
+        "input_tokens": 2527805,
+        "cached_input_tokens": 2337280,
+        "uncached_input_tokens": 190525,
+        "output_tokens": 16979,
+        "reasoning_tokens": 5426,
+        "total_tokens": 2550210,
+        "estimated_cost_usd": 5.23485
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts",
+          "packages/2-mongo-family/1-foundation/mongo-contract/test/entity-kinds.test.ts",
+          "packages/2-mongo-family/1-foundation/mongo-contract/test/ir/mongo-value-set.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts": true,
+          "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/index.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codegraph",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": 12082,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "vscode-language-registry-change-notification-baseline-1",
+      "repository": "vscode",
+      "task": "language-registry-change-notification",
+      "arm": "baseline",
+      "sample": 1,
+      "order_index": 1,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 991,
+      "elapsed_ms_from_first_instruction": 296348,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 18,
+        "mcp_calls": 0,
+        "file_change_batches": 7,
+        "input_tokens": 3713666,
+        "cached_input_tokens": 3476736,
+        "uncached_input_tokens": 236930,
+        "output_tokens": 34824,
+        "reasoning_tokens": 17325,
+        "total_tokens": 3765815,
+        "estimated_cost_usd": 7.844524
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "src/vs/editor/common/languageFeatureRegistry.ts",
+          "src/vs/editor/test/common/languageFeatureRegistry.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/vs/editor/common/languageFeatureRegistry.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "none",
+        "indexed": false,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "vscode-language-registry-change-notification-urdira-typescript-1",
+      "repository": "vscode",
+      "task": "language-registry-change-notification",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 293450,
+      "elapsed_ms_from_first_instruction": 477192,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 6,
+        "mcp_calls": 24,
+        "mcp_failed_calls": 0,
+        "mcp_discovery_calls": 21,
+        "mcp_discovery_successful_calls": 21,
+        "mcp_selector_ambiguous_calls": 0,
+        "mcp_unexpected_failed_calls": 0,
+        "mcp_empty_discovery_calls": 2,
+        "mcp_useful_discovery_calls": 19,
+        "api_v3_discovery_calls": 21,
+        "explicit_workspace_discovery_calls": 21,
+        "first_discovery_before_edit": true,
+        "first_discovery_elapsed_ms": null,
+        "post_edit_discovery_calls": 14,
+        "rediscovery_after_each_edit": true,
+        "core_ipc_timeouts": 0,
+        "core_coverage_incomplete": 0,
+        "request_validation_failures": 0,
+        "file_change_batches": 4,
+        "input_tokens": 2519901,
+        "cached_input_tokens": 2412800,
+        "uncached_input_tokens": 107101,
+        "output_tokens": 12281,
+        "reasoning_tokens": 4268,
+        "total_tokens": 2536450,
+        "estimated_cost_usd": 5.172194
+      },
+      "host_metrics": {
+        "peak_rss_kib": 4921168,
+        "memory_budget_kib": 6000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": null,
+        "sample_count": 1534,
+        "duration_ms": 769844,
+        "sqlite_bytes": 5253536192,
+        "cas_bytes": 222642943,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 291812,
+        "readiness_events": [
+          {
+            "elapsed_ms": 59,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "unknown",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 21058,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 278625,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 287695,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 2,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 291812,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": true,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "complete",
+            "structural_availability": "available",
+            "source_completeness": "complete",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "ready"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 9177,
+          "source_catalog": 79613,
+          "source_ready_ms": 88791,
+          "enumerated_artifact_count": 17675,
+          "cataloged_artifact_count": 17675,
+          "stage_plan": 632,
+          "plugin_analyze": 62193,
+          "analyzed_artifact_count": 17675,
+          "accepted_delta_count": 12944,
+          "seal": 43250,
+          "publish": 188271,
+          "structural_stage_1_ready_ms": 277961,
+          "total": 277962
+        },
+        "analysis_timings": {
+          "closure": 779,
+          "worker_wait": 61310,
+          "acceptance": 61310,
+          "shards": 1,
+          "plan_mode": "stream",
+          "shards_used": 1,
+          "demotions": 0,
+          "per_shard_completed": [
+            12944
+          ]
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 224542243,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 224542243,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "src/vs/editor/common/languageFeatureRegistry.ts",
+          "src/vs/editor/test/common/languageFeatureRegistry.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/vs/editor/common/languageFeatureRegistry.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true,
+        "discovery_status": "urdira-completed",
+        "first_discovery_before_edit": true,
+        "rediscovery_after_edit": true,
+        "edit_count": 8,
+        "discovery_count": 42,
+        "fallback_shell": false,
+        "unexpected_errors": {
+          "tool_call": false,
+          "validation": false,
+          "coverage": false,
+          "ipc": false
+        }
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": "Error: Urdira host exited before readiness (null/SIGTERM)\n"
+    },
+    {
+      "run_id": "vscode-language-registry-change-notification-codebase-memory-1",
+      "repository": "vscode",
+      "task": "language-registry-change-notification",
+      "arm": "codebase-memory",
+      "sample": 1,
+      "order_index": 3,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 77429,
+      "elapsed_ms_from_first_instruction": 380214,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 9,
+        "mcp_calls": 26,
+        "file_change_batches": 4,
+        "input_tokens": 6107367,
+        "cached_input_tokens": 5784832,
+        "uncached_input_tokens": 322535,
+        "output_tokens": 30794,
+        "reasoning_tokens": 15381,
+        "total_tokens": 6153542,
+        "estimated_cost_usd": 12.584134
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "src/vs/editor/common/languageFeatureRegistry.ts",
+          "src/vs/editor/test/common/languageFeatureRegistry.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/vs/editor/common/languageFeatureRegistry.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codebase-memory",
+        "indexed": true,
+        "project": "vscode-language-registry-change-notification-codebase-memory-1",
+        "elapsed_ms": 76795,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "vscode-language-registry-change-notification-codegraph-1",
+      "repository": "vscode",
+      "task": "language-registry-change-notification",
+      "arm": "codegraph",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 82945,
+      "elapsed_ms_from_first_instruction": 297003,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 9,
+        "command_actions": 8,
+        "mcp_calls": 13,
+        "file_change_batches": 4,
+        "input_tokens": 4212205,
+        "cached_input_tokens": 3938048,
+        "uncached_input_tokens": 274157,
+        "output_tokens": 25089,
+        "reasoning_tokens": 11342,
+        "total_tokens": 4248636,
+        "estimated_cost_usd": 8.715858
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "src/vs/editor/common/languageFeatureRegistry.ts",
+          "src/vs/editor/test/common/languageFeatureRegistry.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "src/vs/editor/common/languageFeatureRegistry.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codegraph",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": 81215,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "vscode-language-provider-registration-idempotence-baseline-1",
+      "repository": "vscode",
+      "task": "language-provider-registration-idempotence",
+      "arm": "baseline",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 1242,
+      "elapsed_ms_from_first_instruction": 188859,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 15,
+        "mcp_calls": 0,
+        "file_change_batches": 3,
+        "input_tokens": 2126179,
+        "cached_input_tokens": 1962496,
+        "uncached_input_tokens": 163683,
+        "output_tokens": 21773,
+        "reasoning_tokens": 10100,
+        "total_tokens": 2158052,
+        "estimated_cost_usd": 4.507342
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "extensions/typescript-language-features/src/languageProvider.ts",
+          "extensions/typescript-language-features/src/test/unit/languageProvider.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "extensions/typescript-language-features/src/languageProvider.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "none",
+        "indexed": false,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "vscode-language-provider-registration-idempotence-urdira-typescript-1",
+      "repository": "vscode",
+      "task": "language-provider-registration-idempotence",
+      "arm": "urdira-typescript",
+      "sample": 1,
+      "order_index": 0,
+      "process_exit_code": 0,
+      "process_completed_successfully": false,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 318742,
+      "elapsed_ms_from_first_instruction": 475098,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 10,
+        "command_actions": 6,
+        "mcp_calls": 22,
+        "mcp_failed_calls": 0,
+        "mcp_discovery_calls": 19,
+        "mcp_discovery_successful_calls": 19,
+        "mcp_selector_ambiguous_calls": 0,
+        "mcp_unexpected_failed_calls": 0,
+        "mcp_empty_discovery_calls": 1,
+        "mcp_useful_discovery_calls": 18,
+        "api_v3_discovery_calls": 19,
+        "explicit_workspace_discovery_calls": 19,
+        "first_discovery_before_edit": true,
+        "first_discovery_elapsed_ms": null,
+        "post_edit_discovery_calls": 5,
+        "rediscovery_after_each_edit": true,
+        "core_ipc_timeouts": 0,
+        "core_coverage_incomplete": 0,
+        "request_validation_failures": 0,
+        "file_change_batches": 3,
+        "input_tokens": 1983294,
+        "cached_input_tokens": 1842688,
+        "uncached_input_tokens": 140606,
+        "output_tokens": 10589,
+        "reasoning_tokens": 3762,
+        "total_tokens": 1997645,
+        "estimated_cost_usd": 4.081396
+      },
+      "host_metrics": {
+        "peak_rss_kib": 4804240,
+        "memory_budget_kib": 6000000,
+        "memory_budget_exceeded": false,
+        "memory_budget_exceeded_at": null,
+        "mean_cpu_percent": null,
+        "sample_count": 1579,
+        "duration_ms": 792018,
+        "sqlite_bytes": 6343119360,
+        "cas_bytes": 222651480,
+        "bytes_copied": null,
+        "bytes_transferred": null,
+        "bytes_decoded": null,
+        "ready_elapsed_ms": 316167,
+        "readiness_events": [
+          {
+            "elapsed_ms": 61,
+            "source_ready": false,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "unknown",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "ready"
+          },
+          {
+            "elapsed_ms": 24425,
+            "source_ready": true,
+            "syntax_ready": false,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 0,
+            "structural_completeness": "unknown",
+            "structural_availability": "unavailable",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 301227,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 1,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 311611,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": false,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 2,
+            "structural_completeness": "partial",
+            "structural_availability": "available",
+            "source_completeness": "partial",
+            "freshness_status": "indexing",
+            "workspace_status": "indexing",
+            "startup_phase": "publishing_structural"
+          },
+          {
+            "elapsed_ms": 316167,
+            "source_ready": true,
+            "syntax_ready": true,
+            "structural_ready": true,
+            "semantic_ready": false,
+            "structural_stage_ordinal": 3,
+            "structural_completeness": "complete",
+            "structural_availability": "available",
+            "source_completeness": "complete",
+            "freshness_status": "current",
+            "workspace_status": "ready",
+            "startup_phase": "ready"
+          }
+        ],
+        "stage_timings": {
+          "prior_state_current": 0,
+          "prior_state_occurrences": 0,
+          "prior_state_absences": 0,
+          "prior_state_source_state": 0,
+          "enumerate": 9878,
+          "source_catalog": 80338,
+          "source_ready_ms": 90217,
+          "enumerated_artifact_count": 17675,
+          "cataloged_artifact_count": 17675,
+          "stage_plan": 638,
+          "plugin_analyze": 57925,
+          "analyzed_artifact_count": 17675,
+          "accepted_delta_count": 12944,
+          "seal": 45203,
+          "publish": 209457,
+          "structural_stage_1_ready_ms": 300547,
+          "total": 300547
+        },
+        "analysis_timings": {
+          "closure": 771,
+          "worker_wait": 57050,
+          "acceptance": 57050,
+          "shards": 1,
+          "plan_mode": "stream",
+          "shards_used": 1,
+          "demotions": 0,
+          "per_shard_completed": [
+            12944
+          ]
+        },
+        "byte_telemetry": {
+          "cas": {
+            "read": 224550780,
+            "transferred": 0,
+            "copied": 0,
+            "decoded": 0,
+            "retained": 0,
+            "bytes_hashed": 0,
+            "leaves_modified": 0,
+            "nodes_recalculated": 0,
+            "collections_ordered": 0,
+            "corpus_rereads": 0
+          }
+        },
+        "bytes_read": 224550780,
+        "bytes_retained": null
+      },
+      "correctness": {
+        "changed_files": [
+          "extensions/typescript-language-features/src/languageProvider.ts",
+          "extensions/typescript-language-features/src/test/unit/languageProvider.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "extensions/typescript-language-features/src/languageProvider.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true,
+        "discovery_status": "fallback-completed",
+        "first_discovery_before_edit": true,
+        "rediscovery_after_edit": true,
+        "edit_count": 6,
+        "discovery_count": 38,
+        "fallback_shell": true,
+        "unexpected_errors": {
+          "tool_call": false,
+          "validation": false,
+          "coverage": false,
+          "ipc": false
+        }
+      },
+      "setup": {
+        "kind": "urdira-typescript",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": null,
+        "semantic_index": false,
+        "readiness": "warm"
+      },
+      "failure": "Error: Urdira host exited before readiness (null/SIGTERM)\n"
+    },
+    {
+      "run_id": "vscode-language-provider-registration-idempotence-codebase-memory-1",
+      "repository": "vscode",
+      "task": "language-provider-registration-idempotence",
+      "arm": "codebase-memory",
+      "sample": 1,
+      "order_index": 2,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 78036,
+      "elapsed_ms_from_first_instruction": 314356,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 11,
+        "command_actions": 11,
+        "mcp_calls": 33,
+        "file_change_batches": 2,
+        "input_tokens": 5475037,
+        "cached_input_tokens": 5172736,
+        "uncached_input_tokens": 302301,
+        "output_tokens": 24552,
+        "reasoning_tokens": 9852,
+        "total_tokens": 5509441,
+        "estimated_cost_usd": 11.225306
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "extensions/typescript-language-features/src/languageProvider.ts",
+          "extensions/typescript-language-features/src/test/unit/languageProvider.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "extensions/typescript-language-features/src/languageProvider.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codebase-memory",
+        "indexed": true,
+        "project": "vscode-language-provider-registration-idempotence-codebase-memory-1",
+        "elapsed_ms": 76396,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    },
+    {
+      "run_id": "vscode-language-provider-registration-idempotence-codegraph-1",
+      "repository": "vscode",
+      "task": "language-provider-registration-idempotence",
+      "arm": "codegraph",
+      "sample": 1,
+      "order_index": 3,
+      "process_exit_code": 0,
+      "process_completed_successfully": true,
+      "completed_successfully": true,
+      "setup_elapsed_ms": 82488,
+      "elapsed_ms_from_first_instruction": 293939,
+      "metrics": {
+        "outer_turns": 3,
+        "observable_agent_iterations": 9,
+        "command_actions": 10,
+        "mcp_calls": 11,
+        "file_change_batches": 3,
+        "input_tokens": 3900797,
+        "cached_input_tokens": 3621376,
+        "uncached_input_tokens": 279421,
+        "output_tokens": 25823,
+        "reasoning_tokens": 13797,
+        "total_tokens": 3940417,
+        "estimated_cost_usd": 8.118554
+      },
+      "host_metrics": null,
+      "correctness": {
+        "changed_files": [
+          "extensions/typescript-language-features/src/languageProvider.ts",
+          "extensions/typescript-language-features/src/test/unit/languageProvider.test.ts"
+        ],
+        "changed_paths": true,
+        "required_patterns": {
+          "extensions/typescript-language-features/src/languageProvider.ts": true
+        },
+        "focused_test_changed": true,
+        "diff_clean": true
+      },
+      "setup": {
+        "kind": "codegraph",
+        "indexed": true,
+        "project": null,
+        "elapsed_ms": 81890,
+        "semantic_index": null,
+        "readiness": null
+      },
+      "failure": null
+    }
+  ],
+  "campaign_gate": {
+    "expected_runs": 32,
+    "observed_runs": 32,
+    "successful_runs": 27,
+    "failed_or_blocked_runs": 5,
+    "passed": false,
+    "independent_campaigns": 1,
+    "p95_eligible": false
+  }
+}

@@ -661,13 +661,11 @@ export function analyzeProject(input: { readonly files: readonly AnalyzerFile[];
   const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].sort();
   const sourceFiles = input.files.filter((candidate) => rootNames.includes(candidate.path)).sort((left, right) => left.path.localeCompare(right.path));
   const virtualRoot = "/urdira-workspace";
-  const virtualPath = (path: string): string => `${virtualRoot}/${path}`;
-  const relativePath = (path: string): string => path.startsWith(`${virtualRoot}/`) ? path.slice(virtualRoot.length + 1) : path;
-  const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
   const configPath = `${virtualRoot}/__urdira_project__.json`;
+  const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
   const compilerOptions = { ...(hasJavaScript ? { allowJs: true, checkJs: true } : {}), ...(input.compiler_options ?? {}) };
   const virtualFiles: Record<string, string> = Object.fromEntries([
-    ...sourceFiles.map((file) => [virtualPath(file.path), file.text] as const),
+    ...sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text] as const),
     [configPath, JSON.stringify({ compilerOptions, files: rootNames })],
   ]);
   const api = new API({ fs: createVirtualFileSystem(virtualFiles) });
@@ -676,373 +674,12 @@ export function analyzeProject(input: { readonly files: readonly AnalyzerFile[];
     const snapshot = api.updateSnapshot({ openProjects: [configPath] });
     project = snapshot.getProjects().find((candidate) => candidate.configFileName === configPath);
     if (project === undefined) throw new Error("TypeScript did not create a project for the virtual configuration.");
-    const program = project.program;
-    const checker = project.checker;
-    const entities: JsTsEntity[] = [];
-    const relations: JsTsRelation[] = [];
-    const diagnostics: JsTsDiagnostic[] = [];
+
     const entityByNode = new Map<string, JsTsEntity>();
     const entityById = new Map<string, JsTsEntity>();
     const moduleByPath = new Map<string, JsTsEntity>();
-    // Direct (one-hop) import/export edges between scanned files' own paths,
-    // and the set of files whose closure cannot be trusted as complete --
-    // populated alongside the "core:import"/"core:export" relations below
-    // (`walk`'s import/export branch), then reduced to a transitive closure
-    // per file after every source file has been walked (see
-    // `dependencyClosures`, near the end of this function).
-    const directImportEdges = new Map<string, Set<string>>();
-    const incompleteClosureFiles = new Set<string>();
-    // Type-string extraction (`typeOf`, below) calls into the checker's type
-    // resolution machinery, which is expensive when done for every declaration
-    // in a file (most declarations are locals and parameters, never surfaced
-    // to a query). Restrict it to the file's actual exported surface: a
-    // top-level declaration the checker resolves as a module export, or a
-    // direct member of such a declaration (a method/property of an exported
-    // class or interface). This set is recomputed per source file below.
-    let exportedDeclarations = new Set<Node>();
-    const isExported = (node: Node): boolean => exportedDeclarations.has(node) || (node.parent !== undefined && exportedDeclarations.has(node.parent));
-    const nodeKey = (node: Node): string => `${relativePath(node.getSourceFile().fileName)}:${node.getStart(node.getSourceFile())}`;
-    const nameOf = (node: Node): string | undefined => {
-      const value = (node as Node & { readonly name?: Node }).name;
-      if (value === undefined) return undefined;
-      const candidate = value as Node & { readonly text?: string; readonly escapedText?: string | number };
-      if (typeof candidate.text === "string") return candidate.text;
-      if (typeof candidate.escapedText === "string" || typeof candidate.escapedText === "number") return String(candidate.escapedText);
-      return undefined;
-    };
-    const typeOf = (node: Node): string | undefined => {
-      try {
-        const type = checker.getTypeAtLocation(node);
-        return type === undefined ? undefined : checker.typeToString(type, node);
-      } catch {
-        return undefined;
-      }
-    };
-    const addEntity = (node: Node, parent: JsTsEntity | undefined): JsTsEntity | undefined => {
-      const name = nameOf(node);
-      if (name === undefined || name.length === 0) return undefined;
-      const source = node.getSourceFile();
-      const path = relativePath(source.fileName);
-      const start = node.getStart(source);
-      const end = node.getEnd();
-      let kind: string;
-      let universalKind: string;
-      if (isFunctionDeclaration(node)) { kind = "function"; universalKind = "core:callable"; }
-      else if (isClassDeclaration(node)) { kind = "class"; universalKind = "core:type"; }
-      else if (isInterfaceDeclaration(node)) { kind = "interface"; universalKind = "core:type"; }
-      else if (isTypeAliasDeclaration(node)) { kind = "type"; universalKind = "core:type"; }
-      else if (isEnumDeclaration(node)) { kind = "enum"; universalKind = "core:type"; }
-      else if (isModuleDeclaration(node)) { kind = "namespace"; universalKind = "core:type"; }
-      else if (isVariableDeclaration(node)) { kind = "variable"; universalKind = "core:value"; }
-      else if (isParameterDeclaration(node)) { kind = "parameter"; universalKind = "core:parameter"; }
-      else if (isMethodDeclaration(node) || isMethodSignatureDeclaration(node)) { kind = "method"; universalKind = "core:callable"; }
-      else if (isConstructorDeclaration(node)) { kind = "constructor"; universalKind = "core:callable"; }
-      else if (isGetAccessorDeclaration(node)) { kind = "getter"; universalKind = "core:callable"; }
-      else if (isSetAccessorDeclaration(node)) { kind = "setter"; universalKind = "core:callable"; }
-      else if (isPropertyDeclaration(node)) { kind = "property"; universalKind = "core:value"; }
-      else return undefined;
-      const id = stableId(kind, path, start, name);
-      const existing = entityById.get(id);
-      if (existing !== undefined) return existing;
-      const inferredType = kind === "parameter" || !isExported(node) ? undefined : typeOf(node);
-      const entity: JsTsEntity = { id, name, kind, universal_kind: universalKind, path, start, end, ...(parent === undefined ? {} : { parent_id: parent.id, qualified_name: `${parent.qualified_name ?? parent.name}.${name}` }), ...(inferredType === undefined ? {} : { type: inferredType }) };
-      entities.push(entity);
-      entityById.set(id, entity);
-      entityByNode.set(nodeKey(node), entity);
-      if (parent !== undefined) relations.push({ id: `${JAVASCRIPT_TYPESCRIPT_NAMESPACE}:contains:${parent.id}:${entity.id}`, kind: "core:contains", source_id: parent.id, target_id: entity.id, path, start, end, classification: "confirmed" });
-      return entity;
-    };
-    const collect = (node: Node, parent: JsTsEntity | undefined): void => {
-      const entity = addEntity(node, parent) ?? parent;
-      node.forEachChild((child) => collect(child, entity));
-    };
-    for (const file of sourceFiles) {
-      const source = program.getSourceFile(virtualPath(file.path));
-      if (source !== undefined) {
-        let isTestModule = false;
-        source.forEachChild((node) => {
-          if (!isImportDeclaration(node)) return;
-          const specifier = (node as Node & { readonly moduleSpecifier?: Node }).moduleSpecifier as Node & { readonly text?: string } | undefined;
-          if (specifier?.text === "node:test") isTestModule = true;
-        });
-        const moduleEntity: JsTsEntity = {
-          id: stableId("module", file.path, 0, file.path),
-          name: file.path,
-          kind: "module",
-          universal_kind: "core:container",
-          path: file.path,
-          start: 0,
-          end: source.getEnd(),
-          ...(isTestModule ? { is_test: true } : {}),
-        };
-        entities.push(moduleEntity);
-        entityById.set(moduleEntity.id, moduleEntity);
-        moduleByPath.set(file.path, moduleEntity);
-        try {
-          const moduleSymbol = checker.getSymbolAtLocation(source);
-          exportedDeclarations = new Set(moduleSymbol === undefined ? [] : checker.getExportsOfModule(moduleSymbol)
-            .flatMap((symbol) => symbol.declarations ?? [])
-            .map((handle) => handle.resolve(project))
-            .filter((resolved): resolved is Node => resolved !== undefined));
-        } catch {
-          exportedDeclarations = new Set();
-        }
-        collect(source, moduleEntity);
-      }
-    }
-    const targetForNode = (node: Node | undefined): JsTsEntity | undefined => {
-      if (node === undefined) return undefined;
-      const direct = entityByNode.get(nodeKey(node));
-      if (direct !== undefined) return direct;
-      let symbol = checker.getSymbolAtLocation(node);
-      if (symbol !== undefined) {
-        try {
-          const aliased = checker.getAliasedSymbol(symbol);
-          if (!checker.isUnknownSymbol(aliased)) symbol = aliased;
-        } catch { /* The direct symbol remains authoritative. */ }
-      }
-      const declaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0];
-      const resolved = declaration?.resolve(project);
-      return resolved === undefined ? undefined : entityByNode.get(nodeKey(resolved));
-    };
-    // Runs the identical symbol-resolution steps as `targetForNode`, but
-    // reports only whether the checker resolved `node` to SOME real
-    // declaration -- in or out of the frozen project -- rather than whether
-    // that declaration happens to be one of our own tracked entities. A call
-    // target resolving to a declaration outside the frozen project (a
-    // library function, a DOM/Node built-in, an ambient `.d.ts` type, ...)
-    // is an expected analysis boundary, not a coverage gap -- the same
-    // reasoning the import/export handling above already applies ("an
-    // unresolved bare specifier is an ordinary external dependency, not a
-    // closure gap"). Used below to keep `jsts:unresolved_call` honest: it
-    // should fire only when the checker could not establish ANY call
-    // target at all (e.g. dynamic dispatch through an `any`/computed
-    // expression), never merely because the resolved target is external.
-    const hasResolvedDeclaration = (node: Node | undefined): boolean => {
-      if (node === undefined) return false;
-      if (entityByNode.get(nodeKey(node)) !== undefined) return true;
-      let symbol = checker.getSymbolAtLocation(node);
-      if (symbol !== undefined) {
-        try {
-          const aliased = checker.getAliasedSymbol(symbol);
-          if (!checker.isUnknownSymbol(aliased)) symbol = aliased;
-        } catch { /* The direct symbol remains authoritative. */ }
-      }
-      const declaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0];
-      return declaration?.resolve(project) !== undefined;
-    };
-    const ownerAt = (node: Node): JsTsEntity | undefined => {
-      let current: Node | undefined = node.parent;
-      while (current !== undefined) {
-        const found = entityByNode.get(nodeKey(current));
-        if (found?.universal_kind === "core:callable") return found;
-        current = current.parent;
-      }
-      return undefined;
-    };
-    const moduleTarget = (node: Node): JsTsEntity | undefined => {
-      try {
-        const symbol = checker.getSymbolAtLocation(node);
-        for (const declaration of symbol?.declarations ?? []) {
-          const resolvedDeclaration = declaration.resolve(project);
-          if (resolvedDeclaration === undefined) continue;
-          const targetPath = relativePath(resolvedDeclaration.getSourceFile().fileName);
-          const target = moduleByPath.get(targetPath);
-          if (target !== undefined) return target;
-        }
-      } catch { /* Preserve the unresolved module relation below. */ }
-      const specifier = (node as Node & { readonly text?: string }).text;
-      if (typeof specifier !== "string" || !specifier.startsWith(".")) return undefined;
-      const sourceParts = relativePath(node.getSourceFile().fileName).split("/");
-      sourceParts.pop();
-      for (const part of specifier.split("/")) {
-        if (part === "." || part === "") continue;
-        if (part === "..") sourceParts.pop();
-        else sourceParts.push(part);
-      }
-      const base = sourceParts.join("/");
-      for (const candidate of [base, ...[...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS].map((extension) => `${base}${extension}`), ...[...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS].map((extension) => `${base}/index${extension}`)]) {
-        const target = moduleByPath.get(candidate);
-        if (target !== undefined) return target;
-      }
-      return undefined;
-    };
-    const relate = (kind: string, source: JsTsEntity, target: JsTsEntity | undefined, node: Node, classification: "confirmed" | "possible"): void => {
-      const path = relativePath(node.getSourceFile().fileName);
-      const start = node.getStart(node.getSourceFile());
-      const end = node.getEnd();
-      relations.push({ id: `${JAVASCRIPT_TYPESCRIPT_NAMESPACE}:${kind}:${path}:${start}:${end}:${source.id}:${target?.id ?? "unresolved"}`, kind: `core:${kind}`, source_id: source.id, ...(target === undefined ? {} : { target_id: target.id }), path, start, end, classification });
-      // Closure edges are derived from EVERY cross-file relation this
-      // analyzer ever emits (not only "core:import"/"core:export"): a
-      // "core:call"/"core:references"/"core:inherits"/"core:implements"
-      // relation can legitimately target a file reached only through
-      // re-exports or checker-resolved aliasing, not a literal import
-      // statement in `path` itself. Deriving closure edges here, in the one
-      // function every relation kind funnels through, is what makes the
-      // closure a guaranteed superset of everything `crossArtifactDependencies`
-      // (`packages/plugin-javascript-typescript/src/fact-delta.ts`) will ever
-      // need to resolve for a delta built from this file -- rather than a
-      // narrower, import-statement-only view that could miss a target.
-      if (target !== undefined && target.path !== path) {
-        const edges = directImportEdges.get(path) ?? new Set<string>();
-        edges.add(target.path);
-        directImportEdges.set(path, edges);
-      }
-    };
-    const walk = (node: Node): void => {
-      if (isImportDeclaration(node) || isExportDeclaration(node)) {
-        const specifier = (node as Node & { readonly moduleSpecifier?: Node }).moduleSpecifier;
-        if (specifier !== undefined) {
-          const sourceModule = moduleByPath.get(relativePath(node.getSourceFile().fileName));
-          const targetModule = moduleTarget(specifier);
-          if (sourceModule !== undefined) {
-            relate(isImportDeclaration(node) ? "import" : "export", sourceModule, targetModule, node, targetModule === undefined ? "possible" : "confirmed");
-            if (targetModule === undefined) {
-              // An unresolved specifier only makes this file's closure
-              // untrustworthy if it looked like it should have resolved
-              // locally (relative to this file, i.e. within the scanned
-              // corpus) -- an unresolved bare specifier (a package name) is
-              // an ordinary external dependency, not a closure gap. Likewise
-              // a relative specifier naming a non-source ASSET (a .woff2
-              // font, a .json locale, a stylesheet, an image): such a file
-              // can never be part of this analyzer's corpus, so its content
-              // can never affect any analysis output, and treating it as a
-              // gap is not merely pointless but actively harmful --
-              // incompleteness propagates transitively, and one widely
-              // imported module with a font import (measured: App.tsx on a
-              // real 665-file repository) poisoned 380/665 files' closures,
-              // defeating both affected-owner narrowing and the incremental
-              // analysis session's re-walk narrowing on every edit.
-              const specifierText = (specifier as Node & { readonly text?: string }).text;
-              if (typeof specifierText === "string" && specifierText.startsWith(".") && !relativeAssetSpecifier(specifierText)) incompleteClosureFiles.add(sourceModule.path);
-            }
-          }
-        }
-      }
-      const owner = ownerAt(node);
-      if (isIdentifier(node)) {
-        const parent = node.parent;
-        const declared = parent === undefined ? undefined : entityByNode.get(nodeKey(parent));
-        const parentName = parent === undefined ? undefined : (parent as Node & { readonly name?: Node }).name;
-        const isDeclarationName = declared !== undefined && parentName !== undefined && parentName.getStart(parentName.getSourceFile()) === node.getStart(node.getSourceFile()) && parentName.getEnd() === node.getEnd();
-        if (!isDeclarationName) {
-          const source = owner ?? moduleByPath.get(relativePath(node.getSourceFile().fileName));
-          const target = targetForNode(node);
-          if (source !== undefined && target !== undefined && source.id !== target.id) relate("references", source, target, node, "confirmed");
-        }
-      }
-      if (isCallExpression(node)) {
-        // `ownerAt` only returns entities whose `universal_kind` is
-        // `core:callable` (function/method/constructor/accessor
-        // declarations) -- a call at module top level, or nested inside a
-        // `const foo = () => {...}`/function-expression initializer (whose
-        // entity is `core:value`, since arrow/function expressions are not
-        // separately entity-tracked), climbs past every ancestor without
-        // ever finding one, so `owner` is `undefined` and the entire call
-        // edge used to be dropped silently (Bug Group 4.1). Falling back to
-        // the owning MODULE entity -- exactly the fallback the sibling
-        // `core:references` handling above already uses for its `source`
-        // -- keeps every call site attributable to something, at the cost
-        // of attributing nested-in-value-initializer calls to the module
-        // rather than to the (untracked) arrow/function-expression itself.
-        const callOwner = owner ?? moduleByPath.get(relativePath(node.getSourceFile().fileName));
-        if (callOwner !== undefined) {
-          let target: JsTsEntity | undefined;
-          let declarationResolved = false;
-          try {
-            const signature = checker.getResolvedSignature(node);
-            const declaration = signature?.declaration?.resolve(project);
-            declarationResolved = declaration !== undefined;
-            target = declaration === undefined ? undefined : entityByNode.get(nodeKey(declaration));
-            if (target === undefined) {
-              const expression = (node as Node & { readonly expression?: Node }).expression;
-              target = targetForNode(expression);
-              if (target === undefined && !declarationResolved) declarationResolved = hasResolvedDeclaration(expression);
-            }
-          } catch { target = undefined; }
-          relate("call", callOwner, target, node, target === undefined ? "possible" : "confirmed");
-          // `declarationResolved` is true when the checker DID establish a
-          // real call target, just one outside the frozen project (a library
-          // call, a built-in, ...) -- see `hasResolvedDeclaration`'s doc
-          // comment. Only the genuine "no target at all" case is worth
-          // flagging as incomplete `core:call_relationships` coverage;
-          // otherwise ordinary code (which calls out to its runtime and
-          // dependencies constantly) would always read back as "partial".
-          if (target === undefined && !declarationResolved) diagnostics.push({ code: "jsts:unresolved_call", message: "The TypeScript checker could not establish a unique call target.", path: relativePath(node.getSourceFile().fileName), start: node.getStart(node.getSourceFile()), end: node.getEnd() });
-        }
-      }
-      if (isHeritageClause(node)) {
-        const ownerEntity = entityByNode.get(nodeKey(node.parent));
-        if (ownerEntity !== undefined) for (const type of (node as Node & { readonly types?: readonly Node[] }).types ?? []) {
-          const target = targetForNode((type as Node & { readonly expression?: Node }).expression);
-          const clauseText = node.getText(node.getSourceFile()).trimStart();
-          relate(clauseText.startsWith("implements") ? "implements" : "inherits", ownerEntity, target, type, target === undefined ? "possible" : "confirmed");
-        }
-      }
-      node.forEachChild(walk);
-    };
-    for (const file of sourceFiles) {
-      const source = program.getSourceFile(virtualPath(file.path));
-      if (source !== undefined) walk(source);
-      if (/\b(?:eval|Function)\s*\(/u.test(file.text)) diagnostics.push({ code: "jsts:dynamic_runtime_code", message: "Runtime code generation is not statically resolvable.", path: file.path });
-    }
-    const parentOf = (entity: JsTsEntity): JsTsEntity | undefined => entity.parent_id === undefined ? undefined : entityById.get(entity.parent_id);
-    const testContainerOf = (entity: JsTsEntity): JsTsEntity | undefined => {
-      let current: JsTsEntity | undefined = entity;
-      while (current !== undefined) {
-        if (current.is_test === true) return current;
-        current = parentOf(current);
-      }
-      return undefined;
-    };
-    for (const reference of [...relations]) {
-      if (reference.kind !== "core:references" || reference.target_id === undefined) continue;
-      const source = entityById.get(reference.source_id);
-      const target = entityById.get(reference.target_id);
-      if (source === undefined || target === undefined || source.path === target.path) continue;
-      const testContainer = testContainerOf(source);
-      if (testContainer !== undefined) relations.push({
-        id: `${JAVASCRIPT_TYPESCRIPT_NAMESPACE}:covers:${reference.path}:${reference.start}:${reference.end}:${testContainer.id}:${target.id}`,
-        kind: "core:covers",
-        source_id: testContainer.id,
-        target_id: target.id,
-        path: reference.path,
-        start: reference.start,
-        end: reference.end,
-        classification: "confirmed",
-      });
-    }
-    const diagnosticText = (message: unknown): string => typeof message === "string" ? message : message !== null && typeof message === "object" && "text" in message ? diagnosticText((message as { text: unknown }).text) : String(message);
-    for (const diagnostic of [...program.getSyntacticDiagnostics(), ...program.getBindDiagnostics(), ...program.getSemanticDiagnostics()]) {
-      if (diagnostic.fileName === undefined || !rootNames.includes(relativePath(diagnostic.fileName))) continue;
-      diagnostics.push({ code: "jsts:compiler_diagnostic", compiler_code: diagnostic.code, message: diagnosticText(diagnostic.text), path: relativePath(diagnostic.fileName), start: diagnostic.pos, end: diagnostic.end });
-    }
-    entities.sort((left, right) => left.id.localeCompare(right.id));
-    relations.sort((left, right) => left.id.localeCompare(right.id));
-    diagnostics.sort((left, right) => `${left.path}\0${left.start ?? -1}\0${left.code}`.localeCompare(`${right.path}\0${right.start ?? -1}\0${right.code}`));
-    // Reduce the direct import/export edges collected during `walk`, above,
-    // into a transitive closure per scanned file: a plain reachability
-    // search over `directImportEdges`, always including the file itself.
-    // Incompleteness propagates transitively -- if any file reachable from
-    // `file.path` (including itself) had an unresolved local-looking
-    // specifier, `file.path`'s own closure cannot be trusted either, since
-    // whatever that unresolved import would have pulled in is invisible to
-    // this search.
-    const dependencyClosures: Record<string, JsTsDependencyClosure> = {};
-    for (const file of sourceFiles) {
-      const visited = new Set<string>([file.path]);
-      const stack = [file.path];
-      let complete = true;
-      while (stack.length > 0) {
-        const current = stack.pop()!;
-        if (incompleteClosureFiles.has(current)) complete = false;
-        for (const next of directImportEdges.get(current) ?? []) {
-          if (!visited.has(next)) { visited.add(next); stack.push(next); }
-        }
-      }
-      dependencyClosures[file.path] = { files: [...visited].sort(), complete };
-    }
-    return { language: rootNames.some((path) => languageForPath(path) === "javascript") && !rootNames.some((path) => languageForPath(path) === "typescript") ? "javascript" : "typescript", entities, relations, diagnostics, complete: diagnostics.length === 0, dependency_closures: dependencyClosures };
+    const walkOutput = walkFiles({ project, virtualRoot, filesToProcess: sourceFiles, entityByNode, entityById, moduleByPath });
+    return assembleAnalysis(sourceFiles, rootNames, walkOutput.entitiesByFile, walkOutput.relationsByFile, walkOutput.diagnosticsByFile, walkOutput.directEdgesByFile, walkOutput.directIncompleteFiles, entityById);
   } finally {
     project?.checker.dispose();
     api.close();
@@ -1362,12 +999,11 @@ interface JsTsWalkPassOutput {
 }
 
 /**
- * Runs `analyzeProject`'s pass-1 (entity collection) + pass-2 (relation/walk
- * diagnostics) + per-file compiler diagnostics over exactly
- * `filesToProcess`, against an already-built `project`'s live program and
- * checker. This is intentionally a near-verbatim copy of `analyzeProject`'s
- * own walk logic (not a refactor of it -- `analyzeProject` must stay
- * byte-for-byte unchanged) generalized to a restricted file set:
+ * Runs the shared pass-1 entity collection, pass-2 relation walk, and per-file
+ * compiler diagnostics over exactly `filesToProcess` in an already-built
+ * project. `analyzeProject` uses it for the complete source set; incremental
+ * sessions use the same authority for only the files that require a fresh
+ * walk:
  *
  *  - `entityByNode`/`entityById`/`moduleByPath` MUST already contain entries
  *    for every file OUTSIDE `filesToProcess` that a walked file might
@@ -1677,8 +1313,8 @@ function walkFiles(params: {
 }
 
 /**
- * Global, order-independent merge step shared by a session's full and
- * incremental builds: flattens per-file entity/relation/diagnostic maps
+ * Global, order-independent merge step shared by ordinary full analysis and a
+ * session's full and incremental builds. It flattens per-file maps
  * (whatever mix of fresh-walked and memoized-reused they came from) into
  * `analyzeProject`'s exact output shape -- derives `core:covers` relations,
  * sorts every array with the identical comparators `analyzeProject` uses,

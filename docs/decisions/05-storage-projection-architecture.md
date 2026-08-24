@@ -15,9 +15,9 @@ Map the canonical logical model to local persistent storage and rebuildable spec
 - All knowledge projections support invalidation by owner artifact.
 - Query executions retain compact manifests rather than complete rendered responses.
 - The product is local and open source.
-- The destructive v3 data root has no v1, v2, or early-preview v3 decoder or
-  in-place migration. Portable logical persistence is relational and digests
-  are generated from Schema IR fields.
+- The runtime accepts only the exact supported v3 data-root contract and has no
+  in-place migration mode. Portable logical persistence is relational and
+  digests are generated from Schema IR fields.
 - Before write activation, the engine verifies the exact v3 application ID,
   format marker, schema fingerprint, and required SQLite features. Any
   unsupported root remains unopened and returns
@@ -124,25 +124,19 @@ One workspace SQLite transaction then:
 
 Commit is the visibility and recovery authority. Any failure rolls back the entire transaction and consumes no generation. CAS objects installed before the transaction remain unreachable if it aborts; later GC collects them. No current pointer can reference an uncommitted object. If commit succeeded but acknowledgement failed, recovery confirms the candidate as published and never republishes or marks it failed. Cleanup, catalog summaries, and watcher acknowledgements happen after commit and are idempotent.
 
-## Physical schema migrations
+## Supported storage contract
 
 Storage format has an independent monotonic version. The implemented v3
 startup path verifies application ID, format, required SQLite features, and
 schema fingerprint, then chooses only `compatible` or `unsupported`. It never
-lets SQLite perform implicit type or collation changes and does not attach a
-legacy root.
+lets SQLite perform implicit type or collation changes or attach an
+unsupported root.
 
-There is no current small-additive, rewrite, shadow-copy, or table-backfill
-migration lane into v3. An operator may inventory and back up a legacy root out
-of process, but activation requires a fresh v3 root and source reindexing. CAS
+There is no small-additive, rewrite, shadow-copy, or table-backfill activation
+lane. An operator may inventory and back up an unsupported root out of process,
+but activation requires a fresh supported root and source reindexing. CAS
 objects may be reused only after complete workspace-scope, byte-length, and
 SHA-256 verification.
-
-Any future in-place migration capability requires a new approved decision and
-lossless adapters for every reachable logical value. Such a future migration
-could change physical tables, indexes, compression, sharding, or cache
-encoding, but could not change logical IDs, digests, validity intervals,
-result order, or retained interpretation.
 
 ## Integrity, repair, backup, and rebuild
 
