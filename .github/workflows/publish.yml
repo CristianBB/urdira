@@ -19,7 +19,7 @@ jobs:
     environment: npm-production
     steps:
       - name: Check out the release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_tag }}
           fetch-depth: 0
@@ -27,11 +27,11 @@ jobs:
         shell: bash
         run: test "$(git describe --exact-match --tags HEAD)" = "${{ inputs.release_tag }}"
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 11.20.0
       - name: Set up Node.js and npm registry
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
           cache: pnpm

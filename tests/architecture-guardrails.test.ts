@@ -501,6 +501,33 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 30
     expect(workflow).toContain('branches:\n      - "**"');
   });
 
+  it("uses GitHub Actions releases backed by the Node.js 24 runtime", async () => {
+    const ciWorkflow = await readFile(
+      join(repositoryRoot, ".github/workflows/ci.yml"),
+      "utf8",
+    );
+    const publishWorkflow = await readFile(
+      join(repositoryRoot, ".github/workflows/publish.yml"),
+      "utf8",
+    );
+    const workflows = `${ciWorkflow}\n${publishWorkflow}`;
+
+    expect(ciWorkflow).toContain("actions/upload-artifact@v7");
+    for (const workflow of [ciWorkflow, publishWorkflow]) {
+      expect(workflow).toContain("actions/checkout@v7");
+      expect(workflow).toContain("actions/setup-node@v7");
+      expect(workflow).toContain("pnpm/action-setup@v5");
+    }
+    for (const deprecatedAction of [
+      "actions/checkout@v4",
+      "actions/setup-node@v4",
+      "actions/upload-artifact@v4",
+      "pnpm/action-setup@v4",
+    ]) {
+      expect(workflows).not.toContain(deprecatedAction);
+    }
+  });
+
   it("publishes patch releases idempotently without overwriting existing package versions", async () => {
     const workflow = await readFile(join(repositoryRoot, ".github/workflows/publish.yml"), "utf8");
     expect(workflow).toContain("npm view");
