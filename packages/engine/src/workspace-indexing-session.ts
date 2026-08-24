@@ -274,14 +274,33 @@ export async function runSourceOnlyWorkspaceScan(input: RunSourceOnlyWorkspaceSc
       provider_version_token: observation.provider_version_token,
     }, ...(input.scan_budget === undefined ? {} : { budget: input.scan_budget }), now,
   }));
-  const result = await new GenericSourceIndexer(input.database).apply({
-    response,
-    native_batches: enumeration.batches,
-    allow_partial: enumeration.incremental,
-    read,
-    publication_current_generation: current?.current_generation ?? 0,
-    ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }),
-  });
+  // `read_stream` was missing here for a long time: `enumerateNativeBatches`
+  // starts the bounded byte hand-off unconditionally on a complete capture,
+  // so without a `readStream` consumer every prefetched entry sat unclaimed
+  // (up to the whole 64MiB budget held live, prefetch workers parked on the
+  // gate) while the catalog re-read every file through the legacy `read`
+  // path anyway.
+  const readStream = async (observation: ProviderObservation, streamOptions?: { readonly reuse_existing?: boolean }) => provider.readStream({
+    artifact_id: observation.artifact_id,
+    normalized_uri: observation.normalized_uri,
+    observed_content_hash: observation.observed_content_hash,
+    observed_metadata_digest: observation.observed_metadata_digest,
+    provider_version_token: observation.provider_version_token,
+  }, streamOptions);
+  let result: SourceIndexApplyResult;
+  try {
+    result = await new GenericSourceIndexer(input.database).apply({
+      response,
+      native_batches: enumeration.batches,
+      allow_partial: enumeration.incremental,
+      read,
+      read_stream: readStream,
+      publication_current_generation: current?.current_generation ?? 0,
+      ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }),
+    });
+  } finally {
+    await provider.abortPrefetch();
+  }
   if (result.status !== "published" && result.status !== "equivalent") throw new EngineError("engine:workspace_scan_source_index_degraded", `Source cataloging of ${input.root} did not complete (status ${result.status}, error ${result.error_code ?? "none"}).`);
   const state = await input.database.sourceIndex.getState();
   const occurrences = await input.database.sourceIndex.currentOccurrencesSlim(bindingId);
@@ -679,7 +698,15 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // against this line and this stage's own wall time to see what remains
   // unattributed.
   if (engineTimingEnabled()) resetEngineTimings();
-  sourceIndexResult = await timed("source_catalog", () => { throwIfCancelled(); return new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, allow_partial: enumeration.incremental, publication_current_generation: currentState?.current_generation ?? 0, ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }) }); });
+  try {
+    sourceIndexResult = await timed("source_catalog", () => { throwIfCancelled(); return new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, allow_partial: enumeration.incremental, publication_current_generation: currentState?.current_generation ?? 0, ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }) }); });
+  } finally {
+    // A completed catalog can still leave unclaimed prefetch entries (every
+    // read that took the `reuse_existing` branch); a degraded/thrown one
+    // leaves many. Either way the hand-off budget must be returned -- see
+    // `DirectorySourceProvider.abortPrefetch`.
+    await provider.abortPrefetch();
+  }
   if (engineTimingEnabled()) console.error(`[urdira] engine timings source_catalog workspace:${workspaceId} ms=${JSON.stringify(snapshotEngineTimings())}`);
   if (sourceIndexResult.status !== "published" && sourceIndexResult.status !== "equivalent") {
     throw new EngineError("engine:workspace_scan_source_index_degraded", `Source cataloging of ${input.root} did not complete (status ${sourceIndexResult.status}, error ${sourceIndexResult.error_code ?? "none"}).`);

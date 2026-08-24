@@ -185,6 +185,18 @@ async function attemptWorkspaceForkInner(options: WorkspaceForkOptions): Promise
   const enumeration = await enumerateForkRoot(options, context);
   stage("enumerate", enumerateStarted);
   if (enumeration === undefined) return { status: "skipped", reason: "enumeration of the newly added workspace's root did not succeed" };
+  try {
+    return await forkAfterEnumeration(options, context, enumeration, donors, stage);
+  } finally {
+    // Every exit -- donor-mismatch skip, thrown error, or a completed fork
+    // whose read pass left unclaimed entries -- must return the byte
+    // hand-off budget the enumeration's prefetch is still holding.
+    await enumeration.provider.abortPrefetch();
+  }
+}
+
+async function forkAfterEnumeration(options: WorkspaceForkOptions, context: ForkContext, enumeration: ForkEnumeration, donors: readonly RegisteredWorkspace[], stage: (name: string, startedAt: number) => void): Promise<WorkspaceForkOutcome> {
+  const workspace = options.workspace;
   const donorMatchStarted = Date.now();
 
   // Git fast path: a cheap, byte-free *preference hint* only, not a trusted
@@ -230,7 +242,7 @@ async function attemptWorkspaceForkInner(options: WorkspaceForkOptions): Promise
   // The content-hash multiset the fork target's own enumeration already
   // captured (every observation's `observed_content_hash` is computed during
   // enumeration itself, no separate read pass needed for this comparison).
-  const newMultiset = multisetKey(enumeration.encodedBatch.observations.map((observation) => [observation.normalized_uri, observation.observed_content_hash] as const));
+  const newMultiset = multisetKey(enumeration.observations.map((observation) => [observation.normalized_uri, observation.observed_content_hash] as const));
   let donor: RegisteredWorkspace | undefined;
   for (const candidate of orderedCandidates) {
     try {
@@ -306,10 +318,10 @@ async function commitSourceLayerAndPublish(options: WorkspaceForkOptions, contex
   const workspaceId = options.workspace.workspace_id;
   // Deterministic and computed up front, before any write, from data the
   // enumeration (not the commit) already produced -- `commitForkSourceLayer`
-  // re-derives the identical `observation_batch_id` from this same
-  // `encodedBatch`, so these ids are valid rollback targets regardless of
-  // whether the commit below, or anything after it, actually succeeds.
-  const observationBatchId = enumeration.encodedBatch.batch.observation_batch_id;
+  // returns the identical `enumeration.observationBatchId`, so these ids are
+  // valid rollback targets regardless of whether the commit below, or
+  // anything after it, actually succeeds.
+  const observationBatchId = enumeration.observationBatchId;
   const candidateId = stableId("workspace-fork-candidate", { workspace_id: workspaceId, donor_workspace_id: donor.workspace_id, observation_batch_id: observationBatchId });
   const ids: ForkPublicationIds = {
     candidateId,
@@ -517,8 +529,23 @@ export interface ForkSourceLayer {
 
 export interface ForkEnumeration {
   readonly provider: DirectorySourceProvider;
-  readonly enumerateResponse: Awaited<ReturnType<DirectorySourceProvider["enumerate"]>>;
-  readonly encodedBatch: EncodedObservationBatch;
+  readonly enumerateResponse: Awaited<ReturnType<DirectorySourceProvider["enumerateNativeBatches"]>>["response"];
+  /**
+   * The native enumeration's fragments, fully drained to an array (the
+   * capture -- including every observation's content hash -- is eager, so
+   * draining costs only the fragment metadata encode). Kept fragmented so
+   * `commitForkSourceLayer` can feed them back to
+   * `GenericSourceIndexer.apply`'s native-batch path unchanged.
+   */
+  readonly batches: readonly EncodedObservationBatch[];
+  /** Every fragment's observations, flattened, for multiset/cross-check use. */
+  readonly observations: EncodedObservationBatch["observations"];
+  /**
+   * The first fragment's batch id. Target-local only (candidate/rollback id
+   * derivation) -- never part of any digest compared against a donor or
+   * pack anchor.
+   */
+  readonly observationBatchId: string;
 }
 
 function forkProviderRequest(options: { readonly call: "enumerate" | "read"; readonly workspaceId: string; readonly bindingId: string; readonly componentId: string; readonly componentVersion: string; readonly payload: unknown; readonly now: () => string }) {
@@ -540,12 +567,19 @@ function forkProviderRequest(options: { readonly call: "enumerate" | "read"; rea
 }
 
 /**
- * Non-durable enumeration of the fork target's own root (`DirectorySourceProvider.enumerate`
- * only -- no `GenericSourceIndexer.apply`, so nothing is written to `database`
- * yet). Every observation already carries its `observed_content_hash`
- * (enumeration itself reads and hashes file bytes to produce it), which is
- * enough for both the git-fast-path cross-check and the content-hash
- * fallback predicate without any further file reads.
+ * Non-durable enumeration of the fork target's own root
+ * (`DirectorySourceProvider.enumerateNativeBatches` only -- no
+ * `GenericSourceIndexer.apply`, so nothing is written to `database` yet).
+ * Every observation already carries its `observed_content_hash` (enumeration
+ * itself reads and hashes file bytes to produce it), which is enough for
+ * both the git-fast-path cross-check and the content-hash fallback predicate
+ * without any further file reads. The native path (same one
+ * `runFullWorkspaceScan` uses) also starts the bounded enumerate->catalog
+ * byte hand-off, which is what lets `commitForkSourceLayer` stream bytes to
+ * CAS without a second full read pass -- callers that bail out between this
+ * call and a completed `commitForkSourceLayer` must call
+ * `provider.abortPrefetch()` (see `attemptWorkspaceForkInner` /
+ * `attemptIndexPackImportInner`'s try/finally).
  */
 export async function enumerateForkRoot(options: WorkspaceForkOptions, context: ForkContext): Promise<ForkEnumeration | undefined> {
   const workspaceId = options.workspace.workspace_id;
@@ -559,31 +593,37 @@ export async function enumerateForkRoot(options: WorkspaceForkOptions, context: 
     now: context.now,
   });
   const scope = { scope_type: "source_root" as const, source_provider_binding_id: context.bindingId, source_provider: provider.component_id, normalized_scope_key: "" };
-  const enumerateResponse = await provider.enumerate(forkProviderRequest({ call: "enumerate", workspaceId, bindingId: context.bindingId, componentId: provider.component_id, componentVersion: provider.component_version, payload: { coverage_scopes: [scope] }, now: context.now }));
-  if (enumerateResponse.outcome !== "success" || enumerateResponse.payload === undefined) return undefined;
-  const enumeratePayload = enumerateResponse.payload as { readonly observation_batch: string; readonly watermark: string };
-  const encodedBatch = JSON.parse(enumeratePayload.observation_batch) as EncodedObservationBatch;
-  if (encodedBatch.observations.length === 0) return undefined;
-  return { provider, enumerateResponse, encodedBatch };
+  const enumeration = await provider.enumerateNativeBatches(forkProviderRequest({ call: "enumerate", workspaceId, bindingId: context.bindingId, componentId: provider.component_id, componentVersion: provider.component_version, payload: { coverage_scopes: [scope] }, now: context.now }));
+  if (enumeration.response.outcome !== "success") return undefined;
+  const batches: EncodedObservationBatch[] = [];
+  for await (const batch of enumeration.batches) batches.push(batch);
+  const observations = batches.flatMap((batch) => batch.observations);
+  if (observations.length === 0 || batches.length === 0) { await provider.abortPrefetch(); return undefined; }
+  return { provider, enumerateResponse: enumeration.response, batches, observations, observationBatchId: batches[0]!.batch.observation_batch_id };
 }
 
 /**
- * Durable stage 1 of the fork target's own workspace: reads and hashes every
- * enumerated file's bytes and commits them via `GenericSourceIndexer.apply`,
- * identical in substance to `runFullWorkspaceScan`'s own enumerate + read +
- * apply (`packages/engine/src/workspace-indexing-session.ts`), duplicated
- * here rather than factored out of that file to avoid touching an already
+ * Durable stage 1 of the fork target's own workspace: commits the enumerated
+ * files via `GenericSourceIndexer.apply` on the same native-batch +
+ * `read_stream` path `runFullWorkspaceScan` uses
+ * (`packages/engine/src/workspace-indexing-session.ts`), duplicated here
+ * rather than factored out of that file to avoid touching an already
  * well-tested production scan path for a feature that only ever runs before
- * it. Only ever called once a donor and plugin-resolution match are both
- * confirmed (see `attemptWorkspaceForkInner`). v1 always reads and hashes
- * file bytes (does not special-case the git fast path to skip byte reads) --
+ * it. Because enumeration already read and hashed every file (and prefetched
+ * bytes into the bounded hand-off), the catalog stream claims those bytes
+ * instead of re-reading each file through the legacy `provider.read` path --
+ * previously the single biggest cost of a fork/import
+ * (`source_provider_read`, 169s of a 280s VS Code pack import). Only ever
+ * called once a donor and plugin-resolution match are both confirmed (see
+ * `attemptWorkspaceForkInner`). v1 always reads and hashes file bytes during
+ * enumerate (does not special-case the git fast path to skip byte reads) --
  * see docs/decisions/12-workspace-fork.md's "Shipped variant" section for
  * why, and the follow-up this leaves open.
  */
 export async function commitForkSourceLayer(options: WorkspaceForkOptions, context: ForkContext, enumeration: ForkEnumeration): Promise<ForkSourceLayer | undefined> {
   const workspaceId = options.workspace.workspace_id;
   const database = options.database;
-  const { provider, enumerateResponse, encodedBatch } = enumeration;
+  const { provider, enumerateResponse, batches } = enumeration;
 
   const readObservation = async (observation: EncodedObservationBatch["observations"][number]) => provider.read(forkProviderRequest({
     call: "read",
@@ -600,8 +640,23 @@ export async function commitForkSourceLayer(options: WorkspaceForkOptions, conte
     },
     now: context.now,
   }));
+  // Mirror of `runFullWorkspaceScan`'s `readStream` closure: this is what
+  // lets the CAS stream claim the bytes the enumerate pass already read
+  // (prefetch hand-off + captured-boundary reuse) instead of re-reading and
+  // re-hashing every file through the legacy `provider.read` JSON path --
+  // the 60%-of-import `source_provider_read` cost this replaced.
+  const readStream = async (observation: EncodedObservationBatch["observations"][number], streamOptions?: { readonly reuse_existing?: boolean }) => provider.readStream({
+    artifact_id: observation.artifact_id,
+    normalized_uri: observation.normalized_uri,
+    observed_content_hash: observation.observed_content_hash,
+    observed_metadata_digest: observation.observed_metadata_digest,
+    provider_version_token: observation.provider_version_token,
+  }, streamOptions);
+  const nativeBatches = (async function* (): AsyncGenerator<EncodedObservationBatch> {
+    for (const batch of batches) yield batch;
+  })();
 
-  const sourceIndexResult = await new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, parsed_batch: encodedBatch, ...(options.io_concurrency === undefined ? {} : { io_concurrency: options.io_concurrency }) });
+  const sourceIndexResult = await new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, ...(options.io_concurrency === undefined ? {} : { io_concurrency: options.io_concurrency }) });
   if (sourceIndexResult.status !== "published" && sourceIndexResult.status !== "equivalent") return undefined;
 
   const occurrences = await database.sourceIndex.currentOccurrences(context.bindingId);
@@ -609,7 +664,7 @@ export async function commitForkSourceLayer(options: WorkspaceForkOptions, conte
   const sourceIndexState = await database.sourceIndex.getState();
   return {
     occurrences: occurrences.map((occurrence) => ({ normalized_uri: occurrence.artifact.normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_version_id: occurrence.version.artifact_version_id, content_hash: occurrence.version.content_hash })),
-    observation_batch_id: encodedBatch.batch.observation_batch_id,
+    observation_batch_id: enumeration.observationBatchId,
     source_state_digest: sourceIndexState?.source_state_digest ?? stableId("workspace-fork-empty-base", { workspace_id: workspaceId }),
     source_snapshot_id: `source-snapshot:${sourceIndexState?.current_generation ?? 0}`,
   };

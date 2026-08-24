@@ -152,7 +152,7 @@ describe("Phase 7 five-call source providers", () => {
       new GitReferenceSourceProvider({ ...boundProvider, git_dir: join(root, ".git"), ref: "refs/heads/main", now: () => instant }),
     ];
 
-    expect(methodNames(providers[0]!)).toEqual(["describe", "enumerate", "enumerateNative", "enumerateNativeBatches", "read", "readStream", "reconcile", "watch"]);
+    expect(methodNames(providers[0]!)).toEqual(["abortPrefetch", "describe", "enumerate", "enumerateNative", "enumerateNativeBatches", "read", "readStream", "reconcile", "watch"]);
     for (const provider of providers.slice(1)) expect(methodNames(provider)).toEqual(["describe", "enumerate", "read", "reconcile", "watch"]);
   });
 
@@ -978,6 +978,40 @@ describe("P3-3a bounded enumerate->catalog byte hand-off", () => {
     expect(enabled.beforeReadStream).toBe(disabled.beforeReadStream + 1);
     expect(enabled.afterReadStream).toBe(enabled.beforeReadStream);
     expect(disabled.afterReadStream).toBe(disabled.beforeReadStream + 1);
+  });
+
+  it("abortPrefetch drains held and queued prefetch entries, returns the budget, and leaves readStream on the lazy path", async () => {
+    const root = await temporaryDirectory();
+    // Each file is ~1150 bytes; a budget of 1200 admits exactly one at a
+    // time, so with 6 files the workers necessarily interleave hold/queue on
+    // the gate. `abortPrefetch` resolving AT ALL is then itself the proof
+    // that the drain releases claimed budget (a queued worker's promise can
+    // only settle once the drain's release pumps it through the gate, where
+    // the abort flag makes it give the budget straight back).
+    for (let index = 0; index < 6; index += 1) {
+      await writeFile(join(root, `file-${index}.ts`), `export const value${index} = ${index};\n`.repeat(46));
+    }
+    process.env["URDIRA_CATALOG_HANDOFF_BYTES"] = "1200";
+    let calls = 0;
+    const provider = new DirectorySourceProvider({
+      ...boundProvider,
+      root,
+      now: () => instant,
+      file_system: { ...NODE_DIRECTORY_FILE_SYSTEM, read_file_stream: (candidate) => { calls += 1; return NODE_DIRECTORY_FILE_SYSTEM.read_file_stream!(candidate); } },
+    });
+    const observations = await collectNativeBatches(provider, request("enumerate", { coverage_scopes: completeScope }));
+    expect(observations.length).toBe(6);
+
+    await provider.abortPrefetch();
+    await provider.abortPrefetch(); // idempotent, resolves immediately
+
+    // Every entry was drained, so each readStream falls back to exactly one
+    // fresh lazy read -- and still yields the correct bytes.
+    const callsAfterAbort = calls;
+    const reads = await readAllStreams(provider, observations);
+    expect(Object.keys(reads).length).toBe(6);
+    expect(reads["file-0.ts"]!.text).toContain("export const value0 = 0;");
+    expect(calls).toBe(callsAfterAbort + 6);
   });
 
   it("still rejects a file that changed between enumeration and the prefetch read (tamper/race safety)", async () => {

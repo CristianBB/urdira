@@ -1014,7 +1014,19 @@ async function attemptIndexPackImportInner(options: IndexPackImportOptions): Pro
 
   const enumeration: ForkEnumeration | undefined = await enumerateForkRoot(options as unknown as WorkspaceForkOptions, context);
   if (enumeration === undefined) return { status: "skipped", reason: "enumeration of the newly added workspace's root did not succeed" };
-  const targetMultisetEntries = enumeration.encodedBatch.observations.map((observation) => [observation.normalized_uri, observation.observed_content_hash] as const);
+  try {
+    return await importAfterEnumeration(options, context, enumeration, workspaceId, maxDiffEntries);
+  } finally {
+    // Every exit -- a compatibility/multiset skip before any durable write,
+    // a rollback, or a completed import whose read pass left unclaimed
+    // entries -- must return the byte hand-off budget the enumeration's
+    // prefetch is still holding (see `DirectorySourceProvider.abortPrefetch`).
+    await enumeration.provider.abortPrefetch();
+  }
+}
+
+async function importAfterEnumeration(options: IndexPackImportOptions, context: ForkContext, enumeration: ForkEnumeration, workspaceId: string, maxDiffEntries: number): Promise<IndexPackImportOutcome> {
+  const targetMultisetEntries = enumeration.observations.map((observation) => [observation.normalized_uri, observation.observed_content_hash] as const);
   const targetMultisetKey = multisetKey(targetMultisetEntries);
 
   const lines = readPackLines(options.pack_path);
@@ -1054,7 +1066,7 @@ async function attemptIndexPackImportInner(options: IndexPackImportOptions): Pro
   // reasoning in `workspace-fork.ts` exactly, including the "documented
   // incident" it guards against: a partial commit that never rolls back
   // leaves this workspace permanently wedged for the fallback full scan too.
-  const observationBatchId = enumeration.encodedBatch.batch.observation_batch_id;
+  const observationBatchId = enumeration.observationBatchId;
   const candidateId = stableId("index-pack-import-candidate", { workspace_id: workspaceId, manifest_digest: manifest.manifest_digest, observation_batch_id: observationBatchId });
   const ids: ForkPublicationIds = { candidateId, materializationId: `materialization:${candidateId}`, snapshotId: `snapshot:${candidateId}`, generationManifestId: `generation-manifest:${candidateId}`, generation: 1 };
 

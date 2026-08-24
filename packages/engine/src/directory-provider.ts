@@ -495,6 +495,7 @@ export class DirectorySourceProvider implements SourceProvider {
   // (`source_changed`) read.
   readonly #metadataCache = new Map<string, CapturedFileMetadata>();
   #prefetchGate: BudgetGate | undefined;
+  #prefetchAborted = false;
   readonly #prefetchPromises = new Map<string, Promise<PrefetchedContent | undefined>>();
   readonly #onPrefetchedText: ((uri: string, text: string) => void) | undefined;
 
@@ -1045,6 +1046,7 @@ export class DirectorySourceProvider implements SourceProvider {
   #startPrefetch(files: readonly CapturedFile[]): void {
     const budget = catalogHandoffBudgetBytes();
     if (budget <= 0 || files.length === 0) return;
+    this.#prefetchAborted = false;
     const gate = new BudgetGate(budget);
     this.#prefetchGate = gate;
     const fileSystem = this.#fileSystem;
@@ -1058,7 +1060,14 @@ export class DirectorySourceProvider implements SourceProvider {
     void mapWithConcurrency(eligible, PREFETCH_CONCURRENCY, async (file) => {
       const meta = this.#metadataCache.get(file.uri)!;
       const promise = (async (): Promise<PrefetchedContent | undefined> => {
+        // Checked both before AND after `acquire`: a worker that was already
+        // queued on the gate when `abortPrefetch` ran wakes up (the drain's
+        // releases pump the queue), sees the flag, and returns its budget
+        // instead of reading -- so the drain never waits on a read that
+        // no longer has a consumer.
+        if (this.#prefetchAborted) return undefined;
         await gate.acquire(meta.byte_length);
+        if (this.#prefetchAborted) { gate.release(meta.byte_length); return undefined; }
         // On any failure below, this worker owns the acquired budget and
         // must release it itself here. A successful result instead hands
         // budget ownership to whichever `readStream` call claims this entry
@@ -1084,6 +1093,40 @@ export class DirectorySourceProvider implements SourceProvider {
       this.#prefetchPromises.set(file.uri, promise);
       await promise;
     }).catch(() => undefined);
+  }
+
+  /**
+   * Stops the enumerate->catalog byte hand-off and returns every byte of
+   * budget it still holds. Any caller that enumerates (which starts the
+   * prefetch) but then does not `readStream`-claim every entry -- a fork or
+   * index-pack import that skips before its read pass, a scan whose reads
+   * all take the `reuse_existing` branch, or simply the end of a completed
+   * read pass with unclaimed leftovers -- must call this, or up to the whole
+   * hand-off budget (64MiB default) stays referenced from `#prefetchPromises`
+   * for the provider's remaining lifetime and any still-queued workers stay
+   * parked on the gate forever.
+   *
+   * Ownership stays within the existing release-on-claim contract (see
+   * `PREFETCH_CONCURRENCY`): the drain below IS a claim -- it removes each
+   * entry from `#prefetchPromises` first, then awaits it, then releases the
+   * budget that a successful prefetch handed to whoever claimed it. Workers
+   * that have not acquired yet exit via the `#prefetchAborted` checks in
+   * `#startPrefetch` instead. Never blocks on anything but in-flight file
+   * reads, and is safe to call at any time, repeatedly.
+   */
+  async abortPrefetch(): Promise<void> {
+    this.#prefetchAborted = true;
+    const gate = this.#prefetchGate;
+    if (gate === undefined) return;
+    // Loop until empty: a worker that started between our snapshot and its
+    // own flag check can still add a (resolved-undefined) entry.
+    while (this.#prefetchPromises.size > 0) {
+      for (const [uri, promise] of [...this.#prefetchPromises]) {
+        this.#prefetchPromises.delete(uri);
+        const content = await promise;
+        if (content !== undefined) gate.release(content.reserved_bytes);
+      }
+    }
   }
 
   async #digestFile(path: string): Promise<{ readonly content_hash: string; readonly byte_length: number; readonly has_nul: boolean; readonly valid_utf8: boolean }> {
