@@ -88,6 +88,7 @@ export {
   validateDigestRecipeGraph,
   verifyDigest,
   memoizedCanonicalArrayDigest,
+  seedFrozenCanonicalArrayDigest,
   rememberPackedIdentityTriple,
   memoizedPackedIdentityTriple,
   type DigestOptions,

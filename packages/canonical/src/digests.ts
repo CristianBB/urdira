@@ -27,6 +27,24 @@ export function memoizedCanonicalArrayDigest(elements: readonly unknown[], mappi
 }
 
 /**
+ * Seeds the frozen-array digest memo with a digest computed OUTSIDE this
+ * module's own `digestCanonicalArray`/`digestMappedCanonicalArray` calls --
+ * the seal-time off-thread digest workers (`@urdira/engine`'s
+ * `materialization-digest-worker.ts`) run the byte-identical incremental
+ * encode (`encodeArrayHeader` + per-element `encodeCanonicalInto`, same
+ * package, same code) in a worker thread and hand the result back here so
+ * publication's `verifyTemplateSetAgainstDescriptor` can reuse it against
+ * the local frozen array identity exactly as if it had been computed
+ * in-process. Callers MUST pass a digest produced by that same canonical
+ * encoding over these same elements under this same mapping -- this seeds a
+ * cache consulted for correctness checks, it does not verify the claim.
+ * Ignores non-frozen arrays, same as the internal remember path.
+ */
+export function seedFrozenCanonicalArrayDigest(elements: readonly unknown[], mappingId: string, digest: DigestText): void {
+  rememberFrozenCanonicalArrayDigest(elements, mappingId, digest);
+}
+
+/**
  * The three per-record digests a "packed created identity" tuple's own
  * unpacker recomputes on every use: `identity_assignment_id`, the hex suffix
  * of `identity_id` (everything after `${identity_type}:`), and

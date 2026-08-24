@@ -25,6 +25,7 @@ import {
 } from "./candidate-indexer.js";
 import type { CandidateExecutionDag, CandidatePlan, FrozenCandidateBaseTuple } from "./candidate-planning.js";
 import { CandidateMaterializer, CandidateRecordTemplateAccumulator } from "./candidate-materialization.js";
+import { MaterializationDigestOffload } from "./materialization-digest-offload.js";
 import { record as recordEngineTiming, resetTimings as resetEngineTimings, snapshotTimings as snapshotEngineTimings, timedSync as timedSyncEngine, timingEnabled as engineTimingEnabled } from "./debug-timing.js";
 import {
   DirectorySourceProvider,
@@ -1214,7 +1215,16 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         // accepted deltas, no base/global-identity/absence-barrier authority
         // -- before trusting it, so it's passed through unconditionally here.
         if (engineTimingEnabled()) recordEngineTiming("publish_handoff_pre", performance.now() - handoffPreStartedAt);
-        return timed("seal", async () => new CandidateMaterializer().seal({
+        // The two corpus-scale ordered-set digests go to worker threads
+        // (`MaterializationDigestOffload`) while the main thread computes the
+        // rest of the seal; `sealAsync` falls back to the identical
+        // synchronous digests on any worker trouble, and the workers are
+        // torn down the moment the seal returns (publication reuses the
+        // seeded digest memos, not the workers).
+        const digestOffload = MaterializationDigestOffload.create();
+        return timed("seal", async () => {
+          try {
+            return await new CandidateMaterializer().sealAsync({
           candidate: sealedCandidate,
           manifest: sealedPlan.manifest,
           source_plan: staged.plan,
@@ -1227,10 +1237,25 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
           capability_state_entries: sealedAnalysis.capability_state_entries,
           source_observation_watermarks: [],
           created_at: now(),
-          known_artifact_versions: knownArtifactVersions,
-          known_dependency_roles: input.plugin.dependency_roles,
-          known_lookup_dependencies: [],
-        }, templateAccumulator));
+              known_artifact_versions: knownArtifactVersions,
+              known_dependency_roles: input.plugin.dependency_roles,
+              known_lookup_dependencies: [],
+            }, templateAccumulator, digestOffload);
+          } finally {
+            digestOffload?.close();
+            // P4 (seal/publish-window RSS): the accepted deltas have no
+            // reader after seal -- publication consumes the sealed template
+            // sets, and durable recovery rehydrates confirmed FactDelta
+            // batches from storage -- yet each delta held the ONLY second
+            // reference to its record's `canonical_record` string (the first
+            // lives on via the open template's `record_without_validity`).
+            // Truncating here, mirroring `scannedArtifacts.length = 0` below,
+            // halves the corpus-string root count for the whole publish
+            // window. The array is the app-built mutable array `analyze()`
+            // returned; the readonly cast is only the engine-facing type.
+            (sealedAnalysis.accepted_deltas as unknown as unknown[]).length = 0;
+          }
+        });
       },
       publication: ({ candidate: publishingCandidate, frozen_base: publishingFrozenBase, materialization, template_sets }): CandidatePublicationInput => timedSyncEngine("publication_input_build", () => ({
         // These two fields must mirror the patch already applied by CandidateIndexer's

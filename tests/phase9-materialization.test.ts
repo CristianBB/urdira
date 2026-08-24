@@ -4,7 +4,7 @@ import { LogicalDigestWriter } from "@urdira/canonical";
 import type { CandidateMaterialization, CandidateProjectionTemplate, IndexCandidate, ProjectionWorkItem, ProposedRecord } from "@urdira/contracts";
 import { canonicalBytes, digestBytes, digestCanonicalArray, memoizedCanonicalArrayDigest, memoizedPackedIdentityTriple } from "@urdira/canonical";
 import { canonicalSha256 as pluginCanonicalSha256 } from "@urdira/plugin-sdk";
-import { CandidateMaterializer, CandidateRecordTemplateAccumulator, compactAcceptedFactDelta, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
+import { CandidateMaterializer, CandidateRecordTemplateAccumulator, MaterializationDigestOffload, compactAcceptedFactDelta, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
 
 const candidate = (): IndexCandidate => ({ candidate_generation_id: "candidate:materialization", workspace_id: "workspace:1", target_registry_snapshot_id: "registry:target", target_configuration_revision_id: "config:target", trigger_kind: "source_change", state: "ready", source_observation_batch_ids: [], issue_ids: [], created_at: "2026-08-10T00:00:00.000Z" });
 
@@ -424,6 +424,65 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     expect(viaAccumulator.identity_assignments).toEqual(oneShot.identity_assignments);
     expect(viaAccumulator.record_opens).toEqual(oneShot.record_opens);
     expect(viaAccumulator.materialization).toEqual(oneShot.materialization);
+  });
+
+  // (3d) sealAsync's off-thread digests: the worker runs the identical
+  // canonical encode, so the ENTIRE sealed result -- descriptors, semantic
+  // digest, materialization id -- must be byte-identical to the synchronous
+  // seal over the same input, at packed-identity scale (exercising the
+  // "template" mapping's worker-side unpack, whose triple memo necessarily
+  // misses in the worker heap) and with the frozen-array digest memo seeded
+  // in the MAIN heap so publication can verify without re-encoding.
+  it("(3d) sealAsync with the digest offload workers is byte-identical to seal() and seeds the frozen-array digest memo", async () => {
+    const records = Array.from({ length: 10_500 }, (_unused, index) => record(`async-seal-${index}`, `body-${index}`));
+    const raw = acceptedDelta(records);
+    const compact = compactAcceptedFactDelta({
+      ...raw,
+      delta: { ...raw.delta, fact_delta_id: "delta:async-seal", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+
+    const syncSealed = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }));
+
+    const offload = MaterializationDigestOffload.create();
+    expect(offload).toBeDefined();
+    try {
+      const asyncSealed = await new CandidateMaterializer().sealAsync(input({ accepted_deltas: [compact] }), undefined, offload);
+      expect(asyncSealed.materialization).toEqual(syncSealed.materialization);
+      expect(asyncSealed.record_opens).toEqual(syncSealed.record_opens);
+      expect(asyncSealed.identity_assignments).toEqual(syncSealed.identity_assignments);
+      // The memo must be seeded against the ASYNC result's own frozen arrays
+      // (that is what publication receives), under the exact mapping ids
+      // `verifyTemplateSetAgainstDescriptor` consults, with the digests the
+      // descriptors themselves declare.
+      const opensDescriptor = JSON.parse(asyncSealed.materialization.record_open_template_set) as { content_digest: string };
+      const identitiesDescriptor = JSON.parse(asyncSealed.materialization.identity_assignment_template_set) as { content_digest: string };
+      expect(memoizedCanonicalArrayDigest(asyncSealed.record_opens, "canonical")).toBe(opensDescriptor.content_digest);
+      expect(memoizedCanonicalArrayDigest(asyncSealed.identity_assignments, "urdira:candidate-template-logical-value:v2")).toBe(identitiesDescriptor.content_digest);
+    } finally {
+      offload?.close();
+    }
+  }, 60_000);
+
+  // (3d-fallback) With the kill switch set, sealAsync must not spawn workers
+  // and must still produce the identical result through the synchronous path.
+  it("(3d) sealAsync under URDIRA_SEAL_DIGEST_WORKERS=0 has no offload and still seals identically", async () => {
+    const original = process.env["URDIRA_SEAL_DIGEST_WORKERS"];
+    process.env["URDIRA_SEAL_DIGEST_WORKERS"] = "0";
+    try {
+      expect(MaterializationDigestOffload.create()).toBeUndefined();
+      const records = [record("kill-switch-a", "body-a"), record("kill-switch-b", "body-b")];
+      const raw = acceptedDelta(records);
+      const compact = compactAcceptedFactDelta({
+        ...raw,
+        delta: { ...raw.delta, fact_delta_id: "delta:kill-switch", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+      } as unknown as AcceptedFactDelta);
+      const syncSealed = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }));
+      const asyncSealed = await new CandidateMaterializer().sealAsync(input({ accepted_deltas: [compact] }), undefined, MaterializationDigestOffload.create());
+      expect(asyncSealed.materialization).toEqual(syncSealed.materialization);
+    } finally {
+      if (original === undefined) delete process.env["URDIRA_SEAL_DIGEST_WORKERS"];
+      else process.env["URDIRA_SEAL_DIGEST_WORKERS"] = original;
+    }
   });
 
   // (1c) The packed-identity triple memo: seal() memoizes

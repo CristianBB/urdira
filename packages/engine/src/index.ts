@@ -222,6 +222,7 @@ export {
   type SealedCandidateMaterialization,
   type ValidatedProjectionReplacementSet,
 } from "./candidate-materialization.js";
+export { MaterializationDigestOffload } from "./materialization-digest-offload.js";
 export {
   CandidateIndexer,
   createCandidateIssue,

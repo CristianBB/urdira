@@ -1,6 +1,6 @@
 import { canonicalJson, canonicalSha256 } from "@urdira/plugin-sdk";
-import { canonicalBytes, digestBytes, digestCanonicalArray, digestCanonicalMapWithArrayFields, digestMappedCanonicalArray, LogicalDigestWriter, memoizedPackedIdentityTriple, rememberPackedIdentityTriple } from "@urdira/canonical";
-import type { CanonicalEncodingLimits } from "@urdira/canonical";
+import { canonicalBytes, digestBytes, digestCanonicalArray, digestCanonicalMapWithArrayFields, digestMappedCanonicalArray, LogicalDigestWriter, memoizedPackedIdentityTriple, rememberPackedIdentityTriple, seedFrozenCanonicalArrayDigest } from "@urdira/canonical";
+import type { CanonicalEncodingLimits, DigestText } from "@urdira/canonical";
 import type { BoundPluginLookupInvalidationDependency, PluginInvalidationConsumerType, PluginInvalidationScope, PluginLookupOperation } from "@urdira/plugin-sdk";
 import type {
   CandidateIdentityAssignmentTemplate,
@@ -24,7 +24,7 @@ import type { SourceCandidatePlan } from "./source-candidate-planning.js";
 import type { MaterializationAcceptedFactDelta, MaterializationProposedRecord, BaseCandidateRecord } from "./fact-delta.js";
 import type { BaseCandidateProjection } from "./candidate-planning.js";
 import type { ProviderWatermark, SnapshotCapabilityStateEntry, CandidateWorkManifest } from "@urdira/contracts";
-import { timedSync } from "./debug-timing.js";
+import { timed, timedSync } from "./debug-timing.js";
 
 export interface CandidateMaterializationInput {
   readonly candidate: IndexCandidate;
@@ -220,8 +220,22 @@ function packedTemplateValue(value: unknown): unknown {
 }
 
 function digestTemplateArray(entries: readonly unknown[]): string {
-  return digestMappedCanonicalArray(entries, "urdira:candidate-template-logical-value:v2", packedTemplateValue);
+  return digestMappedCanonicalArray(entries, TEMPLATE_LOGICAL_VALUE_MAPPING, packedTemplateValue);
 }
+
+/** The `digestMappedCanonicalArray` mapping id under which packed candidate templates are digested (and memoized). */
+export const TEMPLATE_LOGICAL_VALUE_MAPPING = "urdira:candidate-template-logical-value:v2";
+
+/**
+ * The packed-template -> canonical-logical-value projection, exported ONLY
+ * for `materialization-digest-worker.ts`, which must reproduce
+ * `digestTemplateArray`'s bytes exactly inside a worker thread. In a worker
+ * heap the packed-identity triple memo naturally misses (it is keyed by
+ * main-heap array identity), so the unpack falls back to recomputing the
+ * three small digests -- never wrong, only uncached, exactly like a resumed
+ * candidate's rehydrated tuples.
+ */
+export const packedTemplateValueForDigest: (value: unknown) => unknown = packedTemplateValue;
 
 // `CandidateMaterialization`'s template-set fields (`record_open_template_set`,
 // `record_closure_template_set`, etc. -- see
@@ -883,13 +897,22 @@ function orderedSetDescriptor(elementType: string, entries: readonly unknown[]):
   const contentDigest = entries.length > 0 && isPackedCandidateTemplate(entries[0])
     ? digestTemplateArray(entries)
     : digestCanonicalArray(entries);
+  return orderedSetDescriptorFromDigest(elementType, entries.length, contentDigest);
+}
+
+/**
+ * The descriptor shape alone, for a content digest computed elsewhere --
+ * `sealAsync`'s off-thread digests arrive as bare `sha256:` strings and must
+ * produce byte-identical descriptor Text to `orderedSetDescriptor` above.
+ */
+function orderedSetDescriptorFromDigest(elementType: string, entryCount: number, contentDigest: string): OrderedSetDescriptor {
   return {
     descriptor_id: `set:${contentDigest.slice("sha256:".length)}`,
     element_type: elementType,
     element_schema_version: "1",
     comparator_id: "core:lexicographic_uri",
     comparator_version: "1",
-    entry_count: entries.length,
+    entry_count: entryCount,
     content_digest: contentDigest,
   };
 }
@@ -941,6 +964,7 @@ export class CandidateRecordTemplateAccumulator {
   private readonly workspaceId: string;
   private readonly retainEveryProposalId: boolean;
   private disqualified = false;
+  private finished = false;
   private readonly acceptedDeltas: MaterializationAcceptedFactDelta[] = [];
   private readonly opens: CandidateRecordOpenTemplate[] = [];
   private readonly identityRaw: FastPathIdentityRaw[] = [];
@@ -964,6 +988,12 @@ export class CandidateRecordTemplateAccumulator {
    * native-batch acceptance) rather than `input.accepted_deltas`'s own order.
    */
   matchesAcceptedDeltas(deltas: readonly MaterializationAcceptedFactDelta[]): boolean {
+    // `finish()` released `acceptedDeltas`/`identityRaw` (see there), so a
+    // match answered from the cleared arrays could only ever be wrong -- an
+    // empty-vs-empty "true" would let a SECOND seal over this accumulator
+    // publish an empty candidate silently. No caller legitimately re-checks
+    // after finishing (one accumulator, one seal); make the bug loud.
+    if (this.finished) throw new CandidateMaterializationError("core:dependency_validation_failed", "CandidateRecordTemplateAccumulator.matchesAcceptedDeltas() called after finish(); an accumulator seals exactly once.", {});
     if (this.acceptedDeltas.length !== deltas.length) return false;
     const seen = new Set(this.acceptedDeltas);
     return seen.size === this.acceptedDeltas.length && deltas.every((delta) => seen.has(delta));
@@ -1044,6 +1074,17 @@ export class CandidateRecordTemplateAccumulator {
           owner_artifact_id: raw.ownerArtifactId,
           owner_artifact_version_id: raw.ownerArtifactVersionId,
         }) as CandidateIdentityAssignmentTemplate), (entry) => entry.identity_assignment_id);
+    // Release the corpus-scale inputs this pass just consumed (P4, RSS of
+    // the seal/publish window): `identityRaw`'s ~one-wrapper-per-record and
+    // the `acceptedDeltas` array's slots are dead the moment `identities`
+    // exists -- both branches above produce NEW arrays/objects. NOT cleared:
+    // `this.opens` (`sortOwned` sorts in place, so the returned `opens` IS
+    // this array), `recordOpenMemo`/`proposalRecordIds` (publication reads
+    // them). The delta OBJECTS live on through the session's own
+    // `accepted_deltas` array until it releases them after seal.
+    this.identityRaw.length = 0;
+    this.acceptedDeltas.length = 0;
+    this.finished = true;
     return { reused: [], opens, closures: [], identities, proposal_record_ids: this.proposalRecordIds, record_open_memo: this.recordOpenMemo };
   }
 }
@@ -1061,6 +1102,52 @@ export class CandidateMaterializer {
    * cost of producing it.
    */
   seal(input: CandidateMaterializationInput, accumulator?: CandidateRecordTemplateAccumulator): SealedCandidateMaterialization {
+    const prepared = this.#prepare(input, accumulator);
+    const opensSetText = timedSync("seal_ordered_digests", () => canonicalJson(orderedSetDescriptor("core:CandidateRecordOpenTemplate", prepared.recordOpens)));
+    const identitiesSetText = timedSync("seal_ordered_digests", () => canonicalJson(orderedSetDescriptor("core:CandidateIdentityAssignmentTemplate", prepared.identityAssignments)));
+    return this.#assemble(input, prepared, opensSetText, identitiesSetText);
+  }
+
+  /**
+   * `seal()` with the two corpus-scale content digests (record opens,
+   * identity assignments -- the two sets that dominate a from-zero
+   * `seal_ordered_digests`) computed on `offload`'s worker threads while the
+   * main thread computes everything else. Byte-identical to `seal()` by
+   * construction: identical `#prepare`/`#assemble`, and the workers run the
+   * same canonical encode over the same elements (a dedicated determinism
+   * test compares the two full sealed results). Any offload trouble falls
+   * back to computing those two digests synchronously over the ALREADY
+   * prepared arrays -- never a second `#prepare` (the accumulator's
+   * `finish()` is one-shot), never a changed result.
+   */
+  async sealAsync(input: CandidateMaterializationInput, accumulator: CandidateRecordTemplateAccumulator | undefined, offload: { digestSet(mapping: "canonical" | "template", elements: readonly unknown[]): Promise<DigestText> } | undefined): Promise<SealedCandidateMaterialization> {
+    if (offload === undefined) return this.seal(input, accumulator);
+    const prepared = this.#prepare(input, accumulator);
+    let opensSetText: string;
+    let identitiesSetText: string;
+    try {
+      const identitiesPacked = prepared.identityAssignments.length > 0 && isPackedCandidateTemplate(prepared.identityAssignments[0]);
+      const [opensDigest, identitiesDigest] = await timed("seal_ordered_digests", () => Promise.all([
+        offload.digestSet("canonical", prepared.recordOpens),
+        offload.digestSet(identitiesPacked ? "template" : "canonical", prepared.identityAssignments),
+      ]));
+      // Publication's `verifyTemplateSetAgainstDescriptor` reuses seal-time
+      // digests through the frozen-array memo; the in-process digest calls
+      // would have written these entries themselves, so the off-thread
+      // results are seeded under the exact same (array identity, mapping)
+      // keys.
+      seedFrozenCanonicalArrayDigest(prepared.recordOpens, "canonical", opensDigest);
+      seedFrozenCanonicalArrayDigest(prepared.identityAssignments, identitiesPacked ? TEMPLATE_LOGICAL_VALUE_MAPPING : "canonical", identitiesDigest);
+      opensSetText = canonicalJson(orderedSetDescriptorFromDigest("core:CandidateRecordOpenTemplate", prepared.recordOpens.length, opensDigest));
+      identitiesSetText = canonicalJson(orderedSetDescriptorFromDigest("core:CandidateIdentityAssignmentTemplate", prepared.identityAssignments.length, identitiesDigest));
+    } catch {
+      opensSetText = timedSync("seal_ordered_digests", () => canonicalJson(orderedSetDescriptor("core:CandidateRecordOpenTemplate", prepared.recordOpens)));
+      identitiesSetText = timedSync("seal_ordered_digests", () => canonicalJson(orderedSetDescriptor("core:CandidateIdentityAssignmentTemplate", prepared.identityAssignments)));
+    }
+    return this.#assemble(input, prepared, opensSetText, identitiesSetText);
+  }
+
+  #prepare(input: CandidateMaterializationInput, accumulator?: CandidateRecordTemplateAccumulator): PreparedSeal {
     const owners = recordOwners(input);
     const retainEveryProposalId = (input.record_dependencies?.length ?? 0) > 0 || (input.lookup_bindings?.length ?? 0) > 0 || (input.projection_dependencies?.length ?? 0) > 0;
     const accumulatorEligible = accumulator !== undefined
@@ -1117,15 +1204,27 @@ export class CandidateMaterializer {
     const recordClosures = timedSync("seal_freeze", () => freeze(records.closures));
     const identityAssignments = timedSync("seal_freeze", () => freeze(records.identities));
     const barrierKeys = new Set((input.absence_barriers ?? []).map((entry) => `${entry.identity_type}\0${entry.identity_key}`));
-    // `seal_ordered_digests`: building each template set's `OrderedSetDescriptor`
-    // (`orderedSetDescriptor`, below -- an incremental `digestCanonicalArray`/
-    // `digestMappedCanonicalArray` pass over every entry in that set) plus
-    // this materialization's own top-level semantic digest. This is a
-    // separate full-corpus content-hashing pass over the very same
-    // (already-templated) records `seal_finish`/`seal_freeze` just built and
-    // froze -- not record-templating or freezing work itself, but the digest
-    // computation every one of those templates still needs before it can be
-    // durably published.
+    return { records, projections, recordDependencies, lookupBindings, projectionDependencies, lookupRevalidations, sourceTransitions, recordOpens, recordClosures, identityAssignments, barrierKeys };
+  }
+
+  /**
+   * The tail of `seal()` after `#prepare`, parameterized over the two
+   * corpus-scale template-set descriptor Texts so `seal()` (computed
+   * in-process) and `sealAsync()` (computed off-thread) assemble the
+   * identical materialization from identical inputs.
+   *
+   * `seal_ordered_digests`: building each remaining template set's
+   * `OrderedSetDescriptor` (`orderedSetDescriptor` -- an incremental
+   * `digestCanonicalArray`/`digestMappedCanonicalArray` pass over every
+   * entry in that set) plus this materialization's own top-level semantic
+   * digest. This is a separate content-hashing pass over the very same
+   * (already-templated) records `seal_finish`/`seal_freeze` just built and
+   * froze -- not record-templating or freezing work itself, but the digest
+   * computation every one of those templates still needs before it can be
+   * durably published.
+   */
+  #assemble(input: CandidateMaterializationInput, prepared: PreparedSeal, opensSetText: string, identitiesSetText: string): SealedCandidateMaterialization {
+    const { records, projections, recordDependencies, lookupBindings, projectionDependencies, lookupRevalidations, sourceTransitions, recordClosures, barrierKeys } = prepared;
     const semanticPayload = timedSync("seal_ordered_digests", () => ({
       workspace_id: input.candidate.workspace_id,
       // Materialization identity is candidate-salted so distinct candidates
@@ -1137,9 +1236,9 @@ export class CandidateMaterializer {
       candidate_generation_id: input.candidate.candidate_generation_id,
       accepted_fact_delta_digests: sorted(input.accepted_deltas.map(semanticAcceptedDeltaDigest), (entry) => entry),
       source_transition_template_set: canonicalJson(orderedSetDescriptor("core:CandidateSourceTransitionTemplate", sourceTransitions)),
-      record_open_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordOpenTemplate", recordOpens)),
+      record_open_template_set: opensSetText,
       record_closure_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordClosureTemplate", recordClosures)),
-      identity_assignment_template_set: canonicalJson(orderedSetDescriptor("core:CandidateIdentityAssignmentTemplate", identityAssignments)),
+      identity_assignment_template_set: identitiesSetText,
       projection_open_template_sets: projections.opens,
       projection_closure_template_sets: projections.closures,
       capability_state_entries: input.capability_state_entries,
@@ -1154,8 +1253,22 @@ export class CandidateMaterializer {
       ...semanticPayload,
       materialization_digest: semanticDigest,
     }));
-    return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: sourceTransitions, record_opens: recordOpens, record_closures: recordClosures, identity_assignments: identityAssignments, record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: lookupRevalidations, projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort(), record_open_memo: records.record_open_memo });
+    return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: sourceTransitions, record_opens: prepared.recordOpens, record_closures: recordClosures, identity_assignments: prepared.identityAssignments, record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: lookupRevalidations, projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort(), record_open_memo: records.record_open_memo });
   }
+}
+
+interface PreparedSeal {
+  readonly records: ReturnType<CandidateRecordTemplateAccumulator["finish"]>;
+  readonly projections: ReturnType<typeof projectionTemplates>;
+  readonly recordDependencies: ReturnType<typeof validateBindings>["record_dependencies"];
+  readonly lookupBindings: ReturnType<typeof validateBindings>["lookup_bindings"];
+  readonly projectionDependencies: ReturnType<typeof validateBindings>["projection_dependencies"];
+  readonly lookupRevalidations: readonly Readonly<Record<string, unknown>>[];
+  readonly sourceTransitions: SealedCandidateMaterialization["source_transitions"];
+  readonly recordOpens: SealedCandidateMaterialization["record_opens"];
+  readonly recordClosures: SealedCandidateMaterialization["record_closures"];
+  readonly identityAssignments: SealedCandidateMaterialization["identity_assignments"];
+  readonly barrierKeys: ReadonlySet<string>;
 }
 
 export type { CandidatePlan, ProjectionWorkItem };
