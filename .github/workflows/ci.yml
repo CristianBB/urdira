@@ -2,6 +2,10 @@ name: CI
 
 on:
   push:
+    # A tagged release is verified again by publish.yml. Restricting this
+    # workflow to branches avoids two full CI matrices for the same commit.
+    branches:
+      - "**"
   pull_request:
 
 permissions:

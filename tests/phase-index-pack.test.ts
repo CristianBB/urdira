@@ -520,7 +520,11 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
     // identity_assignments rows (vs 4.1s below) -- a ~21x regression this
     // test's bound would have caught.
     const N_SYNTHETIC_IDENTITIES = 1_000_000;
-    const PERF_BOUND_MS = 30_000;
+    // Keep enough headroom for shared CI runners while preserving the
+    // regression signal: the known OFFSET implementation took 87.8s on this
+    // fixture, whereas the keyset implementation stays below this 45s gate.
+    // The override supports controlled profiling without editing the test.
+    const PERF_BOUND_MS = Number(process.env["URDIRA_PACK_IDENTITY_BOUND_MS"] ?? 45_000);
 
     const fixture = await buildReadyDonorAndExport("perf-scale");
     const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-perf-scale-target-"));
@@ -563,7 +567,6 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
       const exportStart = Date.now();
       await exportIndexPack({ database: asStorageDatabase(fixture.donorDatabase), workspace_id: fixture.donorWorkspace.workspace_id, out_path: scalePackPath, now: () => now });
       const exportMs = Date.now() - exportStart;
-      // eslint-disable-next-line no-console -- deliberate perf-gate signal, matches this repo's other timing assertions
       console.log(`[index-pack perf gate] export of ${paddedCount?.c ?? 0} identity_assignments rows took ${exportMs}ms`);
       expect(exportMs).toBeLessThan(PERF_BOUND_MS);
 
@@ -588,7 +591,6 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
         verify_mode: "fast",
       });
       const importMs = Date.now() - importStart;
-      // eslint-disable-next-line no-console -- deliberate perf-gate signal, matches this repo's other timing assertions
       console.log(`[index-pack perf gate] import of the same pack took ${importMs}ms`);
       expect(outcome.status).toBe("imported");
       expect(importMs).toBeLessThan(PERF_BOUND_MS);
@@ -690,7 +692,6 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
       const exportStart = Date.now();
       await exportIndexPack({ database: asStorageDatabase(fixture.donorDatabase), workspace_id: donorWorkspaceId, out_path: scalePackPath, now: () => now });
       const exportMs = Date.now() - exportStart;
-      // eslint-disable-next-line no-console -- deliberate perf-gate signal, matches this repo's other timing assertions
       console.log(`[index-pack perf gate] codec-scale export of ${N_SYNTHETIC_RECORDS} record bodies took ${exportMs}ms`);
       expect(exportMs).toBeLessThan(PERF_BOUND_MS);
 
@@ -714,7 +715,6 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
         verify_mode: "fast",
       });
       const importMs = Date.now() - importStart;
-      // eslint-disable-next-line no-console -- deliberate perf-gate signal, matches this repo's other timing assertions
       console.log(`[index-pack perf gate] codec-scale import of the same pack took ${importMs}ms`);
       expect(outcome.status).toBe("imported");
       expect(importMs).toBeLessThan(PERF_BOUND_MS);

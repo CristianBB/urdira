@@ -498,6 +498,7 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 30
     expect(workflow).toContain("macos-latest");
     expect(workflow).toContain("windows-latest");
     expect(workflow).toContain("pnpm preflight:windows");
+    expect(workflow).toContain('branches:\n      - "**"');
   });
 
   it("publishes patch releases idempotently without overwriting existing package versions", async () => {

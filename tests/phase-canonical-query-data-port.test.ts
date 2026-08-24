@@ -555,7 +555,9 @@ describe("SqliteCanonicalQuerySnapshotPort/CanonicalRecordQueryDataPort corpus-s
       // exercising the paging logic at all, so this is specifically the case
       // that would catch a boundary bug (a dropped/duplicated/misordered row
       // where one page ends and the next begins).
-      const recordCount = 12_000;
+      // One row beyond the 10,000-row page is the smallest corpus that
+      // exercises the boundary without adding unrelated CI runtime.
+      const recordCount = 10_001;
       await insertRecordOccurrencesBulk(opened, recordCount, "artv-1", 1);
 
       const port = new SqliteCanonicalQuerySnapshotPort(opened.database);
