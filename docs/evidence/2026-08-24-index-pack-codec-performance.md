@@ -93,12 +93,40 @@ profile.
   1M records single-threaded; within budget. It is the next lever if live
   import misses the target.
 
-### Extrapolation and the pending live validation
+### Live VS Code validation (same day, after the fixes)
 
-150k → 1M linear extrapolation: export ~48s, import ~67s — inside the
-60-100s target, in fixture terms. The 865s→this-machine comparison is NOT
-valid (different session, documented ~7% drift regime, 97%-full disk that
-night, and larger real bodies). The live VS Code re-run (donor reindex →
-export → import, with a same-window control) is still pending and is the
-acceptance test for the target; it also revalidates the anchor fix, since
-the surviving pack declares a pre-fix anchor.
+Fresh donor worktree (vscode @ 038b9225, 17,675 files), from-zero index
+(324s ready, `URDIRA_ANALYSIS_LARGE_SHARDS=2`), then export, then
+`workspace-add --index-pack` into a fresh data root + second worktree.
+Artifacts: `~/Proyectos/urdira-benchmark/c3-2026-08-24/` (pack 440MB —
+~9% larger than the level-6 c2 pack, the accepted level-1 trade). Row
+counts byte-matched the c2 pack (1,002,942 records/identities).
+
+- **Anchor fix validated live**: the import took the pack path (zero
+  `analyze shard progress` lines), passed the fast verify — including the
+  capability-state anchor that failed every c2 attempt — and went straight
+  to `ready`/`current`.
+- **Export: 865s → 89.7s (9.6x), target met.** Live buckets: records SQL
+  pages 59.8s (real bodies cost ~6x the fixture's per-page floor), gzip
+  12.0s, identities 8.3s, stringify 2.3s, row map 2.2s.
+- **Import: ~868s → 647s to ready, target MISSED.** The costs the fixture
+  under-predicted at real body sizes: `bulk_copy` **391.9s** (the fork's
+  own machinery, unmodified by this work — fixture extrapolation said
+  ~19s; now clearly the top import lever), untrusted `verify` 108.6s (the
+  known sharding candidate), `source_provider_read` 170.8s (the target's
+  own source cataloging — a cost every workspace-add pays, pack or not;
+  overlaps the campaign-1 "double read" lever). The paths this change DID
+  target stayed small exactly as measured: JSON parse 2.1s, scratch
+  inserts 7.7s.
+
+Extrapolation lesson recorded: the 150k fixture's ~260B bodies
+under-predict real per-row costs ~6x for BLOB-bearing paths; the fixture
+gate still guards regressions, but absolute targets need the live run.
+
+Next import levers, in measured order: (1) `bulkCopyRecordsAndIdentities`/
+`bulkCopyDependencies` internals at 1M-row scale (shared with local fork —
+a fork of this workspace would pay the same), (2) sharded parallel
+`verifyCopiedRecordIntegrity` (~108s → ~/cores), (3) the source-catalog
+double-read (campaign-1 queue). Import remains strictly opt-in and
+fallback-safe, so shipping with the export win and the correctness fix is
+strictly better than before in every case.
