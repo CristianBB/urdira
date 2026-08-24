@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { canonicalBytes, digestBytes, sortCanonicalValues } from "@urdira/canonical";
+import { canonicalBytes, digestBytes, encodeCanonical, sortCanonicalValues } from "@urdira/canonical";
 // `@urdira/engine`/`@urdira/plugin-javascript-typescript` are not root-level
 // devDependencies, so (matching every tests/*.test.ts that touches them)
 // this file imports them from src by relative path. The plugin-registry/
@@ -20,7 +20,7 @@ import {
   type RegisteredWorkspace,
   type WorkspaceScanPluginProvider,
 } from "../packages/engine/src/index.js";
-import { createDurableStorage, type DurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
+import { computeForkSnapshotDigestFields, createDurableStorage, digestRelationalValue, snapshotDigest, type DurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
 import {
   FORK_INCLUSION_RULES as INDEX_PACK_INCLUSION_RULES,
   asDurableStorage,
@@ -519,4 +519,130 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
       await teardown(fixture);
     }
   }, 180_000);
+
+  it("(g2) the record-body codec path stays fast at scale -- synthetic records with real body payloads through export, import, and the untrusted verify", async () => {
+    // Test (g) pads identity_assignments over ONE reused record, which
+    // exercises SQL pagination but NOT the per-record body_payload codec
+    // (hex/JSON in v1) or the untrusted per-record digest recompute -- the
+    // costs that actually dominated the real VS Code pack (1M records,
+    // export 865s while (g) passed in seconds). This gate pads
+    // record_occurrences itself with distinct, digest-valid bodies (each
+    // must survive `verifyCopiedRecordIntegrity`'s decode+digest recompute),
+    // plus one identity per record, then re-anchors the donor snapshot's
+    // canonical_record_set_digest so the pack's declared anchor matches.
+    // Row count is env-tunable for manual profiling
+    // (URDIRA_PACK_SCALE_ROWS, with URDIRA_STORAGE_DEBUG_TIMING=1 for the
+    // per-bucket breakdown).
+    const N_SYNTHETIC_RECORDS = Number(process.env["URDIRA_PACK_SCALE_ROWS"] ?? 150_000);
+    const PERF_BOUND_MS = Number(process.env["URDIRA_PACK_SCALE_BOUND_MS"] ?? 60_000);
+
+    const fixture = await buildReadyDonorAndExport("perf-codec");
+    const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-perf-codec-target-"));
+    let targetStorage: DurableStorage | undefined;
+    let targetDatabase: WorkspaceDatabase | undefined;
+    try {
+      const donorWorkspaceId = fixture.donorWorkspace.workspace_id;
+      const anchor = await fixture.donorDatabase.database.get<Record<string, unknown>>(
+        "SELECT * FROM record_occurrences WHERE workspace_id = ? AND valid_to_generation IS NULL LIMIT 1",
+        [donorWorkspaceId],
+      );
+      expect(anchor).toBeDefined();
+
+      // Distinct, verifiable bodies: body_digest must equal
+      // digestRelationalValue(decodeCanonical(body_payload)) or the
+      // untrusted recompute pass rejects the pack outright.
+      const INSERT_BATCH = 100;
+      const columns = ["record_id", "workspace_id", "category", "kind", "universal_kind", "schema_version", "producer_id", "producer_version", "owner_artifact_id", "owner_artifact_version_id", "valid_from_generation", "valid_to_generation", "record_digest", "body_digest", "body_byte_length", "body_payload", "analysis_digest", "analysis_configuration_digest", "artifact_dependency_digest"] as const;
+      const placeholderRow = `(${columns.map(() => "?").join(", ")})`;
+      const filler = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(6);
+      let batch: (string | number | null | Uint8Array)[] = [];
+      let batchRows = 0;
+      const flush = async (): Promise<void> => {
+        if (batchRows === 0) return;
+        await fixture.donorDatabase.database.run(
+          `INSERT INTO record_occurrences (${columns.join(", ")}) VALUES ${Array.from({ length: batchRows }, () => placeholderRow).join(", ")}`,
+          batch,
+        );
+        batch = [];
+        batchRows = 0;
+      };
+      for (let i = 0; i < N_SYNTHETIC_RECORDS; i += 1) {
+        const body = { kind: "synthetic", ordinal: i, name: `synthetic-symbol-${i}`, text: `${filler}-${i}` };
+        const payload = encodeCanonical(body);
+        const bodyDigest = digestRelationalValue(body);
+        const recordHex = digestBytes(encodeCanonical(["synthetic-record", i])).slice("sha256:".length);
+        batch.push(
+          `record:${recordHex}`, donorWorkspaceId, "fact", "synthetic:padding", "synthetic:padding", 1,
+          String(anchor!["producer_id"]), "synthetic-pad", String(anchor!["owner_artifact_id"]), String(anchor!["owner_artifact_version_id"]),
+          1, null, `sha256:${recordHex}`, bodyDigest.digest, bodyDigest.byte_length, payload,
+          String(anchor!["analysis_digest"]), String(anchor!["analysis_configuration_digest"]), String(anchor!["artifact_dependency_digest"]),
+        );
+        batchRows += 1;
+        if (batchRows >= INSERT_BATCH) await flush();
+      }
+      await flush();
+      await fixture.donorDatabase.database.run(
+        `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, valid_from_generation, valid_to_generation)
+         SELECT 'syn-ia:' || record_id, workspace_id, 'core:synthetic', 'syn-id:' || record_id, 'created', 'key:' || record_id, 'digest:' || record_id, record_id, 1, NULL
+         FROM record_occurrences WHERE workspace_id = ? AND producer_version = 'synthetic-pad'`,
+        [donorWorkspaceId],
+      );
+
+      // Re-anchor the donor snapshot: the padded record set changes
+      // canonical_record_set_digest, and the export copies the STORED
+      // snapshot anchors into the pack manifest, which fastPackVerify then
+      // compares against the target's own recompute over the copied rows.
+      const donorCurrent = await fixture.donorDatabase.repositories.snapshots.getCurrent();
+      const donorSnapshot = await fixture.donorDatabase.repositories.snapshots.get(donorCurrent!.current_snapshot_id);
+      const reanchored = await computeForkSnapshotDigestFields(asStorageDatabase(fixture.donorDatabase).database, donorWorkspaceId, donorCurrent!.current_generation);
+      const patchedSnapshot = { ...donorSnapshot!, canonical_record_set_digest: reanchored.canonical_record_set_digest };
+      await fixture.donorDatabase.database.run(
+        "UPDATE snapshots SET canonical_record_set_digest = ?, snapshot_digest = ? WHERE workspace_id = ? AND snapshot_id = ?",
+        [reanchored.canonical_record_set_digest, snapshotDigest(patchedSnapshot), donorWorkspaceId, donorSnapshot!.snapshot_id],
+      );
+
+      const scalePackPath = join(fixture.dataRoot, "perf-codec.index-pack.gz");
+      const exportStart = Date.now();
+      await exportIndexPack({ database: asStorageDatabase(fixture.donorDatabase), workspace_id: donorWorkspaceId, out_path: scalePackPath, now: () => now });
+      const exportMs = Date.now() - exportStart;
+      // eslint-disable-next-line no-console -- deliberate perf-gate signal, matches this repo's other timing assertions
+      console.log(`[index-pack perf gate] codec-scale export of ${N_SYNTHETIC_RECORDS} record bodies took ${exportMs}ms`);
+      expect(exportMs).toBeLessThan(PERF_BOUND_MS);
+
+      await seedFixtureFiles(targetRoot);
+      const targetDataRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-perf-codec-target-data-"));
+      targetStorage = await createDurableStorage({ rootDir: targetDataRoot });
+      const targetRegistry = new WorkspaceRegistry();
+      const targetWorkspace = await registerEngineWorkspace(targetRegistry, targetRoot, "target");
+      targetDatabase = await openEngineWorkspace(targetStorage, targetWorkspace);
+      const preparedTarget = await prepareRegistry(targetWorkspace.workspace_id);
+
+      const importStart = Date.now();
+      const outcome = await attemptIndexPackImport({
+        workspace: targetWorkspace,
+        database: asStorageDatabase(targetDatabase),
+        storage: asDurableStorage(targetStorage),
+        registry: targetRegistry,
+        plugin: providerFor(preparedTarget, targetWorkspace.workspace_id),
+        pack_path: scalePackPath,
+        inclusion_rules: INDEX_PACK_INCLUSION_RULES,
+        verify_mode: "fast",
+      });
+      const importMs = Date.now() - importStart;
+      // eslint-disable-next-line no-console -- deliberate perf-gate signal, matches this repo's other timing assertions
+      console.log(`[index-pack perf gate] codec-scale import of the same pack took ${importMs}ms`);
+      expect(outcome.status).toBe("imported");
+      expect(importMs).toBeLessThan(PERF_BOUND_MS);
+
+      const importedCount = outcome.status === "imported"
+        ? (await targetDatabase.database.get<{ c: number }>("SELECT COUNT(*) AS c FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ? AND valid_to_generation IS NULL", [targetWorkspace.workspace_id, outcome.generation]))?.c ?? 0
+        : 0;
+      expect(importedCount).toBeGreaterThanOrEqual(N_SYNTHETIC_RECORDS);
+    } finally {
+      if (targetDatabase) await targetDatabase.close().catch(() => undefined);
+      if (targetStorage) await targetStorage.close();
+      await rm(targetRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await teardown(fixture);
+    }
+  }, 600_000);
 });

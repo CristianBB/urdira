@@ -16,6 +16,7 @@ import type {
 import type { DurableStorage, ForkPublicationPlanInput, WorkspaceDatabase } from "@urdira/storage";
 import { buildForkPublicationPlan, computeForkSnapshotDigestFields, digestRelationalValue, normalizeObservationBatchIds, publicationTransactionCommands, snapshotDigest } from "@urdira/storage";
 import type { GitIgnoreRules, InclusionRules } from "@urdira/security";
+import { record, resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { ISOMORPHIC_GIT_OBJECT_PORT, administrativeState, type GitObjectPort } from "./git-providers.js";
 import type { RegisteredWorkspace, WorkspaceRegistry } from "./workspaces.js";
 import type { WorkspaceScanPluginProvider } from "./workspace-indexing-session.js";
@@ -62,7 +63,7 @@ import {
 
 export const INDEX_PACK_SCHEMA_VERSION = 1 as const;
 const PACK_BATCH_ROWS = 500;
-const SQL_PAGE_ROWS = 1000;
+const SQL_PAGE_ROWS = 8000;
 const DEFAULT_MAX_DIFF_ENTRIES = 20;
 /** How many scratch-donor rows accumulate per `BEGIN`/`COMMIT` while populating `ScratchDonorDatabase` from a pack's streamed rows -- see that class's doc comment. */
 const SCRATCH_DONOR_BATCH_TX_ROWS = 2000;
@@ -150,7 +151,11 @@ function fromHex(text: string | undefined): Uint8Array | null {
 // ---------------------------------------------------------------------------
 
 class PackWriter {
-  private readonly gzip: Gzip = createGzip();
+  // Level 1 (fastest): the 150k-record codec gate measured the default
+  // level 6 at ~2x the compression CPU of level 1 on this payload shape
+  // (highly repetitive JSON/hex rows compress well at any level); a pack is
+  // a transient transport artifact, not an archive, so encode speed wins.
+  private readonly gzip: Gzip = createGzip({ level: 1 });
   private readonly done: Promise<void>;
 
   constructor(outPath: string) {
@@ -164,7 +169,10 @@ class PackWriter {
   }
 
   async writeLine(value: PackLine): Promise<void> {
-    if (!this.gzip.write(`${JSON.stringify(value)}\n`)) await once(this.gzip, "drain");
+    const text = timedSync("index_pack_export_stringify", () => `${JSON.stringify(value)}\n`);
+    const startedAt = timingEnabled() ? performance.now() : 0;
+    if (!this.gzip.write(text)) await once(this.gzip, "drain");
+    if (timingEnabled()) record("index_pack_export_gzip_write", performance.now() - startedAt);
   }
 
   async writeRows(kind: Exclude<PackLine["kind"], "manifest" | "end">, rows: readonly unknown[]): Promise<void> {
@@ -193,7 +201,7 @@ async function* readPackLines(packPath: string): AsyncGenerator<PackLine> {
   for await (const line of rl) {
     if (line.length === 0) continue;
     let parsed: unknown;
-    try { parsed = JSON.parse(line); } catch { throw new Error("index pack contains a malformed line"); }
+    try { parsed = timedSync("index_pack_import_json_parse", () => JSON.parse(line)); } catch { throw new Error("index pack contains a malformed line"); }
     yield parsed as PackLine;
   }
 }
@@ -224,17 +232,8 @@ async function readWorkspaceMetaNumber(database: WorkspaceDatabase, key: string)
   return typeof decoded === "number" ? decoded : undefined;
 }
 
-async function artifactVersionUriMap(database: WorkspaceDatabase, workspaceId: string): Promise<ReadonlyMap<string, string>> {
-  const rows = await database.database.all<{ artifact_version_id: string; normalized_uri: string }>(
-    `SELECT version.artifact_version_id AS artifact_version_id, artifact.normalized_uri AS normalized_uri
-     FROM artifact_versions AS version JOIN source_artifacts AS artifact ON artifact.workspace_id = version.workspace_id AND artifact.artifact_id = version.artifact_id
-     WHERE version.workspace_id = ? AND version.valid_to_generation IS NULL`,
-    [workspaceId],
-  );
-  return new Map(rows.map((row) => [row.artifact_version_id, row.normalized_uri]));
-}
-
 export async function exportIndexPack(options: ExportIndexPackOptions): Promise<ExportIndexPackResult> {
+  if (timingEnabled()) resetTimings();
   const now = options.now ?? (() => new Date().toISOString());
   const database = options.database;
   const workspaceId = options.workspace_id;
@@ -274,15 +273,40 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
   const capabilityStateEntries = manifestRow === undefined ? [] : await visibleCapabilityStateEntries(database, manifestRow.candidate_generation_id);
 
   const visible = (alias: string): string => `${alias}.valid_from_generation <= ? AND (${alias}.valid_to_generation IS NULL OR ${alias}.valid_to_generation > ?)`;
-  const count = async (sql: string, params: readonly (string | number)[]): Promise<number> => (await database.database.get<{ c: number }>(sql, params))?.c ?? 0;
+  // The bulk row reads below go through a private, read-only, same-thread
+  // connection to the workspace's own sqlite file rather than the
+  // `SqliteWorkerAdapter` handle: profiling on the 150k-record codec gate
+  // showed each worker-proxied page pays a structured-clone + postMessage
+  // round trip that dominated export wall time for BLOB-bearing rows
+  // (~40us/row against a ~3us/row native floor). A second read-only
+  // connection against a WAL database is this repo's established pattern
+  // (lexical/semantic worker threads, `openWorkspaceReadOnly`). The reads
+  // run inside one deferred read transaction so the manifest's count pass
+  // and the data pass observe a single WAL snapshot -- the count/data
+  // reconciliation at the end then only fires on genuine pre-transaction
+  // drift. NOTE: these reads are synchronous on this thread; the daemon
+  // invokes exportIndexPack on a worker thread (index-pack-export-thread)
+  // so a large export cannot starve the runtime's event loop.
+  const rawDatabase = new DatabaseSync(database.database.filename, { readOnly: true });
+  rawDatabase.exec("BEGIN;");
+  const closeRawDatabase = (): void => {
+    try { rawDatabase.exec("COMMIT;"); } catch { /* read txn already ended */ }
+    try { rawDatabase.close(); } catch { /* already closed */ }
+  };
+  const count = (sql: string, params: readonly (string | number)[]): number => Number((rawDatabase.prepare(sql).get(...(params as never[])) as { c?: unknown } | undefined)?.c ?? 0);
+  const sqlAll = (sql: string, params: readonly (string | number)[]): readonly Record<string, unknown>[] => {
+    const section = /FROM (\w+)/u.exec(sql)?.[1] ?? "unknown";
+    return timedSync(`index_pack_export_sql_all_${section}`, () => rawDatabase.prepare(sql).all(...(params as never[])) as Record<string, unknown>[]);
+  };
 
-  const multisetRows = await database.database.all<{ normalized_uri: string; content_hash: string }>(
+  try {
+  const multisetRows = sqlAll(
     `SELECT artifact.normalized_uri AS normalized_uri, version.content_hash AS content_hash
      FROM artifact_versions AS version JOIN source_artifacts AS artifact ON artifact.workspace_id = version.workspace_id AND artifact.artifact_id = version.artifact_id
      WHERE version.workspace_id = ? AND version.valid_to_generation IS NULL`,
     [workspaceId],
   );
-  const multisetEntries = multisetRows.map((row) => [row.normalized_uri, row.content_hash] as const);
+  const multisetEntries = multisetRows.map((row) => [String(row["normalized_uri"]), String(row["content_hash"])] as const);
 
   // Row counts are computed via `COUNT(*)` up front, before any row is
   // streamed, so the manifest (which declares them) can be written as the
@@ -296,12 +320,12 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
   // contents.
   const declaredRowCounts: IndexPackRowCounts = {
     multiset: multisetEntries.length,
-    records: await count(`SELECT COUNT(*) AS c FROM record_occurrences r WHERE r.workspace_id = ? AND ${visible("r")}`, [workspaceId, generation, generation]),
-    value_nodes: await count(`SELECT COUNT(*) AS c FROM record_value_nodes v JOIN record_occurrences r ON r.workspace_id = v.workspace_id AND r.record_id = v.record_id AND r.valid_from_generation = v.valid_from_generation WHERE v.workspace_id = ? AND ${visible("r")}`, [workspaceId, generation, generation]),
-    facets: await count("SELECT COUNT(*) AS c FROM record_facets WHERE workspace_id = ? AND valid_from_generation <= ?", [workspaceId, generation]),
-    identities: await count(`SELECT COUNT(*) AS c FROM identity_assignments d WHERE d.workspace_id = ? AND ${visible("d")}`, [workspaceId, generation, generation]),
-    dependencies: await count(`SELECT COUNT(*) AS c FROM artifact_dependencies dep WHERE dep.workspace_id = ? AND ${visible("dep")}`, [workspaceId, generation, generation]),
-    projections: await count(`SELECT COUNT(*) AS c FROM projection_occurrences po WHERE po.workspace_id = ? AND ${visible("po")}`, [workspaceId, generation, generation]),
+    records: count(`SELECT COUNT(*) AS c FROM record_occurrences r WHERE r.workspace_id = ? AND ${visible("r")}`, [workspaceId, generation, generation]),
+    value_nodes: count(`SELECT COUNT(*) AS c FROM record_value_nodes v JOIN record_occurrences r ON r.workspace_id = v.workspace_id AND r.record_id = v.record_id AND r.valid_from_generation = v.valid_from_generation WHERE v.workspace_id = ? AND ${visible("r")}`, [workspaceId, generation, generation]),
+    facets: count("SELECT COUNT(*) AS c FROM record_facets WHERE workspace_id = ? AND valid_from_generation <= ?", [workspaceId, generation]),
+    identities: count(`SELECT COUNT(*) AS c FROM identity_assignments d WHERE d.workspace_id = ? AND ${visible("d")}`, [workspaceId, generation, generation]),
+    dependencies: count(`SELECT COUNT(*) AS c FROM artifact_dependencies dep WHERE dep.workspace_id = ? AND ${visible("dep")}`, [workspaceId, generation, generation]),
+    projections: count(`SELECT COUNT(*) AS c FROM projection_occurrences po WHERE po.workspace_id = ? AND ${visible("po")}`, [workspaceId, generation, generation]),
     capability_state: capabilityStateEntries.length,
   };
   const multisetKeyValue = multisetKey(multisetEntries);
@@ -336,35 +360,59 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
     await writer.writeLine({ kind: "manifest", manifest });
     await writer.writeRows("multiset", multisetEntries);
 
+    // Profiling on the 150k-record codec gate showed the previous
+    // JOIN-per-page shape (owner source_artifacts JOIN + a two-hop LEFT JOIN
+    // for the span uri) cost ~88ms per 1000-row page vs ~3ms for the
+    // identical-shaped JOIN-free identity pages -- ~85% of total export wall
+    // time. Both uri lookups are workspace-bounded (one row per file), so
+    // they are prefetched once here and applied in JS instead.
+    const artifactIdToUri = new Map<string, string>(
+      sqlAll("SELECT artifact_id, normalized_uri FROM source_artifacts WHERE workspace_id = ?", [workspaceId]).map((row) => [String(row["artifact_id"]), String(row["normalized_uri"])]),
+    );
+    // Unlike `versionToUri` (current versions only, used for the
+    // projections section below), span references may name historical
+    // version rows, matching the unfiltered LEFT JOIN this map replaces.
+    const spanVersionToUri = new Map<string, string>(
+      sqlAll(
+        `SELECT version.artifact_version_id AS artifact_version_id, artifact.normalized_uri AS normalized_uri
+         FROM artifact_versions AS version JOIN source_artifacts AS artifact ON artifact.workspace_id = version.workspace_id AND artifact.artifact_id = version.artifact_id
+         WHERE version.workspace_id = ?`,
+        [workspaceId],
+      ).map((row) => [String(row["artifact_version_id"]), String(row["normalized_uri"])]),
+    );
+
     let recordCount = 0;
     let cursor = "";
     for (;;) {
-      const rows = await database.database.all<Record<string, unknown>>(
+      const rows = sqlAll(
         `SELECT r.record_id AS record_id, r.category AS category, r.kind AS kind, r.universal_kind AS universal_kind, r.schema_version AS schema_version,
-           r.producer_id AS producer_id, r.producer_version AS producer_version, owner_artifact.normalized_uri AS owner_normalized_uri,
-           span_artifact.normalized_uri AS primary_source_span_normalized_uri,
+           r.producer_id AS producer_id, r.producer_version AS producer_version, r.owner_artifact_id AS owner_artifact_id,
+           r.primary_source_span_artifact_version_id AS primary_source_span_artifact_version_id,
            r.primary_source_span_start_byte AS primary_source_span_start_byte, r.primary_source_span_end_byte AS primary_source_span_end_byte,
            r.primary_source_span_start_line AS primary_source_span_start_line, r.primary_source_span_end_line AS primary_source_span_end_line,
            r.record_digest AS record_digest, r.body_digest AS body_digest, r.body_byte_length AS body_byte_length, r.body_payload AS body_payload,
            r.analysis_digest AS analysis_digest, r.analysis_configuration_digest AS analysis_configuration_digest, r.artifact_dependency_digest AS artifact_dependency_digest
          FROM record_occurrences r
-         JOIN source_artifacts owner_artifact ON owner_artifact.workspace_id = r.workspace_id AND owner_artifact.artifact_id = r.owner_artifact_id
-         LEFT JOIN artifact_versions span_version ON span_version.workspace_id = r.workspace_id AND span_version.artifact_version_id = r.primary_source_span_artifact_version_id
-         LEFT JOIN source_artifacts span_artifact ON span_artifact.workspace_id = span_version.workspace_id AND span_artifact.artifact_id = span_version.artifact_id
          WHERE r.workspace_id = ? AND ${visible("r")} AND r.record_id > ? ORDER BY r.record_id LIMIT ?`,
         [workspaceId, generation, generation, cursor, SQL_PAGE_ROWS],
       );
       if (rows.length === 0) break;
-      const packRows = rows.map((row) => ({
+      const packRows = timedSync("index_pack_export_row_map", () => rows.map((row) => {
+        const ownerUri = artifactIdToUri.get(String(row["owner_artifact_id"]));
+        // The previous INNER JOIN silently dropped a record with no owner
+        // row; that would be an integrity violation worth failing loudly on.
+        if (ownerUri === undefined) throw new Error(`index pack export: record ${String(row["record_id"])} owner artifact ${String(row["owner_artifact_id"])} has no source_artifacts row`);
+        const spanVersionId = row["primary_source_span_artifact_version_id"];
+        return {
         record_id: row["record_id"], category: row["category"], kind: row["kind"], universal_kind: row["universal_kind"], schema_version: row["schema_version"],
-        producer_id: row["producer_id"], producer_version: row["producer_version"], owner_normalized_uri: row["owner_normalized_uri"],
-        primary_source_span_normalized_uri: row["primary_source_span_normalized_uri"] ?? undefined,
+        producer_id: row["producer_id"], producer_version: row["producer_version"], owner_normalized_uri: ownerUri,
+        primary_source_span_normalized_uri: spanVersionId === null || spanVersionId === undefined ? undefined : spanVersionToUri.get(String(spanVersionId)),
         primary_source_span_start_byte: row["primary_source_span_start_byte"] ?? undefined, primary_source_span_end_byte: row["primary_source_span_end_byte"] ?? undefined,
         primary_source_span_start_line: row["primary_source_span_start_line"] ?? undefined, primary_source_span_end_line: row["primary_source_span_end_line"] ?? undefined,
         record_digest: row["record_digest"], body_digest: row["body_digest"], body_byte_length: row["body_byte_length"],
         body_payload_hex: hexEncode(row["body_payload"] === null ? null : toBytes(row["body_payload"])),
         analysis_digest: row["analysis_digest"], analysis_configuration_digest: row["analysis_configuration_digest"], artifact_dependency_digest: row["artifact_dependency_digest"],
-      }));
+      }; }));
       await writer.writeRows("records", packRows);
       recordCount += rows.length;
       cursor = String(rows[rows.length - 1]!["record_id"]);
@@ -392,7 +440,7 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
     let valueNodeCursorGeneration = -1;
     let valueNodeCursorPath = "";
     for (;;) {
-      const rows = await database.database.all<Record<string, unknown>>(
+      const rows = sqlAll(
         `SELECT v.record_id AS record_id, v.valid_from_generation AS valid_from_generation, v.value_path AS value_path, v.parent_path AS parent_path, v.sequence_ordinal AS sequence_ordinal, v.map_key AS map_key,
            v.value_kind AS value_kind, v.text_value AS text_value, v.integer_value AS integer_value, v.real_value AS real_value, v.bool_value AS bool_value, v.bytes_value AS bytes_value
          FROM record_value_nodes v
@@ -421,7 +469,7 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
     let facetCursorGeneration = -1;
     let facetCursorOrdinal = -1;
     for (;;) {
-      const rows = await database.database.all<Record<string, unknown>>(
+      const rows = sqlAll(
         `SELECT record_id, valid_from_generation, facet_ordinal, facet FROM record_facets
          WHERE workspace_id = ? AND valid_from_generation <= ? AND (record_id, valid_from_generation, facet_ordinal) > (?, ?, ?)
          ORDER BY record_id, valid_from_generation, facet_ordinal LIMIT ?`,
@@ -443,7 +491,7 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
     // visible at this generation.
     let identityCursor = "";
     for (;;) {
-      const rows = await database.database.all<Record<string, unknown>>(
+      const rows = sqlAll(
         `SELECT d.identity_assignment_id AS identity_assignment_id, d.identity_type AS identity_type, d.identity_id AS identity_id, d.identity_key AS identity_key,
            d.identity_key_digest AS identity_key_digest, d.record_id AS record_id
          FROM identity_assignments d
@@ -468,7 +516,7 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
     // is unchanged).
     let dependencyCursor = "";
     for (;;) {
-      const rows = await database.database.all<Record<string, unknown>>(
+      const rows = sqlAll(
         `SELECT dep.dependency_entry_id AS dependency_entry_id, dep.record_id AS record_id, owner_artifact.normalized_uri AS owner_normalized_uri, dependency_artifact.normalized_uri AS dependency_normalized_uri,
            dep.dependency_role AS dependency_role, dep.producer_id AS producer_id, dep.producer_version AS producer_version
          FROM artifact_dependencies dep
@@ -484,13 +532,20 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
       dependencyCursor = String(rows[rows.length - 1]!["dependency_entry_id"]);
     }
 
-    const versionToUri = await artifactVersionUriMap(database, workspaceId);
+    const versionToUri = new Map<string, string>(
+      sqlAll(
+        `SELECT version.artifact_version_id AS artifact_version_id, artifact.normalized_uri AS normalized_uri
+         FROM artifact_versions AS version JOIN source_artifacts AS artifact ON artifact.workspace_id = version.workspace_id AND artifact.artifact_id = version.artifact_id
+         WHERE version.workspace_id = ? AND version.valid_to_generation IS NULL`,
+        [workspaceId],
+      ).map((row) => [String(row["artifact_version_id"]), String(row["normalized_uri"])]),
+    );
     let projectionCount = 0;
     // projection_record_id is projection_occurrences' PRIMARY KEY column
     // and already what the pre-existing ORDER BY sorted on.
     let projectionCursor = "";
     for (;;) {
-      const rows = await database.database.all<Record<string, unknown>>(
+      const rows = sqlAll(
         `SELECT projection_record_id, projection_kind, projection_key, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids,
            generator, generator_version, generator_configuration_digest, content_digest
          FROM projection_occurrences po
@@ -529,6 +584,10 @@ export async function exportIndexPack(options: ExportIndexPackOptions): Promise<
   } finally {
     await writer.close();
     if (!ok) await rm(options.out_path, { force: true }).catch(() => undefined);
+    if (timingEnabled()) console.error(`[urdira] index pack export timings for ${workspaceId}:`, JSON.stringify(snapshotTimings()));
+  }
+  } finally {
+    closeRawDatabase();
   }
 }
 
@@ -561,10 +620,13 @@ export type IndexPackImportOutcome =
 
 /** Never throws: every failure mode (incompatible pack, tamper detected, verify failure, I/O error) becomes `{status:"skipped", reason}`, mirroring `attemptWorkspaceFork`'s contract exactly so a caller can fall back to a full scan unconditionally. */
 export async function attemptIndexPackImport(options: IndexPackImportOptions): Promise<IndexPackImportOutcome> {
+  if (timingEnabled()) resetTimings();
   try {
     return await attemptIndexPackImportInner(options);
   } catch (error) {
     return { status: "skipped", reason: `index pack import attempt threw: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    if (timingEnabled()) console.error(`[urdira] index pack import timings for ${options.workspace.workspace_id}:`, JSON.stringify(snapshotTimings()));
   }
 }
 
@@ -963,12 +1025,12 @@ async function attemptIndexPackImportInner(options: IndexPackImportOptions): Pro
     while (!cursorLine.done) {
       const value = cursorLine.value;
       if (value.kind === "end") break;
-      if (value.kind === "records") { scratch.insertRecords(value.rows as readonly Record<string, unknown>[], uriMap); rowCounts.records += value.rows.length; }
-      else if (value.kind === "value_nodes") { scratch.insertValueNodes(value.rows as readonly Record<string, unknown>[]); rowCounts.value_nodes += value.rows.length; }
-      else if (value.kind === "facets") { scratch.insertFacets(value.rows as readonly Record<string, unknown>[]); rowCounts.facets += value.rows.length; }
-      else if (value.kind === "identities") { scratch.insertIdentities(value.rows as readonly Record<string, unknown>[]); rowCounts.identities += value.rows.length; }
-      else if (value.kind === "dependencies") { scratch.insertDependencies(value.rows as readonly Record<string, unknown>[], uriMap); rowCounts.dependencies += value.rows.length; }
-      else if (value.kind === "projections") { scratch.insertProjections(value.rows as readonly Record<string, unknown>[], uriMap); rowCounts.projections += value.rows.length; }
+      if (value.kind === "records") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertRecords(value.rows as readonly Record<string, unknown>[], uriMap)); rowCounts.records += value.rows.length; }
+      else if (value.kind === "value_nodes") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertValueNodes(value.rows as readonly Record<string, unknown>[])); rowCounts.value_nodes += value.rows.length; }
+      else if (value.kind === "facets") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertFacets(value.rows as readonly Record<string, unknown>[])); rowCounts.facets += value.rows.length; }
+      else if (value.kind === "identities") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertIdentities(value.rows as readonly Record<string, unknown>[])); rowCounts.identities += value.rows.length; }
+      else if (value.kind === "dependencies") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertDependencies(value.rows as readonly Record<string, unknown>[], uriMap)); rowCounts.dependencies += value.rows.length; }
+      else if (value.kind === "projections") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertProjections(value.rows as readonly Record<string, unknown>[], uriMap)); rowCounts.projections += value.rows.length; }
       else if (value.kind === "capability_state") { capabilityStateEntries.push(...value.rows); rowCounts.capability_state += value.rows.length; }
       else if (value.kind !== "multiset") fail(`index pack contains an unrecognized section kind`);
       cursorLine = await lines.next();
@@ -986,9 +1048,9 @@ async function attemptIndexPackImportInner(options: IndexPackImportOptions): Pro
     for (const artifact of donorArtifacts) if (!map.byArtifactVersionId.has(artifact.artifact_version_id)) fail(`invariant violation: index pack artifact ${artifact.normalized_uri} has no counterpart in the import target's fresh source layer despite a passed multiset check`);
 
     const target = options.database;
-    await bulkCopyRecordsAndIdentities(target, scratch.handle(), 1, workspaceId, map);
-    await bulkCopyDependencies(target, scratch.handle(), 1, workspaceId, map);
-    const projectionPatchCount = await bulkCopyProjections(target, scratch.handle(), 1, workspaceId, map);
+    await timed("index_pack_import_bulk_copy", () => bulkCopyRecordsAndIdentities(target, scratch!.handle(), 1, workspaceId, map));
+    await timed("index_pack_import_bulk_copy", () => bulkCopyDependencies(target, scratch!.handle(), 1, workspaceId, map));
+    const projectionPatchCount = await timed("index_pack_import_bulk_copy", () => bulkCopyProjections(target, scratch!.handle(), 1, workspaceId, map));
 
     const publishedAt = context.now();
     const digestFields = await computeForkSnapshotDigestFields(target.database, workspaceId, ids.generation);
@@ -1017,7 +1079,7 @@ async function attemptIndexPackImportInner(options: IndexPackImportOptions): Pro
     };
     const plan = buildForkPublicationPlan(planInput);
     try {
-      await target.database.transactionChunked(publicationTransactionCommands(plan), undefined, { transfer_params: true, discard_results: true });
+      await timed("index_pack_import_publish_transaction", () => target.database.transactionChunked(publicationTransactionCommands(plan), undefined, { transfer_params: true, discard_results: true }));
     } catch (error) {
       fail(`index pack publication failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1026,7 +1088,7 @@ async function attemptIndexPackImportInner(options: IndexPackImportOptions): Pro
     let verifyOk: boolean;
     let verifyDetail: unknown;
     if (verifyMode === "full") {
-      const verification = await target.maintenance.verify();
+      const verification = await timed("index_pack_import_verify", () => target.maintenance.verify());
       verifyDetail = verification.failures;
       // Same pre-existing, documented `StorageMaintenance.verify()` gaps
       // `workspace-fork.ts`'s `copyDonorAndPublish` filters (registry
@@ -1035,10 +1097,10 @@ async function attemptIndexPackImportInner(options: IndexPackImportOptions): Pro
       // scanned workspace, not something this module's own copy introduces;
       // see `isKnownPreexistingVerifyGap`'s doc comment for the specifics.
       verifyOk = verification.failures.filter((failure) => !isKnownPreexistingVerifyGap(failure)).length === 0;
-      const integrityFailures = await verifyCopiedRecordIntegrity(target, workspaceId, ids.generation);
+      const integrityFailures = await timed("index_pack_import_verify", () => verifyCopiedRecordIntegrity(target, workspaceId, ids.generation));
       if (integrityFailures.length > 0) { verifyOk = false; verifyDetail = [...(verifyDetail as readonly unknown[]), ...integrityFailures]; }
     } else {
-      const fast = await fastPackVerify(target, workspaceId, manifest, ids);
+      const fast = await timed("index_pack_import_verify", () => fastPackVerify(target, workspaceId, manifest, ids));
       verifyOk = fast.ok;
       verifyDetail = fast.failures;
     }

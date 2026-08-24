@@ -2,9 +2,10 @@ import { chmod, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename } from "node:path";
-import { attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, exportIndexPack, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
+import { attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
+import { runIndexPackExportInThread } from "./index-pack-export-thread.js";
 import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-thread.js";
 import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths } from "./ownership.js";
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
@@ -2390,18 +2391,17 @@ export class DaemonRuntime {
           if (!workspace) throw new DaemonError("core:workspace_not_found", "Workspace is not registered.");
           if (workspace.status !== "ready") throw new DaemonError("core:workspace_lifecycle", "Workspace must be ready before it can be exported as an index pack.");
           const requireGitClean = values["require-git-clean"] === "true";
-          const database = await indexingStorage.openWorkspace(workspace.workspace_id);
-          try {
-            const result = await exportIndexPack({
-              database,
-              workspace_id: workspace.workspace_id,
-              out_path: outPath,
-              ...(requireGitClean ? { require_git_clean: true, canonical_root: workspace.canonical_root } : {}),
-            });
-            return { workspace_id: workspace.workspace_id, out_path: result.out_path, pack_id: result.manifest.pack_id, manifest_digest: result.manifest.manifest_digest, row_counts: result.manifest.row_counts };
-          } finally {
-            await database.close().catch(() => undefined);
-          }
+          // The export runs in its own worker thread with its own storage
+          // handle: its bulk row reads are synchronous by design (see
+          // `exportIndexPack`'s `rawDatabase` comment), so running it here
+          // would stall this runtime's event loop for the whole export.
+          const result = await runIndexPackExportInThread({
+            data_root: options.data_root,
+            workspace_id: workspace.workspace_id,
+            out_path: outPath,
+            ...(requireGitClean ? { require_git_clean: true, canonical_root: workspace.canonical_root } : {}),
+          });
+          return { workspace_id: workspace.workspace_id, out_path: result.out_path, pack_id: result.manifest.pack_id, manifest_digest: result.manifest.manifest_digest, row_counts: result.manifest.row_counts };
         }
         if (options.workspace_registry && request.call === "core:workspace_remove") {
           const rootOrId = workspaceRootFromRequest(request.payload);
