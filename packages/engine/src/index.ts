@@ -1,5 +1,12 @@
 export { EngineError } from "./errors.js";
 export { mapWithConcurrency } from "./concurrency.js";
+// Re-exported so a composing application (`apps/urdira`) can record its OWN
+// sub-buckets into the exact same `URDIRA_STORAGE_DEBUG_TIMING`-gated bucket
+// map `workspace-indexing-session.ts` snapshots/logs as "engine timings" --
+// see `record`'s doc comment (`debug-timing.ts`) and P3-3c (docs) for why
+// this is the only way to attribute work that happens INSIDE a plugin's own
+// `analyze()` implementation, which engine cannot see into.
+export { record as recordEngineTiming, timingEnabled as engineTimingEnabled } from "./debug-timing.js";
 export { createCanonicalPluginDigestAuthority } from "./plugin-digest-authority.js";
 export { candidateTargetRegistryFromSnapshot } from "./candidate-target-registry.js";
 export {
@@ -249,6 +256,19 @@ export {
   type WorkspaceForkOptions,
   type WorkspaceForkOutcome,
 } from "./workspace-fork.js";
+export {
+  attemptIndexPackImport,
+  exportIndexPack,
+  INDEX_PACK_SCHEMA_VERSION,
+  type ExportIndexPackOptions,
+  type ExportIndexPackResult,
+  type IndexPackCompatibility,
+  type IndexPackImportOptions,
+  type IndexPackImportOutcome,
+  type IndexPackManifest,
+  type IndexPackRowCounts,
+  type IndexPackSnapshotAnchor,
+} from "./index-pack.js";
 export {
   readPersistedControlState,
   readPersistedRegistrySnapshot,

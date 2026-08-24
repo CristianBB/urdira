@@ -1,8 +1,19 @@
 import { agentStatus, installAgent, normalizeAgentClient, runAgentHook, uninstallAgent, type AgentClient } from "./agent-integration.js";
 export * from "./agent-integration.js";
 
-export type CliCommandName = "status" | "query" | "index" | "start" | "stop" | "restart" | "workspace-add" | "workspace-remove" | "workspace-purge" | "workspace-configure" | "config-set" | "repair" | "gc" | "reindex" | "agent-status" | "agent-install" | "agent-uninstall" | "agent-hook";
-export const MUTATING_COMMANDS = ["start", "stop", "restart", "workspace-add", "workspace-remove", "workspace-purge", "workspace-configure", "config-set", "repair", "gc", "reindex"] as const satisfies ReadonlyArray<CliCommandName>;
+export type CliCommandName = "status" | "query" | "index" | "start" | "stop" | "restart" | "workspace-add" | "workspace-remove" | "workspace-purge" | "workspace-configure" | "config-set" | "repair" | "gc" | "reindex" | "index-pack-export" | "agent-status" | "agent-install" | "agent-uninstall" | "agent-hook";
+// `index-pack-export` (docs/decisions/23-index-pack.md) never mutates
+// `workspace_registry` or any published generation -- it only writes a pack
+// file to local disk -- but it is routed through the MUTATING_COMMANDS
+// dispatch anyway rather than READ_ONLY_COMMANDS: it needs two positional
+// args plus `--out`, which READ_ONLY_COMMANDS' hardcoded no-positional-args
+// rule (`status`/`index`) does not accommodate, and MUTATING_COMMANDS'
+// preview/confirm dance is a harmless formality for a genuinely idempotent,
+// non-destructive export. Index pack IMPORT has no separate verb: it rides
+// `workspace-add --index-pack <path>` (see that option below), since import
+// is only ever valid on a genuinely fresh, never-scanned workspace -- which
+// `workspace-add` is the only command that creates.
+export const MUTATING_COMMANDS = ["start", "stop", "restart", "workspace-add", "workspace-remove", "workspace-purge", "workspace-configure", "config-set", "repair", "gc", "reindex", "index-pack-export"] as const satisfies ReadonlyArray<CliCommandName>;
 const READ_ONLY_COMMANDS = ["status", "query", "index", "agent-status"] as const satisfies ReadonlyArray<CliCommandName>;
 const ALL_COMMANDS = new Set<CliCommandName>([...READ_ONLY_COMMANDS, ...MUTATING_COMMANDS]);
 
@@ -15,7 +26,7 @@ export interface CliDaemonClient { readonly call: (call: string, payload: unknow
 export interface CliDependencies { readonly client: CliDaemonClient; readonly preview_admin?: (command: CliCommand) => Promise<unknown>; readonly execute_admin?: (command: CliCommand, preview: unknown) => Promise<unknown>; readonly prompt?: (question: string) => Promise<string | boolean>; readonly read_stdin?: () => Promise<string>; readonly home_directory?: string; }
 export interface CliResult { readonly exit_code: number; readonly data: unknown; readonly stdout: string; }
 
-const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "payload", "proposal-id", "workspace", "path", "value", "engine-build-id", "client", "scope"]);
+const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "payload", "proposal-id", "workspace", "path", "value", "engine-build-id", "client", "scope", "index-pack", "out", "require-git-clean"]);
 // --debug-timing is a process/runtime diagnostic switch, not part of any
 // request payload. It is therefore accepted uniformly on read-only commands
 // as well as lifecycle/admin commands; the app entrypoint consumes it before
@@ -70,7 +81,7 @@ export function parseCliArgs(argv: ReadonlyArray<string>): CliCommand {
   return { name: rawName as CliCommandName, args, options: { json, dry_run: dryRun, confirm, debug_timing: debugTiming, ...(payload === undefined ? {} : { payload }), ...(proposalId === undefined ? {} : { proposal_id: proposalId }), values } };
 }
 
-const adminCall: Readonly<Record<(typeof MUTATING_COMMANDS)[number], string>> = { start: "core:daemon_start", stop: "core:daemon_stop", restart: "core:daemon_restart", "workspace-add": "core:workspace_add", "workspace-remove": "core:workspace_remove", "workspace-purge": "core:workspace_purge", "workspace-configure": "core:workspace_configure", "config-set": "core:configuration_set", repair: "core:repair", gc: "core:garbage_collect", reindex: "core:reindex" };
+const adminCall: Readonly<Record<(typeof MUTATING_COMMANDS)[number], string>> = { start: "core:daemon_start", stop: "core:daemon_stop", restart: "core:daemon_restart", "workspace-add": "core:workspace_add", "workspace-remove": "core:workspace_remove", "workspace-purge": "core:workspace_purge", "workspace-configure": "core:workspace_configure", "config-set": "core:configuration_set", repair: "core:repair", gc: "core:garbage_collect", reindex: "core:reindex", "index-pack-export": "core:index_pack_export" };
 // Owner decision 2026-08-13 (docs/decisions/18-semantic-model-pack.md
 // Outcome): a configure RPC that provisioned the embedding model must print
 // a clear notice, never download silently. `resultPayload` is whatever an

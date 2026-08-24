@@ -1,5 +1,5 @@
 import { canonicalJson, canonicalSha256 } from "@urdira/plugin-sdk";
-import { canonicalBytes, digestBytes, digestCanonicalArray, digestCanonicalMapWithArrayFields, digestMappedCanonicalArray, LogicalDigestWriter } from "@urdira/canonical";
+import { canonicalBytes, digestBytes, digestCanonicalArray, digestCanonicalMapWithArrayFields, digestMappedCanonicalArray, LogicalDigestWriter, memoizedPackedIdentityTriple, rememberPackedIdentityTriple } from "@urdira/canonical";
 import type { CanonicalEncodingLimits } from "@urdira/canonical";
 import type { BoundPluginLookupInvalidationDependency, PluginInvalidationConsumerType, PluginInvalidationScope, PluginLookupOperation } from "@urdira/plugin-sdk";
 import type {
@@ -168,16 +168,38 @@ function isPackedCreatedIdentityAssignment(value: unknown): value is PackedCreat
     && value.every((entry) => typeof entry === "string");
 }
 
-function unpackCreatedIdentityAssignment(value: PackedCreatedIdentityAssignment): CandidateIdentityAssignmentTemplate {
-  const [, workspaceId, identityType, identityKey, recordId, ownerArtifactId, ownerArtifactVersionId] = value;
+/**
+ * The three digests a packed tuple's own id/key fields require --
+ * `identity_assignment_id`, `identity_id`'s hex suffix, and
+ * `identity_key_digest` -- computed once and remembered against the tuple's
+ * own array identity (`rememberPackedIdentityTriple`, `@urdira/canonical`),
+ * so this same tuple's later unpack (here, in seal's own mapped digest) and
+ * `publication-authority.ts`'s independent unpack over the identical
+ * out-of-band array both reuse it instead of each recomputing all three.
+ */
+function packedIdentityTriple(recordId: string, identityKey: string): { readonly identity_assignment_id: string; readonly identity_id_suffix: string; readonly identity_key_digest: string } {
   return {
     identity_assignment_id: digest({ record_id: recordId, identity_key: identityKey }),
+    identity_id_suffix: digest({ identity_key: identityKey }).slice("sha256:".length),
+    identity_key_digest: digest(identityKey),
+  };
+}
+
+function unpackCreatedIdentityAssignment(value: PackedCreatedIdentityAssignment): CandidateIdentityAssignmentTemplate {
+  const [, workspaceId, identityType, identityKey, recordId, ownerArtifactId, ownerArtifactVersionId] = value;
+  // Recompute fallback covers a tuple this exact process never built (a
+  // resumed/recovered candidate rehydrated tuples from storage as new array
+  // objects) -- the memo lookup is by array identity, so it simply misses
+  // there and this recomputes exactly as before the memo existed.
+  const memoized = memoizedPackedIdentityTriple(value) ?? packedIdentityTriple(recordId, identityKey);
+  return {
+    identity_assignment_id: memoized.identity_assignment_id,
     workspace_id: workspaceId,
     identity_type: identityType,
-    identity_id: `${identityType}:${digest({ identity_key: identityKey }).slice("sha256:".length)}`,
+    identity_id: `${identityType}:${memoized.identity_id_suffix}`,
     assignment_kind: "created",
     identity_key: identityKey,
-    identity_key_digest: digest(identityKey),
+    identity_key_digest: memoized.identity_key_digest,
     record_id: recordId,
     owner_artifact_id: ownerArtifactId,
     owner_artifact_version_id: ownerArtifactVersionId,
@@ -359,7 +381,7 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
       opens.push(openTemplate);
       recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
       if (packIdentities) {
-        identities.push([
+        const packedIdentity = [
           PACKED_CREATED_IDENTITY_MARKER,
           workspaceId,
           identityType,
@@ -367,7 +389,9 @@ function recordTemplates(input: CandidateMaterializationInput, owners: ReadonlyM
           recordId,
           owner.owner_artifact_id,
           owner.owner_artifact_version_id,
-        ] as unknown as CandidateIdentityAssignmentTemplate);
+        ] as unknown as CandidateIdentityAssignmentTemplate;
+        rememberPackedIdentityTriple(packedIdentity as unknown as readonly unknown[], packedIdentityTriple(recordId, record.identity_key));
+        identities.push(packedIdentity);
       } else {
         identities.push({
           identity_assignment_id: digest({ record_id: recordId, identity_key: record.identity_key }),
@@ -842,9 +866,21 @@ export class CandidateMaterializationError extends Error {
  * itself (decision: descriptor-as-text, see module comment above).
  * `content_digest` is computed incrementally via `digestCanonicalArray`, so
  * no aggregate encoding of `entries` is ever materialized.
+ *
+ * Packed-ness is checked against `entries[0]` alone, not a full
+ * `entries.some(...)` scan: every producer of a template-set array (the two
+ * `recordTemplates` branches and `CandidateRecordTemplateAccumulator.finish()`
+ * above) decides packed-vs-plain ONCE, from a single length/threshold check,
+ * and applies that one decision uniformly to every entry it pushes -- an
+ * array here is never a mix of packed and plain entries. Only
+ * `identity_assignment_template_set` can ever be packed at all (record opens,
+ * closures, source transitions, and dependency/lookup sets are never packed
+ * by any producer); checking `.some()` over all of them, including a from-
+ * scratch scan's 1,000,000-entry `record_open_template_set`, paid for a full
+ * array scan whose answer was always `false`.
  */
 function orderedSetDescriptor(elementType: string, entries: readonly unknown[]): OrderedSetDescriptor {
-  const contentDigest = entries.some(isPackedCandidateTemplate)
+  const contentDigest = entries.length > 0 && isPackedCandidateTemplate(entries[0])
     ? digestTemplateArray(entries)
     : digestCanonicalArray(entries);
   return {
@@ -983,15 +1019,19 @@ export class CandidateRecordTemplateAccumulator {
     const opens = sortOwned(this.opens, (entry) => String((entry as unknown as Record<string, unknown>)["record_id_hint"] ?? entry.record_without_validity));
     const packIdentities = this.identityRaw.length >= PACKED_IDENTITY_THRESHOLD;
     const identities: CandidateIdentityAssignmentTemplate[] = packIdentities
-      ? sortOwned([...this.identityRaw], (entry) => entry.proposalRecordKey).map((raw) => ([
-          PACKED_CREATED_IDENTITY_MARKER,
-          this.workspaceId,
-          raw.identityType,
-          raw.identityKey,
-          raw.recordId,
-          raw.ownerArtifactId,
-          raw.ownerArtifactVersionId,
-        ] as unknown as CandidateIdentityAssignmentTemplate))
+      ? sortOwned([...this.identityRaw], (entry) => entry.proposalRecordKey).map((raw) => {
+          const packed = [
+            PACKED_CREATED_IDENTITY_MARKER,
+            this.workspaceId,
+            raw.identityType,
+            raw.identityKey,
+            raw.recordId,
+            raw.ownerArtifactId,
+            raw.ownerArtifactVersionId,
+          ] as unknown as CandidateIdentityAssignmentTemplate;
+          rememberPackedIdentityTriple(packed as unknown as readonly unknown[], packedIdentityTriple(raw.recordId, raw.identityKey));
+          return packed;
+        })
       : sortOwned(this.identityRaw.map((raw) => ({
           identity_assignment_id: digest({ record_id: raw.recordId, identity_key: raw.identityKey }),
           workspace_id: this.workspaceId,

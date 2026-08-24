@@ -5,7 +5,7 @@ import type {
   WorkspaceConfigurationRevision,
   WorkspaceFreshnessCheckpoint,
 } from "@urdira/contracts";
-import type { DurableStorage, ForkPublicationPlanInput, WorkspaceDatabase } from "@urdira/storage";
+import type { DurableStorage, ForkPublicationPlanInput, SqliteDatabase, WorkspaceDatabase } from "@urdira/storage";
 import { buildForkPublicationPlan, publicationTransactionCommands, computeForkSnapshotDigestFields, normalizeObservationBatchIds, snapshotDigest } from "@urdira/storage";
 import type { GitIgnoreRules, InclusionRules } from "@urdira/security";
 import { ISOMORPHIC_GIT_OBJECT_PORT, peeledHeadFor, type GitObjectPort } from "./git-providers.js";
@@ -28,8 +28,8 @@ import type { WorkspaceScanPluginProvider } from "./workspace-indexing-session.j
  * result.
  */
 
-const DEFAULT_FORK_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false };
-const DEFAULT_FORK_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
+export const DEFAULT_FORK_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false };
+export const DEFAULT_FORK_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
 const DEFAULT_FORK_SCAN_MAX_DURATION_MS = 600_000;
 const DEFAULT_FORK_SCAN_MAX_RESPONSE_BYTES = 64_000_000;
 
@@ -89,11 +89,29 @@ export type WorkspaceForkOutcome =
   | { readonly status: "forked"; readonly donor_workspace_id: string; readonly snapshot_id: string; readonly generation: number; readonly projection_patch_count: number }
   | { readonly status: "skipped"; readonly reason: string };
 
-function digest(value: unknown): string {
+/**
+ * Minimal shape `bulkCopyRecordsAndIdentities`/`bulkCopyDependencies`/
+ * `bulkCopyProjections` actually need from a "donor" -- a `workspaceId` and a
+ * `SqliteDatabase` handle they can `ATTACH` (records/identities) or `SELECT`
+ * from directly (dependencies/projections). A real `WorkspaceDatabase`
+ * (`attemptWorkspaceFork`'s donor) satisfies this structurally with no
+ * change. `docs/decisions/23-index-pack.md`'s `attemptIndexPackImport`
+ * satisfies it with a throwaway, FK-free scratch SQLite file built from a
+ * distributable pack's rows instead -- the whole reason these three
+ * functions' donor parameter is this narrow interface rather than the full
+ * `WorkspaceDatabase` class: a pack import has no locally-registered donor
+ * workspace to open.
+ */
+export interface ForkDonorHandle {
+  readonly workspaceId: string;
+  readonly database: Pick<SqliteDatabase, "filename" | "all" | "get" | "run">;
+}
+
+export function digest(value: unknown): string {
   return digestBytes(canonicalBytes(value));
 }
 
-function stableId(kind: string, value: unknown): string {
+export function stableId(kind: string, value: unknown): string {
   return `${kind}:${digest(value).slice("sha256:".length)}`;
 }
 
@@ -120,7 +138,7 @@ export async function attemptWorkspaceFork(options: WorkspaceForkOptions): Promi
   }
 }
 
-interface ForkContext {
+export interface ForkContext {
   readonly now: () => string;
   readonly gitObjects: GitObjectPort;
   readonly bindingId: string;
@@ -252,7 +270,7 @@ async function attemptWorkspaceForkInner(options: WorkspaceForkOptions): Promise
 class ForkCopyError extends Error {}
 function fail(reason: string): never { throw new ForkCopyError(reason); }
 
-interface ForkPublicationIds {
+export interface ForkPublicationIds {
   readonly candidateId: string;
   readonly materializationId: string;
   readonly snapshotId: string;
@@ -398,7 +416,7 @@ async function commitSourceLayerAndPublish(options: WorkspaceForkOptions, contex
  * catalog, CAS content the fork's own writes reference) must still report
  * zero failures, or the fork rolls back and falls back to a full scan.
  */
-function isKnownPreexistingVerifyGap(failure: { readonly component_kind: string; readonly component_id: string; readonly error_code: string }): boolean {
+export function isKnownPreexistingVerifyGap(failure: { readonly component_kind: string; readonly component_id: string; readonly error_code: string }): boolean {
   if (failure.component_kind === "registry" && (failure.error_code === "storage:registry_corrupt" || failure.error_code === "storage:registry_digest_corrupt")) return true;
   if (failure.component_kind === "dependency" && failure.error_code === "storage:dependency_corrupt") return true;
   if (failure.component_kind === "control_plane" && failure.component_id.startsWith("capability_state:") && failure.error_code === "storage:control_plane_corrupt") return true;
@@ -409,13 +427,13 @@ function isKnownPreexistingVerifyGap(failure: { readonly component_kind: string;
   return false;
 }
 
-function multisetKey(entries: readonly (readonly [string, string])[]): string {
+export function multisetKey(entries: readonly (readonly [string, string])[]): string {
   return JSON.stringify([...entries].sort(([leftUri], [rightUri]) => (leftUri < rightUri ? -1 : leftUri > rightUri ? 1 : 0)));
 }
 
 interface ResolvedPluginLike { readonly plugin_id: unknown; readonly plugin_version: unknown }
 
-function sortedResolvedPluginsDigest(resolvedPlugins: readonly unknown[]): string {
+export function sortedResolvedPluginsDigest(resolvedPlugins: readonly unknown[]): string {
   const sorted = [...resolvedPlugins].map((entry) => entry as ResolvedPluginLike).sort((left, right) => {
     const leftKey = `${String(left.plugin_id)}@${String(left.plugin_version)}`;
     const rightKey = `${String(right.plugin_id)}@${String(right.plugin_version)}`;
@@ -453,7 +471,7 @@ async function donorPluginResolutionMatches(donorDatabase: WorkspaceDatabase, pl
   return sortedResolvedPluginsDigest(donorLock.resolved_plugins ?? []) === sortedResolvedPluginsDigest(targetResolvedPlugins);
 }
 
-interface DonorVisibleArtifact extends Record<string, unknown> {
+export interface DonorVisibleArtifact extends Record<string, unknown> {
   readonly artifact_id: string;
   readonly artifact_version_id: string;
   readonly normalized_uri: string;
@@ -483,21 +501,21 @@ async function donorVisibleArtifacts(donorDatabase: WorkspaceDatabase): Promise<
   );
 }
 
-interface ForkSourceOccurrence {
+export interface ForkSourceOccurrence {
   readonly normalized_uri: string;
   readonly artifact_id: string;
   readonly artifact_version_id: string;
   readonly content_hash: string;
 }
 
-interface ForkSourceLayer {
+export interface ForkSourceLayer {
   readonly occurrences: readonly ForkSourceOccurrence[];
   readonly observation_batch_id: string;
   readonly source_state_digest: string;
   readonly source_snapshot_id: string;
 }
 
-interface ForkEnumeration {
+export interface ForkEnumeration {
   readonly provider: DirectorySourceProvider;
   readonly enumerateResponse: Awaited<ReturnType<DirectorySourceProvider["enumerate"]>>;
   readonly encodedBatch: EncodedObservationBatch;
@@ -529,7 +547,7 @@ function forkProviderRequest(options: { readonly call: "enumerate" | "read"; rea
  * enough for both the git-fast-path cross-check and the content-hash
  * fallback predicate without any further file reads.
  */
-async function enumerateForkRoot(options: WorkspaceForkOptions, context: ForkContext): Promise<ForkEnumeration | undefined> {
+export async function enumerateForkRoot(options: WorkspaceForkOptions, context: ForkContext): Promise<ForkEnumeration | undefined> {
   const workspaceId = options.workspace.workspace_id;
   const provider = new DirectorySourceProvider({
     root: options.workspace.canonical_root,
@@ -562,7 +580,7 @@ async function enumerateForkRoot(options: WorkspaceForkOptions, context: ForkCon
  * see docs/decisions/12-workspace-fork.md's "Shipped variant" section for
  * why, and the follow-up this leaves open.
  */
-async function commitForkSourceLayer(options: WorkspaceForkOptions, context: ForkContext, enumeration: ForkEnumeration): Promise<ForkSourceLayer | undefined> {
+export async function commitForkSourceLayer(options: WorkspaceForkOptions, context: ForkContext, enumeration: ForkEnumeration): Promise<ForkSourceLayer | undefined> {
   const workspaceId = options.workspace.workspace_id;
   const database = options.database;
   const { provider, enumerateResponse, encodedBatch } = enumeration;
@@ -597,11 +615,11 @@ async function commitForkSourceLayer(options: WorkspaceForkOptions, context: For
   };
 }
 
-interface DonorRowMap {
+export interface DonorRowMap {
   readonly byArtifactVersionId: ReadonlyMap<string, { readonly artifact_id: string; readonly artifact_version_id: string }>;
 }
 
-function buildFullArtifactMap(donorArtifacts: readonly DonorVisibleArtifact[], sourceLayer: ForkSourceLayer): DonorRowMap {
+export function buildFullArtifactMap(donorArtifacts: readonly DonorVisibleArtifact[], sourceLayer: ForkSourceLayer): DonorRowMap {
   const byUri = new Map(sourceLayer.occurrences.map((occurrence) => [occurrence.normalized_uri, occurrence] as const));
   const byArtifactVersionId = new Map<string, { artifact_id: string; artifact_version_id: string }>();
   for (const donorArtifact of donorArtifacts) {
@@ -640,7 +658,7 @@ const ROW_BATCH_INSERT_ROWS = 2000;
  * `StorageMaintenance.verify()` -- only the plain typed columns
  * (`identity_type`/`identity_id`/`identity_key`) are ever read back.
  */
-async function bulkCopyRecordsAndIdentities(target: WorkspaceDatabase, donorDatabase: WorkspaceDatabase, donorGeneration: number, workspaceId: string, map: DonorRowMap): Promise<void> {
+export async function bulkCopyRecordsAndIdentities(target: WorkspaceDatabase, donorDatabase: ForkDonorHandle, donorGeneration: number, workspaceId: string, map: DonorRowMap): Promise<void> {
   const donorPath = donorDatabase.database.filename;
   const mapEntries = [...map.byArtifactVersionId.entries()];
 
@@ -732,7 +750,7 @@ interface DonorDependencyRow extends Record<string, unknown> {
  * `artifactDependencyCommands` (`publication-authority.ts`) uses for an
  * ordinary scan's candidate publish.
  */
-async function bulkCopyDependencies(target: WorkspaceDatabase, donorDatabase: WorkspaceDatabase, donorGeneration: number, workspaceId: string, map: DonorRowMap): Promise<void> {
+export async function bulkCopyDependencies(target: WorkspaceDatabase, donorDatabase: ForkDonorHandle, donorGeneration: number, workspaceId: string, map: DonorRowMap): Promise<void> {
   const donorVisible = "valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)";
   const donorRows = await donorDatabase.database.all<DonorDependencyRow>(
     `SELECT record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version FROM artifact_dependencies WHERE workspace_id = ? AND ${donorVisible}`,
@@ -786,7 +804,7 @@ interface DonorProjectionRow extends Record<string, unknown> {
  * "no production writer" note), so this path is exercised by this module's
  * own tests but not yet by real workloads.
  */
-async function bulkCopyProjections(target: WorkspaceDatabase, donorDatabase: WorkspaceDatabase, donorGeneration: number, workspaceId: string, map: DonorRowMap): Promise<number> {
+export async function bulkCopyProjections(target: WorkspaceDatabase, donorDatabase: ForkDonorHandle, donorGeneration: number, workspaceId: string, map: DonorRowMap): Promise<number> {
   const donorVisible = "valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)";
   const donorRows = await donorDatabase.database.all<DonorProjectionRow>(
     `SELECT projection_record_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, content_digest FROM projection_occurrences WHERE workspace_id = ? AND ${donorVisible}`,
@@ -852,7 +870,7 @@ function parseJsonArray(value: unknown): readonly unknown[] {
   try { const parsed = JSON.parse(value) as unknown; return Array.isArray(parsed) ? parsed : []; } catch { return []; }
 }
 
-async function visibleCapabilityStateEntries(database: WorkspaceDatabase, candidateId: string): Promise<readonly unknown[]> {
+export async function visibleCapabilityStateEntries(database: WorkspaceDatabase, candidateId: string): Promise<readonly unknown[]> {
   const rows = await database.database.all<{ state_json: string }>(
     "SELECT state_json FROM control_plane_state WHERE workspace_id = ? AND state_kind = 'capability_state' AND state_key LIKE ? ORDER BY state_key",
     [database.workspaceId, `capability_state:${candidateId}:%`],
@@ -1086,7 +1104,7 @@ async function copyDonorAndPublish(options: WorkspaceForkOptions, context: ForkC
  * rollback but no worse than skipping this cleanup step entirely, and must
  * never prevent the fallback full scan from being attempted.
  */
-async function rollbackForkPublication(target: WorkspaceDatabase, workspaceId: string, ids: ForkPublicationIds): Promise<void> {
+export async function rollbackForkPublication(target: WorkspaceDatabase, workspaceId: string, ids: ForkPublicationIds): Promise<void> {
   const { candidateId, materializationId, snapshotId, generationManifestId, generation } = ids;
   try {
     await target.database.transaction([

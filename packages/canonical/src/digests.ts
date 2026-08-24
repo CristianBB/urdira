@@ -3,7 +3,7 @@ import { coreSchemaDefinitions, validateSchemaValue, type CanonicalSchemaDefinit
 import { digestDomainRegistry, digestPayloadSchemaDefinitions, digestRecipeDefinitions, digestRecipeVariantDefinitions, documentedDigestRecipeCoordinates } from "./registries.js";
 import { isWholeVerifiedInput, payloadBindingFor, payloadSchemaIdFor } from "./digest-payload-schemas.js";
 import { compareCanonicalValues, readCanonicalPointer } from "./comparators.js";
-import { canonicalBytes, compareBytes, decodeCanonical, encodeArrayHeader, encodeCanonical, encodeMapHeader, type CanonicalEncodingLimits } from "./logical-encoding.js";
+import { canonicalBytes, compareBytes, decodeCanonical, encodeArrayHeader, encodeCanonical, encodeCanonicalInto, encodeMapHeader, type CanonicalEncodingLimits, type CanonicalTextBytesLookup } from "./logical-encoding.js";
 import { fail } from "./errors.js";
 
 export type DigestText = `sha256:${string}`;
@@ -24,6 +24,39 @@ function rememberFrozenCanonicalArrayDigest(elements: readonly unknown[], mappin
  */
 export function memoizedCanonicalArrayDigest(elements: readonly unknown[], mappingId = "canonical"): DigestText | undefined {
   return frozenCanonicalArrayDigests.get(elements)?.get(mappingId);
+}
+
+/**
+ * The three per-record digests a "packed created identity" tuple's own
+ * unpacker recomputes on every use: `identity_assignment_id`, the hex suffix
+ * of `identity_id` (everything after `${identity_type}:`), and
+ * `identity_key_digest`. `@urdira/engine`'s `candidate-materialization.ts` and
+ * `@urdira/storage`'s `publication-authority.ts` each carry their own
+ * independent copy of the unpack function (storage cannot depend on engine),
+ * so this memo -- following the exact same frozen-identity pattern as
+ * `frozenCanonicalArrayDigests` above -- is the one place both can share a
+ * single computation. Keyed by the packed tuple's own array identity: set
+ * once by the producer (engine, the moment it builds the tuple) and read by
+ * both engine's own seal-time unpack and storage's independent publish-time
+ * unpack over that identical (out-of-band, uncloned) array. A resumed
+ * candidate whose tuples were rehydrated from storage is a genuinely
+ * different array identity, so it naturally misses this memo and falls back
+ * to recomputing -- never wrong, only uncached.
+ */
+export interface PackedIdentityTripleDigests {
+  readonly identity_assignment_id: string;
+  readonly identity_id_suffix: string;
+  readonly identity_key_digest: string;
+}
+
+const packedIdentityTripleDigests = new WeakMap<readonly unknown[], PackedIdentityTripleDigests>();
+
+export function rememberPackedIdentityTriple(tuple: readonly unknown[], triple: PackedIdentityTripleDigests): void {
+  packedIdentityTripleDigests.set(tuple, triple);
+}
+
+export function memoizedPackedIdentityTriple(tuple: readonly unknown[]): PackedIdentityTripleDigests | undefined {
+  return packedIdentityTripleDigests.get(tuple);
 }
 
 export interface DigestRecipe {
@@ -77,10 +110,17 @@ export function digestBytes(bytes: Uint8Array): DigestText {
  * does, so pass a `limits.max_elements` large enough for the element count if
  * the default (1,000,000) is insufficient.
  */
-export function digestCanonicalArray(elements: readonly unknown[], limits: CanonicalEncodingLimits = {}): DigestText {
+export function digestCanonicalArray(elements: readonly unknown[], limits: CanonicalEncodingLimits = {}, textBytesLookup?: CanonicalTextBytesLookup): DigestText {
   const hash = createHash("sha256");
   hash.update(encodeArrayHeader(elements.length));
-  for (const element of elements) hash.update(canonicalBytes(element, limits));
+  // Streams each element's canonical bytes straight into the hash (see
+  // `encodeCanonicalInto`) instead of `canonicalBytes(element)` allocating
+  // and memcpy-ing one buffer per element only to hand it to `hash.update`
+  // and discard it -- the element's encoded bytes are never materialized as
+  // a whole. Byte-identical to the old `hash.update(canonicalBytes(element,
+  // limits))` loop: same `writeValue`/`writeText`/etc. emission, just not
+  // buffered first.
+  for (const element of elements) encodeCanonicalInto(element, (chunk) => hash.update(chunk), limits, textBytesLookup);
   const digest = `sha256:${hash.digest("hex")}` as DigestText;
   rememberFrozenCanonicalArrayDigest(elements, "canonical", digest);
   return digest;
@@ -92,10 +132,10 @@ export function digestCanonicalArray(elements: readonly unknown[], limits: Canon
  * identifier prevents a digest computed with one projection from being
  * reused by another.
  */
-export function digestMappedCanonicalArray<T>(elements: readonly T[], mappingId: string, map: (element: T) => unknown, limits: CanonicalEncodingLimits = {}): DigestText {
+export function digestMappedCanonicalArray<T>(elements: readonly T[], mappingId: string, map: (element: T) => unknown, limits: CanonicalEncodingLimits = {}, textBytesLookup?: CanonicalTextBytesLookup): DigestText {
   const hash = createHash("sha256");
   hash.update(encodeArrayHeader(elements.length));
-  for (const element of elements) hash.update(canonicalBytes(map(element), limits));
+  for (const element of elements) encodeCanonicalInto(map(element), (chunk) => hash.update(chunk), limits, textBytesLookup);
   const digest = `sha256:${hash.digest("hex")}` as DigestText;
   rememberFrozenCanonicalArrayDigest(elements, mappingId, digest);
   return digest;

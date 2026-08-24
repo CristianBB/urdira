@@ -83,6 +83,20 @@ export interface WorkspaceScanPluginProvider {
   readonly resolution_lock: SdkPluginResolutionLock;
   readonly configuration: WorkspaceConfigurationRevision;
   readonly dependency_roles: readonly string[];
+  /**
+   * P3-3b: optional observer a provider supplies to receive a file's
+   * complete decoded text as soon as source cataloging (`runFullWorkspaceScan`,
+   * below) has it in memory anyway -- see `DirectorySourceProviderOptions.on_prefetched_text`
+   * (`directory-provider.ts`) for the exact guarantee (only unchanged,
+   * NUL-free, valid-UTF-8 files that the P3-3a byte hand-off actually
+   * admitted). `@urdira/engine` never reads this field itself -- it is
+   * passed straight through to the provider constructor -- which is why it
+   * lives on `WorkspaceScanPluginProvider` rather than a new top-level scan
+   * option: only the SAME composing application that builds `analyze`
+   * (`apps/urdira`) can also make sense of the text (e.g. a language-specific
+   * import-graph pre-seed), and engine stays plugin-agnostic either way.
+   */
+  readonly on_source_text?: (uri: string, text: string) => void;
   analyze(input: {
     readonly workspace_id: string;
     readonly candidate: IndexCandidate;
@@ -543,6 +557,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
     ...(input.inclusion_rules === undefined ? {} : { inclusion_rules: input.inclusion_rules }),
     ...(input.gitignore_rules === undefined ? {} : { gitignore_rules: input.gitignore_rules }),
     ...(input.io_concurrency === undefined ? {} : { io_concurrency: input.io_concurrency }),
+    ...(input.plugin.on_source_text === undefined ? {} : { on_prefetched_text: input.plugin.on_source_text }),
     now,
   });
   const currentState = await timed("prior_state_current", () => database.repositories.snapshots.getCurrent());
@@ -1033,30 +1048,46 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         const acceptedDeltasByFactDeltaId = templateAccumulator === undefined ? undefined : new Map(analysis.accepted_deltas.map((delta) => [delta.delta.fact_delta_id, delta] as const));
         const accumulatorFed = templateAccumulator === undefined ? undefined : new Set<string>();
         for (const native of analysis.native_batches ?? []) {
-          // `accept_native_stage`: the SQLite worker-thread round trip that
-          // durably accepts one native FactDelta batch
-          // (`WorkspaceCandidateRepository.acceptNativeFactDeltaBatch`,
-          // `packages/storage/src/candidates.ts`) -- measured here, at the
-          // call site, rather than inside `candidates.ts` itself, because
-          // storage's own `URDIRA_STORAGE_DEBUG_TIMING` bucket map is reset
-          // the moment `publishCandidate`'s queued builder actually starts
-          // running (`storage.ts`'s `resetTimings()` immediately before
-          // `publishCandidateSerialized`), which is AFTER this loop already
-          // ran -- a storage-side span here would be silently wiped before
-          // ever being logged. Engine's own `debug-timing.ts` bucket map is
-          // instead reset once, right before `staged.publish()`
-          // (`resetEngineTimings()`, below in this file), so a span recorded
-          // here survives into the same `[urdira] engine timings publish
-          // ...` snapshot as `publish_handoff_pre`.
+          // `accept_native_stage_engine_loop` (P3-3c: renamed from
+          // `accept_native_stage` -- see that item for the investigation).
+          // This loop, and this bucket, is DEAD on the real `apps/urdira`
+          // path: `buildJavascriptTypescriptPluginProvider`'s `analyze()`
+          // always receives a defined `acceptNativeBatches` callback, so
+          // every native batch it produces is diverted into its own
+          // `pendingNativeBatches`/`flushNativeBatches` and accepted (via
+          // `database.candidates.acceptNativeFactDeltaBatches`, plural)
+          // BEFORE `analyze()` even returns -- `analysis.native_batches` sent
+          // back to the engine is then always empty, so this loop iterates
+          // zero times on every real scan; its `execute_non_analyze` share
+          // is therefore, in practice, always ~0 too. It stays here (rather
+          // than being deleted) because a plugin provider that does NOT
+          // supply an `acceptNativeBatches` callback (or a test double) is
+          // still a legal `WorkspaceScanPluginProvider` and DOES reach this
+          // loop -- see `accept_native_stage` (below, in `analyze()`'s own
+          // implementation, `apps/urdira/src/index.ts`) for the sub-buckets
+          // that actually cover the real path's native-batch acceptance and
+          // `acceptance.accept()` service cost.
           const nativeAcceptStartedAt = engineTimingEnabled() ? performance.now() : 0;
           await database.candidates.acceptNativeFactDeltaBatch(executingCandidate.candidate_generation_id, native.fact_delta_id, native.batch);
-          if (engineTimingEnabled()) recordEngineTiming("accept_native_stage", performance.now() - nativeAcceptStartedAt);
+          if (engineTimingEnabled()) recordEngineTiming("accept_native_stage_engine_loop", performance.now() - nativeAcceptStartedAt);
           if (templateAccumulator !== undefined) {
             const delta = acceptedDeltasByFactDeltaId!.get(native.fact_delta_id);
             if (delta !== undefined) { templateAccumulator.accept(delta); accumulatorFed!.add(native.fact_delta_id); }
           }
         }
-        if (templateAccumulator !== undefined) for (const delta of analysis.accepted_deltas) if (!accumulatorFed!.has(delta.delta.fact_delta_id)) templateAccumulator.accept(delta);
+        // `template_accumulator_accept` (P3-3c): on the real path (see
+        // above), `accumulatorFed` is always empty, so this is where
+        // effectively ALL of `execute_non_analyze`'s wall time goes --
+        // `CandidateRecordTemplateAccumulator.accept`'s `recordDigest` calls,
+        // run serially on the main thread for every accepted delta. Timed
+        // synchronously (`timedSync`, no await inside the loop) so this span
+        // cannot overlap or double-count with any other bucket here.
+        if (templateAccumulator !== undefined) {
+          const acceptedDeltas = analysis.accepted_deltas;
+          timedSyncEngine("template_accumulator_accept", () => {
+            for (const delta of acceptedDeltas) if (!accumulatorFed!.has(delta.delta.fact_delta_id)) templateAccumulator.accept(delta);
+          });
+        }
         stageTimings["analyzed_artifact_count"] = incrementalArtifacts.length;
         stageTimings["accepted_delta_count"] = analysis.accepted_deltas.length;
         // `seal` (below) only reads `knownArtifactVersions`, precomputed

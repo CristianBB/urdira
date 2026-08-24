@@ -8,10 +8,16 @@ export {
   PROJECT_CONFIGURATION_FILES,
   JAVASCRIPT_TYPESCRIPT_CAPABILITIES,
   JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES,
+  LARGE_SYNTAX_CORPUS_FILE_THRESHOLD,
+  LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD,
+  JS_TS_IMPORT_SPECIFIER_PATTERN,
   languageForPath,
   scriptKindForPath,
   discoverProjects,
   analyzeSyntaxProject,
+  analyzeSyntaxDependencyGraph,
+  extractImportSpecifiers,
+  resolveSyntaxDependencyGraph,
   isLargeSyntaxCorpus,
   analyzeProject,
   JsTsAnalysisSession,
@@ -20,6 +26,7 @@ export {
   type JsTsAnalysisBuildKind,
   type JsTsAnalysisResult,
   type JsTsDependencyClosure,
+  type JsTsDirectDependency,
   type JsTsDiagnostic,
   type JsTsEntity,
   type JsTsLanguage,
@@ -27,7 +34,13 @@ export {
   type JsTsScriptKind,
   type JsTsSessionAnalyzeResult,
 } from "./analyzer.js";
-export { createJavascriptTypescriptWorker, type JavascriptTypescriptWorkerDescriptor } from "./worker.js";
+export {
+  createJavascriptTypescriptWorker,
+  largeSyntaxManifestKey,
+  syntaxDependencyGraphCachePath,
+  writeSyntaxDependencyGraphCache,
+  type JavascriptTypescriptWorkerDescriptor,
+} from "./worker.js";
 export { createJavascriptTypescriptThreadTransport, type JavascriptTypescriptThreadDescriptor } from "./thread-transport.js";
 export { buildJavascriptTypescriptFactDelta, type JavascriptTypescriptFactDeltaInput } from "./fact-delta.js";
 export { iterateNativeFactDeltaBatches, assertNativeFactDeltaBatchBudget } from "./native-batches.js";

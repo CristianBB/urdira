@@ -2,7 +2,7 @@ import { chmod, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename } from "node:path";
-import { attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
+import { attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, exportIndexPack, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
 import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-thread.js";
@@ -158,6 +158,20 @@ export interface DaemonRuntimeOptions {
    * composing application from `URDIRA_FORK_VERIFY`.
    */
   readonly workspace_fork_verify?: "fast" | "full";
+  /**
+   * Index pack import (docs/decisions/23-index-pack.md): the cross-machine
+   * sibling of `workspace_fork` above. On a genuine first-ever scan, if
+   * `core:workspace_add` registered a pending pack path for this workspace
+   * (its `values["index-pack"]`/`--index-pack <path>`) and a local fork was
+   * not attempted or did not match, `attemptIndexPackImport` tries to import
+   * that pack before falling back to a full scan. A kill switch (`false`
+   * only when explicitly disabled via `URDIRA_INDEX_PACK=0`); defaults to ON.
+   * Even when ON, nothing happens unless a pack path was actually registered
+   * for that workspace -- the path argument itself is the real opt-in.
+   */
+  readonly index_pack?: boolean;
+  /** Mirrors `workspace_fork_verify` for `attemptIndexPackImport`'s own `verify_mode`; injected from `URDIRA_INDEX_PACK_VERIFY`. */
+  readonly index_pack_verify?: "fast" | "full";
   /**
    * Whether a successful workspace scan (and a successful workspace fork,
    * and daemon startup for every already-`ready`/`degraded` workspace) also
@@ -1615,6 +1629,13 @@ export class DaemonRuntime {
       // fires for every ordinary watch batch (not only the unsafe ones), a
       // dropped request could mean a real edit is never rescanned at all, so
       // it is coalesced into exactly one guaranteed follow-up scan instead.
+      // Index pack import (docs/decisions/23-index-pack.md): a workspace_id
+      // -> pack path side channel, set by `core:workspace_add` when its
+      // request carried `values["index-pack"]`, consumed exactly once by
+      // `scheduleWorkspaceScan`'s first-ever-scan branch below (deleted on
+      // that first read regardless of outcome, so a later `core:reindex`
+      // never re-attempts an import against an already-populated workspace).
+      const pendingIndexPackPaths = new Map<string, string>();
       const activeAuthoritativeDeletePhases = new Map<string, Set<string>>();
       const pendingScans = new Map<string, {
         full: boolean;
@@ -1742,6 +1763,36 @@ export class DaemonRuntime {
                       console.error(`[urdira] workspace fork skipped for ${workspaceId}, falling back to a full scan: ${forkOutcome.reason}`);
                     } catch (error) {
                       console.error(`[urdira] workspace fork attempt for ${workspaceId} threw, falling back to a full scan:`, error);
+                    }
+                  }
+                  // Index pack import (docs/decisions/23-index-pack.md): the
+                  // cross-machine sibling of the local fork attempt above,
+                  // tried second (a local donor, when one exists, is always
+                  // cheaper and needs no untrusted-content recompute pass).
+                  // Only fires when `core:workspace_add` registered a pack
+                  // path for THIS workspace id (`pendingIndexPackPaths`,
+                  // above) -- the registered path is the real opt-in;
+                  // `options.index_pack !== false` is only a kill switch.
+                  // `attemptIndexPackImport` never throws either, same
+                  // contract as `attemptWorkspaceFork`.
+                  if (priorSnapshotId === undefined) {
+                    const pendingPackPath = pendingIndexPackPaths.get(workspaceId);
+                    if (pendingPackPath !== undefined) {
+                      pendingIndexPackPaths.delete(workspaceId);
+                      if (options.index_pack !== false) {
+                        try {
+                          const importOutcome = await attemptIndexPackImport({ workspace, database, storage: durableStorage, registry, plugin, pack_path: pendingPackPath, ...(options.index_pack_verify === undefined ? {} : { verify_mode: options.index_pack_verify }) });
+                          if (importOutcome.status === "imported") {
+                            registry.markReady(workspaceId, importOutcome.snapshot_id, "ready");
+                            submitLexicalMaintenance(workspaceId);
+                            submitSemanticMaintenance(workspaceId);
+                            return undefined;
+                          }
+                          console.error(`[urdira] index pack import skipped for ${workspaceId}, falling back to a full scan: ${importOutcome.reason}`);
+                        } catch (error) {
+                          console.error(`[urdira] index pack import attempt for ${workspaceId} threw, falling back to a full scan:`, error);
+                        }
+                      }
                     }
                   }
                   const result = await runProgressiveWorkspaceScan({
@@ -2307,10 +2358,50 @@ export class DaemonRuntime {
             selected_technology_ids: selectedTechnologyIds,
             selected_plugin_ids: selectedPluginIds,
           });
+          // Index pack import (docs/decisions/23-index-pack.md): registered
+          // BEFORE `scheduleWorkspaceScan` below so the scan hook's
+          // first-ever-scan branch can see it regardless of how quickly the
+          // scan job actually starts. `requestPayload["values"]` is the same
+          // CLI `--index-pack <path>` / RPC `values["index-pack"]` field
+          // every other free-form workspace-add option flows through.
+          const indexPackPath = typeof requestRecord(requestPayload["values"])["index-pack"] === "string" ? requestRecord(requestPayload["values"])["index-pack"] as string : undefined;
+          if (indexPackPath !== undefined) pendingIndexPackPaths.set(workspace.workspace_id, indexPackPath);
           const active = confirmed ? options.workspace_registry.beginReconciliation(workspace.workspace_id).workspace : workspace;
           if (confirmed) scheduleWorkspaceScan(active.workspace_id);
           if (watcherManager && confirmed) await startWorkspaceWatcher(watcherManager, active);
           return { workspace_id: active.workspace_id, status: active.status, registered: true, observation_started: confirmed, ...(confirmed ? {} : { confirmation_required: true }), ...(semanticModel === undefined ? {} : { semantic_model: semanticModel }) };
+        }
+        // Index pack export (docs/decisions/23-index-pack.md): read-only on
+        // the workspace's own index (never mutates `workspace_registry` or
+        // any published generation) -- its only side effect is writing a
+        // pack file to local disk. `workspace` accepts either the workspace
+        // id or its canonical root, mirroring every other admin RPC's
+        // `workspaceRootFromRequest`-style lookup; `out` is the destination
+        // path (`--out <path>` on the CLI).
+        if (options.workspace_registry && indexingStorage && request.call === "core:index_pack_export") {
+          const payload = requestRecord(request.payload);
+          const args = Array.isArray(payload["args"]) ? payload["args"] : [];
+          const values = requestRecord(payload["values"]);
+          const workspaceRef = typeof args[0] === "string" ? args[0] : typeof values["workspace"] === "string" ? values["workspace"] : undefined;
+          const outPath = typeof args[1] === "string" ? args[1] : typeof values["out"] === "string" ? values["out"] : undefined;
+          if (workspaceRef === undefined) throw new DaemonError("core:ipc_request_invalid", "index pack export requires a workspace id or root.");
+          if (outPath === undefined) throw new DaemonError("core:ipc_request_invalid", "index pack export requires an output path (--out).");
+          const workspace = options.workspace_registry.get(workspaceRef) ?? options.workspace_registry.findByCanonicalRoot(workspaceRef);
+          if (!workspace) throw new DaemonError("core:workspace_not_found", "Workspace is not registered.");
+          if (workspace.status !== "ready") throw new DaemonError("core:workspace_lifecycle", "Workspace must be ready before it can be exported as an index pack.");
+          const requireGitClean = values["require-git-clean"] === "true";
+          const database = await indexingStorage.openWorkspace(workspace.workspace_id);
+          try {
+            const result = await exportIndexPack({
+              database,
+              workspace_id: workspace.workspace_id,
+              out_path: outPath,
+              ...(requireGitClean ? { require_git_clean: true, canonical_root: workspace.canonical_root } : {}),
+            });
+            return { workspace_id: workspace.workspace_id, out_path: result.out_path, pack_id: result.manifest.pack_id, manifest_digest: result.manifest.manifest_digest, row_counts: result.manifest.row_counts };
+          } finally {
+            await database.close().catch(() => undefined);
+          }
         }
         if (options.workspace_registry && request.call === "core:workspace_remove") {
           const rootOrId = workspaceRootFromRequest(request.payload);

@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { gunzip as gunzipCallback, gzip as gzipCallback } from "node:zlib";
 import { LogicalDigestWriter } from "@urdira/canonical";
 import { canonicalSha256, type PluginWorkerRequestEnvelope, type WorkerTransport } from "@urdira/plugin-sdk";
-import { analyzeBoundedSyntaxProject, analyzeSyntaxDependencyGraph, analyzeSyntaxProject, discoverProjects, isLargeSyntaxCorpus, JAVASCRIPT_TYPESCRIPT_CAPABILITIES, JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, JAVASCRIPT_TYPESCRIPT_VERSION, JsTsAnalysisSession, TYPESCRIPT_COMPILER_VERSION, type AnalyzerFile, type JsTsAnalysisResult } from "./analyzer.js";
+import { analyzeBoundedSyntaxProject, analyzeSyntaxDependencyGraph, analyzeSyntaxProject, discoverProjects, isLargeSyntaxCorpus, JAVASCRIPT_TYPESCRIPT_CAPABILITIES, JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, JAVASCRIPT_TYPESCRIPT_VERSION, JsTsAnalysisSession, LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD, LARGE_SYNTAX_CORPUS_FILE_THRESHOLD, TYPESCRIPT_COMPILER_VERSION, type AnalyzerFile, type JsTsAnalysisResult, type JsTsDirectDependency } from "./analyzer.js";
 import { buildJavascriptTypescriptFactDelta } from "./fact-delta.js";
 import { iterateNativeFactDeltaBatches } from "./native-batches.js";
 
@@ -72,9 +72,9 @@ async function filesFromPayload(payload: unknown, casRoot?: string, options: { r
   return result.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-type SyntaxDependencyGraph = Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>>;
+type SyntaxDependencyGraph = Readonly<Record<string, JsTsDirectDependency>>;
 
-function largeSyntaxManifestKey(payload: unknown, rootNames: readonly string[], descriptor: JavascriptTypescriptWorkerDescriptor): string | undefined {
+export function largeSyntaxManifestKey(payload: unknown, rootNames: readonly string[], descriptor: JavascriptTypescriptWorkerDescriptor): string | undefined {
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
   const entries = (payload as Record<string, unknown>)["files"];
   if (!Array.isArray(entries) || entries.length === 0) return undefined;
@@ -92,7 +92,7 @@ function largeSyntaxManifestKey(payload: unknown, rootNames: readonly string[], 
   }), descriptor, "syntax-graph");
 }
 
-function syntaxDependencyGraphCachePath(dir: string, durableKey: string): string {
+export function syntaxDependencyGraphCachePath(dir: string, durableKey: string): string {
   return join(dir, `${durableKey}.graph.json.gz`);
 }
 
@@ -119,7 +119,7 @@ async function readSyntaxDependencyGraphCache(dir: string, durableKey: string): 
   }
 }
 
-async function writeSyntaxDependencyGraphCache(dir: string, durableKey: string, dependencyGraph: SyntaxDependencyGraph): Promise<void> {
+export async function writeSyntaxDependencyGraphCache(dir: string, durableKey: string, dependencyGraph: SyntaxDependencyGraph): Promise<void> {
   try {
     await mkdir(dir, { recursive: true });
     const compressed = await gzip(Buffer.from(JSON.stringify({ format_version: 1, durable_key: durableKey, dependency_graph: dependencyGraph })), { level: 1 });
@@ -535,7 +535,7 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
           return total + (typeof entry["byte_length"] === "number" ? entry["byte_length"] : 0);
         }, 0);
         const graphKey = largeSyntaxManifestKey(request.payload, preliminaryRootNames, descriptor);
-        if ((sourceCount >= 512 || totalBytes >= 16 * 1024 * 1024) && graphKey !== undefined) {
+        if ((sourceCount >= LARGE_SYNTAX_CORPUS_FILE_THRESHOLD || totalBytes >= LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD) && graphKey !== undefined) {
           const cachedGraph = await readSyntaxDependencyGraphCache(descriptor.analysis_cache_dir, graphKey);
           if (cachedGraph !== undefined) {
             descriptor.on_analysis_cache_load?.();

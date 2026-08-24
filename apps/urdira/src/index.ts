@@ -10,8 +10,10 @@ import {
   candidateTargetRegistryFromSnapshot,
   compactAcceptedFactDelta,
   createCanonicalPluginDigestAuthority,
+  engineTimingEnabled,
   FactDeltaAcceptanceService,
   readPersistedControlState,
+  recordEngineTiming,
   type MaterializationAcceptedFactDelta,
   type WorkspaceScanPluginProvider,
   type WorkspaceScanSourceArtifact,
@@ -24,14 +26,20 @@ import {
   createJavascriptTypescriptInstalledBundle,
   createJavascriptTypescriptThreadTransport,
   createJavascriptTypescriptWorker,
+  extractImportSpecifiers,
   iterateNativeFactDeltaBatches,
+  largeSyntaxManifestKey,
   languageForPath,
+  resolveSyntaxDependencyGraph,
+  writeSyntaxDependencyGraphCache,
   JAVASCRIPT_TYPESCRIPT_CAPABILITIES,
   JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES,
   JAVASCRIPT_TYPESCRIPT_DEPENDENCY_ROLES,
   JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
   JAVASCRIPT_TYPESCRIPT_RECORD_KINDS,
   JAVASCRIPT_TYPESCRIPT_VERSION,
+  LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD,
+  LARGE_SYNTAX_CORPUS_FILE_THRESHOLD,
   TYPESCRIPT_COMPILER_VERSION,
   type JavascriptTypescriptPackageAsset,
   type JavascriptTypescriptWorkerDescriptor,
@@ -342,6 +350,28 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
   };
   const workerDescriptorDigest = canonicalSha256(workerDescriptor);
 
+  // P3-3b: per-file raw import specifiers, collected via `on_source_text`
+  // (below) as source cataloging hands off each file's full text -- NOT the
+  // text itself, which is dropped immediately after extraction (see
+  // `extractImportSpecifiers`'s doc comment, `analyzer.ts`). Freshly empty
+  // for every scan: `buildJavascriptTypescriptPluginProvider` itself runs
+  // once per `resolve_plugin_provider` call, i.e. once per scan (only the
+  // underlying registry resolution is memoized across scans, in `prepared`'s
+  // caller -- `createResolveJavascriptTypescriptPluginProvider`, below), so
+  // this map can never leak a stale entry from a PRIOR scan into the current
+  // one's pre-seed.
+  const importSpecifiersByPath = new Map<string, readonly string[]>();
+  const onSourceText = (uri: string, text: string): void => {
+    if (languageForPath(uri) === undefined) return;
+    importSpecifiersByPath.set(uri, extractImportSpecifiers(text));
+  };
+  // A/B measured on VS Code (17,675 files, same machine window): catalog wall
+  // with the hook 75.0s vs without 74.6s -- the UTF-8 decode + specifier regex
+  // is inside run-to-run noise, and the pre-seeded graph saves the worker's
+  // ~3.7s closure cache miss. Default ON; URDIRA_GRAPH_PRESEED=0 is the kill
+  // switch if a corpus ever surfaces a pathological decode cost.
+  const graphPreseedEnabled = process.env["URDIRA_GRAPH_PRESEED"] !== "0";
+
   return {
     supports_progressive_publication: true,
     supports_native_content_refs: true,
@@ -351,6 +381,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
     resolution_lock: prepared.lock,
     configuration,
     dependency_roles: [...JAVASCRIPT_TYPESCRIPT_DEPENDENCY_ROLES],
+    ...(graphPreseedEnabled ? { on_source_text: onSourceText } : {}),
     analyze: async ({ workspace_id, candidate, artifacts, changed_artifact_ids, publication_stage_id }) => {
       const stage = publication_stage_id === undefined
         ? undefined
@@ -468,6 +499,36 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
           readonly impactful_changed_paths?: readonly string[];
         };
       } | undefined;
+      // P3-3b: pre-seed the worker's durable stage-1 dependency-graph cache
+      // (`writeSyntaxDependencyGraphCache`) from the specifiers `on_source_text`
+      // already collected during THIS scan's own source cataloging (above,
+      // in `runFullWorkspaceScan`), so the `analyze_closure` call below can
+      // cache-hit (`worker.ts`'s own early-return, keyed by the identical
+      // `largeSyntaxManifestKey`) instead of re-scanning every file's text a
+      // second time. Gated exactly like the worker gates its OWN cache
+      // lookup (`publication_stage_id === "jsts:structural_stage_1"` and the
+      // shared large-corpus thresholds) so a small scan never pays for a
+      // cache entry the worker will never look for. Requires 100% specifier
+      // coverage of `rootNames`: on an INCREMENTAL rescan, most files are
+      // typically reused via `readStream`'s `reuse_existing` short-circuit
+      // (directory-provider.ts) and never flow through `on_source_text` at
+      // all, so this naturally no-ops there and only actually fires on a
+      // from-zero/full scan -- exactly the case the durable cache is for.
+      // Never allowed to fail the scan: any error here is swallowed, and a
+      // cache miss is always safe (the worker just builds the graph itself).
+      if (publication_stage_id === "jsts:structural_stage_1" && analysisCacheDir !== undefined && sourceArtifacts.length > 0) {
+        try {
+          let totalBytes = 0;
+          for (const artifact of sourceArtifacts) totalBytes += artifact.byte_length;
+          const meetsLargeCorpusThreshold = sourceArtifacts.length >= LARGE_SYNTAX_CORPUS_FILE_THRESHOLD || totalBytes >= LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD;
+          const fullCoverage = rootNames.every((path) => importSpecifiersByPath.has(path));
+          if (meetsLargeCorpusThreshold && fullCoverage) {
+            const graph = resolveSyntaxDependencyGraph(rootNames, importSpecifiersByPath);
+            const graphKey = largeSyntaxManifestKey({ files: sourceArtifacts, root_names: rootNames }, rootNames, workerDescriptor);
+            if (graphKey !== undefined) await writeSyntaxDependencyGraphCache(analysisCacheDir, graphKey, graph);
+          }
+        } catch { /* pre-seed is a pure speedup; a failure here must not fail indexing */ }
+      }
       let closureWorkerRetained = false;
       try {
         closureResponse = !needsSemanticClosure || sourceArtifacts.length === 0 ? undefined : await worker.invoke({
@@ -665,10 +726,32 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       const flushNativeBatches = async (force = false): Promise<void> => {
         if (acceptNativeBatches === undefined || pendingNativeBatches.length === 0 || (!force && pendingNativeBatches.length < 64)) return;
         const batch = pendingNativeBatches.splice(0, pendingNativeBatches.length);
+        // `accept_native_stage` (P3-3c): the SQLite worker-thread round trip
+        // that durably accepts native FactDelta batches
+        // (`WorkspaceCandidateRepository.acceptNativeFactDeltaBatches`,
+        // `packages/storage/src/candidates.ts`). This is the REAL native-batch
+        // cost on the `apps/urdira` path -- `workspace-indexing-session.ts`'s
+        // own `accept_native_stage_engine_loop` bucket is dead here, since
+        // every native batch this `analyze()` produces is diverted into
+        // `pendingNativeBatches` (below `acceptNativeBatches !== undefined`)
+        // and flushed here, INSIDE `analyze()`, before the engine ever sees
+        // it. Recorded into the engine's shared timing map (via the exported
+        // `recordEngineTiming`/`engineTimingEnabled`, not a local bucket map)
+        // so it lands in the same `[urdira] engine timings publish ...`
+        // snapshot as `plugin_analyze` and `execute_non_analyze` -- this cost
+        // is INSIDE `plugin_analyze`'s span, not `execute_non_analyze`'s.
+        const nativeAcceptStartedAt = engineTimingEnabled() ? performance.now() : 0;
         await acceptNativeBatches(candidate.candidate_generation_id, batch);
+        if (engineTimingEnabled()) recordEngineTiming("accept_native_stage", performance.now() - nativeAcceptStartedAt);
       };
       const consumePlanResponse = async (response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } }, plan: AnalysisPlan): Promise<MaterializationAcceptedFactDelta> => {
+        // `fact_delta_accept` (P3-3c): `acceptance.accept`'s own service
+        // cost (validation + staging), also inside `plugin_analyze`'s span --
+        // see `accept_native_stage`'s comment above for why this is recorded
+        // here rather than relying on `execute_non_analyze`.
+        const acceptStartedAt = engineTimingEnabled() ? performance.now() : 0;
         const delta = await acceptance.accept({ candidate, work_item: plan.workItem, raw_delta: response.payload.validation_input.raw_delta, accepted_manifest: plan.manifest, expected_replacement_scopes: [plan.scope], target_registry: targetRegistry, base_records: [], base_record_dependencies: [], staged_records: [], analysis_context_digest: plan.contextDigest });
+        if (engineTimingEnabled()) recordEngineTiming("fact_delta_accept", performance.now() - acceptStartedAt);
         const nativeBatches = response.payload.fact_delta_batches
           ?? (response.payload.fact_delta_batch === undefined ? [] : [response.payload.fact_delta_batch]);
         const batches = nativeBatches.length > 0 ? nativeBatches : iterateNativeFactDeltaBatches(delta.delta);
@@ -1200,6 +1283,22 @@ function workspaceForkVerifyMode(): "fast" | "full" | undefined {
   return raw?.toLowerCase() === "full" ? "full" : undefined;
 }
 
+// Index pack import (docs/decisions/23-index-pack.md): default ON, same kill-switch
+// convention as `workspaceForkEnabled` above. Even ON, nothing happens unless
+// `core:workspace_add` actually registered a pack path for a workspace (see
+// `DaemonRuntimeOptions.index_pack`'s doc comment, `packages/daemon/src/runtime.ts`).
+function indexPackEnabled(): boolean {
+  const raw = process.env["URDIRA_INDEX_PACK"];
+  if (raw === undefined || raw === "") return true;
+  return !["0", "false", "off", "no"].includes(raw.toLowerCase());
+}
+
+// Mirrors `workspaceForkVerifyMode` for `DaemonRuntimeOptions.index_pack_verify`.
+function indexPackVerifyMode(): "fast" | "full" | undefined {
+  const raw = process.env["URDIRA_INDEX_PACK_VERIFY"];
+  return raw?.toLowerCase() === "full" ? "full" : undefined;
+}
+
 // Default ON: analysis (TypeScript program build + checking) runs in a real
 // `node:worker_threads` worker (see `createJavascriptTypescriptThreadTransport`,
 // `@urdira/plugin-javascript-typescript`) so it no longer blocks the daemon's
@@ -1310,6 +1409,8 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   const semanticProcess = semanticProcessEnabled();
   const workspaceFork = workspaceForkEnabled();
   const workspaceForkVerify = workspaceForkVerifyMode();
+  const indexPack = indexPackEnabled();
+  const indexPackVerify = indexPackVerifyMode();
   // Skips descriptor resolution entirely when the kill switch already
   // fired -- there is no reason to even validate the embedding env vars for
   // a run that has already disabled semantic search outright. Otherwise
@@ -1393,6 +1494,8 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
     ...(lexicalThread ? {} : { lexical_thread: false }),
     ...(workspaceFork ? {} : { workspace_fork: false }),
     ...(workspaceForkVerify === undefined ? {} : { workspace_fork_verify: workspaceForkVerify }),
+    ...(indexPack ? {} : { index_pack: false }),
+    ...(indexPackVerify === undefined ? {} : { index_pack_verify: indexPackVerify }),
     // Same "only thread an explicit override through" convention as every
     // other kill switch above -- `semanticIndexEnabled()` also defaults to
     // `true`, matching `DaemonRuntimeOptions.semantic_index`'s own default.

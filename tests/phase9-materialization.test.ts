@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { LogicalDigestWriter } from "@urdira/canonical";
 
 import type { CandidateMaterialization, CandidateProjectionTemplate, IndexCandidate, ProjectionWorkItem, ProposedRecord } from "@urdira/contracts";
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { canonicalBytes, digestBytes, digestCanonicalArray, memoizedCanonicalArrayDigest, memoizedPackedIdentityTriple } from "@urdira/canonical";
 import { canonicalSha256 as pluginCanonicalSha256 } from "@urdira/plugin-sdk";
 import { CandidateMaterializer, CandidateRecordTemplateAccumulator, compactAcceptedFactDelta, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
 
@@ -61,6 +61,28 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     const sealed = new CandidateMaterializer().seal(input());
     expect(Object.isFrozen(sealed.materialization)).toBe(true);
     expect(sealed.materialization.materialization_digest).toMatch(/^sha256:/u);
+  });
+
+  // (1a) `seal_ordered_digests` now hashes `record_open_template_set` via a
+  // streaming sink (`digestCanonicalArray` -> `encodeCanonicalInto`) instead
+  // of buffering each element's canonical bytes first. Confirms that switch
+  // didn't disturb the one side effect publication depends on: every frozen
+  // template array `seal()` digests gets remembered
+  // (`rememberFrozenCanonicalArrayDigest`, `@urdira/canonical`) under the
+  // exact digest its own descriptor commits to, so
+  // `publication-authority.ts`'s `verifyTemplateSetAgainstDescriptor` --
+  // called with this identical, uncloned array reference during publish --
+  // finds it via `memoizedCanonicalArrayDigest` instead of re-encoding a
+  // second time.
+  it("(1a) a streamed seal still leaves the record-open template set's digest memoized against its exact frozen array identity", () => {
+    const records = Array.from({ length: 25 }, (_unused, index) => record(`memo-${index}`, `body-${index}`));
+    const sealed = new CandidateMaterializer().seal(input({ accepted_deltas: [acceptedDelta(records)] }));
+    expect(Object.isFrozen(sealed.record_opens)).toBe(true);
+    const descriptor = JSON.parse(sealed.materialization.record_open_template_set) as { content_digest: string };
+    expect(memoizedCanonicalArrayDigest(sealed.record_opens)).toBe(descriptor.content_digest);
+    // The same array reference re-digested from scratch must still agree --
+    // the memo is a cache of a real computation, never a substitute value.
+    expect(digestCanonicalArray(sealed.record_opens)).toBe(descriptor.content_digest);
   });
 
   it("compacts validated records without changing sealed materialization", () => {
@@ -402,6 +424,62 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     expect(viaAccumulator.identity_assignments).toEqual(oneShot.identity_assignments);
     expect(viaAccumulator.record_opens).toEqual(oneShot.record_opens);
     expect(viaAccumulator.materialization).toEqual(oneShot.materialization);
+  });
+
+  // (1c) The packed-identity triple memo: seal() memoizes
+  // `identity_assignment_id`/`identity_id`'s hex suffix/`identity_key_digest`
+  // against each packed tuple's own array identity the moment it builds that
+  // tuple. Verifies, independently of the module's internal helper, that the
+  // memoized triple is byte-identical to a from-scratch recompute using the
+  // exact same formula `unpackCreatedIdentityAssignment` uses -- above the
+  // packing threshold (where the memo is actually populated and consulted)
+  // and below it (where nothing is ever packed, so there is no tuple to
+  // memoize -- the properly "empty" case).
+  it("(1c) memoizes the packed identity triple exactly equal to a from-scratch recompute, above and below the packing threshold", () => {
+    const above = Array.from({ length: 10_500 }, (_unused, index) => record(`triple-above-${index}`, `body-${index}`));
+    const aboveSource = acceptedDelta(above);
+    const aboveCompact = compactAcceptedFactDelta({
+      ...aboveSource,
+      delta: { ...aboveSource.delta, fact_delta_id: "delta:triple-above", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+    const sealedAbove = new CandidateMaterializer().seal(input({ accepted_deltas: [aboveCompact] }));
+    expect(sealedAbove.identity_assignments.length).toBe(above.length);
+    let checkedPacked = 0;
+    for (const entry of sealedAbove.identity_assignments) {
+      expect(Array.isArray(entry) && entry[0] === "urdira:created-identity:v1").toBe(true);
+      const [, , , identityKey, recordId] = entry as unknown as readonly string[];
+      const memoized = memoizedPackedIdentityTriple(entry as unknown as readonly unknown[]);
+      expect(memoized, `no memo for packed tuple record_id=${recordId}`).toBeDefined();
+      const recomputed = {
+        identity_assignment_id: digest({ record_id: recordId, identity_key: identityKey }),
+        identity_id_suffix: digest({ identity_key: identityKey }).slice("sha256:".length),
+        identity_key_digest: digest(identityKey),
+      };
+      expect(memoized).toEqual(recomputed);
+      checkedPacked += 1;
+    }
+    expect(checkedPacked).toBe(above.length);
+
+    // Below the threshold: no packing happens at all, so every assignment is
+    // already the plain object (never a tuple, never memoized) -- confirm
+    // its id/key-digest fields match the same recompute formula directly.
+    const below = Array.from({ length: 50 }, (_unused, index) => record(`triple-below-${index}`, `body-${index}`));
+    const sealedBelow = new CandidateMaterializer().seal(input({ accepted_deltas: [acceptedDelta(below)] }));
+    expect(sealedBelow.identity_assignments.length).toBe(below.length);
+    for (const entry of sealedBelow.identity_assignments) {
+      expect(Array.isArray(entry)).toBe(false);
+      expect(memoizedPackedIdentityTriple(entry as unknown as readonly unknown[])).toBeUndefined();
+      expect(entry.identity_assignment_id).toBe(digest({ record_id: entry.record_id, identity_key: entry.identity_key }));
+      expect(entry.identity_id).toBe(`entity:${digest({ identity_key: entry.identity_key }).slice("sha256:".length)}`);
+      expect(entry.identity_key_digest).toBe(digest(entry.identity_key));
+    }
+
+    // A structurally identical tuple this process never built (the "resumed
+    // candidate rehydrated tuples from storage" case) is a different array
+    // identity and must miss the memo -- proving the lookup is by identity,
+    // not by tuple content, and that the recompute fallback path is real.
+    const foreignTuple = ["urdira:created-identity:v1", "workspace:1", "entity", "triple-above-0", "record:deadbeef", "artifact:owner", "version:owner"] as const;
+    expect(memoizedPackedIdentityTriple(foreignTuple)).toBeUndefined();
   });
 
   // A candidate that turns out ineligible mid-stream (any record is a

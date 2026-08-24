@@ -5,15 +5,24 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   analyzeProject,
+  analyzeSyntaxDependencyGraph,
   analyzeSyntaxProject,
   bundledPluginCatalogEntry,
   createJavascriptTypescriptWorker,
   discoverProjects,
+  extractImportSpecifiers,
   assertNativeFactDeltaBatchBudget,
+  isLargeSyntaxCorpus,
   iterateNativeFactDeltaBatches,
   languageForPath,
+  resolveSyntaxDependencyGraph,
   scriptKindForPath,
   JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES,
+  JS_TS_IMPORT_SPECIFIER_PATTERN,
+  LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD,
+  LARGE_SYNTAX_CORPUS_FILE_THRESHOLD,
+  type AnalyzerFile,
+  type JsTsDirectDependency,
 } from "../packages/plugin-javascript-typescript/src/index.js";
 import { detectWorkspaceTechnologies } from "../packages/engine/src/index.js";
 
@@ -298,5 +307,105 @@ describe("workspace recognition for the bundled analyzer", () => {
       expect.objectContaining({ technology_id: "typescript", compatible_plugin_ids: [bundledPluginCatalogEntry.plugin_id] }),
       expect.objectContaining({ technology_id: "javascript", compatible_plugin_ids: [bundledPluginCatalogEntry.plugin_id] }),
     ]));
+  });
+});
+
+// P3-3b: a host-side pre-seed (`apps/urdira/src/index.ts`) must produce
+// EXACTLY the graph `analyzeSyntaxDependencyGraph` (the worker's own
+// large-corpus scanner, `worker.ts`) would produce, by splitting its
+// per-file extraction (`extractImportSpecifiers`) from its resolution
+// (`resolveSyntaxDependencyGraph`) so a host can extract per-file as text
+// streams by and resolve once, later, without ever re-reading text. Since
+// both halves are the SAME exported functions `analyzeSyntaxDependencyGraph`
+// itself now delegates to (see analyzer.ts), equivalence is guaranteed by
+// construction for any input where the two call sites agree on `root_names`
+// -- these fixtures exercise the interesting textual edge cases (equivalence
+// gate: any fixture that diverged here would mean the split, not just the
+// pattern, introduced a bug).
+describe("P3-3b host/worker syntax-dependency-graph equivalence", () => {
+  /** Simulates the host's split extract-then-resolve pre-seed path exactly. */
+  function hostGraph(files: readonly AnalyzerFile[], rootNames: readonly string[]): Readonly<Record<string, JsTsDirectDependency>> {
+    const filteredRootNames = rootNames.filter((path) => languageForPath(path) !== undefined);
+    const rootNameSet = new Set(filteredRootNames);
+    const specifiersByPath = new Map(files.filter((file) => rootNameSet.has(file.path)).map((file) => [file.path, extractImportSpecifiers(file.text)] as const));
+    return resolveSyntaxDependencyGraph(filteredRootNames, specifiersByPath);
+  }
+
+  const fixtures: Readonly<Record<string, readonly AnalyzerFile[]>> = {
+    "plain relative imports": [
+      { path: "a.ts", text: `import { b } from "./b";\nexport const a = 1;\n` },
+      { path: "b.ts", text: `export const b = 2;\n` },
+    ],
+    "CRLF line endings": [
+      { path: "a.ts", text: `import { b } from "./b";\r\nexport const a = 1;\r\n` },
+      { path: "b.ts", text: `export const b = 2;\r\n` },
+    ],
+    "UTF-8 BOM prefix": [
+      { path: "a.ts", text: `﻿import { b } from "./b";\nexport const a = 1;\n` },
+      { path: "b.ts", text: `export const b = 2;\n` },
+    ],
+    "export-from and re-export": [
+      { path: "a.ts", text: `export * from "./b";\nexport { c } from "./c";\n` },
+      { path: "b.ts", text: `export const b = 1;\n` },
+      { path: "c.ts", text: `export const c = 2;\n` },
+    ],
+    "bare side-effect import": [
+      { path: "a.ts", text: `import "./b";\nexport const a = 1;\n` },
+      { path: "b.ts", text: `export const b = 1;\n` },
+    ],
+    // Dynamic `import("...")` is NOT matched by the shared pattern in either
+    // implementation -- a known, pre-existing limitation of the bounded
+    // stage-1 lexer, not something the host/worker split can diverge on.
+    "dynamic import (shared limitation, not a divergence)": [
+      { path: "a.ts", text: `export async function load() { return import("./b"); }\n` },
+      { path: "b.ts", text: `export const b = 1;\n` },
+    ],
+    "unresolved external, relative asset, and missing relative specifiers": [
+      { path: "a.ts", text: `import fs from "node:fs";\nimport "./styles.css";\nimport { missing } from "./missing";\nexport const a = 1;\n` },
+    ],
+    // A multi-line import statement is also unmatched by the shared pattern
+    // (it deliberately excludes newlines, `[^;\n]*?`) in BOTH implementations.
+    "multi-line import (shared limitation, not a divergence)": [
+      { path: "a.ts", text: `import {\n  b,\n} from "./b";\nexport const a = 1;\n` },
+      { path: "b.ts", text: `export const b = 1;\n` },
+    ],
+    "file containing a NUL character in otherwise-decoded text": [
+      { path: "a.ts", text: `import { b } from "./b";\nexport const a = "\0";\n` },
+      { path: "b.ts", text: `export const b = 1;\n` },
+    ],
+    "deep relative traversal and index resolution": [
+      { path: "src/pkg/a.ts", text: `import { b } from "../lib/b";\nimport { c } from "./sub";\nexport const a = 1;\n` },
+      { path: "src/lib/b.ts", text: `export const b = 1;\n` },
+      { path: "src/pkg/sub/index.ts", text: `export const c = 1;\n` },
+    ],
+  };
+
+  for (const [name, files] of Object.entries(fixtures)) {
+    it(`matches analyzeSyntaxDependencyGraph exactly for: ${name}`, () => {
+      const rootNames = files.map((file) => file.path);
+      const monolithic = analyzeSyntaxDependencyGraph({ files, root_names: rootNames });
+      expect(hostGraph(files, rootNames)).toEqual(monolithic);
+    });
+  }
+
+  it("cross-checks: isLargeSyntaxCorpus is driven by the exported threshold constants, at their exact boundary", () => {
+    // Real cross-check (not a re-derivation): calls the ACTUAL exported
+    // `isLargeSyntaxCorpus` and asserts it flips exactly at
+    // `LARGE_SYNTAX_CORPUS_FILE_THRESHOLD` -- the same constant `worker.ts`
+    // imports for its own early-cache-check gate (see that file and
+    // `tests/phase-worker-analysis-cache.test.ts` for the end-to-end version
+    // that drives the actual worker code path with a real durable cache).
+    const atThreshold = Array.from({ length: LARGE_SYNTAX_CORPUS_FILE_THRESHOLD }, (_, index): AnalyzerFile => ({ path: `f-${index}.ts`, text: `export const v${index} = ${index};\n` }));
+    const belowThreshold = atThreshold.slice(0, LARGE_SYNTAX_CORPUS_FILE_THRESHOLD - 1);
+    expect(isLargeSyntaxCorpus({ files: atThreshold })).toBe(true);
+    expect(isLargeSyntaxCorpus({ files: belowThreshold })).toBe(false);
+    const byteThresholdOnly = [{ path: "huge.ts", text: "x".repeat(LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD) }];
+    expect(isLargeSyntaxCorpus({ files: byteThresholdOnly })).toBe(true);
+    expect(isLargeSyntaxCorpus({ files: [{ path: "small.ts", text: "x" }] })).toBe(false);
+  });
+
+  it("extractImportSpecifiers is driven by the same exported, stable pattern analyzeSyntaxDependencyGraph uses", () => {
+    expect(JS_TS_IMPORT_SPECIFIER_PATTERN.flags).toContain("g");
+    expect(extractImportSpecifiers(`import { a } from "./a";\nexport * from "./b";\n`)).toEqual(["./a", "./b"]);
   });
 });

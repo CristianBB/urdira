@@ -34,6 +34,34 @@ export function encodeCanonical(value: unknown, limits: CanonicalEncodingLimits 
 
 export const canonicalBytes = encodeCanonical;
 
+/**
+ * Looks up pre-encoded UTF-8 bytes for a string field before `writeText`
+ * would otherwise re-run `TextEncoder.encode` on it. `owner` is the exact
+ * object instance the string was read off of (identity, not structural,
+ * lookup -- callers key their cache the same way) and `fieldKey` is that
+ * object's own field name; a `undefined` return falls through to ordinary
+ * encoding. This package deliberately knows nothing about which field names
+ * are worth caching -- that decision, and the cache's own lifetime/scoping,
+ * belongs entirely to the caller (see `@urdira/engine`'s
+ * `record_without_validity` cache, the motivating use).
+ */
+export type CanonicalTextBytesLookup = (owner: object, fieldKey: string, value: string) => Uint8Array | undefined;
+
+/**
+ * Streaming twin of `encodeCanonical`: identical byte stream (same
+ * `writeValue`/`writeText`/`writeBytes`/`writeBigInt` emission code -- see
+ * `Writer`'s sink mode below), but each chunk is handed to `sink` as it's
+ * produced instead of being accumulated into one final allocated-and-memcpy'd
+ * buffer. Used by `digestCanonicalArray`/`digestMappedCanonicalArray`
+ * (`digests.ts`) to hash one element at a time without ever materializing
+ * that element's encoded bytes.
+ */
+export function encodeCanonicalInto(value: unknown, sink: (chunk: Uint8Array) => void, limits: CanonicalEncodingLimits = {}, textBytesLookup?: CanonicalTextBytesLookup): void {
+  const state: State = { ...DEFAULT_LIMITS, ...limits, elements: 0, bytes: 0, textBytesLookup };
+  const writer = new Writer(state, sink);
+  writeValue(writer, value, 0, state);
+}
+
 export function decodeCanonical(bytes: Uint8Array, limits: CanonicalEncodingLimits = {}): unknown {
   const state: State = { ...DEFAULT_LIMITS, ...limits, elements: 0, bytes: bytes.length };
   if (bytes.length > state.max_bytes) limit(state, "max_bytes", bytes.length);
@@ -74,21 +102,34 @@ export function encodeDecimalFraction(exponent: bigint, mantissa: bigint): Uint8
 interface State extends Required<CanonicalEncodingLimits> {
   elements: number;
   bytes: number;
+  /** Not a limit; see `CanonicalTextBytesLookup`. Absent for plain `encodeCanonical` callers. */
+  textBytesLookup?: CanonicalTextBytesLookup | undefined;
 }
 
+// Buffered mode (no `sink`) accumulates chunks and memcpys them into one
+// allocated result at `finish()`, exactly as before. Streaming mode (a `sink`
+// supplied) hands each chunk straight to the caller instead -- same
+// `write()` call, same size bookkeeping/limit check, no `chunks` array and no
+// final allocate-and-copy. Every encoding function above (`writeValue` and
+// its helpers) goes through this one `write()`, so there is exactly one
+// implementation of the byte emission regardless of mode.
 class Writer {
-  private readonly chunks: Uint8Array[] = [];
+  private readonly chunks?: Uint8Array[];
   private length = 0;
-  constructor(private readonly state: State) {}
+  constructor(private readonly state: State, private readonly sink?: (chunk: Uint8Array) => void) {
+    if (!sink) this.chunks = [];
+  }
   write(value: Uint8Array): void {
     this.length += value.length;
     if (this.length > this.state.max_bytes) limit(this.state, "max_bytes", this.length);
-    this.chunks.push(value);
+    if (this.sink) this.sink(value);
+    else this.chunks!.push(value);
   }
   finish(): Uint8Array {
+    if (this.sink) throw new Error("Writer.finish() is not valid in streaming sink mode; consume bytes via the sink instead.");
     const result = new Uint8Array(this.length);
     let offset = 0;
-    for (const chunk of this.chunks) { result.set(chunk, offset); offset += chunk.length; }
+    for (const chunk of this.chunks!) { result.set(chunk, offset); offset += chunk.length; }
     return result;
   }
 }
@@ -124,7 +165,12 @@ function writeValue(writer: Writer, value: unknown, depth: number, state: State)
     for (const entry of entries) {
       if (previous && compareBytes(previous, entry.keyBytes) === 0) fail("uce:duplicate_map_key", "normalize", { byte_offset: 0, duplicate_key: entry.key });
       writeText(writer, entry.key, state);
-      writeValue(writer, entry.value, depth + 1, state);
+      // A caller-supplied lookup can hand back this exact field's already-
+      // UTF-8-encoded bytes (e.g. a value precomputed once when the object
+      // was built) instead of paying for `TextEncoder.encode` again here.
+      const precomputed = typeof entry.value === "string" ? state.textBytesLookup?.(record, entry.key, entry.value) : undefined;
+      if (precomputed !== undefined) writeText(writer, entry.value as string, state, precomputed);
+      else writeValue(writer, entry.value, depth + 1, state);
       previous = entry.keyBytes;
     }
     return;
@@ -132,9 +178,9 @@ function writeValue(writer: Writer, value: unknown, depth: number, state: State)
   fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "TYPE_MISMATCH" });
 }
 
-function writeText(writer: Writer, value: string, state: State): void {
+function writeText(writer: Writer, value: string, state: State, precomputedBytes?: Uint8Array): void {
   validateUnicode(value, state);
-  const bytes = encoder.encode(value);
+  const bytes = precomputedBytes ?? encoder.encode(value);
   writer.write(Uint8Array.of(3)); writer.write(varint(bytes.length)); writer.write(bytes);
 }
 

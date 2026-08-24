@@ -5,8 +5,10 @@ export {
   decodeCanonical,
   encodeArrayHeader,
   encodeCanonical,
+  encodeCanonicalInto,
   encodeFloat64,
   type CanonicalEncodingLimits,
+  type CanonicalTextBytesLookup,
 } from "./logical-encoding.js";
 export { SparseMerkleSet } from "./sparse-merkle.js";
 export { MerkleRadixSet } from "./merkle-radix.js";
@@ -86,11 +88,14 @@ export {
   validateDigestRecipeGraph,
   verifyDigest,
   memoizedCanonicalArrayDigest,
+  rememberPackedIdentityTriple,
+  memoizedPackedIdentityTriple,
   type DigestOptions,
   type DigestEnvelopeValidationContext,
   type DigestRecipe,
   type DigestRecipeGraphResult,
   type DigestText,
+  type PackedIdentityTripleDigests,
 } from "./digests.js";
 
 import {

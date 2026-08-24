@@ -226,6 +226,14 @@ export interface JsTsAnalysisResult {
   readonly dependency_closures: Readonly<Record<string, JsTsDependencyClosure>>;
 }
 
+// Hoisted so `isLargeSyntaxCorpus` (here) and the worker's OWN early
+// durable-cache-check (`worker.ts`, before it even decodes `files` into
+// `AnalyzerFile[]`) can never drift apart -- they used to duplicate this pair
+// of literals (P3-3b). A host-side pre-seed (see `resolveSyntaxDependencyGraph`
+// below, and `apps/urdira/src/index.ts`) also gates on these directly.
+export const LARGE_SYNTAX_CORPUS_FILE_THRESHOLD = 512;
+export const LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD = 16 * 1024 * 1024;
+
 /**
  * Stage 1 must remain useful on repositories whose source set is too large
  * for a project-wide TypeScript program to be a reasonable readiness gate.
@@ -244,7 +252,7 @@ export function isLargeSyntaxCorpus(input: { readonly files: readonly AnalyzerFi
     sourceFileCount += 1;
     totalBytes += Buffer.byteLength(file.text, "utf8");
   }
-  return sourceFileCount >= 512 || totalBytes >= 16 * 1024 * 1024;
+  return sourceFileCount >= LARGE_SYNTAX_CORPUS_FILE_THRESHOLD || totalBytes >= LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD;
 }
 
 function resolveLargeSyntaxModule(available: ReadonlySet<string>, from: string, specifier: string): string | undefined {
@@ -257,6 +265,51 @@ function resolveLargeSyntaxModule(available: ReadonlySet<string>, from: string, 
   return undefined;
 }
 
+// Shared with `analyzeBoundedSyntaxProject`'s own import scan, below, and
+// exported (P3-3b) so a host-side pre-seed (`apps/urdira/src/index.ts`) can
+// extract the identical specifier set from a file's text WITHOUT
+// re-implementing the pattern -- the only way to extract specifiers is this
+// one regex, used from exactly one place (`extractImportSpecifiers`).
+export const JS_TS_IMPORT_SPECIFIER_PATTERN = /\b(import|export)\b[^;\n]*?\bfrom\s*["']([^"']+)["']|\bimport\s*["']([^"']+)["']/gu;
+
+/** Every raw import/re-export specifier textually present in `text`, in source order (duplicates kept). */
+export function extractImportSpecifiers(text: string): readonly string[] {
+  const specifiers: string[] = [];
+  for (const match of text.matchAll(JS_TS_IMPORT_SPECIFIER_PATTERN)) {
+    const specifier = match[2] ?? match[3];
+    if (specifier !== undefined) specifiers.push(specifier);
+  }
+  return specifiers;
+}
+
+/**
+ * Resolves an already-extracted per-file specifier set into the direct
+ * import graph -- the pure "given specifiers, produce edges" half of
+ * `analyzeSyntaxDependencyGraph` (below), split out so a host-side pre-seed
+ * can call it directly once it knows the complete root-name set, without
+ * ever needing file TEXT again (only the specifiers `extractImportSpecifiers`
+ * already pulled out of it -- see that function and P3-3b). `sourceFiles`
+ * must already be exactly the filtered+sorted root-name set (as
+ * `analyzeSyntaxDependencyGraph` computes it); this function does no
+ * filtering of its own so both callers share the identical edge-building
+ * logic, not just the identical regex.
+ */
+export function resolveSyntaxDependencyGraph(sourceFiles: readonly string[], specifiersByPath: ReadonlyMap<string, readonly string[]>): Readonly<Record<string, JsTsDirectDependency>> {
+  const available = new Set(sourceFiles);
+  const graph: Record<string, JsTsDirectDependency> = {};
+  for (const path of sourceFiles) {
+    const direct = new Set<string>();
+    let complete = true;
+    for (const specifier of specifiersByPath.get(path) ?? []) {
+      const targetPath = resolveLargeSyntaxModule(available, path, specifier);
+      if (targetPath !== undefined) direct.add(targetPath);
+      else if (specifier.startsWith(".") && !relativeAssetSpecifier(specifier)) complete = false;
+    }
+    graph[path] = { direct_files: [...direct].sort(), complete };
+  }
+  return graph;
+}
+
 /**
  * Scan only the direct import graph required to plan a large stage-1 pass.
  * It deliberately retains no declarations, relations, ASTs, transitive
@@ -266,22 +319,8 @@ export function analyzeSyntaxDependencyGraph(input: { readonly files: readonly A
   const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].filter((path) => languageForPath(path) !== undefined).sort();
   const rootNameSet = new Set(rootNames);
   const sourceFiles = input.files.filter((file) => rootNameSet.has(file.path)).sort((left, right) => left.path.localeCompare(right.path));
-  const available = new Set(sourceFiles.map((file) => file.path));
-  const graph: Record<string, JsTsDirectDependency> = {};
-  const importPattern = /\b(import|export)\b[^;\n]*?\bfrom\s*["']([^"']+)["']|\bimport\s*["']([^"']+)["']/gu;
-  for (const file of sourceFiles) {
-    const direct = new Set<string>();
-    let complete = true;
-    for (const match of file.text.matchAll(importPattern)) {
-      const specifier = match[2] ?? match[3];
-      if (specifier === undefined) continue;
-      const targetPath = resolveLargeSyntaxModule(available, file.path, specifier);
-      if (targetPath !== undefined) direct.add(targetPath);
-      else if (specifier.startsWith(".") && !relativeAssetSpecifier(specifier)) complete = false;
-    }
-    graph[file.path] = { direct_files: [...direct].sort(), complete };
-  }
-  return graph;
+  const specifiersByPath = new Map(sourceFiles.map((file) => [file.path, extractImportSpecifiers(file.text)] as const));
+  return resolveSyntaxDependencyGraph(sourceFiles.map((file) => file.path), specifiersByPath);
 }
 
 /** Always use the bounded, checker-free stage-1 scanner. */
@@ -316,8 +355,7 @@ export function analyzeBoundedSyntaxProject(input: { readonly files: readonly An
       entities.push(entity);
       addRelation("contains", moduleEntity, entity, file.path, start, start + name.length, "confirmed");
     }
-    const importPattern = /\b(import|export)\b[^;\n]*?\bfrom\s*["']([^"']+)["']|\bimport\s*["']([^"']+)["']/gu;
-    for (const match of file.text.matchAll(importPattern)) {
+    for (const match of file.text.matchAll(JS_TS_IMPORT_SPECIFIER_PATTERN)) {
       const specifier = match[2] ?? match[3]; if (specifier === undefined) continue;
       const targetPath = resolveLargeSyntaxModule(available, file.path, specifier); const target = targetPath === undefined ? undefined : modules.get(targetPath);
       const start = match.index; addRelation(match[1] === "export" ? "export" : "import", moduleEntity, target, file.path, start, start + match[0].length, target === undefined ? "possible" : "confirmed");

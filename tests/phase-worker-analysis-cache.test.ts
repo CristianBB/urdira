@@ -1,14 +1,21 @@
+import { mkdtemp, rm } from "node:fs/promises";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   analyzeProject,
+  analyzeSyntaxDependencyGraph,
   buildJavascriptTypescriptFactDelta,
   createJavascriptTypescriptWorker,
+  largeSyntaxManifestKey,
   languageForPath,
+  writeSyntaxDependencyGraphCache,
+  LARGE_SYNTAX_CORPUS_FILE_THRESHOLD,
   type AnalyzerFile,
   type JavascriptTypescriptFactDeltaInput,
+  type JavascriptTypescriptWorkerDescriptor,
 } from "../packages/plugin-javascript-typescript/src/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -310,6 +317,125 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
       expect(analysisBuildCount).toBe(2);
     } finally {
       await worker.terminate();
+    }
+  });
+});
+
+// P3-3b: the host-side pre-seed (`apps/urdira/src/index.ts`) writes the
+// SAME durable cache file the worker's own early-cache-check
+// (`analyze_closure`, `worker.ts`) reads, keyed via the SAME exported
+// `largeSyntaxManifestKey`. This proves the two sides actually agree on the
+// cache key (not just that they compile) by seeding a DELIBERATELY altered
+// graph and confirming the worker serves exactly that seeded content --
+// the only way that could happen is a real cache hit at the identical key,
+// never a coincidental recompute.
+describe("P3-3b host pre-seed of the worker's durable syntax-dependency-graph cache", () => {
+  async function temporaryCacheDir(): Promise<string> {
+    return mkdtemp(join(tmpdir(), "urdira-pre-seed-"));
+  }
+
+  function largeCorpus(): { readonly files: readonly (AnalyzerFile & { readonly content_hash: string; readonly byte_length: number })[]; readonly rootNames: readonly string[] } {
+    const files = Array.from({ length: LARGE_SYNTAX_CORPUS_FILE_THRESHOLD }, (_, index) => {
+      const text = index === 0
+        ? `import { value1 } from "./large-1";\nexport const value0 = value1;\n`
+        : `export const value${index} = ${index};\n`;
+      return {
+        path: `src/large-${index}.ts`,
+        text,
+        content_hash: `sha256:${Buffer.from(text).toString("hex").padStart(64, "0").slice(0, 64)}`,
+        byte_length: Buffer.byteLength(text, "utf8"),
+      };
+    });
+    return { files, rootNames: files.map((file) => file.path) };
+  }
+
+  it("is consumed by the worker's analyze_closure early-cache-check at the identical manifest key", async () => {
+    const dir = await temporaryCacheDir();
+    try {
+      const { files, rootNames } = largeCorpus();
+      const descriptor: JavascriptTypescriptWorkerDescriptor = { analysis_cache_dir: dir, analysis_digest: "sha256:pre-seed-test" };
+
+      // Ground truth (what the worker WOULD build if it had to), then
+      // deliberately altered so a served copy is unmistakable.
+      const realGraph = analyzeSyntaxDependencyGraph({ files, root_names: rootNames });
+      const seededGraph = { ...realGraph, "__pre_seed_marker__": { direct_files: [], complete: true } };
+
+      const graphKey = largeSyntaxManifestKey({ files, root_names: rootNames }, rootNames, descriptor);
+      expect(graphKey).toBeDefined();
+      await writeSyntaxDependencyGraphCache(dir, graphKey!, seededGraph);
+
+      let builds = 0;
+      let cacheLoads = 0;
+      const worker = createJavascriptTypescriptWorker({ ...descriptor, on_analysis_build: () => { builds += 1; }, on_analysis_cache_load: () => { cacheLoads += 1; } });
+      try {
+        const response = await worker.invoke({
+          protocol_version: "1.0.0", request_id: "pre-seed:closure", request_digest: "digest:pre-seed:closure", call: "analyze_closure",
+          deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:pre-seed:closure",
+          payload: { files, root_names: rootNames, publication_stage_id: "jsts:structural_stage_1" },
+        }) as { readonly payload: { readonly dependency_graph?: Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>> } };
+
+        expect(builds).toBe(0);
+        expect(cacheLoads).toBe(1);
+        expect(response.payload.dependency_graph).toEqual(seededGraph);
+        expect(response.payload.dependency_graph?.["__pre_seed_marker__"]).toBeDefined();
+      } finally {
+        await worker.terminate();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a correctly pre-seeded graph (no tamper) matches exactly what the worker would have built itself", async () => {
+    const dir = await temporaryCacheDir();
+    try {
+      const { files, rootNames } = largeCorpus();
+      const descriptor: JavascriptTypescriptWorkerDescriptor = { analysis_cache_dir: dir, analysis_digest: "sha256:pre-seed-test-2" };
+      const graph = analyzeSyntaxDependencyGraph({ files, root_names: rootNames });
+      const graphKey = largeSyntaxManifestKey({ files, root_names: rootNames }, rootNames, descriptor);
+      await writeSyntaxDependencyGraphCache(dir, graphKey!, graph);
+
+      const worker = createJavascriptTypescriptWorker(descriptor);
+      try {
+        const response = await worker.invoke({
+          protocol_version: "1.0.0", request_id: "pre-seed:closure-2", request_digest: "digest:pre-seed:closure-2", call: "analyze_closure",
+          deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:pre-seed:closure-2",
+          payload: { files, root_names: rootNames, publication_stage_id: "jsts:structural_stage_1" },
+        }) as { readonly payload: { readonly dependency_graph?: Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>> } };
+        expect(response.payload.dependency_graph).toEqual(graph);
+      } finally {
+        await worker.terminate();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back safely (no pre-seed, worker builds normally) when the corpus is below the large-corpus threshold", async () => {
+    const dir = await temporaryCacheDir();
+    try {
+      const { files, rootNames } = largeCorpus();
+      const smallFiles = files.slice(0, LARGE_SYNTAX_CORPUS_FILE_THRESHOLD - 1);
+      const smallRootNames = rootNames.slice(0, LARGE_SYNTAX_CORPUS_FILE_THRESHOLD - 1);
+      const descriptor: JavascriptTypescriptWorkerDescriptor = { analysis_cache_dir: dir, analysis_digest: "sha256:pre-seed-test-3" };
+      let builds = 0;
+      const worker = createJavascriptTypescriptWorker({ ...descriptor, on_analysis_build: () => { builds += 1; } });
+      try {
+        await worker.invoke({
+          protocol_version: "1.0.0", request_id: "pre-seed:closure-3", request_digest: "digest:pre-seed:closure-3", call: "analyze_closure",
+          deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:pre-seed:closure-3",
+          payload: { files: smallFiles, root_names: smallRootNames, publication_stage_id: "jsts:structural_stage_1" },
+        });
+        // Below threshold: the worker's own early-cache-check never engages
+        // (its gate is the identical `LARGE_SYNTAX_CORPUS_FILE_THRESHOLD`),
+        // so this always builds fresh via the monolithic analyzer path --
+        // no pre-seed was ever written or expected here.
+        expect(builds).toBe(1);
+      } finally {
+        await worker.terminate();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

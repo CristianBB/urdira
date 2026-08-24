@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { computeDigest, computeDigestOverArrayPayload, digestBytes, digestCanonicalArray, digestLogicalValue, digestMappedCanonicalArray, encodeArrayHeader, encodeCanonical as encodeCanonicalBytes, LogicalDigestWriter, memoizedCanonicalArrayDigest } from "@urdira/canonical";
+import { computeDigest, computeDigestOverArrayPayload, digestBytes, digestCanonicalArray, digestLogicalValue, digestMappedCanonicalArray, encodeArrayHeader, encodeCanonical as encodeCanonicalBytes, LogicalDigestWriter, memoizedCanonicalArrayDigest, memoizedPackedIdentityTriple } from "@urdira/canonical";
 import type { CanonicalEncodingLimits } from "@urdira/canonical";
 import type { ProjectionSetDigestEntry, Snapshot, WorkspaceCurrentState, IndexCandidate, PluginResolutionLock, RegistrySnapshot, WorkspaceConfigurationRevision, WorkspaceFreshnessCheckpoint } from "@urdira/contracts";
 import { StorageError } from "./errors.js";
@@ -649,6 +649,16 @@ export interface ForkPublicationPlanInput {
   readonly publicationStageId?: string;
   readonly publicationStageOrdinal?: number;
   readonly publicationStageCount?: number;
+  /**
+   * `candidate_state.trigger_kind` / the publication journal's `trigger_kind`
+   * field for this generation-1 publish. Defaults to `"core:workspace_fork"`
+   * (every pre-existing caller). `docs/decisions/23-index-pack.md`'s import
+   * path passes `"core:index_pack_import"` instead -- same O(1) publication
+   * shape, distinct provenance so a snapshot's `candidate_state` row can
+   * always be read back to tell a local same-machine fork apart from an
+   * imported distributable pack.
+   */
+  readonly triggerKind?: string;
 }
 
 /**
@@ -688,6 +698,7 @@ export function buildForkPublicationPlan(input: ForkPublicationPlanInput): Publi
   const materializationId = `materialization:${candidateId}`;
   const normalizedBatchIds = normalizeObservationBatchIds(input.sourceObservationBatchIds);
 
+  const triggerKind = input.triggerKind ?? "core:workspace_fork";
   const manifestDescriptors = buildManifestDescriptors([], input.recordOpenSetEntries, [], input.identityAssignmentSetEntries, [], []);
   const manifest = manifestRow(generationManifestId, workspaceId, candidateId, generation, snapshotId, undefined, input.targetRegistry.registry_snapshot_id, "activation", publishedAt, manifestDescriptors);
 
@@ -747,7 +758,7 @@ export function buildForkPublicationPlan(input: ForkPublicationPlanInput): Publi
   // full scan", so failing loudly here is strictly better than silently
   // reusing a row that might not agree with this attempt's own generation.
   const candidateStateCommands: readonly SqliteCommand[] = [
-    { kind: "run", sql: "INSERT INTO candidate_state (candidate_generation_id, workspace_id, base_snapshot_id, base_generation, base_registry_snapshot_id, target_registry_snapshot_id, base_configuration_revision_id, target_configuration_revision_id, trigger_kind, state, work_manifest_id, source_observation_batch_ids, retention_lease_id, candidate_materialization_id, candidate_digest, created_at, analysis_started_at, ready_at, finished_at, published_snapshot_id, published_generation, generation_manifest_id, stale_against_snapshot_id, failure_code, issue_ids, frozen_source_state_digest, frozen_source_observation_batch_ids, frozen_tuple_digest) VALUES (?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, 'published', NULL, ?, NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)", params: [candidateId, workspaceId, input.targetRegistry.registry_snapshot_id, input.targetConfiguration.configuration_revision_id, "core:workspace_fork", JSON.stringify(normalizedBatchIds), materializationId, materializationDigest, publishedAt, publishedAt, snapshotId, generation, generationManifestId, JSON.stringify([]), input.sourceStateDigest, JSON.stringify(normalizedBatchIds), materializationDigest] },
+    { kind: "run", sql: "INSERT INTO candidate_state (candidate_generation_id, workspace_id, base_snapshot_id, base_generation, base_registry_snapshot_id, target_registry_snapshot_id, base_configuration_revision_id, target_configuration_revision_id, trigger_kind, state, work_manifest_id, source_observation_batch_ids, retention_lease_id, candidate_materialization_id, candidate_digest, created_at, analysis_started_at, ready_at, finished_at, published_snapshot_id, published_generation, generation_manifest_id, stale_against_snapshot_id, failure_code, issue_ids, frozen_source_state_digest, frozen_source_observation_batch_ids, frozen_tuple_digest) VALUES (?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, 'published', NULL, ?, NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)", params: [candidateId, workspaceId, input.targetRegistry.registry_snapshot_id, input.targetConfiguration.configuration_revision_id, triggerKind, JSON.stringify(normalizedBatchIds), materializationId, materializationDigest, publishedAt, publishedAt, snapshotId, generation, generationManifestId, JSON.stringify([]), input.sourceStateDigest, JSON.stringify(normalizedBatchIds), materializationDigest] },
   ];
 
   const targetControlCommands: readonly SqliteCommand[] = [
@@ -770,7 +781,7 @@ export function buildForkPublicationPlan(input: ForkPublicationPlanInput): Publi
     ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_snapshot_id, snapshot_contract_version, publication_stage_id, publication_stage_ordinal, publication_stage_count, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [completedSnapshot.snapshot_id, completedSnapshot.workspace_id, completedSnapshot.generation, completedSnapshot.generation_manifest_id, completedSnapshot.registry_snapshot_id, completedSnapshot.resolution_lock_id, completedSnapshot.configuration_revision_id, completedSnapshot.source_state_digest, completedSnapshot.source_snapshot_id ?? null, completedSnapshot.snapshot_contract_version ?? null, completedSnapshot.publication_stage_id ?? null, completedSnapshot.publication_stage_ordinal ?? null, completedSnapshot.publication_stage_count ?? null, completedSnapshot.source_observation_watermarks, completedSnapshot.canonical_record_set_digest, completedSnapshot.projection_set_digests, completedSnapshot.capability_state_digest, completedSnapshot.published_at, completedSnapshot.snapshot_digest] }),
   ];
 
-  const publicationPayload = encodeCanonical({ candidate_generation_id: candidateId, workspace_id: workspaceId, trigger_kind: "core:workspace_fork", snapshot_id: snapshotId });
+  const publicationPayload = encodeCanonical({ candidate_generation_id: candidateId, workspace_id: workspaceId, trigger_kind: triggerKind, snapshot_id: snapshotId });
   const journalCommands: readonly SqliteCommand[] = [
     ...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_publication_journal (candidate_generation_id, workspace_id, status, snapshot_id, generation_manifest_id, generation, published_at, publication_digest) VALUES (?, ?, 'published', ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", params: [candidateId, workspaceId, snapshotId, generationManifestId, generation, publishedAt, canonicalSha256(publicationPayload)] }),
   ];
@@ -933,14 +944,21 @@ function isPackedCreatedIdentityAssignment(value: unknown): value is PackedCreat
 
 function unpackCreatedIdentityAssignment(value: PackedCreatedIdentityAssignment): Record<string, unknown> {
   const [, workspaceId, identityType, identityKey, recordId, ownerArtifactId, ownerArtifactVersionId] = value;
+  // `@urdira/engine`'s `candidate-materialization.ts` memoizes this exact
+  // triple the moment it builds the packed tuple (same array identity,
+  // threaded here out-of-band, uncloned); reuse it instead of recomputing
+  // all three digests a second time during publish. A resumed/recovered
+  // candidate's rehydrated tuples are a different array identity and simply
+  // miss the memo, falling back to the recompute below -- never wrong.
+  const memoized = memoizedPackedIdentityTriple(value);
   return {
-    identity_assignment_id: canonicalSha256({ record_id: recordId, identity_key: identityKey }),
+    identity_assignment_id: memoized?.identity_assignment_id ?? canonicalSha256({ record_id: recordId, identity_key: identityKey }),
     workspace_id: workspaceId,
     identity_type: identityType,
-    identity_id: `${identityType}:${canonicalSha256({ identity_key: identityKey }).slice("sha256:".length)}`,
+    identity_id: `${identityType}:${memoized?.identity_id_suffix ?? canonicalSha256({ identity_key: identityKey }).slice("sha256:".length)}`,
     assignment_kind: "created",
     identity_key: identityKey,
-    identity_key_digest: canonicalSha256(identityKey),
+    identity_key_digest: memoized?.identity_key_digest ?? canonicalSha256(identityKey),
     record_id: recordId,
     owner_artifact_id: ownerArtifactId,
     owner_artifact_version_id: ownerArtifactVersionId,
@@ -965,7 +983,16 @@ function digestCandidateTemplateArray(entries: readonly unknown[]): string {
   // LogicalDigestWriter has its own domain and therefore cannot provide the
   // byte-identical canonical-array digest. Use the ordinary canonical helper
   // for uncompressed sets and a bounded decoded view for packed identities.
-  if (!entries.some(isPackedCandidateTemplate)) return digestCanonicalArray(entries);
+  // `entries[0]` alone decides packed-vs-plain for the whole array: engine's
+  // producers (`candidate-materialization.ts`) each make that call once, from
+  // a single length/threshold check, and apply it to every entry uniformly --
+  // see that file's `orderedSetDescriptor` doc comment for the full argument.
+  // A recovery/direct caller's reconstructed array carries the same
+  // (persisted, engine-authored) packed-or-not shape it was built with, so
+  // this holds for those too. Avoids a full `.some()` scan whose answer is
+  // always false for every template set except identity assignments --
+  // including a from-scratch scan's 1,000,000-entry record-open set.
+  if (entries.length === 0 || !isPackedCandidateTemplate(entries[0])) return digestCanonicalArray(entries);
   return digestMappedCanonicalArray(entries, "urdira:candidate-template-logical-value:v2", candidateTemplateValue);
 }
 

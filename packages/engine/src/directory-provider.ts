@@ -117,6 +117,22 @@ export interface DirectorySourceProviderOptions {
    * bound in practice.
    */
   readonly io_concurrency?: number;
+  /**
+   * Optional observer (P3-3b) invoked with a file's complete decoded text
+   * exactly once, ONLY for a file whose bytes arrived via the P3-3a prefetch
+   * hand-off (`#startPrefetch`/`#prefetchPromises`) AND whose content is
+   * proven unchanged since enumerate (called from inside `readStream`'s
+   * `after_read`, i.e. strictly AFTER CAS's own hash has already matched
+   * `observed_content_hash` -- never called with content that might not
+   * match what enumerate actually observed, which would poison a caller's
+   * derived cache). Never called for a NUL-containing or invalid-UTF-8 file,
+   * or for a file the hand-off did not admit (over budget, budget disabled,
+   * or a prefetch read that itself failed) -- those silently fall back to
+   * whatever the caller does when it never sees this uri. Must not throw;
+   * any failure here is swallowed and never affects the read itself -- this
+   * is purely an optimization hook, never a contract.
+   */
+  readonly on_prefetched_text?: (uri: string, text: string) => void;
 }
 
 export interface ProviderObservation extends SourceObservation {
@@ -194,6 +210,180 @@ const DEFAULT_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules
 const DEFAULT_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
 const DEFAULT_WALK_CONCURRENCY = 16;
 const BINARY_EXTENSIONS = new Set([".7z", ".avi", ".bin", ".bmp", ".class", ".dll", ".dylib", ".eot", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".mov", ".mp3", ".mp4", ".o", ".pdf", ".png", ".so", ".tar", ".wasm", ".webp", ".woff", ".woff2", ".zip"]);
+
+// Bounded enumerate->catalog byte hand-off (docs: P3-3a). A from-zero catalog
+// pass used to pay two full-file passes back to back: enumerate's `#digestFile`
+// streams every file once (hash/has_nul/valid_utf8/byte_length) and discards
+// the bytes, then `readStream` (below) lazily re-opens and re-streams the SAME
+// bytes only when CAS actually consumes its `chunks` generator, strictly AFTER
+// `readStream`'s own await returns -- so nothing ever reads file N+1 while CAS
+// is still writing file N. `#startPrefetch` closes that gap: once enumerate's
+// full file list is known, it reads ahead of CAS consumption with bounded
+// concurrency and a bounded LIVE-byte budget (not a total-bytes-ever budget --
+// see `BudgetGate`), so up to `PREFETCH_CONCURRENCY` files' disk reads overlap
+// with whatever the rest of the pipeline (CAS hash/write/fsync, SQL) is doing
+// for earlier files, instead of happening strictly after it. A single file
+// larger than the whole budget is never admitted and falls back to today's
+// lazy per-chunk streaming unchanged -- the hand-off is an optimization, never
+// a contract. `URDIRA_CATALOG_HANDOFF_BYTES=0` disables it entirely.
+//
+// BUDGET OWNERSHIP CONTRACT (read this before touching `#startPrefetch`,
+// `#prefetchPromises`, `BudgetGate`, or `readStream`'s prefetch-hit branch):
+// `BudgetGate` bounds only the "parked, unclaimed" window -- bytes a prefetch
+// worker has already read into memory but that no `readStream` call has yet
+// taken ownership of -- NEVER the window from claim through CAS's own
+// hash/write/fsync/commit. A worker's `gate.acquire(n)` (inside the IIFE
+// stored in `#prefetchPromises`) is released the INSTANT `readStream` claims
+// that entry (`gate.release` is called synchronously in the prefetch-hit
+// branch, right after `await prefetched` resolves, BEFORE returning the
+// stream object to the caller) -- unconditionally, regardless of what the
+// caller does with the returned stream afterward (pushes it into a commit,
+// discards it because the observation turned out `equivalent`, the
+// observation's own validation fails, the fragment's commit itself later
+// fails, `chunks` never gets iterated, etc). This is deliberate and load
+// bearing: an EARLIER design released budget from `after_read` (fired only
+// once CAS's `putStreamsMany` actually consumes `chunks`, i.e. only once the
+// content is durably committed) -- but `source-indexer.ts#readAll` reads an
+// ENTIRE fragment's observations (bounded concurrency, but ALL of them)
+// before that fragment's commit (and therefore before any `after_read`) ever
+// runs. So a still-registered-but-not-yet-acquired prefetch entry for a uri
+// IN THAT SAME FRAGMENT could never be unblocked: the only thing that could
+// free its budget (the fragment's own commit) was itself waiting on
+// `readAll` to finish, which was waiting on that same blocked `gate.acquire`
+// -- a structural circular wait, not a probabilistic race, that reliably
+// wedges any real scan once the budget fills before a fragment's `readAll`
+// drains (small fixtures never accumulate enough parked bytes to hit this;
+// a real multi-thousand-file tree does). Releasing at CLAIM time instead
+// makes every pending `gate.acquire()` depend only on OTHER `readStream`
+// calls landing -- which always happens, since nothing downstream of
+// `readStream` can itself block on this gate -- so a pending acquire is now
+// STRUCTURALLY guaranteed to eventually unblock. The bytes stay alive in
+// memory from claim through CAS's write (referenced by the
+// `content_streams`/`contents` arrays `source-indexer.ts#applyBatch`
+// builds), but that footprint is bounded by a fragment's own row cap
+// (`maxRows`/`SOURCE_INDEX_BATCH_MAX_ROWS`) times `io_concurrency`, entirely
+// independent of this gate. `after_read` keeps its OWN, unrelated job:
+// proving (via CAS's authoritative post-write hash) that the bytes handed
+// off are still exactly what enumerate observed, and firing
+// `on_prefetched_text` only once that proof holds -- neither of which ever
+// depended on when budget was released.
+//
+// A SECOND, independent bug compounds the above at real scale and is fixed
+// alongside it (see `BudgetGate`'s own doc comment): the gate's original
+// `acquire` admitted a fresh request whenever `#used` alone allowed it,
+// without checking whether anyone was already queued. Under the sustained
+// high-concurrency churn a multi-thousand-file scan produces (many lanes
+// each finishing one tiny acquire and immediately issuing the next), a
+// fresh request can repeatedly "cut in line" ahead of an already-queued
+// one, starving it forever even though the gate's overall throughput looks
+// fine -- a livelock, not a hang, and just as fatal to a real scan (proven
+// live: fixing only the claim-time release above still wedged a multi-file
+// repro on 4 permanently-starved entries). `BudgetGate` is now strictly
+// FIFO so a queued waiter's position is a guarantee.
+const PREFETCH_CONCURRENCY = 16;
+const DEFAULT_CATALOG_HANDOFF_BYTES = 64 * 1024 * 1024;
+
+function catalogHandoffBudgetBytes(): number {
+  const raw = process.env["URDIRA_CATALOG_HANDOFF_BYTES"];
+  if (raw === undefined || raw === "") return DEFAULT_CATALOG_HANDOFF_BYTES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_CATALOG_HANDOFF_BYTES;
+  return Math.trunc(parsed);
+}
+
+/**
+ * Tracks LIVE (not cumulative) hand-off bytes: `acquire` only blocks when
+ * something is already using budget AND admitting the new request would
+ * exceed capacity, so a single file bigger than the whole budget still gets
+ * admitted when nothing else is in flight (never deadlocks) -- callers that
+ * want such files to fall back instead must check size against capacity
+ * themselves before calling `acquire` (see `#startPrefetch`).
+ *
+ * STRICTLY FIFO-FAIR: a fresh `acquire` call that arrives while ANYONE is
+ * already queued always joins the back of the queue, even if the current
+ * `#used` would otherwise admit it immediately. An earlier version checked
+ * only `#used` (never the queue), so a fresh request could "cut in line"
+ * ahead of an already-queued one whenever it happened to arrive at a moment
+ * with enough momentary headroom -- under sustained high-concurrency churn
+ * (many callers repeatedly finishing one small acquire and immediately
+ * issuing the next), this reliably STARVED whichever request was already
+ * queued: it would be woken, re-check, find a later-arriving fresh request
+ * had already claimed the just-freed room first, and re-queue -- forever,
+ * for specific requests, while overall throughput looked fine. `release`
+ * now hands freed budget directly to the front of the queue (see `#pump`)
+ * instead of merely "waking" it to re-race everyone else, so a queued
+ * waiter's position is a real guarantee, not a hint.
+ */
+class BudgetGate {
+  readonly #capacity: number;
+  #used = 0;
+  #waiters: { readonly bytes: number; readonly resolve: () => void }[] = [];
+  constructor(capacity: number) { this.#capacity = capacity; }
+  async acquire(bytes: number): Promise<void> {
+    // Fair-queue check: admit immediately ONLY when nobody is already ahead
+    // in line AND (nothing else is in flight OR this request fits) --
+    // otherwise queue behind whoever is already waiting, even if `#used`
+    // alone would seem to allow it.
+    if (this.#waiters.length === 0 && (this.#used === 0 || this.#used + bytes <= this.#capacity)) {
+      this.#used += bytes;
+      return;
+    }
+    await new Promise<void>((resolve) => { this.#waiters.push({ bytes, resolve }); });
+  }
+  release(bytes: number): void {
+    this.#used = Math.max(0, this.#used - bytes);
+    this.#pump();
+  }
+  /** Grants freed budget to queued waiters strictly in arrival order, stopping at the first one that still doesn't fit. */
+  #pump(): void {
+    while (this.#waiters.length > 0) {
+      const front = this.#waiters[0]!;
+      if (this.#used > 0 && this.#used + front.bytes > this.#capacity) return;
+      this.#waiters.shift();
+      this.#used += front.bytes;
+      front.resolve();
+    }
+  }
+}
+
+interface CapturedFileMetadata {
+  readonly target_path: string;
+  readonly byte_length: number;
+  readonly has_nul: boolean;
+  readonly valid_utf8: boolean;
+  /**
+   * The exact `FileBoundary` `#captureFile`'s own post-digest re-inspection
+   * (its "after" `#inspectBoundary` call, proving nothing changed on disk
+   * while `#digestFile` was reading the file) already computed for this uri.
+   * `readStream` (below) reuses this AS-IS as its own "before" boundary
+   * instead of paying a fresh lstat/realpath/stat for a uri it already has
+   * an enumerate-time proof point for -- see `readStream`'s doc comment for
+   * why this does not shrink what gets proven.
+   */
+  readonly boundary: FileBoundary;
+}
+
+interface PrefetchedContent {
+  readonly bytes: Uint8Array;
+  readonly byte_length: number;
+  // The exact amount `gate.acquire`d for this entry (the digest pass's
+  // declared `meta.byte_length`, NOT necessarily `byte_length` above, which
+  // is however many bytes the prefetch worker's own read actually produced
+  // -- they can differ if the file's size changed between the digest pass
+  // and the prefetch read). `readStream` releases exactly this amount so
+  // acquired and released bytes always balance even under that race; a
+  // mismatch here would either double-count freed capacity (release too
+  // much) or permanently strand budget (release too little).
+  readonly reserved_bytes: number;
+}
+
+function concatChunks(chunks: readonly Uint8Array[], totalLength: number): Uint8Array {
+  if (chunks.length === 1) return chunks[0]!;
+  const merged = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.byteLength; }
+  return merged;
+}
 
 function jsonDigest(value: unknown): string {
   return digestLogicalValue(value);
@@ -292,9 +482,25 @@ export class DirectorySourceProvider implements SourceProvider {
   readonly #runtime: SourceProviderRuntime;
   readonly #requestExpectations: SourceProviderRequestExpectations;
   readonly #ioConcurrency: number;
+  // Cheap per-uri metadata retained for EVERY file enumerate observes (see the
+  // hand-off doc comment above `PREFETCH_CONCURRENCY`) -- never bytes, so this
+  // is bounded by file COUNT, not corpus size, and safe to keep for a whole
+  // scan's lifetime. `readStream` reuses `has_nul`/`valid_utf8` for a
+  // prefetch-hit file instead of re-deriving them from re-read bytes, and
+  // reuses `boundary` as its own "before" boundary instead of a fresh
+  // lstat/realpath/stat: safe because whatever content actually reaches CAS
+  // is independently re-hashed there against `observed_content_hash`
+  // regardless (see `readStream`), so reused metadata for a file that
+  // changed between passes can only ever accompany an already-rejected
+  // (`source_changed`) read.
+  readonly #metadataCache = new Map<string, CapturedFileMetadata>();
+  #prefetchGate: BudgetGate | undefined;
+  readonly #prefetchPromises = new Map<string, Promise<PrefetchedContent | undefined>>();
+  readonly #onPrefetchedText: ((uri: string, text: string) => void) | undefined;
 
   constructor(options: DirectorySourceProviderOptions) {
     this.#root = canonicalizePath(options.root);
+    this.#onPrefetchedText = options.on_prefetched_text;
     this.#ioConcurrency = options.io_concurrency !== undefined && Number.isSafeInteger(options.io_concurrency) && options.io_concurrency > 0
       ? options.io_concurrency : DEFAULT_WALK_CONCURRENCY;
     this.#providerKind = options.provider_kind ?? "core:directory_source_provider";
@@ -401,6 +607,14 @@ export class DirectorySourceProvider implements SourceProvider {
       return { native_stream: true, watermark: `watermark:${capture.end_fingerprint}`, capture_start_fingerprint: capture.start_fingerprint, capture_end_fingerprint: capture.end_fingerprint };
     });
     const captured = capture;
+    // Started here, before any batch is even encoded, so prefetch always has
+    // the maximum possible head start on the `readStream` calls the caller
+    // will make once it starts consuming `batches`. Restricted to a complete
+    // (non-incremental) capture: an incremental rescan's changed-file set is
+    // typically tiny, so the fixed prefetch machinery buys little there and
+    // this keeps the hand-off scoped to the from-zero/full-scan case it was
+    // built for.
+    if (!incremental && response.outcome === "success" && captured !== undefined) this.#startPrefetch(captured.files);
     const batches = (async function* (provider: DirectorySourceProvider): AsyncGenerator<EncodedObservationBatch> {
       if (response.outcome !== "success" || captured === undefined) return;
       const payload = request.payload as unknown as SourceProviderEnumerateRequest;
@@ -463,14 +677,50 @@ export class DirectorySourceProvider implements SourceProvider {
    * Internal native path used by the source indexer. Unlike the JSON/provider
    * response, it never assembles the file or converts it to text: a consumer
    * streams the chunks directly into CAS, which performs the final hash and
-   * length check while consuming them.
+   * length check while consuming them -- EXCEPT when `#startPrefetch` already
+   * read this uri's bytes ahead of time (see `#prefetchPromises`, below),
+   * in which case `chunks` yields the already-in-memory buffer as a single
+   * chunk instead of lazily re-opening the file. Either way CAS still
+   * independently hashes whatever bytes it receives against
+   * `observed_content_hash` (unchanged verification chain); a prefetch hit
+   * only changes WHEN those bytes were read, never what proves they are
+   * still correct. `after_read` (below) still re-stats after CAS's read
+   * completes, exactly as before the hand-off -- what changes is the window
+   * that re-stat proves stable: it used to bound only "this call's own lazy
+   * read", and now bounds "enumerate's original observation through commit",
+   * a LONGER window than before, not a weaker proof (the enumerate-time
+   * digest and this same post-read re-stat are the two ends of the proof
+   * either way).
+   *
+   * The "before" boundary itself (below) is, for the same reason, ALSO
+   * reused from enumerate rather than freshly lstat/realpath/stat'd here when
+   * `#metadataCache` has an entry for this uri: `#captureFile`'s own
+   * post-digest re-inspection already produced exactly this proof point
+   * ("disk matched this token as of enumerate"), so a THIRD stat call here,
+   * strictly between that proof and `after_read`'s fresh one, would only ever
+   * re-confirm what enumerate already confirmed on a stable file -- and on an
+   * UNSTABLE one (disk changed between enumerate and this call), skipping it
+   * costs nothing either: `after_read`'s fresh re-inspection below still
+   * independently re-derives the boundary from the live filesystem and still
+   * requires it to match this reused `before.token` exactly, so any such
+   * change is still caught, just at the end of the read instead of before it
+   * starts -- the window actually PROVEN correct (enumerate's own post-digest
+   * observation through commit) is unchanged either way. Excluded from this
+   * reuse: `options.reuse_existing === true` calls, which return without any
+   * `after_read` follow-up at all (see below) -- for those the entry check
+   * right below IS the only verification, so it always uses a fresh
+   * boundary. A uri `#metadataCache` never saw (incremental rescans,
+   * watcher-driven reads, `metadataOnly` capture passes) falls back to the
+   * original fresh inspect unchanged.
    */
   async readStream(input: SourceProviderReadRequest, options: { readonly reuse_existing?: boolean } = {}): Promise<DirectorySourceByteStream> {
     const uri = normalizeWorkspacePath(this.#root, input.normalized_uri);
     if (uri !== input.normalized_uri || uri.length === 0) throw new SourceProviderOutcomeError("failed", "core:source_provider_uri_invalid", "never", "The normalized URI is invalid.");
     const path = resolve(this.#root, uri);
     if (!isWithinRoot(this.#root, path)) throw new SourceProviderOutcomeError("failed", "core:source_provider_uri_invalid", "never", "The normalized URI escapes the root.");
-    const before = await this.#inspectBoundary(uri, path);
+    const before = options.reuse_existing === true
+      ? await this.#inspectBoundary(uri, path)
+      : this.#metadataCache.get(uri)?.boundary ?? await this.#inspectBoundary(uri, path);
     if (!before.included) throw new SourceProviderOutcomeError("failed", "core:source_provider_artifact_ineligible", "never", "The requested URI is not an eligible source artifact.");
     if (contentVersionToken(before.token, input.observed_content_hash) !== input.provider_version_token || before.metadata_digest !== input.observed_metadata_digest) {
       throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed before reading.");
@@ -489,6 +739,53 @@ export class DirectorySourceProvider implements SourceProvider {
         reused_existing: true,
         chunks: (async function* (): AsyncGenerator<Uint8Array> { })(),
       };
+    }
+    const prefetched = this.#prefetchPromises.get(uri);
+    if (prefetched !== undefined) {
+      this.#prefetchPromises.delete(uri);
+      const content = await prefetched;
+      if (content !== undefined) {
+        // `meta` is always present here: `#startPrefetch` only ever creates a
+        // `#prefetchPromises` entry for a uri already in `#metadataCache`.
+        const meta = this.#metadataCache.get(uri)!;
+        const gate = this.#prefetchGate!;
+        // Budget ownership contract (see the doc block above
+        // `PREFETCH_CONCURRENCY`): release HERE, synchronously, the instant
+        // this call claims the bytes -- unconditionally, before the caller
+        // can do anything (including nothing) with the returned stream.
+        // Guaranteed exactly-once because this whole branch runs only once
+        // per uri: the map entry was already deleted above before this
+        // `await`, so no other call can reach this line for the same uri.
+        gate.release(content.reserved_bytes);
+        return {
+          artifact_id: input.artifact_id,
+          provider_version_token: input.provider_version_token,
+          content_hash: input.observed_content_hash,
+          byte_length: content.byte_length,
+          metadata_digest: before.metadata_digest,
+          media_type: BINARY_EXTENSIONS.has(extname(uri).toLowerCase()) ? "application/octet-stream" : "text/plain; charset=utf-8",
+          chunks: (async function* (): AsyncGenerator<Uint8Array> { yield content.bytes; })(),
+          after_read: async (contentHash, byteLength) => {
+            const after = await this.#inspectBoundary(uri, path);
+            const mediaBytes = meta.has_nul || !meta.valid_utf8 ? new Uint8Array([0]) : new Uint8Array();
+            if (!this.#included(uri, before, mediaBytes) || !after.included || before.token !== after.token || contentVersionToken(after.token, contentHash) !== input.provider_version_token || contentHash !== input.observed_content_hash || byteLength !== after.target_stat.size) {
+              throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed while reading.");
+            }
+            // Only now -- content proven byte-identical to what enumerate
+            // observed -- is it safe to hand text to the observer (see its
+            // doc comment on `DirectorySourceProviderOptions`). Unrelated to
+            // budget: that was already released above at claim time.
+            if (this.#onPrefetchedText !== undefined && !meta.has_nul && meta.valid_utf8) {
+              try { this.#onPrefetchedText(uri, new TextDecoder("utf-8", { fatal: true }).decode(content.bytes)); } catch { /* observer hook is an optimization, never a contract */ }
+            }
+          },
+        };
+      }
+      // Prefetch lost the race, was never admitted (budget/size), or the
+      // prefetch read itself failed -- any budget it held was already
+      // released by `#startPrefetch`. Fall through to the unchanged lazy
+      // per-chunk path below; the hand-off is an optimization, not a
+      // contract.
     }
     const fileSystem = this.#fileSystem;
     const sourceFactory = (): AsyncIterable<Uint8Array> => fileSystem.read_file_stream?.(before.target_path)
@@ -559,10 +856,18 @@ export class DirectorySourceProvider implements SourceProvider {
     // The stability proof reads every eligible file's bytes twice (this pass,
     // then again below) to prove nothing changed between the two passes. The
     // enumeration response carries only metadata and digests, so retaining a
-    // complete first-pass byte image here would be dead memory: `read` below
-    // reads the bytes again after the observation has been accepted. Keeping
-    // both passes digest-only makes enumeration bounded by metadata while
-    // preserving the same stability proof and content hashes.
+    // complete first-pass byte image on `Capture`/`CapturedFile` here would
+    // still be dead memory: nothing downstream of THIS type reads it back.
+    // Bytes ARE retained now, but on a separate, bounded, short-lived path --
+    // `#metadataCache` (cheap has_nul/valid_utf8/byte_length per uri, kept for
+    // the whole scan) plus `#startPrefetch`'s live-budget-gated read-ahead
+    // (actual bytes, budget released the moment `readStream` claims each
+    // file, not when its CAS put durably lands -- see the ownership
+    // contract above `PREFETCH_CONCURRENCY`) -- so this method's own return
+    // type stays
+    // digest-only and the stability proof below is unchanged. See the
+    // `readStream` doc comment for how that hand-off changes the window the
+    // read-time correctness checks prove over.
     const first = await this.#inventory(scopeKeys, true, false);
     const firstBefore = first.before_fingerprint;
     const firstAfter = first.after_fingerprint;
@@ -702,6 +1007,12 @@ export class DirectorySourceProvider implements SourceProvider {
     const mediaBytes = digest.has_nul || !digest.valid_utf8 ? Uint8Array.of(0) : new Uint8Array();
     if (!this.#included(uri, before, mediaBytes)) return false;
     const after = await this.#inspectBoundary(uri, path, mediaBytes);
+    // Retained for the whole scan (see `#metadataCache`'s doc comment): a
+    // later `readStream` prefetch hit reuses `has_nul`/`valid_utf8`/
+    // `byte_length` instead of re-deriving them from a second read, and
+    // reuses `boundary` (this exact post-digest `after`) as its own "before"
+    // boundary instead of a fresh lstat/realpath/stat.
+    this.#metadataCache.set(uri, { target_path: before.target_path, byte_length: digest.byte_length, has_nul: digest.has_nul, valid_utf8: digest.valid_utf8, boundary: after });
     const versionToken = contentVersionToken(before.token, digest.content_hash);
     files.push({
       uri,
@@ -715,6 +1026,64 @@ export class DirectorySourceProvider implements SourceProvider {
       token_after: after.included ? contentVersionToken(after.token, digest.content_hash) : `ineligible:${after.token}`,
     });
     return after.included && before.token === after.token;
+  }
+
+  /**
+   * Fire-and-forget prefetch driver, started right after enumerate's file
+   * list is known (before any `readStream` call can possibly happen -- see
+   * the call site) so it always has a head start. Reads full file bytes
+   * ahead of CAS consumption under `PREFETCH_CONCURRENCY`-bounded fan-out and
+   * a live-byte `BudgetGate`; `readStream` claims a ready entry from
+   * `#prefetchPromises` when present and falls back to today's lazy
+   * per-chunk streaming otherwise (budget disabled, file over budget, race
+   * lost, or a prefetch read itself failed). Never throws: any per-file or
+   * driver-level failure just leaves that file unprefetched. See the budget
+   * ownership contract above `PREFETCH_CONCURRENCY` for exactly when each
+   * file's acquired budget is released -- it is NOT tied to how long the
+   * bytes this method reads actually stay alive downstream.
+   */
+  #startPrefetch(files: readonly CapturedFile[]): void {
+    const budget = catalogHandoffBudgetBytes();
+    if (budget <= 0 || files.length === 0) return;
+    const gate = new BudgetGate(budget);
+    this.#prefetchGate = gate;
+    const fileSystem = this.#fileSystem;
+    const eligible = files.filter((file) => {
+      const meta = this.#metadataCache.get(file.uri);
+      // A lone file bigger than the entire budget can never be admitted
+      // (`BudgetGate.acquire` would otherwise wait forever once something
+      // else is in flight); leave it to the unchanged fallback path.
+      return meta !== undefined && meta.byte_length <= budget;
+    });
+    void mapWithConcurrency(eligible, PREFETCH_CONCURRENCY, async (file) => {
+      const meta = this.#metadataCache.get(file.uri)!;
+      const promise = (async (): Promise<PrefetchedContent | undefined> => {
+        await gate.acquire(meta.byte_length);
+        // On any failure below, this worker owns the acquired budget and
+        // must release it itself here. A successful result instead hands
+        // budget ownership to whichever `readStream` call claims this entry
+        // from `#prefetchPromises` -- released synchronously the instant
+        // that claim happens (see the ownership contract above
+        // `PREFETCH_CONCURRENCY`), independent of what happens to the bytes
+        // afterward.
+        try {
+          const stream = fileSystem.read_file_stream?.(meta.target_path);
+          if (stream === undefined) { gate.release(meta.byte_length); return undefined; }
+          const chunks: Uint8Array[] = [];
+          let total = 0;
+          for await (const chunk of stream) {
+            if (!(chunk instanceof Uint8Array)) { gate.release(meta.byte_length); return undefined; }
+            chunks.push(chunk); total += chunk.byteLength;
+          }
+          return { bytes: total === 0 ? new Uint8Array() : concatChunks(chunks, total), byte_length: total, reserved_bytes: meta.byte_length };
+        } catch {
+          gate.release(meta.byte_length);
+          return undefined;
+        }
+      })();
+      this.#prefetchPromises.set(file.uri, promise);
+      await promise;
+    }).catch(() => undefined);
   }
 
   async #digestFile(path: string): Promise<{ readonly content_hash: string; readonly byte_length: number; readonly has_nul: boolean; readonly valid_utf8: boolean }> {

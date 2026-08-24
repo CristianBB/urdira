@@ -693,4 +693,98 @@ describe("digestCanonicalArray", () => {
     expect(() => digestCanonicalArray(elements)).not.toThrow();
     assertMatchesAggregate(elements);
   });
+
+  it("honors a CanonicalTextBytesLookup hook for object string fields without changing the digest when the supplied bytes are correct", () => {
+    // The hook exists purely as a caching shortcut (see
+    // `@urdira/engine`'s `record_without_validity` cache): correct
+    // precomputed bytes must be indistinguishable from ordinary encoding.
+    const encoder = new TextEncoder();
+    const template = { record_without_validity: "hello world", open_reason_code: "core:record_created" };
+    const withoutLookup = digestCanonicalArray([template]);
+    const lookup = (owner: object, fieldKey: string, value: string): Uint8Array | undefined =>
+      owner === template && fieldKey === "record_without_validity" ? encoder.encode(value) : undefined;
+    expect(digestCanonicalArray([template], {}, lookup)).toBe(withoutLookup);
+
+    // A lookup returning the WRONG bytes for the field must actually change
+    // the digest -- proving the hook is wired into the real byte stream, not
+    // silently ignored.
+    const wrongLookup = (owner: object, fieldKey: string): Uint8Array | undefined =>
+      owner === template && fieldKey === "record_without_validity" ? encoder.encode("tampered") : undefined;
+    expect(digestCanonicalArray([template], {}, wrongLookup)).not.toBe(withoutLookup);
+
+    // A lookup that never matches (wrong owner identity) is a pure no-op.
+    const missLookup = (): Uint8Array | undefined => undefined;
+    expect(digestCanonicalArray([template], {}, missLookup)).toBe(withoutLookup);
+  });
+});
+
+describe("digestCanonicalArray / digestMappedCanonicalArray: streaming vs buffered fuzz", () => {
+  // Deterministic PRNG (mulberry32) so a failure's seed is reproducible from
+  // the printed iteration alone -- no external randomness source.
+  function mulberry32(seed: number): () => number {
+    let a = seed;
+    return () => {
+      a |= 0; a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const TEXT_POOL = [
+    "",
+    "plain ascii text",
+    "café résumé naïve",
+    "日本語のテキスト",
+    "\u{1f600}\u{1f601}\u{1f602}\u{1f923}", // surrogate-pair emoji
+    "\u{10348}\u{10349}\u{1034a}", // astral-plane (surrogate pair) letters
+    "line1\nline2\ttab\"quote\\backslash",
+    "x".repeat(2000), // large string, well past any small internal buffer
+  ];
+
+  function randomValue(rng: () => number, depth: number): unknown {
+    const kinds = depth >= 4
+      ? ["null", "bool", "int", "float", "bigint", "text", "bytes"]
+      : ["null", "bool", "int", "float", "bigint", "text", "bytes", "array", "object"];
+    const kind = kinds[Math.floor(rng() * kinds.length)]!;
+    switch (kind) {
+      case "null": return null;
+      case "bool": return rng() < 0.5;
+      case "int": return Math.floor(rng() * 2 ** 40) - 2 ** 39;
+      case "float": return rng() < 0.5 ? 0 : (rng() - 0.5) * 1e10;
+      case "bigint": return BigInt(Math.floor(rng() * 2 ** 40) - 2 ** 39) * 1_000_000_000n;
+      case "text": return TEXT_POOL[Math.floor(rng() * TEXT_POOL.length)]!;
+      case "bytes": return Uint8Array.from({ length: Math.floor(rng() * 40) }, () => Math.floor(rng() * 256));
+      case "array": return Array.from({ length: Math.floor(rng() * 5) }, () => randomValue(rng, depth + 1));
+      case "object": {
+        const object: Record<string, unknown> = {};
+        const entryCount = Math.floor(rng() * 5);
+        for (let index = 0; index < entryCount; index += 1) object[`field_${Math.floor(rng() * 500)}`] = randomValue(rng, depth + 1);
+        return object;
+      }
+      default: return null;
+    }
+  }
+
+  const FUZZ_LIMITS = { max_elements: 10_000_000, max_bytes: 64 * 1024 * 1024, max_text_code_points: 8 * 1024 * 1024 };
+
+  it("digestCanonicalArray matches the buffered aggregate over randomized values, including empty arrays", () => {
+    const rng = mulberry32(0xc0ffee);
+    for (let iteration = 0; iteration < 300; iteration += 1) {
+      const elements = Array.from({ length: Math.floor(rng() * 8) }, () => randomValue(rng, 0));
+      const streamed = digestCanonicalArray(elements, FUZZ_LIMITS);
+      const aggregate = digestBytes(encodeCanonical(elements, FUZZ_LIMITS));
+      expect(streamed, `iteration ${iteration}: ${JSON.stringify(elements, (_key, value) => typeof value === "bigint" ? value.toString() : value)}`).toBe(aggregate);
+    }
+  });
+
+  it("digestMappedCanonicalArray matches the buffered aggregate of its mapped view over randomized values", () => {
+    const rng = mulberry32(0x5eed01);
+    for (let iteration = 0; iteration < 300; iteration += 1) {
+      const rawElements = Array.from({ length: Math.floor(rng() * 8) }, () => ({ payload: randomValue(rng, 0) }));
+      const mapped = digestMappedCanonicalArray(rawElements, "test:fuzz-mapped:v1", (entry) => entry.payload, FUZZ_LIMITS);
+      const aggregate = digestBytes(encodeCanonical(rawElements.map((entry) => entry.payload), FUZZ_LIMITS));
+      expect(mapped).toBe(aggregate);
+    }
+  });
 });

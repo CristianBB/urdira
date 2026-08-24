@@ -247,14 +247,21 @@ Order:
      pressure to bulk-`ATTACH`-copy it, so it stayed a JS loop.
    - Not copied: `lexical_*` (the async post-ready reconciler rebuilds them
      from CAS), `graph_edges`/`metric_projections`/`vector_*` (no production
-     writer exists for these yet), `candidate_*` history, `capability_state_entries`
-     (the fork publishes an empty set; a forked workspace's capability/
-     completeness reporting reads as empty until its next real rescan — the
-     same "completeness always reports partial" cosmetic gap already
-     documented elsewhere, not a new one), `candidate_lookup_dependencies`
-     (query-invalidation bookkeeping; the first real incremental publish
-     after a fork rebuilds whatever it needs from scratch), retention/
-     lifecycle tables, journal, snapshots, registry, control plane.
+     writer exists for these yet), `candidate_*` history,
+     `candidate_lookup_dependencies` (query-invalidation bookkeeping; the
+     first real incremental publish after a fork rebuilds whatever it needs
+     from scratch), retention/lifecycle tables, journal, snapshots, registry,
+     control plane.
+   - **Corrected 2026-08-24 (was stale): `capability_state_entries` IS
+     copied**, not published empty. `visibleCapabilityStateEntries`
+     (`workspace-fork.ts`) reads the donor's `control_plane_state` rows keyed
+     `capability_state:<donor_candidate_generation_id>:*` and
+     `copyDonorAndPublish` threads them straight into
+     `ForkPublicationPlanInput.capabilityStateEntries`, so a forked
+     workspace's `snapshot.capability_state_digest` is byte-identical to its
+     donor's, and its capability/completeness reporting reads exactly as the
+     donor's did — not empty. `fastForkVerify` cross-checks this digest
+     against the donor's own stored snapshot as part of its normal pass.
 3. **Publication layer, minted fresh through a narrower, fork-specific plan —
    not `buildCandidatePublicationPlan`.** `buildForkPublicationPlan`
    (`packages/storage/src/publication-authority.ts`, `@internal`-exported via
@@ -300,14 +307,24 @@ Order:
    - **`"fast"`** (`fastForkVerify`, `workspace-fork.ts`, the production
      default) checks: row-count equality between the donor's own visible set
      and the fork's newly published generation, across every bulk-copied
-     table; a byte-compare spot check of 50 randomly sampled copied records
-     against their donor counterpart (content-derived `record_id`s mean any
-     mismatch here is unambiguous corruption, never a legitimate difference);
-     and a self-consistency check of the freshly written snapshot's own
-     `snapshot_digest` against its own stored payload. This is a narrower
-     guarantee than full `verify()` — not a superset — traded deliberately for
-     speed on the production default; a handful of indexed queries and 50 row
-     comparisons versus a whole-database walk.
+     table; a **complete, index-driven set-digest comparison** — not a
+     sample — via `computeForkSnapshotDigestFields` recomputed from the
+     fork's own freshly copied rows, cross-checked against both (a) the
+     fork's own just-published `snapshot` row (self-consistency) and (b) the
+     donor's own stored `canonical_record_set_digest`/`capability_state_digest`
+     (equivalence with the donor); every remapped owner/dependency reference
+     is also checked for completeness (no `NULL` owner column survived the
+     copy); and a self-consistency check of the freshly written snapshot's
+     own `snapshot_digest` against its own stored typed fields. **Corrected
+     2026-08-24 (was stale): this was never a 50-record sample** — decision
+     11's content-derived `record_id`s make a full set-digest comparison
+     cheap enough (one SQL pass, no payload re-decoding) that there was never
+     a reason to sample instead of covering the complete set. This is still a
+     narrower guarantee than full `verify()` (it does not walk CAS/lexical/
+     retention state), traded deliberately for speed on the production
+     default: a handful of indexed queries and one full-set digest pass
+     versus a whole-database walk — but on the canonical-row content itself,
+     it is exact, not probabilistic.
 
    Either way, a verify failure is logged loudly and the fork's own
    generation-1 rows are deleted in a best-effort rollback
