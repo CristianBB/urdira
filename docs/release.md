@@ -1,6 +1,6 @@
 # Release Process
 
-This document is the operational checklist for Urdira 0.2.x. The normative
+This document is the operational checklist for Urdira 0.3.x. The normative
 distribution contract is [decision 10](decisions/10-daemon-mcp-packaging.md);
 the non-waivable qualification gates are [decision 08](decisions/08-performance-reliability-evaluation.md).
 

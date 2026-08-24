@@ -3,7 +3,11 @@
 All notable user-visible changes are documented here. Urdira follows the
 repository's [semantic versioning policy](docs/versioning.md).
 
-## Unreleased — Urdira v3 optimized pipeline
+## [0.3.0] - 2026-08-24 — Urdira v3 optimized pipeline
+
+This is an intentionally incompatible release. Existing pre-v3 and early
+preview-v3 data roots must be reindexed; the runtime rejects them instead of
+silently serving mixed-format state.
 
 - binding-oriented v3 pipelines now validate a closed dependency DAG, execute
   independent branches concurrently, preserve scalar cardinality, and expose

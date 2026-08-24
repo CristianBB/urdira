@@ -67,7 +67,7 @@ export interface UrdiraRunOptions {
   readonly on_startup_progress?: (phase: DaemonStartupPhase) => void;
 }
 
-export const URDIRA_VERSION = "0.2.2";
+export const URDIRA_VERSION = "0.3.0";
 const debugTimingEnabled = (): boolean => process.env["URDIRA_DEBUG_TIMING"] === "1";
 
 function urdiraHelpLegacy(): string {

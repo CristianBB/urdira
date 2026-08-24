@@ -91,7 +91,7 @@ async function queryAfterStagedPublication(client: DaemonClient, workspaceId: st
 
 describe("Urdira application runner", () => {
   it("publishes stable version and help output without starting the daemon", () => {
-    expect(URDIRA_VERSION).toBe("0.2.2");
+    expect(URDIRA_VERSION).toBe("0.3.0");
     expect(urdiraHelp()).toContain("urdira mcp");
     expect(urdiraHelp()).toContain("explicit workspace scope");
   });

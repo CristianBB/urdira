@@ -1,6 +1,6 @@
 {
   "release_schema_version": 1,
-  "engine_version": "0.1.1",
+  "engine_version": "0.3.0",
   "runtime": {
     "node": "24.18.1",
     "pnpm": "11.20.0",

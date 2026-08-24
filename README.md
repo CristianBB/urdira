@@ -41,7 +41,7 @@ remain available; unsupported operations fail explicitly.
 
 ## Install
 
-Urdira 0.2.2 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
+Urdira 0.3.0 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
 requires npm `>=11.16.0`, which supplies the strict install-script policy. Check
 with `npm --version`; if necessary, update the npm paired with the active Node
 installation before preparing the runtime:
