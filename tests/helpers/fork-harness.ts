@@ -128,7 +128,12 @@ export function asDurableStorage(storage: DurableStorage): Parameters<typeof att
   return storage as unknown as Parameters<typeof attemptWorkspaceFork>[0]["storage"];
 }
 
-export function buildPluginProvider(prepared: PreparedRegistry, workspaceId: string, registrySnapshotId: string, configurationRevisionId: string, analyzedWorkspaceIds: Set<string>): WorkspaceScanPluginProvider {
+export interface BuildPluginProviderOptions {
+  /** Test hook: reshape (order included) the provider's emitted capability_state entries before they reach the seal — the digest contract requires order-independence, so regressions need a provider whose emission order is NOT already canonical. */
+  readonly capability_state_entries?: (base: readonly SnapshotCapabilityStateEntry[]) => readonly SnapshotCapabilityStateEntry[];
+}
+
+export function buildPluginProvider(prepared: PreparedRegistry, workspaceId: string, registrySnapshotId: string, configurationRevisionId: string, analyzedWorkspaceIds: Set<string>, options?: BuildPluginProviderOptions): WorkspaceScanPluginProvider {
   const encoder = new TextEncoder();
   const configuration: WorkspaceScanPluginProvider["configuration"] = {
     configuration_revision_id: configurationRevisionId,
@@ -207,7 +212,7 @@ export function buildPluginProvider(prepared: PreparedRegistry, workspaceId: str
         affected_artifact_ids: [...new Set(claims.flatMap((claim) => JSON.parse(claim.affected_artifact_ids) as string[]))].sort(),
         diagnostic_record_ids: [],
       }];
-      return { accepted_deltas: accepted, capability_state_entries };
+      return { accepted_deltas: accepted, capability_state_entries: [...(options?.capability_state_entries?.(capability_state_entries) ?? capability_state_entries)] };
     },
   };
 }

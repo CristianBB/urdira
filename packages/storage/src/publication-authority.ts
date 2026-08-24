@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { computeDigest, computeDigestOverArrayPayload, digestBytes, digestCanonicalArray, digestLogicalValue, digestMappedCanonicalArray, encodeArrayHeader, encodeCanonical as encodeCanonicalBytes, LogicalDigestWriter, memoizedCanonicalArrayDigest, memoizedPackedIdentityTriple } from "@urdira/canonical";
+import { computeDigest, computeDigestOverArrayPayload, digestBytes, digestCanonicalArray, digestLogicalValue, digestMappedCanonicalArray, encodeArrayHeader, encodeCanonical as encodeCanonicalBytes, LogicalDigestWriter, memoizedCanonicalArrayDigest, memoizedPackedIdentityTriple, sortCanonicalValues } from "@urdira/canonical";
 import type { CanonicalEncodingLimits } from "@urdira/canonical";
+import { comparatorDefinitions } from "@urdira/contracts";
 import type { ProjectionSetDigestEntry, Snapshot, WorkspaceCurrentState, IndexCandidate, PluginResolutionLock, RegistrySnapshot, WorkspaceConfigurationRevision, WorkspaceFreshnessCheckpoint } from "@urdira/contracts";
 import { StorageError } from "./errors.js";
 import type { FaultBoundary, FaultInjector } from "./faults.js";
@@ -413,7 +414,7 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
       source_observation_watermarks: sourceWatermarks,
       canonical_record_set_digest: snapshotDigests.canonical_record_set_digest,
       projection_set_digests: snapshotDigests.projection_set_digests,
-      capability_state_digest: canonicalSha256(materialization.capability_state_entries),
+      capability_state_digest: capabilityStateDigest(materialization.capability_state_entries),
       published_at: publishedAt,
       snapshot_digest: "",
     };
@@ -716,7 +717,7 @@ export function buildForkPublicationPlan(input: ForkPublicationPlanInput): Publi
     source_observation_watermarks: JSON.stringify({ watermarks: [], source_observation_batch_ids: normalizedBatchIds }),
     canonical_record_set_digest: input.canonicalRecordSetDigest,
     projection_set_digests: input.projectionSetDigests,
-    capability_state_digest: canonicalSha256(input.capabilityStateEntries ?? []),
+    capability_state_digest: capabilityStateDigest(input.capabilityStateEntries ?? []),
     published_at: publishedAt,
     snapshot_digest: "",
   };
@@ -923,6 +924,22 @@ function encodeCanonical(value: unknown, limits?: CanonicalEncodingLimits): Uint
   return encodeCanonicalBytes(value, limits);
 }
 function canonicalSha256(value: unknown): string { return digestBytes(encodeCanonical(value)); }
+
+// `Snapshot.capability_state_digest` is contractually
+// `input(ordered_set(SnapshotCapabilityStateEntry, core:capability_state_order@1))`
+// (docs/serialization/core-digest-field-contracts.md): the comparator exists so the
+// digest is independent of map or storage iteration order. Callers hand entries in
+// whatever order they hold them (a staged publish's stage-grouped emission order, a
+// fork/import's `ORDER BY state_key` read-back order), so the sort here is what makes
+// the donor's declared digest and any copy's recomputed digest comparable at all.
+const CAPABILITY_STATE_ORDER_COMPARATOR = (() => {
+  const comparator = comparatorDefinitions.find((entry) => entry.comparator_id === "core:capability_state_order" && entry.comparator_version === 1);
+  if (comparator === undefined) throw new StorageError("storage:publication_invalid", "The core:capability_state_order@1 comparator is missing from the contracts registry.");
+  return comparator;
+})();
+function capabilityStateDigest(entries: readonly unknown[]): string {
+  return canonicalSha256(sortCanonicalValues(entries, CAPABILITY_STATE_ORDER_COMPARATOR));
+}
 
 const PACKED_CREATED_IDENTITY_MARKER = "urdira:created-identity:v1";
 type PackedCreatedIdentityAssignment = readonly [

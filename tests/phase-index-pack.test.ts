@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { canonicalBytes, digestBytes, sortCanonicalValues } from "@urdira/canonical";
 // `@urdira/engine`/`@urdira/plugin-javascript-typescript` are not root-level
 // devDependencies, so (matching every tests/*.test.ts that touches them)
 // this file imports them from src by relative path. The plugin-registry/
@@ -13,6 +13,7 @@ import { canonicalBytes, digestBytes } from "@urdira/canonical";
 // re-import of the other .test.ts file).
 import {
   attemptIndexPackImport,
+  attemptWorkspaceFork,
   exportIndexPack,
   runFullWorkspaceScan,
   WorkspaceRegistry,
@@ -30,11 +31,12 @@ import {
   prepareRegistry,
   registerEngineWorkspace,
   seedFixtureFiles,
+  type BuildPluginProviderOptions,
 } from "./helpers/fork-harness.js";
 
 /** `buildPluginProvider` takes a registry snapshot id, configuration revision id, and an `analyzedWorkspaceIds` tracker this file has no use for -- this supplies them consistently, mirroring `tests/phase-workspace-fork.test.ts`'s own `buildPluginProviderResolver`'s derivation of the same two ids. */
-function providerFor(prepared: Awaited<ReturnType<typeof prepareRegistry>>, workspaceId: string): WorkspaceScanPluginProvider {
-  return buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`, new Set());
+function providerFor(prepared: Awaited<ReturnType<typeof prepareRegistry>>, workspaceId: string, options?: BuildPluginProviderOptions): WorkspaceScanPluginProvider {
+  return buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`, new Set(), options);
 }
 
 /** Reads an index pack's decompressed NDJSON lines as parsed JSON values. Test-only: production code never re-parses its own output this way. */
@@ -63,7 +65,7 @@ interface Fixture {
   readonly packPath: string;
 }
 
-async function buildReadyDonorAndExport(label: string): Promise<Fixture> {
+async function buildReadyDonorAndExport(label: string, providerOptions?: BuildPluginProviderOptions): Promise<Fixture> {
   const dataRoot = await mkdtemp(join(tmpdir(), `urdira-index-pack-${label}-data-`));
   const donorRoot = await mkdtemp(join(tmpdir(), `urdira-index-pack-${label}-donor-`));
   await seedFixtureFiles(donorRoot);
@@ -72,7 +74,7 @@ async function buildReadyDonorAndExport(label: string): Promise<Fixture> {
   const donorWorkspace = await registerEngineWorkspace(registry, donorRoot, "donor");
   const donorDatabase = await openEngineWorkspace(storage, donorWorkspace);
   const prepared = await prepareRegistry(donorWorkspace.workspace_id);
-  const donorPlugin = providerFor(prepared, donorWorkspace.workspace_id);
+  const donorPlugin = providerFor(prepared, donorWorkspace.workspace_id, providerOptions);
   const donorResult = await runFullWorkspaceScan({ root: donorRoot, database: asStorageDatabase(donorDatabase), workspace_id: donorWorkspace.workspace_id, plugin: donorPlugin, inclusion_rules: INDEX_PACK_INCLUSION_RULES });
   expect(donorResult.status).toBe("published");
   registry.markReady(donorWorkspace.workspace_id, donorResult.snapshot_id, "ready");
@@ -135,6 +137,87 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
     } finally {
       if (targetDatabase) await targetDatabase.close().catch(() => undefined);
       if (targetStorage) await targetStorage.close();
+      await rm(targetRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await teardown(fixture);
+    }
+  }, 120_000);
+
+  it("(a2) capability-state digest is order-independent: a donor emitting entries in non-canonical order still imports AND forks under the default fast verify", async () => {
+    // Regression for the 2026-08-24 live VS Code import failure
+    // ("capability-state digest differs from the pack's declared donor
+    // anchor"): the donor digested its entries in plugin emission order while
+    // every read-back (`visibleCapabilityStateEntries`) yields ORDER BY
+    // state_key (per-entry hash) order. The digest contract is
+    // `ordered_set(SnapshotCapabilityStateEntry, core:capability_state_order@1)`
+    // (docs/serialization/core-digest-field-contracts.md), so the digest must
+    // not depend on either order. A single-entry fixture can never catch
+    // this; this donor emits three entries deliberately arranged in
+    // reverse-canonical order.
+    const CAPABILITY_STATE_ORDER = { comparator_id: "core:capability_state_order", comparator_version: 1, sort_keys: [{ value_path: "", comparison_mode: "uce_bytes", direction: "ascending", absent_order: "forbidden" }] } as const;
+    const fixture = await buildReadyDonorAndExport("capability-order", {
+      capability_state_entries: (base) => {
+        const entries = [base[0]!, { ...base[0]!, capability: "core:type_information" }, { ...base[0]!, capability: "core:syntax_structure" }];
+        const emitted = [...sortCanonicalValues(entries, CAPABILITY_STATE_ORDER)].reverse();
+        expect(emitted).not.toEqual(sortCanonicalValues(entries, CAPABILITY_STATE_ORDER));
+        return emitted;
+      },
+    });
+    const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-capability-order-target-"));
+    const forkRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-capability-order-fork-"));
+    let targetStorage: DurableStorage | undefined;
+    let targetDatabase: WorkspaceDatabase | undefined;
+    let forkDatabase: WorkspaceDatabase | undefined;
+    try {
+      // The manifest's declared anchor must follow the documented ordered_set
+      // recipe over the pack's own rows -- pinning the recipe itself, not
+      // just import/donor self-consistency (both sides sharing the same
+      // wrong recipe would pass a pure round-trip).
+      const lines = readRawPackLines(await readFile(fixture.packPath));
+      const manifest = (lines[0] as { manifest: { donor_snapshot_anchor: { capability_state_digest: string } } }).manifest;
+      const packEntries = lines.filter((line): line is { kind: string; rows: unknown[] } => (line as { kind?: string }).kind === "capability_state").flatMap((line) => line.rows);
+      expect(packEntries).toHaveLength(3);
+      expect(manifest.donor_snapshot_anchor.capability_state_digest).toBe(digestBytes(canonicalBytes(sortCanonicalValues(packEntries, CAPABILITY_STATE_ORDER))));
+
+      // Import into an unrelated data root with the DEFAULT verify mode --
+      // "fast" is the mode that runs `fastPackVerify`'s anchor cross-check,
+      // which is where the live failure surfaced (test (a) uses "full").
+      await seedFixtureFiles(targetRoot);
+      const targetDataRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-capability-order-target-data-"));
+      targetStorage = await createDurableStorage({ rootDir: targetDataRoot });
+      const targetRegistry = new WorkspaceRegistry();
+      const targetWorkspace = await registerEngineWorkspace(targetRegistry, targetRoot, "target");
+      targetDatabase = await openEngineWorkspace(targetStorage, targetWorkspace);
+      const preparedTarget = await prepareRegistry(targetWorkspace.workspace_id);
+      const importOutcome = await attemptIndexPackImport({
+        workspace: targetWorkspace,
+        database: asStorageDatabase(targetDatabase),
+        storage: asDurableStorage(targetStorage),
+        registry: targetRegistry,
+        plugin: providerFor(preparedTarget, targetWorkspace.workspace_id),
+        pack_path: fixture.packPath,
+        inclusion_rules: INDEX_PACK_INCLUSION_RULES,
+      });
+      expect(importOutcome.status).toBe("imported");
+
+      // Twin latent bug: `fastForkVerify` compares the same digests, so a
+      // local fork from this donor must also survive its default fast verify.
+      await seedFixtureFiles(forkRoot);
+      const forkWorkspace = await registerEngineWorkspace(fixture.registry, forkRoot, "fork-target");
+      forkDatabase = await openEngineWorkspace(fixture.storage, forkWorkspace);
+      const preparedFork = await prepareRegistry(forkWorkspace.workspace_id);
+      const forkOutcome = await attemptWorkspaceFork({
+        workspace: forkWorkspace,
+        database: asStorageDatabase(forkDatabase),
+        storage: asDurableStorage(fixture.storage),
+        registry: fixture.registry,
+        plugin: providerFor(preparedFork, forkWorkspace.workspace_id),
+      });
+      expect(forkOutcome.status).toBe("forked");
+    } finally {
+      if (forkDatabase) await forkDatabase.close().catch(() => undefined);
+      if (targetDatabase) await targetDatabase.close().catch(() => undefined);
+      if (targetStorage) await targetStorage.close();
+      await rm(forkRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       await rm(targetRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       await teardown(fixture);
     }
