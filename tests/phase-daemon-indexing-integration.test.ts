@@ -782,8 +782,14 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
     return String(body?.["path"] ?? "");
   }
 
-  // Directly polls the workspace's own SQLite database for
-  // `semantic_index_state.completed_generation` (via a SECOND, independent
+  // Polls both the workspace's durable semantic completion marker and the
+  // daemon's public materialization view. The SQLite marker commits just
+  // before `submitSemanticMaintenance` updates its in-memory status map, so
+  // observing the marker alone leaves a narrow race where query admission
+  // can still report semantic coverage as incomplete.
+  //
+  // The durable half polls `semantic_index_state.completed_generation` via a
+  // SECOND, independent
   // `createDurableStorage` handle over the SAME `dataRoot` the daemon under
   // test already uses -- safe because `openWorkspace` only requires the
   // workspace already present in the shared on-disk installation catalog,
@@ -793,7 +799,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
   // `reconcileSemanticProjection`'s own fast path checks, and the most
   // direct way to know the async maintenance pass genuinely finished rather
   // than inferring it indirectly from a query response shape.
-  async function pollUntilSemanticGenerationCurrent(dataRoot: string, workspaceId: string, timeoutMs = 120_000): Promise<void> {
+  async function pollUntilSemanticGenerationCurrent(client: DaemonClient, dataRoot: string, workspaceId: string, timeoutMs = 120_000): Promise<void> {
     const pollStorage = await createDurableStorage({ rootDir: dataRoot });
     try {
       // Open the workspace database ONCE, outside the poll loop, instead of
@@ -810,7 +816,13 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
         while (Date.now() < deadline) {
           const currentRow = await database.database.get<{ readonly current_generation: number }>("SELECT current_generation FROM workspace_current_state WHERE workspace_id = ?", [workspaceId]);
           const state = await database.projections.semanticIndexState();
-          if (currentRow !== undefined && state !== undefined && state.completed_generation === currentRow.current_generation) return;
+          if (currentRow !== undefined && state !== undefined && state.completed_generation === currentRow.current_generation) {
+            const status = await client.call("core:index_status", { workspace_ids: [workspaceId] });
+            const payload = status.outcome === "success"
+              ? status.payload as { readonly workspaces?: ReadonlyArray<{ readonly semantic_materializations?: ReadonlyArray<{ readonly materialization_state?: string }> }> }
+              : undefined;
+            if (payload?.workspaces?.[0]?.semantic_materializations?.[0]?.materialization_state === "complete") return;
+          }
           await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
         }
         throw new Error(`semantic_index_state never caught up to the current generation for workspace ${workspaceId} within ${timeoutMs}ms.`);
@@ -860,7 +872,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       // Before semantic maintenance completes, `core:search_semantic` would
       // throw `core:semantic_index_unavailable` -- this poll only returns
       // once the async pass genuinely finished for this scan's generation.
-      await pollUntilSemanticGenerationCurrent(dataRoot, workspaceId);
+      await pollUntilSemanticGenerationCurrent(client, dataRoot, workspaceId);
 
       const semanticResponse = await client.call("core:query", {
         api_version: 3,
@@ -868,7 +880,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
         expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: "CreateTaskInput", query_class: "identifier" } },
         options: queryOptions,
       });
-      expect(semanticResponse.outcome).toBe("success");
+      expect(semanticResponse.outcome, JSON.stringify(semanticResponse)).toBe("success");
       const semanticPayload = semanticResponse.payload as { readonly streams: Readonly<Record<string, StreamPage>> };
       const semanticCandidates = semanticPayload.streams["candidates"]?.items ?? [];
       expect(semanticCandidates.length).toBeGreaterThan(0);
@@ -955,7 +967,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       // throw `core:semantic_index_unavailable` -- this poll only returns
       // once the async, THREADED pass genuinely finished for this scan's
       // generation.
-      await pollUntilSemanticGenerationCurrent(dataRoot, workspaceId);
+      await pollUntilSemanticGenerationCurrent(client, dataRoot, workspaceId);
 
       const semanticResponse = await client.call("core:query", {
         api_version: 3,
@@ -1025,7 +1037,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       const settled = await pollUntilReady(client, workspaceId);
       expect(settled.workspace_status).toBe("ready");
 
-      await pollUntilSemanticGenerationCurrent(dataRoot, workspaceId);
+      await pollUntilSemanticGenerationCurrent(client, dataRoot, workspaceId);
 
       const semanticResponse = await client.call("core:query", {
         api_version: 3,
@@ -1130,7 +1142,7 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       const settled = await pollUntilReady(client, workspaceId);
       expect(settled.workspace_status).toBe("ready");
 
-      await pollUntilSemanticGenerationCurrent(dataRoot, workspaceId);
+      await pollUntilSemanticGenerationCurrent(client, dataRoot, workspaceId);
 
       // The direct regression check: without activation invalidating the
       // cached per-workspace query engine, or without activation running at
