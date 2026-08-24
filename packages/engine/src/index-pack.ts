@@ -15,7 +15,8 @@ import type {
   WorkspaceFreshnessCheckpoint,
 } from "@urdira/contracts";
 import type { DurableStorage, ForkPublicationPlanInput, WorkspaceDatabase } from "@urdira/storage";
-import { buildForkPublicationPlan, computeForkSnapshotDigestFields, digestRelationalValue, normalizeObservationBatchIds, publicationTransactionCommands, snapshotDigest } from "@urdira/storage";
+import { buildForkPublicationPlan, computeForkSnapshotDigestFields, normalizeObservationBatchIds, publicationTransactionCommands, snapshotDigest } from "@urdira/storage";
+import { recordIntegrityFailure } from "./index-pack-verify-core.js";
 import type { GitIgnoreRules, InclusionRules } from "@urdira/security";
 import { record, resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { ISOMORPHIC_GIT_OBJECT_PORT, administrativeState, type GitObjectPort } from "./git-providers.js";
@@ -878,7 +879,6 @@ function multisetDiff(packEntries: readonly (readonly [string, string])[], targe
   return `pack has ${packMap.size} entries, target root has ${targetMap.size}; only in pack: ${bound(onlyInPack)}; only in target: ${bound(onlyInTarget)}; content-hash mismatches: ${bound(hashMismatch)}`;
 }
 
-const RECORD_ID_PATTERN = /^record:[0-9a-f]{64}$/u;
 
 /**
  * The trust boundary this whole module exists to add on top of
@@ -904,7 +904,134 @@ const RECORD_ID_PATTERN = /^record:[0-9a-f]{64}$/u;
  * body_payload that does not match its own claimed body_digest, a record_id
  * that does not match its own record_digest), which is the class of tamper a
  * naive forger would actually produce.
+ *
+ * WHERE the recompute runs moved in 2026-08-24's stream-verify change: the
+ * default import path now runs it at scratch-build time over the PACK'S OWN
+ * rows (`IndexPackStreamVerifier` below), overlapped with the source-layer
+ * commit and finished before bulkCopy/publish -- strictly earlier in the
+ * write sequence than the old post-publish pass. What that stream pass can
+ * no longer observe ("did bulkCopy land every row in the target
+ * faithfully") is covered by `fastPackVerify`'s row counts + recomputed
+ * anchors + ownership checks over the target; `verifyCopiedRecordIntegrity`
+ * below (the target-side pass) remains the `verify_mode: "full"` surface
+ * and the fallback whenever stream verify is unavailable.
  */
+/**
+ * Stream-time front end of the untrusted per-record recompute: the import
+ * feeds each `records` pack line here as it lands in the scratch donor, and
+ * 1-2 `index-pack-verify-worker` threads (batch mode) run the exact same
+ * `recordIntegrityFailure` check the post-publish pass would -- so the whole
+ * decode+digest cost overlaps the source-layer commit's I/O window and a
+ * corrupt pack is rejected BEFORE bulkCopy/publish ever run. Two workers,
+ * not more: the machine-level ceiling measured for this decode+digest mix
+ * (aggregate ~1.4x at 8 shards) makes wider fan-out pointless, and here the
+ * workers only need to keep up with the pack stream, not win a race.
+ *
+ * Failure semantics mirror the module's never-throw rule: infrastructure
+ * problems (spawn failure, worker crash) surface as `status: "unavailable"`
+ * -- the import then simply keeps the old post-publish verify -- while
+ * verified pack corruption is a definite failure list. `URDIRA_INDEX_PACK_STREAM_VERIFY=0`
+ * forces "unavailable" (the fallback path) for tests and emergencies.
+ */
+const STREAM_VERIFY_WORKERS = 2;
+const STREAM_VERIFY_MAX_INFLIGHT_BATCHES = 8;
+
+interface StreamVerifyRow { readonly record_id: string; readonly record_digest: string; readonly body_digest: string; readonly body_payload_hex?: string }
+
+class IndexPackStreamVerifier {
+  readonly #workers: Worker[] = [];
+  readonly #failures: string[] = [];
+  #inflight = 0;
+  #nextWorker = 0;
+  #infraError: string | undefined;
+  #waiters: (() => void)[] = [];
+  readonly #finalResults: Promise<void>[] = [];
+
+  static create(): IndexPackStreamVerifier | undefined {
+    if (process.env["URDIRA_INDEX_PACK_STREAM_VERIFY"] === "0") return undefined;
+    try {
+      const verifier = new IndexPackStreamVerifier();
+      const workerEntry = new URL("index-pack-verify-worker.js", import.meta.resolve("@urdira/engine"));
+      for (let index = 0; index < STREAM_VERIFY_WORKERS; index += 1) {
+        const worker = new Worker(workerEntry, { workerData: { mode: "batch" } });
+        verifier.#workers.push(worker);
+        verifier.#finalResults.push(new Promise<void>((resolve) => {
+          // `finished` distinguishes a worker that reported its final
+          // "result" from one that died mid-stream: only the former may
+          // count toward a completed ("verified") pass -- an exit without a
+          // result means fed rows may never have been checked, which must
+          // degrade to "unavailable" (fall back to the post-publish verify),
+          // never silently pass.
+          let finished = false;
+          worker.on("message", (message: { readonly kind: string; readonly failures?: readonly string[]; readonly error?: { readonly message: string } }) => {
+            if (message.kind === "batch_result" && message.failures !== undefined) { verifier.#failures.push(...message.failures); verifier.#settleOne(); }
+            else if (message.kind === "result") { finished = true; resolve(); }
+            else { verifier.#infraError ??= message.error?.message ?? "stream verify worker returned an unrecognized message"; verifier.#settleOne(); resolve(); }
+          });
+          worker.on("error", (error) => { verifier.#infraError ??= error instanceof Error ? error.message : String(error); verifier.#drainWaiters(); resolve(); });
+          worker.on("exit", () => { if (!finished) verifier.#infraError ??= "stream verify worker exited before reporting its final result"; verifier.#drainWaiters(); resolve(); });
+        }));
+      }
+      return verifier;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #settleOne(): void {
+    this.#inflight = Math.max(0, this.#inflight - 1);
+    const waiter = this.#waiters.shift();
+    waiter?.();
+  }
+
+  #drainWaiters(): void {
+    this.#inflight = 0;
+    for (const waiter of this.#waiters.splice(0)) waiter();
+  }
+
+  failuresSoFar(): number { return this.#failures.length; }
+
+  /**
+   * Feed one pack batch. Applies backpressure (bounded batches in flight)
+   * so pack bytes never accumulate unboundedly between here and the
+   * workers. Never throws; after an infrastructure error it becomes a
+   * no-op, because the import will fall back to the post-publish verify
+   * anyway.
+   */
+  async push(rows: readonly StreamVerifyRow[]): Promise<void> {
+    if (this.#infraError !== undefined || this.#workers.length === 0) return;
+    while (this.#inflight >= STREAM_VERIFY_MAX_INFLIGHT_BATCHES && this.#infraError === undefined) {
+      await new Promise<void>((resolve) => { this.#waiters.push(resolve); });
+    }
+    if (this.#infraError !== undefined) return;
+    this.#inflight += 1;
+    const worker = this.#workers[this.#nextWorker % this.#workers.length]!;
+    this.#nextWorker += 1;
+    try {
+      worker.postMessage({ kind: "batch", rows });
+    } catch (error) {
+      this.#infraError = error instanceof Error ? error.message : String(error);
+      this.#drainWaiters();
+    }
+  }
+
+  /** Drains every in-flight batch, stops the workers, and reports. */
+  async finish(): Promise<{ readonly status: "verified"; readonly failures: readonly string[] } | { readonly status: "unavailable"; readonly reason: string }> {
+    for (const worker of this.#workers) {
+      try { worker.postMessage({ kind: "end" }); } catch (error) { this.#infraError = this.#infraError ?? (error instanceof Error ? error.message : String(error)); }
+    }
+    await Promise.all(this.#finalResults);
+    this.abort();
+    if (this.#infraError !== undefined && this.#failures.length === 0) return { status: "unavailable", reason: this.#infraError };
+    return { status: "verified", failures: [...this.#failures] };
+  }
+
+  abort(): void {
+    for (const worker of this.#workers) void worker.terminate();
+    this.#drainWaiters();
+  }
+}
+
 export async function verifyCopiedRecordIntegrity(target: WorkspaceDatabase, workspaceId: string, generation: number): Promise<readonly string[]> {
   // Above this row count the pure-CPU decode+digest loop is sharded across
   // worker threads over contiguous record_id ranges (the check is strictly
@@ -924,14 +1051,8 @@ export async function verifyCopiedRecordIntegrity(target: WorkspaceDatabase, wor
     );
     if (rows.length === 0) break;
     for (const row of rows) {
-      if (!RECORD_ID_PATTERN.test(row.record_id)) { failures.push(`record ${row.record_id} does not use the plain first-open id form (chain-salted or malformed ids are rejected)`); continue; }
-      if (row.record_id !== `record:${row.record_digest.slice("sha256:".length)}`) { failures.push(`record ${row.record_id} id is not self-consistent with its own record_digest`); continue; }
-      if (row.body_payload !== null && row.body_payload !== undefined) {
-        try {
-          const recomputed = digestRelationalValue(decodeCanonical(toBytes(row.body_payload)));
-          if (recomputed.digest !== row.body_digest) failures.push(`record ${row.record_id} body_digest does not match its recomputed body_payload content`);
-        } catch { failures.push(`record ${row.record_id} body_payload is not a valid canonical payload`); }
-      }
+      const failure = recordIntegrityFailure(row.record_id, row.record_digest, row.body_digest, row.body_payload === null || row.body_payload === undefined ? null : toBytes(row.body_payload));
+      if (failure !== undefined) failures.push(failure);
     }
     cursor = rows[rows.length - 1]!.record_id;
     if (failures.length > 0) break;
@@ -976,7 +1097,7 @@ async function shardedVerifyCopiedRecordIntegrity(target: WorkspaceDatabase, wor
   return shardFailures.flat();
 }
 
-async function fastPackVerify(target: WorkspaceDatabase, workspaceId: string, manifest: IndexPackManifest, ids: ForkPublicationIds): Promise<{ readonly ok: boolean; readonly failures: readonly string[] }> {
+async function fastPackVerify(target: WorkspaceDatabase, workspaceId: string, manifest: IndexPackManifest, ids: ForkPublicationIds, options?: { readonly skip_record_integrity?: boolean }): Promise<{ readonly ok: boolean; readonly failures: readonly string[] }> {
   const failures: string[] = [];
   const forkVisible = "valid_from_generation = ? AND valid_to_generation IS NULL";
   const expected: Readonly<Record<string, number>> = { record_occurrences: manifest.row_counts.records, identity_assignments: manifest.row_counts.identities, artifact_dependencies: manifest.row_counts.dependencies, projection_occurrences: manifest.row_counts.projections };
@@ -1003,7 +1124,12 @@ async function fastPackVerify(target: WorkspaceDatabase, workspaceId: string, ma
     const decoded = await target.repositories.snapshots.get(ids.snapshotId);
     if (!decoded || snapshotDigest(decoded) !== snapshotRow.snapshot_digest) failures.push("snapshot_digest is not self-consistent with its typed fields");
   }
-  failures.push(...(await verifyCopiedRecordIntegrity(target, workspaceId, ids.generation)));
+  // Skipped when the stream-time verify already ran the identical
+  // record-local recompute over the pack's own rows (see
+  // `IndexPackStreamVerifier`): what it cannot re-prove -- "did bulkCopy
+  // land every row faithfully" -- is exactly what the row counts, recomputed
+  // anchors and ownership checks above cover.
+  if (options?.skip_record_integrity !== true) failures.push(...(await verifyCopiedRecordIntegrity(target, workspaceId, ids.generation)));
   return { ok: failures.length === 0, failures };
 }
 
@@ -1076,39 +1202,89 @@ async function importAfterEnumeration(options: IndexPackImportOptions, context: 
     return { status: "skipped", reason };
   };
 
-  let sourceLayer: ForkSourceLayer | undefined;
-  try {
-    sourceLayer = await commitForkSourceLayer(options as unknown as WorkspaceForkOptions, context, enumeration);
-  } catch (error) {
-    return await rollbackAndSkip(`source cataloging threw: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (sourceLayer === undefined) return await rollbackAndSkip("source cataloging for the index pack target did not produce any eligible files");
+  // The source-layer commit (I/O bound: streaming every workspace file into
+  // CAS) and the scratch-donor build + stream-time verify (decode+digest
+  // offloaded to verify worker threads) share no data -- the scratch needs
+  // only `uriMap`, built before the durable boundary -- so they run
+  // CONCURRENTLY: the verify cost that used to be its own post-publish pass
+  // (~70s wall at VS Code scale) now hides inside the commit's I/O window,
+  // and a corrupt pack is rejected before bulkCopy/publish ever run.
+  //
+  // THE ONE HARD SEQUENCING RULE: nothing may call `rollbackAndSkip` until
+  // the commit promise below has SETTLED. A rollback racing a still-writing
+  // source-layer commit could delete rows the commit then re-adds -- exactly
+  // the permanently-wedged half-committed state this module exists to
+  // prevent. `buildScratchAndStreamVerify` never throws, so the single
+  // `await` ordering below enforces the rule structurally.
+  const sourceLayerSettled: Promise<{ readonly ok: true; readonly layer: ForkSourceLayer | undefined } | { readonly ok: false; readonly error: unknown }> =
+    commitForkSourceLayer(options as unknown as WorkspaceForkOptions, context, enumeration)
+      .then((layer) => ({ ok: true as const, layer }), (error: unknown) => ({ ok: false as const, error }));
 
-  let scratch: ScratchDonorDatabase | undefined;
-  try {
-    scratch = await ScratchDonorDatabase.create(`index-pack-donor:${workspaceId}`);
-    const rowCounts = { records: 0, value_nodes: 0, facets: 0, identities: 0, dependencies: 0, projections: 0, capability_state: 0 };
+  const buildScratchAndStreamVerify = async (): Promise<{ readonly scratch: ScratchDonorDatabase | undefined; readonly capabilityStateEntries: unknown[]; readonly failure?: string; readonly streamVerified: boolean }> => {
     const capabilityStateEntries: unknown[] = [];
-    while (!cursorLine.done) {
-      const value = cursorLine.value;
-      if (value.kind === "end") break;
-      if (value.kind === "records") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertRecords(value.rows as readonly Record<string, unknown>[], uriMap)); rowCounts.records += value.rows.length; }
-      else if (value.kind === "value_nodes") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertValueNodes(value.rows as readonly Record<string, unknown>[])); rowCounts.value_nodes += value.rows.length; }
-      else if (value.kind === "facets") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertFacets(value.rows as readonly Record<string, unknown>[])); rowCounts.facets += value.rows.length; }
-      else if (value.kind === "identities") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertIdentities(value.rows as readonly Record<string, unknown>[])); rowCounts.identities += value.rows.length; }
-      else if (value.kind === "dependencies") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertDependencies(value.rows as readonly Record<string, unknown>[], uriMap)); rowCounts.dependencies += value.rows.length; }
-      else if (value.kind === "projections") { timedSync("index_pack_import_scratch_insert", () => scratch!.insertProjections(value.rows as readonly Record<string, unknown>[], uriMap)); rowCounts.projections += value.rows.length; }
-      else if (value.kind === "capability_state") { capabilityStateEntries.push(...value.rows); rowCounts.capability_state += value.rows.length; }
-      else if (value.kind !== "multiset") fail(`index pack contains an unrecognized section kind`);
-      cursorLine = await lines.next();
+    const verifier = IndexPackStreamVerifier.create();
+    let builtScratch: ScratchDonorDatabase | undefined;
+    try {
+      builtScratch = await ScratchDonorDatabase.create(`index-pack-donor:${workspaceId}`);
+      const rowCounts = { records: 0, value_nodes: 0, facets: 0, identities: 0, dependencies: 0, projections: 0, capability_state: 0 };
+      let corruptionSeen = false;
+      while (!cursorLine.done) {
+        const value = cursorLine.value;
+        if (value.kind === "end") break;
+        if (value.kind === "records") {
+          timedSync("index_pack_import_scratch_insert", () => builtScratch!.insertRecords(value.rows as readonly Record<string, unknown>[], uriMap));
+          rowCounts.records += value.rows.length;
+          if (verifier !== undefined) await timed("index_pack_stream_verify_backpressure", () => verifier.push(value.rows as readonly StreamVerifyRow[]));
+        }
+        else if (value.kind === "value_nodes") { timedSync("index_pack_import_scratch_insert", () => builtScratch!.insertValueNodes(value.rows as readonly Record<string, unknown>[])); rowCounts.value_nodes += value.rows.length; }
+        else if (value.kind === "facets") { timedSync("index_pack_import_scratch_insert", () => builtScratch!.insertFacets(value.rows as readonly Record<string, unknown>[])); rowCounts.facets += value.rows.length; }
+        else if (value.kind === "identities") { timedSync("index_pack_import_scratch_insert", () => builtScratch!.insertIdentities(value.rows as readonly Record<string, unknown>[])); rowCounts.identities += value.rows.length; }
+        else if (value.kind === "dependencies") { timedSync("index_pack_import_scratch_insert", () => builtScratch!.insertDependencies(value.rows as readonly Record<string, unknown>[], uriMap)); rowCounts.dependencies += value.rows.length; }
+        else if (value.kind === "projections") { timedSync("index_pack_import_scratch_insert", () => builtScratch!.insertProjections(value.rows as readonly Record<string, unknown>[], uriMap)); rowCounts.projections += value.rows.length; }
+        else if (value.kind === "capability_state") { capabilityStateEntries.push(...value.rows); rowCounts.capability_state += value.rows.length; }
+        else if (value.kind !== "multiset") fail(`index pack contains an unrecognized section kind`);
+        // Fail fast on the first confirmed corrupt record: no point streaming
+        // the rest of a pack that is already rejected. The definite failure
+        // list comes out of `finish()` below either way.
+        if (verifier !== undefined && verifier.failuresSoFar() > 0) { corruptionSeen = true; break; }
+        cursorLine = await lines.next();
+      }
+      if (!corruptionSeen) {
+        for (const key of Object.keys(rowCounts) as (keyof typeof rowCounts)[]) {
+          if (rowCounts[key] !== manifest.row_counts[key]) fail(`index pack row count mismatch for ${key}: declared=${manifest.row_counts[key]} actual=${rowCounts[key]}`);
+        }
+        // Flush whatever partial SCRATCH_DONOR_BATCH_TX_ROWS batch is still
+        // open so the bulkCopy* reads below (via scratch.handle()) run
+        // against a fully committed scratch database.
+        builtScratch.finalizeWrites();
+      }
+      const stream = verifier === undefined ? { status: "unavailable" as const } : await timed("index_pack_stream_verify_finish", () => verifier.finish());
+      if (stream.status === "verified" && stream.failures.length > 0) {
+        return { scratch: builtScratch, capabilityStateEntries, failure: `stream verify rejected the pack: ${stream.failures[0]!}${stream.failures.length > 1 ? ` (+${stream.failures.length - 1} more)` : ""}`, streamVerified: false };
+      }
+      if (corruptionSeen) {
+        // Failures were observed mid-stream but the workers could not report
+        // a final verdict (infrastructure trouble). Definite enough to skip.
+        return { scratch: builtScratch, capabilityStateEntries, failure: "stream verify observed corrupt records but could not complete", streamVerified: false };
+      }
+      return { scratch: builtScratch, capabilityStateEntries, streamVerified: stream.status === "verified" };
+    } catch (error) {
+      verifier?.abort();
+      return { scratch: builtScratch, capabilityStateEntries, failure: error instanceof IndexPackFormatError ? error.message : `index pack scratch build threw: ${error instanceof Error ? error.message : String(error)}`, streamVerified: false };
     }
-    for (const key of Object.keys(rowCounts) as (keyof typeof rowCounts)[]) {
-      if (rowCounts[key] !== manifest.row_counts[key]) fail(`index pack row count mismatch for ${key}: declared=${manifest.row_counts[key]} actual=${rowCounts[key]}`);
-    }
-    // Flush whatever partial SCRATCH_DONOR_BATCH_TX_ROWS batch is still
-    // open so the bulkCopy* reads below (via scratch.handle()) run against
-    // a fully committed scratch database.
-    scratch.finalizeWrites();
+  };
+  const scratchOutcome = await buildScratchAndStreamVerify();
+  const sourceOutcome = await sourceLayerSettled;
+
+  const scratch: ScratchDonorDatabase | undefined = scratchOutcome.scratch;
+  const streamVerified = scratchOutcome.streamVerified;
+  const capabilityStateEntries = scratchOutcome.capabilityStateEntries;
+  try {
+    if (!sourceOutcome.ok) return await rollbackAndSkip(`source cataloging threw: ${sourceOutcome.error instanceof Error ? sourceOutcome.error.message : String(sourceOutcome.error)}`);
+    const sourceLayer = sourceOutcome.layer;
+    if (sourceLayer === undefined) return await rollbackAndSkip("source cataloging for the index pack target did not produce any eligible files");
+    if (scratchOutcome.failure !== undefined) return await rollbackAndSkip(scratchOutcome.failure);
+    if (scratch === undefined) return await rollbackAndSkip("index pack scratch donor database was never created");
 
     const donorArtifacts: readonly DonorVisibleArtifact[] = [...uriMap.entries()].map(([uri, entry]) => ({ artifact_id: entry.artifact_id, artifact_version_id: entry.artifact_version_id, normalized_uri: uri, content_hash: entry.content_hash }));
     const map: DonorRowMap = buildFullArtifactMap(donorArtifacts, sourceLayer);
@@ -1167,7 +1343,7 @@ async function importAfterEnumeration(options: IndexPackImportOptions, context: 
       const integrityFailures = await timed("index_pack_import_verify", () => verifyCopiedRecordIntegrity(target, workspaceId, ids.generation));
       if (integrityFailures.length > 0) { verifyOk = false; verifyDetail = [...(verifyDetail as readonly unknown[]), ...integrityFailures]; }
     } else {
-      const fast = await timed("index_pack_import_verify", () => fastPackVerify(target, workspaceId, manifest, ids));
+      const fast = await timed("index_pack_import_verify", () => fastPackVerify(target, workspaceId, manifest, ids, { skip_record_integrity: streamVerified }));
       verifyOk = fast.ok;
       verifyDetail = fast.failures;
     }

@@ -1,14 +1,21 @@
 // One shard of `verifyCopiedRecordIntegrity`'s untrusted per-record
 // recompute (`index-pack.ts`), run inside a real `node:worker_threads`
-// worker over its own READ-ONLY `node:sqlite` connection to the target
-// workspace database. The check is record-local (decode the copied
-// `body_payload`, recompute its digest, check record_id/record_digest
-// self-consistency), so contiguous `record_id` keyset ranges shard it with
-// no cross-shard state; the parent (`shardedVerifyCopiedRecordIntegrity`)
-// picks the boundaries and concatenates the failure lists. Read-only
-// second connections against a WAL workspace database are this repo's
-// established pattern (lexical/semantic worker threads,
-// `openWorkspaceReadOnly`).
+// worker. Two modes, selected by `workerData`:
+//
+// - Range mode (default): its own READ-ONLY `node:sqlite` connection to the
+//   target workspace database over one contiguous `record_id` keyset range.
+//   The check is record-local, so ranges shard it with no cross-shard state;
+//   the parent (`shardedVerifyCopiedRecordIntegrity`) picks the boundaries
+//   and concatenates the failure lists. Read-only second connections against
+//   a WAL workspace database are this repo's established pattern
+//   (lexical/semantic worker threads, `openWorkspaceReadOnly`).
+//
+// - Batch mode (`workerData.mode === "batch"`): message-driven stream-time
+//   verify for the import path -- the parent posts the pack's own `records`
+//   rows (hex bodies included) as it builds the scratch database, this
+//   worker decodes+digests each and replies per batch, so the whole
+//   recompute overlaps the source-layer commit instead of running as its
+//   own post-publish pass. No database connection at all in this mode.
 //
 // This file is a worker ENTRY POINT (loaded via `new Worker(new URL(...))`
 // against compiled `dist/index-pack-verify-worker.js`, resolved the same
@@ -16,8 +23,7 @@
 // never imported by other modules.
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
-import { decodeCanonical } from "@urdira/canonical";
-import { digestRelationalValue } from "@urdira/storage";
+import { recordIntegrityFailure } from "./index-pack-verify-core.js";
 
 interface VerifyShardJob {
   readonly filename: string;
@@ -30,10 +36,15 @@ interface VerifyShardJob {
   readonly page_rows: number;
 }
 
-interface WorkerResultMessage { readonly kind: "result"; readonly failures: readonly string[] }
-interface WorkerErrorMessage { readonly kind: "error"; readonly error: { readonly name: string; readonly message: string } }
+interface VerifyBatchJob { readonly mode: "batch" }
 
-const RECORD_ID_PATTERN = /^record:[0-9a-f]{64}$/u;
+interface StreamVerifyRow { readonly record_id: string; readonly record_digest: string; readonly body_digest: string; readonly body_payload_hex?: string }
+interface StreamVerifyBatchMessage { readonly kind: "batch"; readonly rows: readonly StreamVerifyRow[] }
+interface StreamVerifyEndMessage { readonly kind: "end" }
+
+interface WorkerResultMessage { readonly kind: "result"; readonly failures: readonly string[] }
+interface WorkerBatchResultMessage { readonly kind: "batch_result"; readonly failures: readonly string[] }
+interface WorkerErrorMessage { readonly kind: "error"; readonly error: { readonly name: string; readonly message: string } }
 
 function toBytes(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) return value;
@@ -43,43 +54,63 @@ function toBytes(value: unknown): Uint8Array {
 
 const port = parentPort;
 if (!port) throw new Error("The index pack verify worker entry must be run inside a node:worker_threads worker.");
-const job = workerData as VerifyShardJob;
+const job = workerData as VerifyShardJob | VerifyBatchJob;
 
-try {
-  const startedAt = Date.now();
+if ("mode" in job && job.mode === "batch") {
   let rowCount = 0;
-  const database = new DatabaseSync(job.filename, { readOnly: true });
-  try {
-    const failures: string[] = [];
-    let cursor = job.cursor_start;
-    const rangeSql = job.cursor_end === null ? "" : " AND record_id <= ?";
-    for (;;) {
-      const params: (string | number)[] = [job.workspace_id, job.generation, cursor];
-      if (job.cursor_end !== null) params.push(job.cursor_end);
-      params.push(job.page_rows);
-      const rows = database.prepare(
-        `SELECT record_id, record_digest, body_digest, body_payload FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ? AND valid_to_generation IS NULL AND record_id > ?${rangeSql} ORDER BY record_id LIMIT ?`,
-      ).all(...(params as never[])) as { record_id: string; record_digest: string; body_digest: string; body_payload: unknown }[];
-      if (rows.length === 0) break;
-      rowCount += rows.length;
-      for (const row of rows) {
-        if (!RECORD_ID_PATTERN.test(row.record_id)) { failures.push(`record ${row.record_id} does not use the plain first-open id form (chain-salted or malformed ids are rejected)`); continue; }
-        if (row.record_id !== `record:${row.record_digest.slice("sha256:".length)}`) { failures.push(`record ${row.record_id} id is not self-consistent with its own record_digest`); continue; }
-        if (row.body_payload !== null && row.body_payload !== undefined) {
-          try {
-            const recomputed = digestRelationalValue(decodeCanonical(toBytes(row.body_payload)));
-            if (recomputed.digest !== row.body_digest) failures.push(`record ${row.record_id} body_digest does not match its recomputed body_payload content`);
-          } catch { failures.push(`record ${row.record_id} body_payload is not a valid canonical payload`); }
-        }
+  const startedAt = Date.now();
+  port.on("message", (message: StreamVerifyBatchMessage | StreamVerifyEndMessage) => {
+    try {
+      if (message.kind === "end") {
+        if (process.env["URDIRA_STORAGE_DEBUG_TIMING"] === "1") console.error(`[urdira] index pack stream-verify worker done rows=${rowCount} ms=${Date.now() - startedAt}`);
+        port.postMessage({ kind: "result", failures: [] } satisfies WorkerResultMessage);
+        port.close();
+        return;
       }
-      cursor = rows[rows.length - 1]!.record_id;
-      if (failures.length > 0) break;
+      const failures: string[] = [];
+      for (const row of message.rows) {
+        rowCount += 1;
+        const body = row.body_payload_hex === undefined ? null : new Uint8Array(Buffer.from(row.body_payload_hex, "hex"));
+        const failure = recordIntegrityFailure(row.record_id, row.record_digest, row.body_digest, body);
+        if (failure !== undefined) failures.push(failure);
+      }
+      port.postMessage({ kind: "batch_result", failures } satisfies WorkerBatchResultMessage);
+    } catch (error) {
+      port.postMessage({ kind: "error", error: { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error) } } satisfies WorkerErrorMessage);
     }
-    if (process.env["URDIRA_STORAGE_DEBUG_TIMING"] === "1") console.error(`[urdira] index pack verify shard done rows=${rowCount} ms=${Date.now() - startedAt} range=(${job.cursor_start.slice(0, 24)}..${job.cursor_end === null ? "end" : job.cursor_end.slice(0, 24)}]`);
-    port.postMessage({ kind: "result", failures } satisfies WorkerResultMessage);
-  } finally {
-    try { database.close(); } catch { /* already closed */ }
+  });
+} else {
+  const shardJob = job as VerifyShardJob;
+  try {
+    const startedAt = Date.now();
+    let rowCount = 0;
+    const database = new DatabaseSync(shardJob.filename, { readOnly: true });
+    try {
+      const failures: string[] = [];
+      let cursor = shardJob.cursor_start;
+      const rangeSql = shardJob.cursor_end === null ? "" : " AND record_id <= ?";
+      for (;;) {
+        const params: (string | number)[] = [shardJob.workspace_id, shardJob.generation, cursor];
+        if (shardJob.cursor_end !== null) params.push(shardJob.cursor_end);
+        params.push(shardJob.page_rows);
+        const rows = database.prepare(
+          `SELECT record_id, record_digest, body_digest, body_payload FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ? AND valid_to_generation IS NULL AND record_id > ?${rangeSql} ORDER BY record_id LIMIT ?`,
+        ).all(...(params as never[])) as { record_id: string; record_digest: string; body_digest: string; body_payload: unknown }[];
+        if (rows.length === 0) break;
+        rowCount += rows.length;
+        for (const row of rows) {
+          const failure = recordIntegrityFailure(row.record_id, row.record_digest, row.body_digest, row.body_payload === null || row.body_payload === undefined ? null : toBytes(row.body_payload));
+          if (failure !== undefined) failures.push(failure);
+        }
+        cursor = rows[rows.length - 1]!.record_id;
+        if (failures.length > 0) break;
+      }
+      if (process.env["URDIRA_STORAGE_DEBUG_TIMING"] === "1") console.error(`[urdira] index pack verify shard done rows=${rowCount} ms=${Date.now() - startedAt} range=(${shardJob.cursor_start.slice(0, 24)}..${shardJob.cursor_end === null ? "end" : shardJob.cursor_end.slice(0, 24)}]`);
+      port.postMessage({ kind: "result", failures } satisfies WorkerResultMessage);
+    } finally {
+      try { database.close(); } catch { /* already closed */ }
+    }
+  } catch (error) {
+    port.postMessage({ kind: "error", error: { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error) } } satisfies WorkerErrorMessage);
   }
-} catch (error) {
-  port.postMessage({ kind: "error", error: { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error) } } satisfies WorkerErrorMessage);
 }

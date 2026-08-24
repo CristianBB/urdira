@@ -269,6 +269,90 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
     }
   }, 120_000);
 
+  it("(b2) the same mutated body_payload is still rejected with stream verify forced off (URDIRA_INDEX_PACK_STREAM_VERIFY=0), via the post-publish fallback pass", async () => {
+    const fixture = await buildReadyDonorAndExport("tamper-body-nostream");
+    const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-tamper-body-nostream-target-"));
+    let targetStorage: DurableStorage | undefined;
+    let targetDatabase: WorkspaceDatabase | undefined;
+    const originalStreamVerify = process.env["URDIRA_INDEX_PACK_STREAM_VERIFY"];
+    process.env["URDIRA_INDEX_PACK_STREAM_VERIFY"] = "0";
+    try {
+      await seedFixtureFiles(targetRoot);
+      const lines = readRawPackLines(await readFile(fixture.packPath));
+      const recordsLineIndex = lines.findIndex((line) => (line as { kind?: string }).kind === "records");
+      const recordsLine = lines[recordsLineIndex] as { rows: { body_payload_hex?: string }[] };
+      const target = recordsLine.rows.find((row) => typeof row.body_payload_hex === "string" && row.body_payload_hex.length > 4);
+      expect(target).toBeDefined();
+      const mutated = Buffer.from(target!.body_payload_hex!, "hex");
+      mutated[0] = (mutated[0]! + 1) % 256;
+      target!.body_payload_hex = mutated.toString("hex");
+      const tamperedPath = join(fixture.dataRoot, "tampered-body-nostream.index-pack.gz");
+      await writeFile(tamperedPath, writeRawPackLines(lines));
+
+      const targetDataRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-tamper-body-nostream-data-"));
+      targetStorage = await createDurableStorage({ rootDir: targetDataRoot });
+      const targetRegistry = new WorkspaceRegistry();
+      const targetWorkspace = await registerEngineWorkspace(targetRegistry, targetRoot, "target");
+      targetDatabase = await openEngineWorkspace(targetStorage, targetWorkspace);
+      const preparedTarget = await prepareRegistry(targetWorkspace.workspace_id);
+      const targetPlugin = providerFor(preparedTarget, targetWorkspace.workspace_id);
+
+      const outcome = await attemptIndexPackImport({ workspace: targetWorkspace, database: asStorageDatabase(targetDatabase), storage: asDurableStorage(targetStorage), registry: targetRegistry, plugin: targetPlugin, pack_path: tamperedPath, inclusion_rules: INDEX_PACK_INCLUSION_RULES });
+      expect(outcome.status).toBe("skipped");
+
+      const fallback = await runFullWorkspaceScan({ root: targetRoot, database: asStorageDatabase(targetDatabase), workspace_id: targetWorkspace.workspace_id, plugin: targetPlugin, inclusion_rules: INDEX_PACK_INCLUSION_RULES });
+      expect(fallback.status).toBe("published");
+    } finally {
+      if (originalStreamVerify === undefined) delete process.env["URDIRA_INDEX_PACK_STREAM_VERIFY"];
+      else process.env["URDIRA_INDEX_PACK_STREAM_VERIFY"] = originalStreamVerify;
+      if (targetDatabase) await targetDatabase.close().catch(() => undefined);
+      if (targetStorage) await targetStorage.close();
+      await rm(targetRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await teardown(fixture);
+    }
+  }, 120_000);
+
+  it("(b3) a mutated body in the LAST records line of the pack is rejected too (stream verify covers every batch, not just the first)", async () => {
+    const fixture = await buildReadyDonorAndExport("tamper-body-last");
+    const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-tamper-body-last-target-"));
+    let targetStorage: DurableStorage | undefined;
+    let targetDatabase: WorkspaceDatabase | undefined;
+    try {
+      await seedFixtureFiles(targetRoot);
+      const lines = readRawPackLines(await readFile(fixture.packPath));
+      const recordsLineIndexes = lines.map((line, index) => ((line as { kind?: string }).kind === "records" ? index : -1)).filter((index) => index >= 0);
+      expect(recordsLineIndexes.length).toBeGreaterThan(0);
+      const recordsLine = lines[recordsLineIndexes[recordsLineIndexes.length - 1]!] as { rows: { body_payload_hex?: string }[] };
+      const candidates = recordsLine.rows.filter((row) => typeof row.body_payload_hex === "string" && row.body_payload_hex.length > 4);
+      expect(candidates.length).toBeGreaterThan(0);
+      const target = candidates[candidates.length - 1]!;
+      const mutated = Buffer.from(target.body_payload_hex!, "hex");
+      mutated[0] = (mutated[0]! + 1) % 256;
+      target.body_payload_hex = mutated.toString("hex");
+      const tamperedPath = join(fixture.dataRoot, "tampered-body-last.index-pack.gz");
+      await writeFile(tamperedPath, writeRawPackLines(lines));
+
+      const targetDataRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-tamper-body-last-data-"));
+      targetStorage = await createDurableStorage({ rootDir: targetDataRoot });
+      const targetRegistry = new WorkspaceRegistry();
+      const targetWorkspace = await registerEngineWorkspace(targetRegistry, targetRoot, "target");
+      targetDatabase = await openEngineWorkspace(targetStorage, targetWorkspace);
+      const preparedTarget = await prepareRegistry(targetWorkspace.workspace_id);
+      const targetPlugin = providerFor(preparedTarget, targetWorkspace.workspace_id);
+
+      const outcome = await attemptIndexPackImport({ workspace: targetWorkspace, database: asStorageDatabase(targetDatabase), storage: asDurableStorage(targetStorage), registry: targetRegistry, plugin: targetPlugin, pack_path: tamperedPath, inclusion_rules: INDEX_PACK_INCLUSION_RULES });
+      expect(outcome.status).toBe("skipped");
+
+      const fallback = await runFullWorkspaceScan({ root: targetRoot, database: asStorageDatabase(targetDatabase), workspace_id: targetWorkspace.workspace_id, plugin: targetPlugin, inclusion_rules: INDEX_PACK_INCLUSION_RULES });
+      expect(fallback.status).toBe("published");
+    } finally {
+      if (targetDatabase) await targetDatabase.close().catch(() => undefined);
+      if (targetStorage) await targetStorage.close();
+      await rm(targetRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await teardown(fixture);
+    }
+  }, 120_000);
+
   it("(c) a forged record_id is rejected and rolled back", async () => {
     const fixture = await buildReadyDonorAndExport("tamper-id");
     const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-tamper-id-target-"));
