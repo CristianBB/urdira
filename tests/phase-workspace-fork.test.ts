@@ -304,6 +304,17 @@ async function pollUntilSettled(client: DaemonClient, workspaceId: string, timeo
       const detailPayload = detail.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> };
       const detailWorkspace = detailPayload.workspaces[0];
       if (detailWorkspace === undefined) throw new Error("core:index_status (detail) returned no workspace entry.");
+      // The same staged-rescan race as the `core:index_unavailable` branch
+      // above, one step later: the detail call can SUCCEED while the
+      // workspace has already transitioned back to "indexing" (a staged
+      // pipeline's between-stage window, widened under full-suite parallel
+      // load). Returning that momentary "indexing" here was this suite's
+      // long-standing intermittent "expected 'ready', received 'indexing'"
+      // flake -- keep polling until the detail view itself settles.
+      if (detailWorkspace.workspace_status !== "ready" && detailWorkspace.workspace_status !== "degraded") {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        continue;
+      }
       return detailWorkspace;
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
