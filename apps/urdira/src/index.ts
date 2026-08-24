@@ -382,7 +382,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
     configuration,
     dependency_roles: [...JAVASCRIPT_TYPESCRIPT_DEPENDENCY_ROLES],
     ...(graphPreseedEnabled ? { on_source_text: onSourceText } : {}),
-    analyze: async ({ workspace_id, candidate, artifacts, changed_artifact_ids, publication_stage_id }) => {
+    analyze: async ({ workspace_id, candidate, artifacts, changed_artifact_ids, publication_stage_id, on_accepted_delta }) => {
       const stage = publication_stage_id === undefined
         ? undefined
         : JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES.find((entry) => entry.stage_id === publication_stage_id);
@@ -767,7 +767,13 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         }
         if (batchIndex > 0 && !finalSeen) throw new Error("Plugin FactDelta batches must terminate with a final batch.");
         await flushNativeBatches();
-        return compactAcceptedFactDelta(delta);
+        const compacted = compactAcceptedFactDelta(delta);
+        // (3a pipelined) Hand the compacted delta to the engine's observer
+        // the moment it exists, so per-record digest work overlaps the rest
+        // of this analyze instead of running after it. Best-effort hook: it
+        // must never be able to fail an analyze.
+        if (on_accepted_delta !== undefined) { try { on_accepted_delta(compacted); } catch { /* optimization hook, never a contract */ } }
+        return compacted;
       };
       const invokeShard = async (shard: readonly AnalysisPlan[], shardIndex: number): Promise<readonly { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[]> => {
         if (shard.length === 0) return [];

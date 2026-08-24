@@ -20,16 +20,18 @@
 // imported by other modules.
 import { createHash, type Hash } from "node:crypto";
 import { parentPort } from "node:worker_threads";
-import { encodeArrayHeader, encodeCanonicalInto } from "@urdira/canonical";
+import { canonicalBytes, digestBytes, encodeArrayHeader, encodeCanonicalInto } from "@urdira/canonical";
 import { packedTemplateValueForDigest } from "./candidate-materialization.js";
 
 interface BeginSetMessage { readonly kind: "begin_set"; readonly set_id: string; readonly mapping: "canonical" | "template"; readonly entry_count: number }
 interface ElementsMessage { readonly kind: "elements"; readonly set_id: string; readonly elements: readonly unknown[] }
 interface FinishSetMessage { readonly kind: "finish_set"; readonly set_id: string }
+interface RecordDigestsMessage { readonly kind: "record_digests"; readonly batch_id: string; readonly canonical_records: readonly string[] }
 interface EndMessage { readonly kind: "end" }
 
 interface AckMessage { readonly kind: "ack"; readonly set_id: string }
 interface SetResultMessage { readonly kind: "set_result"; readonly set_id: string; readonly content_digest: string }
+interface RecordDigestsResultMessage { readonly kind: "record_digests_result"; readonly batch_id: string; readonly digests: readonly string[] }
 interface WorkerErrorMessage { readonly kind: "error"; readonly error: { readonly name: string; readonly message: string } }
 
 const port = parentPort;
@@ -37,8 +39,17 @@ if (!port) throw new Error("The materialization digest worker entry must be run 
 
 const openSets = new Map<string, { readonly hash: Hash; readonly mapping: "canonical" | "template"; declared: number; seen: number }>();
 
-port.on("message", (message: BeginSetMessage | ElementsMessage | FinishSetMessage | EndMessage) => {
+port.on("message", (message: BeginSetMessage | ElementsMessage | FinishSetMessage | RecordDigestsMessage | EndMessage) => {
   try {
+    if (message.kind === "record_digests") {
+      // (3a) Per-record content digests, the exact `recordDigest` formula
+      // for a compacted record (`candidate-materialization.ts`):
+      // digestBytes(canonicalBytes(JSON.parse(canonical_record))). Order is
+      // the contract -- digests[i] belongs to canonical_records[i].
+      const digests = message.canonical_records.map((canonicalRecord) => digestBytes(canonicalBytes(JSON.parse(canonicalRecord))));
+      port.postMessage({ kind: "record_digests_result", batch_id: message.batch_id, digests } satisfies RecordDigestsResultMessage);
+      return;
+    }
     if (message.kind === "begin_set") {
       const hash = createHash("sha256");
       hash.update(encodeArrayHeader(message.entry_count));

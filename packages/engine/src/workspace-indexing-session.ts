@@ -125,6 +125,17 @@ export interface WorkspaceScanPluginProvider {
     /** Ordered publication stage requested by the core; omitted means legacy full analysis. */
     readonly publication_stage_id?: string;
     readonly preceding_stage_snapshot_id?: string;
+    /**
+     * (3a pipelined) Optional observer invoked once per accepted delta, the
+     * moment the provider compacts it (i.e. INSIDE `plugin_analyze`'s own
+     * span, while later analysis work is still in flight). The engine uses
+     * it to start the per-record digest work early on a worker thread so
+     * the post-analysis `template_accumulator_accept` pass shrinks to
+     * whatever was not pipelined. Purely an optimization hook: a provider
+     * that never calls it (or a run where the digest worker fails) leaves
+     * every delta to the unchanged synchronous accept loop.
+     */
+    readonly on_accepted_delta?: (delta: MaterializationAcceptedFactDelta) => void;
   }): Promise<WorkspaceScanAnalysisOutcome>;
 }
 
@@ -1060,8 +1071,83 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
             stageTimings["analyzed_artifact_count_before_plugin"] = selected.length;
             return selected;
           })();
+        // (3a pipelined) When a first-scan accumulator exists, per-record
+        // digest work is started the moment the provider hands over each
+        // compacted delta (`on_accepted_delta`, invoked inside
+        // `plugin_analyze`'s span): batches of `canonical_record` strings go
+        // to a digest-offload worker, and each response's continuation
+        // applies `acceptPrecomputed` + marks the delta in `accumulatorFed`
+        // -- so the synchronous `template_accumulator_accept` loop below
+        // shrinks to whatever was never pipelined (nothing, on a healthy
+        // run; everything, when the worker fails or the provider ignores
+        // the hook -- both degrade to the unchanged path, never a changed
+        // result).
+        const accumulatorFed = templateAccumulator === undefined ? undefined : new Set<string>();
+        // One small-heap worker, not the seal offload's two: the ~24s of
+        // record-digest CPU fits comfortably inside plugin_analyze's window
+        // on a single worker, and this worker lives through the whole
+        // analyze phase -- the phase whose RSS the in-product shard budget
+        // polices most tightly.
+        const acceptPipeline = templateAccumulator === undefined ? undefined : MaterializationDigestOffload.create({ workers: 1, max_old_generation_size_mb: 128 });
+        const PIPELINE_BATCH_RECORDS = 2_000;
+        let pipelineBroken = false;
+        let pendingPipelineDeltas: { readonly delta: MaterializationAcceptedFactDelta; readonly strings: readonly string[] }[] = [];
+        let pendingPipelineRecords = 0;
+        const inflightPipelineApplies: Promise<void>[] = [];
+        // Digests only, NOT applied templates: building ~1M open templates +
+        // memo entries during analyze moved hundreds of MB of the publish
+        // window INTO the analyze window and pushed the daemon past the
+        // in-product analysis RSS budget (measured live: mid-scan shard
+        // demotion at 2 shards). Buffering just the digest strings (~70B per
+        // record) keeps the analyze-phase footprint flat; the template build
+        // itself is cheap object assembly and stays in the post-analysis
+        // pass below, where it always was.
+        const pipelinedDigests: { readonly delta: MaterializationAcceptedFactDelta; readonly digests: readonly string[] }[] = [];
+        const pipelinedDeltaIds = new Set<string>();
+        const flushPipeline = (): void => {
+          if (acceptPipeline === undefined || pendingPipelineDeltas.length === 0) return;
+          const batch = pendingPipelineDeltas;
+          pendingPipelineDeltas = [];
+          pendingPipelineRecords = 0;
+          inflightPipelineApplies.push(acceptPipeline.digestRecords(batch.flatMap((entry) => entry.strings)).then((digests) => {
+            let offset = 0;
+            for (const entry of batch) {
+              pipelinedDigests.push({ delta: entry.delta, digests: digests.slice(offset, offset + entry.strings.length) });
+              offset += entry.strings.length;
+              pipelinedDeltaIds.add(entry.delta.delta.fact_delta_id);
+            }
+          }).catch(() => { pipelineBroken = true; }));
+        };
+        const onAcceptedDelta = templateAccumulator === undefined || acceptPipeline === undefined ? undefined : (delta: MaterializationAcceptedFactDelta): void => {
+          if (pipelineBroken) return;
+          const strings: string[] = [];
+          for (const set of delta.replacement_sets) {
+            for (const record of set.records) {
+              // A non-compacted record cannot be digested from a string;
+              // leave the whole delta to the sync loop, which will
+              // disqualify the accumulator exactly as before.
+              if (!("canonical_record" in (record as object))) return;
+              strings.push((record as { readonly canonical_record: string }).canonical_record);
+            }
+          }
+          pendingPipelineDeltas.push({ delta, strings });
+          pendingPipelineRecords += strings.length;
+          if (pendingPipelineRecords >= PIPELINE_BATCH_RECORDS) flushPipeline();
+        };
         const analyzeStartedAt = engineTimingEnabled() ? performance.now() : 0;
-        analysis = await timed("plugin_analyze", () => input.plugin.analyze({ workspace_id: workspaceId, candidate: executingCandidate, artifacts: incrementalArtifacts, ...(changedArtifactIds === undefined ? {} : { changed_artifact_ids: changedArtifactIds }), ...(input.publication_stage_id === undefined ? {} : { publication_stage_id: input.publication_stage_id }) }));
+        try {
+          analysis = await timed("plugin_analyze", () => input.plugin.analyze({ workspace_id: workspaceId, candidate: executingCandidate, artifacts: incrementalArtifacts, ...(changedArtifactIds === undefined ? {} : { changed_artifact_ids: changedArtifactIds }), ...(input.publication_stage_id === undefined ? {} : { publication_stage_id: input.publication_stage_id }), ...(onAcceptedDelta === undefined ? {} : { on_accepted_delta: onAcceptedDelta }) }));
+          // Drain: every pipelined delta must be applied (or its batch
+          // failed, leaving it un-fed for the sync loop) before eligibility
+          // is decided. On a healthy run the workers already kept pace, so
+          // this await is near-zero -- its residual is timed separately.
+          const drainStartedAt = engineTimingEnabled() ? performance.now() : 0;
+          flushPipeline();
+          if (inflightPipelineApplies.length > 0) await Promise.all(inflightPipelineApplies);
+          if (engineTimingEnabled()) recordEngineTiming("template_accumulator_pipeline_drain", performance.now() - drainStartedAt);
+        } finally {
+          acceptPipeline?.close();
+        }
         const analyzeElapsedMs = engineTimingEnabled() ? performance.now() - analyzeStartedAt : 0;
         // (3a) Feed each delta into the template accumulator as its native
         // batch's own durable write confirms, keyed by `fact_delta_id` (the
@@ -1074,7 +1160,6 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         // order-independent, so feeding native-batch deltas before any
         // remaining non-native ones is safe.
         const acceptedDeltasByFactDeltaId = templateAccumulator === undefined ? undefined : new Map(analysis.accepted_deltas.map((delta) => [delta.delta.fact_delta_id, delta] as const));
-        const accumulatorFed = templateAccumulator === undefined ? undefined : new Set<string>();
         for (const native of analysis.native_batches ?? []) {
           // `accept_native_stage_engine_loop` (P3-3c: renamed from
           // `accept_native_stage` -- see that item for the investigation).
@@ -1100,7 +1185,10 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
           if (engineTimingEnabled()) recordEngineTiming("accept_native_stage_engine_loop", performance.now() - nativeAcceptStartedAt);
           if (templateAccumulator !== undefined) {
             const delta = acceptedDeltasByFactDeltaId!.get(native.fact_delta_id);
-            if (delta !== undefined) { templateAccumulator.accept(delta); accumulatorFed!.add(native.fact_delta_id); }
+            // Skip anything the (3a) pipeline already digested during
+            // analyze (`pipelinedDeltaIds`; its templates are applied in the
+            // accept block below) or that was already accepted here.
+            if (delta !== undefined && !accumulatorFed!.has(native.fact_delta_id) && !pipelinedDeltaIds.has(native.fact_delta_id)) { templateAccumulator.accept(delta); accumulatorFed!.add(native.fact_delta_id); }
           }
         }
         // `template_accumulator_accept` (P3-3c): on the real path (see
@@ -1113,6 +1201,14 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         if (templateAccumulator !== undefined) {
           const acceptedDeltas = analysis.accepted_deltas;
           timedSyncEngine("template_accumulator_accept", () => {
+            // Pipelined deltas first: their record digests arrived from the
+            // worker during analyze, so this is pure template assembly (no
+            // hashing). Everything else takes the unchanged full accept().
+            for (const entry of pipelinedDigests) {
+              templateAccumulator.acceptPrecomputed(entry.delta, entry.digests);
+              accumulatorFed!.add(entry.delta.delta.fact_delta_id);
+            }
+            pipelinedDigests.length = 0;
             for (const delta of acceptedDeltas) if (!accumulatorFed!.has(delta.delta.fact_delta_id)) templateAccumulator.accept(delta);
           });
         }

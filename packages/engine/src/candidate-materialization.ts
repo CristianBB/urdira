@@ -1038,6 +1038,51 @@ export class CandidateRecordTemplateAccumulator {
   }
 
   /**
+   * (3a pipelined) `accept()` with the per-record content digests already
+   * computed elsewhere (the digest-offload worker, during
+   * `plugin_analyze`'s own awaits), in this delta's record iteration order
+   * (replacement set by replacement set, record by record -- exactly the
+   * order `accept()` visits and the order the caller extracted
+   * `canonical_record` strings in). Everything except the `recordDigest`
+   * call is identical to `accept()`; a digest-count mismatch or a
+   * non-compacted record disqualifies, exactly like `accept()`'s own
+   * disqualification, so a confused caller degrades to the one-shot path
+   * instead of producing a wrong candidate.
+   */
+  acceptPrecomputed(delta: MaterializationAcceptedFactDelta, digests: readonly string[]): void {
+    this.acceptedDeltas.push(delta);
+    if (this.disqualified) return;
+    const disqualify = (): void => {
+      this.disqualified = true;
+      this.opens.length = 0;
+      this.identityRaw.length = 0;
+      this.proposalRecordIds.clear();
+      this.recordOpenMemo.clear();
+    };
+    const dependencyProposalKeys = this.retainEveryProposalId ? undefined : (() => {
+      const keys = new Set<string>();
+      for (const dependency of delta.delta.proposed_dependencies ?? []) keys.add(dependency.proposal_record_key);
+      return keys;
+    })();
+    let digestIndex = 0;
+    for (const set of delta.replacement_sets) {
+      for (const record of set.records) {
+        if (!isMaterializationProposedRecord(record) || digestIndex >= digests.length) { disqualify(); return; }
+        const identityType = identityTypeForCategory(record.category) ?? "entity";
+        const recordContentDigest = digests[digestIndex]!;
+        digestIndex += 1;
+        const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
+        if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.proposalRecordIds.set(record.proposal_record_key, recordId);
+        const openTemplate = { record_without_validity: record.canonical_record, open_reason_code: "core:record_created", owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id, cause_references: causes(record.owner_artifact_id), record_id_hint: recordId, record_digest_hint: recordContentDigest } as CandidateRecordOpenTemplate;
+        this.opens.push(openTemplate);
+        this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
+        this.identityRaw.push({ identityType, identityKey: record.identity_key, recordId, ownerArtifactId: record.owner_artifact_id, ownerArtifactVersionId: record.owner_artifact_version_id, proposalRecordKey: record.proposal_record_key });
+      }
+    }
+    if (digestIndex !== digests.length) disqualify();
+  }
+
+  /**
    * Sort, freeze, and (for a small candidate) compute the two identity
    * digests `recordTemplates`'s packed branch defers past the threshold --
    * the only work left for the final synchronous pass. Throws if called
@@ -1125,12 +1170,21 @@ export class CandidateMaterializer {
     const prepared = this.#prepare(input, accumulator);
     let opensSetText: string;
     let identitiesSetText: string;
+    let preassembled: PreassembledSealPieces | undefined;
     try {
       const identitiesPacked = prepared.identityAssignments.length > 0 && isPackedCandidateTemplate(prepared.identityAssignments[0]);
-      const [opensDigest, identitiesDigest] = await timed("seal_ordered_digests", () => Promise.all([
-        offload.digestSet("canonical", prepared.recordOpens),
-        offload.digestSet(identitiesPacked ? "template" : "canonical", prepared.identityAssignments),
-      ]));
+      const opensPromise = offload.digestSet("canonical", prepared.recordOpens);
+      const identitiesPromise = offload.digestSet(identitiesPacked ? "template" : "canonical", prepared.identityAssignments);
+      // Attach no-op catches so a fast worker failure cannot surface as an
+      // unhandled rejection while the main thread is still busy below.
+      void opensPromise.catch(() => undefined);
+      void identitiesPromise.catch(() => undefined);
+      // Main-thread work that does NOT depend on the offloaded digests runs
+      // HERE, overlapped with the workers -- delta digests + the five small
+      // descriptors -- so the await below only pays whatever worker wall
+      // time is left after the main thread finishes its own share.
+      preassembled = this.#preassemble(input, prepared);
+      const [opensDigest, identitiesDigest] = await timed("seal_ordered_digests", () => Promise.all([opensPromise, identitiesPromise]));
       // Publication's `verifyTemplateSetAgainstDescriptor` reuses seal-time
       // digests through the frozen-array memo; the in-process digest calls
       // would have written these entries themselves, so the off-thread
@@ -1144,7 +1198,7 @@ export class CandidateMaterializer {
       opensSetText = timedSync("seal_ordered_digests", () => canonicalJson(orderedSetDescriptor("core:CandidateRecordOpenTemplate", prepared.recordOpens)));
       identitiesSetText = timedSync("seal_ordered_digests", () => canonicalJson(orderedSetDescriptor("core:CandidateIdentityAssignmentTemplate", prepared.identityAssignments)));
     }
-    return this.#assemble(input, prepared, opensSetText, identitiesSetText);
+    return this.#assemble(input, prepared, opensSetText, identitiesSetText, preassembled);
   }
 
   #prepare(input: CandidateMaterializationInput, accumulator?: CandidateRecordTemplateAccumulator): PreparedSeal {
@@ -1223,8 +1277,27 @@ export class CandidateMaterializer {
    * computation every one of those templates still needs before it can be
    * durably published.
    */
-  #assemble(input: CandidateMaterializationInput, prepared: PreparedSeal, opensSetText: string, identitiesSetText: string): SealedCandidateMaterialization {
+  /**
+   * Everything a sealed `semanticPayload` needs EXCEPT the two offloadable
+   * set descriptors -- split out so `sealAsync` can compute all of this on
+   * the main thread WHILE the offload workers digest the two big sets,
+   * instead of idling on the await. Pure functions of the same inputs, so
+   * computing them before or after those digests is byte-identical.
+   */
+  #preassemble(input: CandidateMaterializationInput, prepared: PreparedSeal): PreassembledSealPieces {
+    return timedSync("seal_ordered_digests", () => ({
+      accepted_fact_delta_digests: sorted(input.accepted_deltas.map(semanticAcceptedDeltaDigest), (entry) => entry),
+      source_transition_template_set: canonicalJson(orderedSetDescriptor("core:CandidateSourceTransitionTemplate", prepared.sourceTransitions)),
+      record_closure_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordClosureTemplate", prepared.recordClosures)),
+      artifact_dependency_template_set: canonicalJson(orderedSetDescriptor("core:RecordArtifactDependency", prepared.recordDependencies)),
+      lookup_dependency_template_set: canonicalJson(orderedSetDescriptor("core:PluginLookupInvalidationDependency", prepared.lookupBindings)),
+      lookup_revalidation_template_set: canonicalJson(orderedSetDescriptor("core:LookupRevalidationTemplate", prepared.lookupRevalidations)),
+    }));
+  }
+
+  #assemble(input: CandidateMaterializationInput, prepared: PreparedSeal, opensSetText: string, identitiesSetText: string, preassembled?: PreassembledSealPieces): SealedCandidateMaterialization {
     const { records, projections, recordDependencies, lookupBindings, projectionDependencies, lookupRevalidations, sourceTransitions, recordClosures, barrierKeys } = prepared;
+    const pieces = preassembled ?? this.#preassemble(input, prepared);
     const semanticPayload = timedSync("seal_ordered_digests", () => ({
       workspace_id: input.candidate.workspace_id,
       // Materialization identity is candidate-salted so distinct candidates
@@ -1234,18 +1307,18 @@ export class CandidateMaterializer {
       // A resumed candidate still re-seals to the identical id and digest,
       // since it re-derives from the same candidate_generation_id.
       candidate_generation_id: input.candidate.candidate_generation_id,
-      accepted_fact_delta_digests: sorted(input.accepted_deltas.map(semanticAcceptedDeltaDigest), (entry) => entry),
-      source_transition_template_set: canonicalJson(orderedSetDescriptor("core:CandidateSourceTransitionTemplate", sourceTransitions)),
+      accepted_fact_delta_digests: pieces.accepted_fact_delta_digests,
+      source_transition_template_set: pieces.source_transition_template_set,
       record_open_template_set: opensSetText,
-      record_closure_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordClosureTemplate", recordClosures)),
+      record_closure_template_set: pieces.record_closure_template_set,
       identity_assignment_template_set: identitiesSetText,
       projection_open_template_sets: projections.opens,
       projection_closure_template_sets: projections.closures,
       capability_state_entries: input.capability_state_entries,
       source_observation_watermarks: input.source_observation_watermarks,
-      artifact_dependency_template_set: canonicalJson(orderedSetDescriptor("core:RecordArtifactDependency", recordDependencies)),
-      lookup_dependency_template_set: canonicalJson(orderedSetDescriptor("core:PluginLookupInvalidationDependency", lookupBindings)),
-      lookup_revalidation_template_set: canonicalJson(orderedSetDescriptor("core:LookupRevalidationTemplate", lookupRevalidations)),
+      artifact_dependency_template_set: pieces.artifact_dependency_template_set,
+      lookup_dependency_template_set: pieces.lookup_dependency_template_set,
+      lookup_revalidation_template_set: pieces.lookup_revalidation_template_set,
     }));
     const semanticDigest = timedSync("seal_ordered_digests", () => digest({ ...semanticPayload, projection_dependencies: projectionDependencies }));
     const materialization = timedSync("seal_ordered_digests", () => freeze({
@@ -1255,6 +1328,15 @@ export class CandidateMaterializer {
     }));
     return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: sourceTransitions, record_opens: prepared.recordOpens, record_closures: recordClosures, identity_assignments: prepared.identityAssignments, record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: lookupRevalidations, projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort(), record_open_memo: records.record_open_memo });
   }
+}
+
+interface PreassembledSealPieces {
+  readonly accepted_fact_delta_digests: readonly string[];
+  readonly source_transition_template_set: string;
+  readonly record_closure_template_set: string;
+  readonly artifact_dependency_template_set: string;
+  readonly lookup_dependency_template_set: string;
+  readonly lookup_revalidation_template_set: string;
 }
 
 interface PreparedSeal {

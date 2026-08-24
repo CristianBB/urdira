@@ -485,6 +485,48 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     }
   });
 
+  // (3e) The pipelined accept path: digests computed by the offload worker
+  // over the compacted records' canonical_record strings, applied via
+  // acceptPrecomputed, must seal byte-identically to the plain accept()
+  // path over the same deltas -- and a digest-count mismatch must
+  // disqualify (falling back to the one-shot path) instead of sealing a
+  // wrong candidate.
+  it("(3e) acceptPrecomputed with worker-computed record digests seals identically to accept()", async () => {
+    const records = Array.from({ length: 500 }, (_unused, index) => record(`pipelined-${index}`, `body-${index}`));
+    const raw = acceptedDelta(records);
+    const compact = compactAcceptedFactDelta({
+      ...raw,
+      delta: { ...raw.delta, fact_delta_id: "delta:pipelined", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+
+    const syncAccumulator = new CandidateRecordTemplateAccumulator("workspace:1", false);
+    syncAccumulator.accept(compact);
+    const syncSealed = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }), syncAccumulator);
+
+    const offload = MaterializationDigestOffload.create();
+    expect(offload).toBeDefined();
+    try {
+      const strings = compact.replacement_sets.flatMap((set) => set.records.map((entry) => (entry as { canonical_record: string }).canonical_record));
+      const digests = await offload!.digestRecords(strings);
+      expect(digests).toHaveLength(records.length);
+      const pipelinedAccumulator = new CandidateRecordTemplateAccumulator("workspace:1", false);
+      pipelinedAccumulator.acceptPrecomputed(compact, digests);
+      const pipelinedSealed = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }), pipelinedAccumulator);
+      expect(pipelinedSealed.materialization).toEqual(syncSealed.materialization);
+      expect(pipelinedSealed.record_opens).toEqual(syncSealed.record_opens);
+      expect(pipelinedSealed.identity_assignments).toEqual(syncSealed.identity_assignments);
+    } finally {
+      offload?.close();
+    }
+
+    // Count mismatch disqualifies; seal falls back to the (identical) one-shot path.
+    const mismatched = new CandidateRecordTemplateAccumulator("workspace:1", false);
+    mismatched.acceptPrecomputed(compact, ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]);
+    expect(mismatched.isDisqualified).toBe(true);
+    const fallbackSealed = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }), mismatched);
+    expect(fallbackSealed.materialization).toEqual(syncSealed.materialization);
+  }, 30_000);
+
   // (1c) The packed-identity triple memo: seal() memoizes
   // `identity_assignment_id`/`identity_id`'s hex suffix/`identity_key_digest`
   // against each packed tuple's own array identity the moment it builds that

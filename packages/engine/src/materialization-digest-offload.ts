@@ -27,6 +27,7 @@ interface WorkerSlot {
   waiters: (() => void)[];
   failure: string | undefined;
   readonly pendingSets: Map<string, { readonly resolve: (digest: DigestText) => void; readonly reject: (error: Error) => void }>;
+  readonly pendingRecordBatches: Map<string, { readonly resolve: (digests: readonly string[]) => void; readonly reject: (error: Error) => void }>;
 }
 
 export class MaterializationDigestOffload {
@@ -34,21 +35,30 @@ export class MaterializationDigestOffload {
   #nextSlot = 0;
   #nextSetId = 0;
 
-  static create(): MaterializationDigestOffload | undefined {
+  static create(options?: { readonly workers?: number; readonly max_old_generation_size_mb?: number }): MaterializationDigestOffload | undefined {
     if (process.env["URDIRA_SEAL_DIGEST_WORKERS"] === "0") return undefined;
     try {
       const offload = new MaterializationDigestOffload();
       const workerEntry = new URL("materialization-digest-worker.js", import.meta.resolve("@urdira/engine"));
-      for (let index = 0; index < DIGEST_OFFLOAD_WORKERS; index += 1) {
-        const worker = new Worker(workerEntry);
-        const slot: WorkerSlot = { worker, inflightBatches: 0, waiters: [], failure: undefined, pendingSets: new Map() };
+      for (let index = 0; index < (options?.workers ?? DIGEST_OFFLOAD_WORKERS); index += 1) {
+        // Bounded old-space: these workers only ever hold a few acked
+        // batches plus streaming hash state, but V8's default heap ceiling
+        // lets GC laziness balloon each worker's RSS by hundreds of MB
+        // right inside the windows whose peak RSS is what gates the 2-shard
+        // default (measured live: the un-capped version pushed the daemon
+        // past the in-product analysis budget and triggered a mid-scan
+        // shard demotion). Cap it so the workers' combined footprint stays
+        // small and GC runs eagerly instead.
+        const worker = new Worker(workerEntry, { resourceLimits: { maxOldGenerationSizeMb: options?.max_old_generation_size_mb ?? 256 } });
+        const slot: WorkerSlot = { worker, inflightBatches: 0, waiters: [], failure: undefined, pendingSets: new Map(), pendingRecordBatches: new Map() };
         const failSlot = (message: string): void => {
           slot.failure = slot.failure ?? message;
           slot.inflightBatches = 0;
           for (const waiter of slot.waiters.splice(0)) waiter();
           for (const [setId, pending] of [...slot.pendingSets]) { slot.pendingSets.delete(setId); pending.reject(new Error(message)); }
+          for (const [batchId, pending] of [...slot.pendingRecordBatches]) { slot.pendingRecordBatches.delete(batchId); pending.reject(new Error(message)); }
         };
-        worker.on("message", (message: { readonly kind: string; readonly set_id?: string; readonly content_digest?: string; readonly error?: { readonly message: string } }) => {
+        worker.on("message", (message: { readonly kind: string; readonly set_id?: string; readonly batch_id?: string; readonly content_digest?: string; readonly digests?: readonly string[]; readonly error?: { readonly message: string } }) => {
           if (message.kind === "ack") {
             slot.inflightBatches = Math.max(0, slot.inflightBatches - 1);
             const waiter = slot.waiters.shift();
@@ -57,6 +67,10 @@ export class MaterializationDigestOffload {
             const pending = slot.pendingSets.get(message.set_id);
             slot.pendingSets.delete(message.set_id);
             pending?.resolve(message.content_digest as DigestText);
+          } else if (message.kind === "record_digests_result" && message.batch_id !== undefined && message.digests !== undefined) {
+            const pending = slot.pendingRecordBatches.get(message.batch_id);
+            slot.pendingRecordBatches.delete(message.batch_id);
+            pending?.resolve(message.digests);
           } else {
             failSlot(message.error?.message ?? "materialization digest worker returned an unrecognized message");
           }
@@ -97,6 +111,32 @@ export class MaterializationDigestOffload {
       post({ kind: "finish_set", set_id: setId });
     } catch (error) {
       slot.pendingSets.delete(setId);
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+    return result;
+  }
+
+  /**
+   * (3a) Per-record content digests for a batch of compacted
+   * `canonical_record` strings, in order (digests[i] belongs to
+   * canonicalRecords[i]) -- the exact `recordDigest` formula, computed on a
+   * worker so the accept phase's dominant cost overlaps `plugin_analyze`'s
+   * own awaits instead of running as one synchronous post-analysis pass.
+   * Rejects on worker trouble; the caller falls back to synchronous
+   * `accept()` for whatever was not applied.
+   */
+  async digestRecords(canonicalRecords: readonly string[]): Promise<readonly string[]> {
+    if (this.#slots.length === 0) throw new Error("materialization digest offload has no workers");
+    const slot = this.#slots[this.#nextSlot % this.#slots.length]!;
+    this.#nextSlot += 1;
+    if (slot.failure !== undefined) throw new Error(slot.failure);
+    const batchId = `records-${this.#nextSetId}`;
+    this.#nextSetId += 1;
+    const result = new Promise<readonly string[]>((resolve, reject) => { slot.pendingRecordBatches.set(batchId, { resolve, reject }); });
+    try {
+      slot.worker.postMessage({ kind: "record_digests", batch_id: batchId, canonical_records: canonicalRecords });
+    } catch (error) {
+      slot.pendingRecordBatches.delete(batchId);
       throw error instanceof Error ? error : new Error(String(error));
     }
     return result;
