@@ -130,3 +130,46 @@ a fork of this workspace would pay the same), (2) sharded parallel
 double-read (campaign-1 queue). Import remains strictly opt-in and
 fallback-safe, so shipping with the export win and the correctness fix is
 strictly better than before in every case.
+
+## Import optimization round (same day): 647s → 280s, now faster than a scan
+
+Levers (1) and (2) implemented and re-measured with real imports of the
+same 440MB c3 pack (no donor rebuild — the pack is the reusable asset).
+
+**Bulk copy: 391.9s → 60-74s (~6x).** Three standard bulk-load moves in
+`bulkCopyRecordsAndIdentities` (`workspace-fork.ts`, shared with local
+fork): (a) drop the secondary indexes on `record_occurrences`/
+`identity_assignments` before the inserts and recreate them after, all
+INSIDE the same transaction (SQLite DDL is transactional, so any failure
+rolls the schema back with the rows; the DDL is captured verbatim from
+`sqlite_master`, never hardcoded); (b) `ORDER BY` the big SELECTs by the
+target PK prefix so the un-droppable PK autoindexes append instead of
+splitting randomly; (c) one deliberate index on the scratch donor's
+`record_occurrences(record_id)` after its bulk load, replacing the
+per-statement ~1M-row automatic indexes the value_nodes/identities JOINs
+were silently building.
+
+**Sharded verify: 95.6s → 69.6s only (~1.4x) — parallelism hypothesis
+REFUTED on this hardware.** The sharding itself is correct (8 contiguous
+keyset ranges, 125,368/125,367 rows each, no gaps — regression-tested by
+corrupting a mid-range row at (g2) scale and demanding detection), but
+per-shard probes measured hard contention: one shard alone runs 125k rows
+in 8.3s (66µs/row); at 2/4/8 concurrent shards the per-row cost degrades
+to 103/195/360µs — aggregate throughput saturates at ~1.4x single-thread,
+and the SAME saturation reproduces with separate OS processes, so it is
+not a process-global SQLite mutex but a machine-level ceiling for this
+read+decode+digest mix (allocation/memory-bound, not CPU-bound). Kept:
+1.4x is still real, the fallback below 50k rows keeps small imports
+worker-free, and the failure mode is fail-safe (a shard error throws →
+skip+fallback, never a silently passed verify).
+
+**Live import composition after this round** (`phase2-iterB.log`, clean
+machine): total **280.2s** — `source_provider_read` 169.0s (60%; the
+shared source-catalog cost, campaign-1's double-read lever),
+`bulk_copy` 73.8s, `verify` 69.6s (overlaps SQL waits), scratch 8.0s,
+parse 2.1s. Import now beats the 324s from-zero scan on the same machine;
+the 60-100s target still stands as future work, and the highest-leverage
+remaining ideas are the source-catalog double-read fix and moving the
+per-record verify to STREAM time (during scratch build, overlapping the
+source read entirely and rejecting a bad pack before any durable write —
+a trust-boundary placement change that needs its own design pass).

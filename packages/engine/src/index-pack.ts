@@ -1,9 +1,10 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
+import { Worker } from "node:worker_threads";
 import { createGunzip, createGzip, type Gzip } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
 import { canonicalBytes, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
@@ -771,6 +772,14 @@ class ScratchDonorDatabase {
       this.raw.exec("COMMIT;");
       this.transactionOpen = false;
     }
+    // `bulkCopyRecordsAndIdentities`'s value_nodes and identities statements
+    // both JOIN this scratch's record_occurrences ON record_id; without an
+    // index SQLite builds a transient automatic index over the full table
+    // PER STATEMENT (two ~1M-row builds at VS Code scale), and the records
+    // statement's new ORDER BY d.record_id gets a sort for free from the
+    // same index. One deliberate index after the bulk inserts costs a
+    // single sort-based build instead.
+    this.raw.exec("CREATE INDEX scratch_records_record_id ON record_occurrences (record_id);");
   }
 
   insertRecords(rows: readonly Record<string, unknown>[], uriMap: ReadonlyMap<string, DonorArtifactEntry>): void {
@@ -896,7 +905,16 @@ const RECORD_ID_PATTERN = /^record:[0-9a-f]{64}$/u;
  * that does not match its own record_digest), which is the class of tamper a
  * naive forger would actually produce.
  */
-async function verifyCopiedRecordIntegrity(target: WorkspaceDatabase, workspaceId: string, generation: number): Promise<readonly string[]> {
+export async function verifyCopiedRecordIntegrity(target: WorkspaceDatabase, workspaceId: string, generation: number): Promise<readonly string[]> {
+  // Above this row count the pure-CPU decode+digest loop is sharded across
+  // worker threads over contiguous record_id ranges (the check is strictly
+  // record-local; see `index-pack-verify-worker.ts`). Live VS Code measured
+  // the single-threaded loop at 108.6s for ~1M records -- the second-largest
+  // import cost after bulk copy. Below the threshold the worker spawn
+  // overhead is not worth it and the inline loop below runs unchanged.
+  const VERIFY_SHARD_MIN_ROWS = 50_000;
+  const total = (await target.database.get<{ c: number }>("SELECT COUNT(*) AS c FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ? AND valid_to_generation IS NULL", [workspaceId, generation]))?.c ?? 0;
+  if (total >= VERIFY_SHARD_MIN_ROWS) return shardedVerifyCopiedRecordIntegrity(target, workspaceId, generation, total);
   const failures: string[] = [];
   let cursor = "";
   for (;;) {
@@ -919,6 +937,43 @@ async function verifyCopiedRecordIntegrity(target: WorkspaceDatabase, workspaceI
     if (failures.length > 0) break;
   }
   return failures;
+}
+
+/**
+ * Fan the per-record integrity recompute out over worker threads, each
+ * holding its own read-only connection to the target's sqlite file over one
+ * contiguous `record_id` keyset range. Boundaries are picked with small-N
+ * `OFFSET` probes over the PK index (N-1 index scans total -- bounded and
+ * cheap, unlike per-page OFFSET pagination). A shard that fails to run at
+ * all (spawn/thread error) THROWS rather than returning an empty failure
+ * list: the caller's never-throws wrapper turns that into a skip+fallback,
+ * so a broken verify can never be mistaken for a passed one.
+ */
+async function shardedVerifyCopiedRecordIntegrity(target: WorkspaceDatabase, workspaceId: string, generation: number, totalRows: number): Promise<readonly string[]> {
+  const shardCount = Math.max(2, Math.min(8, availableParallelism() - 2));
+  const boundaries: string[] = [];
+  for (let shard = 1; shard < shardCount; shard += 1) {
+    const offset = Math.floor((totalRows * shard) / shardCount);
+    const row = await target.database.get<{ record_id: string }>(
+      "SELECT record_id FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ? AND valid_to_generation IS NULL ORDER BY record_id LIMIT 1 OFFSET ?",
+      [workspaceId, generation, offset],
+    );
+    if (row !== undefined) boundaries.push(row.record_id);
+  }
+  const uniqueBoundaries = [...new Set(boundaries)].sort();
+  const ranges = [...uniqueBoundaries, null].map((end, index) => ({ start: index === 0 ? "" : uniqueBoundaries[index - 1]!, end }));
+  const workerEntry = new URL("index-pack-verify-worker.js", import.meta.resolve("@urdira/engine"));
+  const shardFailures = await Promise.all(ranges.map((range) => new Promise<readonly string[]>((resolve, reject) => {
+    const worker = new Worker(workerEntry, { workerData: { filename: target.database.filename, workspace_id: workspaceId, generation, cursor_start: range.start, cursor_end: range.end, page_rows: SQL_PAGE_ROWS } });
+    let settled = false;
+    const settle = (run: () => void): void => { if (!settled) { settled = true; run(); } void worker.terminate(); };
+    worker.on("message", (message: { readonly kind: string; readonly failures?: readonly string[]; readonly error?: { readonly message: string } }) => {
+      settle(() => { if (message.kind === "result" && message.failures !== undefined) resolve(message.failures); else reject(new Error(message.error?.message ?? "verify shard returned an unrecognized message")); });
+    });
+    worker.on("error", (error) => settle(() => reject(error instanceof Error ? error : new Error(String(error)))));
+    worker.on("exit", (code) => { if (!settled) { settled = true; reject(new Error(`index pack verify shard exited with code ${code} before producing a result`)); } });
+  })));
+  return shardFailures.flat();
 }
 
 async function fastPackVerify(target: WorkspaceDatabase, workspaceId: string, manifest: IndexPackManifest, ids: ForkPublicationIds): Promise<{ readonly ok: boolean; readonly failures: readonly string[] }> {

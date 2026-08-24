@@ -20,6 +20,7 @@ import {
   type RegisteredWorkspace,
   type WorkspaceScanPluginProvider,
 } from "../packages/engine/src/index.js";
+import { verifyCopiedRecordIntegrity } from "../packages/engine/src/index-pack.js";
 import { computeForkSnapshotDigestFields, createDurableStorage, digestRelationalValue, snapshotDigest, type DurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
 import {
   FORK_INCLUSION_RULES as INDEX_PACK_INCLUSION_RULES,
@@ -638,6 +639,24 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
         ? (await targetDatabase.database.get<{ c: number }>("SELECT COUNT(*) AS c FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ? AND valid_to_generation IS NULL", [targetWorkspace.workspace_id, outcome.generation]))?.c ?? 0
         : 0;
       expect(importedCount).toBeGreaterThanOrEqual(N_SYNTHETIC_RECORDS);
+
+      // At this row count the untrusted verify runs SHARDED across worker
+      // threads (see shardedVerifyCopiedRecordIntegrity). A sharding bug
+      // that leaves a record_id range uncovered would silently WEAKEN the
+      // trust boundary while every honest import still passes -- so corrupt
+      // one mid-range imported row in place and demand the same verify
+      // entry the import used still catches it.
+      const victim = await targetDatabase.database.get<{ record_id: string }>(
+        "SELECT record_id FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ? AND valid_to_generation IS NULL AND body_payload IS NOT NULL ORDER BY record_id LIMIT 1 OFFSET ?",
+        [targetWorkspace.workspace_id, 1, Math.floor(N_SYNTHETIC_RECORDS / 2)],
+      );
+      expect(victim).toBeDefined();
+      await targetDatabase.database.run(
+        "UPDATE record_occurrences SET body_digest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000' WHERE workspace_id = ? AND record_id = ?",
+        [targetWorkspace.workspace_id, victim!.record_id],
+      );
+      const recheck = await verifyCopiedRecordIntegrity(asStorageDatabase(targetDatabase), targetWorkspace.workspace_id, 1);
+      expect(recheck.some((failure) => failure.includes(victim!.record_id))).toBe(true);
     } finally {
       if (targetDatabase) await targetDatabase.close().catch(() => undefined);
       if (targetStorage) await targetStorage.close();

@@ -672,8 +672,35 @@ export async function bulkCopyRecordsAndIdentities(target: WorkspaceDatabase, do
       await target.database.run(`INSERT INTO fork_artifact_map (donor_artifact_version_id, new_artifact_id, new_artifact_version_id) VALUES ${chunk.map(() => "(?, ?, ?)").join(", ")}`, params);
     }
 
+    // Bulk-insert B-tree maintenance dominated the live VS Code import
+    // (392s of a 647s import for ~2M rows -- see
+    // docs/evidence/2026-08-24-index-pack-codec-performance.md): every row
+    // incrementally maintained record_occurrences' 2 and
+    // identity_assignments' 3 secondary indexes, in effectively random key
+    // order. Two standard bulk-load moves, both INSIDE the same transaction
+    // so a failure at any point rolls the schema back with the rows
+    // (SQLite DDL is transactional):
+    // 1. Drop the secondary indexes first and recreate them after the
+    //    inserts -- a post-load CREATE INDEX is one sort-based bulk build
+    //    instead of per-row page splits. The DDL is captured verbatim from
+    //    sqlite_master (never hardcoded), so schema evolution cannot drift
+    //    this list; implicit PRIMARY KEY autoindexes have sql IS NULL and
+    //    are correctly excluded (they cannot be dropped).
+    // 2. ORDER BY the big SELECTs by the target's PK prefix so what CANNOT
+    //    be dropped (the PK autoindex) is appended in order instead of
+    //    split randomly.
+    // Fork and import share this function; both only ever publish into a
+    // first-generation workspace, so the recreate never pays for
+    // pre-existing foreign rows.
+    const secondaryIndexes = await target.database.all<{ name: string; sql: string }>(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('record_occurrences', 'identity_assignments') AND sql IS NOT NULL",
+    );
+    const dropIndexCommands = secondaryIndexes.map((index) => ({ kind: "run" as const, sql: `DROP INDEX ${index.name}`, params: [] }));
+    const createIndexCommands = secondaryIndexes.map((index) => ({ kind: "run" as const, sql: index.sql, params: [] }));
+
     const donorVisible = "d.valid_from_generation <= ? AND (d.valid_to_generation IS NULL OR d.valid_to_generation > ?)";
     await target.database.transaction([
+      ...dropIndexCommands,
       {
         kind: "run",
         sql: `INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest)
@@ -685,7 +712,8 @@ export async function bulkCopyRecordsAndIdentities(target: WorkspaceDatabase, do
           FROM fork_donor_db.record_occurrences AS d
           JOIN fork_artifact_map AS owner_map ON owner_map.donor_artifact_version_id = d.owner_artifact_version_id
           LEFT JOIN fork_artifact_map AS span_map ON span_map.donor_artifact_version_id = d.primary_source_span_artifact_version_id
-          WHERE d.workspace_id = ? AND ${donorVisible}`,
+          WHERE d.workspace_id = ? AND ${donorVisible}
+          ORDER BY d.record_id`,
         params: [workspaceId, donorDatabase.workspaceId, donorGeneration, donorGeneration],
       },
       {
@@ -716,9 +744,11 @@ export async function bulkCopyRecordsAndIdentities(target: WorkspaceDatabase, do
             ON records.workspace_id = d.workspace_id AND records.record_id = d.record_id
           JOIN fork_artifact_map AS owner_map ON owner_map.donor_artifact_version_id = records.owner_artifact_version_id
           WHERE d.workspace_id = ? AND ${donorVisible}
-            AND records.valid_from_generation <= ? AND (records.valid_to_generation IS NULL OR records.valid_to_generation > ?)`,
+            AND records.valid_from_generation <= ? AND (records.valid_to_generation IS NULL OR records.valid_to_generation > ?)
+          ORDER BY d.identity_assignment_id`,
         params: [workspaceId, donorDatabase.workspaceId, donorGeneration, donorGeneration, donorGeneration, donorGeneration],
       },
+      ...createIndexCommands,
     ]);
   } finally {
     await target.database.run("DETACH DATABASE fork_donor_db").catch((error) => console.error(`[urdira] workspace fork DETACH DATABASE fork_donor_db failed for ${workspaceId} (leaked attach, non-fatal -- the connection closes at the end of this scan attempt regardless):`, error));
