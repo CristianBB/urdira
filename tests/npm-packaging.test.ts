@@ -25,7 +25,7 @@ describe("public npm package graph", () => {
   it("publishes only the production allowlist with exact internal versions", async () => {
     const versions = await productionPackageVersions();
     expect([...versions.keys()]).toEqual(PRODUCTION_PACKAGE_NAMES);
-    expect(versions.get("urdira")).toBe("0.3.2");
+    expect(versions.get("urdira")).toBe("0.3.3");
     expect(versions.get("@urdira/runtime")).toBe("0.3.2");
     expect(versions.get("@urdira/cli")).toBe("0.3.2");
     expect(versions.get("@urdira/daemon")).toBe("0.3.2");

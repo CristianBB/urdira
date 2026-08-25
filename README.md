@@ -41,7 +41,8 @@ remain available; unsupported operations fail explicitly.
 
 ## Install
 
-Urdira 0.3.2 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
+Urdira 0.3.3 requires Node.js `>=24.18.1`. The dependency-free 0.3.3 bootstrap
+prepares the exact `@urdira/runtime@0.3.2` application. Confirmed runtime preparation also
 requires npm `>=11.16.0`, which supplies the strict install-script policy. Check
 with `npm --version`; if necessary, update the npm paired with the active Node
 installation before preparing the runtime:
@@ -76,6 +77,15 @@ that acknowledged npm notice, rejects any new warning, validates the installed
 runtime, and activates it atomically. An interactive terminal offers the same
 confirmation before its first runtime command; non-interactive and MCP starts
 never install anything implicitly.
+
+The same dry-run inspects only the data-root catalog contract. When it detects
+a pre-v3 root, it names that exact root and states that confirmed preparation
+will permanently remove it. `--confirm` refuses to continue while a daemon
+still owns the root, stages and validates the replacement runtime first, then
+deletes the complete legacy root and activates a clean v3 runtime. A valid v3
+root is never reset by runtime preparation. Because v3 has no compatibility
+reader or in-place migration, workspaces from a removed pre-v3 root must be
+registered and indexed again.
 
 The first confirmed configuration that enables semantic search may download
 the declared open embedding model. The CLI reports that action. Urdira does

@@ -2,9 +2,9 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, mkdir, open, readFile, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, parse as parsePath, resolve, sep } from "node:path";
 
-export const BOOTSTRAP_VERSION = "0.3.2";
+export const BOOTSTRAP_VERSION = "0.3.3";
 export const RUNTIME_PACKAGE_NAME = "@urdira/runtime";
 export const RUNTIME_VERSION = "0.3.2";
 export const RUNTIME_REGISTRY = "https://registry.npmjs.org/";
@@ -19,6 +19,9 @@ export const RUNTIME_INSTALL_SCRIPT_APPROVALS = Object.freeze({
 
 const ACKNOWLEDGED_BOOLEAN_WARNING = "npm warn deprecated boolean@3.2.0: Package no longer supported. Contact Support at https://www.npmjs.com/support for more info.";
 const RUNTIME_MANIFEST_NAME = "urdira-runtime.json";
+// Bootstrap 0.3.3 changes only pre-v3 preparation. Its runtime coordinate,
+// lockfile validation, warning policy, and install-script closure remain 0.3.2.
+const COMPATIBLE_RUNTIME_PREPARERS = new Set(["0.3.2", BOOTSTRAP_VERSION]);
 
 export interface RuntimePaths {
   readonly runtime_parent: string;
@@ -36,9 +39,19 @@ export interface RuntimePreparationPlan {
   readonly minimum_node_version: string;
   readonly minimum_npm_version: string;
   readonly registry: string;
+  readonly data_root: string;
+  readonly data_root_state: RuntimeDataRootState;
+  readonly destructive_reset_required: boolean;
   readonly target_root: string;
   readonly install_scripts: readonly string[];
   readonly known_upstream_notices: readonly string[];
+}
+
+export type RuntimeDataRootState = "empty" | "v3" | "pre-v3" | "unknown";
+
+export interface RuntimeDataRootInspection {
+  readonly data_root: string;
+  readonly state: RuntimeDataRootState;
 }
 
 export interface RuntimeInstallerRequest {
@@ -63,7 +76,7 @@ export interface PrepareRuntimeOptions {
 
 export type PrepareRuntimeResult =
   | { readonly status: "preview"; readonly plan: RuntimePreparationPlan }
-  | { readonly status: "prepared" | "already_prepared"; readonly plan: RuntimePreparationPlan; readonly entrypoint: string };
+  | { readonly status: "prepared" | "already_prepared"; readonly plan: RuntimePreparationPlan; readonly entrypoint: string; readonly data_root_reset: boolean };
 
 interface RuntimeManifest {
   readonly manifest_schema_version: 1;
@@ -89,12 +102,14 @@ export function runtimePaths(dataRoot = defaultDataRoot()): RuntimePaths {
     active_root: activeRoot,
     entrypoint: join(activeRoot, "node_modules", "@urdira", "runtime", "dist", "cli.js"),
     manifest: join(activeRoot, RUNTIME_MANIFEST_NAME),
-    lock: join(runtimeParent, ".prepare.lock"),
+    // The lock must survive a confirmed destructive reset of `normalizedRoot`.
+    lock: join(dirname(normalizedRoot), `.${basename(normalizedRoot)}.runtime-prepare.lock`),
     npm_cache: join(runtimeParent, ".npm-cache"),
   };
 }
 
-export function createRuntimePreparationPlan(dataRoot = defaultDataRoot()): RuntimePreparationPlan {
+export function createRuntimePreparationPlan(dataRoot = defaultDataRoot(), dataRootState: RuntimeDataRootState = "empty"): RuntimePreparationPlan {
+  const normalizedRoot = resolve(dataRoot);
   const paths = runtimePaths(dataRoot);
   return {
     bootstrap_version: BOOTSTRAP_VERSION,
@@ -103,10 +118,40 @@ export function createRuntimePreparationPlan(dataRoot = defaultDataRoot()): Runt
     minimum_node_version: MINIMUM_NODE_VERSION,
     minimum_npm_version: MINIMUM_NPM_VERSION,
     registry: RUNTIME_REGISTRY,
+    data_root: normalizedRoot,
+    data_root_state: dataRootState,
+    destructive_reset_required: dataRootState === "pre-v3",
     target_root: paths.active_root,
     install_scripts: Object.keys(RUNTIME_INSTALL_SCRIPT_APPROVALS),
     known_upstream_notices: ["boolean@3.2.0 is deprecated through @huggingface/transformers@4.2.0 -> onnxruntime-node@1.24.3 -> global-agent@3.0.0."],
   };
+}
+
+/** Inspect only the catalog contract marker; preparation never opens workspace indexes. */
+export async function inspectRuntimeDataRoot(dataRoot = defaultDataRoot()): Promise<RuntimeDataRootInspection> {
+  const normalizedRoot = resolve(dataRoot);
+  const catalogPath = join(normalizedRoot, "catalog.sqlite");
+  try {
+    await access(catalogPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { data_root: normalizedRoot, state: "empty" };
+    return { data_root: normalizedRoot, state: "unknown" };
+  }
+
+  let database: InstanceType<(typeof import("node:sqlite"))["DatabaseSync"]> | undefined;
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    database = new DatabaseSync(catalogPath, { readOnly: true });
+    const table = database.prepare("SELECT 1 AS found FROM sqlite_schema WHERE type = 'table' AND name = 'storage_meta'").get() as { readonly found?: unknown } | undefined;
+    if (table?.found !== 1) return { data_root: normalizedRoot, state: "pre-v3" };
+    const marker = database.prepare("SELECT value FROM storage_meta WHERE key = 'index_contract'").get() as { readonly value?: unknown } | undefined;
+    const bytes = marker?.value instanceof Uint8Array ? marker.value : marker?.value instanceof ArrayBuffer ? new Uint8Array(marker.value) : undefined;
+    return { data_root: normalizedRoot, state: bytes?.byteLength === 1 && bytes[0] === 0x33 ? "v3" : "pre-v3" };
+  } catch {
+    return { data_root: normalizedRoot, state: "unknown" };
+  } finally {
+    database?.close();
+  }
 }
 
 export function classifyNpmWarnings(stderr: string): { readonly acknowledged: readonly string[]; readonly unknown: readonly string[] } {
@@ -124,7 +169,8 @@ async function existingRuntime(paths: RuntimePaths): Promise<boolean> {
     const packageLock = await readFile(join(paths.active_root, "package-lock.json"));
     return entry.isFile() && !entry.isSymbolicLink()
       && manifest.manifest_schema_version === 1
-      && manifest.bootstrap_version === BOOTSTRAP_VERSION
+      && typeof manifest.bootstrap_version === "string"
+      && COMPATIBLE_RUNTIME_PREPARERS.has(manifest.bootstrap_version)
       && manifest.runtime_package === RUNTIME_PACKAGE_NAME
       && manifest.runtime_version === RUNTIME_VERSION
       && manifest.package_lock_sha256 === sha256(packageLock);
@@ -222,36 +268,85 @@ async function validateStagedRuntime(stagingRoot: string): Promise<string> {
   return sha256(lockBytes);
 }
 
-function assertStagingPath(paths: RuntimePaths, stagingRoot: string): void {
+function assertStagingPath(paths: RuntimePaths, stagingRoot: string, dataRoot: string, destructiveReset: boolean): void {
+  const normalizedStaging = resolve(stagingRoot);
+  if (destructiveReset) {
+    const prefix = join(dirname(resolve(dataRoot)), `.${basename(resolve(dataRoot))}.runtime-staging-${RUNTIME_VERSION}-`);
+    if (!normalizedStaging.startsWith(prefix)) throw new Error("Refusing unsafe destructive-reset runtime staging path.");
+    return;
+  }
   const prefix = `${resolve(paths.runtime_parent)}${sep}`;
-  if (!resolve(stagingRoot).startsWith(prefix) || !stagingRoot.includes(".staging-")) throw new Error("Refusing unsafe runtime staging path.");
+  if (!normalizedStaging.startsWith(prefix) || !stagingRoot.includes(".staging-")) throw new Error("Refusing unsafe runtime staging path.");
+}
+
+async function assertSafeDestructiveDataRoot(dataRoot: string): Promise<void> {
+  const target = resolve(dataRoot);
+  if (target === parsePath(target).root || target === resolve(homedir())) throw new Error(`Refusing unsafe destructive data-root target: ${target}`);
+  const targetStat = await lstat(target);
+  if (!targetStat.isDirectory() || targetStat.isSymbolicLink()) throw new Error(`Refusing destructive reset of a non-directory or symbolic-link data root: ${target}`);
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(error && typeof error === "object" && "code" in error && (error.code === "ESRCH" || error.code === "EINVAL"));
+  }
+}
+
+async function liveDaemonPid(dataRoot: string): Promise<number | undefined> {
+  try {
+    const owner = JSON.parse(await readFile(join(resolve(dataRoot), "daemon.lock"), "utf8")) as { readonly pid?: unknown };
+    return typeof owner.pid === "number" && processIsAlive(owner.pid) ? owner.pid : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function prepareRuntime(options: PrepareRuntimeOptions): Promise<PrepareRuntimeResult> {
-  const paths = runtimePaths(options.data_root);
-  const plan = createRuntimePreparationPlan(options.data_root);
-  if (await existingRuntime(paths)) return { status: "already_prepared", plan, entrypoint: paths.entrypoint };
+  const dataRoot = resolve(options.data_root ?? defaultDataRoot());
+  const paths = runtimePaths(dataRoot);
+  let inspection = await inspectRuntimeDataRoot(dataRoot);
+  let plan = createRuntimePreparationPlan(dataRoot, inspection.state);
+  if (inspection.state === "unknown") throw new Error(`Cannot determine the index contract for ${dataRoot}; refusing runtime preparation without a safe data-root classification.`);
+  if (!plan.destructive_reset_required && await existingRuntime(paths)) return { status: "already_prepared", plan, entrypoint: paths.entrypoint, data_root_reset: false };
   if (!options.confirm) return { status: "preview", plan };
 
-  await mkdir(paths.runtime_parent, { recursive: true, mode: 0o700 });
+  await mkdir(dirname(paths.lock), { recursive: true, mode: 0o700 });
   let lock: FileHandle | undefined;
-  const stagingRoot = join(paths.runtime_parent, `.staging-${RUNTIME_VERSION}-${randomUUID()}`);
-  assertStagingPath(paths, stagingRoot);
   try {
     lock = await open(paths.lock, "wx", 0o600);
   } catch (error) {
     throw new Error(`Another Urdira runtime preparation is active (${error instanceof Error ? error.message : String(error)}).`);
   }
 
+  let stagingRoot: string | undefined;
   try {
-    if (await existingRuntime(paths)) return { status: "already_prepared", plan, entrypoint: paths.entrypoint };
-    try {
-      await access(paths.active_root);
-      throw new Error(`Runtime target already exists but is invalid: ${paths.active_root}`);
-    } catch (error) {
-      if (error instanceof Error && error.message.startsWith("Runtime target already exists")) throw error;
+    inspection = await inspectRuntimeDataRoot(dataRoot);
+    plan = createRuntimePreparationPlan(dataRoot, inspection.state);
+    if (inspection.state === "unknown") throw new Error(`Cannot determine the index contract for ${dataRoot}; refusing runtime preparation without a safe data-root classification.`);
+    const destructiveReset = plan.destructive_reset_required;
+    if (destructiveReset) {
+      const daemonPid = await liveDaemonPid(dataRoot);
+      if (daemonPid !== undefined) throw new Error(`Stop the running Urdira daemon before confirming the destructive v3 reset (process ${daemonPid}).`);
+      await assertSafeDestructiveDataRoot(dataRoot);
+    } else {
+      if (await existingRuntime(paths)) return { status: "already_prepared", plan, entrypoint: paths.entrypoint, data_root_reset: false };
+      await mkdir(paths.runtime_parent, { recursive: true, mode: 0o700 });
+      try {
+        await access(paths.active_root);
+        throw new Error(`Runtime target already exists but is invalid: ${paths.active_root}`);
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Runtime target already exists")) throw error;
+      }
     }
 
+    stagingRoot = destructiveReset
+      ? join(dirname(dataRoot), `.${basename(dataRoot)}.runtime-staging-${RUNTIME_VERSION}-${randomUUID()}`)
+      : join(paths.runtime_parent, `.staging-${RUNTIME_VERSION}-${randomUUID()}`);
+    assertStagingPath(paths, stagingRoot, dataRoot, destructiveReset);
     await mkdir(stagingRoot, { recursive: false, mode: 0o700 });
     await writeFile(join(stagingRoot, "package.json"), `${JSON.stringify({
       name: "urdira-private-runtime",
@@ -277,13 +372,23 @@ export async function prepareRuntime(options: PrepareRuntimeOptions): Promise<Pr
       acknowledged_npm_warnings: warnings.acknowledged,
     };
     await writeFile(join(stagingRoot, RUNTIME_MANIFEST_NAME), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+    if (destructiveReset) {
+      const current = await inspectRuntimeDataRoot(dataRoot);
+      if (current.state !== "pre-v3") throw new Error(`Data-root state changed during runtime preparation (${current.state}); refusing destructive reset.`);
+      const daemonPid = await liveDaemonPid(dataRoot);
+      if (daemonPid !== undefined) throw new Error(`Stop the running Urdira daemon before confirming the destructive v3 reset (process ${daemonPid}).`);
+      await assertSafeDestructiveDataRoot(dataRoot);
+      await rm(dataRoot, { recursive: true, force: true });
+      await mkdir(paths.runtime_parent, { recursive: true, mode: 0o700 });
+    }
     await rename(stagingRoot, paths.active_root);
-    return { status: "prepared", plan, entrypoint: paths.entrypoint };
+    stagingRoot = undefined;
+    return { status: "prepared", plan, entrypoint: paths.entrypoint, data_root_reset: destructiveReset };
   } catch (error) {
-    await rm(stagingRoot, { recursive: true, force: true });
+    if (stagingRoot !== undefined) await rm(stagingRoot, { recursive: true, force: true });
     throw error;
   } finally {
-    await lock.close();
+    await lock?.close();
     await rm(paths.lock, { force: true });
   }
 }
@@ -305,6 +410,7 @@ export interface RunBootstrapOptions {
   readonly node_version?: string;
   readonly interactive?: boolean;
   readonly prompt?: (message: string) => Promise<boolean>;
+  readonly inspect_data_root?: (dataRoot?: string) => Promise<RuntimeDataRootInspection>;
   readonly resolve_entrypoint?: (dataRoot?: string) => Promise<string | undefined>;
   readonly prepare_runtime?: (options: PrepareRuntimeOptions) => Promise<PrepareRuntimeResult>;
   readonly execute_runtime?: (entrypoint: string, argv: readonly string[]) => Promise<number>;
@@ -312,7 +418,12 @@ export interface RunBootstrapOptions {
 
 export function formatRuntimePreparationPlan(plan: RuntimePreparationPlan): string {
   return [
-    `Urdira runtime ${plan.package_version} is not prepared.`,
+    `Urdira runtime ${plan.package_version} preparation plan.`,
+    `Data root: ${plan.data_root}`,
+    `Data root state: ${plan.data_root_state}`,
+    plan.destructive_reset_required
+      ? `Destructive reset: permanently remove ${plan.data_root} before installing the v3 runtime.`
+      : "Destructive reset: not required.",
     `Target: ${plan.target_root}`,
     `Registry: ${plan.registry}`,
     `Package: ${plan.package_name}@${plan.package_version}`,
@@ -346,9 +457,11 @@ export async function runBootstrap(argv: readonly string[], options: RunBootstra
 
   const dataRoot = options.data_root ?? defaultDataRoot();
   const resolveEntrypoint = options.resolve_entrypoint ?? preparedRuntimeEntrypoint;
+  const inspectDataRoot = options.inspect_data_root ?? inspectRuntimeDataRoot;
   const prepare = options.prepare_runtime ?? prepareRuntime;
   const execute = options.execute_runtime ?? executeRuntimeProcess;
-  const plan = createRuntimePreparationPlan(dataRoot);
+  const inspection = await inspectDataRoot(dataRoot);
+  const plan = createRuntimePreparationPlan(dataRoot, inspection.state);
   const nodeVersion = options.node_version ?? process.versions.node;
   const unsupportedNode = (): BootstrapResult => ({
     exit_code: 2,
@@ -370,7 +483,16 @@ export async function runBootstrap(argv: readonly string[], options: RunBootstra
       if (argv[2] === "--dry-run") return { exit_code: 0, stdout: `${formatRuntimePreparationPlan(plan)}\n`, stderr: "" };
       if (!minimumVersionSatisfied(nodeVersion, MINIMUM_NODE_VERSION)) return unsupportedNode();
       const prepared = await prepare({ data_root: dataRoot, confirm: true });
-      return { exit_code: 0, stdout: `Urdira runtime ${RUNTIME_VERSION} ${prepared.status === "already_prepared" ? "was already prepared" : "is prepared"}.\n`, stderr: "" };
+      if (prepared.status === "preview") throw new Error("Confirmed runtime preparation returned a preview instead of an active runtime.");
+      return {
+        exit_code: 0,
+        stdout: prepared.status === "already_prepared"
+          ? `Urdira runtime ${RUNTIME_VERSION} was already prepared.\n`
+          : prepared.data_root_reset
+            ? `Urdira pre-v3 data root ${dataRoot} was permanently removed; runtime ${RUNTIME_VERSION} is prepared.\n`
+            : `Urdira runtime ${RUNTIME_VERSION} is prepared.\n`,
+        stderr: "",
+      };
     }
     return { exit_code: 2, stdout: "", stderr: "Usage: urdira runtime status | runtime prepare --dry-run | --confirm\n" };
   }

@@ -3,6 +3,16 @@
 All notable user-visible changes are documented here. Urdira follows the
 repository's [semantic versioning policy](docs/versioning.md).
 
+## [0.3.3] - 2026-08-25 — Explicit destructive v3 preparation
+
+- `runtime prepare --dry-run` classifies the current data root and names the
+  exact pre-v3 root that confirmed preparation will permanently remove;
+- `runtime prepare --confirm` stages and validates the replacement runtime
+  before deleting an incompatible pre-v3 root, then activates a clean v3
+  runtime; and
+- valid v3 roots are preserved, while a live daemon or an unclassifiable
+  catalog blocks destructive preparation.
+
 ## [0.3.2] - 2026-08-25 — Bounded semantic startup
 
 - a missing local embedding-model cache is detected before the neural runtime

@@ -122,6 +122,18 @@ fresh v3 root and reindexes source observations from scratch. CAS objects may
 be reused only when scope, byte length and SHA-256 digest all verify. An unsupported
 root is never attached to the v3 daemon.
 
+The dependency-free bootstrap enforces this destructive boundary during
+explicit runtime preparation. Its dry-run reads only the catalog contract
+marker and identifies the exact pre-v3 data root that confirmation will
+permanently remove. Confirmed preparation first stages and validates the new
+runtime outside that root, refuses deletion while a live daemon owns it,
+rechecks the contract to close the inspection/deletion race, then removes the
+complete legacy root and activates a clean v3 runtime. It never resets a root
+whose catalog carries the v3 marker, and an unreadable or unclassifiable
+catalog fails closed. No legacy workspace, cursor, cache, model, CAS object, or
+runtime directory survives this reset; source workspaces are registered and
+indexed again.
+
 ## Operational budgets
 
 FactDelta batches are capped at 4 MiB or 4096 rows. Generated SQLite

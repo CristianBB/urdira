@@ -143,6 +143,13 @@ Best-effort overwrite is not offered as secure erasure because SSD wear leveling
 
 Runtime prepare/remove, plugin install/activate/upgrade/downgrade/rollback/remove, model-pack install/repair/remove, workspace register/relocate/suspend/remove/purge, migration, backup/restore, retention pins, and emergency cache eviction are administrative operations outside MCP. Destructive or executable-state transitions identify exact targets and require a dry-run preview plus confirmation; direct workspace registration/configuration uses its interactive detection proposal, and idempotent daemon stop executes directly.
 
+For the destructive v3 storage boundary, runtime preparation positively
+classifies the catalog marker before offering reset. Its dry-run names the
+complete pre-v3 data root that confirmation will permanently remove. The
+replacement runtime is staged and validated first; a live daemon, unknown
+catalog, changed classification, filesystem root, or home-directory target
+fails closed. Valid v3 roots are never reset by preparation.
+
 Long operations persist an operation identity, state, exact authorized input digests, progress counters, cancellation state, staged objects, and issues. Cancellation is safe at documented barriers and never rolls back an already committed snapshot or installation; it stops future phases and cleans unreachable staging through GC.
 
 Persisted logical operation identities and staged file paths are not physical

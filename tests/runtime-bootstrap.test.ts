@@ -1,6 +1,7 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
   BOOTSTRAP_VERSION,
@@ -17,9 +18,28 @@ import {
 
 const knownDeprecation = "npm warn deprecated boolean@3.2.0: Package no longer supported. Contact Support at https://www.npmjs.com/support for more info.";
 
+async function installFakeRuntime(stagingRoot: string) {
+  const packageRoot = join(stagingRoot, "node_modules", "@urdira", "runtime");
+  await mkdir(join(packageRoot, "dist"), { recursive: true });
+  await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: RUNTIME_PACKAGE_NAME, version: RUNTIME_VERSION }));
+  await writeFile(join(packageRoot, "dist", "cli.js"), "#!/usr/bin/env node\n");
+  await writeFile(join(stagingRoot, "package-lock.json"), "{}\n");
+  return { stdout: "added packages", stderr: `${knownDeprecation}\n`, npm_version: "11.16.0" };
+}
+
+function writeCatalog(dataRoot: string, contract?: number): void {
+  const database = new DatabaseSync(join(dataRoot, "catalog.sqlite"));
+  try {
+    database.exec("CREATE TABLE storage_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL) STRICT");
+    if (contract !== undefined) database.prepare("INSERT INTO storage_meta(key, value) VALUES ('index_contract', ?)").run(Uint8Array.of(contract));
+  } finally {
+    database.close();
+  }
+}
+
 describe("dependency-free runtime bootstrap", () => {
   it("binds one bootstrap release to one exact runtime and reviewed script closure", () => {
-    expect(BOOTSTRAP_VERSION).toBe("0.3.2");
+    expect(BOOTSTRAP_VERSION).toBe("0.3.3");
     expect(RUNTIME_PACKAGE_NAME).toBe("@urdira/runtime");
     expect(RUNTIME_VERSION).toBe("0.3.2");
     expect(MINIMUM_NODE_VERSION).toBe("24.18.1");
@@ -71,6 +91,144 @@ describe("dependency-free runtime bootstrap", () => {
     const result = await prepareRuntime({ data_root: dataRoot, confirm: false });
     expect(result.status).toBe("preview");
     await expect(readFile(runtimePaths(dataRoot).manifest, "utf8")).rejects.toThrow();
+  });
+
+  it("discloses and applies the destructive reset required by a pre-v3 data root", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-bootstrap-pre-v3-"));
+    await prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async ({ staging_root }) => installFakeRuntime(staging_root),
+    });
+    const legacySentinel = join(dataRoot, "legacy-index.bin");
+    await writeFile(legacySentinel, "legacy");
+    writeCatalog(dataRoot);
+
+    const preview = await runBootstrap(["runtime", "prepare", "--dry-run"], { data_root: dataRoot });
+    expect(preview.exit_code).toBe(0);
+    expect(preview.stdout).toContain("Data root state: pre-v3");
+    expect(preview.stdout).toContain(`Destructive reset: permanently remove ${dataRoot}`);
+    await expect(readFile(legacySentinel, "utf8")).resolves.toBe("legacy");
+
+    let replacementInstalls = 0;
+    const prepared = await prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async ({ staging_root }) => {
+        replacementInstalls += 1;
+        return installFakeRuntime(staging_root);
+      },
+    });
+    expect(prepared).toMatchObject({ status: "prepared", data_root_reset: true });
+    expect(replacementInstalls).toBe(1);
+    await expect(readFile(legacySentinel, "utf8")).rejects.toThrow();
+    await expect(readFile(runtimePaths(dataRoot).manifest, "utf8")).resolves.toContain(`"runtime_version": "${RUNTIME_VERSION}"`);
+  });
+
+  it("preserves a valid v3 data root during runtime preparation", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-bootstrap-v3-"));
+    const currentSentinel = join(dataRoot, "current-index.bin");
+    await writeFile(currentSentinel, "current");
+    writeCatalog(dataRoot, 0x33);
+
+    const prepared = await prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async ({ staging_root }) => installFakeRuntime(staging_root),
+    });
+    expect(prepared).toMatchObject({ status: "prepared", data_root_reset: false });
+    await expect(readFile(currentSentinel, "utf8")).resolves.toBe("current");
+  });
+
+  it("reuses runtime 0.3.2 prepared by the compatible 0.3.2 bootstrap on a v3 root", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-bootstrap-compatible-"));
+    writeCatalog(dataRoot, 0x33);
+    await prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async ({ staging_root }) => installFakeRuntime(staging_root),
+    });
+    const paths = runtimePaths(dataRoot);
+    const manifest = JSON.parse(await readFile(paths.manifest, "utf8"));
+    await writeFile(paths.manifest, `${JSON.stringify({ ...manifest, bootstrap_version: "0.3.2" }, null, 2)}\n`);
+    let reinstalled = false;
+
+    const prepared = await prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async () => {
+        reinstalled = true;
+        throw new Error("compatible runtime must not be reinstalled");
+      },
+    });
+    expect(prepared).toMatchObject({ status: "already_prepared", data_root_reset: false });
+    expect(reinstalled).toBe(false);
+  });
+
+  it("refuses destructive reset while a daemon process still owns the legacy root", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-bootstrap-live-legacy-"));
+    const legacySentinel = join(dataRoot, "legacy-index.bin");
+    await writeFile(legacySentinel, "legacy");
+    await writeFile(join(dataRoot, "daemon.lock"), JSON.stringify({ pid: process.pid }));
+    writeCatalog(dataRoot);
+
+    await expect(prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async ({ staging_root }) => installFakeRuntime(staging_root),
+    })).rejects.toThrow("Stop the running Urdira daemon before confirming the destructive v3 reset");
+    await expect(readFile(legacySentinel, "utf8")).resolves.toBe("legacy");
+  });
+
+  it("refuses destructive reset through a symbolic-link data root", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "urdira-bootstrap-symlink-"));
+    const target = join(parent, "legacy-target");
+    const dataRoot = join(parent, "configured-root");
+    await mkdir(target);
+    await writeFile(join(target, "legacy-index.bin"), "legacy");
+    writeCatalog(target);
+    await symlink(target, dataRoot, "dir");
+
+    await expect(prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async ({ staging_root }) => installFakeRuntime(staging_root),
+    })).rejects.toThrow("symbolic-link data root");
+    await expect(readFile(join(target, "legacy-index.bin"), "utf8")).resolves.toBe("legacy");
+  });
+
+  it("preserves the complete legacy root when replacement installation fails", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-bootstrap-install-failure-"));
+    const legacySentinel = join(dataRoot, "legacy-index.bin");
+    await writeFile(legacySentinel, "legacy");
+    writeCatalog(dataRoot);
+
+    await expect(prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async () => { throw new Error("simulated replacement failure"); },
+    })).rejects.toThrow("simulated replacement failure");
+    await expect(readFile(legacySentinel, "utf8")).resolves.toBe("legacy");
+    await expect(readFile(join(dataRoot, "catalog.sqlite"))).resolves.toBeInstanceOf(Buffer);
+  });
+
+  it("cancels deletion when the catalog contract changes during staging", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-bootstrap-contract-race-"));
+    const legacySentinel = join(dataRoot, "legacy-index.bin");
+    await writeFile(legacySentinel, "legacy");
+    writeCatalog(dataRoot);
+
+    await expect(prepareRuntime({
+      data_root: dataRoot,
+      confirm: true,
+      install: async ({ staging_root }) => {
+        const database = new DatabaseSync(join(dataRoot, "catalog.sqlite"));
+        try { database.prepare("INSERT INTO storage_meta(key, value) VALUES ('index_contract', ?)").run(Uint8Array.of(0x33)); }
+        finally { database.close(); }
+        return installFakeRuntime(staging_root);
+      },
+    })).rejects.toThrow("Data-root state changed during runtime preparation (v3)");
+    await expect(readFile(legacySentinel, "utf8")).resolves.toBe("legacy");
   });
 
   it("atomically activates a validated runtime after explicit confirmation", async () => {
@@ -147,7 +305,7 @@ describe("dependency-free runtime bootstrap", () => {
       },
       prepare_runtime: async (options) => {
         expect(options.confirm).toBe(true);
-        return { status: "prepared", plan: createRuntimePreparationPlan(options.data_root), entrypoint };
+        return { status: "prepared", plan: createRuntimePreparationPlan(options.data_root), entrypoint, data_root_reset: false };
       },
       execute_runtime: async (target, argv) => {
         calls.push(target, ...argv);
