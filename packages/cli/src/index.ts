@@ -196,7 +196,7 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
     // The command itself is the user's intent; neither operation needs a
     // second --confirm acknowledgement. A dry-run remains available when a
     // caller explicitly wants the lifecycle proposal without executing it.
-    const directCommand = mutationName === "start" || mutationName === "stop";
+    const directCommand = mutationName === "start" || mutationName === "stop" || mutationName === "restart";
     if (mutationName === "workspace-add" && command.args.length === 0 && command.options.values["path"] === undefined && command.options.values["workspace_root"] === undefined) {
       throw new CliError("cli:command_invalid", "workspace add requires a workspace path.");
     }

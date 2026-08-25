@@ -5,7 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { validateFactDeltaBatch, type ArtifactWorkItem, type FactDeltaBatch, type ReplacementScope, type SnapshotCapabilityStateEntry } from "@urdira/contracts";
 import { parseCliArgs, runCli, type CliCommand, type CliResult } from "@urdira/cli";
-import { createPersistentWorkspaceRegistry, DaemonClient, DaemonRuntime, EndpointDescriptorStore, daemonPaths, type DaemonRuntimeOptions, type DaemonStartupPhase, type SemanticProviderDescriptor } from "@urdira/daemon";
+import { createPersistentWorkspaceRegistry, DaemonClient, DaemonError, DaemonRuntime, EndpointDescriptorStore, ProcessLock, daemonPaths, type DaemonRuntimeOptions, type DaemonStartupPhase, type IpcProgress, type SemanticProviderDescriptor } from "@urdira/daemon";
 import {
   candidateTargetRegistryFromSnapshot,
   compactAcceptedFactDelta,
@@ -65,9 +65,16 @@ export interface UrdiraRunOptions {
   readonly execute_admin?: (command: CliCommand, preview: unknown) => Promise<unknown>;
   readonly prompt?: (question: string) => Promise<string | boolean>;
   readonly on_startup_progress?: (phase: DaemonStartupPhase) => void;
+  /** Human-facing daemon attachment and long-running CLI operation progress. */
+  readonly on_progress?: (progress: IpcProgress["progress"]) => void;
 }
 
-export const URDIRA_VERSION = "0.3.0";
+export const URDIRA_VERSION = "0.3.1";
+/** Exact runtime release identity. Bump automatically with every Urdira release. */
+export const URDIRA_ENGINE_BUILD_ID = `urdira-core-${URDIRA_VERSION}`;
+const DAEMON_HEALTH_PROBE_TIMEOUT_MS = 2_000;
+const CLI_ADMIN_REQUEST_TIMEOUT_MS = 300_000;
+const DAEMON_SHUTDOWN_TIMEOUT_MS = 300_000;
 const debugTimingEnabled = (): boolean => process.env["URDIRA_DEBUG_TIMING"] === "1";
 
 function urdiraHelpLegacy(): string {
@@ -1475,7 +1482,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   const warmRecordsBudgetMb = warmRecordsBudgetMbEnv();
   return {
     data_root: dataRoot,
-    engine_build_id: "urdira-core-0.1.0",
+    engine_build_id: URDIRA_ENGINE_BUILD_ID,
     workspace_registry: createPersistentWorkspaceRegistry(dataRoot),
     plugin_catalog: [{ ...bundledPluginCatalogEntry, capability_declarations: JAVASCRIPT_TYPESCRIPT_CAPABILITIES }],
     resolve_plugin_provider: createResolveJavascriptTypescriptPluginProvider(analysisCacheDir, analysisWorkerPool, workerShards),
@@ -1520,18 +1527,65 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   };
 }
 
-async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, startIfMissing = true, onStartupProgress?: (phase: DaemonStartupPhase) => void): Promise<{ readonly endpoint: string; readonly runtime?: DaemonRuntime } | undefined> {
+async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, startIfMissing = true, onStartupProgress?: (phase: DaemonStartupPhase) => void, onProgress?: (progress: IpcProgress["progress"]) => void, allowIncompatibleLifecycleCall = false): Promise<{ readonly endpoint: string; readonly runtime?: DaemonRuntime } | undefined> {
   if (endpoint !== undefined) return { endpoint };
   const dataRoot = options?.data_root ?? process.env["URDIRA_DATA_ROOT"] ?? join(homedir(), ".urdira");
+  const requiredEngineBuildId = options?.engine_build_id ?? URDIRA_ENGINE_BUILD_ID;
   const paths = await daemonPaths(dataRoot);
+  onProgress?.({ phase: "daemon_discovery", completed: 0, message: "checking for an existing per-user daemon" });
   const descriptor = await new EndpointDescriptorStore(paths).read();
   if (descriptor) {
+    const owner = await ProcessLock.inspect(paths.process_lock);
+    const matchingLiveOwner = owner?.alive === true && owner.pid === descriptor.pid;
+    if (matchingLiveOwner && descriptor.engine_build_id !== requiredEngineBuildId) {
+      if (allowIncompatibleLifecycleCall) {
+        onProgress?.({ phase: "daemon_reuse", completed: 1, total: 1, message: `connecting to incompatible daemon process ${descriptor.pid} for explicit lifecycle control` });
+        return { endpoint: descriptor.endpoint };
+      }
+      throw new DaemonError(
+        "core:daemon_restart_required",
+        `Daemon process ${descriptor.pid} uses engine build ${descriptor.engine_build_id}; ${requiredEngineBuildId} is required. Stop or restart Urdira before retrying.`,
+        {
+          data_root_id: dataRoot,
+          detected_engine_build_id: descriptor.engine_build_id,
+          required_engine_build_id: requiredEngineBuildId,
+          blocking_reason: "restart_lease_denied",
+          safe_automatic_restart: false,
+        },
+      );
+    }
+    onProgress?.({ phase: "daemon_probe", completed: 0, message: `checking daemon process ${descriptor.pid}` });
+    let response: Awaited<ReturnType<DaemonClient["call"]>> | undefined;
     try {
-      const response = await new DaemonClient(descriptor.endpoint).call("core:status", {});
-      if (response.outcome === "success") return { endpoint: descriptor.endpoint };
-    } catch { /* A stale descriptor is replaced by the coordinated starter below. */ }
+      response = await new DaemonClient(descriptor.endpoint, { request_timeout_ms: DAEMON_HEALTH_PROBE_TIMEOUT_MS }).call("core:status", {});
+    } catch {
+      // A failed health probe does not prove that the descriptor is stale.
+      // A live matching lock means another process still owns this endpoint;
+      // reuse it and let the requested operation apply its own deadline.
+    }
+    if (response?.outcome === "success") {
+      const reportedEngineBuildId = response.payload && typeof response.payload === "object" && "engine_build_id" in response.payload && typeof response.payload.engine_build_id === "string"
+        ? response.payload.engine_build_id
+        : descriptor.engine_build_id;
+      if (reportedEngineBuildId !== requiredEngineBuildId) {
+        throw new DaemonError("core:daemon_restart_required", `Daemon process ${descriptor.pid} reported engine build ${reportedEngineBuildId}; ${requiredEngineBuildId} is required.`, {
+          data_root_id: dataRoot,
+          detected_engine_build_id: reportedEngineBuildId,
+          required_engine_build_id: requiredEngineBuildId,
+          blocking_reason: "restart_lease_denied",
+          safe_automatic_restart: false,
+        });
+      }
+      onProgress?.({ phase: "daemon_reuse", completed: 1, total: 1, message: `reusing daemon process ${descriptor.pid}` });
+      return { endpoint: descriptor.endpoint };
+    }
+    if (matchingLiveOwner) {
+      onProgress?.({ phase: "daemon_reuse", completed: 1, total: 1, message: `daemon process ${descriptor.pid} is alive but busy; waiting for it` });
+      return { endpoint: descriptor.endpoint };
+    }
   }
   if (!startIfMissing) return undefined;
+  onProgress?.({ phase: "daemon_start", completed: 0, message: "no reusable daemon found; starting one" });
   const daemonOptions = options ?? (await defaultDaemonOptions(dataRoot));
   const configuredProgress = daemonOptions.on_startup_progress;
   const runtime = await DaemonRuntime.start({
@@ -1546,6 +1600,28 @@ async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, 
   return { endpoint: runtime.endpoint, runtime };
 }
 
+async function waitForDaemonShutdown(dataRoot: string, onProgress?: (progress: IpcProgress["progress"]) => void): Promise<void> {
+  const paths = await daemonPaths(dataRoot);
+  onProgress?.({ phase: "daemon_shutdown_wait", completed: 0, message: "waiting for the previous daemon to release its lock" });
+  const deadline = Date.now() + DAEMON_SHUTDOWN_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const owner = await ProcessLock.inspect(paths.process_lock);
+    if (owner?.alive !== true) {
+      onProgress?.({ phase: "daemon_shutdown_wait", completed: 1, total: 1, message: "previous daemon stopped and released its lock" });
+      return;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  const descriptor = await new EndpointDescriptorStore(paths).read().catch(() => undefined);
+  throw new DaemonError("core:daemon_restart_required", "The previous daemon did not release its lock before the shutdown deadline.", {
+    data_root_id: dataRoot,
+    detected_engine_build_id: descriptor?.engine_build_id ?? "unknown",
+    required_engine_build_id: URDIRA_ENGINE_BUILD_ID,
+    blocking_reason: "restart_lease_timeout",
+    safe_automatic_restart: false,
+  });
+}
+
 export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunOptions): Promise<CliResult> {
   // Parse before daemon resolution. Invalid commands must never start the
   // expensive composed runtime merely to discover a local CLI error, and a
@@ -1556,18 +1632,30 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
     process.env["URDIRA_STORAGE_DEBUG_TIMING"] = "1";
   }
   const previewOnlyLifecycle = (command.name === "start" || command.name === "stop") && command.options.dry_run;
-  const daemon = command.name === "stop" || previewOnlyLifecycle
-    ? await resolveDaemon(options.daemon, options.endpoint, false, options.on_startup_progress)
-    : await resolveDaemon(options.daemon, options.endpoint, true, options.on_startup_progress);
+  const explicitLifecycleControl = command.name === "stop" || command.name === "restart";
+  const daemon = command.name === "stop" || command.name === "restart" || previewOnlyLifecycle
+    ? await resolveDaemon(options.daemon, options.endpoint, false, options.on_startup_progress, options.on_progress, explicitLifecycleControl)
+    : await resolveDaemon(options.daemon, options.endpoint, true, options.on_startup_progress, options.on_progress, explicitLifecycleControl);
   const prompt = options.prompt ?? (process.stdin.isTTY && process.stdout.isTTY ? async (question: string) => {
     const readline = createInterface({ input: process.stdin, output: process.stdout });
     try { return await readline.question(`${question} `); } finally { readline.close(); }
   } : undefined);
-  const client = daemon === undefined
+  const rawClient = daemon === undefined ? undefined : new DaemonClient(daemon.endpoint);
+  const client = rawClient === undefined
     ? { call: async () => ({ outcome: "success", payload: { state: "already_stopped" } }) }
-    : new DaemonClient(daemon.endpoint);
+    : { call: async (call: string, payload: unknown) => {
+      if (call === "core:workspace_preview") options.on_progress?.({ phase: "workspace_preview", completed: 0, message: "inspecting workspace technologies and compatible plugins" });
+      if (call === "core:workspace_add") options.on_progress?.({ phase: "workspace_registration", completed: 0, message: "registering the workspace and starting observation" });
+      if (call === "core:daemon_stop") options.on_progress?.({ phase: "daemon_stop", completed: 0, message: "requesting graceful daemon shutdown" });
+      if (call === "core:daemon_restart") options.on_progress?.({ phase: "daemon_restart", completed: 0, message: "requesting graceful daemon replacement" });
+      const longRunning = call === "core:workspace_preview" || call === "core:workspace_add" || call === "core:workspace_configure" || call === "core:configuration_set" || call === "core:reindex" || call === "core:daemon_stop" || call === "core:daemon_restart";
+      return rawClient.call(call, payload, {
+        ...(longRunning ? { deadline_at: new Date(Date.now() + CLI_ADMIN_REQUEST_TIMEOUT_MS).toISOString() } : {}),
+        ...(options.on_progress === undefined ? {} : { on_progress: options.on_progress }),
+      });
+    } };
   try {
-    return await runCli(argv, {
+    const result = await runCli(argv, {
       client,
       preview_admin: async (command) => command.name === "workspace-add"
         ? (await client.call("core:workspace_preview", { args: command.args, values: command.options.values })).payload
@@ -1576,6 +1664,11 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
       ...(prompt === undefined ? {} : { prompt }),
       read_stdin: async () => { const chunks: Buffer[] = []; for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk)); return Buffer.concat(chunks).toString("utf8"); },
     });
+    if ((command.name === "stop" || command.name === "restart") && rawClient !== undefined && options.endpoint === undefined) {
+      const dataRoot = options.daemon?.data_root ?? process.env["URDIRA_DATA_ROOT"] ?? join(homedir(), ".urdira");
+      await waitForDaemonShutdown(dataRoot, options.on_progress);
+    }
+    return result;
   }
   finally {
     // `daemon start` deliberately transfers ownership to the long-lived

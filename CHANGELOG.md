@@ -3,6 +3,21 @@
 All notable user-visible changes are documented here. Urdira follows the
 repository's [semantic versioning policy](docs/versioning.md).
 
+## [0.3.1] - 2026-08-25 — Reliable daemon discovery and replacement
+
+- a busy live daemon with matching ownership is reused instead of racing a
+  second process for the per-user lock;
+- every runtime release advertises an exact engine build identity, so an
+  updated CLI cannot silently keep using a daemon from an older release;
+- incompatible daemons reject workspace and query operations with
+  `core:daemon_restart_required`, while explicit lifecycle recovery remains
+  available;
+- `daemon stop` waits for ownership-lock release and `daemon restart` launches
+  the installed runtime as a detached process before returning ready; and
+- workspace discovery, registration, daemon attachment, shutdown, and restart
+  now report terminal progress, use administrative deadlines, and render
+  expected failures without internal stack traces.
+
 ## [0.3.0] - 2026-08-24 — Urdira v3 optimized pipeline
 
 This is an intentionally incompatible release. Existing pre-v3 and early

@@ -59,6 +59,15 @@ The daemon is normally started on demand by the first `urdira mcp` or CLI reques
 
 Before forwarding a request, `urdira mcp` verifies that the live daemon belongs to the same operating-system user, data root, engine build, and compatible private interface. When no live daemon exists, it starts the daemon from its own exact engine installation and waits for verified readiness. Compatible concurrent MCP servers share it.
 
+The engine build ID is the exact runtime release identity
+`urdira-core-<runtime-semver>`, not a long-lived compatibility-series label.
+Consequently, installing a new Urdira release can never make its CLI silently
+reuse a process still executing an older release. Explicit `daemon stop` waits
+for ownership-lock release, and explicit `daemon restart` waits for that release
+before launching the installed runtime as a detached daemon and returning only
+after verified readiness. Long-lived MCP adapter processes are restarted during
+an update so both adapter and daemon execute the installed release.
+
 If a different live engine build owns the data root, automatic replacement is permitted only through a daemon-granted restart lease. The old daemon grants that lease only while it is idle: no publication or migration transaction is open, no administrative operation is active, and no other client or retained in-flight request depends on that process. The lease blocks new admission, performs graceful shutdown, releases the ownership lock, and allows `urdira mcp` to start its matching build. A lease denial, timeout, active transaction, active client, incompatible storage requirement, or ownership mismatch leaves the old process untouched and makes every Urdira tool call return `core:daemon_restart_required` until the user completes the explicit update/restart action. Urdira never sends optimistic private requests to an incompatible daemon and never kills a live process merely because a PID or endpoint exists.
 
 ## Private daemon boundary

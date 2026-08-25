@@ -69,8 +69,14 @@ describe("Phase 12 bounded IPC and daemon startup state", () => {
     const root = await mkdtemp(join(tmpdir(), "urdira-phase12-")); roots.push(root);
     const paths = await daemonPaths(root);
     const first = await ProcessLock.acquire(paths.process_lock, { pid: process.pid, started_at: "2026-08-10T16:00:00.000Z" });
+    await expect(ProcessLock.inspect(paths.process_lock)).resolves.toMatchObject({
+      pid: process.pid,
+      started_at: "2026-08-10T16:00:00.000Z",
+      alive: true,
+    });
     await expect(ProcessLock.acquire(paths.process_lock, { pid: process.pid, started_at: "2026-08-10T16:01:00.000Z" })).rejects.toMatchObject({ code: "core:daemon_already_running" });
     await first.release();
+    await expect(ProcessLock.inspect(paths.process_lock)).resolves.toBeUndefined();
     const stale = await ProcessLock.acquire(paths.process_lock, { pid: 999_999_999, started_at: "2026-08-10T16:00:00.000Z" });
     await stale.release();
     expect(await readFile(paths.process_lock, "utf8").catch(() => "")).toBe("");

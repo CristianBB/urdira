@@ -11,9 +11,9 @@ describe("Phase 12 closed CLI", () => {
     expect(() => parseCliArgs(["status", "--shell=rm -rf"])).toThrowError(CliError);
   });
 
-  it("uses direct execution for daemon start/stop and explicit confirmation for other mutations", async () => {
+  it("uses direct execution for daemon start/stop/restart and explicit confirmation for other mutations", async () => {
     for (const command of MUTATING_COMMANDS) {
-      if (command === "start" || command === "stop") {
+      if (command === "start" || command === "stop" || command === "restart") {
         await expect(runCli([command], { client })).resolves.toMatchObject({ exit_code: 0, data: { command, confirmed: true } });
         continue;
       }

@@ -6,6 +6,7 @@ import { DaemonError } from "./errors.js";
 export interface DaemonPaths { readonly data_root: string; readonly endpoint: string; readonly endpoint_descriptor: string; readonly process_lock: string; readonly last_known_good: string; }
 export interface EndpointDescriptor { readonly protocol_version: number; readonly endpoint: string; readonly pid: number; readonly owner_uid: number; readonly engine_build_id: string; readonly started_at: string; readonly descriptor_digest?: string; }
 export interface LastKnownGood { readonly engine_build_id: string; readonly checkpoint_id: string; readonly workspaces: ReadonlyArray<string>; readonly cursors: ReadonlyArray<string>; readonly written_at: string; readonly state_digest?: string; }
+export interface ProcessLockOwner { readonly pid: number; readonly started_at?: string; readonly alive: boolean; }
 
 function digest(value: unknown): string { return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`; }
 function currentUid(): number { return process.getuid?.() ?? 0; }
@@ -39,15 +40,25 @@ export class EndpointDescriptorStore {
 
 export class ProcessLock {
   private constructor(private readonly path: string, private readonly token: string) {}
+  static async inspect(path: string): Promise<ProcessLockOwner | undefined> {
+    const existing = await readJson(path);
+    if (existing === undefined || existing === null || typeof existing !== "object") return undefined;
+    const record = existing as { readonly pid?: unknown; readonly started_at?: unknown };
+    if (typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0) return undefined;
+    return {
+      pid: record.pid,
+      ...(typeof record.started_at === "string" ? { started_at: record.started_at } : {}),
+      alive: isProcessAlive(record.pid),
+    };
+  }
   static async acquire(path: string, owner: { readonly pid: number; readonly started_at: string }): Promise<ProcessLock> {
     await ownerOnlyDirectory(dirname(path));
     const token = randomUUID();
     try { const handle = await open(path, "wx", 0o600); await handle.writeFile(`${JSON.stringify({ ...owner, token })}\n`); await handle.close(); return new ProcessLock(path, token); }
     catch (error) {
       if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
-      const existing = await readJson(path);
-      const pid = existing && typeof existing === "object" && typeof (existing as { pid?: unknown }).pid === "number" ? (existing as { pid: number }).pid : undefined;
-      if (pid !== undefined && isProcessAlive(pid)) throw new DaemonError("core:daemon_already_running", `Daemon process ${pid} already owns the lock.`);
+      const existing = await ProcessLock.inspect(path);
+      if (existing?.alive) throw new DaemonError("core:daemon_already_running", `Daemon process ${existing.pid} already owns the lock.`);
       await rm(path, { force: true });
       return ProcessLock.acquire(path, owner);
     }

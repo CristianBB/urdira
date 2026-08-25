@@ -141,9 +141,17 @@ async function packPackage(staged, tarballRoot) {
   return { ...staged, tarball: join(tarballRoot, result.filename), files: filenames, size: result.size, integrity: result.integrity };
 }
 
+const productionProjects = ["packages/contracts", "packages/canonical", "packages/security", "packages/storage", "packages/plugin-sdk", "packages/plugin-javascript-typescript", "packages/engine", "packages/embedding-local", "packages/daemon", "packages/mcp", "packages/cli", "apps/urdira", "apps/bootstrap"];
+
+export async function cleanProductionBuildOutputs(projectRoots = productionProjects.map((project) => join(ROOT, project))) {
+  await Promise.all(projectRoots.map((projectRoot) => rm(join(projectRoot, "dist"), { recursive: true, force: true })));
+}
+
 async function buildProduction() {
-  const projects = ["packages/contracts", "packages/canonical", "packages/security", "packages/storage", "packages/plugin-sdk", "packages/plugin-javascript-typescript", "packages/engine", "packages/embedding-local", "packages/daemon", "packages/mcp", "packages/cli", "apps/urdira", "apps/bootstrap"];
-  await execFileAsync("pnpm", ["exec", "tsc", "--build", "--force", ...projects], { cwd: ROOT, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
+  await cleanProductionBuildOutputs();
+  for (const project of productionProjects) {
+    await execFileAsync("pnpm", ["exec", "tsc", "--build", "--force", project], { cwd: ROOT, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
+  }
 }
 
 export async function buildNpmPackages({ outputRoot = join(ROOT, "release", "npm"), build = true } = {}) {

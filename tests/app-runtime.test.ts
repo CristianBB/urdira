@@ -4,8 +4,16 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import { defaultDaemonOptions, runUrdira, URDIRA_VERSION, urdiraHelp } from "../apps/urdira/src/index.js";
-import { DaemonClient, DaemonRuntime } from "../packages/daemon/src/index.js";
+import { defaultDaemonOptions, runUrdira, URDIRA_ENGINE_BUILD_ID, URDIRA_VERSION, urdiraHelp } from "../apps/urdira/src/index.js";
+import {
+  daemonPaths,
+  DaemonClient,
+  DaemonError,
+  DaemonRuntime,
+  EndpointDescriptorStore,
+  LocalIpcServer,
+  ProcessLock,
+} from "../packages/daemon/src/index.js";
 import { JAVASCRIPT_TYPESCRIPT_PLUGIN_ID } from "../packages/plugin-javascript-typescript/src/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -91,7 +99,8 @@ async function queryAfterStagedPublication(client: DaemonClient, workspaceId: st
 
 describe("Urdira application runner", () => {
   it("publishes stable version and help output without starting the daemon", () => {
-    expect(URDIRA_VERSION).toBe("0.3.0");
+    expect(URDIRA_VERSION).toBe("0.3.1");
+    expect(URDIRA_ENGINE_BUILD_ID).toBe(`urdira-core-${URDIRA_VERSION}`);
     expect(urdiraHelp()).toContain("urdira mcp");
     expect(urdiraHelp()).toContain("explicit workspace scope");
   });
@@ -126,6 +135,169 @@ describe("Urdira application runner", () => {
       expect(result.exit_code).toBe(0);
       expect(result.data).toMatchObject({ state: "ready", engine_build_id: "build-app-start" });
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses a live daemon after a failed status probe and reports workspace discovery progress", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-live-daemon-"));
+    const paths = await daemonPaths(root);
+    const lock = await ProcessLock.acquire(paths.process_lock, {
+      pid: process.pid,
+      started_at: "2026-08-25T00:00:00.000Z",
+    });
+    const descriptor = new EndpointDescriptorStore(paths);
+    const server = new LocalIpcServer({
+      endpoint: paths.endpoint,
+      handler: async (request, context) => {
+        if (request.call === "core:status") {
+          throw new DaemonError("core:ipc_timeout", "The live daemon is temporarily busy.");
+        }
+        if (request.call === "core:workspace_preview") {
+          context.reportProgress({
+            phase: "workspace_discovery",
+            completed: 1,
+            total: 1,
+            message: "inspected 1 workspace file",
+          });
+          return { technologies: [], confirmation_required: true };
+        }
+        if (request.call === "core:daemon_stop") {
+          setImmediate(() => { void Promise.all([descriptor.remove(), lock.release()]); });
+          return { state: "stopping", pid: process.pid, engine_build_id: "build-app-live-daemon", endpoint: paths.endpoint };
+        }
+        throw new DaemonError("core:unknown_call", `Unexpected test call ${request.call}.`);
+      },
+    });
+    const progress: Array<{ readonly phase: string; readonly message?: string }> = [];
+
+    try {
+      await server.listen();
+      await descriptor.write({
+        protocol_version: 1,
+        endpoint: paths.endpoint,
+        pid: process.pid,
+        owner_uid: process.getuid?.() ?? 0,
+        engine_build_id: "build-app-live-daemon",
+        started_at: "2026-08-25T00:00:00.000Z",
+      });
+
+      const result = await runUrdira(["workspace", "add", fixtureRoot, "--dry-run"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-app-live-daemon",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+        on_progress: (entry) => progress.push(entry),
+      });
+
+      expect(result.exit_code).toBe(0);
+      expect(progress.map((entry) => entry.phase)).toEqual(expect.arrayContaining([
+        "daemon_discovery",
+        "daemon_probe",
+        "daemon_reuse",
+        "workspace_preview",
+        "workspace_discovery",
+      ]));
+
+      const shutdownProgress: string[] = [];
+      const stopped = await runUrdira(["daemon", "stop"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-app-live-daemon",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+        on_progress: (entry) => shutdownProgress.push(entry.phase),
+      });
+      expect(stopped.data).toMatchObject({ command: "stop", result: { state: "stopping" } });
+      expect(shutdownProgress).toContain("daemon_shutdown_wait");
+    } finally {
+      await server.close();
+      await descriptor.remove();
+      await lock.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an incompatible live daemon without forwarding workspace operations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-incompatible-daemon-"));
+    const paths = await daemonPaths(root);
+    const lock = await ProcessLock.acquire(paths.process_lock, {
+      pid: process.pid,
+      started_at: "2026-08-25T00:00:00.000Z",
+    });
+    const descriptor = new EndpointDescriptorStore(paths);
+    const calls: string[] = [];
+    const server = new LocalIpcServer({
+      endpoint: paths.endpoint,
+      handler: async (request) => {
+        calls.push(request.call);
+        if (request.call === "core:daemon_stop") {
+          setImmediate(() => { void Promise.all([descriptor.remove(), lock.release()]); });
+          return { state: "stopping", pid: process.pid, engine_build_id: "build-old", endpoint: paths.endpoint };
+        }
+        throw new DaemonError("core:unknown_call", `Unexpected test call ${request.call}.`);
+      },
+    });
+    const daemon = {
+      data_root: root,
+      engine_build_id: "build-required",
+      scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+    } as const;
+
+    try {
+      await server.listen();
+      await descriptor.write({
+        protocol_version: 1,
+        endpoint: paths.endpoint,
+        pid: process.pid,
+        owner_uid: process.getuid?.() ?? 0,
+        engine_build_id: "build-old",
+        started_at: "2026-08-25T00:00:00.000Z",
+      });
+
+      await expect(runUrdira(["workspace", "add", fixtureRoot, "--dry-run"], { daemon })).rejects.toMatchObject({
+        code: "core:daemon_restart_required",
+        details: {
+          detected_engine_build_id: "build-old",
+          required_engine_build_id: "build-required",
+          safe_automatic_restart: false,
+        },
+      });
+      expect(calls).toEqual([]);
+
+      const stopped = await runUrdira(["daemon", "stop"], { daemon });
+      expect(stopped.data).toMatchObject({ command: "stop", result: { state: "stopping", engine_build_id: "build-old" } });
+      expect(calls).toEqual(["core:daemon_stop"]);
+    } finally {
+      await server.close();
+      await descriptor.remove();
+      await lock.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("streams progress while detecting technologies in a real workspace", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-preview-progress-"));
+    const runtime = await DaemonRuntime.start({
+      data_root: root,
+      engine_build_id: "build-app-preview-progress",
+      scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+    });
+    const progress: Array<{ readonly phase: string; readonly completed: number; readonly total?: number }> = [];
+    try {
+      const result = await runUrdira(["workspace", "add", fixtureRoot, "--dry-run"], {
+        endpoint: runtime.endpoint,
+        on_progress: (entry) => progress.push(entry),
+      });
+      expect(result.exit_code).toBe(0);
+      expect(progress[0]).toMatchObject({ phase: "workspace_preview", completed: 0 });
+      expect(progress).toEqual(expect.arrayContaining([
+        expect.objectContaining({ phase: "workspace_discovery", completed: 0 }),
+        expect.objectContaining({ phase: "workspace_discovery", total: expect.any(Number) }),
+      ]));
+    } finally {
+      await runtime.stop({ force: true });
       await rm(root, { recursive: true, force: true });
     }
   });

@@ -35,8 +35,17 @@ function writeStartupProgress(phase: DaemonStartupPhase): void {
   process.stderr.write(`[urdira] ${startupMessages[phase]}\n`);
 }
 
+function writeOperationProgress(progress: { readonly phase: string; readonly completed: number; readonly total?: number; readonly message?: string }): void {
+  const message = progress.message ?? progress.phase;
+  process.stderr.write(`[urdira] ${message}\n`);
+}
+
 function isDaemonStart(args: readonly string[]): boolean {
   return args[0] === "daemon" && args[1] === "start" && !args.includes("--dry-run");
+}
+
+function isDaemonRestart(args: readonly string[]): boolean {
+  return args[0] === "daemon" && args[1] === "restart" && !args.includes("--dry-run");
 }
 
 function isV3Migration(args: readonly string[]): boolean {
@@ -145,13 +154,30 @@ if (process.env[INTERNAL_DAEMON_CHILD] === "1") {
   const result = await startDetachedDaemon();
   process.stdout.write(result.stdout);
   process.exitCode = result.exit_code;
+} else if (isDaemonRestart(argv)) {
+  parseCliArgs(argv);
+  await runUrdira(argv, {
+    ...(endpoint === undefined ? {} : { endpoint }),
+    on_startup_progress: writeStartupProgress,
+    on_progress: writeOperationProgress,
+  });
+  const result = await startDetachedDaemon();
+  process.stdout.write(result.stdout);
+  process.exitCode = result.exit_code;
 } else if (isV3Migration(argv)) {
   await runV3Migration(argv);
 } else {
-  const result = await runUrdira(argv, {
-    ...(endpoint === undefined ? {} : { endpoint }),
-    on_startup_progress: writeStartupProgress,
-  });
-  process.stdout.write(result.stdout);
-  process.exitCode = result.exit_code;
+  try {
+    const result = await runUrdira(argv, {
+      ...(endpoint === undefined ? {} : { endpoint }),
+      on_startup_progress: writeStartupProgress,
+      on_progress: writeOperationProgress,
+    });
+    process.stdout.write(result.stdout);
+    process.exitCode = result.exit_code;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[urdira] ${message}\n`);
+    process.exitCode = 1;
+  }
 }

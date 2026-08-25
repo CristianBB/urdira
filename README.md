@@ -41,7 +41,7 @@ remain available; unsupported operations fail explicitly.
 
 ## Install
 
-Urdira 0.3.0 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
+Urdira 0.3.1 requires Node.js `>=24.18.1`. Confirmed runtime preparation also
 requires npm `>=11.16.0`, which supplies the strict install-script policy. Check
 with `npm --version`; if necessary, update the npm paired with the active Node
 installation before preparing the runtime:
@@ -99,6 +99,25 @@ urdira workspace add /absolute/path/to/project --dry-run
 urdira status --json
 urdira index --json
 ```
+
+Human CLI commands report daemon discovery, attachment or startup, workspace
+technology inspection, registration, and daemon-emitted operation progress on
+stderr. A temporarily busy daemon that still owns the matching live process
+lock is reused instead of racing a second daemon for the same data root.
+The daemon must advertise the exact engine build for the installed Urdira
+release. After an update, an older live daemon receives no workspace or query
+operation: the CLI reports `core:daemon_restart_required`, while an explicit
+`urdira daemon stop` or `urdira daemon restart` remains available for lifecycle
+recovery. Restart long-lived MCP clients after updating so their adapters and
+the replacement daemon use the same installed release. `daemon stop` waits for
+the previous process to release its ownership lock; `daemon restart` then
+launches the installed release as a detached daemon and returns only after it
+reports readiness.
+Workspace preview and registration use a five-minute administrative deadline
+so large repositories can finish discovery while continuing to report
+progress; ordinary status and query calls keep their shorter request boundary.
+Expected operational failures are rendered as concise `[urdira]` messages
+instead of uncaught JavaScript stack traces.
 
 After an interactive registration succeeds, Urdira asks which coding-agent
 integrations to install. Answer `yes`/`all` for every supported installer, or

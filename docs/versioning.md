@@ -18,12 +18,19 @@ Semantic versioning, applied to OBSERVABLE BEHAVIOR, not to API surface alone:
 | --- | --- | --- |
 | Output-changing or behavior-breaking revision (any consumer could observe a difference: analysis results, closure completeness, record/digest values, wire payloads, defaults that alter results) | **minor** (`0.1.x -> 0.2.0`) | **major** |
 | Backwards-compatible additions (new optional fields, new calls, new env knobs that default to old behavior) | minor | minor |
+| Bug fix that restores already documented behavior without changing valid data, query results, public request schemas, or persisted formats | patch | patch |
 | No observable output difference (pure performance, internal refactors, comment/doc changes, byte-identical encoder rewrites) | patch | patch |
 
 The test is not "did an interface change" but "could anything downstream —
 a cache, a stored row, a fact delta, a user reading results — tell the
 difference between the two versions given identical inputs?" If yes, the
 change is breaking, and in `0.x` the minor slot is the breaking slot.
+
+An error path becoming successful, progress becoming visible, or a lifecycle
+command finally completing its documented operation is a patch when valid
+inputs, stored state, and successful-operation results retain their contract.
+It becomes a minor/major change only when the fix necessarily changes those
+contracts or invalidates behavior that was previously documented as valid.
 
 When in doubt, bump the larger slot: the runtime cost of a bump is identical
 either way (see below), so the only thing a too-small bump saves is honesty.

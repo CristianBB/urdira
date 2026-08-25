@@ -10,7 +10,7 @@ import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-th
 import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths } from "./ownership.js";
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
 import { ensureSemanticAssetsInProcess, runSemanticReconcileInProcess, startNeuralSemanticProviderHost, type NeuralSemanticProviderHost, type SemanticProcessRun } from "./semantic-process.js";
-import { LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
+import { LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcProgress, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
 import { DaemonScheduler, PersistentCursorRecovery, type PersistedCursorState, type SchedulerOptions } from "./scheduler.js";
 
 export interface DaemonPluginCatalogEntry extends WorkspacePluginCatalogEntry {
@@ -1165,8 +1165,9 @@ async function warmWorkspaceQueryEngine(workspaceId: string, registry: Workspace
   }
 }
 
-async function detectWorkspacePreview(root: string, catalog: readonly DaemonPluginCatalogEntry[]) {
+async function detectWorkspacePreview(root: string, catalog: readonly DaemonPluginCatalogEntry[], reportProgress?: (progress: IpcProgress["progress"]) => void) {
   const files: Array<{ readonly path: string; readonly content?: string }> = [];
+  reportProgress?.({ phase: "workspace_discovery", completed: 0, message: `scanning ${root}` });
   const walk = async (directory: string, relativeRoot = ""): Promise<void> => {
     let entries: ReadonlyArray<import("node:fs").Dirent<string>>;
     try { entries = await readdir(directory, { encoding: "utf8", withFileTypes: true }) as ReadonlyArray<import("node:fs").Dirent<string>>; } catch { return; }
@@ -1181,10 +1182,12 @@ async function detectWorkspacePreview(root: string, catalog: readonly DaemonPlug
           const content = await readFile(path, "utf8").catch(() => undefined);
           files.push(content === undefined ? { path: relativePath } : { path: relativePath, content });
         } else files.push({ path: relativePath });
+        if (files.length % 250 === 0) reportProgress?.({ phase: "workspace_discovery", completed: files.length, message: `inspected ${files.length} workspace files` });
       }
     }
   };
   await walk(root);
+  reportProgress?.({ phase: "workspace_discovery", completed: files.length, total: files.length, message: `workspace discovery complete (${files.length} files inspected)` });
   return detectWorkspaceTechnologies({
     provider_fingerprint: workspaceDigest(root),
     git_state_fingerprint: "git:unresolved",
@@ -2304,7 +2307,7 @@ export class DaemonRuntime {
         if (request.call === "core:workspace_preview") {
           const root = workspaceRootFromRequest(request.payload);
           if (root === undefined) throw new DaemonError("core:ipc_request_invalid", "workspace preview requires a workspace path.");
-          const proposal = await detectWorkspacePreview(root, pluginCatalog);
+          const proposal = await detectWorkspacePreview(root, pluginCatalog, context.reportProgress);
           return { proposal_id: `proposal:${proposal.proposal_fingerprint.slice("sha256:".length)}`, ...proposal, confirmation_required: true };
         }
         if (options.workspace_registry && request.call === "core:workspace_add") {

@@ -12,6 +12,7 @@ export interface PublishManifest {
 
 export const ROOT: string;
 export function productionPackageVersions(): Promise<Map<string, string>>;
+export function cleanProductionBuildOutputs(projectRoots?: readonly string[]): Promise<void>;
 export function createPublishManifest(source: Record<string, unknown>, versions: ReadonlyMap<string, string>): PublishManifest;
 export function validatePublishManifest(manifest: PublishManifest, versions: ReadonlyMap<string, string>): string[];
 export function publicationOrder(packages: readonly { readonly name: string; readonly manifest: PublishManifest }[]): string[];
