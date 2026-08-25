@@ -3,6 +3,15 @@
 All notable user-visible changes are documented here. Urdira follows the
 repository's [semantic versioning policy](docs/versioning.md).
 
+## [0.3.2] - 2026-08-25 — Bounded semantic startup
+
+- a missing local embedding-model cache is detected before the neural runtime
+  is loaded, so a fresh data root reaches structural readiness immediately;
+- the persistent neural child must complete its readiness handshake within 30
+  seconds and is terminated if it stalls; and
+- a neural child error or premature exit now degrades semantic search instead
+  of leaving daemon startup waiting indefinitely.
+
 ## [0.3.1] - 2026-08-25 — Reliable daemon discovery and replacement
 
 - a busy live daemon with matching ownership is reused instead of racing a

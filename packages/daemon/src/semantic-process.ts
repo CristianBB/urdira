@@ -109,9 +109,19 @@ export interface NeuralSemanticProviderHost {
   close(): Promise<void>;
 }
 
+export interface NeuralSemanticProviderHostStartupOptions {
+  readonly startup_timeout_ms?: number;
+  readonly spawn_child?: () => ChildProcess;
+}
+
+export const NEURAL_SEMANTIC_HOST_STARTUP_TIMEOUT_MS = 30_000;
+
 /** Persistent child used by neural query and configure-time provisioning. */
-export async function startNeuralSemanticProviderHost(descriptor: SemanticProviderDescriptor): Promise<NeuralSemanticProviderHost> {
+export async function startNeuralSemanticProviderHost(descriptor: SemanticProviderDescriptor, options: NeuralSemanticProviderHostStartupOptions = {}): Promise<NeuralSemanticProviderHost> {
   if (descriptor.kind !== "neural") throw new Error("The neural semantic host requires a neural descriptor.");
+  const startupTimeoutMs = options.startup_timeout_ms ?? NEURAL_SEMANTIC_HOST_STARTUP_TIMEOUT_MS;
+  if (!Number.isSafeInteger(startupTimeoutMs) || startupTimeoutMs <= 0) throw new Error("Neural semantic host startup timeout must be a positive safe integer.");
+  const spawnChild = options.spawn_child ?? (() => fork(semanticProcessEntryPath("semantic-neural-process.js"), [], { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" }));
   let child: ChildProcess | undefined;
   let nextId = 1;
   let closed = false;
@@ -121,7 +131,7 @@ export async function startNeuralSemanticProviderHost(descriptor: SemanticProvid
   const rejectPending = (error: Error): void => { for (const item of pending.values()) item.reject(error); pending.clear(); };
   let restart: Promise<NeuralHostReply> | undefined;
   const spawn = (): Promise<NeuralHostReply> => {
-    const processChild = fork(semanticProcessEntryPath("semantic-neural-process.js"), [], { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
+    const processChild = spawnChild();
     child = processChild;
     processChild.on("message", (message: NeuralHostReply) => {
       if (message.kind === "ready") return;
@@ -143,9 +153,40 @@ export async function startNeuralSemanticProviderHost(descriptor: SemanticProvid
       rejectPending(new Error("Neural semantic host exited; semantic search is temporarily unavailable."));
     });
     return new Promise<NeuralHostReply>((resolve, reject) => {
-      const onMessage = (message: NeuralHostReply): void => { if (message.kind === "ready") { processChild.off("message", onMessage); resolve(message); } };
+      let settled = false;
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        processChild.off("message", onMessage);
+        processChild.off("error", onError);
+        processChild.off("exit", onExit);
+      };
+      const finish = (operation: () => void): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        operation();
+      };
+      const rejectBeforeReady = (error: Error, terminate: boolean): void => finish(() => {
+        if (child === processChild) child = undefined;
+        if (terminate && !processChild.killed) processChild.kill("SIGTERM");
+        reject(error);
+      });
+      const onMessage = (message: NeuralHostReply): void => {
+        if (message.kind === "ready") finish(() => resolve(message));
+        else if (message.kind === "error" && message.id === undefined) rejectBeforeReady(asError(message.error ?? { message: "Neural semantic host initialization failed." }), true);
+      };
+      const onError = (error: Error): void => rejectBeforeReady(error, true);
+      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => rejectBeforeReady(new Error(`Neural semantic host exited before readiness (${code ?? "no-code"}/${signal ?? "no-signal"}).`), false);
+      const timeout = setTimeout(() => rejectBeforeReady(new Error(`Neural semantic host did not become ready within ${startupTimeoutMs} ms.`), true), startupTimeoutMs);
+      timeout.unref?.();
       processChild.on("message", onMessage);
-      processChild.send({ kind: "init", descriptor }, (error) => { if (error) reject(error); });
+      processChild.once("error", onError);
+      processChild.once("exit", onExit);
+      try {
+        processChild.send({ kind: "init", descriptor }, (error) => { if (error) rejectBeforeReady(error, true); });
+      } catch (error) {
+        rejectBeforeReady(error instanceof Error ? error : new Error(String(error)), true);
+      }
     });
   };
   const ensureChild = async (): Promise<NeuralHostReply> => {

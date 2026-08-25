@@ -69,7 +69,7 @@ export interface UrdiraRunOptions {
   readonly on_progress?: (progress: IpcProgress["progress"]) => void;
 }
 
-export const URDIRA_VERSION = "0.3.1";
+export const URDIRA_VERSION = "0.3.2";
 /** Exact runtime release identity. Bump automatically with every Urdira release. */
 export const URDIRA_ENGINE_BUILD_ID = `urdira-core-${URDIRA_VERSION}`;
 const DAEMON_HEALTH_PROBE_TIMEOUT_MS = 2_000;

@@ -31,4 +31,4 @@ export { DaemonClient, DaemonRuntime, type DaemonPluginCatalogEntry, type Daemon
 export { createPersistentWorkspaceRegistry, WorkspaceRegistry, type WorkspaceRegistryState } from "./workspace-registry.js";
 export { runLexicalReconcileInThread, type LexicalThreadJob, type LexicalThreadRun } from "./lexical-thread.js";
 export { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
-export { runSemanticReconcileInProcess, runSemanticReconcileInThread, startNeuralSemanticProviderHost, type SemanticProcessJob, type SemanticProcessRun, type SemanticThreadJob, type SemanticThreadRun, type NeuralSemanticProviderHost } from "./semantic-process.js";
+export { NEURAL_SEMANTIC_HOST_STARTUP_TIMEOUT_MS, runSemanticReconcileInProcess, runSemanticReconcileInThread, startNeuralSemanticProviderHost, type NeuralSemanticProviderHostStartupOptions, type SemanticProcessJob, type SemanticProcessRun, type SemanticThreadJob, type SemanticThreadRun, type NeuralSemanticProviderHost } from "./semantic-process.js";

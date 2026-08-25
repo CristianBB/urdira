@@ -23,6 +23,7 @@
 // `ensureLocalEmbeddingModel`, never via `buildSemanticProvider`).
 import type { ResolvedSemanticProvider } from "@urdira/engine";
 import { createHttpEmbeddingProvider, createLocalHashProvider } from "@urdira/engine";
+import { access } from "node:fs/promises";
 
 export type SemanticProviderDescriptor =
   | { readonly kind: "neural"; readonly model_id?: string; readonly dtype?: string; readonly cache_dir: string; readonly window_chars?: number; readonly max_windows?: number }
@@ -56,6 +57,12 @@ export async function buildSemanticProvider(descriptor: SemanticProviderDescript
   }
   // "neural": the only branch that ever touches `@urdira/embedding-local` --
   // lazy `import()`, not a static one, per this module's own header comment.
+  try {
+    await access(descriptor.cache_dir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`The local embedding model cache is not provisioned at ${descriptor.cache_dir}.`);
+    throw error;
+  }
   const { createLocalNeuralProvider } = await import("@urdira/embedding-local");
   return createLocalNeuralProvider({
     cache_dir: descriptor.cache_dir,

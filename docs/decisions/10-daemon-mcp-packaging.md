@@ -55,6 +55,15 @@ A second process first connects and performs the handshake. If the existing daem
 
 Startup phases are `locking`, `catalog_verification`, `workspace_recovery`, `provider_reconciliation`, and `ready`. The local query endpoint becomes available after catalog verification and serves last-known-good snapshots while individual workspaces recover. Status exposes each workspace phase. Mutating administrative operations wait for global readiness; read-only queries need only the selected verified snapshot.
 
+Neural semantic initialization cannot hold global readiness indefinitely. A
+data root whose local model cache has not been provisioned skips neural runtime
+loading immediately and starts with semantic search unavailable. When a cache
+does exist, the isolated neural child has a 30-second readiness deadline; an
+initialization error, premature exit, or timeout terminates that child and lets
+the daemon continue with structural and lexical capabilities. A later explicit
+workspace configuration may provision and activate the model without weakening
+the startup deadline or triggering an implicit download.
+
 The daemon is normally started on demand by the first `urdira mcp` or CLI request. `urdira daemon start` explicitly launches the same per-user daemon as a detached background process and returns only after verified readiness; its persistent process output is appended to the owner-only data-root `daemon.log`. There is no machine-wide multi-user daemon in the initial architecture.
 
 Before forwarding a request, `urdira mcp` verifies that the live daemon belongs to the same operating-system user, data root, engine build, and compatible private interface. When no live daemon exists, it starts the daemon from its own exact engine installation and waits for verified readiness. Compatible concurrent MCP servers share it.
