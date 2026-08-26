@@ -41,7 +41,7 @@ describe("dependency-free runtime bootstrap", () => {
   it("binds one bootstrap release to one exact runtime and reviewed script closure", () => {
     expect(BOOTSTRAP_VERSION).toBe("0.3.3");
     expect(RUNTIME_PACKAGE_NAME).toBe("@urdira/runtime");
-    expect(RUNTIME_VERSION).toBe("0.3.2");
+    expect(RUNTIME_VERSION).toBe("0.3.3");
     expect(MINIMUM_NODE_VERSION).toBe("24.18.1");
     expect(RUNTIME_INSTALL_SCRIPT_APPROVALS).toEqual({
       "onnxruntime-node@1.24.3": true,
@@ -53,7 +53,7 @@ describe("dependency-free runtime bootstrap", () => {
     const plan = createRuntimePreparationPlan("/var/lib/urdira");
     expect(plan).toMatchObject({
       package_name: "@urdira/runtime",
-      package_version: "0.3.2",
+      package_version: "0.3.3",
       minimum_node_version: "24.18.1",
       minimum_npm_version: "11.16.0",
       registry: "https://registry.npmjs.org/",
@@ -140,7 +140,7 @@ describe("dependency-free runtime bootstrap", () => {
     await expect(readFile(currentSentinel, "utf8")).resolves.toBe("current");
   });
 
-  it("reuses runtime 0.3.2 prepared by the compatible 0.3.2 bootstrap on a v3 root", async () => {
+  it("does not reuse a runtime prepared by an older bootstrap authority", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "urdira-bootstrap-compatible-"));
     writeCatalog(dataRoot, 0x33);
     await prepareRuntime({
@@ -151,18 +151,11 @@ describe("dependency-free runtime bootstrap", () => {
     const paths = runtimePaths(dataRoot);
     const manifest = JSON.parse(await readFile(paths.manifest, "utf8"));
     await writeFile(paths.manifest, `${JSON.stringify({ ...manifest, bootstrap_version: "0.3.2" }, null, 2)}\n`);
-    let reinstalled = false;
-
-    const prepared = await prepareRuntime({
+    await expect(prepareRuntime({
       data_root: dataRoot,
       confirm: true,
-      install: async () => {
-        reinstalled = true;
-        throw new Error("compatible runtime must not be reinstalled");
-      },
-    });
-    expect(prepared).toMatchObject({ status: "already_prepared", data_root_reset: false });
-    expect(reinstalled).toBe(false);
+      install: async () => { throw new Error("an invalid active runtime must not be overwritten"); },
+    })).rejects.toThrow("Runtime target already exists but is invalid");
   });
 
   it("refuses destructive reset while a daemon process still owns the legacy root", async () => {
@@ -239,7 +232,7 @@ describe("dependency-free runtime bootstrap", () => {
       install: async ({ staging_root }) => {
         const privateManifest = JSON.parse(await readFile(join(staging_root, "package.json"), "utf8"));
         expect(privateManifest).toMatchObject({
-          dependencies: { "@urdira/runtime": "0.3.2" },
+          dependencies: { "@urdira/runtime": "0.3.3" },
           overrides: { "adm-zip": "0.6.0", sharp: "0.35.3" },
           allowScripts: RUNTIME_INSTALL_SCRIPT_APPROVALS,
         });

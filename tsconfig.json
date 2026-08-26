@@ -34,6 +34,7 @@
     { "path": "packages/daemon" },
     { "path": "packages/mcp" },
     { "path": "packages/cli" },
+    { "path": "packages/web" },
     { "path": "packages/testkit" },
     { "path": "tsconfig.tests.json" },
     { "path": "apps/urdira" },

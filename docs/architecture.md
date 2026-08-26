@@ -32,7 +32,10 @@ flowchart TD
   Bootstrap["apps/bootstrap"] --> Runtime["@urdira/runtime"]
   Runtime --> CLI["@urdira/cli"]
   Runtime --> MCP["@urdira/mcp"]
+  Runtime --> Web["@urdira/web"]
   Runtime --> Daemon["@urdira/daemon"]
+  Web --> CLI
+  Web --> MCP
   CLI --> Daemon
   MCP --> Daemon
   Daemon --> Engine["@urdira/engine"]
@@ -276,6 +279,7 @@ itself.
 | Pipeline execution | `packages/engine/src/pipeline-executor.ts` | `executePipeline` schedules ready frontiers and seals every output as a `StageSetHandle`. |
 | Canonical operations | `packages/engine/src/canonical-query-data-port.ts` | `CanonicalRecordQueryDataPort` implements language-neutral operations with indexed pushdown and bounded fallback paths. |
 | MCP surface | `packages/mcp/src/index.ts` | `createUrdiraToolDefinitions`, request lowering, IPC invocation, result dieting, and deterministic rendering. |
+| Local web surface | `packages/web/src/server/index.ts` and `packages/web/src/client/main.tsx` | Authenticated loopback CLI API, Streamable HTTP MCP composition, directory-only selection, and the bundled browser interface. |
 | Daemon orchestration | `packages/daemon/src/runtime.ts` and `scheduler.ts` | Workspace lifecycle, readiness barriers, scan scheduling, query cancellation, and maintenance. |
 | Physical schema | `packages/storage/src/schema.ts` and `packages/contracts/src/relational-schema.ts` | SQLite DDL derived from Schema IR and the destructive v3 contract marker. |
 | Logical digests | `packages/canonical/src/logical-digest-writer.ts` | Incremental field, presence, type, length, sequence, and canonical-set framing. |
@@ -285,5 +289,5 @@ For normative detail, read [Decision 04](decisions/04-workspace-snapshot-increme
 [Decision 20](decisions/20-source-first-readiness.md),
 [Decision 21](decisions/21-native-pipeline-relational-storage.md),
 [Decision 22](decisions/22-v3-optimization.md),
-[Decision 23](decisions/23-index-pack.md), and the
+[Decision 23](decisions/23-index-pack.md), [Decision 24](decisions/24-local-web-interface.md), and the
 [public query contract](protocol/public-query-contract.md).

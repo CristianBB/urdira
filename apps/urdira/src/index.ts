@@ -5,7 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { validateFactDeltaBatch, type ArtifactWorkItem, type FactDeltaBatch, type ReplacementScope, type SnapshotCapabilityStateEntry } from "@urdira/contracts";
 import { parseCliArgs, runCli, type CliCommand, type CliResult } from "@urdira/cli";
-import { createPersistentWorkspaceRegistry, DaemonClient, DaemonError, DaemonRuntime, EndpointDescriptorStore, ProcessLock, daemonPaths, type DaemonRuntimeOptions, type DaemonStartupPhase, type IpcProgress, type SemanticProviderDescriptor } from "@urdira/daemon";
+import { createPersistentWorkspaceRegistry, DAEMON_PRIVATE_INTERFACE_VERSION, DaemonClient, DaemonError, DaemonRuntime, EndpointDescriptorStore, ProcessLock, daemonPaths, type DaemonRuntimeOptions, type DaemonStartupPhase, type IpcProgress, type SemanticProviderDescriptor } from "@urdira/daemon";
 import {
   candidateTargetRegistryFromSnapshot,
   compactAcceptedFactDelta,
@@ -19,6 +19,7 @@ import {
   type WorkspaceScanSourceArtifact,
 } from "@urdira/engine";
 import { MCP_BENCHMARK_INSTRUCTIONS, buildBenchmarkInstructions, serveUrdiraStdio, type ServeUrdiraStdioOptions, type UrdiraMcpClient } from "@urdira/mcp";
+import { startUrdiraWeb, type UrdiraWebHandle } from "@urdira/web";
 export { MCP_BENCHMARK_INSTRUCTIONS, buildBenchmarkInstructions } from "@urdira/mcp";
 import type { PluginWorkerRequestEnvelope } from "@urdira/plugin-sdk";
 import {
@@ -69,7 +70,7 @@ export interface UrdiraRunOptions {
   readonly on_progress?: (progress: IpcProgress["progress"]) => void;
 }
 
-export const URDIRA_VERSION = "0.3.2";
+export const URDIRA_VERSION = "0.3.3";
 /** Exact runtime release identity. Bump automatically with every Urdira release. */
 export const URDIRA_ENGINE_BUILD_ID = `urdira-core-${URDIRA_VERSION}`;
 const DAEMON_HEALTH_PROBE_TIMEOUT_MS = 2_000;
@@ -78,7 +79,7 @@ const DAEMON_SHUTDOWN_TIMEOUT_MS = 300_000;
 const debugTimingEnabled = (): boolean => process.env["URDIRA_DEBUG_TIMING"] === "1";
 
 function urdiraHelpLegacy(): string {
-  return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace add <path> [--dry-run]\n  urdira workspace configure <id> [--dry-run]\n  urdira workspace remove <id> [--dry-run|--confirm]\n  urdira workspace purge <id> [--dry-run|--confirm]\n  urdira daemon start\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n\nWorkspace add/configure and daemon start/stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;
+  return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace list|show|add|configure|remove|purge\n  urdira codebase list|create|rename|assign|unassign|remove\n  urdira daemon start\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n  urdira web\n\nWorkspace add/configure and daemon start/stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;
 }
 
 export function urdiraHelp(): string {
@@ -1527,8 +1528,78 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   };
 }
 
-async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, startIfMissing = true, onStartupProgress?: (phase: DaemonStartupPhase) => void, onProgress?: (progress: IpcProgress["progress"]) => void, allowIncompatibleLifecycleCall = false): Promise<{ readonly endpoint: string; readonly runtime?: DaemonRuntime } | undefined> {
-  if (endpoint !== undefined) return { endpoint };
+function compatibilityDetails(payload: unknown, requiredCapabilities: readonly string[]): { readonly interface_version?: number; readonly capabilities: readonly string[]; readonly missing: readonly string[] } {
+  if (payload === null || typeof payload !== "object") return { capabilities: [], missing: requiredCapabilities };
+  const record = payload as Record<string, unknown>;
+  const capabilities = Array.isArray(record["rpc_capabilities"])
+    ? record["rpc_capabilities"].filter((entry): entry is string => typeof entry === "string")
+    : [];
+  return {
+    ...(typeof record["private_interface_version"] === "number" ? { interface_version: record["private_interface_version"] } : {}),
+    capabilities,
+    missing: requiredCapabilities.filter((capability) => !capabilities.includes(capability)),
+  };
+}
+
+function daemonCompatibilityError(dataRoot: string, detectedBuild: string, requiredBuild: string, detectedInterface: number | undefined, missingCapabilities: readonly string[]): DaemonError {
+  return new DaemonError(
+    "core:daemon_restart_required",
+    `The running daemon exposes private interface ${detectedInterface ?? "legacy"}; interface ${DAEMON_PRIVATE_INTERFACE_VERSION} is required. Restart Urdira before retrying.`,
+    {
+      data_root_id: dataRoot,
+      detected_engine_build_id: detectedBuild,
+      required_engine_build_id: requiredBuild,
+      detected_private_interface_version: detectedInterface ?? "legacy",
+      required_private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION,
+      missing_rpc_capabilities: missingCapabilities,
+      blocking_reason: "restart_lease_denied",
+      safe_automatic_restart: false,
+    },
+  );
+}
+
+function requiredRpcCapabilities(command: CliCommand): readonly string[] {
+  if (command.name === "workspace-add" && command.options.dry_run) return ["core:status", "core:workspace_preview"];
+  const capabilityByCommand: Partial<Record<CliCommand["name"], string>> = {
+    status: "core:status",
+    query: "core:query",
+    index: "core:index_status",
+    start: "core:daemon_start",
+    stop: "core:daemon_stop",
+    restart: "core:daemon_restart",
+    "workspace-list": "core:workspace_admin_list",
+    "workspace-show": "core:workspace_admin_show",
+    "workspace-add": "core:workspace_add",
+    "workspace-remove": "core:workspace_remove",
+    "workspace-purge": "core:workspace_purge",
+    "workspace-configure": "core:workspace_configure",
+    "codebase-list": "core:codebase_list",
+    "codebase-create": "core:codebase_create",
+    "codebase-rename": "core:codebase_rename",
+    "codebase-assign": "core:codebase_assign",
+    "codebase-unassign": "core:codebase_unassign",
+    "codebase-remove": "core:codebase_remove",
+    "config-set": "core:configuration_set",
+    repair: "core:repair",
+    gc: "core:garbage_collect",
+    reindex: "core:reindex",
+    "index-pack-export": "core:index_pack_export",
+  };
+  const capability = capabilityByCommand[command.name];
+  return capability === undefined ? ["core:status"] : ["core:status", capability];
+}
+
+async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, startIfMissing = true, onStartupProgress?: (phase: DaemonStartupPhase) => void, onProgress?: (progress: IpcProgress["progress"]) => void, allowIncompatibleLifecycleCall = false, requiredCapabilities: readonly string[] = ["core:status"]): Promise<{ readonly endpoint: string; readonly runtime?: DaemonRuntime } | undefined> {
+  if (endpoint !== undefined) {
+    if (!allowIncompatibleLifecycleCall) {
+      const status = await new DaemonClient(endpoint, { request_timeout_ms: DAEMON_HEALTH_PROBE_TIMEOUT_MS }).call("core:status", {});
+      const compatibility = compatibilityDetails(status.payload, requiredCapabilities);
+      if (status.outcome !== "success" || compatibility.interface_version !== DAEMON_PRIVATE_INTERFACE_VERSION || compatibility.missing.length > 0) {
+        throw daemonCompatibilityError("explicit-endpoint", "unknown", "explicit-endpoint", compatibility.interface_version, compatibility.missing);
+      }
+    }
+    return { endpoint };
+  }
   const dataRoot = options?.data_root ?? process.env["URDIRA_DATA_ROOT"] ?? join(homedir(), ".urdira");
   const requiredEngineBuildId = options?.engine_build_id ?? URDIRA_ENGINE_BUILD_ID;
   const paths = await daemonPaths(dataRoot);
@@ -1537,6 +1608,12 @@ async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, 
   if (descriptor) {
     const owner = await ProcessLock.inspect(paths.process_lock);
     const matchingLiveOwner = owner?.alive === true && owner.pid === descriptor.pid;
+    const descriptorCapabilities = descriptor.rpc_capabilities ?? [];
+    const missingDescriptorCapabilities = requiredCapabilities.filter((capability) => !descriptorCapabilities.includes(capability));
+    if (matchingLiveOwner && !allowIncompatibleLifecycleCall
+      && (descriptor.private_interface_version !== DAEMON_PRIVATE_INTERFACE_VERSION || missingDescriptorCapabilities.length > 0)) {
+      throw daemonCompatibilityError(dataRoot, descriptor.engine_build_id, requiredEngineBuildId, descriptor.private_interface_version, missingDescriptorCapabilities);
+    }
     if (matchingLiveOwner && descriptor.engine_build_id !== requiredEngineBuildId) {
       if (allowIncompatibleLifecycleCall) {
         onProgress?.({ phase: "daemon_reuse", completed: 1, total: 1, message: `connecting to incompatible daemon process ${descriptor.pid} for explicit lifecycle control` });
@@ -1575,6 +1652,10 @@ async function resolveDaemon(options?: DaemonRuntimeOptions, endpoint?: string, 
           blocking_reason: "restart_lease_denied",
           safe_automatic_restart: false,
         });
+      }
+      const compatibility = compatibilityDetails(response.payload, requiredCapabilities);
+      if (!allowIncompatibleLifecycleCall && (compatibility.interface_version !== DAEMON_PRIVATE_INTERFACE_VERSION || compatibility.missing.length > 0)) {
+        throw daemonCompatibilityError(dataRoot, reportedEngineBuildId, requiredEngineBuildId, compatibility.interface_version, compatibility.missing);
       }
       onProgress?.({ phase: "daemon_reuse", completed: 1, total: 1, message: `reusing daemon process ${descriptor.pid}` });
       return { endpoint: descriptor.endpoint };
@@ -1634,8 +1715,8 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
   const previewOnlyLifecycle = (command.name === "start" || command.name === "stop") && command.options.dry_run;
   const explicitLifecycleControl = command.name === "stop" || command.name === "restart";
   const daemon = command.name === "stop" || command.name === "restart" || previewOnlyLifecycle
-    ? await resolveDaemon(options.daemon, options.endpoint, false, options.on_startup_progress, options.on_progress, explicitLifecycleControl)
-    : await resolveDaemon(options.daemon, options.endpoint, true, options.on_startup_progress, options.on_progress, explicitLifecycleControl);
+    ? await resolveDaemon(options.daemon, options.endpoint, false, options.on_startup_progress, options.on_progress, explicitLifecycleControl, requiredRpcCapabilities(command))
+    : await resolveDaemon(options.daemon, options.endpoint, true, options.on_startup_progress, options.on_progress, explicitLifecycleControl, requiredRpcCapabilities(command));
   const prompt = options.prompt ?? (process.stdin.isTTY && process.stdout.isTTY ? async (question: string) => {
     const readline = createInterface({ input: process.stdin, output: process.stdout });
     try { return await readline.question(`${question} `); } finally { readline.close(); }
@@ -1679,7 +1760,7 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
 }
 
 export async function runUrdiraMcp(options: UrdiraMcpRunOptions): Promise<{ readonly close: () => Promise<void> }> {
-  const daemon = await resolveDaemon(options.daemon, options.endpoint);
+  const daemon = await resolveDaemon(options.daemon, options.endpoint, true, undefined, undefined, false, ["core:status", "core:index_status", "core:query", "core:query_continue"]);
   if (daemon === undefined) throw new Error("MCP daemon resolution unexpectedly returned no endpoint.");
   try {
     const clientOptions = options.request_timeout_ms === undefined ? {} : { request_timeout_ms: options.request_timeout_ms };
@@ -1695,6 +1776,33 @@ export async function runUrdiraMcp(options: UrdiraMcpRunOptions): Promise<{ read
         await handle.close();
         if (daemon.runtime) await daemon.runtime.stop({ force: false });
       },
+    };
+  } catch (error) {
+    if (daemon.runtime) await daemon.runtime.stop({ force: true });
+    throw error;
+  }
+}
+
+export interface UrdiraWebRunOptions {
+  readonly endpoint?: string;
+  readonly daemon?: DaemonRuntimeOptions;
+  readonly port?: number;
+}
+
+/** Owns the loopback web listener and, when needed, the private daemon it started. */
+export async function runUrdiraWeb(options: UrdiraWebRunOptions = {}): Promise<UrdiraWebHandle> {
+  const daemon = await resolveDaemon(options.daemon, options.endpoint, true, undefined, undefined, false, ["core:status", "core:index_status", "core:query", "core:query_continue", "core:workspace_admin_list", "core:codebase_list"]);
+  if (daemon === undefined) throw new Error("Web daemon resolution unexpectedly returned no endpoint.");
+  try {
+    const client = new DaemonClient(daemon.endpoint);
+    const handle = await startUrdiraWeb({
+      client,
+      run_cli: (argv: readonly string[], onProgress?: (progress: unknown) => void) => runUrdira(argv, { endpoint: daemon.endpoint, ...(onProgress === undefined ? {} : { on_progress: onProgress as (progress: IpcProgress["progress"]) => void }) }),
+      ...(options.port === undefined ? {} : { port: options.port }),
+    });
+    return {
+      ...handle,
+      close: async () => { await handle.close(); if (daemon.runtime) await daemon.runtime.stop({ force: false }); },
     };
   } catch (error) {
     if (daemon.runtime) await daemon.runtime.stop({ force: true });

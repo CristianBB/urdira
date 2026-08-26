@@ -334,7 +334,10 @@ export async function buildRelease({ rootDir = SCRIPT_ROOT, outputDir = join(roo
   // The repository root also references the test project. Release builds must
   // compile only the production project graph; the test tsconfig intentionally
   // has source-only imports that are not a distributable package input.
-  if (build) await execFileAsync("pnpm", ["exec", "tsc", "--build", "--force", "packages/contracts", "packages/canonical", "packages/security", "packages/storage", "packages/plugin-sdk", "packages/plugin-javascript-typescript", "packages/engine", "packages/embedding-local", "packages/daemon", "packages/mcp", "packages/cli", "apps/urdira", "apps/bootstrap"], { cwd: rootDir, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
+  if (build) {
+    await execFileAsync("pnpm", ["exec", "tsc", "--build", "--force", "packages/contracts", "packages/canonical", "packages/security", "packages/storage", "packages/plugin-sdk", "packages/plugin-javascript-typescript", "packages/engine", "packages/embedding-local", "packages/daemon", "packages/mcp", "packages/cli", "packages/web", "apps/urdira", "apps/bootstrap"], { cwd: rootDir, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
+    await execFileAsync("pnpm", ["--filter", "@urdira/web", "build"], { cwd: rootDir, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
+  }
   const metadata = buildReleaseMetadata({ gitCommit: await gitCommit(rootDir), lockfileDigest: await lockfileDigest(rootDir) });
   const archives = [];
   const inspections = {};

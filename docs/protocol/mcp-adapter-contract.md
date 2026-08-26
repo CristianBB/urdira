@@ -2,11 +2,11 @@
 
 Status: Approved initial contract  
 Verified against MCP: 2026-07-28  
-Last verified: 2026-08-08
+Last verified: 2026-08-26
 
 ## Purpose
 
-This document is the authoritative transport contract for exposing Urdira through the Model Context Protocol. The coding agent configures and launches exactly one command, `urdira mcp`; no separate adapter package, daemon endpoint, private protocol, or workspace session is exposed. Internally the command may attach to Urdira's durable per-user daemon, but that boundary cannot appear in agent-facing schemas or configuration.
+This document is the authoritative transport contract for exposing Urdira through the Model Context Protocol. A coding agent configures and launches exactly one command, `urdira mcp`; no separate adapter package, daemon endpoint, private protocol, or workspace session is exposed. The local browser uses the same factory through `urdira web` at its token-free same-origin `/mcp` route. Internally either composition may attach to Urdira's durable per-user daemon, but that boundary cannot appear in schemas or configuration.
 
 The initial implementation targets the stable `2026-07-28` MCP revision and the stable v2 line of the official TypeScript SDK. It uses `McpServer` and `registerTool` from the split `@modelcontextprotocol/server` package and the current `serveStdio(factory, options)` entry point from `@modelcontextprotocol/server/stdio`. It must not use the superseded manual `StdioServerTransport` plus `server.connect(transport)` wiring or build new code on the legacy monolithic `@modelcontextprotocol/sdk` v1 API.
 
@@ -24,7 +24,7 @@ MCP `2026-07-28` is the primary modern, stateless protocol era. Urdira implement
 
 - There is no `initialize`/`initialized` handshake and no MCP session identifier.
 - Every request carries `io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientCapabilities`, and any client identity supplied by the client in request `_meta`.
-- The adapter implements `server/discover` and advertises exact supported MCP revisions, `serverInfo`, and only the capabilities it actually implements.
+- The adapter implements `server/discover` and advertises exact supported MCP revisions, `serverInfo`, and only the capabilities it actually implements. `serverInfo.name` is `urdira`; `serverInfo.version` is the exact Urdira runtime release version and is release-authority tested against every publishable manifest.
 - The adapter rejects an unsupported modern revision with MCP `UnsupportedProtocolVersionError`, including the exact supported revisions.
 - MCP request metadata selects protocol behavior only. It never selects a Urdira workspace, snapshot, query execution, cursor, plugin, or configuration.
 
@@ -36,9 +36,11 @@ Removing legacy support or changing the selected legacy revisions is a release c
 
 The initial adapter advertises only the MCP `tools` server capability. It does not advertise resources, resource subscriptions, prompts, completion, sampling, roots, elicitation, logging, Tasks, MCP Apps, or any other extension.
 
-The adapter also sets the top-level `instructions` field of the initialize/discover result: a compact, deterministic agent-facing manual covering the explicit workspace-discovery bootstrap, a minimal query example, and one line per registered core operation and intent recipe, built directly from the same operation and recipe registries the engine validates every request against so it cannot drift. `instructions` is plain descriptive text, not a capability; advertising it does not imply resources, prompts, or any other extension.
+The adapter also sets the top-level `instructions` field of the initialize/discover result. It is a deterministic, progressively disclosed agent manual in this order: a four-step quick start, a five-tool decision guide, expression selection, a minimal direct query, the pipeline mental model and executable examples, readiness and result guidance, then the exact operation and recipe catalogs. The pipeline section defines `arguments` as static inputs, `bindings` as typed edges from an earlier `{stage_id, output}` to a downstream argument, `outputs` as the final exposed streams, complete-set propagation, topological ordering, and scalar-cardinality failure. It includes tested `search -> source`, `resolve -> references`, and `resolve -> references -> source` examples plus recovery guidance for invalid output names, selector shapes, readiness, and cursors.
 
-The tool set is static for the lifetime of an adapter release and is returned in deterministic name order. The adapter does not advertise `tools.listChanged`; tool additions, removals, or incompatible schema changes require a new adapter release and process restart. On modern connections, `tools/list` uses the MCP `2026-07-28` list-response shape, including `resultType`, cache metadata supported by the SDK, and MCP's opaque `nextCursor` when the catalog ever exceeds one page. The SDK emits the negotiated legacy list shape on legacy connections. Any MCP list cursor is a transport catalog cursor and has no relationship to Urdira query cursors.
+The exact operation signatures and recipe catalog in `instructions` are generated directly from the same registries used to validate requests. Every registered operation must appear once in the categorized usage guide; missing guidance or duplicate coverage fails server construction. `instructions` is plain descriptive text, not a capability, and advertising it does not imply resources, prompts, or any other extension.
+
+The tool set is static for the lifetime of an adapter release and is returned in deterministic name order. The adapter explicitly advertises `tools.listChanged: false`; it does not rely on the SDK default, because registering the first tool otherwise enables list-change support. Tool additions, removals, or incompatible schema changes require a new adapter release and process restart. On modern connections, `tools/list` uses the MCP `2026-07-28` list-response shape, including `resultType`, cache metadata supported by the SDK, and MCP's opaque `nextCursor` when the catalog ever exceeds one page. The SDK emits the negotiated legacy list shape on legacy connections. Any MCP list cursor is a transport catalog cursor and has no relationship to Urdira query cursors.
 
 The five tool names are:
 
@@ -55,11 +57,11 @@ Names are unique, case-sensitive, stable within the API major, and restricted to
 Every tool definition contains:
 
 - a stable `name` and concise human-readable `title`;
-- a concise `description` explaining when to use it, explicit workspace scope, continuation behavior, and Urdira's read-only guarantee;
+- a concise `description` explaining when to use it, how it differs from the other four tools, explicit workspace scope, continuation behavior, and Urdira's read-only guarantee; `urdira_query` also carries a self-contained pipeline primer so clients that omit server instructions still receive the essential binding rules;
 - an `inputSchema` generated from the authoritative Urdira public schema;
 - annotations `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, and `openWorldHint: false`.
 
-No tool declares an `outputSchema`. A 2026-08-14 benchmark found that Claude Code's MCP client reads only `structuredContent` -- never the `content[0].text` block below -- whenever a tool's `tools/list` entry carries an `outputSchema`, because the installed official SDK requires `structuredContent` on every non-error result once an outputSchema exists. That made the compact-text rendering the adapter is built around invisible to the agent in practice. An internal reference value describing the successful-or-operation-error Urdira result union is still retained in the adapter's own source for documentation and tests, but it is never passed to `registerTool` and never appears in `tools/list`.
+In the default `agent` profile no tool declares an `outputSchema`. A 2026-08-14 benchmark found that Claude Code's MCP client reads only `structuredContent` -- never the `content[0].text` block below -- whenever a tool's `tools/list` entry carries an `outputSchema`. The compact agent rendering therefore remains the complete compatibility surface. In the `web` profile, the same internal successful-or-operation-error union is passed to `registerTool` as `outputSchema`, and calls return the matching validated `structuredContent` for browser consumption. Profiles never change tool names, input schemas, domain requests, or result semantics.
 
 `urdira_index_status` defaults to Index Status API v3. Its readiness fields are
 actionable: `source_ready` means a complete equivalent source catalog,
@@ -73,7 +75,7 @@ The compact rendering includes a copy-ready `query_scope` object for every
 workspace. Clients reuse that object byte-for-byte; `workspace_id` is opaque
 and must not be retyped, abbreviated, normalized, or synthesized.
 
-The `inputSchema` uses JSON Schema 2020-12. Every object is closed with `additionalProperties: false`, every union has an explicit discriminator, and every agent-visible field has the description required by the public query contract. The generated schema is validated using the SDK's supported schema integration and retained as a release fixture so that SDK upgrades cannot alter it silently.
+The `inputSchema` uses JSON Schema 2020-12. Every object is closed with `additionalProperties: false`, every union has an explicit discriminator, and every agent-visible field has the description required by the public query contract. Pipeline schema descriptions explicitly distinguish static stage `arguments`, dependency `bindings`, topological stage order, operation-specific stream names, and final declared `outputs`. The generated schema is validated using the SDK's supported schema integration and retained as a release fixture so that SDK upgrades cannot alter it silently.
 
 MCP annotations are descriptive hints, not the security boundary. The daemon protocol and Urdira authorization rules independently enforce that all five operations are read-only.
 
@@ -82,7 +84,7 @@ MCP annotations are descriptive hints, not the security boundary. The daemon pro
 On a modern connection, `tools/call` follows the MCP `2026-07-28` result model:
 
 - A completed call returns `resultType: "complete"`.
-- No result carries `structuredContent`: since no tool declares an `outputSchema` (see above), the SDK never requires it, and the adapter never emits it, so a client is guaranteed to find the full result in `content`.
+- In the agent profile no result carries `structuredContent`, so a client is guaranteed to find the full result in `content`. In the web profile the complete wrapper is also returned in `structuredContent`; `content` remains equivalent.
 - `content` contains exactly one text block. By default it is Urdira's compact, grep-like plain-text rendering of the public wrapper value; an undocumented `render: "json"` debug argument (accepted at runtime but never advertised in any schema, description, or the server instructions) instead puts the complete JSON-serialized wrapper in that same text block.
 - A successful Urdira operation sets `isError: false` or omits it when the SDK's exact type permits omission.
 - A recoverable Urdira `OperationError` returns the typed error wrapper as compact JSON in `content[0].text` and sets `isError: true`. The agent therefore receives the registered diagnostic code, retryability, recovery actions, and closed details needed to correct the call.
@@ -141,7 +143,7 @@ Daemon delegation is an implementation detail. MCP request IDs, progress tokens,
 
 The adapter validates MCP envelopes and generated tool schemas before forwarding a request. It applies response and concurrency ceilings, sanitizes all agent-visible output, and preserves the path and secret-handling rules of the security specification. MCP results contain normalized workspace-relative paths or approved safe URIs, never absolute host paths, daemon sockets, cache paths, environment values, credentials, stack traces, or plugin scratch data.
 
-No MCP authorization layer is required for the initial client-launched stdio binding. Local authority derives from the operating-system user launching the adapter and the owner-restricted daemon channel. A future network transport requires its own security and authorization design and does not inherit this assumption.
+No MCP authorization layer is required for either local binding. Local authority derives from the operating-system user launching the adapter and the owner-restricted daemon channel. The Streamable HTTP binding is available only inside foreground `urdira web`; it binds exclusively to `127.0.0.1`, validates same-origin and Host headers, has no CORS or remote-bind mode, and does not expose daemon IPC.
 
 ## Conformance gates
 
@@ -152,7 +154,8 @@ An adapter release must pass:
 - legacy `initialize`, era pinning, tool-list equivalence, tool-call equivalence, and unsupported-revision fixtures through the same `serveStdio` factory;
 - deterministic tool ordering and schema snapshot tests;
 - JSON Schema 2020-12 validation for every minimal, maximal, and invalid public fixture;
-- no-`outputSchema`/no-`structuredContent` conformance tests (`tools/list` advertises no `outputSchema` for any tool; every result carries its full value in `content[0].text` only);
+- agent-profile no-`outputSchema`/no-`structuredContent` byte-compatibility tests and web-profile schema/structured-content equivalence tests;
+- loopback Streamable HTTP tests using the pinned official client without application credentials, including discovery, tool calls, errors, cancellation, and cursors;
 - protocol-error versus `OperationError` mapping tests;
 - MCP catalog-cursor and Urdira result-cursor separation tests;
 - progress monotonicity, cancellation race, stdin EOF, stdout purity, and adapter restart tests;

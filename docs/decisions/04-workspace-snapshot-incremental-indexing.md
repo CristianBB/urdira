@@ -41,7 +41,7 @@ The authoritative logical schemas are defined only in the [universal data model]
 
 ## Workspace lifecycle
 
-Registration creates a random stable `workspace_id` for one explicit source-provider binding and normalized source root. Path, Git repository, branch, commit, remote, inode, and content do not determine that identity. Registering an already active canonical provider root is idempotent and returns the existing workspace unless the caller explicitly requests a separate virtual provider instance.
+Registration creates a stable `workspace:<project-slug>:<uuid>` identity for one explicit source-provider binding and normalized source root. The informative slug comes from the effective project name; only the UUID is identity authority. Existing opaque IDs remain unchanged during the versioned registry migration. Path, Git repository, branch, commit, remote, inode, and content do not determine identity. Registering an already active canonical provider root is idempotent and returns the existing workspace unless the caller explicitly requests a separate virtual provider instance.
 
 A physical workspace stores both its display path and a provider-normalized canonical root. Symlinks are resolved according to the configured source-boundary policy before duplicate detection. Moving a root does not automatically transfer identity based only on matching content. Relocation is an explicit control operation that proves continuity using the old workspace ID, the previous provider fingerprint, and the new root; it updates control state without changing snapshots or entity identities. If the old root is missing and exactly one candidate matches its provider-stable filesystem identity or Git worktree administrative identity, status may propose a relocation, but activation still requires administrator approval.
 
@@ -51,9 +51,9 @@ Workspace state is `registering`, `indexing`, `ready`, `degraded`, `suspended`, 
 
 ## Codebase grouping
 
-`Codebase` is an optional user-managed grouping for related workspaces. Urdira may propose membership using Git common-directory identity, normalized remote fingerprints, or an explicit portable project marker, but these are hints. Membership never merges snapshots, entities, plugin locks, configuration, update queues, or query scope.
+`Codebase` is the effective project grouping for related workspaces. Exact captured Git common-repository identity groups worktrees automatically; non-Git registrations receive their own codebase. Users may rename a codebase or assign independent clones explicitly. Unassigning or removing a group creates independent replacement groups for active members, so no active workspace is presented as “Ungrouped”. Membership never merges snapshots, entities, plugin locks, configuration, update queues, or query scope.
 
-Clones and worktrees may share a codebase while retaining independent workspace IDs. A non-Git directory may belong to a codebase, and a workspace may be ungrouped. Comparison requests still name every workspace explicitly; codebase membership is never an implicit fan-out selector in the initial public API.
+Clones and worktrees may share a codebase while retaining independent workspace IDs. A non-Git directory belongs to a codebase. Status resolution accepts an explicit root or nested `cwd`, selecting the most-specific registered containing root and returning its `query_scope`; hooks copy that explicit `workspace_id` into every source-reading call. There is no process-global active workspace. Comparison requests still name every workspace explicitly; codebase membership is never an implicit fan-out selector.
 
 ## Source-provider protocol
 
@@ -157,6 +157,13 @@ On restart, Urdira first verifies the current workspace tuple and publication jo
 Candidates whose frozen base tuple is still current may resume missing idempotent work. Candidates with changed base, registry, resolution lock, configuration, or source observations are cancelled and replanned. Plugin responses from a previous daemon process are accepted only if their complete request and output digests match persisted work items; otherwise they are discarded.
 
 Recovery runs an authoritative provider reconciliation before declaring mutable workspaces fresh. The last verified snapshot remains queryable throughout. Repeated recovery failure marks the workspace degraded and exposes bounded candidate issues; it never deletes the last valid state.
+
+Legacy registry compatibility may normalize a relative user-facing
+`display_root` to an already-identical absolute `canonical_root`. The catalog
+applies only that narrow one-way metadata upgrade atomically; arbitrary display
+root, canonical root, registration time, provider binding, and database-path
+changes remain immutable and require the existing relocation or lifecycle
+operation.
 
 ## Conformance scenarios
 

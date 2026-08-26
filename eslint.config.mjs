@@ -39,4 +39,21 @@ export default [
       "no-undef": "off",
     },
   },
+  {
+    ...eslint.configs.recommended,
+    files: ["**/*.tsx"],
+    languageOptions: {
+      parser: babelParser,
+      parserOptions: {
+        requireConfigFile: false,
+        babelOptions: {
+          plugins: [["@babel/plugin-syntax-typescript", { isTSX: true }]],
+        },
+      },
+      globals: nodeGlobals,
+    },
+    rules: {
+      "no-undef": "off",
+    },
+  },
 ];

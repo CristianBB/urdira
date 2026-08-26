@@ -485,6 +485,7 @@ describe("Daemon periodic reconciliation sweep (Bug B backstop)", () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-sweep-data-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-sweep-workspace-"));
     let runtime: DaemonRuntime | undefined;
+    let releaseSweep: (() => void) | undefined;
     try {
       await mkdir(workspaceRoot, { recursive: true });
       for (const file of ["task.ts", "errors.ts"]) {
@@ -492,8 +493,15 @@ describe("Daemon periodic reconciliation sweep (Bug B backstop)", () => {
       }
 
       const resolveCalls: string[] = [];
+      let holdSweep = false;
+      let reportSweepStarted: (() => void) | undefined;
+      const sweepStarted = new Promise<void>((resolve) => { reportSweepStarted = resolve; });
       const countingResolvePluginProvider: NonNullable<DaemonRuntimeOptions["resolve_plugin_provider"]> = async (workspace, database) => {
         resolveCalls.push(workspace.workspace_id);
+        if (holdSweep) {
+          reportSweepStarted?.();
+          await new Promise<void>((resolve) => { releaseSweep = resolve; });
+        }
         return resolvePluginProvider(workspace, database);
       };
 
@@ -525,6 +533,15 @@ describe("Daemon periodic reconciliation sweep (Bug B backstop)", () => {
       const callsAtReady = resolveCalls.length;
       expect(callsAtReady).toBeGreaterThan(0);
 
+      holdSweep = true;
+      await sweepStarted;
+      const administrative = await client.call("core:workspace_admin_list", {});
+      expect(administrative.outcome).toBe("success");
+      const administrativeWorkspace = (administrative.payload as { readonly workspaces: readonly { readonly workspace_id: string; readonly status: string; readonly indexing_activity?: string }[] }).workspaces.find((workspace) => workspace.workspace_id === workspaceId);
+      expect(administrativeWorkspace).toMatchObject({ status: "indexing", indexing_activity: "checking_for_updates" });
+      holdSweep = false;
+      releaseSweep?.();
+
       // Wait for a completed sweep instead of assuming a loaded CI host will
       // schedule one within a fixed wall-clock delay.
       await pollUntil(() => resolveCalls.length > callsAtReady, process.platform === "win32" ? 30_000 : 10_000);
@@ -538,6 +555,7 @@ describe("Daemon periodic reconciliation sweep (Bug B backstop)", () => {
       expect(final.workspace_status).toBe("ready");
       expect(final.current_snapshot_id).toBe(settled.current_snapshot_id);
     } finally {
+      releaseSweep?.();
       if (runtime) await runtime.stop();
       await rm(dataRoot, { recursive: true, force: true });
       await rm(workspaceRoot, { recursive: true, force: true });

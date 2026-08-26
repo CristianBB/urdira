@@ -7,6 +7,8 @@ import { describe, expect, it, vi } from "vitest";
 import { defaultDaemonOptions, runUrdira, URDIRA_ENGINE_BUILD_ID, URDIRA_VERSION, urdiraHelp } from "../apps/urdira/src/index.js";
 import {
   daemonPaths,
+  DAEMON_PRIVATE_INTERFACE_VERSION,
+  daemonRpcCapabilities,
   DaemonClient,
   DaemonError,
   DaemonRuntime,
@@ -99,7 +101,7 @@ async function queryAfterStagedPublication(client: DaemonClient, workspaceId: st
 
 describe("Urdira application runner", () => {
   it("publishes stable version and help output without starting the daemon", () => {
-    expect(URDIRA_VERSION).toBe("0.3.2");
+    expect(URDIRA_VERSION).toBe("0.3.3");
     expect(URDIRA_ENGINE_BUILD_ID).toBe(`urdira-core-${URDIRA_VERSION}`);
     expect(urdiraHelp()).toContain("urdira mcp");
     expect(urdiraHelp()).toContain("explicit workspace scope");
@@ -175,6 +177,8 @@ describe("Urdira application runner", () => {
       await server.listen();
       await descriptor.write({
         protocol_version: 1,
+        private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION,
+        rpc_capabilities: daemonRpcCapabilities(true),
         endpoint: paths.endpoint,
         pid: process.pid,
         owner_uid: process.getuid?.() ?? 0,
@@ -269,6 +273,55 @@ describe("Urdira application runner", () => {
       const stopped = await runUrdira(["daemon", "stop"], { daemon });
       expect(stopped.data).toMatchObject({ command: "stop", result: { state: "stopping", engine_build_id: "build-old" } });
       expect(calls).toEqual(["core:daemon_stop"]);
+    } finally {
+      await server.close();
+      await descriptor.remove();
+      await lock.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a legacy private interface even when the daemon reports the same engine build", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-legacy-interface-"));
+    const paths = await daemonPaths(root);
+    const lock = await ProcessLock.acquire(paths.process_lock, { pid: process.pid, started_at: "2026-08-25T00:00:00.000Z" });
+    const descriptor = new EndpointDescriptorStore(paths);
+    const calls: string[] = [];
+    const server = new LocalIpcServer({
+      endpoint: paths.endpoint,
+      handler: async (request) => {
+        calls.push(request.call);
+        if (request.call === "core:status") return { state: "ready", pid: process.pid, engine_build_id: "build-same", endpoint: paths.endpoint };
+        throw new DaemonError("core:unknown_call", `Legacy daemon does not implement ${request.call}.`);
+      },
+    });
+    try {
+      await server.listen();
+      await descriptor.write({
+        protocol_version: 1,
+        endpoint: paths.endpoint,
+        pid: process.pid,
+        owner_uid: process.getuid?.() ?? 0,
+        engine_build_id: "build-same",
+        started_at: "2026-08-25T00:00:00.000Z",
+      });
+
+      await expect(runUrdira(["workspace", "list"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-same",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+      })).rejects.toMatchObject({
+        code: "core:daemon_restart_required",
+        details: {
+          detected_engine_build_id: "build-same",
+          required_engine_build_id: "build-same",
+          detected_private_interface_version: "legacy",
+          required_private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION,
+        },
+      });
+      expect(calls).toEqual([]);
     } finally {
       await server.close();
       await descriptor.remove();

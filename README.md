@@ -42,7 +42,7 @@ remain available; unsupported operations fail explicitly.
 ## Install
 
 Urdira 0.3.3 requires Node.js `>=24.18.1`. The dependency-free 0.3.3 bootstrap
-prepares the exact `@urdira/runtime@0.3.2` application. Confirmed runtime preparation also
+prepares the exact `@urdira/runtime@0.3.3` application. Confirmed runtime preparation also
 requires npm `>=11.16.0`, which supplies the strict install-script policy. Check
 with `npm --version`; if necessary, update the npm paired with the active Node
 installation before preparing the runtime:
@@ -114,8 +114,10 @@ Human CLI commands report daemon discovery, attachment or startup, workspace
 technology inspection, registration, and daemon-emitted operation progress on
 stderr. A temporarily busy daemon that still owns the matching live process
 lock is reused instead of racing a second daemon for the same data root.
-The daemon must advertise the exact engine build for the installed Urdira
-release. After an update, an older live daemon receives no workspace or query
+The daemon must advertise the exact engine build, private-interface version,
+and required RPC capabilities for the installed Urdira release. Legacy
+descriptors and missing RPCs require restart even when the reported build text
+matches. After an update, an older live daemon receives no workspace or query
 operation: the CLI reports `core:daemon_restart_required`, while an explicit
 `urdira daemon stop` or `urdira daemon restart` remains available for lifecycle
 recovery. Restart long-lived MCP clients after updating so their adapters and
@@ -169,11 +171,88 @@ For storage tuning, `URDIRA_CAS_PUT_CONCURRENCY` bounds independent CAS writes
 per source-ingestion batch (default `16`). It is a scheduling knob only; each
 blob keeps the same fsync and atomic-install durability boundary.
 
+### Local web interface
+
+Start the bundled local interface with:
+
+```bash
+urdira web
+```
+
+The command prints `http://127.0.0.1:<port>/` and keeps the foreground process
+alive. The local UI does not require a token. There is no remote-bind option,
+CORS policy, or separately installed web server; Host and Origin validation
+keep browser access on the listener's own loopback origin.
+
+The interface manages Projects and Workspaces from a persistent searchable
+context bar, shows branch/worktree, directory, commit, dirty state, readiness,
+and observation age, and runs the registered CLI catalog through the ordinary
+preview and confirmation gates, and calls the five public MCP tools directly
+over `/mcp`. Query, data-explorer, and graph views use public MCP operations
+only; they never open SQLite or expose raw database tables. Every MCP call
+still carries an explicit `workspace_id`. Workspace removal keeps its
+recoverable tombstone, while purge remains a separate advanced action.
+
+Periodic reconciliation of an already-ready workspace is labeled **Checking
+for updates**; **Indexing** is reserved for actual initial, changed-source,
+recovery, or explicitly requested scans. This local UI distinction does not
+change public MCP responses.
+
+New registrations use `workspace:<project-slug>:<uuid>` while retaining legacy
+IDs unchanged. Worktrees sharing an exact Git common-repository identity are
+grouped automatically; `urdira codebase rename <codebase-id> <name>` changes
+the project label, and unassigning creates an independent project rather than
+an ungrouped workspace. Search renders lexical, semantic, and hybrid results
+visually. The MCP section can build every advertised tool request through a
+schema-driven guided form or a synchronized manual JSON editor, with reusable
+query starters for common code-intelligence tasks. Its dependent-pipeline guide
+includes contract-valid search-to-source and resolve-to-references examples,
+explains complete-set bindings, and visualizes which upstream stream feeds each
+downstream argument. Raw schemas, responses, and CLI JSON remain available from
+the technical inspector.
+
+When a scan is rejected, the workspace card and every affected view show the
+failure reason, timestamp, technical code, and a safe retry action. Operations
+that can still use the last successful snapshot remain available and are
+explicitly marked stale; only operations whose required frontier is missing are
+disabled. Project and Workspace fields use selectable controls instead of
+accepting arbitrary identifiers. Large indexed-file and indexed-symbol
+collections use keyboard-accessible searchable selectors, disambiguate repeated
+symbol names, and omit generated build output from the primary browsing
+surface. Generated records remain inspectable through the Advanced raw result.
+The advanced CLI form also derives fixed choices from the registered command
+schema: agent integrations list every supported client and the closed `user`
+scope, while internal proposal identifiers and duplicate argument/option
+spellings are not shown as user-editable fields.
+
+Long-running exact queries report meaningful staged progress, structured
+MCP/CLI output switches to readable cards when a table would become too dense,
+and query pages expose result-group totals plus persistent previous and next
+navigation without describing a partial page as the complete result. Search,
+outline, source, reference, and architecture results use operation-specific
+views that lead with human names, kinds, paths, source lines, snippets, and
+match explanations; opaque record, artifact, workspace, and version identifiers
+stay under technical details. Exact matches are grouped by file while retaining
+every source occurrence, and visited immutable pages remain available through
+Previous even when the continuation response has no reverse cursor. Indexed
+symbol selectors collect all outline pages instead of silently stopping at the
+first page. Selecting a symbol also retains its indexed
+artifact and byte position so reference and relationship queries target the
+exact selected occurrence. Graphs provide named nodes, readable relationship
+labels, a synchronized tabular alternative, explicit continuation when more
+relationships exist, fit and zoom controls, and a lower-noise depth-one
+starting view.
+The responsive interface supports persistent light and dark themes, using the
+operating-system preference until a local preference is selected.
+
 ### MCP configuration
 
 Urdira exposes one local stdio MCP server. The process starts or shares the
 per-user daemon; workspace scope stays in tool arguments and is never stored as
 connection state. Most MCP clients use this entry:
+
+Discovery reports the exact installed Urdira release in `serverInfo.version`
+and marks the five-tool catalog as static with `tools.listChanged: false`.
 
 ```json
 {
@@ -289,8 +368,9 @@ construction, and frozen index status. See the
 [MCP adapter contract](docs/protocol/mcp-adapter-contract.md).
 
 Agents should first call `urdira_index_status` with the exact workspace root,
-then repeat the returned `workspaceId` on every source-reading request. A
-returned cursor is opaque and must be continued with the same scope.
+then reuse its returned `query_scope` object byte-for-byte on every
+source-reading request. A returned cursor is opaque and must be continued with
+the same scope.
 
 For a multi-step coding task, prefer `urdira_context` or an API v3 pipeline
 with explicit stage bindings. Dependent stages execute inside one snapshot and
@@ -299,6 +379,17 @@ with that same query instead of a readiness-polling loop. The complete-context
 wrapper waits for the structural frontier by default (30 seconds unless an
 explicit freshness policy is supplied); source-safe operations remain usable
 at `source_ready` while later stages continue in the background.
+
+The MCP server teaches this flow during discovery: its quick start first helps
+the agent choose among the five tools, then explains direct operations,
+recipes, continuations, and typed pipelines before the exhaustive catalog.
+Pipeline examples cover `search -> source`, `resolve -> references`, and
+`resolve -> references -> source`. Each downstream `bindings` property names
+the argument it fills and points to an earlier `{stage_id, output}`; sequence
+arguments receive the complete upstream set, while scalar arguments require
+exactly one item. The same essential guidance is repeated in the
+`urdira_query` tool and pipeline schema descriptions for clients that do not
+surface server-level instructions.
 
 ## Benchmark evidence
 
@@ -404,7 +495,9 @@ records bytes read, transferred, copied, decoded, and retained.
 ## Current limitations
 
 - The bundled production structural analyzer is JavaScript/TypeScript only.
-- Urdira is local and single-user; there is no network MCP or hosted service.
+- Urdira is local and single-user; the only HTTP MCP binding is the
+  token-free `127.0.0.1` listener owned by foreground `urdira web`. There
+  is no remote MCP or hosted service.
 - Supported filesystems must provide reliable locking, atomic rename, durable
   sync, and SQLite WAL behavior.
 - Semantic search depends on the configured local model being present and

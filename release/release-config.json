@@ -1,6 +1,6 @@
 {
   "release_schema_version": 1,
-  "engine_version": "0.3.2",
+  "engine_version": "0.3.3",
   "runtime": {
     "node": "24.18.1",
     "pnpm": "11.20.0",
@@ -21,6 +21,7 @@
     "@urdira/runtime",
     "@urdira/cli",
     "@urdira/mcp",
+    "@urdira/web",
     "@urdira/daemon",
     "@urdira/engine",
     "@urdira/embedding-local",
@@ -32,13 +33,19 @@
     "@urdira/contracts"
   ],
   "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
+    "@vitejs/plugin-react": "6.1.0",
     "@huggingface/transformers": "4.2.0",
     "@parcel/watcher": "2.6.0",
     "adm-zip": "0.6.0",
     "isomorphic-git": "1.40.5",
+    "cytoscape": "3.34.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
     "sharp": "0.35.3",
     "typescript": "7.0.2",
+    "vite": "8.2.2",
     "vitest": "4.1.10",
     "eslint": "9.39.5"
   },

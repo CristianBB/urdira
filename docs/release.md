@@ -91,7 +91,7 @@ Required outcomes:
 
 - architecture, lint, type, generated-contract, test, and coverage gates pass;
 - the production dependency audit reports no known vulnerabilities;
-- all 13 npm tarballs contain only `dist`, `README.md`, `LICENSE`, and package
+- all 14 npm tarballs contain only `dist`, `README.md`, `LICENSE`, and package
   metadata, with no `workspace:*`, testkit, fixture, source, or private path;
 - a clean global npm prefix installs only the `urdira` bootstrap with no
   dependencies and no npm warning, then a separate temporary project installs

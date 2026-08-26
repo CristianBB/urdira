@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { parseCliArgs, type CliResult } from "@urdira/cli";
 import type { DaemonStartupPhase } from "@urdira/daemon";
 import { migrateToV3 } from "@urdira/storage";
-import { runUrdira, runUrdiraMcp, URDIRA_VERSION, urdiraHelp } from "./index.js";
+import { runUrdira, runUrdiraMcp, runUrdiraWeb, URDIRA_VERSION, urdiraHelp } from "./index.js";
 
 const endpoint = process.env["URDIRA_ENDPOINT"];
 const argv = process.argv.slice(2);
@@ -148,6 +148,11 @@ if (process.env[INTERNAL_DAEMON_CHILD] === "1") {
   const handle = await runUrdiraMcp({ ...(endpoint === undefined ? {} : { endpoint }) });
   process.stdin.resume();
   await new Promise<void>((resolve) => process.stdin.once("end", resolve));
+  await handle.close();
+} else if (argv[0] === "web") {
+  const handle = await runUrdiraWeb({ ...(endpoint === undefined ? {} : { endpoint }) });
+  process.stdout.write(`${handle.url}\n`);
+  await new Promise<void>((resolve) => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); });
   await handle.close();
 } else if (isDaemonStart(argv)) {
   parseCliArgs(argv);

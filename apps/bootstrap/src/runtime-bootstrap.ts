@@ -6,7 +6,7 @@ import { basename, dirname, join, parse as parsePath, resolve, sep } from "node:
 
 export const BOOTSTRAP_VERSION = "0.3.3";
 export const RUNTIME_PACKAGE_NAME = "@urdira/runtime";
-export const RUNTIME_VERSION = "0.3.2";
+export const RUNTIME_VERSION = BOOTSTRAP_VERSION;
 export const RUNTIME_REGISTRY = "https://registry.npmjs.org/";
 export const MINIMUM_NODE_VERSION = "24.18.1";
 export const MINIMUM_NPM_VERSION = "11.16.0";
@@ -19,9 +19,7 @@ export const RUNTIME_INSTALL_SCRIPT_APPROVALS = Object.freeze({
 
 const ACKNOWLEDGED_BOOLEAN_WARNING = "npm warn deprecated boolean@3.2.0: Package no longer supported. Contact Support at https://www.npmjs.com/support for more info.";
 const RUNTIME_MANIFEST_NAME = "urdira-runtime.json";
-// Bootstrap 0.3.3 changes only pre-v3 preparation. Its runtime coordinate,
-// lockfile validation, warning policy, and install-script closure remain 0.3.2.
-const COMPATIBLE_RUNTIME_PREPARERS = new Set(["0.3.2", BOOTSTRAP_VERSION]);
+const COMPATIBLE_RUNTIME_PREPARERS = new Set([BOOTSTRAP_VERSION]);
 
 export interface RuntimePaths {
   readonly runtime_parent: string;

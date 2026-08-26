@@ -29,7 +29,8 @@ const descriptions = {
   "@urdira/engine": "Workspace indexing and deterministic query engine for Urdira.",
   "@urdira/embedding-local": "Local open-model embedding provider for Urdira.",
   "@urdira/daemon": "Local daemon, scheduling, and recovery for Urdira.",
-  "@urdira/mcp": "Four-tool MCP adapter for Urdira.",
+  "@urdira/mcp": "Five-tool MCP adapter for Urdira.",
+  "@urdira/web": "Secured loopback web interface for Urdira CLI and MCP.",
   "@urdira/cli": "Command-line parsing and administrative safety gates for Urdira.",
 };
 
@@ -141,7 +142,7 @@ async function packPackage(staged, tarballRoot) {
   return { ...staged, tarball: join(tarballRoot, result.filename), files: filenames, size: result.size, integrity: result.integrity };
 }
 
-const productionProjects = ["packages/contracts", "packages/canonical", "packages/security", "packages/storage", "packages/plugin-sdk", "packages/plugin-javascript-typescript", "packages/engine", "packages/embedding-local", "packages/daemon", "packages/mcp", "packages/cli", "apps/urdira", "apps/bootstrap"];
+const productionProjects = ["packages/contracts", "packages/canonical", "packages/security", "packages/storage", "packages/plugin-sdk", "packages/plugin-javascript-typescript", "packages/engine", "packages/embedding-local", "packages/daemon", "packages/mcp", "packages/cli", "packages/web", "apps/urdira", "apps/bootstrap"];
 
 export async function cleanProductionBuildOutputs(projectRoots = productionProjects.map((project) => join(ROOT, project))) {
   await Promise.all(projectRoots.map((projectRoot) => rm(join(projectRoot, "dist"), { recursive: true, force: true })));
@@ -150,7 +151,8 @@ export async function cleanProductionBuildOutputs(projectRoots = productionProje
 async function buildProduction() {
   await cleanProductionBuildOutputs();
   for (const project of productionProjects) {
-    await execFileAsync("pnpm", ["exec", "tsc", "--build", "--force", project], { cwd: ROOT, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
+    if (project === "packages/web") await execFileAsync("pnpm", ["--filter", "@urdira/web", "build"], { cwd: ROOT, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
+    else await execFileAsync("pnpm", ["exec", "tsc", "--build", "--force", project], { cwd: ROOT, env: { ...process.env, CI: "true" }, maxBuffer: 20 * 1024 * 1024 });
   }
 }
 

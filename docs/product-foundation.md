@@ -1,7 +1,7 @@
 # Urdira Product Foundation
 
 Status: Current product contract
-Last updated: 2026-08-24
+Last updated: 2026-08-25
 
 ## Purpose of this document
 
@@ -43,6 +43,7 @@ current architecture.
 | 21 | Native pipeline and relational storage | Approved and implemented in v3 | [Native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md) |
 | 22 | v3 bounded pipelines, incremental digests, and destructive data-root boundary | Approved and implemented | [v3 optimization](decisions/22-v3-optimization.md) |
 | 23 | Cross-machine index pack bootstrap | Approved and implemented | [Index pack](decisions/23-index-pack.md) |
+| 24 | Local web interface | Approved and implemented | [Local web interface](decisions/24-local-web-interface.md) |
 
 The order expresses dependency between current specifications. Decisions 21
 and 22 define the v3 native pipeline, relational authority, logical digests,

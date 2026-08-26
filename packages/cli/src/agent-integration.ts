@@ -20,11 +20,11 @@ export interface DiscoveryChildContext {
 export interface AgentBridgeClient { readonly call: (call: string, payload: unknown) => Promise<{ readonly outcome: string; readonly payload?: unknown; readonly error?: unknown }>; }
 
 const MANAGED = "urdira-managed-agent-integration-v1";
-const CLIENTS: readonly AgentClient[] = ["claude-code", "codex", "opencode", "cursor", "vscode", "cline", "roo", "claude-desktop"];
+export const AGENT_CLIENTS: readonly AgentClient[] = ["claude-code", "codex", "opencode", "cursor", "vscode", "cline", "roo", "claude-desktop"];
 
 export function normalizeAgentClient(value: string | undefined): AgentClient | "all" {
   if (value === "all") return "all";
-  if (CLIENTS.includes(value as AgentClient)) return value as AgentClient;
+  if (AGENT_CLIENTS.includes(value as AgentClient)) return value as AgentClient;
   throw new Error(`Unknown agent client: ${value ?? ""}`);
 }
 

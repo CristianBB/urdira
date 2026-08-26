@@ -1,4 +1,5 @@
 export { DaemonError, type DaemonErrorCode } from "./errors.js";
+export { DAEMON_PRIVATE_INTERFACE_VERSION, daemonRpcCapabilities } from "./compatibility.js";
 export {
   IPC_DEFAULT_MAX_FRAME_BYTES,
   IPC_MAX_CHUNK_BYTES,

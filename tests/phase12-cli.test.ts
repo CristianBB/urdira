@@ -1,9 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
-import { CliError, MUTATING_COMMANDS, parseCliArgs, runCli, type CliDaemonClient } from "../packages/cli/src/index.js";
+import { CLI_COMMAND_CATALOG, CliError, MUTATING_COMMANDS, parseCliArgs, runCli, type CliDaemonClient } from "../packages/cli/src/index.js";
 
 const client: CliDaemonClient = { call: vi.fn(async (call) => ({ outcome: "success", payload: { call } })) };
 
 describe("Phase 12 closed CLI", () => {
+  it("publishes one closed descriptor for every registered command and never exposes shell execution", () => {
+    expect(new Set(CLI_COMMAND_CATALOG.map((entry) => entry.command)).size).toBe(CLI_COMMAND_CATALOG.length);
+    expect(CLI_COMMAND_CATALOG.some((entry) => entry.command === "workspace-list")).toBe(true);
+    expect(CLI_COMMAND_CATALOG.some((entry) => entry.command === "codebase-create" && entry.confirmation === "proposal")).toBe(true);
+    expect(JSON.stringify(CLI_COMMAND_CATALOG.map((entry) => ({ command: entry.command, options: entry.options })))).not.toMatch(/shell|spawn/u);
+  });
+
+  it("parses workspace inspection and codebase administration aliases", () => {
+    expect(parseCliArgs(["workspace", "list"]).name).toBe("workspace-list");
+    expect(parseCliArgs(["workspace", "show", "workspace-1"]).name).toBe("workspace-show");
+    expect(parseCliArgs(["codebase", "create", "Project", "--confirm"]).name).toBe("codebase-create");
+    expect(parseCliArgs(["codebase", "unassign", "workspace-1", "--confirm"]).name).toBe("codebase-unassign");
+    expect(parseCliArgs(["agent", "install", "--client", "codex", "--dry-run"]).name).toBe("agent-install");
+  });
   it("parses read-only commands and rejects unknown options", () => {
     expect(parseCliArgs(["status", "--json"])).toMatchObject({ name: "status", options: { json: true, dry_run: false, confirm: false } });
     expect(parseCliArgs(["index", "--debug-timing"])).toMatchObject({ name: "index", options: { debug_timing: true } });

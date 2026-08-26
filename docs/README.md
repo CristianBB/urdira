@@ -14,7 +14,7 @@ implementation or release.
    diagnostic registry, indexing registry, semantic registry, or compatibility
    contract.
    For Urdira's native indexing/storage lineage and destructive v3 boundary,
-   also read [native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md), [v3 optimization](decisions/22-v3-optimization.md), and [index pack](decisions/23-index-pack.md).
+   also read [native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md), [v3 optimization](decisions/22-v3-optimization.md), [index pack](decisions/23-index-pack.md), and [local web interface](decisions/24-local-web-interface.md).
 5. Use [audits](audits/), [evidence](evidence/), and public benchmark reports
    only as verification. They cannot introduce product behavior.
 6. Use the [release process](release.md) for qualification and publication.
@@ -42,6 +42,8 @@ Its destructive v3 storage, digest, pipeline, and migration boundary is refined
 by [`decisions/22-v3-optimization.md`](decisions/22-v3-optimization.md).
 Optional cross-machine bootstrap of a new workspace is governed by
 [`decisions/23-index-pack.md`](decisions/23-index-pack.md).
+The loopback UI, CLI HTTP adapter, and structured MCP web profile are governed
+by [`decisions/24-local-web-interface.md`](decisions/24-local-web-interface.md).
 Schema IR generates relational table metadata; typed worker arenas and the
 length-prefixed Protobuf chunk contract are used only at their documented
 boundaries.

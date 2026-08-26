@@ -4,7 +4,17 @@ import { dirname, join } from "node:path";
 import { DaemonError } from "./errors.js";
 
 export interface DaemonPaths { readonly data_root: string; readonly endpoint: string; readonly endpoint_descriptor: string; readonly process_lock: string; readonly last_known_good: string; }
-export interface EndpointDescriptor { readonly protocol_version: number; readonly endpoint: string; readonly pid: number; readonly owner_uid: number; readonly engine_build_id: string; readonly started_at: string; readonly descriptor_digest?: string; }
+export interface EndpointDescriptor {
+  readonly protocol_version: number;
+  readonly private_interface_version?: number;
+  readonly rpc_capabilities?: ReadonlyArray<string>;
+  readonly endpoint: string;
+  readonly pid: number;
+  readonly owner_uid: number;
+  readonly engine_build_id: string;
+  readonly started_at: string;
+  readonly descriptor_digest?: string;
+}
 export interface LastKnownGood { readonly engine_build_id: string; readonly checkpoint_id: string; readonly workspaces: ReadonlyArray<string>; readonly cursors: ReadonlyArray<string>; readonly written_at: string; readonly state_digest?: string; }
 export interface ProcessLockOwner { readonly pid: number; readonly started_at?: string; readonly alive: boolean; }
 
@@ -34,7 +44,7 @@ async function readJson(path: string): Promise<unknown | undefined> { try { retu
 export class EndpointDescriptorStore {
   constructor(private readonly paths: DaemonPaths) {}
   async write(descriptor: Omit<EndpointDescriptor, "descriptor_digest">): Promise<EndpointDescriptor> { const value = { ...descriptor, descriptor_digest: digest(descriptor) }; await atomicJson(this.paths.endpoint_descriptor, value); return value; }
-  async read(): Promise<EndpointDescriptor | undefined> { const value = await readJson(this.paths.endpoint_descriptor); if (value === undefined) return undefined; if (!value || typeof value !== "object" || typeof (value as { descriptor_digest?: unknown }).descriptor_digest !== "string") throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor is incomplete."); const descriptor = value as EndpointDescriptor; if (descriptor.protocol_version !== 1 || typeof descriptor.endpoint !== "string" || typeof descriptor.pid !== "number" || !Number.isSafeInteger(descriptor.pid) || typeof descriptor.owner_uid !== "number" || typeof descriptor.engine_build_id !== "string" || typeof descriptor.started_at !== "string") throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor fields are invalid."); const { descriptor_digest, ...unsigned } = descriptor; if (descriptor_digest !== digest(unsigned)) throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor digest does not verify."); return descriptor; }
+  async read(): Promise<EndpointDescriptor | undefined> { const value = await readJson(this.paths.endpoint_descriptor); if (value === undefined) return undefined; if (!value || typeof value !== "object" || typeof (value as { descriptor_digest?: unknown }).descriptor_digest !== "string") throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor is incomplete."); const descriptor = value as EndpointDescriptor; if (descriptor.protocol_version !== 1 || typeof descriptor.endpoint !== "string" || typeof descriptor.pid !== "number" || !Number.isSafeInteger(descriptor.pid) || typeof descriptor.owner_uid !== "number" || typeof descriptor.engine_build_id !== "string" || typeof descriptor.started_at !== "string" || (descriptor.private_interface_version !== undefined && (!Number.isSafeInteger(descriptor.private_interface_version) || descriptor.private_interface_version < 1)) || (descriptor.rpc_capabilities !== undefined && (!Array.isArray(descriptor.rpc_capabilities) || descriptor.rpc_capabilities.some((entry) => typeof entry !== "string" || entry.length === 0)))) throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor fields are invalid."); const { descriptor_digest, ...unsigned } = descriptor; if (descriptor_digest !== digest(unsigned)) throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor digest does not verify."); return descriptor; }
   async remove(): Promise<void> { await rm(this.paths.endpoint_descriptor, { force: true }); }
 }
 

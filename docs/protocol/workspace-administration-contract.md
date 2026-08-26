@@ -36,3 +36,41 @@ worktree administration events preserve the workspace identity, stale the
 previous snapshot, and schedule one full reconciliation. Overflow, provider
 reset, or lost events widen to a full reconciliation before freshness is
 reported.
+
+## Administrative listing and Codebases
+
+`workspace list` returns active workspaces and recoverable removed tombstones;
+`workspace show <workspace_id>` returns one explicit administrative record.
+When a Git worktree is available, registration persists its common-repository
+identity, ref kind and name, head revision, detached flag, dirty flag, and
+capture time. Structured status and administrative views include the effective
+`project_name`, `workspace_label`, normalized branch name, short commit,
+directory/worktree kind, and observation age. These absolute-path administrative views remain CLI/local-web
+data and never enter public MCP query results.
+
+While a workspace has lifecycle status `indexing`, the local administrative
+view may additionally expose transient `indexing_activity` with the closed
+values `indexing` or `checking_for_updates`. A watcher event, explicit reindex,
+initial scan, or recovery scan reports `indexing`. The periodic reconciliation
+backstop for an otherwise ready workspace reports `checking_for_updates` until
+it proves equivalence or discovers work to publish. This presentation field is
+process-local, is not persisted, and is deliberately absent from public query
+pages and agent MCP output.
+
+A `Codebase` is the effective project grouping of related Workspaces.
+`codebase list/create/rename/assign/unassign/remove` are the grouping
+operations. Registration automatically reuses an active Codebase only for an
+exact captured Git common-repository identity; independent clones require
+confirmed manual assignment. Non-Git registrations receive independent
+Codebases. Unassigning, or removing a Codebase, creates independent replacement
+groups for active members and retains every Workspace.
+
+New workspace identifiers use `workspace:<project-slug>:<uuid>`. The slug is
+informative, the UUID is stable identity, and legacy identifiers are preserved.
+Root resolution accepts an explicit registered root or nested directory and
+selects the most-specific containing Workspace; its returned query scope must
+be copied into each agent or web query rather than stored as global state.
+
+Workspace removal retains the existing recoverable tombstone. Physical purge
+remains a separate destructive operation and is never implied by removing a
+Workspace from the local UI.

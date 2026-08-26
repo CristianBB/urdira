@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { basename, isAbsolute, relative } from "node:path";
 import type { SourceProviderDescribeResult, WorkspaceSourceProviderBinding } from "@urdira/contracts";
 import { canonicalizePath } from "@urdira/security";
 import { EngineError } from "./errors.js";
@@ -16,15 +17,20 @@ export interface WorkspaceRegistration {
   readonly separate_virtual_instance?: boolean;
   readonly selected_technology_ids?: ReadonlyArray<string>;
   readonly selected_plugin_ids?: ReadonlyArray<string>;
+  readonly vcs_state?: string;
+  /** Human-facing project name. It never participates in workspace identity. */
+  readonly project_name?: string;
 }
 
 export interface RegisteredWorkspace {
   readonly workspace_id: string;
   readonly codebase_id?: string;
+  readonly project_name?: string;
   readonly canonical_root: string;
   readonly display_root: string;
   readonly provider: SourceProviderBindingInput;
   readonly source_state_fingerprint: string;
+  readonly vcs_state?: string;
   readonly separate_virtual_instance?: boolean;
   readonly selected_technology_ids?: ReadonlyArray<string>;
   readonly selected_plugin_ids?: ReadonlyArray<string>;
@@ -74,7 +80,7 @@ export interface RegisteredCodebase {
 }
 
 export interface WorkspaceRegistryOptions {
-  readonly create_id?: (kind: "workspace" | "codebase") => string;
+  readonly create_id?: (kind: "workspace" | "codebase", project_slug?: string) => string;
   readonly create_reconciliation_id?: () => string;
   readonly now?: () => string;
   readonly canonicalize_root?: (root: string) => string;
@@ -82,6 +88,7 @@ export interface WorkspaceRegistryOptions {
 }
 
 export interface WorkspaceRegistryState {
+  readonly schema_version?: 2;
   readonly workspaces: readonly RegisteredWorkspace[];
   readonly codebases: readonly RegisteredCodebase[];
 }
@@ -162,6 +169,27 @@ function providerRootKey(provider: SourceProviderBindingInput, canonicalRoot: st
   return `${provider.source_provider}\0${canonicalRoot}`;
 }
 
+function projectNameFromRoot(root: string): string {
+  const candidate = basename(root.replace(/[\\/]+$/u, ""));
+  return candidate.length === 0 || candidate === "." ? "project" : candidate;
+}
+
+function projectSlug(name: string): string {
+  const normalized = name.normalize("NFKD").replace(/[\u0300-\u036f]/gu, "").toLowerCase();
+  const slug = normalized.replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 48);
+  return slug.length === 0 ? "project" : slug;
+}
+
+function vcsIdentity(serialized: string | undefined): string | undefined {
+  if (serialized === undefined) return undefined;
+  try {
+    const value = JSON.parse(serialized) as unknown;
+    return isRecord(value) && nonEmptyString(value["common_repository_id"]) ? value["common_repository_id"] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function validatePersistedState(value: unknown): asserts value is WorkspaceRegistryState {
   if (!isRecord(value) || !Array.isArray(value["workspaces"]) || !Array.isArray(value["codebases"])) {
     corruptState("Persisted registry state must contain workspace and codebase arrays.");
@@ -197,6 +225,7 @@ function validatePersistedState(value: unknown): asserts value is WorkspaceRegis
     }
     optionalStringArray(workspace.selected_technology_ids, "selected technology identifiers");
     optionalStringArray(workspace.selected_plugin_ids, "selected plugin identifiers");
+    if (workspace.vcs_state !== undefined && !nonEmptyString(workspace.vcs_state)) corruptState("Persisted workspace VCS state must be serialized JSON.");
     workspaceIds.add(workspace.workspace_id);
 
     const provider = workspace.provider as unknown as SourceProviderBindingInput;
@@ -229,6 +258,12 @@ function validatePersistedState(value: unknown): asserts value is WorkspaceRegis
       && (workspace.status !== "indexing" || !nonEmptyString(workspace.reconciliation_operation_id))) {
       corruptState("Persisted reconciliation operation is not attached to indexing state.");
     }
+    if (!nonEmptyString(workspace.project_name)) {
+      corruptState("Persisted workspace project metadata is required.");
+    }
+    if (workspace.status !== "removed" && !nonEmptyString(workspace.codebase_id)) {
+      corruptState("Every active workspace must belong to an active codebase.");
+    }
     if (workspace.codebase_id !== undefined && !activeCodebaseIds.has(workspace.codebase_id)) {
       corruptState("Persisted workspace references a missing or removed codebase.");
     }
@@ -244,22 +279,57 @@ function validatePersistedState(value: unknown): asserts value is WorkspaceRegis
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, RegisteredWorkspace>();
   private readonly codebases = new Map<string, RegisteredCodebase>();
-  private readonly createId: (kind: "workspace" | "codebase") => string;
+  private readonly createId: (kind: "workspace" | "codebase", projectSlug?: string) => string;
   private readonly createReconciliationId: () => string;
   private readonly clock: () => string;
   private readonly canonicalizeRoot: (root: string) => string;
   private readonly persistence: WorkspaceRegistryPersistence | undefined;
 
   constructor(options: WorkspaceRegistryOptions = {}) {
-    this.createId = options.create_id ?? ((kind) => `${kind}:${randomUUID()}`);
+    this.createId = options.create_id ?? ((kind, slug) => kind === "workspace" ? `workspace:${slug ?? "project"}:${randomUUID()}` : `codebase:${randomUUID()}`);
     this.createReconciliationId = options.create_reconciliation_id ?? (() => `reconciliation:${randomUUID()}`);
     this.clock = options.now ?? (() => new Date().toISOString());
     this.canonicalizeRoot = options.canonicalize_root ?? canonicalizePath;
     this.persistence = options.persistence;
-    const persisted = this.persistence?.load();
-    if (persisted !== undefined) validatePersistedState(persisted);
+    const loaded = this.persistence?.load();
+    let migrated = false;
+    let persisted = loaded;
+    if (loaded !== undefined) {
+      if (!isRecord(loaded) || !Array.isArray(loaded.workspaces) || !Array.isArray(loaded.codebases)) validatePersistedState(loaded);
+      const codebases = [...loaded.codebases];
+      const workspaces = loaded.workspaces.map((workspace) => {
+        const projectName = nonEmptyString(workspace.project_name) ? workspace.project_name : projectNameFromRoot(workspace.canonical_root);
+        const normalizedDisplayRoot = isAbsolute(workspace.canonical_root) && !isAbsolute(workspace.display_root) ? workspace.canonical_root : workspace.display_root;
+        let codebaseId = workspace.codebase_id;
+        if (workspace.status !== "removed" && codebaseId === undefined) {
+          const identity = vcsIdentity(workspace.vcs_state);
+          let codebase = identity === undefined ? undefined : codebases.find((candidate) => candidate.removed_at === undefined && candidate.vcs_identity === identity);
+          if (codebase === undefined) {
+            codebase = {
+              codebase_id: this.createId("codebase", projectSlug(projectName)),
+              display_name: projectName,
+              ...(identity === undefined ? {} : { vcs_identity: identity }),
+              created_at: this.clock(),
+            };
+            codebases.push(codebase);
+          }
+          codebaseId = codebase.codebase_id;
+        }
+        if (workspace.project_name !== projectName || workspace.display_root !== normalizedDisplayRoot || workspace.codebase_id !== codebaseId) migrated = true;
+        return {
+          ...workspace,
+          project_name: projectName,
+          display_root: normalizedDisplayRoot,
+          ...(codebaseId === undefined ? {} : { codebase_id: codebaseId }),
+        };
+      });
+      if (loaded.schema_version !== 2) migrated = true;
+      persisted = { schema_version: 2, workspaces, codebases };
+      validatePersistedState(persisted);
+    }
     for (const workspace of persisted?.workspaces ?? []) this.workspaces.set(workspace.workspace_id, workspace);
     for (const codebase of persisted?.codebases ?? []) this.codebases.set(codebase.codebase_id, codebase);
+    if (migrated) this.persist();
   }
 
   register(input: WorkspaceRegistration): RegisteredWorkspace {
@@ -276,12 +346,22 @@ export class WorkspaceRegistry {
     if (this.list().some((workspace) => workspace.provider.source_provider_binding_id === input.provider.source_provider_binding_id)) {
       throw new EngineError("engine:workspace_provider_binding_conflict", "A source-provider binding occurrence identity cannot be reused.");
     }
+    const projectName = input.project_name?.trim() || projectNameFromRoot(canonicalRoot);
+    const identity = vcsIdentity(input.vcs_state);
+    const workspaceId = this.createId("workspace", projectSlug(projectName));
+    let codebase = identity === undefined
+      ? undefined
+      : this.listCodebases().find((candidate) => candidate.vcs_identity === identity);
+    if (codebase === undefined) codebase = this.createCodebase(projectName, identity);
     const workspace: RegisteredWorkspace = {
-      workspace_id: this.createId("workspace"),
+      workspace_id: workspaceId,
+      codebase_id: codebase.codebase_id,
+      project_name: projectName,
       canonical_root: canonicalRoot,
-      display_root: input.display_root,
+      display_root: isAbsolute(canonicalRoot) ? canonicalRoot : input.display_root,
       provider: input.provider,
       source_state_fingerprint: input.description.source_state_fingerprint,
+      ...(input.vcs_state === undefined ? {} : { vcs_state: input.vcs_state }),
       ...(input.separate_virtual_instance === true ? { separate_virtual_instance: true } : {}),
       ...(input.selected_technology_ids === undefined ? {} : { selected_technology_ids: [...new Set(input.selected_technology_ids)].sort() }),
       ...(input.selected_plugin_ids === undefined ? {} : { selected_plugin_ids: [...new Set(input.selected_plugin_ids)].sort() }),
@@ -311,11 +391,23 @@ export class WorkspaceRegistry {
     return [...this.workspaces.values()].filter((workspace) => workspace.status !== "removed").sort((left, right) => left.workspace_id.localeCompare(right.workspace_id));
   }
 
+  /** Administrative view including recoverable removed tombstones. */
+  listIncludingRemoved(): readonly RegisteredWorkspace[] {
+    return [...this.workspaces.values()].sort((left, right) => left.workspace_id.localeCompare(right.workspace_id));
+  }
+
   /** Resolve an explicit root using the same canonicalization used at registration time. */
   findByCanonicalRoot(root: string, sourceProvider?: string): RegisteredWorkspace | undefined {
     const canonicalRoot = this.canonicalizeRoot(root);
-    return this.list().find((workspace) => workspace.canonical_root === canonicalRoot
-      && (sourceProvider === undefined || workspace.provider.source_provider === sourceProvider));
+    return this.list()
+      .filter((workspace) => sourceProvider === undefined || workspace.provider.source_provider === sourceProvider)
+      .filter((workspace) => {
+        if (workspace.canonical_root === canonicalRoot) return true;
+        if (workspace.canonical_root.includes("://") || canonicalRoot.includes("://")) return false;
+        const nested = relative(workspace.canonical_root, canonicalRoot);
+        return nested.length > 0 && nested !== ".." && !nested.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && !isAbsolute(nested);
+      })
+      .sort((left, right) => right.canonical_root.length - left.canonical_root.length)[0];
   }
 
   relocate(input: WorkspaceRelocation): RegisteredWorkspace {
@@ -333,7 +425,7 @@ export class WorkspaceRegistry {
     return this.replace(workspace.workspace_id, {
       ...relocatable,
       canonical_root: canonicalRoot,
-      display_root: input.display_root,
+      display_root: isAbsolute(canonicalRoot) ? canonicalRoot : input.display_root,
       source_state_fingerprint: input.description.source_state_fingerprint,
       relocated_at: this.clock(),
     });
@@ -464,8 +556,23 @@ export class WorkspaceRegistry {
     return codebase;
   }
 
+  renameCodebase(codebaseId: string, displayName: string): RegisteredCodebase {
+    const codebase = this.codebases.get(codebaseId);
+    if (!codebase || codebase.removed_at !== undefined) throw new EngineError("engine:codebase_not_found", `Codebase ${codebaseId} is not active.`);
+    const normalized = displayName.trim();
+    if (normalized.length === 0) throw new EngineError("engine:codebase_name_required", "Codebase display name cannot be empty.");
+    const renamed = { ...codebase, display_name: normalized };
+    this.codebases.set(codebaseId, renamed);
+    this.persist();
+    return renamed;
+  }
+
   getCodebase(codebaseId: string): RegisteredCodebase | undefined {
     return this.codebases.get(codebaseId);
+  }
+
+  listCodebases(includeRemoved = false): readonly RegisteredCodebase[] {
+    return [...this.codebases.values()].filter((codebase) => includeRemoved || codebase.removed_at === undefined).sort((left, right) => left.codebase_id.localeCompare(right.codebase_id));
   }
 
   assignCodebase(workspaceId: string, codebaseId?: string): RegisteredWorkspace {
@@ -475,8 +582,18 @@ export class WorkspaceRegistry {
       if (!codebase || codebase.removed_at !== undefined) throw new EngineError("engine:codebase_not_found", `Codebase ${codebaseId} is not active.`);
       return this.replace(workspaceId, { ...workspace, codebase_id: codebaseId });
     }
-    const { codebase_id: _, ...ungrouped } = workspace;
-    return this.replace(workspaceId, ungrouped);
+    const standalone = this.createCodebase(workspace.project_name ?? projectNameFromRoot(workspace.canonical_root));
+    return this.replace(workspaceId, { ...workspace, codebase_id: standalone.codebase_id });
+  }
+
+  updateAdministrativeMetadata(workspaceId: string, metadata: { readonly vcs_state?: string; readonly project_name?: string }): RegisteredWorkspace {
+    const workspace = this.requireMutable(workspaceId);
+    const projectName = metadata.project_name?.trim() || workspace.project_name || projectNameFromRoot(workspace.canonical_root);
+    return this.replace(workspaceId, {
+      ...workspace,
+      project_name: projectName,
+      ...(metadata.vcs_state === undefined ? {} : { vcs_state: metadata.vcs_state }),
+    });
   }
 
   members(codebaseId: string): readonly RegisteredWorkspace[] {
@@ -490,8 +607,13 @@ export class WorkspaceRegistry {
     if (!codebase || codebase.removed_at !== undefined) throw new EngineError("engine:codebase_not_found", `Codebase ${codebaseId} is not active.`);
     for (const workspace of this.workspaces.values()) {
       if (workspace.codebase_id !== codebaseId) continue;
-      const { codebase_id: _, ...ungrouped } = workspace;
-      this.replace(workspace.workspace_id, ungrouped);
+      if (workspace.status === "removed") {
+        const { codebase_id: _, ...closed } = workspace;
+        this.workspaces.set(workspace.workspace_id, closed);
+        continue;
+      }
+      const standalone = this.createCodebase(workspace.project_name ?? projectNameFromRoot(workspace.canonical_root));
+      this.replace(workspace.workspace_id, { ...workspace, codebase_id: standalone.codebase_id });
     }
     const removed = { ...codebase, removed_at: this.clock() };
     this.codebases.set(codebaseId, removed);
@@ -514,6 +636,7 @@ export class WorkspaceRegistry {
 
   private persist(): void {
     this.persistence?.save({
+      schema_version: 2,
       workspaces: [...this.workspaces.values()],
       codebases: [...this.codebases.values()],
     });

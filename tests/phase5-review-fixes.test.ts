@@ -402,6 +402,25 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
     });
   });
 
+  it("upgrades a legacy relative display root without weakening workspace identity", async () => {
+    await withStorage(async (_root, storage) => {
+      const legacy = { ...workspaceA, display_root: "." };
+      await storage.catalog.registerWorkspace(legacy);
+
+      await expect(storage.catalog.registerWorkspace(workspaceA)).resolves.toMatchObject({
+        workspace_id: workspaceA.workspace_id,
+        canonical_root: workspaceA.canonical_root,
+        display_root: workspaceA.canonical_root,
+      });
+      await expect(storage.catalog.getWorkspace(workspaceA.workspace_id)).resolves.toMatchObject({
+        display_root: workspaceA.canonical_root,
+      });
+      await expect(storage.catalog.registerWorkspace({ ...workspaceA, display_root: "/changed" })).rejects.toMatchObject({
+        code: "storage:immutable_workspace",
+      });
+    });
+  });
+
   it("protects cross-workspace CAS roots and blocks new readers during the GC barrier", async () => {
     await withStorage(async (_root, storage) => {
       await storage.catalog.registerWorkspace(workspaceA);

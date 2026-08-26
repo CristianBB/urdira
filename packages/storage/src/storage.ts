@@ -1,6 +1,6 @@
 import { access, mkdir, readFile, readdir, rename, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalBytes, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { ModelPackInstallation, Workspace, WorkspaceCurrentState, Snapshot, IndexCandidate, RegistrySnapshot, PluginResolutionLock, WorkspaceConfigurationRevision, WorkspaceFreshnessCheckpoint } from "@urdira/contracts";
 import { BlobStore, CAS_LAYOUT_MARKER_FILENAME, CAS_LAYOUT_VERSION, ContentAddressedStore, writeCasLayoutMarker, type BlobReference } from "./cas.js";
@@ -294,6 +294,22 @@ export class InstallationCatalog {
   private async resolveWorkspaceRegistration(workspace: Workspace, absolutePath: string, existing: WorkspaceRegistrationRow): Promise<RegisteredWorkspace> {
     if (existing.database_path !== absolutePath) throw new StorageError("storage:immutable_workspace", `Workspace ${workspace.workspace_id} database path is immutable; use relocation.`);
     if (existing.removed_at !== null) throw new StorageError("storage:workspace_lifecycle", `Workspace ${workspace.workspace_id} is removed and cannot be reopened.`);
+    if (!isAbsolute(existing.display_root)
+      && workspace.canonical_root === existing.canonical_root
+      && workspace.display_root === workspace.canonical_root) {
+      const upgraded = await this.database.run(
+        `UPDATE installation_workspaces SET display_root = ?
+         WHERE workspace_id = ? AND canonical_root = ? AND display_root = ? AND database_path = ?
+           AND registered_at = ? AND removed_at IS NULL`,
+        [workspace.display_root, workspace.workspace_id, existing.canonical_root, existing.display_root, existing.database_path, existing.registered_at],
+      );
+      if (upgraded.changes === 1) existing = { ...existing, display_root: workspace.display_root };
+      else {
+        const raced = await this.getWorkspaceRegistration(workspace.workspace_id);
+        if (!raced) throw new StorageError("storage:workspace_registration_conflict", `Workspace ${workspace.workspace_id} changed while its legacy display root was being upgraded.`);
+        existing = raced;
+      }
+    }
     if (existing.canonical_root !== workspace.canonical_root || existing.display_root !== workspace.display_root
       || existing.registered_at !== workspace.registered_at || existing.source_provider_bindings !== JSON.stringify(workspace.source_provider_bindings)) {
       throw new StorageError("storage:immutable_workspace", `Workspace ${workspace.workspace_id} has immutable identity fields that conflict.`);

@@ -3,7 +3,7 @@ import type { QueryExpression, QueryRequest, QueryScope } from "@urdira/contract
 import { CanonicalRecordQueryDataPort, CursorCache, QueryEngine, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem } from "../packages/engine/src/index.js";
 import { executePipeline } from "../packages/engine/src/pipeline-executor.js";
 import { stageSetHandle } from "../packages/engine/src/stage-set-handle.js";
-import { PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES, PIPELINE_EXAMPLE_SEARCH_TO_SOURCE } from "../packages/mcp/src/index.js";
+import { PIPELINE_EXAMPLE_RESOLVE_REFERENCES_TO_SOURCE, PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES, PIPELINE_EXAMPLE_SEARCH_TO_SOURCE } from "../packages/mcp/src/index.js";
 import { buildTaskPlannerWorkspace } from "./support/task-planner-workspace.js";
 
 /**
@@ -377,6 +377,17 @@ describe("pipeline MCP instruction examples verified against a real workspace", 
       const page = await workspace.engine.execute(pipelineRequest(workspace.workspaceId, PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES));
       expect(items(page, "references").length).toBeGreaterThan(0);
       expect(items(page, "owners").length).toBeGreaterThan(0);
+    } finally {
+      await workspace.close();
+    }
+  });
+
+  it("three-stage example from MCP_SERVER_INSTRUCTIONS: resolve -> references -> source returns source for reference owners", async () => {
+    const workspace = await buildTaskPlannerWorkspace("typescript");
+    try {
+      const page = await workspace.engine.execute(pipelineRequest(workspace.workspaceId, PIPELINE_EXAMPLE_RESOLVE_REFERENCES_TO_SOURCE));
+      expect(items(page, "references").length).toBeGreaterThan(0);
+      expect(items(page, "sources").length).toBeGreaterThan(0);
     } finally {
       await workspace.close();
     }

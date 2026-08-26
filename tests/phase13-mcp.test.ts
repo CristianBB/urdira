@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import type { LocalIpcRequestOptions, IpcResponse } from "../packages/daemon/src/index.js";
 import { normalizeQueryRequest } from "../packages/engine/src/index.js";
 import { operationRegistry, recipeRegistry, type QueryRequest } from "@urdira/contracts";
 import {
   MCP_SERVER_INSTRUCTIONS,
+  MCP_SERVER_VERSION,
   buildBenchmarkInstructions,
   MCP_TOOL_NAMES,
   McpProtocolError,
@@ -36,6 +38,23 @@ function tool(definitions: readonly UrdiraMcpToolDefinition[], name: string): Ur
 }
 
 describe("Phase 13 Urdira MCP adapter", () => {
+  it("advertises the release version and a static tool catalog", async () => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const server = createUrdiraMcpServer({ client: { call: vi.fn(async () => success({})) } });
+    const client = new Client({ name: "urdira-discovery-test", version: "1" });
+
+    await server.connect(serverTransport);
+    try {
+      await client.connect(clientTransport);
+      expect(MCP_SERVER_VERSION).toBe("0.3.3");
+      expect(client.getServerVersion()).toEqual({ name: "urdira", version: "0.3.3" });
+      expect(client.getServerCapabilities()).toEqual({ tools: { listChanged: false } });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("exposes the deterministic public tools, including the one-call context wrapper", () => {
     const definitions = createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({})) } });
     expect(definitions.map((definition) => definition.name)).toEqual([...MCP_TOOL_NAMES]);
@@ -250,6 +269,28 @@ describe("Phase 13 Urdira MCP adapter", () => {
       expect(server._registeredTools[name]).toBeDefined();
       expect(server._registeredTools[name]!.outputSchema).toBeUndefined();
     }
+  });
+
+  it("keeps the agent profile unchanged while the web profile advertises and returns the structured page", async () => {
+    const payload = { result_sets: [], page: { returned_items: 0, truncated: false } };
+    const call = vi.fn(async () => success(payload));
+    const agentServer = createUrdiraMcpServer({ client: { call } }) as unknown as {
+      _registeredTools: Record<string, { outputSchema?: unknown; handler: (args: unknown, context: unknown) => Promise<Record<string, unknown>> }>;
+    };
+    const webServer = createUrdiraMcpServer({ client: { call } }, { presentation_profile: "web" }) as unknown as {
+      _registeredTools: Record<string, { outputSchema?: unknown; handler: (args: unknown, context: unknown) => Promise<Record<string, unknown>> }>;
+    };
+    const args = { workspace_ids: ["workspace-1"] };
+    const context = { mcpReq: { signal: new AbortController().signal, notify: vi.fn() } };
+
+    const agentResult = await agentServer._registeredTools["urdira_index_status"]!.handler(args, context);
+    const webResult = await webServer._registeredTools["urdira_index_status"]!.handler(args, context);
+
+    expect(agentServer._registeredTools["urdira_index_status"]!.outputSchema).toBeUndefined();
+    expect(agentResult["structuredContent"]).toBeUndefined();
+    expect(webServer._registeredTools["urdira_index_status"]!.outputSchema).toBeDefined();
+    expect(webResult["structuredContent"]).toEqual({ page: payload });
+    expect(webResult["content"]).toEqual(agentResult["content"]);
   });
 
   it("never advertises a render field on any tool's input schema, description, or the server instructions", () => {
@@ -678,6 +719,38 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(MCP_SERVER_INSTRUCTIONS.length).toBeGreaterThan(0);
     for (const operation of operationRegistry) expect(MCP_SERVER_INSTRUCTIONS).toContain(operation.operation_id);
     for (const recipe of recipeRegistry) expect(MCP_SERVER_INSTRUCTIONS).toContain(recipe.recipe_id);
+  });
+
+  it("teaches a new agent tool choice and dependent pipelines before the exhaustive catalog", () => {
+    expect(MCP_SERVER_INSTRUCTIONS).toMatch(/^URDIRA AGENT QUICK START/u);
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("WHICH MCP TOOL SHOULD I CALL?");
+    for (const toolName of MCP_TOOL_NAMES) expect(MCP_SERVER_INSTRUCTIONS).toContain(toolName);
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("PIPELINE MENTAL MODEL");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("bindings maps a downstream argument name to {stage_id, output}");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("The binding passes the complete typed upstream set");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Do not copy opaque ids out and send them back in a later MCP call");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("THREE-STAGE PIPELINE");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("resolve -> references -> source");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("If a scalar binding receives zero or multiple items");
+    expect(MCP_SERVER_INSTRUCTIONS.indexOf("PIPELINE MENTAL MODEL")).toBeLessThan(MCP_SERVER_INSTRUCTIONS.indexOf("EXACT OPERATION CATALOG"));
+  });
+
+  it("puts essential pipeline semantics in the query tool and its advertised schema", () => {
+    const definition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({})) } }), "urdira_query");
+    expect(definition.description).toContain("For dependent work, use one pipeline");
+    expect(definition.description).toContain("bindings");
+    expect(definition.description).toContain("complete upstream set");
+    expect(definition.description).toContain("search -> source");
+
+    const query = definition.input_schema.properties?.["query"] as { properties?: Record<string, unknown> };
+    const expression = query.properties?.["expression"] as { oneOf?: Array<{ properties?: Record<string, unknown> }> };
+    const pipeline = expression.oneOf?.find((variant) => (variant.properties?.["expression_type"] as { const?: unknown })?.const === "pipeline");
+    const stages = pipeline?.properties?.["stages"] as { description?: string; items?: { oneOf?: Array<{ properties?: Record<string, unknown> }> } };
+    const operationStage = stages.items?.oneOf?.find((variant) => variant.properties?.["operation"] !== undefined);
+    expect(stages.description).toContain("topological order");
+    expect((operationStage?.properties?.["arguments"] as { description?: string }).description).toContain("Static arguments only");
+    expect((operationStage?.properties?.["bindings"] as { description?: string }).description).toContain("downstream argument name");
+    expect((pipeline?.properties?.["outputs"] as { description?: string }).description).toContain("final streams");
   });
 
   it("renders a search_text-style match as one grep -n style line, path: matched text", async () => {

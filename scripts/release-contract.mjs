@@ -20,6 +20,7 @@ export const PRODUCTION_PACKAGE_NAMES = Object.freeze([
   "@urdira/runtime",
   "@urdira/cli",
   "@urdira/mcp",
+  "@urdira/web",
   "@urdira/daemon",
   "@urdira/engine",
   "@urdira/embedding-local",
@@ -72,14 +73,14 @@ export function buildReleaseMetadata({ gitCommit, lockfileDigest, generatedAt = 
   if (!gitCommit || !lockfileDigest) throw new Error("Release metadata requires git commit and lockfile digest.");
   return stable({
     release_schema_version: 1,
-    engine_version: "0.3.2",
+    engine_version: "0.3.3",
     generated_at: generatedAt,
     git_commit: gitCommit,
     lockfile_digest: lockfileDigest,
     runtime: { node: "24.18.1", pnpm: "11.20.0", sqlite: "node:sqlite", watcher: "@parcel/watcher@2.6.0", semantic_runtime: "@huggingface/transformers@4.2.0", sandbox_contract: "plugin-sdk:restricted-node@1" },
     targets: [...SUPPORTED_TARGETS],
     production_packages: [...PRODUCTION_PACKAGE_NAMES],
-    dependencies: { "@huggingface/transformers": "4.2.0", "@modelcontextprotocol/server": "2.0.0", "@parcel/watcher": "2.6.0", "adm-zip": "0.6.0", "isomorphic-git": "1.40.5", sharp: "0.35.3", typescript: "7.0.2", vitest: "4.1.10", eslint: "9.39.5" },
+    dependencies: { "@huggingface/transformers": "4.2.0", "@modelcontextprotocol/client": "2.0.0", "@modelcontextprotocol/server": "2.0.0", "@parcel/watcher": "2.6.0", "@vitejs/plugin-react": "6.1.0", "adm-zip": "0.6.0", cytoscape: "3.34.1", "isomorphic-git": "1.40.5", react: "19.2.8", "react-dom": "19.2.8", sharp: "0.35.3", typescript: "7.0.2", vite: "8.2.2", vitest: "4.1.10", eslint: "9.39.5" },
     semantic_model: { model_id: "Xenova/all-MiniLM-L6-v2", acquisition: "configure_time_download", bundled_assets: false },
     gates: [...RELEASE_GATES],
   });

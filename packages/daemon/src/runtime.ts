@@ -1,8 +1,8 @@
 import { chmod, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
-import { basename } from "node:path";
-import { attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
+import { basename, dirname, resolve } from "node:path";
+import { administrativeState, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
 import { runIndexPackExportInThread } from "./index-pack-export-thread.js";
@@ -12,6 +12,7 @@ import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisio
 import { ensureSemanticAssetsInProcess, runSemanticReconcileInProcess, startNeuralSemanticProviderHost, type NeuralSemanticProviderHost, type SemanticProcessRun } from "./semantic-process.js";
 import { LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcProgress, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
 import { DaemonScheduler, PersistentCursorRecovery, type PersistedCursorState, type SchedulerOptions } from "./scheduler.js";
+import { DAEMON_PRIVATE_INTERFACE_VERSION, daemonRpcCapabilities } from "./compatibility.js";
 
 export interface DaemonPluginCatalogEntry extends WorkspacePluginCatalogEntry {
   readonly capability_declarations: readonly PluginCapabilityDeclaration[];
@@ -373,7 +374,16 @@ export interface DaemonRuntimeOptions {
    */
   readonly warm_records_budget_mb?: number;
 }
-export interface DaemonStatus { readonly state: "starting" | "ready" | "stopping"; readonly pid: number; readonly engine_build_id: string; readonly endpoint: string; readonly active_jobs: number; readonly restart_leases: number; }
+export interface DaemonStatus {
+  readonly state: "starting" | "ready" | "stopping";
+  readonly pid: number;
+  readonly engine_build_id: string;
+  readonly private_interface_version: number;
+  readonly rpc_capabilities: readonly string[];
+  readonly endpoint: string;
+  readonly active_jobs: number;
+  readonly restart_leases: number;
+}
 
 function workspaceDigest(value: string): string {
   return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
@@ -949,6 +959,51 @@ function requestRecord(payload: unknown): Record<string, unknown> {
   return payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
 }
 
+function parsedVcsState(serialized: string | undefined): Record<string, unknown> | undefined {
+  if (serialized === undefined) return undefined;
+  try { return requestRecord(JSON.parse(serialized)); } catch { return undefined; }
+}
+
+function normalizedVcsState(serialized: string | undefined): Record<string, unknown> | undefined {
+  const vcs = parsedVcsState(serialized);
+  if (vcs === undefined) return undefined;
+  const rawRef = typeof vcs["ref_name"] === "string" ? vcs["ref_name"] : undefined;
+  const branch = rawRef?.replace(/^refs\/heads\//u, "");
+  const revision = typeof vcs["head_revision"] === "string" ? vcs["head_revision"] : undefined;
+  const capturedAt = typeof vcs["captured_at"] === "string" ? vcs["captured_at"] : undefined;
+  return {
+    ...vcs,
+    ...(rawRef === undefined ? {} : { ref_name: branch }),
+    ...(branch === undefined ? {} : { branch }),
+    ...(revision === undefined ? {} : { short_commit: revision.slice(0, 8) }),
+    ...(capturedAt === undefined || !Number.isFinite(Date.parse(capturedAt)) ? {} : { observation_age_ms: Math.max(0, Date.now() - Date.parse(capturedAt)) }),
+  };
+}
+
+function projectNameForGitRoot(root: string, administration: Awaited<ReturnType<typeof administrativeState>> | undefined): string {
+  return administration === undefined ? basename(resolve(root)) : basename(dirname(administration.common_directory));
+}
+
+type WorkspaceIndexingActivity = "checking_for_updates" | "indexing";
+
+function workspaceAdministrativeView(registry: WorkspaceRegistry, workspace: RegisteredWorkspace, indexingActivity?: WorkspaceIndexingActivity): Readonly<Record<string, unknown>> {
+  const vcs = normalizedVcsState(workspace.vcs_state);
+  const codebase = workspace.codebase_id === undefined ? undefined : registry.getCodebase(workspace.codebase_id);
+  const branch = typeof vcs?.["branch"] === "string" ? vcs["branch"] : undefined;
+  const detached = vcs?.["detached"] === true;
+  const shortCommit = typeof vcs?.["short_commit"] === "string" ? vcs["short_commit"] : undefined;
+  const workspaceLabel = branch ?? (detached && shortCommit !== undefined ? `detached@${shortCommit}` : basename(workspace.canonical_root));
+  return {
+    ...workspace,
+    project_name: codebase?.display_name ?? workspace.project_name ?? basename(workspace.canonical_root),
+    workspace_label: workspaceLabel,
+    workspace_kind: vcs === undefined ? "directory" : "worktree",
+    directory_name: basename(workspace.canonical_root),
+    ...(workspace.status !== "indexing" || indexingActivity === undefined ? {} : { indexing_activity: indexingActivity }),
+    ...(vcs === undefined ? {} : { vcs_state: vcs }),
+  };
+}
+
 function workspaceRootFromRequest(payload: unknown): string | undefined {
   const record = requestRecord(payload);
   const args = Array.isArray(record["args"]) ? record["args"] : [];
@@ -1188,13 +1243,15 @@ async function detectWorkspacePreview(root: string, catalog: readonly DaemonPlug
   };
   await walk(root);
   reportProgress?.({ phase: "workspace_discovery", completed: files.length, total: files.length, message: `workspace discovery complete (${files.length} files inspected)` });
-  return detectWorkspaceTechnologies({
+  const detection = detectWorkspaceTechnologies({
     provider_fingerprint: workspaceDigest(root),
     git_state_fingerprint: "git:unresolved",
     plugin_catalog_fingerprint: pluginCatalogFingerprint(catalog),
     plugin_catalog: catalog,
     files,
   });
+  const vcsState = await administrativeState(root, ISOMORPHIC_GIT_OBJECT_PORT, () => new Date().toISOString()).then((state) => state.vcs_state as unknown as Readonly<Record<string, unknown>>).catch(() => undefined);
+  return { ...detection, ...(vcsState === undefined ? {} : { vcs_state: vcsState, suggested_codebase_vcs_identity: vcsState["common_repository_id"] }) };
 }
 
 async function startWorkspaceWatcher(manager: WorkspaceWatcherManager, workspace: RegisteredWorkspace): Promise<void> {
@@ -1315,6 +1372,7 @@ export class DaemonRuntime {
     this.paths = paths; this.endpoint = paths.endpoint; this.scheduler = scheduler; this.recovery = recovery; this.recovered_checkpoint = recoveredCheckpoint; this.recovered_cursor_ids = recoveredCursorIds; this.knownCursorIds = new Set([...recoveredCursorIds, ...(options.known_cursors ?? [])]);
   }
   static async start(options: DaemonRuntimeOptions): Promise<DaemonRuntime> {
+    const rpcCapabilities = daemonRpcCapabilities(options.workspace_registry !== undefined);
     options.on_startup_progress?.("locking");
     const paths = await daemonPaths(options.data_root);
     const lock = await ProcessLock.acquire(paths.process_lock, { pid: process.pid, started_at: new Date().toISOString() });
@@ -1587,6 +1645,11 @@ export class DaemonRuntime {
       // (not instant) freshness the rest of this file already accepts
       // elsewhere (e.g. crash recovery's full-rescan retry, above).
       const scanInFlight = new Set<string>();
+      // Local administrative presentation only. Public query/MCP responses
+      // retain the existing workspace lifecycle contract; the web interface
+      // uses this transient detail to distinguish a periodic equivalence
+      // check from a scan triggered by a real change or explicit reindex.
+      const scanActivities = new Map<string, WorkspaceIndexingActivity>();
       const scanControllers = new Map<string, AbortController>();
       const scanGenerations = new Map<string, number>();
       // Tracks the currently in-flight THREADED lexical maintenance run (if
@@ -1646,19 +1709,26 @@ export class DaemonRuntime {
         uris: Set<string>;
         authoritativeDeletes: Map<string, import("@urdira/engine").WatcherHint>;
         presencesAfterDeletes: Set<string>;
+        activity: WorkspaceIndexingActivity;
       }>();
-      const scheduleWorkspaceScan = (workspaceId: string, changedUris?: readonly string[], authoritativeDeletes: readonly import("@urdira/engine").WatcherHint[] = []): void => {
+      const scheduleWorkspaceScan = (workspaceId: string, changedUris?: readonly string[], authoritativeDeletes: readonly import("@urdira/engine").WatcherHint[] = [], activity: WorkspaceIndexingActivity = "indexing"): void => {
         const registry = options.workspace_registry;
         const resolvePluginProvider = options.resolve_plugin_provider;
         const durableStorage = indexingStorage;
         if (!registry || !resolvePluginProvider || !durableStorage) return;
+        // A concrete filesystem event or explicit scan always upgrades a
+        // periodic check that happened to be in flight; a later sweep must
+        // never downgrade visible real indexing to a passive check.
+        scanActivities.set(workspaceId, scanActivities.get(workspaceId) === "indexing" || activity === "indexing" ? "indexing" : "checking_for_updates");
         if (scanInFlight.has(workspaceId)) {
           const pending = pendingScans.get(workspaceId) ?? {
             full: false,
             uris: new Set<string>(),
             authoritativeDeletes: new Map<string, import("@urdira/engine").WatcherHint>(),
             presencesAfterDeletes: new Set<string>(),
+            activity,
           };
+          if (activity === "indexing") pending.activity = "indexing";
           if (changedUris === undefined) {
             // Unsafe/lost coverage supersedes narrower work and does not
             // carry a delete hint into the full reconciliation.
@@ -1721,8 +1791,15 @@ export class DaemonRuntime {
             pool: "structural",
             run: async () => {
               try {
-                const workspace = registry.get(workspaceId);
+                let workspace = registry.get(workspaceId);
                 if (!workspace || workspace.status !== "indexing") return undefined;
+                const administration = await administrativeState(workspace.canonical_root, ISOMORPHIC_GIT_OBJECT_PORT, () => new Date().toISOString()).catch(() => undefined);
+                if (administration !== undefined) {
+                  workspace = registry.updateAdministrativeMetadata(workspaceId, {
+                    vcs_state: JSON.stringify(administration.vcs_state),
+                    project_name: workspace.project_name ?? projectNameForGitRoot(workspace.canonical_root, administration),
+                  });
+                }
                 const priorSnapshotId = workspace.current_snapshot_id;
                 let database: WorkspaceDatabase | undefined;
                 try {
@@ -1826,6 +1903,11 @@ export class DaemonRuntime {
                     ...(authoritativeDeletes.length === 0 ? {} : { authoritative_delete_events: authoritativeDeletes }),
                     signal: scanController.signal,
                     on_stage_published: (stage, stageResult) => {
+                      // A periodic equivalence check has now discovered and
+                      // published real work. Upgrade the local presentation
+                      // before exposing the new stage; equivalent checks
+                      // never enter this callback and stay labeled checking.
+                      scanActivities.set(workspaceId, "indexing");
                       if (stage.ordinal < stage.stage_count) registry.markStructuralStagePublished(workspaceId, stageResult.snapshot_id);
                     },
                   });
@@ -1898,7 +1980,7 @@ export class DaemonRuntime {
                   pendingScans.delete(workspaceId);
                   try { registry.beginReconciliation(workspaceId); } catch { /* the workspace was removed while this scan ran */ }
                   if (pending.full) {
-                    scheduleWorkspaceScan(workspaceId, undefined);
+                    scheduleWorkspaceScan(workspaceId, undefined, [], pending.activity);
                   } else if (pending.authoritativeDeletes.size > 0) {
                     // Preserve a second generation for rename/recreate
                     // batches even when both callbacks arrived while the
@@ -1909,13 +1991,14 @@ export class DaemonRuntime {
                         uris: new Set(pending.presencesAfterDeletes),
                         authoritativeDeletes: new Map(),
                         presencesAfterDeletes: new Set(),
+                        activity: pending.activity,
                       });
                     }
-                    scheduleWorkspaceScan(workspaceId, [], [...pending.authoritativeDeletes.values()]);
+                    scheduleWorkspaceScan(workspaceId, [], [...pending.authoritativeDeletes.values()], pending.activity);
                   } else {
-                    scheduleWorkspaceScan(workspaceId, [...pending.uris]);
+                    scheduleWorkspaceScan(workspaceId, [...pending.uris], [], pending.activity);
                   }
-                }
+                } else scanActivities.delete(workspaceId);
               }
             },
           });
@@ -1925,6 +2008,7 @@ export class DaemonRuntime {
           // reconciliation attempt (watcher event or `workspace add`) retries.
           scanInFlight.delete(workspaceId);
           activeAuthoritativeDeletePhases.delete(workspaceId);
+          scanActivities.delete(workspaceId);
         }
       };
       // D5: post-ready lexical maintenance (`reconcileLexicalProjection`,
@@ -2180,7 +2264,7 @@ export class DaemonRuntime {
         },
       }) : undefined;
       server = new LocalIpcServer({ endpoint: paths.endpoint, ...(options.max_frame_bytes === undefined ? {} : { max_frame_bytes: options.max_frame_bytes }), handler: async (request, context) => {
-        if (request.call === "core:status") return { state: "ready", pid: process.pid, engine_build_id: options.engine_build_id, endpoint: paths.endpoint, active_jobs: scheduler.activeCount, restart_leases: scheduler.restartLeaseCount } satisfies DaemonStatus;
+        if (request.call === "core:status") return { state: "ready", pid: process.pid, engine_build_id: options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: rpcCapabilities, endpoint: paths.endpoint, active_jobs: scheduler.activeCount, restart_leases: scheduler.restartLeaseCount } satisfies DaemonStatus;
         if (request.call === "core:index_status" && options.workspace_status) return options.workspace_status(request, context);
         if (request.call === "core:index_status" && options.workspace_registry) {
           const payload = request.payload !== null && typeof request.payload === "object" ? request.payload as { readonly api_version?: unknown; readonly workspace_ids?: unknown; readonly workspace_root?: unknown } : {};
@@ -2190,7 +2274,8 @@ export class DaemonRuntime {
           const buildStatusView = async (workspace: RegisteredWorkspace) => {
             const readiness = await workspaceReadiness(workspace, indexingStorage, semanticMaterializations, scanInFlight.has(workspace.workspace_id));
             const pluginStatus = pluginStatusForWorkspace(workspace, pluginCatalog, readiness);
-            return { workspace_id: workspace.workspace_id, display_root: basename(workspace.display_root), workspace_status: workspace.status, startup_phase: workspace.status === "registering" ? "reconciling_sources" : readiness.source_ready && !readiness.structural_ready ? "publishing_structural" : "ready", ...(workspace.current_snapshot_id === undefined ? {} : { current_snapshot_id: workspace.current_snapshot_id }), freshness_status: workspaceFreshnessStatus(workspace), ...(workspace.last_scan_error === undefined ? {} : { last_scan_error_code: workspace.last_scan_error }), ...(workspace.last_scan_error_at === undefined ? {} : { last_scan_error_at: workspace.last_scan_error_at }), plugins: pluginStatus.plugins, capabilities: pluginStatus.capabilities, structural_progress: pluginStatus.structural_progress, semantic_materializations: semanticMaterializations.get(workspace.workspace_id) === undefined ? [] : [semanticMaterializations.get(workspace.workspace_id)!], configuration_issues: [], ...readinessPayload(readiness) };
+            const administrative = workspaceAdministrativeView(options.workspace_registry!, workspace);
+            return { workspace_id: workspace.workspace_id, codebase_id: workspace.codebase_id, project_name: administrative["project_name"], workspace_label: administrative["workspace_label"], workspace_kind: administrative["workspace_kind"], display_root: basename(workspace.display_root), ...(administrative["vcs_state"] === undefined ? {} : { vcs_state: administrative["vcs_state"] }), workspace_status: workspace.status, startup_phase: workspace.status === "registering" ? "reconciling_sources" : readiness.source_ready && !readiness.structural_ready ? "publishing_structural" : "ready", ...(workspace.current_snapshot_id === undefined ? {} : { current_snapshot_id: workspace.current_snapshot_id }), freshness_status: workspaceFreshnessStatus(workspace), ...(workspace.last_scan_error === undefined ? {} : { last_scan_error_code: workspace.last_scan_error }), ...(workspace.last_scan_error_at === undefined ? {} : { last_scan_error_at: workspace.last_scan_error_at }), plugins: pluginStatus.plugins, capabilities: pluginStatus.capabilities, structural_progress: pluginStatus.structural_progress, semantic_materializations: semanticMaterializations.get(workspace.workspace_id) === undefined ? [] : [semanticMaterializations.get(workspace.workspace_id)!], configuration_issues: [], ...readinessPayload(readiness) };
           };
           if (apiVersion === 3 && workspaceIds.length === 0 && payload.workspace_root === undefined) return { workspaces: await Promise.all(options.workspace_registry.list().map(buildStatusView)) };
           const resolution = resolveIndexStatusRequest(options.workspace_registry, { api_version: apiVersion, workspace_ids: workspaceIds, ...(typeof payload.workspace_root === "string" ? { workspace_root: payload.workspace_root } : {}) });
@@ -2310,6 +2395,49 @@ export class DaemonRuntime {
           const proposal = await detectWorkspacePreview(root, pluginCatalog, context.reportProgress);
           return { proposal_id: `proposal:${proposal.proposal_fingerprint.slice("sha256:".length)}`, ...proposal, confirmation_required: true };
         }
+        if (options.workspace_registry && request.call === "core:workspace_admin_list") {
+          return { api_version: 1, workspaces: options.workspace_registry.listIncludingRemoved().map((workspace) => workspaceAdministrativeView(options.workspace_registry!, workspace, scanActivities.get(workspace.workspace_id))) };
+        }
+        if (options.workspace_registry && request.call === "core:workspace_admin_show") {
+          const payload = requestRecord(request.payload);
+          const args = Array.isArray(payload["args"]) ? payload["args"] : [];
+          const workspaceId = typeof args[0] === "string" ? args[0] : typeof requestRecord(payload["values"])["workspace"] === "string" ? requestRecord(payload["values"])["workspace"] as string : undefined;
+          const workspace = workspaceId === undefined ? undefined : options.workspace_registry.get(workspaceId);
+          if (!workspace) throw new DaemonError("core:workspace_not_found", "Workspace is not registered.");
+          return { api_version: 1, workspace: workspaceAdministrativeView(options.workspace_registry, workspace, scanActivities.get(workspace.workspace_id)) };
+        }
+        if (options.workspace_registry && request.call === "core:codebase_list") {
+          return { api_version: 1, codebases: options.workspace_registry.listCodebases().map((codebase) => ({ ...codebase, project_name: codebase.display_name, workspace_count: options.workspace_registry!.members(codebase.codebase_id).length })), workspaces: options.workspace_registry.list().map((workspace) => workspaceAdministrativeView(options.workspace_registry!, workspace, scanActivities.get(workspace.workspace_id))) };
+        }
+        if (options.workspace_registry && request.call === "core:codebase_create") {
+          const payload = requestRecord(request.payload);
+          const args = Array.isArray(payload["args"]) ? payload["args"] : [];
+          const displayName = typeof args[0] === "string" ? args[0] : undefined;
+          if (displayName === undefined) throw new DaemonError("core:ipc_request_invalid", "codebase create requires a display name.");
+          const vcsIdentity = typeof requestRecord(payload["values"])["vcs-identity"] === "string" ? requestRecord(payload["values"])["vcs-identity"] as string : undefined;
+          return { api_version: 1, codebase: options.workspace_registry.createCodebase(displayName, vcsIdentity) };
+        }
+        if (options.workspace_registry && request.call === "core:codebase_rename") {
+          const payload = requestRecord(request.payload);
+          const args = Array.isArray(payload["args"]) ? payload["args"] : [];
+          if (typeof args[0] !== "string" || typeof args[1] !== "string") throw new DaemonError("core:ipc_request_invalid", "codebase rename requires an identifier and display name.");
+          return { api_version: 1, codebase: options.workspace_registry.renameCodebase(args[0], args[1]) };
+        }
+        if (options.workspace_registry && (request.call === "core:codebase_assign" || request.call === "core:codebase_unassign")) {
+          const payload = requestRecord(request.payload);
+          const args = Array.isArray(payload["args"]) ? payload["args"] : [];
+          const workspaceId = typeof args[0] === "string" ? args[0] : undefined;
+          const codebaseId = request.call === "core:codebase_assign" && typeof args[1] === "string" ? args[1] : undefined;
+          if (workspaceId === undefined || (request.call === "core:codebase_assign" && codebaseId === undefined)) throw new DaemonError("core:ipc_request_invalid", "codebase assignment requires explicit identifiers.");
+          return { api_version: 1, workspace: options.workspace_registry.assignCodebase(workspaceId, codebaseId) };
+        }
+        if (options.workspace_registry && request.call === "core:codebase_remove") {
+          const payload = requestRecord(request.payload);
+          const args = Array.isArray(payload["args"]) ? payload["args"] : [];
+          const codebaseId = typeof args[0] === "string" ? args[0] : undefined;
+          if (codebaseId === undefined) throw new DaemonError("core:ipc_request_invalid", "codebase remove requires an explicit identifier.");
+          return { api_version: 1, codebase: options.workspace_registry.removeCodebase(codebaseId) };
+        }
         if (options.workspace_registry && request.call === "core:workspace_add") {
           const root = workspaceRootFromRequest(request.payload);
           if (root === undefined) throw new DaemonError("core:ipc_request_invalid", "workspace add requires a workspace path.");
@@ -2358,6 +2486,8 @@ export class DaemonRuntime {
           // Same configure-time provisioning as the existing-workspace branch
           // above -- see its comment.
           const semanticModel = await ensureAndActivateSemanticProvider();
+          const administration = await administrativeState(root, ISOMORPHIC_GIT_OBJECT_PORT, () => new Date().toISOString()).catch(() => undefined);
+          const vcsState = administration === undefined ? undefined : JSON.stringify(administration.vcs_state);
           const workspace = options.workspace_registry.register({
             display_root: root,
             provider: {
@@ -2376,6 +2506,8 @@ export class DaemonRuntime {
             },
             selected_technology_ids: selectedTechnologyIds,
             selected_plugin_ids: selectedPluginIds,
+            project_name: projectNameForGitRoot(root, administration),
+            ...(vcsState === undefined ? {} : { vcs_state: vcsState }),
           });
           // Index pack import (docs/decisions/23-index-pack.md): registered
           // BEFORE `scheduleWorkspaceScan` below so the scan hook's
@@ -2628,7 +2760,7 @@ export class DaemonRuntime {
       } });
       await server.listen();
       if (process.platform !== "win32") await chmod(paths.endpoint, 0o600);
-      await descriptor.write({ protocol_version: 1, endpoint: paths.endpoint, pid: process.pid, owner_uid: process.getuid?.() ?? 0, engine_build_id: options.engine_build_id, started_at: new Date().toISOString() });
+      await descriptor.write({ protocol_version: 1, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: rpcCapabilities, endpoint: paths.endpoint, pid: process.pid, owner_uid: process.getuid?.() ?? 0, engine_build_id: options.engine_build_id, started_at: new Date().toISOString() });
       options.on_startup_progress?.("provider_reconciliation");
       if (watcherManager && options.workspace_registry) {
         await Promise.all(options.workspace_registry.list().filter((workspace) => workspace.status !== "registering").map((workspace) => startWorkspaceWatcher(watcherManager, workspace)));
@@ -2654,7 +2786,7 @@ export class DaemonRuntime {
             if (workspace.status !== "ready" && workspace.status !== "degraded") continue;
             try {
               registry.beginReconciliation(workspace.workspace_id);
-              scheduleWorkspaceScan(workspace.workspace_id);
+              scheduleWorkspaceScan(workspace.workspace_id, undefined, [], workspace.status === "ready" ? "checking_for_updates" : "indexing");
             } catch (error) {
               // A removed/suspended workspace racing this tick, or any other
               // transient registry error, must not take down the sweep
@@ -2673,7 +2805,7 @@ export class DaemonRuntime {
       return runtime;
     } catch (error) { await server?.close().catch(() => undefined); await indexingStorage?.close().catch(() => undefined); if (process.platform !== "win32") await unlink(paths.endpoint).catch(() => undefined); await lock.release(); throw error; }
   }
-  status(): DaemonStatus { return { state: this.state, pid: process.pid, engine_build_id: this.options.engine_build_id, endpoint: this.endpoint, active_jobs: this.scheduler.activeCount, restart_leases: this.scheduler.restartLeaseCount }; }
+  status(): DaemonStatus { return { state: this.state, pid: process.pid, engine_build_id: this.options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: daemonRpcCapabilities(this.options.workspace_registry !== undefined), endpoint: this.endpoint, active_jobs: this.scheduler.activeCount, restart_leases: this.scheduler.restartLeaseCount }; }
   byteTelemetrySnapshot(): Readonly<Record<string, unknown>> {
     return this.indexingStorage?.byteTelemetry.snapshot() ?? {};
   }

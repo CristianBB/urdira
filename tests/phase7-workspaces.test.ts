@@ -128,7 +128,7 @@ describe("Phase 7 workspace lifecycle", () => {
     const duplicate = workspaces.register(registration("/repo", description("fingerprint:two")));
 
     expect(duplicate.workspace_id).toBe(first.workspace_id);
-    expect(first).toMatchObject({ canonical_root: "/repo", display_root: "/Repo/", status: "registering" });
+    expect(first).toMatchObject({ canonical_root: "/repo", display_root: "/repo", status: "registering" });
     expect(first.workspace_id).toBe("workspace:1");
   });
 
@@ -537,7 +537,8 @@ describe("Phase 7 workspace lifecycle", () => {
     expect(workspaces.get(left.workspace_id)?.current_snapshot_id).toBeUndefined();
 
     workspaces.removeCodebase(codebase.codebase_id);
-    expect(workspaces.get(left.workspace_id)?.codebase_id).toBeUndefined();
+    expect(workspaces.get(left.workspace_id)?.codebase_id).toBeDefined();
+    expect(workspaces.get(left.workspace_id)?.codebase_id).not.toBe(codebase.codebase_id);
     expect(workspaces.getCodebase(codebase.codebase_id)?.removed_at).toBeDefined();
   });
 

@@ -1,10 +1,12 @@
 import {
   McpServer,
+  createMcpHandler,
   fromJsonSchema,
   ProtocolError,
   type CallToolResult,
   type JsonSchemaType,
   type ServerContext,
+  type McpHttpHandler,
 } from "@modelcontextprotocol/server";
 import { serveStdio, type ServeStdioOptions, type StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 import { createHash } from "node:crypto";
@@ -14,7 +16,7 @@ import { operationErrorDefinitions, operationRegistry, queryAlgebraOperatorIds, 
 
 export const MCP_PROTOCOL_VERSION = "2026-07-28" as const;
 export const MCP_SERVER_NAME = "urdira" as const;
-export const MCP_SERVER_VERSION = "0.1.0" as const;
+export const MCP_SERVER_VERSION = "0.3.3" as const;
 
 export const MCP_TOOL_NAMES = [
   "urdira_query",
@@ -25,6 +27,7 @@ export const MCP_TOOL_NAMES = [
 ] as const;
 
 export type UrdiraMcpToolName = (typeof MCP_TOOL_NAMES)[number];
+export type McpPresentationProfile = "agent" | "web";
 export type UrdiraProgress = IpcProgress["progress"];
 
 export interface UrdiraMcpClient {
@@ -329,10 +332,28 @@ export const PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES = {
   outputs: [{ name: "references", stage_id: "references", output: "references" }, { name: "owners", stage_id: "references", output: "owners" }],
 } as const;
 
+/** Canonical three-stage example: resolve once, reuse the exact declaration
+ * for reference discovery, then hydrate source for every owning artifact. */
+export const PIPELINE_EXAMPLE_RESOLVE_REFERENCES_TO_SOURCE = {
+  expression_type: "pipeline",
+  stages: [
+    { stage_id: "resolve", stage_type: "operation", operation: "core:resolve_symbol", operation_version: 3, arguments: { reference: "TaskService", resolution_scope: "exports" } },
+    { stage_id: "references", stage_type: "operation", operation: "core:find_references", operation_version: 3, arguments: { include_declarations: false }, bindings: { target: { stage_id: "resolve", output: "declarations" } } },
+    { stage_id: "source", stage_type: "operation", operation: "core:get_source", operation_version: 3, arguments: { source: { mode: "relevant", max_characters_per_snippet: 2000, max_total_characters: 20_000, context_lines: 2 } }, bindings: { subjects: { stage_id: "references", output: "owners" } } },
+  ],
+  outputs: [{ name: "references", stage_id: "references", output: "references" }, { name: "sources", stage_id: "source", output: "sources" }],
+} as const;
+
 // v3 uses explicit bindings instead of embedding a stage-output selector in
 // an operation's argument tree. The engine lowers this closed shape to the
 // internal algebra without materialising upstream arrays.
-const pipelineV3BindingSchema: JsonSchema = objectSchema({ stage_id: { type: "string", minLength: 1 }, output: { type: "string", minLength: 1 } }, ["stage_id", "output"]);
+const pipelineV3BindingSchema: JsonSchema = {
+  ...objectSchema({
+    stage_id: { type: "string", minLength: 1, description: "Earlier stage_id that produced the data. The referenced stage must precede this dependent stage." },
+    output: { type: "string", minLength: 1, description: "Exact registered output stream name from that earlier operation, such as subjects, declarations, references, owners, or sources. Consult the operation catalog in the server instructions; never invent or derive this name from result_projection." },
+  }, ["stage_id", "output"]),
+  description: "One typed edge in the pipeline DAG. It passes the complete upstream logical set without copying opaque ids or materialising a client-side array.",
+};
 const pipelineV3StageSchema: JsonSchema = {
   oneOf: [
     objectSchema({
@@ -340,24 +361,28 @@ const pipelineV3StageSchema: JsonSchema = {
       stage_type: { type: "string", const: "operation" },
       operation: { type: "string", enum: operationIds, description: "Registered operation id. The field name is exactly operation; never use core, operator, or operation_id here." },
       operation_version: { type: "integer", minimum: 1 },
-      arguments: { type: "object" },
-      bindings: { type: "object", additionalProperties: pipelineV3BindingSchema },
+      arguments: { type: "object", description: "Static arguments only for this operation. Omit every argument supplied through bindings; a bound argument must not also appear here." },
+      bindings: { type: "object", additionalProperties: pipelineV3BindingSchema, description: "Optional dependency map. Each property name is the exact downstream argument name to fill; its value identifies an earlier {stage_id, output}. Example: subjects: {stage_id: \"search\", output: \"subjects\"}." },
     }, ["stage_id", "stage_type", "operation", "arguments"]),
     objectSchema({
       stage_id: { type: "string", minLength: 1 },
       stage_type: { type: "string", const: "operator" },
       operator: { type: "string", enum: [...queryAlgebraOperatorIds] },
-      arguments: { type: "object" },
-      inputs: { type: "array", items: pipelineV3BindingSchema },
+      arguments: { type: "object", description: "Static arguments for this registered algebra operator." },
+      inputs: { type: "array", items: pipelineV3BindingSchema, description: "Typed upstream streams consumed by this operator, in the operator's declared input order." },
     }, ["stage_id", "stage_type", "operator", "arguments"]),
   ],
   description: "Exactly one v3 operation or operator stage. An operation stage uses the exact field operation (never core, operator, or operation_id); operation and operator fields may not be mixed.",
 };
-const pipelineV3OutputSchema: JsonSchema = objectSchema({ name: { type: "string", minLength: 1 }, stage_id: { type: "string", minLength: 1 }, output: { type: "string", minLength: 1 } }, ["name", "stage_id", "output"]);
+const pipelineV3OutputSchema: JsonSchema = objectSchema({
+  name: { type: "string", minLength: 1, description: "Stable response alias chosen by the caller." },
+  stage_id: { type: "string", minLength: 1, description: "Stage whose stream should be returned." },
+  output: { type: "string", minLength: 1, description: "Exact registered stream name produced by that stage." },
+}, ["name", "stage_id", "output"]);
 const pipelineV3ExpressionSchema: JsonSchema = objectSchema({
   expression_type: { type: "string", const: "pipeline" },
-  stages: { type: "array", items: pipelineV3StageSchema, minItems: 1 },
-  outputs: { type: "array", items: pipelineV3OutputSchema, minItems: 1 },
+  stages: { type: "array", items: pipelineV3StageSchema, minItems: 1, description: "Operations and algebra operators in dependency order. Independent stages may run concurrently; bindings establish the topological order for dependent stages." },
+  outputs: { type: "array", items: pipelineV3OutputSchema, minItems: 1, description: "Named final streams returned to the agent. Intermediate streams remain inside the pipeline unless explicitly listed here." },
 }, ["expression_type", "stages", "outputs"]);
 
 const expressionSchema: JsonSchema = {
@@ -419,11 +444,11 @@ const buildContextFacetContract = operationDefinition("core:build_context")?.arg
 if (buildContextFacetContract === undefined) throw new Error("core:build_context must register its facets argument contract");
 
 const toolDescriptions: Readonly<Record<UrdiraMcpToolName, string>> = {
-  urdira_query: "Execute one public Urdira v3 query, or continue a previous query using its signed cursor. Urdira never infers a workspace: first call urdira_index_status with workspace_root to resolve a workspace_id, then pass it as scope.workspace_id here. expression selects exactly one registered operation, recipe, or binding-oriented pipeline. Source-safe operations (find_artifacts, search_text, get_source) can run at source_ready, with results honestly labeled partial while indexing is still running; structural and semantic operations wait for their registered frontier. Important closed-contract guardrails: get_outline.container accepts only an artifact or entity selector, never a symbol selector; resolve the symbol first and pass one exact returned entity_id. get_source source.mode must be signature, relevant, or body; never none. search_text pipeline outputs are only matches and subjects, never artifacts, even when result_projection is artifact. Results render as compact, grep-like plain text by default.",
-  urdira_context: `Execute the registered context recipe for one complete coding task in a single call. api_version: 3 is a required top-level field, alongside scope and task; do not omit it or nest it under options. All execution overrides belong under the single top-level options object: options.freshness, options.snippets, and options.response_budget; never place those three fields beside task. Every freshness object requires mode, required_frontier, and timeout_ms together. Provide optional seeds and facets; receive subjects, relations, snippets, provenance, completeness and freshness together. Facets use this exact closed contract: ${buildContextFacetContract}. public_surfaces is an architecture view, not a context facet. This is the agent-friendly wrapper around core:build_context; use urdira_query for custom v3 pipelines. Becomes available once structural indexing completes; while indexing is still running it returns a compact degradation notice naming the source/syntax-frontier tools available right now instead of an error.`,
-  urdira_analyze_change: "Analyze the impact of one explicit hypothetical code change -- a rename, signature change, deletion, or move -- in one already-indexed Urdira workspace. This tool is read-only: it never modifies files. Resolve workspace_id first with urdira_index_status(workspace_root=...). target identifies the exact symbol, entity, or artifact the change applies to, typically obtained from a prior resolve_symbol or search_text call; change describes the hypothetical edit itself. The response reports what will break, what must be updated, what may be affected, which tests to run, and any uncertain dynamic usage, each backed by evidence and, on request, source snippets. options is optional and defaults to agent-friendly evidence, diagnostics, snippet, and response-budget settings; override only what you need. Equivalent to calling urdira_query with expression.operation core:analyze_impact. Results render as compact plain text by default.",
-  urdira_build_context: "Build a deterministic, evidence-aware bundle of context for one scoped coding task in an already-indexed Urdira workspace. Resolve workspace_id first with urdira_index_status(workspace_root=...). task is a short natural-language statement of the work to do; seeds are optional starting subjects (entities, symbols, or artifacts), typically obtained from a prior resolve_symbol or search_text call; facets narrow which kinds of context to gather, such as callers, tests, or architecture. The response returns ranked, evidenced result subjects with source snippets sized to fit the response budget -- useful for grounding an edit in one call instead of chaining several individual queries by hand. options is optional and defaults to agent-friendly evidence, diagnostics, snippet, and response-budget settings. Equivalent to calling urdira_query with expression.operation core:build_context. Waits for the structural frontier by default; if still indexing when the wait ends, returns a compact degradation notice naming source/syntax-frontier tools available now instead of an error. Results render as compact plain text by default.",
-  urdira_index_status: "Read Urdira Index Status v3. Every field is optional. Call with workspace_root set to the exact repository root to resolve or register it, then copy the returned query_scope object byte-for-byte into every query; never retype, abbreviate, normalize, or synthesize its opaque workspace_id. source_ready, structural_stage_1_ready, structural_ready, and semantic_ready are independent readiness frontiers. Use operation_availability to choose operations that are actually available; disabled or unscheduled stages are reported as non-retryable. Renders as compact actionable lines per workspace; no MCP outputSchema is advertised for client compatibility.",
+  urdira_query: "Run one custom Urdira query after resolving query_scope with urdira_index_status. Choose exactly one expression: operation for one lookup, recipe for a registered standard workflow, or pipeline when a later lookup depends on an earlier result; use the continuation request variant only with a signed cursor returned by Urdira. For dependent work, use one pipeline instead of copying ids between MCP calls. A pipeline stage keeps static values in arguments; bindings maps a downstream argument name to an earlier {stage_id, output} and passes the complete upstream set. Minimal data flow: search -> source means search outputs subjects, then the source stage declares bindings.subjects={stage_id:\"search\",output:\"subjects\"}. List only the final streams to return in pipeline outputs. Output names are operation-specific and are not result_projection values. Scalar bindings require exactly one upstream item; sequence arguments consume the whole set. Source-safe operations (find_artifacts, search_text, get_source) can run at source_ready; structural and semantic operations wait for their registered frontier. Guardrails: get_outline.container accepts only an artifact or entity selector. get_source source.mode must be signature, relevant, or body; never none. search_text pipeline outputs are only matches and subjects, never artifacts. Results render as compact plain text by default.",
+  urdira_context: `Use this as the default first choice for an ordinary coding task when you want definitions, callers, dependencies, tests, contracts, or extension points together and do not need custom stage wiring. It is the readiness-aware agent wrapper around core:build_context: it waits for the structural frontier by default and, if that wait expires, returns a compact notice naming source/syntax operations usable immediately. api_version: 3 is a required top-level field; scope, task, and facets are also required. Optional seeds anchor known subjects. All overrides stay inside options. Facets use exactly: ${buildContextFacetContract}. public_surfaces is an architecture view, not a context facet. Use urdira_query only when a registered recipe or custom pipeline is more precise.`,
+  urdira_analyze_change: "Use this for one explicit hypothetical rename, signature change, deletion, move, type, visibility, contract, or behavior change. It is strictly read-only. Supply the exact target returned by prior discovery plus the change descriptor; receive will_break, must_update, may_be_affected, tests_to_run, and uncertain_dynamic_usage with evidence. Prefer this dedicated tool over constructing core:analyze_impact manually. Resolve and copy query_scope from urdira_index_status first.",
+  urdira_build_context: "Use this explicit core:build_context wrapper when you already know the desired task, facets, and optional seed subjects and want the ordinary query-operation behavior. Required fields are api_version:3, scope, task, and facets; options is optional. For a general agent task prefer urdira_context because it adds readiness-aware degradation guidance. For custom dependent stages use urdira_query with a pipeline.",
+  urdira_index_status: "Always call this first with only workspace_root set to the exact repository root. It resolves or registers the workspace and returns a copy-ready query_scope; reuse that object byte-for-byte in every later tool and never synthesize its opaque workspace_id. It also reports source, syntax, structural, and semantic readiness plus operation_availability, retryability, scan failures, and retry timing. Call it again only when readiness or indexing state matters. Every input field is optional; no api_version or scope belongs in this tool.",
 };
 
 const operationErrorSchema: JsonSchema = objectSchema({ code: { type: "string" }, message: { type: "string" }, retryable: { type: "boolean" }, recovery_action: { type: "string" }, workspace_id: { type: "string" }, query_execution_id: { type: "string" }, details: { type: "object" } }, ["code", "message", "retryable"]);
@@ -1185,6 +1210,8 @@ export interface FormatUrdiraResultOptions {
   readonly render?: "text" | "json";
   /** Optional; default: "query". Selects which compact-text renderer applies in "text" mode. */
   readonly page_kind?: "query" | "index_status";
+  /** Optional; default: "agent". The web profile adds schema-validated structuredContent. */
+  readonly presentation_profile?: McpPresentationProfile;
 }
 
 // A live benchmark (2026-08-14) found that Claude Code's MCP client reads
@@ -1212,22 +1239,25 @@ export function formatUrdiraResult(value: unknown, options: FormatUrdiraResultOp
   if (error) {
     const mapped = operationError(String(error["code"]), String(error["message"] ?? "Urdira operation failed."), isRecord(error["details"]) ? error["details"] : {});
     for (const field of ["workspace_id", "query_execution_id"]) if (typeof error[field] === "string") mapped[field] = error[field];
-    return {
+    const result: CallToolResult = {
       isError: true,
       content: [{ type: "text", text: stableJson({ error: mapped }) }],
     };
+    return options.presentation_profile === "web" ? { ...result, structuredContent: { error: mapped } } : result;
   }
   if (options.render === "json") {
-    return {
+    const result: CallToolResult = {
       content: [{ type: "text", text: stableJson({ page: stable }) }],
     };
+    return options.presentation_profile === "web" ? { ...result, structuredContent: { page: stable } } : result;
   }
   const page = isRecord(stable) ? stable : {};
   const pageKind = options.page_kind ?? "query";
   const text = pageKind === "index_status" ? renderIndexStatusText(page) : renderQueryPageText(page);
-  return {
+  const result: CallToolResult = {
     content: [{ type: "text", text }],
   };
+  return options.presentation_profile === "web" ? { ...result, structuredContent: { page: stable } } : result;
 }
 
 function extractResponseBudget(call: string, payload: JsonRecord): { readonly max_characters?: unknown } | undefined {
@@ -1313,15 +1343,16 @@ function renderContextDegradationText(errorCode: string, errorMessage: string, e
   return lines.join("\n");
 }
 
-async function buildContextDegradationResult(client: UrdiraMcpClient, payload: JsonRecord, error: NonNullable<IpcResponse["error"]>, requestOptions: LocalIpcRequestOptions): Promise<CallToolResult | undefined> {
+async function buildContextDegradationResult(client: UrdiraMcpClient, payload: JsonRecord, error: NonNullable<IpcResponse["error"]>, requestOptions: LocalIpcRequestOptions, presentationProfile: McpPresentationProfile): Promise<CallToolResult | undefined> {
   const scope = isRecord(payload["scope"]) ? payload["scope"] as JsonRecord : undefined;
   const workspaceId = scope !== undefined && scope["scope_type"] === "single_workspace" && typeof scope["workspace_id"] === "string" ? scope["workspace_id"] : undefined;
   if (workspaceId === undefined) return undefined;
   const workspace = await fetchWorkspaceStatusForDegradation(client, workspaceId, requestOptions);
-  return { content: [{ type: "text", text: renderContextDegradationText(error.code, error.message, error.details ?? {}, workspace) }] };
+  const result: CallToolResult = { content: [{ type: "text", text: renderContextDegradationText(error.code, error.message, error.details ?? {}, workspace) }] };
+  return presentationProfile === "web" ? { ...result, structuredContent: { page: { degradation: { code: error.code, message: error.message, details: error.details ?? {}, workspace } } } } : result;
 }
 
-async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { client: UrdiraMcpClient }, context: UrdiraMcpToolContext = {}): Promise<CallToolResult> {
+async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { client: UrdiraMcpClient }, context: UrdiraMcpToolContext = {}, presentationProfile: McpPresentationProfile = "agent"): Promise<CallToolResult> {
   const raw = requireRecord(input, "tool arguments");
   const canonical = canonicalKeys(raw);
   const render: "text" | "json" = isRecord(canonical) && canonical["render"] === "json" ? "json" : "text";
@@ -1338,13 +1369,13 @@ async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { c
   };
   const response = await dependencies.client.call(call, payload, requestOptions);
   if (response.outcome === "error" && render !== "json" && response.error !== undefined && CONTEXT_DEGRADATION_ERROR_CODES.has(response.error.code) && isBuildContextOperationPayload(payload)) {
-    const degraded = await buildContextDegradationResult(dependencies.client, payload, response.error, requestOptions);
+    const degraded = await buildContextDegradationResult(dependencies.client, payload, response.error, requestOptions, presentationProfile);
     if (degraded !== undefined) return degraded;
   }
   const scopeKind = isRecord(payload["scope"]) && payload["scope"]["scope_type"] === "comparison" ? "comparison" : "single_workspace";
   const responseBudget = extractResponseBudget(call, payload);
   const pageKind: "query" | "index_status" = call === "core:index_status" ? "index_status" : "query";
-  const renderContext: RenderContext = { render, page_kind: pageKind };
+  const renderContext: RenderContext & { readonly presentation_profile: McpPresentationProfile } = { render, page_kind: pageKind, presentation_profile: presentationProfile };
   const page = response.outcome === "success"
     ? (call === "core:index_status" ? publicIndexStatusPage(response.payload) : publicQueryPage(response.payload, scopeKind, responseBudget, renderContext))
     : { error: responseError(response) };
@@ -1352,59 +1383,131 @@ async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { c
 }
 
 /** Builds the five read-only public MCP tools from their shared closed schemas and IPC dispatcher. */
-export function createUrdiraToolDefinitions(dependencies: { readonly client: UrdiraMcpClient }): readonly UrdiraMcpToolDefinition[] {
+export function createUrdiraToolDefinitions(dependencies: { readonly client: UrdiraMcpClient }, options: { readonly presentation_profile?: McpPresentationProfile } = {}): readonly UrdiraMcpToolDefinition[] {
   return MCP_TOOL_NAMES.map((name) => ({
     name,
-    description: toolDescriptions[name],
+    description: options.presentation_profile === "web" && name === "urdira_index_status" ? toolDescriptions[name].replace("no MCP outputSchema is advertised for client compatibility", "the web profile also returns schema-validated structuredContent") : toolDescriptions[name],
     input_schema: toolSchemas[name],
     output_schema: MCP_OUTPUT_SCHEMA,
-    invoke: (args: unknown, context?: UrdiraMcpToolContext) => invoke(name, args, dependencies, context),
+    invoke: (args: unknown, context?: UrdiraMcpToolContext) => invoke(name, args, dependencies, context, options.presentation_profile ?? "agent"),
   }));
 }
 
 // --- Server instructions ----------------------------------------------------
 //
-// Built once from `operationRegistry`/`recipeRegistry` -- the same
-// registries the engine validates every request against -- so the cheat
-// sheet can never drift out of sync with the real operation and recipe ids.
+// The first sections are deliberately task-oriented and short enough to guide
+// a new agent before the exhaustive registry-derived reference. The final
+// catalog is still built from the exact registries the engine validates.
+const operationAgentUses: Readonly<Record<string, string>> = {
+  "core:discover_definitions": "Discover Urdira registry definitions such as unfamiliar record kinds, facets, or languages before constructing a structural selector; this is not source-symbol discovery.",
+  "core:find_records": "Enumerate indexed structural records using an exact record/category/kind/facet selector.",
+  "core:resolve_symbol": "Resolve a known symbol name, optionally anchored by file and byte offset, into exact declarations or explicit candidates.",
+  "core:get_outline": "List declarations inside one known artifact or entity container.",
+  "core:find_references": "Find indexed references and their owning artifacts for one exact resolved target.",
+  "core:expand_relations": "Traverse callers, callees, imports, dependencies, containment, control flow, data flow, or other registered relations from known subjects.",
+  "core:find_paths": "Find bounded structural paths between explicit source and target subject sets.",
+  "core:find_artifacts": "List indexed files using path, language, kind, external, or generated-code filters.",
+  "core:search_text": "Find an exact literal or safe regex; use result_projection=artifact when the next stage needs one subject per matching artifact.",
+  "core:search_semantic": "Find conceptually relevant code from natural language when semantic retrieval alone is desired and available.",
+  "core:search_hybrid": "Combine lexical and semantic evidence for natural-language discovery; prefer this when wording and identifiers may both help.",
+  "core:get_source": "Hydrate signatures, relevant snippets, or complete bodies for exact artifact/entity/symbol subjects returned by discovery.",
+  "core:analyze_impact": "Classify what breaks or must change for one hypothetical edit; prefer the dedicated urdira_analyze_change tool for this intent.",
+  "core:find_related_tests": "Find tests, fixtures, mocks, and helpers related to known code subjects.",
+  "core:inspect_architecture": "Inspect entry points, boundaries, public surfaces, cycles, extension points, or layers for a workspace or selected scope.",
+  "core:compare": "Compare two explicitly role-bound workspace snapshots; it requires comparison scope.",
+  "core:build_context": "Build a bounded task context from a task statement, optional seeds, and explicit facets; prefer urdira_context for the readiness-aware wrapper.",
+  "core:index_status": "Read status inside an already scoped query; use urdira_index_status for global workspace discovery and the initial query_scope.",
+};
+
+const operationWorkflowGroups: readonly { readonly title: string; readonly ids: readonly string[] }[] = [
+  { title: "Find a starting point", ids: ["core:find_artifacts", "core:search_text", "core:search_semantic", "core:search_hybrid", "core:resolve_symbol", "core:discover_definitions", "core:find_records"] },
+  { title: "Understand structure and relationships", ids: ["core:get_outline", "core:find_references", "core:expand_relations", "core:find_paths"] },
+  { title: "Read, assess, and plan", ids: ["core:get_source", "core:find_related_tests", "core:inspect_architecture", "core:analyze_impact", "core:compare", "core:build_context"] },
+  { title: "Inspect scoped status", ids: ["core:index_status"] },
+];
+
 function buildInstructions(): string {
-  const operationLines = operationRegistry.map((operation) => {
-    const argumentsSummary = operation.argument_fields.map((field) => `${field.name}${field.presence === "required" ? "!" : "?"}:${field.logical_type}`).join(", ") || "none";
-    return `- ${operation.operation_id} (arguments: ${argumentsSummary}; outputs: ${operation.result_streams.join(", ")}): ${operation.description}`;
-  }).join("\n");
-  const recipeLines = recipeRegistry.map((recipe) => `- ${recipe.recipe_id}: ${recipe.description}`).join("\n");
+  const operationById = new Map(operationRegistry.map((operation) => [operation.operation_id, operation]));
+  const coveredIds = operationWorkflowGroups.flatMap((group) => group.ids);
+  const missingGuides = operationRegistry.filter((operation) => !coveredIds.includes(operation.operation_id) || operationAgentUses[operation.operation_id] === undefined);
+  const unknownGuides = coveredIds.filter((id) => !operationById.has(id));
+  if (missingGuides.length > 0 || unknownGuides.length > 0 || new Set(coveredIds).size !== coveredIds.length) throw new Error("Every registered operation must have exactly one MCP agent guide.");
+  const operationSections = operationWorkflowGroups.map((group) => [
+    `${group.title}:`,
+    ...group.ids.map((id) => {
+      const operation = operationById.get(id)!;
+      const argumentsSummary = operation.argument_fields.map((field) => `${field.name}${field.presence === "required" ? "!" : "?"}:${field.logical_type}`).join(", ") || "none";
+      return `- ${id} — ${operationAgentUses[id]}\n  frontier=${operation.required_frontier}; arguments=${argumentsSummary}; outputs=${operation.result_streams.join(" | ")}`;
+    }),
+  ].join("\n")).join("\n\n");
+  const recipeLines = recipeRegistry.map((recipe) => `- ${recipe.recipe_id} — ${recipe.description}`).join("\n");
+  const directExample = { request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" }, expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "PaymentService", syntax: "literal", word_mode: "identifier", result_projection: "artifact" } } } };
+  const pipelineRequest = (expression: unknown): unknown => ({ request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" }, expression } });
   return [
-    "Urdira is a read-only structural and semantic index of a codebase. It never infers a workspace from the current directory or the MCP connection: every call is explicitly scoped by workspace_id.",
+    "URDIRA AGENT QUICK START",
+    "Urdira is a read-only, snapshot-aware code-intelligence service. It never edits source, runs commands, or infers workspace scope from the current directory or MCP connection.",
+    "1. Call urdira_index_status with exactly {workspace_root:\"/absolute/repository/root\"}.",
+    "2. Copy the returned query_scope object byte-for-byte into every later call. workspace_id is opaque: never retype, shorten, normalize, or invent it.",
+    "3. Choose the smallest tool below. Use one direct operation for one lookup; use a recipe for a standard workflow; use one pipeline when a later stage depends on an earlier result.",
+    "4. Let Urdira pass typed results between dependent stages. Do not copy opaque ids out and send them back in a later MCP call unless no single pipeline or recipe can express the task.",
     "",
-    "Bootstrap (do this once per workspace):",
-    "1. Call urdira_index_status with only workspace_root set to the exact repository root. This registers or resolves the workspace and returns its workspace_id.",
-    "2. Use that workspace_id as scope.workspace_id in every subsequent urdira_query, urdira_analyze_change, and urdira_build_context call.",
-    "3. Resolve a starting point with resolve_symbol or search_text to obtain an entity_id, then use find_references, get_source, or urdira_analyze_change with that entity_id.",
-    "Readiness: source_ready means source catalog available, complete, and equivalent to current source; structural_ready means complete structural facts are published against the current source snapshot; semantic_ready means semantic materialization is complete against the current structural snapshot. availability=available/unavailable; completeness=complete/partial/unknown/unsupported/stale; freshness=equivalent/changes_pending/degraded; build_state=not_started/building/idle/failed/disabled. partial is queryable partial data; unknown is not queryable. Use operation_availability and retry_after_ms instead of guessing. A query can set options.freshness={mode:\"wait\",required_frontier:\"source\"|\"syntax\"|\"structural\"|\"semantic\",timeout_ms:N} so readiness is waited for inside the same call; do not poll status between dependent stages.",
-    "While structural_ready=no, use v3 source-safe core:find_artifacts, source-projection core:search_text, and artifact-selector core:get_source with the returned source_snapshot_id. Structural pipelines and recipes wait for their registered frontier; no response silently downgrades coverage.",
+    "WHICH MCP TOOL SHOULD I CALL?",
+    "- urdira_index_status — always first; resolve query_scope and inspect readiness, scan failures, and operation availability.",
+    "- urdira_context — default for an ordinary coding task when definitions, callers, dependencies, tests, contracts, or extension points should arrive together.",
+    "- urdira_query — custom direct operation, registered recipe, dependent pipeline, or signed-cursor continuation.",
+    "- urdira_analyze_change — one read-only hypothetical change-impact question with an exact target.",
+    "- urdira_build_context — explicit core:build_context wrapper when task, facets, and seeds are already known; otherwise prefer urdira_context.",
     "",
-    "Minimal urdira_query example (options is fully optional and defaults to agent-friendly values):",
-    '{"request_type":"query","query":{"api_version":3,"scope":{"scope_type":"single_workspace","workspace_id":"<workspace_id>"},"expression":{"expression_type":"operation","operation":"core:search_text","arguments":{"pattern":"PaymentService","result_projection":"artifact"}}}}',
+    "CHOOSING AN urdira_query EXPRESSION",
+    "- operation: exactly one lookup. Put operation-specific fields in expression.arguments. Do not add operation_version to a direct operation expression.",
+    "- recipe: a registered, immutable multi-step workflow. Put its fields in expression.arguments and use the exact recipe_id.",
+    "- pipeline: a custom typed DAG for dependent or parallel stages. Operation stages do include operation_version:3.",
+    "- continuation: a separate request_type=continuation using the exact signed cursor and original scope; never decode or edit the cursor.",
+    "Minimal direct query (options is optional and defaults to agent-friendly values):",
+    JSON.stringify(directExample),
     "",
-    "Which search to use: resolve_symbol for an exact known name; search_text for literal or regex text with path/kind filters; search_semantic or search_hybrid for a natural-language description of behavior when you do not know the exact name or text.",
+    "PIPELINE MENTAL MODEL",
+    "A pipeline executes several operations inside one immutable scope and snapshot. Think data flow, not a sequence of client-side requests:",
+    "- stages gives every operation or algebra operator a unique stage_id.",
+    "- arguments contains static values only. Omit an argument when a binding supplies it.",
+    "- bindings maps a downstream argument name to {stage_id, output} from an earlier stage.",
+    "- The binding passes the complete typed upstream set; it does not interpolate JSON or expose an array of ids to the client.",
+    "- outputs names only the final stage streams the agent needs. Intermediate streams stay internal unless listed.",
+    "Example data flow: search.subjects -> source.arguments.subjects is encoded on the source stage as bindings.subjects={stage_id:\"search\",output:\"subjects\"}.",
+    "Rules that prevent most pipeline errors:",
+    "1. Bind only from an earlier stage and use the exact output name listed for that operation in the catalog below.",
+    "2. The binding property name must be the exact downstream argument name, and that argument must be batchable or accept the referenced scalar type.",
+    "3. Output streams are independent of result_projection. core:search_text always exposes matches and subjects; it never exposes artifacts.",
+    "4. Sequence arguments consume the complete set. Scalar arguments require exactly one upstream item; Urdira fails on zero or many rather than guessing.",
+    "5. Independent stages may run concurrently. A binding creates dependency order automatically; do not add a separate ordering field.",
+    "6. Use options.freshness={mode:\"wait\",required_frontier:\"source\"|\"syntax\"|\"structural\"|\"semantic\",timeout_ms:N} when the newest required frontier matters; do not poll between stages.",
+    "Pipeline troubleshooting:",
+    "- Unknown output: replace it with an exact stream from the operation catalog. For example find_artifacts -> artifacts, search_text -> matches|subjects, resolve_symbol -> declarations|candidates.",
+    "- If a scalar binding receives zero or multiple items, narrow the upstream stage with exact context or use a sequence-valued downstream argument. Never select the first result by accident.",
+    "- Invalid selector: bind a compatible typed subject stream; get_outline.container accepts one artifact or entity, while get_source.subjects accepts a subject sequence.",
+    "- Unavailable frontier: use operation_availability or a bounded freshness wait. Never weaken completeness silently.",
     "",
-    "Edits auto-reindex: Urdira watches the workspace and publishes source, syntax, structural, and semantic frontiers independently. Prefer freshness.mode=wait with a bounded timeout when the task needs the newest frontier; a timeout is typed and retryable. ",
+    "TWO-STAGE PIPELINE — search -> source. Search once and fetch relevant source for every matched artifact:",
+    JSON.stringify(pipelineRequest(PIPELINE_EXAMPLE_SEARCH_TO_SOURCE)),
     "",
-    "Results render as compact, grep-like plain text by default -- one line per result, grouped by path, with matched/reference lines shown grep -n style -- instead of the full JSON envelope, to keep per-call context cost low. When you have several independent queries to make, issue them as multiple tool calls in the same message rather than one at a time -- it is faster and does not require waiting on each result before issuing the next.",
+    "TWO-STAGE PIPELINE — resolve -> references. Resolve once and pass exact declarations into reference discovery:",
+    JSON.stringify(pipelineRequest(PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES)),
     "",
-    `Operations (${operationRegistry.length} stable core operations; use directly as expression.operation in urdira_query, or via the dedicated urdira_analyze_change / urdira_build_context tools for those two intents):`,
-    operationLines,
+    "THREE-STAGE PIPELINE — resolve -> references -> source. Reuse exact declarations, find references, then hydrate source for every owning artifact:",
+    JSON.stringify(pipelineRequest(PIPELINE_EXAMPLE_RESOLVE_REFERENCES_TO_SOURCE)),
     "",
-    `Recipes (${recipeRegistry.length} immutable multi-step intents composing several operations into one call; use as expression.recipe_id in urdira_query):`,
+    "READINESS, RESULTS, AND PARALLELISM",
+    "source_ready permits core:find_artifacts, source-projection core:search_text, and artifact-selector core:get_source. syntax, structural, and semantic operations require their registered frontiers. partial is queryable and labeled; unknown is not queryable. Follow operation_availability and retry_after_ms.",
+    "Results are compact grep-like text by default. When several queries are independent, issue them as parallel tool calls in one agent message. Use a pipeline only when data must flow between them.",
+    "Edits auto-reindex. A bounded freshness wait belongs in the query that needs the new frontier, not in a client polling loop.",
+    "",
+    "EXACT OPERATION CATALOG",
+    "Legend: ! means required, ? means optional. outputs are the only names legal in bindings and final pipeline outputs.",
+    operationSections,
+    "",
+    "REGISTERED MULTI-STEP RECIPES",
+    "Use a recipe instead of rebuilding a standard workflow. Use expression_type=recipe, the exact recipe_id below, and recipe-specific arguments.",
     recipeLines,
-    "",
-    "Fuse dependent lookups into one call: API v3 expression_type \"pipeline\" is a typed DAG. Each stage declares {stage_id, stage_type, operation|operator, arguments, bindings}; a binding is {stage_id, output} and passes the COMPLETE upstream logical set. Independent stages may run concurrently; dependent stages run in order. Scalar bindings require exactly one result and fail on zero or many. Use a three-stage pipeline (search -> expand_relations -> get_source/find_related_tests) for coding tasks; outputs is [{name, stage_id, output}] and aliases are preserved. The executor uses bounded relational spooling and hydrates only final pages. Use urdira_context when the standard task facets are sufficient.",
-    "",
-    "Pipeline example (a): search a literal pattern, then fetch source for every match, in one call:",
-    JSON.stringify({ request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" }, expression: PIPELINE_EXAMPLE_SEARCH_TO_SOURCE } }),
-    "",
-    "Pipeline example (b): resolve a symbol, then find references to exactly the declaration that resolved, in one call:",
-    JSON.stringify({ request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" }, expression: PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES } }),
   ].join("\n");
 }
 
@@ -1549,10 +1652,15 @@ function hiddenRenderInputSchema(publicSchema: JsonSchema): ReturnType<typeof fr
   } as ReturnType<typeof fromJsonSchema>;
 }
 
-export function createUrdiraMcpServer(dependencies: { readonly client: UrdiraMcpClient }, options: Pick<ServeUrdiraStdioOptions, "tool_names" | "instructions" | "compact" | "benchmark_discover"> = {}): McpServer {
-  const server = new McpServer({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }, { capabilities: { tools: {} }, instructions: options.instructions ?? MCP_SERVER_INSTRUCTIONS });
+export interface CreateUrdiraMcpServerOptions extends Pick<ServeUrdiraStdioOptions, "tool_names" | "instructions" | "compact" | "benchmark_discover"> {
+  readonly presentation_profile?: McpPresentationProfile;
+}
+
+export function createUrdiraMcpServer(dependencies: { readonly client: UrdiraMcpClient }, options: CreateUrdiraMcpServerOptions = {}): McpServer {
+  const server = new McpServer({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }, { capabilities: { tools: { listChanged: false } }, instructions: options.instructions ?? MCP_SERVER_INSTRUCTIONS });
   const allowedTools = options.tool_names === undefined ? undefined : new Set(options.tool_names);
-  for (const definition of createUrdiraToolDefinitions(dependencies).filter((entry) => allowedTools === undefined || allowedTools.has(entry.name))) {
+  const presentationProfile = options.presentation_profile ?? "agent";
+  for (const definition of createUrdiraToolDefinitions(dependencies, { presentation_profile: presentationProfile }).filter((entry) => allowedTools === undefined || allowedTools.has(entry.name))) {
     // `compact` changes only instruction/description rendering.  The exact
     // public schema is always used for validation so compact mode cannot turn
     // malformed queries into IPC traffic.
@@ -1569,6 +1677,7 @@ export function createUrdiraMcpServer(dependencies: { readonly client: UrdiraMcp
       title: toolTitles[definition.name],
       description: definition.description,
       inputSchema: schema,
+      ...(presentationProfile === "web" ? { outputSchema: fromJsonSchema(definition.output_schema as unknown as JsonSchemaType) } : {}),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     }, async (args, context) => {
       const lifecycle = { active: true };
@@ -1607,6 +1716,14 @@ export function createUrdiraMcpServer(dependencies: { readonly client: UrdiraMcp
     });
   }
   return server;
+}
+
+/** Streamable HTTP composition used only by the loopback-owned web command. */
+export function createUrdiraMcpHttpHandler(dependencies: { readonly client: UrdiraMcpClient }): McpHttpHandler {
+  return createMcpHandler(() => createUrdiraMcpServer(dependencies, { presentation_profile: "web" }), {
+    legacy: "reject",
+    responseMode: "auto",
+  });
 }
 
 export function serveUrdiraStdio(dependencies: { readonly client: UrdiraMcpClient }, options: ServeUrdiraStdioOptions = {}): StdioServerHandle {

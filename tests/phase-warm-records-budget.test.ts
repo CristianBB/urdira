@@ -141,8 +141,9 @@ describe("Daemon warm-records LRU byte budget (URDIRA_WARM_RECORDS_BUDGET_MB)", 
       // alphabetically-ordered ids make "A registered/warmed before B"
       // deterministic instead of a coin flip across runs.
       let nextWorkspaceId = 0;
+      let nextCodebaseId = 0;
       const fixedWorkspaceIds = ["workspace:warm-budget-a", "workspace:warm-budget-b"];
-      const registry = new WorkspaceRegistry({ create_id: (kind) => (kind === "workspace" ? fixedWorkspaceIds[nextWorkspaceId++]! : `codebase:${nextWorkspaceId++}`) });
+      const registry = new WorkspaceRegistry({ create_id: (kind) => (kind === "workspace" ? fixedWorkspaceIds[nextWorkspaceId++]! : `codebase:${nextCodebaseId++}`) });
       const workspaceA = registerReadyWorkspace(registry, "a");
       const workspaceB = registerReadyWorkspace(registry, "b");
 
