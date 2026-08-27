@@ -572,7 +572,14 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
       const cacheKey = analysisCacheKey(files, rootNames, compilerOptions, fileHashMemo);
       let analysis: JsTsAnalysisResult;
       let impactfulChangedPaths: readonly string[] | undefined;
-      const boundedSyntax = rawPayload["bounded_syntax"] === true;
+      // A pooled worker has already created the checker-backed TypeScript API
+      // while publishing stages 2/3. On a later edit, stage 1 must not create
+      // a second SyncRpcChannel in that same worker: TypeScript's sync API can
+      // fail with `spawn EBADF` when two child channels overlap. Stage 1 only
+      // needs declarations and direct imports, so use its bounded scanner for
+      // every post-initial stage-1 request and leave the live checker API for
+      // the checker-backed later stages.
+      const boundedSyntax = rawPayload["bounded_syntax"] === true || (publicationStageId === "jsts:structural_stage_1" && stage1AnalysisCache !== undefined);
       if (publicationStageId !== "jsts:structural_stage_1") stage1AnalysisCache = undefined;
       if (publicationStageId === "jsts:structural_stage_1") {
         const cachedSyntax = stage1AnalysisCache?.key === cacheKey

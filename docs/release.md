@@ -27,20 +27,35 @@ the release surface.
 
 The current expanded TypeScript evidence report records one sequential sample
 for each of 32 cells across TypeScript, Playwright, Prisma, and VS Code. The
-Urdira arm was rerun on 2026-08-24; baseline, codebase-memory, and CodeGraph
+Urdira arm was rerun on 2026-08-26; baseline, codebase-memory, and CodeGraph
 rows are reused from the prior audited campaign and are marked as such. A
 readiness control is not a successful agent task: every Urdira run must be
-accompanied by stage timings, peak RSS, SQLite/CAS sizes, copy telemetry when
+accompanied by stage timings, observed peak RSS, SQLite/CAS sizes, copy telemetry when
 available, a repository grader result, and transcript attribution before it
-enters the release aggregate.
+enters the release aggregate. The current [Markdown report](../release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-27.md)
+and [JSON report](../release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-27.json)
+contain the derived measurements and failure details.
 
-The Urdira rerun completed 8/8 graded tasks and materially reduced readiness,
-but five discovery calls failed and two cells used narrow native source
-inspection afterward. It is therefore performance evidence, not accepted
-code-intelligence-replacement evidence. The combined 32-cell gate also remains
-false because five reused comparison rows failed. The exact comparison and
-limitations are recorded in the
-[expanded agent report](../release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-24.md).
+The expanded benchmark runner measures RSS but deliberately has no benchmark
+memory limit and never kills a host for crossing a threshold. Only a genuine
+operating-system termination is classified as an OOM/infrastructure failure.
+
+The previous Urdira reruns were retired after their rows were invalidated; their
+derived reports are not current release evidence. New runs must be generated
+with the reproducible campaign below and retained only when their manifests,
+grader results, transcript attribution, and cleanup records pass the stated
+acceptance rules.
+
+The reproducible comparative campaign is driven by
+`release/benchmarks/run-expanded-agent-benchmark.mjs`. It supports the four
+arms (native baseline, codebase-memory, CodeGraph, and checkout-built Urdira
+with `urdira:javascript_typescript`), the quick-local, deep-cross-file, and
+staged-incremental scenarios, and repository selection through
+`--repositories`. Each cell uses a detached worktree and isolated index/data
+root, records cleanup evidence, and must pass the smoke gate before additional
+independent samples are launched. Benchmark invocations use the repository's
+built `apps/urdira/dist/index.js` and Node.js `>=24.18.1`; the globally
+installed `urdira` CLI is not part of the benchmark runtime.
 
 ## One-time external setup
 

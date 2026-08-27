@@ -397,6 +397,22 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     expect(sortedMemo(viaAccumulator.record_open_memo)).toEqual(sortedMemo(oneShot.record_open_memo));
   });
 
+  it("(3a) streamed first-scan metadata seals identically after the accepted delta array is released", () => {
+    const raw = acceptedDelta([record("streamed", "body-streamed")]);
+    const compact = compactAcceptedFactDelta({
+      ...raw,
+      delta: { ...raw.delta, fact_delta_id: "delta:streamed", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+    const expected = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }));
+    const accumulator = new CandidateRecordTemplateAccumulator("workspace:1", false);
+    accumulator.accept(compact);
+    expect(accumulator.matchesAcceptedDeltas([])).toBe(false);
+    const streamed = new CandidateMaterializer().seal(input(), accumulator);
+    expect(streamed.materialization).toEqual(expected.materialization);
+    expect(streamed.record_opens).toEqual(expected.record_opens);
+    expect(streamed.identity_assignments).toEqual(expected.identity_assignments);
+  });
+
   // Same determinism gate, at the scale that actually exercises the packed
   // identity encoding (>= PACKED_IDENTITY_THRESHOLD, see "retains large
   // initial identity sets" above) and split across two deltas -- the fast
@@ -425,7 +441,10 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     expect(viaAccumulator.identity_assignments).toEqual(oneShot.identity_assignments);
     expect(viaAccumulator.record_opens).toEqual(oneShot.record_opens);
     expect(viaAccumulator.materialization).toEqual(oneShot.materialization);
-  });
+    // Large first scans use the promoted id/digest hints on each open rather
+    // than retaining a second Map entry for every record until publication.
+    expect(viaAccumulator.record_open_memo.size).toBe(0);
+  }, 15_000);
 
   // (3d) sealAsync's off-thread digests: the worker runs the identical
   // canonical encode, so the ENTIRE sealed result -- descriptors, semantic
@@ -556,6 +575,48 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     expect(completed).toEqual([{ delta: first, digests: [`sha256:${"1".repeat(64)}`] }]);
     expect(pipeline.completedFactDeltaIds).toEqual(new Set(["delta:pipeline-a"]));
     expect(closed).toBe(true);
+  });
+
+  it("applies backpressure instead of accumulating unlimited digest batches", async () => {
+    const first = compactAcceptedFactDelta({
+      ...acceptedDelta([record("pipeline-limit-a", "body-a")]),
+      delta: { ...acceptedDelta([]).delta, fact_delta_id: "delta:pipeline-limit-a", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+    const second = compactAcceptedFactDelta({
+      ...acceptedDelta([record("pipeline-limit-b", "body-b")]),
+      delta: { ...acceptedDelta([]).delta, fact_delta_id: "delta:pipeline-limit-b", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+    const third = compactAcceptedFactDelta({
+      ...acceptedDelta([record("pipeline-limit-c", "body-c")]),
+      delta: { ...acceptedDelta([]).delta, fact_delta_id: "delta:pipeline-limit-c", plugin_id: "plugin:test", plugin_version: "1.0.0", proposed_dependencies: [], completeness_claims: [] },
+    } as unknown as AcceptedFactDelta);
+    const releases: (() => void)[] = [];
+    let calls = 0;
+    const pipeline = new MaterializationRecordDigestPipeline({
+      digestRecords: async (records) => {
+        calls += 1;
+        await new Promise<void>((resolve) => { releases.push(resolve); });
+        return records.map(() => `sha256:${"2".repeat(64)}`);
+      },
+      close: () => undefined,
+    }, 1, 2);
+
+    const firstAccepted = pipeline.accept(first);
+    const secondAccepted = pipeline.accept(second);
+    const thirdAccepted = pipeline.accept(third);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(2);
+
+    releases.shift()!();
+    await firstAccepted;
+    await secondAccepted;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(3);
+    releases.shift()!();
+    releases.shift()!();
+    await thirdAccepted;
+    const completed = await pipeline.drain();
+    expect(completed).toHaveLength(3);
   });
 
   // (1c) The packed-identity triple memo: seal() memoizes

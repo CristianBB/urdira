@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* global URL */
 /* Sequential campaign driver for the four-arm TypeScript benchmark. */
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
@@ -24,16 +24,19 @@ const codebaseMemoryBin = value("--codebase-memory", "/Users/Cristian/.local/bin
 const runner = join(root, "release/benchmarks/expanded-agent-benchmark-runner.mjs");
 const requestedArms = value("--arms", corpus.arms.join(",")).split(",").map((arm) => arm.trim()).filter(Boolean);
 const arms = [...new Set(requestedArms)];
+const requestedRepositoryIds = value("--repositories", corpus.repositories.map((repository) => repository.id).join(",")).split(",").map((repository) => repository.trim()).filter(Boolean);
+const repositories = corpus.repositories.filter((repository) => requestedRepositoryIds.includes(repository.id));
 const smokeAuditPath = value("--smoke-audit", undefined);
 const independentCampaigns = Number(value("--independent-campaigns", "1"));
 const [nodeMajor, nodeMinor, nodePatch] = process.versions.node.split(".").map(Number);
 if (nodeMajor < 24 || nodeMajor === 24 && (nodeMinor < 18 || nodeMinor === 18 && nodePatch < 1)) throw new Error(`Node >=24.18.1 is required for the expanded campaign; found ${process.version}`);
 if (arms.length === 0 || arms.some((arm) => !corpus.arms.includes(arm))) throw new Error(`--arms must contain only: ${corpus.arms.join(", ")}`);
+if (repositories.length === 0 || repositories.length !== requestedRepositoryIds.length) throw new Error(`--repositories must contain only known repository ids: ${corpus.repositories.map((repository) => repository.id).join(", ")}`);
 if (!Number.isSafeInteger(samples) || samples < 1) throw new Error("--samples must be a positive integer");
 if (!Number.isSafeInteger(independentCampaigns) || independentCampaigns < 1) throw new Error("--independent-campaigns must be a positive integer");
 if (!existsSync(codex)) throw new Error(`Codex executable not found: ${codex}`);
-if (!existsSync(codegraphBin)) throw new Error(`CodeGraph executable not found: ${codegraphBin}`);
-if (!existsSync(codebaseMemoryBin)) throw new Error(`codebase-memory executable not found: ${codebaseMemoryBin}`);
+if (arms.includes("codegraph") && !existsSync(codegraphBin)) throw new Error(`CodeGraph executable not found: ${codegraphBin}`);
+if (arms.includes("codebase-memory") && !existsSync(codebaseMemoryBin)) throw new Error(`codebase-memory executable not found: ${codebaseMemoryBin}`);
 
 if (samples > 1) {
   if (smokeAuditPath === undefined) throw new Error("The expanded campaign is gated: pass --smoke-audit pointing to a completed six-run smoke audit.");
@@ -54,6 +57,48 @@ const run = (command, args, options = {}) => new Promise((resolvePromise, reject
   child.on("close", (code, signal) => resolvePromise({ code: code ?? 1, signal, stdout, stderr }));
 });
 
+const cleanupCell = async ({ repositoryRoot, worktree, dataRoot, codebaseMemoryBin, codebaseMemoryProject }) => {
+  const evidence = { codegraph_servers_terminated: true, worktree_removed: false, data_root_removed: false, worktree_pruned: false, codebase_project_removed: codebaseMemoryProject === undefined, errors: [] };
+  const processList = await run("ps", ["-ax", "-o", "pid=,command="]);
+  const worktreeVariants = [worktree, worktree.startsWith("/tmp/") ? `/private${worktree}` : null].filter(Boolean);
+  const codegraphPids = processList.stdout.split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.includes("codegraph.js serve --mcp") && (worktreeVariants.some((candidate) => line.includes(`--path ${candidate}`)) || line.includes(`--path ${basename(worktree)}`)))
+    .map((line) => Number(line.split(/\s+/u, 1)[0]))
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid);
+  for (const pid of codegraphPids) {
+    try {
+      process.kill(pid, "SIGTERM");
+      try { process.kill(pid, "SIGKILL"); } catch { /* the server exited after SIGTERM */ }
+    } catch (error) { evidence.errors.push(`codegraph pid ${pid}: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  evidence.codegraph_servers_terminated = codegraphPids.every((pid) => {
+    try { process.kill(pid, 0); return false; } catch { return true; }
+  });
+  if (existsSync(worktree)) {
+    const removed = await run("git", ["worktree", "remove", "--force", worktree], { cwd: repositoryRoot });
+    evidence.worktree_removed = removed.code === 0 && !existsSync(worktree);
+    if (!evidence.worktree_removed) {
+      try { rmSync(worktree, { recursive: true, force: true }); } catch (error) { evidence.errors.push(`worktree: ${error instanceof Error ? error.message : String(error)}`); }
+      evidence.worktree_removed = !existsSync(worktree);
+    }
+  } else {
+    evidence.worktree_removed = true;
+  }
+  const pruned = await run("git", ["worktree", "prune"], { cwd: repositoryRoot });
+  evidence.worktree_pruned = pruned.code === 0;
+  if (dataRoot !== undefined && existsSync(dataRoot)) {
+    try { rmSync(dataRoot, { recursive: true, force: true }); } catch (error) { evidence.errors.push(`data_root: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  evidence.data_root_removed = dataRoot === undefined || !existsSync(dataRoot);
+  if (codebaseMemoryProject !== undefined) {
+    const deleted = await run(codebaseMemoryBin, ["cli", "delete_project", `--project=${codebaseMemoryProject}`], { cwd: root });
+    evidence.codebase_project_removed = deleted.code === 0;
+    if (!evidence.codebase_project_removed) evidence.errors.push(`codebase-memory: ${deleted.stderr || deleted.stdout}`.slice(0, 1000));
+  }
+  return evidence;
+};
+
 const orderFor = (sample, repoIndex, taskIndex) => {
   const rotation = (sample - 1 + repoIndex + taskIndex) % arms.length;
   return arms.slice(rotation).concat(arms.slice(0, rotation));
@@ -71,14 +116,14 @@ const audit = {
   samples_per_cell: samples,
   independent_campaigns: independentCampaigns,
   arms,
-  repositories: corpus.repositories.map(({ id, repository, commit, tasks }) => ({ id, repository, commit, tasks: tasks.map(({ id, complexity }) => ({ id, complexity })) })),
+  repositories: repositories.map(({ id, repository, source_ref, commit, size_tier, tasks }) => ({ id, repository, source_ref: source_ref ?? commit, commit, size_tier, tasks: tasks.map(({ id, complexity, scenario }) => ({ id, complexity, scenario })) })),
   output_dir: outputDir,
   runs: [],
 };
 
 for (let sample = 1; sample <= samples; sample += 1) {
-  for (let repoIndex = 0; repoIndex < corpus.repositories.length; repoIndex += 1) {
-    const repo = corpus.repositories[repoIndex];
+  for (let repoIndex = 0; repoIndex < repositories.length; repoIndex += 1) {
+    const repo = repositories[repoIndex];
     const repositoryRoot = join(repositoriesRoot, repo.id);
     if (!existsSync(join(repositoryRoot, ".git"))) throw new Error(`Repository checkout is unavailable: ${repositoryRoot}`);
     for (let taskIndex = 0; taskIndex < repo.tasks.length; taskIndex += 1) {
@@ -97,12 +142,17 @@ for (let sample = 1; sample <= samples; sample += 1) {
         const worktreeResult = await run("git", ["worktree", "add", "--detach", worktree, repo.commit], { cwd: repositoryRoot });
         if (worktreeResult.code !== 0) throw new Error(`Unable to create ${worktree}: ${worktreeResult.stderr}`);
         const started = Date.now();
-        const result = await run(nodeBin, [runner, "--repository-id", repo.id, "--task-id", task.id, "--arm", arm, "--sample", String(sample), "--phase", "warm", "--worktree", worktree, "--data-root", dataRoot, "--output-dir", runOutput, "--commit", repo.commit, "--model", corpus.model, "--codex", codex, "--node", nodeBin, "--codegraph", codegraphBin, "--codebase-memory", codebaseMemoryBin], { cwd: root, env: { URDIRA_SEMANTIC_INDEX: "0" } });
-        const manifestPath = join(runOutput, `${runId}.json`);
+        let result;
         let manifest;
-        try { manifest = JSON.parse(await readFile(manifestPath, "utf8")); } catch { manifest = undefined; }
-        audit.runs.push({ run_id: runId, repository: repo.id, task: task.id, arm, sample, order_index: orderFor(sample, repoIndex, taskIndex).indexOf(arm), exit_code: result.code, elapsed_ms: Date.now() - started, manifest, stdout_tail: result.stdout.slice(-6000), stderr_tail: result.stderr.slice(-6000) });
-        writeFileSync(join(outputDir, "audit.json"), `${JSON.stringify(audit, null, 2)}\n`, "utf8");
+        try {
+          result = await run(nodeBin, [runner, "--repository-id", repo.id, "--task-id", task.id, "--arm", arm, "--sample", String(sample), "--phase", "warm", "--worktree", worktree, "--data-root", dataRoot, "--output-dir", runOutput, "--commit", repo.commit, "--model", corpus.model, "--codex", codex, "--node", nodeBin, "--codegraph", codegraphBin, "--codebase-memory", codebaseMemoryBin], { cwd: root, env: { URDIRA_SEMANTIC_INDEX: "0" } });
+          const manifestPath = join(runOutput, `${runId}.json`);
+          try { manifest = JSON.parse(await readFile(manifestPath, "utf8")); } catch { manifest = undefined; }
+        } finally {
+          const cleanup = await cleanupCell({ repositoryRoot, worktree, dataRoot, codebaseMemoryBin, codebaseMemoryProject: arm === "codebase-memory" ? `${repo.id}-${task.id}-${arm}-${sample}` : undefined });
+          audit.runs.push({ run_id: runId, repository: repo.id, task: task.id, scenario: task.scenario ?? null, size_tier: repo.size_tier ?? null, arm, sample, order_index: orderFor(sample, repoIndex, taskIndex).indexOf(arm), exit_code: result?.code ?? 1, elapsed_ms: Date.now() - started, manifest, cleanup, stdout_tail: result?.stdout?.slice(-6000) ?? "", stderr_tail: result?.stderr?.slice(-6000) ?? "" });
+          writeFileSync(join(outputDir, "audit.json"), `${JSON.stringify(audit, null, 2)}\n`, "utf8");
+        }
       }
     }
   }
@@ -111,7 +161,7 @@ for (let sample = 1; sample <= samples; sample += 1) {
 const successful = audit.runs.filter((entry) => entry.manifest?.completed_successfully === true);
 audit.successful_runs = successful.length;
 audit.failed_runs = audit.runs.length - successful.length;
-audit.expected_runs = corpus.repositories.length * 2 * arms.length * samples;
+audit.expected_runs = repositories.length * 2 * arms.length * samples;
 audit.campaign_gate = { passed: audit.failed_runs === 0 && audit.runs.length === audit.expected_runs };
 writeFileSync(join(outputDir, "audit.json"), `${JSON.stringify(audit, null, 2)}\n`, "utf8");
 console.log(JSON.stringify({ output_dir: outputDir, successful_runs: audit.successful_runs, failed_runs: audit.failed_runs, expected_runs: audit.expected_runs }));

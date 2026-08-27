@@ -8,6 +8,7 @@ import {
   type ServerContext,
   type McpHttpHandler,
 } from "@modelcontextprotocol/server";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/server/validators/ajv";
 import { serveStdio, type ServeStdioOptions, type StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 import { createHash } from "node:crypto";
 import { buildQueryAdmissionPlan } from "@urdira/engine";
@@ -430,6 +431,47 @@ const toolSchemas: Readonly<Record<UrdiraMcpToolName, JsonSchema>> = {
   urdira_analyze_change: intentSchema("core:analyze_impact"),
   urdira_build_context: intentSchema("core:build_context"),
   urdira_index_status: indexStatusSchema,
+};
+
+const BUILD_CONTEXT_FACETS = [
+  "definitions",
+  "implementations",
+  "callers",
+  "callees",
+  "dependencies",
+  "contracts",
+  "effects",
+  "tests",
+  "configuration",
+  "analogues",
+  "extension_points",
+] as const;
+
+/**
+ * The MCP SDK validates tool arguments before invoking our handler. Its AJV
+ * error for an invalid enum only says "must be equal to one of the allowed
+ * values", which leaves an agent unable to repair a call when the enum is
+ * large or was not retained by the client. Keep the closed enum in the
+ * advertised schema and enrich the validator-side diagnostic with the exact
+ * registered values.
+ */
+const defaultMcpJsonSchemaValidator = new AjvJsonSchemaValidator();
+const diagnosticMcpJsonSchemaValidator = {
+  getValidator<T>(schema: JsonSchemaType) {
+    const validate = defaultMcpJsonSchemaValidator.getValidator<T>(schema);
+    return (input: unknown) => {
+      const result = validate(input);
+      if (result.valid || !result.errorMessage) return result;
+      if (result.errorMessage.includes("data/facets/") && result.errorMessage.includes("allowed values")) {
+        return {
+          valid: false as const,
+          data: undefined,
+          errorMessage: `${result.errorMessage}; valid facets: ${BUILD_CONTEXT_FACETS.join(", ")}`,
+        };
+      }
+      return result;
+    };
+  },
 };
 
 const toolTitles: Readonly<Record<UrdiraMcpToolName, string>> = {
@@ -1589,7 +1631,8 @@ export function buildBenchmarkInstructions(discoveryPath?: string): string {
     `Registered operation arguments (! required, ? optional; use these exact field names and logical types): ${operationArguments}.`,
     "Nested closed contracts used often: discover_definitions.matcher={text:<non-empty string>,mode:exact|prefix|contains|semantic|hybrid}; get_outline.container accepts only an artifact or entity selector (resolve a symbol first); StructuralFilter fields are only paths, languages, namespaces, kind_selector, subject_types, include_external, include_generated. Every paths entry is an exact workspace-relative glob: use src/file.ts for one exact file, src/directory/** for a directory subtree, and never use a bare directory when descendants are intended.",
     "A pipeline binding to a scalar argument requires exactly one upstream result. Do not bind resolve_symbol declarations directly to get_outline.container when resolution may return multiple declarations; consume an exact returned entity id instead.",
-    `core:build_context and urdira_context facets use exactly ${buildContextFacetContract}; public_surfaces is an architecture view, not a core:build_context facet.`,
+    "If core:selector_ambiguous is returned, do not repeat the same selector: use one exact entity_id from details.confirmed_candidate_ids or rerun with context_artifact or kind_selector as requested by recovery_action.",
+    `core:build_context and urdira_context facets use exactly ${buildContextFacetContract}; public_surfaces is an architecture view, not a core:build_context facet; use it with core:inspect_architecture.views. If a tool rejects an enum and prints valid values, treat that list as authoritative and immediately retry the corrected call before continuing.`,
     `Copy-paste direct-query example: ${JSON.stringify(directQueryExample)}.`,
     `Copy-paste pipeline example: ${JSON.stringify(pipelineQueryExample)}.`,
     `Copy-paste known-path source example: ${JSON.stringify(knownPathSourceExample)}.`,
@@ -1643,7 +1686,7 @@ function withHiddenRenderProperty(schema: JsonSchema): JsonSchema {
 }
 
 function hiddenRenderInputSchema(publicSchema: JsonSchema): ReturnType<typeof fromJsonSchema> {
-  const validated = fromJsonSchema(withHiddenRenderProperty(publicSchema) as unknown as JsonSchemaType);
+  const validated = fromJsonSchema(withHiddenRenderProperty(publicSchema) as unknown as JsonSchemaType, diagnosticMcpJsonSchemaValidator);
   return {
     "~standard": {
       ...validated["~standard"],

@@ -53,6 +53,32 @@ export interface CandidateMaterializationInput {
   readonly known_lookup_dependencies: readonly CandidateLookupDependencyAuthority[];
 }
 
+interface FastPathProposedDependency {
+  readonly fact_delta_id: string;
+  readonly proposed_dependency_id: string;
+  readonly proposal_record_key: string;
+  readonly record_id: string;
+  readonly owner_artifact_id: string;
+  readonly owner_artifact_version_id: string;
+  readonly dependency_artifact_id: string;
+  readonly dependency_artifact_version_id: string;
+  readonly dependency_role: string;
+  readonly producer_id: string;
+  readonly producer_version: string;
+}
+
+interface FastPathRecordOwner {
+  readonly owner_artifact_id: string;
+  readonly owner_artifact_version_id: string;
+}
+
+interface FastPathMaterializationMetadata {
+  readonly accepted_fact_delta_digests: readonly string[];
+  readonly proposed_dependencies: readonly FastPathProposedDependency[];
+  readonly proposal_record_ids: ReadonlyMap<string, string>;
+  readonly record_owners: ReadonlyMap<string, FastPathRecordOwner>;
+}
+
 export interface CandidateKnownArtifactVersion {
   readonly artifact_id: string;
   readonly artifact_version_id: string;
@@ -685,7 +711,7 @@ function candidateMaterializationError(message: string, scope: Readonly<Record<s
   throw new CandidateMaterializationError("core:dependency_validation_failed", message, scope);
 }
 
-function validateBindings(input: CandidateMaterializationInput, proposalRecordIds: ReadonlyMap<string, string>, owners: ReadonlyMap<string, RecordOwner>): {
+function validateBindings(input: CandidateMaterializationInput, proposalRecordIds: ReadonlyMap<string, string>, owners: ReadonlyMap<string, RecordOwner>, fastPath?: FastPathMaterializationMetadata): {
   readonly record_dependencies: readonly CandidateRecordDependencyTemplate[];
   readonly lookup_bindings: readonly CandidateLookupBindingTemplate[];
   readonly projection_dependencies: readonly CandidateProjectionDependencyTemplate[];
@@ -696,6 +722,7 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
   const baseRecords = new Map(input.base_records.map((record) => [record.record_id, record]));
   const dependencyProposalKeys = new Set<string>();
   for (const accepted of input.accepted_deltas) for (const dependency of accepted.delta.proposed_dependencies ?? []) dependencyProposalKeys.add(dependency.proposal_record_key);
+  for (const dependency of fastPath?.proposed_dependencies ?? []) dependencyProposalKeys.add(dependency.proposal_record_key);
   const requiresCompleteRecordAuthority = (input.record_dependencies?.length ?? 0) > 0
     || (input.lookup_bindings?.length ?? 0) > 0
     || (input.projection_dependencies?.length ?? 0) > 0;
@@ -717,11 +744,16 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
     if (base !== undefined) return { workspace_id: base.workspace_id, owner_artifact_id: base.owner_artifact_id, owner_artifact_version_id: base.owner_artifact_version_id };
     const proposed = proposedRecords.get(recordId) ?? proposedRecordsByFinalId.get(recordId);
     const owner = proposed === undefined ? undefined : retainedRecordOwner(proposed, owners);
-    return owner === undefined ? undefined : { workspace_id: workspaceId, ...owner };
+    const fastOwner = fastPath?.record_owners.get(recordId);
+    return fastOwner === undefined && owner === undefined ? undefined : { workspace_id: workspaceId, ...(fastOwner ?? owner!) };
   };
   const knownRecords = new Set<string>(baseRecords.keys());
   for (const proposalKey of proposedRecords.keys()) knownRecords.add(proposalKey);
   for (const recordId of proposedRecordsByFinalId.keys()) knownRecords.add(recordId);
+  for (const dependency of fastPath?.proposed_dependencies ?? []) {
+    knownRecords.add(dependency.proposal_record_key);
+    knownRecords.add(dependency.record_id);
+  }
   // Full staged-record visibility is required only for externally supplied
   // record/lookup/projection bindings. Promoted analyzer dependencies refer to
   // `dependencyProposalKeys`, already retained above. Expanding every staged
@@ -745,11 +777,31 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
   const dependencies: CandidateRecordDependencyTemplate[] = [];
   const dependencyIds = new Set<string>();
   const promotedDependencies: RecordArtifactDependency[] = [];
-  for (const accepted of input.accepted_deltas) for (const dependency of accepted.delta.proposed_dependencies ?? []) {
-    const recordId = proposalRecordIds.get(dependency.proposal_record_key);
-    const proposed = proposedRecords.get(dependency.proposal_record_key);
-    const owner = proposed === undefined ? undefined : retainedRecordOwner(proposed, owners);
-    if (owner === undefined || recordId === undefined) throw new CandidateMaterializationError("core:dependency_validation_failed", "Accepted dependency source proposal is absent from the sealed record set.", { dependency_failure_kind: "proposal_record_missing", proposal_record_key: dependency.proposal_record_key });
+  const acceptedDependencies: readonly FastPathProposedDependency[] = fastPath?.proposed_dependencies !== undefined
+    ? fastPath.proposed_dependencies
+    : input.accepted_deltas.flatMap((accepted) => (accepted.delta.proposed_dependencies ?? []).map((dependency) => {
+      const recordId = proposalRecordIds.get(dependency.proposal_record_key);
+      const proposed = proposedRecords.get(dependency.proposal_record_key);
+      const owner = proposed === undefined ? undefined : retainedRecordOwner(proposed, owners);
+      if (owner === undefined || recordId === undefined) throw new CandidateMaterializationError("core:dependency_validation_failed", "Accepted dependency source proposal is absent from the sealed record set.", { dependency_failure_kind: "proposal_record_missing", proposal_record_key: dependency.proposal_record_key });
+      return {
+        fact_delta_id: accepted.delta.fact_delta_id,
+        proposed_dependency_id: dependency.proposed_dependency_id,
+        proposal_record_key: dependency.proposal_record_key,
+        record_id: recordId,
+        owner_artifact_id: owner.owner_artifact_id,
+        owner_artifact_version_id: owner.owner_artifact_version_id,
+        dependency_artifact_id: dependency.dependency_artifact_id,
+        dependency_artifact_version_id: dependency.dependency_artifact_version_id,
+        dependency_role: dependency.dependency_role,
+        producer_id: accepted.delta.plugin_id,
+        producer_version: accepted.delta.plugin_version,
+      };
+    }));
+  for (const dependency of acceptedDependencies) {
+    const recordId = dependency.record_id;
+    const owner = ownerOf(recordId);
+    if (owner === undefined || proposalRecordIds.get(dependency.proposal_record_key) !== recordId) throw new CandidateMaterializationError("core:dependency_validation_failed", "Accepted dependency source proposal is absent from the sealed record set.", { dependency_failure_kind: "proposal_record_missing", proposal_record_key: dependency.proposal_record_key });
     // The dependency's owner must match whichever owner its *record*
     // (`recordId`) actually has, not necessarily this scan's own fresh
     // replacement-scope owner (`owner`, above). Those two disagree exactly
@@ -782,7 +834,7 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
     // `proposalRecordIds`.
     const resolvedOwner = ownerOf(recordId) ?? owner;
     promotedDependencies.push({
-      dependency_entry_id: `dependency:${digest({ fact_delta_id: accepted.delta.fact_delta_id, proposed_dependency_id: dependency.proposed_dependency_id, record_id: recordId }).slice("sha256:".length)}`,
+      dependency_entry_id: `dependency:${digest({ fact_delta_id: dependency.fact_delta_id, proposed_dependency_id: dependency.proposed_dependency_id, record_id: recordId }).slice("sha256:".length)}`,
       workspace_id: workspaceId,
       record_id: recordId,
       owner_artifact_id: resolvedOwner.owner_artifact_id,
@@ -790,8 +842,8 @@ function validateBindings(input: CandidateMaterializationInput, proposalRecordId
       dependency_artifact_id: dependency.dependency_artifact_id,
       dependency_artifact_version_id: dependency.dependency_artifact_version_id,
       dependency_role: dependency.dependency_role,
-      producer_id: accepted.delta.plugin_id,
-      producer_version: accepted.delta.plugin_version,
+      producer_id: dependency.producer_id,
+      producer_version: dependency.producer_version,
       valid_from_generation: 0,
     });
   }
@@ -917,14 +969,23 @@ function orderedSetDescriptorFromDigest(elementType: string, entryCount: number,
   };
 }
 
-interface FastPathIdentityRaw {
-  readonly identityType: "entity" | "relation" | "diagnostic";
-  readonly identityKey: string;
-  readonly recordId: string;
-  readonly ownerArtifactId: string;
-  readonly ownerArtifactVersionId: string;
-  /** Carried only to reproduce `desired`'s global proposal_record_key order at finish() (see below). */
-  readonly proposalRecordKey: string;
+const FAST_PATH_PROPOSAL_RECORD_KEY = Symbol("urdira.fast_path_proposal_record_key");
+
+type FastPathOpenTemplate = CandidateRecordOpenTemplate & {
+  readonly [FAST_PATH_PROPOSAL_RECORD_KEY]: string;
+};
+
+function fastPathOpenTemplate(record: MaterializationProposedRecord, causeReferences: readonly ChangeCauseReference[], recordId: string, recordContentDigest: string): CandidateRecordOpenTemplate {
+  const openTemplate = { record_without_validity: record.canonical_record, open_reason_code: "core:record_created", owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id, cause_references: causeReferences, record_id_hint: recordId, record_digest_hint: recordContentDigest } as CandidateRecordOpenTemplate as FastPathOpenTemplate;
+  // Keep proposal order out of the public template shape. A separate
+  // million-entry `{ proposalRecordKey, openIndex }` array costs more RSS than
+  // this non-enumerable scalar attached to the already-required open object.
+  Object.defineProperty(openTemplate, FAST_PATH_PROPOSAL_RECORD_KEY, { value: record.proposal_record_key, enumerable: false });
+  return openTemplate;
+}
+
+function fastPathProposalRecordKey(open: CandidateRecordOpenTemplate): string {
+  return (open as FastPathOpenTemplate)[FAST_PATH_PROPOSAL_RECORD_KEY];
 }
 
 /**
@@ -944,7 +1005,7 @@ interface FastPathIdentityRaw {
  * record body -- lands on the main thread while other awaited work is in
  * flight, rather than as one 60+ second blocking tail.
  *
- * DETERMINISM: per-record output (open template, identity raw fields,
+ * DETERMINISM: per-record output (open template, identity fields,
  * proposal-id entry) depends only on that record and its own delta/scope --
  * never on any other delta -- so accepting deltas one at a time or all at
  * once produces the identical unordered result set. The one order-sensitive
@@ -965,11 +1026,14 @@ export class CandidateRecordTemplateAccumulator {
   private readonly retainEveryProposalId: boolean;
   private disqualified = false;
   private finished = false;
-  private readonly acceptedDeltas: MaterializationAcceptedFactDelta[] = [];
+  private readonly acceptedDeltaDigests = new Map<string, string>();
+  private readonly fastPathDependencies: FastPathProposedDependency[] = [];
+  private readonly recordOwnersById = new Map<string, FastPathRecordOwner>();
   private readonly opens: CandidateRecordOpenTemplate[] = [];
-  private readonly identityRaw: FastPathIdentityRaw[] = [];
   private readonly proposalRecordIds = new Map<string, string>();
   private readonly recordOpenMemo = new Map<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>();
+  private readonly causeReferencesByArtifactId = new Map<string, readonly ChangeCauseReference[]>();
+  private retainRecordOpenMemo = true;
 
   constructor(workspaceId: string, retainEveryProposalId: boolean) {
     this.workspaceId = workspaceId;
@@ -977,7 +1041,17 @@ export class CandidateRecordTemplateAccumulator {
   }
 
   get isDisqualified(): boolean { return this.disqualified; }
-  get acceptedDeltaCount(): number { return this.acceptedDeltas.length; }
+  get acceptedDeltaCount(): number { return this.acceptedDeltaDigests.size; }
+
+  get fastPathMetadata(): FastPathMaterializationMetadata | undefined {
+    if (this.disqualified) return undefined;
+    return {
+      accepted_fact_delta_digests: [...this.acceptedDeltaDigests.values()],
+      proposed_dependencies: [...this.fastPathDependencies],
+      proposal_record_ids: new Map(this.proposalRecordIds),
+      record_owners: new Map(this.recordOwnersById),
+    };
+  }
 
   /**
    * Whether this accumulator's accepted deltas are exactly `deltas`, as a
@@ -988,23 +1062,36 @@ export class CandidateRecordTemplateAccumulator {
    * native-batch acceptance) rather than `input.accepted_deltas`'s own order.
    */
   matchesAcceptedDeltas(deltas: readonly MaterializationAcceptedFactDelta[]): boolean {
-    // `finish()` released `acceptedDeltas`/`identityRaw` (see there), so a
+    // `finish()` released the delta identity metadata, so a
     // match answered from the cleared arrays could only ever be wrong -- an
     // empty-vs-empty "true" would let a SECOND seal over this accumulator
     // publish an empty candidate silently. No caller legitimately re-checks
     // after finishing (one accumulator, one seal); make the bug loud.
     if (this.finished) throw new CandidateMaterializationError("core:dependency_validation_failed", "CandidateRecordTemplateAccumulator.matchesAcceptedDeltas() called after finish(); an accumulator seals exactly once.", {});
-    if (this.acceptedDeltas.length !== deltas.length) return false;
-    const seen = new Set(this.acceptedDeltas);
-    return seen.size === this.acceptedDeltas.length && deltas.every((delta) => seen.has(delta));
+    if (this.acceptedDeltaDigests.size !== deltas.length) return false;
+    const seen = new Set<string>();
+    return deltas.every((delta) => {
+      const id = delta.delta.fact_delta_id;
+      if (seen.has(id) || this.acceptedDeltaDigests.get(id) !== semanticAcceptedDeltaDigest(delta)) return false;
+      seen.add(id);
+      return true;
+    });
   }
 
   matchesRetainEveryProposalId(retainEveryProposalId: boolean): boolean {
     return this.retainEveryProposalId === retainEveryProposalId;
   }
 
+  private causesFor(ownerArtifactId: string): readonly ChangeCauseReference[] {
+    const existing = this.causeReferencesByArtifactId.get(ownerArtifactId);
+    if (existing !== undefined) return existing;
+    const references = causes(ownerArtifactId);
+    this.causeReferencesByArtifactId.set(ownerArtifactId, references);
+    return references;
+  }
+
   accept(delta: MaterializationAcceptedFactDelta): void {
-    this.acceptedDeltas.push(delta);
+    this.acceptedDeltaDigests.set(delta.delta.fact_delta_id, semanticAcceptedDeltaDigest(delta));
     if (this.disqualified) return;
     const dependencyProposalKeys = this.retainEveryProposalId ? undefined : (() => {
       const keys = new Set<string>();
@@ -1020,20 +1107,40 @@ export class CandidateRecordTemplateAccumulator {
           // to the untouched general/one-shot path over the full input.
           this.disqualified = true;
           this.opens.length = 0;
-          this.identityRaw.length = 0;
           this.proposalRecordIds.clear();
           this.recordOpenMemo.clear();
+          this.fastPathDependencies.length = 0;
+          this.recordOwnersById.clear();
           return;
         }
-        const identityType = identityTypeForCategory(record.category) ?? "entity";
         const recordContentDigest = recordDigest(record);
         const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
         if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.proposalRecordIds.set(record.proposal_record_key, recordId);
-        const openTemplate = { record_without_validity: record.canonical_record, open_reason_code: "core:record_created", owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id, cause_references: causes(record.owner_artifact_id), record_id_hint: recordId, record_digest_hint: recordContentDigest } as CandidateRecordOpenTemplate;
+        if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.recordOwnersById.set(recordId, { owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id });
+        const openTemplate = fastPathOpenTemplate(record, this.causesFor(record.owner_artifact_id), recordId, recordContentDigest);
         this.opens.push(openTemplate);
-        this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
-        this.identityRaw.push({ identityType, identityKey: record.identity_key, recordId, ownerArtifactId: record.owner_artifact_id, ownerArtifactVersionId: record.owner_artifact_version_id, proposalRecordKey: record.proposal_record_key });
+        if (this.retainRecordOpenMemo && this.opens.length < PACKED_IDENTITY_THRESHOLD) this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
+        else {
+          this.retainRecordOpenMemo = false;
+          this.recordOpenMemo.clear();
+        }
       }
+    }
+    for (const dependency of delta.delta.proposed_dependencies ?? []) {
+      const recordId = this.proposalRecordIds.get(dependency.proposal_record_key);
+      const owner = recordId === undefined ? undefined : this.recordOwnersById.get(recordId);
+      if (recordId !== undefined && owner !== undefined) this.fastPathDependencies.push({
+        fact_delta_id: delta.delta.fact_delta_id,
+        proposed_dependency_id: dependency.proposed_dependency_id,
+        proposal_record_key: dependency.proposal_record_key,
+        record_id: recordId,
+        ...owner,
+        dependency_artifact_id: dependency.dependency_artifact_id,
+        dependency_artifact_version_id: dependency.dependency_artifact_version_id,
+        dependency_role: dependency.dependency_role,
+        producer_id: delta.delta.plugin_id,
+        producer_version: delta.delta.plugin_version,
+      });
     }
   }
 
@@ -1050,14 +1157,15 @@ export class CandidateRecordTemplateAccumulator {
    * instead of producing a wrong candidate.
    */
   acceptPrecomputed(delta: MaterializationAcceptedFactDelta, digests: readonly string[]): void {
-    this.acceptedDeltas.push(delta);
+    this.acceptedDeltaDigests.set(delta.delta.fact_delta_id, semanticAcceptedDeltaDigest(delta));
     if (this.disqualified) return;
     const disqualify = (): void => {
       this.disqualified = true;
       this.opens.length = 0;
-      this.identityRaw.length = 0;
       this.proposalRecordIds.clear();
       this.recordOpenMemo.clear();
+      this.fastPathDependencies.length = 0;
+      this.recordOwnersById.clear();
     };
     const dependencyProposalKeys = this.retainEveryProposalId ? undefined : (() => {
       const keys = new Set<string>();
@@ -1068,18 +1176,37 @@ export class CandidateRecordTemplateAccumulator {
     for (const set of delta.replacement_sets) {
       for (const record of set.records) {
         if (!isMaterializationProposedRecord(record) || digestIndex >= digests.length) { disqualify(); return; }
-        const identityType = identityTypeForCategory(record.category) ?? "entity";
         const recordContentDigest = digests[digestIndex]!;
         digestIndex += 1;
         const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
         if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.proposalRecordIds.set(record.proposal_record_key, recordId);
-        const openTemplate = { record_without_validity: record.canonical_record, open_reason_code: "core:record_created", owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id, cause_references: causes(record.owner_artifact_id), record_id_hint: recordId, record_digest_hint: recordContentDigest } as CandidateRecordOpenTemplate;
+        if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.recordOwnersById.set(recordId, { owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id });
+        const openTemplate = fastPathOpenTemplate(record, this.causesFor(record.owner_artifact_id), recordId, recordContentDigest);
         this.opens.push(openTemplate);
-        this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
-        this.identityRaw.push({ identityType, identityKey: record.identity_key, recordId, ownerArtifactId: record.owner_artifact_id, ownerArtifactVersionId: record.owner_artifact_version_id, proposalRecordKey: record.proposal_record_key });
+        if (this.retainRecordOpenMemo && this.opens.length < PACKED_IDENTITY_THRESHOLD) this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
+        else {
+          this.retainRecordOpenMemo = false;
+          this.recordOpenMemo.clear();
+        }
       }
     }
     if (digestIndex !== digests.length) disqualify();
+    if (!this.disqualified) for (const dependency of delta.delta.proposed_dependencies ?? []) {
+      const recordId = this.proposalRecordIds.get(dependency.proposal_record_key);
+      const owner = recordId === undefined ? undefined : this.recordOwnersById.get(recordId);
+      if (recordId !== undefined && owner !== undefined) this.fastPathDependencies.push({
+        fact_delta_id: delta.delta.fact_delta_id,
+        proposed_dependency_id: dependency.proposed_dependency_id,
+        proposal_record_key: dependency.proposal_record_key,
+        record_id: recordId,
+        ...owner,
+        dependency_artifact_id: dependency.dependency_artifact_id,
+        dependency_artifact_version_id: dependency.dependency_artifact_version_id,
+        dependency_role: dependency.dependency_role,
+        producer_id: delta.delta.plugin_id,
+        producer_version: delta.delta.plugin_version,
+      });
+    }
   }
 
   /**
@@ -1091,44 +1218,57 @@ export class CandidateRecordTemplateAccumulator {
    */
   finish(): { readonly reused: readonly string[]; readonly opens: readonly CandidateRecordOpenTemplate[]; readonly closures: readonly CandidateRecordClosureTemplate[]; readonly identities: readonly CandidateIdentityAssignmentTemplate[]; readonly proposal_record_ids: ReadonlyMap<string, string>; readonly record_open_memo: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry> } {
     if (this.disqualified) throw new CandidateMaterializationError("core:dependency_validation_failed", "CandidateRecordTemplateAccumulator.finish() called after disqualification.", {});
-    const opens = sortOwned(this.opens, (entry) => String((entry as unknown as Record<string, unknown>)["record_id_hint"] ?? entry.record_without_validity));
-    const packIdentities = this.identityRaw.length >= PACKED_IDENTITY_THRESHOLD;
-    const identities: CandidateIdentityAssignmentTemplate[] = packIdentities
-      ? sortOwned([...this.identityRaw], (entry) => entry.proposalRecordKey).map((raw) => {
-          const packed = [
-            PACKED_CREATED_IDENTITY_MARKER,
-            this.workspaceId,
-            raw.identityType,
-            raw.identityKey,
-            raw.recordId,
-            raw.ownerArtifactId,
-            raw.ownerArtifactVersionId,
-          ] as unknown as CandidateIdentityAssignmentTemplate;
-          rememberPackedIdentityTriple(packed as unknown as readonly unknown[], packedIdentityTriple(raw.recordId, raw.identityKey));
-          return packed;
-        })
-      : sortOwned(this.identityRaw.map((raw) => ({
-          identity_assignment_id: digest({ record_id: raw.recordId, identity_key: raw.identityKey }),
+    const packIdentities = this.opens.length >= PACKED_IDENTITY_THRESHOLD;
+    // Sort the already-required open templates by proposal order before
+    // creating identities. This removes the former million-entry ordering
+    // wrapper array from the seal peak; the opens carry that private order key
+    // non-enumerably and it never enters a canonical/public template.
+    sortOwned(this.opens, fastPathProposalRecordKey);
+    const identities: CandidateIdentityAssignmentTemplate[] = new Array(this.opens.length);
+    for (let index = 0; index < this.opens.length; index += 1) {
+      const open = this.opens[index]!;
+      const record = JSON.parse(open.record_without_validity) as { readonly category?: unknown; readonly identity_key?: unknown };
+      const identityType = identityTypeForCategory(typeof record.category === "string" ? record.category : "") ?? "entity";
+      const identityKey = typeof record.identity_key === "string" ? record.identity_key : "";
+      const recordId = String((open as unknown as Record<string, unknown>)["record_id_hint"] ?? "");
+      const ownerArtifactId = open.owner_artifact_id;
+      const ownerArtifactVersionId = open.owner_artifact_version_id;
+      if (packIdentities) {
+        const packed = [
+          PACKED_CREATED_IDENTITY_MARKER,
+          this.workspaceId,
+          identityType,
+          identityKey,
+          recordId,
+          ownerArtifactId,
+          ownerArtifactVersionId,
+        ] as unknown as CandidateIdentityAssignmentTemplate;
+        rememberPackedIdentityTriple(packed as unknown as readonly unknown[], packedIdentityTriple(recordId, identityKey));
+        identities[index] = packed;
+      } else {
+        identities[index] = {
+          identity_assignment_id: digest({ record_id: recordId, identity_key: identityKey }),
           workspace_id: this.workspaceId,
-          identity_type: raw.identityType,
-          identity_id: `${raw.identityType}:${digest({ identity_key: raw.identityKey }).slice("sha256:".length)}`,
+          identity_type: identityType,
+          identity_id: `${identityType}:${digest({ identity_key: identityKey }).slice("sha256:".length)}`,
           assignment_kind: "created",
-          identity_key: raw.identityKey,
-          identity_key_digest: digest(raw.identityKey),
-          record_id: raw.recordId,
-          owner_artifact_id: raw.ownerArtifactId,
-          owner_artifact_version_id: raw.ownerArtifactVersionId,
-        }) as CandidateIdentityAssignmentTemplate), (entry) => entry.identity_assignment_id);
-    // Release the corpus-scale inputs this pass just consumed (P4, RSS of
-    // the seal/publish window): `identityRaw`'s ~one-wrapper-per-record and
-    // the `acceptedDeltas` array's slots are dead the moment `identities`
-    // exists -- both branches above produce NEW arrays/objects. NOT cleared:
+          identity_key: identityKey,
+          identity_key_digest: digest(identityKey),
+          record_id: recordId,
+          owner_artifact_id: ownerArtifactId,
+          owner_artifact_version_id: ownerArtifactVersionId,
+        } as CandidateIdentityAssignmentTemplate;
+      }
+    }
+    const opens = sortOwned(this.opens, (entry) => String((entry as unknown as Record<string, unknown>)["record_id_hint"] ?? entry.record_without_validity));
+    if (!packIdentities) sortOwned(identities, (entry) => entry.identity_assignment_id);
+    // The accepted-delta identity metadata's slots are dead once identities
+    // exist. NOT cleared:
     // `this.opens` (`sortOwned` sorts in place, so the returned `opens` IS
     // this array), `recordOpenMemo`/`proposalRecordIds` (publication reads
     // them). The delta OBJECTS live on through the session's own
     // `accepted_deltas` array until it releases them after seal.
-    this.identityRaw.length = 0;
-    this.acceptedDeltas.length = 0;
+    this.acceptedDeltaDigests.clear();
     this.finished = true;
     return { reused: [], opens, closures: [], identities, proposal_record_ids: this.proposalRecordIds, record_open_memo: this.recordOpenMemo };
   }
@@ -1202,12 +1342,17 @@ export class CandidateMaterializer {
   }
 
   #prepare(input: CandidateMaterializationInput, accumulator?: CandidateRecordTemplateAccumulator): PreparedSeal {
+    // Capture the accumulator's compact metadata before `finish()` releases
+    // its delta identity table. A streamed first scan deliberately passes an
+    // empty `accepted_deltas` array here; all record templates and the small
+    // dependency/digest metadata have already been consumed incrementally.
+    const fastPath = input.accepted_deltas.length === 0 ? accumulator?.fastPathMetadata : undefined;
     const owners = recordOwners(input);
     const retainEveryProposalId = (input.record_dependencies?.length ?? 0) > 0 || (input.lookup_bindings?.length ?? 0) > 0 || (input.projection_dependencies?.length ?? 0) > 0;
     const accumulatorEligible = accumulator !== undefined
       && !accumulator.isDisqualified
       && accumulator.matchesRetainEveryProposalId(retainEveryProposalId)
-      && accumulator.matchesAcceptedDeltas(input.accepted_deltas)
+      && (fastPath !== undefined || accumulator.matchesAcceptedDeltas(input.accepted_deltas))
       && input.base_records.length === 0
       && (input.global_identity_records?.length ?? 0) === 0
       && (input.absence_barriers?.length ?? 0) === 0;
@@ -1224,7 +1369,7 @@ export class CandidateMaterializer {
     // `scopeRecords(input)` walk (the first, and only, full sort of every
     // proposed record by `proposal_record_key` on the fast accumulator path,
     // since `accumulator.finish()`, above, never calls it).
-    const bindings = timedSync("seal_validate_bindings", () => validateBindings(input, records.proposal_record_ids, owners));
+    const bindings = timedSync("seal_validate_bindings", () => validateBindings(input, records.proposal_record_ids, owners, accumulatorEligible ? fastPath : undefined));
     // `seal_projection_templates`: near-zero whenever a scan has no
     // projection authority to reconcile (the production JS/TS scan path
     // never populates `accepted_projection_sets`/`base_projections`), kept
@@ -1258,7 +1403,8 @@ export class CandidateMaterializer {
     const recordClosures = timedSync("seal_freeze", () => freeze(records.closures));
     const identityAssignments = timedSync("seal_freeze", () => freeze(records.identities));
     const barrierKeys = new Set((input.absence_barriers ?? []).map((entry) => `${entry.identity_type}\0${entry.identity_key}`));
-    return { records, projections, recordDependencies, lookupBindings, projectionDependencies, lookupRevalidations, sourceTransitions, recordOpens, recordClosures, identityAssignments, barrierKeys };
+    const acceptedFactDeltaDigests = fastPath?.accepted_fact_delta_digests ?? input.accepted_deltas.map(semanticAcceptedDeltaDigest);
+    return { records, projections, recordDependencies, lookupBindings, projectionDependencies, lookupRevalidations, sourceTransitions, recordOpens, recordClosures, identityAssignments, barrierKeys, acceptedFactDeltaDigests };
   }
 
   /**
@@ -1286,7 +1432,7 @@ export class CandidateMaterializer {
    */
   #preassemble(input: CandidateMaterializationInput, prepared: PreparedSeal): PreassembledSealPieces {
     return timedSync("seal_ordered_digests", () => ({
-      accepted_fact_delta_digests: sorted(input.accepted_deltas.map(semanticAcceptedDeltaDigest), (entry) => entry),
+      accepted_fact_delta_digests: sorted(prepared.acceptedFactDeltaDigests, (entry) => entry),
       source_transition_template_set: canonicalJson(orderedSetDescriptor("core:CandidateSourceTransitionTemplate", prepared.sourceTransitions)),
       record_closure_template_set: canonicalJson(orderedSetDescriptor("core:CandidateRecordClosureTemplate", prepared.recordClosures)),
       artifact_dependency_template_set: canonicalJson(orderedSetDescriptor("core:RecordArtifactDependency", prepared.recordDependencies)),
@@ -1351,6 +1497,7 @@ interface PreparedSeal {
   readonly recordClosures: SealedCandidateMaterialization["record_closures"];
   readonly identityAssignments: SealedCandidateMaterialization["identity_assignments"];
   readonly barrierKeys: ReadonlySet<string>;
+  readonly acceptedFactDeltaDigests: readonly string[];
 }
 
 export type { CandidatePlan, ProjectionWorkItem };

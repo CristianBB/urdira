@@ -3,6 +3,7 @@ import {
   DeterministicFakeWatcher,
   FreshnessBarrier,
   ParcelWatcherAdapter,
+  watcherOptionsForSourceProvider,
   ReconciliationCoordinator,
   type FreshnessBarrierPort,
   type FreshnessCheckpoint,
@@ -77,6 +78,20 @@ const directoryBinding: WatcherBinding = {
   ordering_domain: "binding:directory",
   root: "/repo",
 };
+
+describe("native watcher exclusions", () => {
+  it("keeps generated trees out of the FSEvents client queue and preserves Git metadata for Git worktrees", () => {
+    const directoryOptions = watcherOptionsForSourceProvider("core:directory_source_provider");
+    expect(directoryOptions.ignore).toEqual(expect.arrayContaining(["node_modules", "node_modules/**", "dist", "dist/**", ".git", ".git/**"]));
+    if (process.platform === "darwin") expect(directoryOptions.backend).toBe("kqueue");
+
+    const gitOptions = watcherOptionsForSourceProvider("core:git_worktree_source_provider");
+    expect(gitOptions.ignore).toEqual(expect.arrayContaining(["node_modules", "node_modules/**", "dist", "dist/**"]));
+    expect(gitOptions.ignore).not.toContain(".git");
+    expect(gitOptions.ignore).not.toContain(".git/**");
+    if (process.platform === "darwin") expect(gitOptions.backend).toBe("kqueue");
+  });
+});
 
 const gitBinding: WatcherBinding = {
   ...directoryBinding,

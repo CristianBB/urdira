@@ -13,13 +13,13 @@ describe("code explainability guardrails", () => {
     expect(coordinator.split("\n").length).toBeLessThan(80);
   });
 
-  it("keeps record-digest batching out of workspace scan orchestration", async () => {
+  it("keeps streamed record materialization out of workspace scan orchestration", async () => {
     const source = await readFile("packages/engine/src/workspace-indexing-session.ts", "utf8");
     const start = source.indexOf("export async function runFullWorkspaceScan");
     const end = source.indexOf("export async function runProgressiveWorkspaceScan", start);
     const coordinator = source.slice(start, end);
 
-    expect(coordinator).toContain("MaterializationRecordDigestPipeline.create()");
+    expect(coordinator).toContain("CandidateRecordTemplateAccumulator(");
     expect(coordinator).not.toContain(".digestRecords(");
   });
 });

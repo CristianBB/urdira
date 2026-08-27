@@ -401,7 +401,14 @@ function validatePipelineExpressionInternal(expression: QueryExpression): void {
     for (const dependency of dependencies.get(stageId) ?? []) visit(dependency);
   };
   for (const root of roots) visit(root);
-  if (reachable.size !== stages.size) invalid("core:stage_reference_invalid", "Every pipeline stage must contribute to a declared output; disconnected stages are forbidden.");
+  if (reachable.size !== stages.size) {
+    const disconnectedStageIds = [...stages.keys()].filter((stageId) => !reachable.has(stageId));
+    invalid(
+      "core:stage_reference_invalid",
+      `Every pipeline stage must contribute to a declared output; disconnected stages are forbidden (${disconnectedStageIds.join(", ")}). Declare an output from the disconnected stage or remove it from the pipeline.`,
+      { stage_id: disconnectedStageIds[0] },
+    );
+  }
   validatePipelineContract(expression);
 }
 

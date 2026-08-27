@@ -57,8 +57,8 @@ describe("current-state documentation", () => {
     const readme = await read("README.md");
     const release = await read("docs/release.md");
     expect(foundation).toContain("[Index pack](decisions/23-index-pack.md)");
-    expect(readme).toContain("expanded-typescript-agent-benchmark-results-2026-08-24.md");
-    expect(release).toContain("expanded-typescript-agent-benchmark-results-2026-08-24.md");
+    expect(readme).toContain("expanded-typescript-agent-benchmark-results-2026-08-27.md");
+    expect(release).toContain("expanded-typescript-agent-benchmark-results-2026-08-27.md");
   });
 
   it("publishes only current architecture decisions, without rejected drafts or implementation diaries", async () => {

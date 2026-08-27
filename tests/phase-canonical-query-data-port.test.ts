@@ -675,6 +675,25 @@ function sourceBundles(evaluation: { readonly streams: Readonly<Record<string, r
 }
 
 describe("CanonicalRecordQueryDataPort core:get_source", () => {
+  it("narrows a symbol selector by context_artifact even when no module container record is materialized", async () => {
+    const declarationA: CanonicalQueryRecord = {
+      ...stubRecord("rec-session-a", "artv-a", { path: "src/server/session.ts", name: "Session" }),
+      owner_artifact_id: "art-a",
+    };
+    const declarationB: CanonicalQueryRecord = {
+      ...stubRecord("rec-session-b", "artv-b", { path: "src/test/session.ts", name: "Session" }),
+      owner_artifact_id: "art-b",
+    };
+    const port = new CanonicalRecordQueryDataPort(stubPort({ records: async () => [declarationA, declarationB] }));
+    const evaluation = await port.execute({
+      operation_id: "core:get_source",
+      result_streams: ["sources"],
+      arguments: { subjects: [{ subject_type: "symbol", name: "Session", context_artifact: "src/server/session.ts" }], source: { mode: "signature", max_characters_per_snippet: 2000, max_total_characters: 2000, context_lines: 0 } },
+      scope,
+    });
+    expect(sourceBundles(evaluation).map((bundle) => (bundle.primary_result as { record_id: string }).record_id)).toEqual(["rec-session-a"]);
+  });
+
   it.each([
     { subject_type: "artifact", path: "src/a.ts" },
     { subject_type: "artifact", artifact_id: "art-1" },

@@ -46,6 +46,15 @@ interface PoolEntry<TDescriptor> {
   idle_timer: NodeJS.Timeout | undefined;
 }
 
+function workerIsUnusable(worker: WorkerTransport): boolean {
+  // The optional hook is deliberately outside the public worker protocol so
+  // existing plugin transports remain valid. The threaded JS/TS transport
+  // exposes it only for a terminal worker error; its in-process recovery path
+  // remains healthy and reusable.
+  const health = (worker as WorkerTransport & { readonly is_healthy?: () => boolean }).is_healthy;
+  return health !== undefined && health() === false;
+}
+
 /**
  * One live worker per key (today, `workspace_id`), reused across scans as
  * long as its descriptor digest stays the same. `acquire`/`release` bracket
@@ -87,7 +96,7 @@ export class AnalysisWorkerPool<TDescriptor> {
   acquire(key: string, descriptor: TDescriptor, descriptorDigest: string): WorkerTransport {
     const existing = this.entries.get(key);
     if (existing !== undefined) {
-      if (existing.descriptor_digest === descriptorDigest) {
+      if (!workerIsUnusable(existing.worker) && existing.descriptor_digest === descriptorDigest) {
         if (existing.in_use) throw new Error(`Analysis worker admission exhausted for ${key}: worker is already leased.`);
         this.clearIdleTimer(existing);
         existing.in_use = true;

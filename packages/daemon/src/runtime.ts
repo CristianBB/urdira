@@ -2,7 +2,7 @@ import { chmod, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, resolve } from "node:path";
-import { administrativeState, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
+import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
 import { runIndexPackExportInThread } from "./index-pack-export-thread.js";
@@ -457,6 +457,10 @@ function semanticMaterializationView(workspaceId: string, reconciled: ReconcileS
 // something diagnosable to persist and later surface via `core:index_status`.
 function scanFailureErrorCode(error: unknown): string {
   if (error && typeof error === "object" && "code" in error && typeof (error as { code: unknown }).code === "string") return (error as { code: string }).code;
+  if (error && typeof error === "object" && "provider_error" in error) {
+    const providerError = (error as { provider_error?: unknown }).provider_error;
+    if (providerError && typeof providerError === "object" && "error_code" in providerError && typeof (providerError as { error_code: unknown }).error_code === "string") return (providerError as { error_code: string }).error_code;
+  }
   return "core:workspace_scan_failed";
 }
 
@@ -537,6 +541,29 @@ function queryFreshnessWait(payload: unknown): { readonly requested: boolean; re
   return { requested, timeoutMs: typeof rawTimeout === "number" && Number.isSafeInteger(rawTimeout) && rawTimeout >= 0 ? rawTimeout : 0 };
 }
 
+/**
+ * Reads a query workspace from the registry with a short, bounded grace
+ * window. Registry replacements are synchronous, but workspace registration
+ * and query admission can arrive on adjacent IPC turns while a caller is
+ * copying the opaque id returned by `core:index_status`. In that interval a
+ * brand-new id may not yet be visible to the query turn even though the
+ * durable catalog and the next status turn already expose it. Removed
+ * tombstones fail immediately; only an id with no tombstone is treated as a
+ * possible registration race.
+ */
+async function findQueryWorkspace(workspaceId: string, registry: WorkspaceRegistry, signal?: AbortSignal): Promise<RegisteredWorkspace | undefined> {
+  const retryDelaysMs = [0, 10, 25, 50, 100] as const;
+  for (const delayMs of retryDelaysMs) {
+    const workspace = registry.get(workspaceId);
+    if (workspace !== undefined) return workspace;
+    if (registry.listIncludingRemoved().some((candidate) => candidate.workspace_id === workspaceId)) return undefined;
+    if (delayMs === 0) continue;
+    if (signal?.aborted) return undefined;
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, delayMs));
+  }
+  return registry.get(workspaceId);
+}
+
 function frontierForStructuralStage(stage: number): "source" | "syntax" | "structural" {
   return stage <= 0 ? "source" : stage === 1 ? "syntax" : "structural";
 }
@@ -545,8 +572,8 @@ function frontierForStructuralStage(stage: number): "source" | "syntax" | "struc
  * Waits on the same durable readiness state exposed by `core:index_status`.
  * The old query path converted `wait_for_current` into a fail-fast check,
  * which made an agent poll status and retry while a scan was already making
- * progress.  Polling is deliberately coarse (one bounded SQLite read per
- * 100ms) and cancellation-aware; it does not rerun a query or alter the
+ * progress. Polling uses bounded exponential backoff (250ms initially, up
+ * to one read per second) and is cancellation-aware; it does not rerun a query or alter the
  * published snapshot.  A timeout is a typed, closed error carrying the
  * pending workspace count required by the public error contract.
  */
@@ -564,10 +591,11 @@ async function waitForQueryFrontier(
   const started = Date.now();
   const deadline = Math.min(started + timeoutMs, absoluteDeadlineMs ?? Number.POSITIVE_INFINITY);
   let latest: WorkspaceReadiness | undefined;
+  let pollAttempt = 0;
   while (true) {
     if (signal.aborted) throw new DaemonError("core:operation_cancelled", "Freshness wait was cancelled.", { workspace_id: workspaceId, frontier });
-    const workspace = registry.get(workspaceId);
-    if (workspace === undefined) throw new DaemonError("core:workspace_not_found", `Workspace ${workspaceId} is not registered.`, { workspace_id: workspaceId });
+    const workspace = await findQueryWorkspace(workspaceId, registry, signal);
+    if (workspace === undefined) throw new DaemonError("core:workspace_not_found", `Workspace ${workspaceId} is not registered. Call urdira_index_status with the exact workspace_root and copy its query_scope.workspace_id byte-for-byte; never synthesize or shorten a workspace id.`, { workspace_id: workspaceId });
     latest = await workspaceReadiness(workspace, storage, semantic, scanInFlight.has(workspaceId));
     const scanRunning = scanInFlight.has(workspaceId);
     if (!scanRunning && frontierReady(latest, frontier) && workspace.last_scan_error === undefined) return latest;
@@ -592,7 +620,9 @@ async function waitForQueryFrontier(
       });
     }
     await new Promise<void>((resolve, reject) => {
-      const remaining = Math.max(1, Math.min(100, deadline - Date.now()));
+      const pollDelayMs = Math.min(1_000, 250 * 2 ** Math.min(pollAttempt, 2));
+      pollAttempt += 1;
+      const remaining = Math.max(1, Math.min(pollDelayMs, deadline - Date.now()));
       let settled = false;
       const timer = setTimeout(() => { settled = true; signal.removeEventListener("abort", cancel); resolve(); }, remaining);
       const cancel = (): void => {
@@ -1167,12 +1197,12 @@ function enforceWarmRecordsBudget(cache: ReadonlyMap<string, CachedWorkspaceQuer
 }
 
 async function acquireWorkspaceQueryEngine(workspaceId: string, registry: WorkspaceRegistry, storage: DurableStorage, cursorCache: CursorCache, cache: Map<string, CachedWorkspaceQueryEngine>, interner: RecordBodyInterner, lru: WarmRecordsLru, semanticProvider?: ResolvedSemanticProvider, allowSourceBinding = false): Promise<CachedWorkspaceQueryEngine> {
-  const sourceWorkspace = allowSourceBinding ? registry.get(workspaceId) : undefined;
-  const registeredWorkspace = registry.get(workspaceId);
+  const registeredWorkspace = await findQueryWorkspace(workspaceId, registry);
+  const sourceWorkspace = allowSourceBinding ? registeredWorkspace : undefined;
   const resolution = registeredWorkspace !== undefined && registeredWorkspace.status !== "removed"
     ? { workspace_id: workspaceId }
     : { error: { code: "core:workspace_not_found" as const, details: { workspace_id: workspaceId } } };
-  if ("error" in resolution) throw new DaemonError(resolution.error.code, "The requested query workspace is unavailable.", resolution.error.details);
+  if ("error" in resolution) throw new DaemonError(resolution.error.code, `The requested query workspace ${workspaceId} is unavailable. Call urdira_index_status with the exact workspace_root and copy query_scope.workspace_id byte-for-byte; never synthesize or shorten a workspace id.`, resolution.error.details);
   const cached = cache.get(resolution.workspace_id);
   if (cached) { touchWarmLru(lru, resolution.workspace_id); return cached; }
   const database = await storage.openWorkspace(resolution.workspace_id);
@@ -1279,7 +1309,7 @@ async function startWorkspaceWatcher(manager: WorkspaceWatcherManager, workspace
         // is the real backstop if re-arming itself keeps failing.
         root,
         case_sensitive: process.platform !== "win32",
-      }, { on_error: (error: Error) => console.error(`[urdira] watcher error for workspace ${workspace.workspace_id} (${workspace.display_root}):`, error) }),
+      }, { watcher_options: watcherOptionsForSourceProvider(workspace.provider.source_provider), on_error: (error: Error) => console.error(`[urdira] watcher error for workspace ${workspace.workspace_id} (${workspace.display_root}):`, error) }),
     });
   } catch {
     // A missing or temporarily unavailable root is reconciled on the next
@@ -1322,6 +1352,25 @@ function pluginStatusForWorkspace(workspace: RegisteredWorkspace, catalog: reado
 }
 
 /**
+ * Makes the durable workspace registration visible before an indexing
+ * operation is exposed through the in-memory registry. `core:workspace_add`
+ * publishes `indexing` immediately and the readiness poll starts as soon as
+ * that response is received; leaving catalog/database creation to the first
+ * background scan therefore creates a real `storage:workspace_not_found`
+ * window between those two events.
+ */
+async function ensureWorkspaceCatalogRegistration(workspace: RegisteredWorkspace, storage: DurableStorage): Promise<void> {
+  await storage.catalog.registerWorkspace({
+    workspace_id: workspace.workspace_id,
+    canonical_root: workspace.canonical_root,
+    display_root: workspace.display_root,
+    source_provider_bindings: [workspace.provider],
+    status: "registered",
+    registered_at: workspace.registered_at,
+  });
+}
+
+/**
  * Opens a `WorkspaceDatabase` handle for one bounded administrative call
  * (`core:repair`, `core:garbage_collect`), registering the workspace in the
  * durable-storage catalog first -- mirroring `scheduleWorkspaceScan`'s own
@@ -1339,14 +1388,7 @@ function pluginStatusForWorkspace(workspace: RegisteredWorkspace, catalog: reado
  * (see `InstallationCatalog.acquireWorkspaceLease` in `packages/storage/src/storage.ts`).
  */
 async function withWorkspaceDatabase<T>(workspace: RegisteredWorkspace, storage: DurableStorage, run: (database: WorkspaceDatabase) => Promise<T>): Promise<T> {
-  await storage.catalog.registerWorkspace({
-    workspace_id: workspace.workspace_id,
-    canonical_root: workspace.canonical_root,
-    display_root: workspace.display_root,
-    source_provider_bindings: [workspace.provider],
-    status: "registered",
-    registered_at: workspace.registered_at,
-  });
+  await ensureWorkspaceCatalogRegistration(workspace, storage);
   const database = await storage.openWorkspace(workspace.workspace_id);
   try { return await run(database); }
   finally { await database.close().catch(() => undefined); }
@@ -1356,6 +1398,15 @@ function selectionHasCompatiblePlugin(technologies: readonly string[], plugins: 
   return technologies.every((technology) => {
     const compatible = catalog.filter((plugin) => plugin.verified && plugin.language_ids.includes(technology));
     return compatible.length === 0 || compatible.some((plugin) => plugins.includes(plugin.plugin_id));
+  });
+}
+
+function hasPotentialWorkspaceForkDonor(workspace: RegisteredWorkspace, registry: WorkspaceRegistry): boolean {
+  const selection = [...(workspace.selected_plugin_ids ?? [])].sort();
+  return registry.list().some((candidate) => {
+    if (candidate.workspace_id === workspace.workspace_id || candidate.status !== "ready") return false;
+    const candidateSelection = [...(candidate.selected_plugin_ids ?? [])].sort();
+    return candidateSelection.length === selection.length && candidateSelection.every((pluginId, index) => pluginId === selection[index]);
   });
 }
 
@@ -1624,8 +1675,8 @@ export class DaemonRuntime {
        */
       // Guards against two scans of the SAME workspace running concurrently.
       // `scheduleWorkspaceScan` can be invoked multiple times in quick
-      // succession for one workspace (e.g. two rapid watcher reconcile
-      // events, or a watcher event racing an explicit `core:reindex`); with
+      // succession for one workspace (e.g. several watcher batches for one
+      // edit, or a watcher event racing an explicit `core:reindex`); with
       // `pool_concurrency.structural` now configurable above 1 (see
       // `URDIRA_STRUCTURAL_CONCURRENCY` in `apps/urdira`), the scheduler can
       // genuinely run two "structural" jobs at once, and nothing else in
@@ -1636,21 +1687,17 @@ export class DaemonRuntime {
       // concurrent candidate generations racing the same source index and
       // publication tables). This set is checked and updated synchronously
       // around `scheduler.submit`, so it closes the race even though the
-      // scheduler may not start the job immediately. A request that arrives
-      // while a scan is already in flight is simply dropped (not queued for
-      // an immediate follow-up scan): the in-flight scan already reads
-      // current on-disk state, and any change that lands after that read but
-      // before this guard would have dropped the request anyway is picked up
-      // by the next reconciliation trigger, consistent with the bounded
-      // (not instant) freshness the rest of this file already accepts
-      // elsewhere (e.g. crash recovery's full-rescan retry, above).
+      // scheduler may not start the job immediately. Requests arriving while
+      // a scan is running are coalesced below and run once after it settles.
+      // They deliberately do not abort the active scan: on macOS kqueue can
+      // report one directory edit as several path events, and aborting at
+      // every event can tear down a TypeScript worker during publication.
       const scanInFlight = new Set<string>();
       // Local administrative presentation only. Public query/MCP responses
       // retain the existing workspace lifecycle contract; the web interface
       // uses this transient detail to distinguish a periodic equivalence
       // check from a scan triggered by a real change or explicit reindex.
       const scanActivities = new Map<string, WorkspaceIndexingActivity>();
-      const scanControllers = new Map<string, AbortController>();
       const scanGenerations = new Map<string, number>();
       // Tracks the currently in-flight THREADED lexical maintenance run (if
       // any) per workspace -- `submitLexicalMaintenance` below adds an entry
@@ -1743,34 +1790,20 @@ export class DaemonRuntime {
           }
           for (const event of authoritativeDeletes) pending.authoritativeDeletes.set(event.normalized_uri, event);
           pendingScans.set(workspaceId, pending);
-          // A concrete changed-path generation supersedes work that has not
-          // reached publication. Periodic/full reconciliation hints are not
-          // cancellation signals: aborting those on every sweep tick would
-          // starve a workspace whose sweep interval is shorter than a scan.
-          // Keep an authoritative-delete scan alive so its tombstone can be
-          // published before a queued successor presence.
-          //
-          // Deliberately `has_completed_first_scan`, not `current_snapshot_id
-          // === undefined`: a large first checkout (tens of thousands of
-          // files) delivers its own creation events to the watcher in many
-          // chunks over many seconds, sometimes well after the workspace's
-          // first structural stage has already progressively published (which
-          // sets `current_snapshot_id` while `status` is still `"indexing"`).
-          // Reading `current_snapshot_id` here would let a later chunk of that
-          // SAME checkout's own backlog masquerade as a real edit and abort
-          // stage 2+ of the very scan it belongs to -- repeatedly, since each
-          // retry republishes stage 1 and races the next backlog chunk again,
-          // sometimes for longer than a scan takes to finish. Gating on
-          // "has any scan for this workspace EVER reached ready/degraded"
-          // instead keeps the whole first scan protected regardless of how
-          // many intermediate stages it progressively publishes along the way.
-          const initialScan = !(registry.get(workspaceId)?.has_completed_first_scan);
-          if (changedUris !== undefined && changedUris.length > 0 && !initialScan && pending.authoritativeDeletes.size === 0 && !activeAuthoritativeDeletePhases.has(workspaceId)) scanControllers.get(workspaceId)?.abort();
+          // All pending changes are coalesced into a follow-up scan. The
+          // active scan is never aborted: kqueue can report one edit as
+          // several path events, and tearing down the active worker for each
+          // event can fail during stage publication.
+          // Do not abort the active scan here. macOS kqueue can report one
+          // directory edit as several path events; aborting at every event
+          // tears down TypeScript workers while they publish stage 1 and can
+          // produce `spawn EBADF` plus SQLite generation-check failures.
+          // The pending request is already coalesced above and will run once
+          // after this scan settles.
           return;
         }
         scanInFlight.add(workspaceId);
         const scanController = new AbortController();
-        scanControllers.set(workspaceId, scanController);
         const scanGeneration = (scanGenerations.get(workspaceId) ?? 0) + 1;
         scanGenerations.set(workspaceId, scanGeneration);
         const requestedUris = changedUris === undefined ? undefined : [...new Set(changedUris)];
@@ -1791,15 +1824,15 @@ export class DaemonRuntime {
             pool: "structural",
             run: async () => {
               try {
-                let workspace = registry.get(workspaceId);
+                const workspace = registry.get(workspaceId);
                 if (!workspace || workspace.status !== "indexing") return undefined;
-                const administration = await administrativeState(workspace.canonical_root, ISOMORPHIC_GIT_OBJECT_PORT, () => new Date().toISOString()).catch(() => undefined);
-                if (administration !== undefined) {
-                  workspace = registry.updateAdministrativeMetadata(workspaceId, {
-                    vcs_state: JSON.stringify(administration.vcs_state),
-                    project_name: workspace.project_name ?? projectNameForGitRoot(workspace.canonical_root, administration),
-                  });
-                }
+                // Do not run `administrativeState` here. It verifies the
+                // complete Git worktree by reading and hashing every tracked
+                // file, which is disproportionate on a large repository and
+                // needlessly delays the first source scan. The source
+                // provider performs the authoritative before/after
+                // administrative checks around the actual capture; this
+                // pre-scan presentation refresh is not part of correctness.
                 const priorSnapshotId = workspace.current_snapshot_id;
                 let database: WorkspaceDatabase | undefined;
                 try {
@@ -1823,7 +1856,7 @@ export class DaemonRuntime {
                       root: workspace.canonical_root,
                       database,
                       workspace_id: workspaceId,
-                      inclusion_rules: { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false },
+                      inclusion_rules: DEFAULT_WORKSPACE_INCLUSION,
                       ...(options.scan_budget === undefined ? {} : { scan_budget: options.scan_budget }),
                       ...(options.scan_io_concurrency === undefined ? {} : { io_concurrency: options.scan_io_concurrency }),
                       ...(requestedUris === undefined ? {} : { changed_uris: requestedUris }),
@@ -1847,7 +1880,7 @@ export class DaemonRuntime {
                   // cataloged, and republishes an equivalent generation).
                   // `URDIRA_WORKSPACE_FORK=0` (kill switch, default ON) disables
                   // this entirely -- see `DaemonRuntimeOptions.workspace_fork`.
-                  if (priorSnapshotId === undefined && options.workspace_fork !== false) {
+                  if (priorSnapshotId === undefined && options.workspace_fork !== false && hasPotentialWorkspaceForkDonor(workspace, registry)) {
                     try {
                       const forkOutcome = await attemptWorkspaceFork({ workspace, database, storage: durableStorage, registry, plugin, ...(options.workspace_fork_verify === undefined ? {} : { verify_mode: options.workspace_fork_verify }) });
                       if (forkOutcome.status === "forked") {
@@ -1896,7 +1929,7 @@ export class DaemonRuntime {
                     database,
                     workspace_id: workspaceId,
                     plugin,
-                      inclusion_rules: { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false },
+                      inclusion_rules: DEFAULT_WORKSPACE_INCLUSION,
                     ...(options.scan_budget === undefined ? {} : { scan_budget: options.scan_budget }),
                     ...(options.scan_io_concurrency === undefined ? {} : { io_concurrency: options.scan_io_concurrency }),
                     ...(requestedUris === undefined ? {} : { changed_uris: requestedUris }),
@@ -1937,6 +1970,27 @@ export class DaemonRuntime {
                     console.error(`[urdira] workspace scan superseded for ${workspaceId}`);
                     return undefined;
                   }
+                  const failureCode = scanFailureErrorCode(error);
+                  // A watcher can legitimately deliver an edit while the
+                  // source provider is streaming the same file. The provider
+                  // rejects that mixed generation with a retryable
+                  // `core:source_changed`; this is not an indexing failure and
+                  // must not pin the workspace to a stale degraded snapshot.
+                  // Queue one full successor after the current scan settles so
+                  // the next capture observes a stable occurrence. The normal
+                  // pending-scan coalescer guarantees that several edits still
+                  // become one follow-up scan.
+                  if (failureCode === "core:source_changed") {
+                    console.warn(`[urdira] workspace scan deferred for ${workspaceId}: source changed during capture; retrying`);
+                    pendingScans.set(workspaceId, {
+                      full: true,
+                      uris: new Set(),
+                      authoritativeDeletes: new Map(),
+                      presencesAfterDeletes: new Set(),
+                      activity: "indexing",
+                    });
+                    return undefined;
+                  }
                   // A first-ever scan failure leaves the workspace "indexing" with
                   // no visible failure state, so the error must at least reach
                   // stderr or the failure is completely undiagnosable.
@@ -1961,7 +2015,6 @@ export class DaemonRuntime {
                 return undefined;
               } finally {
                 scanInFlight.delete(workspaceId);
-                if (scanControllers.get(workspaceId) === scanController) scanControllers.delete(workspaceId);
                 activeAuthoritativeDeletePhases.delete(workspaceId);
                 // Run exactly one coalesced follow-up scan for every hint that
                 // arrived while this scan was in flight, instead of dropping
@@ -2465,6 +2518,13 @@ export class DaemonRuntime {
             // call) becomes this response's own `semantic_model` field below,
             // so a caller-triggered download is never silent (docs/decisions/18).
             const semanticModel = await ensureAndActivateSemanticProvider();
+            // The readiness poll can start immediately after this response is
+            // sent. Ensure the durable catalog/database exists before making
+            // the in-memory workspace observable as an active indexing
+            // operation; otherwise `workspaceReadiness` can legitimately see
+            // `storage:workspace_not_found` while the background scan is still
+            // performing this same registration.
+            if (confirmed && indexingStorage !== undefined) await ensureWorkspaceCatalogRegistration(existing, indexingStorage);
             if (confirmed && existing.status !== "indexing" && existing.status !== "ready" && existing.status !== "degraded") { options.workspace_registry.beginReconciliation(existing.workspace_id); scheduleWorkspaceScan(existing.workspace_id); }
             const current = options.workspace_registry.get(existing.workspace_id) ?? existing;
             if (watcherManager && confirmed) await startWorkspaceWatcher(watcherManager, current);
@@ -2486,8 +2546,6 @@ export class DaemonRuntime {
           // Same configure-time provisioning as the existing-workspace branch
           // above -- see its comment.
           const semanticModel = await ensureAndActivateSemanticProvider();
-          const administration = await administrativeState(root, ISOMORPHIC_GIT_OBJECT_PORT, () => new Date().toISOString()).catch(() => undefined);
-          const vcsState = administration === undefined ? undefined : JSON.stringify(administration.vcs_state);
           const workspace = options.workspace_registry.register({
             display_root: root,
             provider: {
@@ -2506,8 +2564,11 @@ export class DaemonRuntime {
             },
             selected_technology_ids: selectedTechnologyIds,
             selected_plugin_ids: selectedPluginIds,
-            project_name: projectNameForGitRoot(root, administration),
-            ...(vcsState === undefined ? {} : { vcs_state: vcsState }),
+            // Workspace registration must stay O(1) with respect to the
+            // repository contents. `administrativeState` performs a full
+            // tracked-file byte comparison and belongs to explicit
+            // administrative inspection, not the first-index admission path.
+            project_name: projectNameForGitRoot(root, undefined),
           });
           // Index pack import (docs/decisions/23-index-pack.md): registered
           // BEFORE `scheduleWorkspaceScan` below so the scan hook's
@@ -2517,6 +2578,12 @@ export class DaemonRuntime {
           // every other free-form workspace-add option flows through.
           const indexPackPath = typeof requestRecord(requestPayload["values"])["index-pack"] === "string" ? requestRecord(requestPayload["values"])["index-pack"] as string : undefined;
           if (indexPackPath !== undefined) pendingIndexPackPaths.set(workspace.workspace_id, indexPackPath);
+          // Complete the durable registration before exposing the confirmed
+          // workspace to readiness polling and before scheduling its first
+          // scan. The scan repeats this idempotently as a recovery guard, but
+          // it must not be the first point at which the catalog becomes
+          // visible.
+          if (confirmed && indexingStorage !== undefined) await ensureWorkspaceCatalogRegistration(workspace, indexingStorage);
           const active = confirmed ? options.workspace_registry.beginReconciliation(workspace.workspace_id).workspace : workspace;
           if (confirmed) scheduleWorkspaceScan(active.workspace_id);
           if (watcherManager && confirmed) await startWorkspaceWatcher(watcherManager, active);

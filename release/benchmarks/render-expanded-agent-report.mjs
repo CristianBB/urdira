@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -37,6 +37,15 @@ const metricsFor = (manifest) => {
   try { events = readFileSync(manifest.transcript, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch { return undefined; }
   const completed = events.filter((event) => event.type === "item.completed");
   const mcpCalls = completed.filter((event) => event.item?.type === "mcp_tool_call");
+  const mcpFailureDetails = mcpCalls.filter((event) => event.item?.status === "failed").map((event) => {
+    const text = (event.item?.result?.content ?? [])
+      .filter((item) => item?.type === "text")
+      .map((item) => String(item.text ?? ""))
+      .join(" ")
+      .replaceAll(/\s+/gu, " ")
+      .trim();
+    return sanitizeText(`${event.item?.tool ?? "mcp_tool"}: ${text || "MCP call failed without a response body."}`).slice(0, 1000);
+  });
   const discoveryMcpCalls = mcpCalls.filter((event) => event.item?.tool !== "urdira_index_status");
   const discoveryRequest = (event) => event.item?.arguments?.query ?? event.item?.arguments ?? {};
   const discoveryResultText = (event) => (event.item?.result?.content ?? [])
@@ -90,7 +99,10 @@ const metricsFor = (manifest) => {
     core_coverage_incomplete: mcpCalls.filter((event) => JSON.stringify(event).includes("core:coverage_incomplete")).length,
     request_validation_failures: mcpCalls.filter((event) => {
       const encoded = JSON.stringify(event);
-      return encoded.includes("Input validation error") || encoded.includes("requires expression");
+      return encoded.includes("Input validation error")
+        || encoded.includes("requires expression")
+        || encoded.includes("core:request_invalid")
+        || encoded.includes("core:request_validation_failed");
     }).length,
     file_change_batches: completed.filter((event) => event.item?.type === "file_change").length,
     input_tokens: input,
@@ -100,6 +112,7 @@ const metricsFor = (manifest) => {
     reasoning_tokens: reasoning,
     total_tokens: input + output + reasoning,
     estimated_cost_usd: (input * rateCard.input + output * rateCard.output + reasoning * rateCard.reasoning) / 1_000_000,
+    mcp_failure_details: mcpFailureDetails,
   };
 };
 const hostEvidenceFor = (manifest) => {
@@ -149,6 +162,22 @@ const hostEvidenceFor = (manifest) => {
   }
   return { ...(manifest.host_metrics ?? {}), stage_timings, analysis_timings, byte_telemetry, readiness_events, ready_elapsed_ms, bytes_read: totals.read || null, bytes_transferred: totals.transferred || null, bytes_copied: totals.copied || null, bytes_decoded: totals.decoded || null, bytes_retained: totals.retained || null };
 };
+const graderFailureDetails = (manifest) => {
+  const evidence = manifest?.correctness?.evidence;
+  if (manifest?.completed_successfully !== false || !evidence) return null;
+  const details = [];
+  if (evidence.changed_paths === false) details.push("grader rejected changed_paths=false");
+  if (evidence.focused_test_changed === false) details.push("grader rejected focused_test_changed=false");
+  const missingPatterns = Object.entries(evidence.required_patterns ?? {})
+    .filter(([, present]) => !present)
+    .map(([pattern]) => pattern);
+  if (missingPatterns.length > 0) details.push(`missing required implementation evidence: ${missingPatterns.join(", ")}`);
+  if (evidence.fallback_shell === true) details.push("native source fallback was used (fallback_shell=true)");
+  if (evidence.discovery_status && evidence.discovery_status !== "urdira-completed") {
+    details.push(`discovery_status=${evidence.discovery_status}`);
+  }
+  return details.length > 0 ? details.join("; ") : "grader rejected the correctness evidence";
+};
 const freshRuns = audit.runs.map((entry) => {
   const manifest = entry.manifest;
   const rawEvidence = manifest?.correctness?.evidence;
@@ -161,14 +190,25 @@ const freshRuns = audit.runs.map((entry) => {
     run_id: entry.run_id,
     repository: entry.repository,
     task: entry.task,
+    scenario: entry.scenario ?? manifest?.scenario ?? null,
+    size_tier: entry.size_tier ?? manifest?.size_tier ?? null,
     arm: entry.arm,
     sample: entry.sample,
     order_index: entry.order_index,
     process_exit_code: entry.exit_code,
     process_completed_successfully: manifest?.completed_successfully === true,
-    completed_successfully: manifest?.completed_successfully === true || (manifest?.exit_code === 0 && evidencePass),
+    // New manifests carry the runner's authoritative outcome, which includes
+    // the repository grader result. Do not turn an agent process exit of zero
+    // into a successful benchmark when the grader rejected the cell (for
+    // example after an MCP request-validation failure). Keep the evidence
+    // fallback only for older manifests that predate this field.
+    completed_successfully: typeof manifest?.completed_successfully === "boolean"
+      ? manifest.completed_successfully
+      : (manifest?.exit_code === 0 && evidencePass),
     setup_elapsed_ms: manifest?.setup_elapsed_ms ?? null,
     elapsed_ms_from_first_instruction: manifest?.elapsed_ms_from_first_instruction ?? null,
+    incremental_protocol: manifest?.incremental_protocol ?? null,
+    cleanup: entry.cleanup ?? null,
     metrics: metricsFor(manifest),
     host_metrics: hostEvidenceFor(manifest),
     correctness: manifest?.correctness?.evidence ?? null,
@@ -180,7 +220,9 @@ const freshRuns = audit.runs.map((entry) => {
       semantic_index: manifest.setup.semantic_index ?? null,
       readiness: manifest.setup.readiness ?? null,
     } : null,
-    failure: manifest?.error || entry.stderr_tail ? sanitizeText(manifest?.error ?? entry.stderr_tail) : null,
+    failure: manifest?.error || entry.stderr_tail
+      ? sanitizeText(manifest?.error ?? entry.stderr_tail)
+      : (metricsFor(manifest)?.mcp_failure_details?.join("; ") ?? graderFailureDetails(manifest)),
   };
 });
 const reusedRuns = comparisonReport?.runs?.filter((run) => run.arm !== "urdira-typescript") ?? [];
@@ -192,7 +234,10 @@ const runs = [...reusedRuns, ...freshRuns].sort((left, right) =>
   (repositoryOrder.get(left.repository) ?? Number.MAX_SAFE_INTEGER) - (repositoryOrder.get(right.repository) ?? Number.MAX_SAFE_INTEGER)
   || (taskOrder.get(`${left.repository}:${left.task}`) ?? Number.MAX_SAFE_INTEGER) - (taskOrder.get(`${right.repository}:${right.task}`) ?? Number.MAX_SAFE_INTEGER)
   || armOrder.indexOf(left.arm) - armOrder.indexOf(right.arm));
-const expectedRuns = Number(audit.expected_runs ?? freshRuns.length) + reusedRuns.length;
+const corpusExpectedRuns = Array.isArray(audit.repositories)
+  ? audit.repositories.reduce((total, repository) => total + (repository.tasks?.length ?? 0), 0) * (audit.arms?.length ?? 0) * Number(audit.samples_per_cell ?? 1)
+  : freshRuns.length;
+const expectedRuns = Number(audit.expected_runs ?? corpusExpectedRuns) + reusedRuns.length;
 const successfulRuns = runs.filter((run) => run.completed_successfully).length;
 const benchmarkAudit = comparisonReport ? {
   ...audit,
@@ -234,26 +279,48 @@ const summaries = Object.fromEntries(Object.entries(groups).map(([key, rows]) =>
     request_validation_failures: { median: percentile(numeric("request_validation_failures"), 0.5), mean: mean(numeric("request_validation_failures")) },
   }];
 }));
+const taskMetadata = new Map(runs.filter((run) => run.scenario || run.size_tier).map((run) => [run.task, { scenario: run.scenario ?? null, size_tier: run.size_tier ?? null }]));
 const report = {
   report_version: 1,
   generated_at: new Date().toISOString(),
   benchmark: { ...benchmarkAudit, runs: undefined, output_dir: undefined, corpus: "release/benchmarks/expanded-typescript-agent-benchmark.json" },
   price_card_usd_per_million_tokens: rateCard,
-  source_audit: { sha256: `sha256:${createHash("sha256").update(auditText).digest("hex")}`, raw_evidence: "Raw transcripts and host logs remain outside the repository; this report contains their derived metrics and grader evidence." },
-  ...(comparisonReport ? { reused_comparison: { report: relative(root, resolve(comparisonReportPath)), source_audit: comparisonReport.source_audit ?? null } } : {}),
+  source_audit: { sha256: `sha256:${createHash("sha256").update(auditText).digest("hex")}`, raw_evidence: "Raw transcripts and host logs were generated outside the repository, used to derive this report, and removed after extraction; the report retains derived metrics and grader evidence." },
+  ...(comparisonReport ? { reused_comparison: { report: `external-temporary:${basename(resolve(comparisonReportPath))}`, source_audit: comparisonReport.source_audit ?? null } } : {}),
   groups: summaries,
   runs,
+  task_comparisons: runs.map((run) => ({
+    repository: run.repository,
+    size_tier: run.size_tier ?? taskMetadata.get(run.task)?.size_tier ?? null,
+    scenario: run.scenario ?? taskMetadata.get(run.task)?.scenario ?? null,
+    task: run.task,
+    arm: run.arm,
+    completed_successfully: run.completed_successfully,
+    setup_elapsed_ms: run.setup_elapsed_ms ?? null,
+    agent_elapsed_ms: run.elapsed_ms_from_first_instruction ?? null,
+    total_elapsed_ms: Number.isFinite(run.setup_elapsed_ms) && Number.isFinite(run.elapsed_ms_from_first_instruction)
+      ? run.setup_elapsed_ms + run.elapsed_ms_from_first_instruction
+      : null,
+    input_tokens: run.metrics?.input_tokens ?? null,
+    output_tokens: run.metrics?.output_tokens ?? null,
+    reasoning_tokens: run.metrics?.reasoning_tokens ?? null,
+    total_tokens: run.metrics?.total_tokens ?? null,
+    estimated_cost_usd: run.metrics?.estimated_cost_usd ?? null,
+    outer_turns: run.metrics?.outer_turns ?? null,
+    mcp_calls: run.metrics?.mcp_calls ?? null,
+    readiness_ms: run.host_metrics?.ready_elapsed_ms ?? null,
+    peak_rss_kib: run.host_metrics?.peak_rss_kib ?? null,
+  })),
   campaign_gate: { expected_runs: expectedRuns, observed_runs: runs.length, successful_runs: successfulRuns, failed_or_blocked_runs: runs.length - successfulRuns, passed: runs.length === expectedRuns && runs.every((run) => run.completed_successfully), independent_campaigns: independentCampaigns, p95_eligible: p95Eligible },
 };
-const compactRuns = runs.map((run) => `| ${run.repository} | ${run.task} | ${run.arm} | ${run.completed_successfully ? "yes" : "no"} | ${run.metrics?.total_tokens?.toLocaleString("en-US") ?? "—"} | ${run.metrics?.estimated_cost_usd?.toFixed(4) ?? "—"} | ${run.metrics?.outer_turns ?? "—"} | ${run.metrics?.mcp_calls ?? "—"} | ${run.metrics?.mcp_failed_calls ?? "—"} | ${run.metrics?.mcp_discovery_calls === undefined ? "—" : `${run.metrics.mcp_discovery_successful_calls}/${run.metrics.mcp_discovery_calls}`} | ${run.metrics?.mcp_selector_ambiguous_calls ?? "—"} | ${run.metrics?.mcp_unexpected_failed_calls ?? "—"} | ${run.metrics?.mcp_useful_discovery_calls ?? "—"} | ${run.correctness?.fallback_shell === false ? "no" : run.correctness?.fallback_shell === true ? "yes" : "—"} | ${run.metrics?.core_ipc_timeouts ?? "—"} | ${run.setup_elapsed_ms ?? "—"} | ${run.elapsed_ms_from_first_instruction ?? "—"} | ${run.host_metrics?.peak_rss_kib ?? "—"} | ${run.host_metrics?.mean_cpu_percent?.toFixed?.(1) ?? "—"} | ${run.host_metrics?.sqlite_bytes ?? "—"} | ${run.host_metrics?.cas_bytes ?? "—"} | ${run.host_metrics?.bytes_copied ?? "—"} | ${run.host_metrics?.bytes_transferred ?? "—"} | ${run.host_metrics?.bytes_decoded ?? "—"} |`);
-const armSummaries = armOrder.filter((arm) => runs.some((run) => run.arm === arm)).map((arm) => {
-  const rows = runs.filter((run) => run.arm === arm);
-  const metric = (field) => percentile(rows.map((run) => Number(run.metrics?.[field] ?? NaN)), 0.5);
-  const discoveryRows = rows.filter((run) => Number.isFinite(run.metrics?.mcp_discovery_calls));
-  const discoveryCalls = discoveryRows.reduce((sum, run) => sum + run.metrics.mcp_discovery_calls, 0);
-  const successfulDiscoveryCalls = discoveryRows.reduce((sum, run) => sum + run.metrics.mcp_discovery_successful_calls, 0);
-  const totalMs = percentile(rows.map((run) => Number(run.setup_elapsed_ms ?? NaN) + Number(run.elapsed_ms_from_first_instruction ?? NaN)), 0.5);
-  return `| ${arm} | ${rows.filter((run) => run.completed_successfully).length}/${rows.length} | ${percentile(rows.map((run) => Number(run.setup_elapsed_ms ?? NaN)), 0.5) ?? "—"} | ${percentile(rows.map((run) => Number(run.elapsed_ms_from_first_instruction ?? NaN)), 0.5) ?? "—"} | ${totalMs ?? "—"} | ${metric("total_tokens")?.toLocaleString("en-US") ?? "—"} | ${metric("estimated_cost_usd")?.toFixed(4) ?? "—"} | ${metric("mcp_calls") ?? "—"} | ${metric("mcp_failed_calls") ?? "—"} | ${discoveryRows.length ? `${successfulDiscoveryCalls}/${discoveryCalls}` : "—"} |`;
+const compactRuns = runs.map((run) => `| ${run.repository} | ${run.size_tier ?? "—"} | ${run.scenario ?? "—"} | ${run.task} | ${run.arm} | ${run.completed_successfully ? "yes" : "no"} | ${run.metrics?.input_tokens?.toLocaleString("en-US") ?? "—"} | ${run.metrics?.output_tokens?.toLocaleString("en-US") ?? "—"} | ${run.metrics?.reasoning_tokens?.toLocaleString("en-US") ?? "—"} | ${run.metrics?.total_tokens?.toLocaleString("en-US") ?? "—"} | ${run.metrics?.estimated_cost_usd?.toFixed(4) ?? "—"} | ${run.metrics?.outer_turns ?? "—"} | ${run.metrics?.mcp_calls ?? "—"} | ${run.metrics?.mcp_failed_calls ?? "—"} | ${run.metrics?.mcp_discovery_calls === undefined ? "—" : `${run.metrics.mcp_discovery_successful_calls}/${run.metrics.mcp_discovery_calls}`} | ${run.metrics?.mcp_selector_ambiguous_calls ?? "—"} | ${run.metrics?.mcp_unexpected_failed_calls ?? "—"} | ${run.metrics?.mcp_useful_discovery_calls ?? "—"} | ${run.correctness?.fallback_shell === false ? "no" : run.correctness?.fallback_shell === true ? "yes" : "—"} | ${run.metrics?.core_ipc_timeouts ?? "—"} | ${run.setup_elapsed_ms ?? "—"} | ${run.elapsed_ms_from_first_instruction ?? "—"} | ${run.host_metrics?.peak_rss_kib ?? "—"} | ${run.host_metrics?.mean_cpu_percent?.toFixed?.(1) ?? "—"} | ${run.host_metrics?.sqlite_bytes ?? "—"} | ${run.host_metrics?.cas_bytes ?? "—"} | ${run.host_metrics?.bytes_copied ?? "—"} | ${run.host_metrics?.bytes_transferred ?? "—"} | ${run.host_metrics?.bytes_decoded ?? "—"} | ${run.cleanup?.errors?.length === 0 ? "yes" : run.cleanup ? "no" : "—"} |`);
+const taskComparisonRows = runs.map((run) => {
+  const number = (value, digits = 0) => value == null ? "—" : Number(value).toLocaleString("en-US", digits ? { minimumFractionDigits: digits, maximumFractionDigits: digits } : undefined);
+  const metadata = taskMetadata.get(run.task) ?? {};
+  const totalElapsed = Number.isFinite(run.setup_elapsed_ms) && Number.isFinite(run.elapsed_ms_from_first_instruction)
+    ? run.setup_elapsed_ms + run.elapsed_ms_from_first_instruction
+    : null;
+  return `| ${run.repository} | ${run.task} | ${run.scenario ?? metadata.scenario ?? "—"} | ${run.arm} | ${run.completed_successfully ? "yes" : "no"} | ${number(run.setup_elapsed_ms)} | ${number(run.elapsed_ms_from_first_instruction)} | ${number(totalElapsed)} | ${number(run.metrics?.input_tokens)} | ${number(run.metrics?.output_tokens)} | ${number(run.metrics?.reasoning_tokens)} | ${number(run.metrics?.estimated_cost_usd, 4)} | ${number(run.metrics?.outer_turns)} | ${number(run.metrics?.mcp_calls)} | ${number(run.host_metrics?.ready_elapsed_ms)} | ${number(run.host_metrics?.peak_rss_kib)} |`;
 });
 const urdiraRuns = runs.filter((run) => run.arm === "urdira-typescript");
 const urdiraDiscoveryCalls = urdiraRuns.reduce((sum, run) => sum + Number(run.metrics?.mcp_discovery_calls ?? 0), 0);
@@ -285,6 +352,8 @@ const readinessRuns = runs.filter((run) => run.host_metrics).map((run) => {
   const timings = metrics.stage_timings ?? {};
   return `| ${run.repository} | ${run.task} | ${metrics.ready_elapsed_ms ?? "—"} | ${firstFrontierMs(metrics, (event) => event.source_ready === true) ?? "—"} | ${firstFrontierMs(metrics, (event) => event.structural_stage_ordinal >= 1 && event.structural_availability === "available") ?? "—"} | ${timings.source_catalog_ms ?? timings.source_catalogue_ms ?? timings.source_catalog ?? "—"} | ${timings.plugin_analysis_ms ?? timings.plugin_analyze ?? "—"} | ${timings.publish_ms ?? timings.publish ?? "—"} | ${metrics.analysis_timings?.acceptance ?? "—"} | ${metrics.peak_rss_kib ?? "—"} |`;
 });
+const failureRuns = runs.filter((run) => run.failure).map((run) =>
+  `| ${run.repository} | ${run.task} | ${run.arm} | ${String(run.failure).replaceAll("|", "/")} |`);
 const executedArms = audit.arms ?? [...new Set(runs.map((run) => run.arm))];
 const campaignProvenance = benchmarkAudit.rerun_status !== undefined || benchmarkAudit.rerun_observed_runs !== undefined || reusedArms.length > 0
   ? `The Urdira arm was rerun in this campaign (${benchmarkAudit.rerun_status ?? "status unavailable"}: ${benchmarkAudit.rerun_observed_runs ?? "?"}/${benchmarkAudit.rerun_expected_runs ?? "?"} cells). Existing comparison-arm rows were reused from the prior audited campaign: ${reusedArms.length ? reusedArms.join(", ") : "none"}. They were not re-executed in this run.${benchmarkAudit.rerun_stop_reason ? ` The rerun stopped after a controlled resource guard: ${benchmarkAudit.rerun_stop_reason}` : ""}`
@@ -295,20 +364,24 @@ Generated from the sequential audit for four frozen TypeScript repositories. A c
 
 ${campaignProvenance}
 
-The estimated cost uses the explicit planning card in the JSON report and is not a provider invoice. Raw transcripts and host logs are retained outside the repository and bound by the audit SHA-256.
+The estimated cost uses the explicit planning card in the JSON report and is not a provider invoice. Raw transcripts and host logs were generated outside the repository, used for extraction, and removed after cleanup; the derived evidence is bound by the audit SHA-256.
 
-## Arm summary
+## Comparison by task and option
 
-| Arm | Correct | Median setup ms | Median agent ms | Median total ms | Median tokens | Median cost USD | Median MCP calls | Median failed MCP calls | Discovery MCP passed |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-${armSummaries.join("\n")}
+Each row is one benchmark task under one tool option. No values in this table
+are averaged across different tasks. \`Total elapsed ms\` is setup plus measured
+agent elapsed; \`Agent elapsed ms\` starts at the first instruction.
+
+| Repository | Task | Scenario | Option | Correct | Setup ms | Agent elapsed ms | Total elapsed ms | Input tokens | Output tokens | Reasoning tokens | Cost USD | Turns | MCP calls | Readiness ms | Peak RSS KiB |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+${taskComparisonRows.join("\n")}
 
 ${viabilityAssessment ? `## Viability assessment\n\n${viabilityAssessment}\n` : ""}
 
 ## Per-run measurements
 
-| Repository | Task | Arm | Correct | Total tokens | Cost USD | Turns | MCP calls | Failed MCP | Discovery completed | Selector narrowing | Unexpected MCP failures | Useful discovery | Native source fallback | IPC timeouts | Setup ms | Agent elapsed ms | Peak RSS KiB | CPU % | SQLite bytes | CAS bytes | Bytes copied | Bytes transferred | Bytes decoded |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Repository | Tier | Scenario | Task | Arm | Correct | Input tokens | Output tokens | Reasoning tokens | Total tokens | Cost USD | Turns | MCP calls | Failed MCP | Discovery completed | Selector narrowing | Unexpected MCP failures | Useful discovery | Native source fallback | IPC timeouts | Setup ms | Agent elapsed ms | Peak RSS KiB | CPU % | SQLite bytes | CAS bytes | Bytes copied | Bytes transferred | Bytes decoded | Cleanup |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 ${compactRuns.join("\n")}
 
 ## Gate
@@ -319,7 +392,12 @@ ${compactRuns.join("\n")}
 - Failed or blocked runs: ${report.campaign_gate.failed_or_blocked_runs}
 - Campaign gate passed: ${report.campaign_gate.passed}
 
-See the JSON file for grouped medians/means, setup evidence, correctness evidence, and failure messages.
+See the JSON file for the same per-task/per-option records, grouped task-level
+statistics, setup evidence, correctness evidence, and failure messages.
+
+## Failures and recovery details
+
+${failureRuns.length ? "| Repository | Task | Arm | Recorded failure |\n|---|---|---|---|\n" + failureRuns.join("\n") : "No failure details were recorded."}
 
 ## Indexing and readiness evidence
 

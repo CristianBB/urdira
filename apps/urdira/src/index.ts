@@ -776,11 +776,12 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         if (batchIndex > 0 && !finalSeen) throw new Error("Plugin FactDelta batches must terminate with a final batch.");
         await flushNativeBatches();
         const compacted = compactAcceptedFactDelta(delta);
-        // (3a pipelined) Hand the compacted delta to the engine's observer
-        // the moment it exists, so per-record digest work overlaps the rest
-        // of this analyze instead of running after it. Best-effort hook: it
-        // must never be able to fail an analyze.
-        if (on_accepted_delta !== undefined) { try { on_accepted_delta(compacted); } catch { /* optimization hook, never a contract */ } }
+        // (3a pipelined) Hand the compacted delta to the engine's streaming
+        // consumer the moment it exists, so per-record digest work overlaps
+        // the rest of this analyze instead of running after it. The callback
+        // remains best-effort so a performance consumer can never change the
+        // provider's accepted-delta contract.
+        if (on_accepted_delta !== undefined) { try { await on_accepted_delta(compacted); } catch { /* streaming optimization failure is isolated */ } }
         return compacted;
       };
       const invokeShard = async (shard: readonly AnalysisPlan[], shardIndex: number): Promise<readonly { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[]> => {
@@ -814,7 +815,8 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
             // Accept each response before releasing it. Retaining every raw
             // FactDelta until all owners finish doubles the peak heap for a
             // large workspace and was the direct cause of the VS Code OOM.
-            results.push({ plan_index: plan.planIndex, delta: await consumePlanResponse(response, plan) });
+            const delta = await consumePlanResponse(response, plan);
+            if (on_accepted_delta === undefined) results.push({ plan_index: plan.planIndex, delta });
             if ((index + 1) % 100 === 0 || index + 1 === shard.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=${shardIndex} completed=${index + 1}/${shard.length}`);
             if (index + 1 < shard.length) {
               pending = shardWorker.invoke(shard[index + 1]!.request);
@@ -852,7 +854,8 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         try {
           for (let index = 0; index < affectedOwners.length; index += 1) {
             const response = await pending as { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } };
-            accepted.push(await consumePlanResponse(response, currentPlan));
+            const delta = await consumePlanResponse(response, currentPlan);
+            if (on_accepted_delta === undefined) accepted.push(delta);
             if ((index + 1) % 100 === 0 || index + 1 === affectedOwners.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=0 completed=${index + 1}/${affectedOwners.length}`);
             if (index + 1 < affectedOwners.length) {
               currentPlan = buildPlan(affectedOwners[index + 1]!, index + 1);
@@ -949,7 +952,8 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
               while (pendingResponses.has(nextAcceptIndex)) {
                 const { response, plan } = pendingResponses.get(nextAcceptIndex)!;
                 pendingResponses.delete(nextAcceptIndex);
-                accepted.push(await consumePlanResponse(response, plan));
+                const delta = await consumePlanResponse(response, plan);
+                if (on_accepted_delta === undefined) accepted.push(delta);
                 const resolve = acceptWaiters.get(nextAcceptIndex);
                 acceptWaiters.delete(nextAcceptIndex);
                 nextAcceptIndex += 1;

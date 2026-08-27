@@ -205,8 +205,10 @@ interface Capture {
 
 // Generated comparison baselines are not source artifacts. Excluding them by
 // default keeps source-first indexing focused on executable/declarative code;
-// callers can still opt in explicitly with an include rule.
-const DEFAULT_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**"], allow_external_root: false };
+// callers can still opt in explicitly with an include rule. This is the
+// single workspace policy reused by scans, forks, and filesystem watchers.
+export const DEFAULT_WORKSPACE_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false };
+const DEFAULT_INCLUSION: InclusionRules = DEFAULT_WORKSPACE_INCLUSION;
 const DEFAULT_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
 const DEFAULT_WALK_CONCURRENCY = 16;
 const BINARY_EXTENSIONS = new Set([".7z", ".avi", ".bin", ".bmp", ".class", ".dll", ".dylib", ".eot", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".mov", ".mp3", ".mp4", ".o", ".pdf", ".png", ".so", ".tar", ".wasm", ".webp", ".woff", ".woff2", ".zip"]);
@@ -800,6 +802,7 @@ export class DirectorySourceProvider implements SourceProvider {
         for await (const chunk of sourceFactory()) {
           if (!(chunk instanceof Uint8Array)) throw new SourceProviderOutcomeError("failed", "core:source_provider_read_invalid", "never", "The source stream yielded a non-byte chunk.");
           byteLength += chunk.byteLength;
+          if (byteLength > before.target_stat.size) throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence grew while reading.");
           streamHasNul ||= chunk.some((byte) => byte === 0);
           if (streamValidUtf8) {
             try { decoder.decode(chunk, { stream: true }); } catch { streamValidUtf8 = false; }
@@ -807,6 +810,7 @@ export class DirectorySourceProvider implements SourceProvider {
           yield chunk;
         }
         if (streamValidUtf8) { try { decoder.decode(); } catch { streamValidUtf8 = false; } }
+        if (byteLength !== before.target_stat.size) throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The observed occurrence changed length while reading.");
         // CAS invokes `after_read` with its actual digest. Keeping this
         // provider-side boundary callback separate preserves the post-read
         // race check without hashing the same stream twice.
@@ -1084,6 +1088,10 @@ export class DirectorySourceProvider implements SourceProvider {
             if (!(chunk instanceof Uint8Array)) { gate.release(meta.byte_length); return undefined; }
             chunks.push(chunk); total += chunk.byteLength;
           }
+          // Do not hand a file that grew after enumeration to CAS with the
+          // stale declared length. The source boundary will take the retryable
+          // path instead of surfacing a storage-layer mismatch.
+          if (total !== meta.byte_length) { gate.release(meta.byte_length); return undefined; }
           return { bytes: total === 0 ? new Uint8Array() : concatChunks(chunks, total), byte_length: total, reserved_bytes: meta.byte_length };
         } catch {
           gate.release(meta.byte_length);

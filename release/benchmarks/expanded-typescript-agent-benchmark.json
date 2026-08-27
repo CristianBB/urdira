@@ -8,18 +8,26 @@
     "samples_per_cell": 3,
     "cells": 32,
     "total_runs": 96,
-    "protocol": "three independent sequential samples per cell; each sample uses three sequential Codex instructions in one resumable session and a fresh detached worktree/data root"
+    "protocol": "three independent sequential samples per cell; each sample uses three sequential Codex instructions in one resumable session and a fresh detached worktree/data root",
+    "scenarios": {
+      "quick-local": "small focused change with few source files",
+      "deep-cross-file": "cross-file change with distributed implementation and tests",
+      "staged-incremental": "the same task is delivered in three sequential instructions; Urdira waits for a current structural frontier after each edit before resuming"
+    }
   },
   "repositories": [
     {
       "id": "typescript",
       "repository": "microsoft/TypeScript",
+      "size_tier": "L",
+      "source_ref": "b465fdbfe175304d9b977da137b2c178ae1091d3",
       "url": "https://github.com/microsoft/TypeScript",
       "commit": "b465fdbfe175304d9b977da137b2c178ae1091d3",
       "tasks": [
         {
           "id": "transpile-diagnostic-callback",
           "complexity": "medium",
+          "scenario": "quick-local",
           "prompt": "Add an optional onDiagnostic callback to the transpilation API. It must be part of TranspileOptions, be invoked exactly once for each diagnostic produced by transpileModule and transpileDeclaration, preserve the returned diagnostics and default behavior when omitted, and have focused tests. Trace the shared worker and both public entry points before editing.",
           "changed_path_regex": ["^src/services/transpile\\.ts$", "(^|/)testRunner/"],
           "required_patterns": [{"path": "src/services/transpile.ts", "regex": "onDiagnostic"}, {"path": "src/services/transpile.ts", "regex": "TranspileOptions"}],
@@ -28,6 +36,7 @@
         {
           "id": "session-project-event-hook",
           "complexity": "high",
+          "scenario": "deep-cross-file",
           "prompt": "Add an optional onProjectEvent project-event observer to the tsserver session options. Thread onProjectEvent through SessionOptions into ProjectServiceOptions and invoke it without changing the existing eventHandler or suppressDiagnosticEvents semantics. Preserve the public server types, cover the option being absent and present, and add focused tests. Use the call graph to identify the construction boundary and all affected tests.",
           "changed_path_regex": ["^src/server/(session|editorServices)\\.ts$", "(^|/)testRunner/"],
           "required_patterns": [{"path": "src/server/session.ts", "regex": "onProjectEvent"}, {"path": "src/server/editorServices.ts", "regex": "onProjectEvent"}],
@@ -38,12 +47,15 @@
     {
       "id": "playwright",
       "repository": "microsoft/playwright",
+      "size_tier": "S",
+      "source_ref": "main@2026-08-26T09:14:00Z",
       "url": "https://github.com/microsoft/playwright",
-      "commit": "644132a6326cb12b0549b0f3c57071143c22b2bb",
+      "commit": "1b44f5a441f391538c42c7ce36dd8ce779a5d6a1",
       "tasks": [
         {
           "id": "affected-tests-deterministic",
           "complexity": "medium",
+          "scenario": "quick-local",
           "prompt": "Make the affected-test calculation deterministic. affectedTestFiles must deduplicate repeated changes and return the same path-sorted result regardless of input change order, while preserving the current dependency semantics. Trace collectAffectedTestFiles and add focused tests for duplicates and ordering.",
           "changed_path_regex": ["^packages/playwright/src/transform/compilationCache\\.ts$", "(^|/)(test|tests)/"],
           "required_patterns": [{"path": "packages/playwright/src/transform/compilationCache.ts", "regex": "affectedTestFiles"}, {"path": "packages/playwright/src/transform/compilationCache.ts", "regex": "sort"}],
@@ -52,6 +64,7 @@
         {
           "id": "reporter-error-isolation",
           "complexity": "high",
+          "scenario": "deep-cross-file",
           "prompt": "Harden the reporter Multiplexer error path. A reporter callback throwing from onError must not recursively redispatch forever, must mark reporter errors, must not stop other reporters from receiving the original lifecycle event, and must preserve the current onEnd status behavior. Trace _wrap, _wrapAsync, and onError, then add focused tests for sync and async failures.",
           "changed_path_regex": ["^packages/playwright/src/reporters/multiplexer\\.ts$", "(^|/)(test|tests)/"],
           "required_patterns": [{"path": "packages/playwright/src/reporters/multiplexer.ts", "regex": "onError"}, {"path": "packages/playwright/src/reporters/multiplexer.ts", "regex": "_hasReporterErrors"}],
@@ -62,12 +75,14 @@
     {
       "id": "prisma",
       "repository": "prisma/prisma",
+      "size_tier": "M",
       "url": "https://github.com/prisma/prisma",
       "commit": "0f37454eec96b193e8b20e8f569e453acd2af644",
       "tasks": [
         {
           "id": "wire-name-validation",
           "complexity": "medium",
+          "scenario": "quick-local",
           "prompt": "Strengthen the SQL wire-name boundary. Keep formatWireName as the canonical formatter, add a small exported predicate for validating a complete wire name, and make parseNaming use the shared validation path so malformed prefixes and suffixes are rejected consistently. Preserve exact-name behavior and add focused tests for valid, malformed, and prefix-mismatch values.",
           "changed_path_regex": ["^packages/2-sql/1-core/schema-ir/src/naming\\.ts$", "^packages/2-sql/1-core/schema-ir/test/"],
           "required_patterns": [{"path": "packages/2-sql/1-core/schema-ir/src/naming.ts", "regex": "is.*Wire|Wire.*valid|validate.*Wire"}, {"path": "packages/2-sql/1-core/schema-ir/test/", "regex": "wire"}],
@@ -76,6 +91,7 @@
         {
           "id": "mongo-value-set-transform",
           "complexity": "high",
+          "scenario": "deep-cross-file",
           "prompt": "Add an immutable transformation API to MongoValueSet. Expose a withValues method that returns a new frozen MongoValueSet, never mutates the original values, preserves the valueSet discriminator, and remains compatible with hydration and public exports. Trace entity-kind construction and add focused tests for identity separation and freezing.",
           "changed_path_regex": ["^packages/2-mongo-family/1-foundation/mongo-contract/src/", "^packages/2-mongo-family/1-foundation/mongo-contract/test/"],
           "required_patterns": [{"path": "packages/2-mongo-family/1-foundation/mongo-contract/src/ir/mongo-value-set.ts", "regex": "withValues"}, {"path": "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/index.ts", "regex": "MongoValueSet"}],
@@ -86,12 +102,14 @@
     {
       "id": "vscode",
       "repository": "microsoft/vscode",
+      "size_tier": "L",
       "url": "https://github.com/microsoft/vscode",
       "commit": "038b9225c82c6b75172beda6081c64887692538c",
       "tasks": [
         {
           "id": "language-registry-change-notification",
           "complexity": "medium",
+          "scenario": "quick-local",
           "prompt": "Improve LanguageFeatureRegistry change notifications. When a model changes the provider scores or ordering, onDidChange should notify observers exactly when the effective registry result changes; repeated evaluation of the same candidate must remain quiet. Preserve registration and disposal behavior and add focused tests around ordered providers and exclusive selectors.",
           "changed_path_regex": ["^src/vs/editor/common/languageFeatureRegistry\\.ts$", "^src/vs/editor/.*test/"],
           "required_patterns": [{"path": "src/vs/editor/common/languageFeatureRegistry.ts", "regex": "onDidChange"}, {"path": "src/vs/editor/common/languageFeatureRegistry.ts", "regex": "_lastCandidate|_updateScores"}],
@@ -100,6 +118,7 @@
         {
           "id": "language-provider-registration-idempotence",
           "complexity": "high",
+          "scenario": "deep-cross-file",
           "prompt": "Make TypeScript LanguageProvider registration idempotent. If the client readiness signal is delivered more than once, provider modules must be registered only once; concurrent readiness callbacks must share the same in-flight work; disposal must still clean up every registered provider. Trace LanguageProvider, its readiness event, and the disposable base, then add focused tests.",
           "changed_path_regex": ["^extensions/typescript-language-features/src/languageProvider\\.ts$", "^extensions/typescript-language-features/.*test/"],
           "required_patterns": [{"path": "extensions/typescript-language-features/src/languageProvider.ts", "regex": "registerProviders"}, {"path": "extensions/typescript-language-features/src/languageProvider.ts", "regex": "Promise|registered|registration"}],

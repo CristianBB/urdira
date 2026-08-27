@@ -2,10 +2,10 @@
 
 Date: 2026-08-23
 
-Historical evidence: this report remains the provenance source for comparison
-rows reused by the [2026-08-24 report](../../release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-24.md).
-Its functional-viability conclusion does not describe the later rerun, whose
-native-source fallbacks require the more limited attribution stated there.
+Historical evidence: this report is retained only as an audit record for the
+comparison methodology. The derived 2026-08-24 report was retired because its
+Urdira rows were invalidated, so neither its performance nor correctness
+claims should be reused as current evidence.
 
 ## Scope and provenance
 

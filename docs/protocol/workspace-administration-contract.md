@@ -35,7 +35,9 @@ watcher is retained per workspace and restored by the daemon. Git `HEAD` and
 worktree administration events preserve the workspace identity, stale the
 previous snapshot, and schedule one full reconciliation. Overflow, provider
 reset, or lost events widen to a full reconciliation before freshness is
-reported.
+reported. On macOS the watcher uses the native `kqueue` backend rather than
+FSEvents, preventing client-queue drops during large indexing operations; the
+same inclusion exclusions apply to either native backend.
 
 ## Administrative listing and Codebases
 

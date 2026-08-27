@@ -41,6 +41,7 @@ export { MemoryStageSpool, SqliteStageSpool, DEFAULT_HARD_BYTES, DEFAULT_SPILL_B
 export {
   DeterministicFakeWatcher,
   ParcelWatcherAdapter,
+  watcherOptionsForSourceProvider,
   type ParcelWatcherAdapterOptions,
   type ParcelWatcherBackend,
   type PhysicalWatcherEvent,
@@ -83,6 +84,7 @@ export {
 } from "./reconciliation.js";
 export {
   DirectorySourceProvider,
+  DEFAULT_WORKSPACE_INCLUSION,
   NODE_DIRECTORY_FILE_SYSTEM,
   type DirectoryEntry,
   type DirectoryFileStat,

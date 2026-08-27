@@ -1048,14 +1048,18 @@ describe("P3-3a bounded enumerate->catalog byte hand-off", () => {
             // Simulate a tamper/race: the prefetch driver's own read
             // observes DIFFERENT bytes than enumeration's digest pass(es)
             // already committed to.
-            yield new TextEncoder().encode("export const alpha = TAMPERED;\n");
+            // Keep the byte length stable so this exercises content-integrity
+            // validation rather than the separate growing-file guard.
+            yield new TextEncoder().encode("export const alpha = 2;\n");
             return;
           }
           for await (const chunk of NODE_DIRECTORY_FILE_SYSTEM.read_file_stream!(candidate)) yield chunk;
         })(),
       },
     });
-    const observations = await enumerateOnly(provider);
+    const enumeration = await provider.enumerateNativeBatches(request("enumerate", { coverage_scopes: completeScope }));
+    const observations: ProviderObservation[] = [];
+    for await (const batch of enumeration.batches) observations.push(...batch.observations);
     expect(calls).toBe(captureCallCount + 1);
 
     const observation = observations[0]!;
@@ -1256,7 +1260,7 @@ describe("P3-3b on_prefetched_text observer", () => {
         ...NODE_DIRECTORY_FILE_SYSTEM,
         read_file_stream: (candidate) => (async function* (): AsyncGenerator<Uint8Array> {
           calls += 1;
-          if (calls === captureCallCount + 1) { yield new TextEncoder().encode("export const alpha = TAMPERED;\n"); return; }
+          if (calls === captureCallCount + 1) { yield new TextEncoder().encode("export const alpha = 2;\n"); return; }
           for await (const chunk of NODE_DIRECTORY_FILE_SYSTEM.read_file_stream!(candidate)) yield chunk;
         })(),
       },
@@ -1280,6 +1284,42 @@ describe("P3-3b on_prefetched_text observer", () => {
     const bytes = Buffer.concat(chunks);
     await expect(stream.after_read?.(digestBytes(new Uint8Array(bytes)), bytes.byteLength)).rejects.toThrow();
     expect(fired).toBe(false);
+  });
+
+  it("reports a growing stream as source_changed before CAS sees a length mismatch", async () => {
+    const root = await temporaryDirectory();
+    const stableText = "export const alpha = 1;\n";
+    await writeFile(join(root, "alpha.ts"), stableText);
+    let streamCalls = 0;
+    const provider = new DirectorySourceProvider({
+      ...boundProvider,
+      root,
+      now: () => instant,
+      file_system: {
+        ...NODE_DIRECTORY_FILE_SYSTEM,
+        read_file_stream: (candidate) => (async function* (): AsyncGenerator<Uint8Array> {
+          streamCalls += 1;
+          // `#capture` performs two digest passes. The prefetch and lazy read
+          // then observe a file that grew after enumeration.
+          const text = streamCalls <= 2 ? stableText : `${stableText}// grew while reading\n`;
+          yield new TextEncoder().encode(text);
+        })(),
+      },
+    });
+    const enumeration = await provider.enumerateNativeBatches(request("enumerate", { coverage_scopes: completeScope }));
+    const observations: ProviderObservation[] = [];
+    for await (const batch of enumeration.batches) observations.push(...batch.observations);
+    const observation = observations[0]!;
+    const stream = await provider.readStream({
+      artifact_id: observation.artifact_id,
+      normalized_uri: observation.normalized_uri,
+      observed_content_hash: observation.observed_content_hash,
+      observed_metadata_digest: observation.observed_metadata_digest,
+      provider_version_token: observation.provider_version_token,
+    });
+    await expect((async () => {
+      for await (const _chunk of stream.chunks) { /* consume the source boundary */ }
+    })()).rejects.toMatchObject({ outcome: "source_changed", provider_error: { error_code: "core:source_changed" } });
   });
 });
 

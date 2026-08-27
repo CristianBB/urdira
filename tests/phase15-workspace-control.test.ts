@@ -10,7 +10,7 @@ import {
   WorkspaceWatcherManager,
   type WorkspaceDetectionInput,
 } from "../packages/engine/src/index.js";
-import { createUrdiraToolDefinitions } from "../packages/mcp/src/index.js";
+import { createUrdiraMcpServer, createUrdiraToolDefinitions } from "../packages/mcp/src/index.js";
 import { operationErrorDefinitions } from "../packages/contracts/src/index.js";
 import { parseCliArgs, runCli } from "../packages/cli/src/index.js";
 import { WorkspaceRegistry } from "../packages/engine/src/index.js";
@@ -59,6 +59,27 @@ describe("workspace configuration impact", () => {
 });
 
 describe("MCP index status v3", () => {
+  test("advertises the closed build-context facets and repeats them in SDK validation errors", async () => {
+    const client = { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) };
+    const tools = createUrdiraToolDefinitions({ client });
+    const context = tools.find((tool) => tool.name === "urdira_context")!;
+    const facets = (context.input_schema.properties as Record<string, { items?: { enum?: string[] } }>) ["facets"];
+    expect(facets?.items?.enum).toEqual([
+      "definitions", "implementations", "callers", "callees", "dependencies", "contracts",
+      "effects", "tests", "configuration", "analogues", "extension_points",
+    ]);
+
+    const server = createUrdiraMcpServer({ client });
+    const registered = (server as unknown as { _registeredTools: Record<string, { inputSchema: { "~standard": { validate: (input: unknown) => Promise<{ issues?: readonly { message: string }[] }> } } }> })._registeredTools;
+    const result = await registered["urdira_context"]!.inputSchema["~standard"].validate({
+      api_version: 3,
+      scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+      task: "diagnostic callback",
+      facets: ["public_surfaces"],
+    });
+    expect(result.issues?.[0]?.message).toContain("valid facets: definitions, implementations, callers, callees, dependencies, contracts, effects, tests, configuration, analogues, extension_points");
+  });
+
   test("resolves an explicit root and normalizes away a redundant workspace id list", async () => {
     const calls: unknown[] = [];
     const tools = createUrdiraToolDefinitions({ client: { call: async (_name: string, payload: unknown) => { calls.push(payload); return { protocol_version: 1, request_id: "request-1", outcome: "success", payload: { workspaces: [{ workspace_id: "workspace-1", workspace_root: "/tmp/example", display_root: "project" }] } }; } } });

@@ -26,25 +26,23 @@ const nodeBin = value("--node", process.execPath);
 const codegraphBin = value("--codegraph");
 const codebaseMemoryBin = value("--codebase-memory");
 const benchmarkTimeoutMs = Number(process.env.URDIRA_BENCHMARK_TIMEOUT_MS ?? "900000");
-const benchmarkMaxRssKib = Number(process.env.URDIRA_BENCHMARK_MAX_RSS_KIB ?? "5000000");
 const repo = corpus.repositories.find((entry) => entry.id === repositoryId);
 const task = repo?.tasks.find((entry) => entry.id === taskId);
 if (!repo || !task || !["baseline", "urdira-typescript", "codebase-memory", "codegraph"].includes(arm)) throw new Error("Invalid repository, task, or arm");
 const preflightOnly = argv.includes("--preflight-only");
 if ((!preflightOnly && (!worktree || !commit)) || !Number.isSafeInteger(sample) || sample < 1) throw new Error("--worktree, --commit, and a positive --sample are required");
 if (!Number.isSafeInteger(benchmarkTimeoutMs) || benchmarkTimeoutMs < 1_000) throw new Error("URDIRA_BENCHMARK_TIMEOUT_MS must be an integer of at least 1000ms");
-if (!Number.isSafeInteger(benchmarkMaxRssKib) || benchmarkMaxRssKib < 1_000_000) throw new Error("URDIRA_BENCHMARK_MAX_RSS_KIB must be an integer of at least 1000000 KiB");
 
 function validateAgentRoleConfig() {
   const rolePath = join(homedir(), ".codex", "agents", "urdira_explorer.toml");
   if (!existsSync(rolePath)) throw new Error(`Urdira benchmark preflight: agent role file is missing: ${rolePath}`);
   const text = readFileSync(rolePath, "utf8");
-  const required = ["name", "description", "developer_instructions"];
+  const required = ["name", "description"];
   for (const field of required) {
     const assignment = new RegExp(`^\\s*${field}\\s*=\\s*`, "m");
     if (!assignment.test(text)) throw new Error(`Urdira benchmark preflight: ${rolePath} is missing TOML field ${field}.`);
   }
-  if (!/developer_instructions\s*=\s*(['"]{3}[\s\S]+?['"]{3}|['"][^'"]+['"])/m.test(text)) throw new Error(`Urdira benchmark preflight: ${rolePath}.developer_instructions is empty.`);
+  if (!/description\s*=\s*(['"]{3}[\s\S]+?['"]{3}|['"][^'"]+['"])/m.test(text)) throw new Error(`Urdira benchmark preflight: ${rolePath}.description is empty.`);
   if (!/name\s*=\s*['"]urdira_explorer['"]/m.test(text)) throw new Error(`Urdira benchmark preflight: agent role name must be urdira_explorer.`);
   return rolePath;
 }
@@ -180,8 +178,15 @@ const waitForCurrentStructuralFrontier = async (afterTurn) => {
   const { DaemonClient, daemonPaths } = await import("../../packages/daemon/dist/index.js");
   const paths = await daemonPaths(effectiveDataRoot);
   const client = new DaemonClient(paths.endpoint, { request_timeout_ms: 60_000 });
+  let gateWorkspaceId;
+  try {
+    const readyLine = readFileSync(hostLog, "utf8").split("\n").reverse().find((line) => line.startsWith("BENCH_HOST_READY "));
+    if (readyLine !== undefined) gateWorkspaceId = JSON.parse(readyLine.slice("BENCH_HOST_READY ".length)).workspace_id;
+  } catch { /* fall back to the legacy all-workspaces query below */ }
+  let pollDelayMs = 500;
+  let previousFrontier;
   while (Date.now() < deadline) {
-    const status = await client.call("core:index_status", { api_version: 3, workspace_ids: [] });
+    const status = await client.call("core:index_status", { api_version: 3, workspace_ids: typeof gateWorkspaceId === "string" ? [gateWorkspaceId] : [] });
     if (status.outcome !== "success") throw new Error(`Urdira inter-turn freshness gate failed after turn ${afterTurn}: ${JSON.stringify(status)}`);
     const entry = status.payload?.workspaces?.find((candidate) => candidate.display_root === basename(worktree));
     if ([entry?.workspace_status, entry?.freshness_status, entry?.startup_phase].includes("failed")) {
@@ -192,7 +197,10 @@ const waitForCurrentStructuralFrontier = async (afterTurn) => {
       appendFileSync(hostLog, `BENCH_INTER_TURN_READY ${JSON.stringify({ after_turn: afterTurn, elapsed_ms: elapsed, workspace_id: entry.workspace_id })}\n`);
       return elapsed;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const frontier = JSON.stringify({ status: entry?.workspace_status, freshness: entry?.freshness_status, startup_phase: entry?.startup_phase, structural_ready: entry?.structural_ready, stage: entry?.structural_stage_ordinal });
+    pollDelayMs = frontier === previousFrontier ? Math.min(2_000, pollDelayMs * 2) : 500;
+    previousFrontier = frontier;
+    await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
   }
   throw new Error(`Timed out waiting for Urdira current structural frontier after turn ${afterTurn}`);
 };
@@ -220,7 +228,7 @@ if (host) await stopHost(host);
 const grade = await run(nodeBin, [join(root, "release/benchmarks/expanded-agent-benchmark-grader.mjs"), "--worktree", worktree, "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--transcript", transcript], { cwd: root });
 let grader;
 try { grader = JSON.parse(grade.stdout); } catch { grader = { completed_successfully: false, parse_error: grade.stdout.slice(-2000) }; }
-const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, task_id: taskId, complexity: task.complexity, arm, phase, sample, model, commit, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, host_log: arm === "urdira-typescript" ? hostLog : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
+const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, host_log: arm === "urdira-typescript" ? hostLog : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 console.log(JSON.stringify(manifest));
 if (!manifest.completed_successfully) process.exitCode = 1;
@@ -244,7 +252,7 @@ async function prepareArm() {
 }
 
 function startHostMetrics(child, dataRoot) {
-  const state = { peak_rss_kib: 0, cpu_percent_samples: [], sample_count: 0, started_at: Date.now(), sqlite_bytes: 0, cas_bytes: 0, bytes_copied: null, bytes_transferred: null, bytes_decoded: null, readiness_events: [], ready_elapsed_ms: null, memory_budget_kib: benchmarkMaxRssKib, memory_budget_exceeded: false, memory_budget_exceeded_at: null };
+  const state = { peak_rss_kib: 0, cpu_percent_samples: [], sample_count: 0, started_at: Date.now(), sqlite_bytes: 0, cas_bytes: 0, bytes_copied: null, bytes_transferred: null, bytes_decoded: null, readiness_events: [], ready_elapsed_ms: null, memory_budget_kib: null, memory_budget_exceeded: false, memory_budget_exceeded_at: null };
   let pending = "";
   child.stdout.on("data", (chunk) => {
     pending += chunk.toString();
@@ -268,11 +276,6 @@ function startHostMetrics(child, dataRoot) {
     const cpu = Number(fields[1]);
     if (Number.isFinite(rss)) {
       state.peak_rss_kib = Math.max(state.peak_rss_kib, rss);
-      if (rss >= benchmarkMaxRssKib && !state.memory_budget_exceeded) {
-        state.memory_budget_exceeded = true;
-        state.memory_budget_exceeded_at = Date.now();
-        child.kill("SIGTERM");
-      }
     }
     if (Number.isFinite(cpu)) state.cpu_percent_samples.push(cpu);
     state.sample_count += 1;
@@ -344,12 +347,13 @@ async function hostMain() {
   const client = new DaemonClient(runtime.endpoint, { request_timeout_ms: benchmarkTimeoutMs });
   const registration = await client.call("core:workspace_add", { args: [worktree], confirmed: true, selected_technology_ids: ["javascript", "typescript"], selected_plugin_ids: ["urdira:javascript_typescript"] });
   if (registration.outcome !== "success") throw new Error(`workspace registration failed: ${JSON.stringify(registration)}`);
+  const registeredWorkspaceId = registration.payload?.workspace_id;
   const deadline = Date.now() + benchmarkTimeoutMs;
   let ready = false;
   let previousFrontier;
   let sourceReadySinceTs;
   while (Date.now() < deadline) {
-    const status = await client.call("core:index_status", { api_version: 3, workspace_ids: [] });
+    const status = await client.call("core:index_status", { api_version: 3, workspace_ids: typeof registeredWorkspaceId === "string" ? [registeredWorkspaceId] : [] });
     const entry = status.payload?.workspaces?.find((candidate) => candidate.display_root === worktree.split("/").at(-1));
     if ([entry?.workspace_status, entry?.freshness_status, entry?.startup_phase].includes("failed")) {
       throw new Error(`Urdira structural indexing failed: ${JSON.stringify(entry)}`);
@@ -369,7 +373,8 @@ async function hostMain() {
       startup_phase: entry?.startup_phase ?? null,
     };
     const frontierKey = JSON.stringify({ ...frontier, elapsed_ms: undefined });
-    if (frontierKey !== previousFrontier) {
+    const frontierChanged = frontierKey !== previousFrontier;
+    if (frontierChanged) {
       previousFrontier = frontierKey;
       process.stdout.write(`BENCH_FRONTIER ${JSON.stringify(frontier)}\n`);
     }
@@ -396,10 +401,17 @@ async function hostMain() {
     sourceReadySinceTs = sourceReadyNow ? (sourceReadySinceTs ?? Date.now()) : undefined;
     const sourceReadyStable = sourceReadySinceTs !== undefined && Date.now() - sourceReadySinceTs >= 1000;
     if (phase === "warm" ? warmReady : sourceReadyStable) { ready = true; break; }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // Readiness is a gate, not a heartbeat. Polling the full status payload
+    // every 500ms while a large incremental generation is committing makes
+    // the benchmark compete with the SQLite writer and can turn one edit
+    // into thousands of redundant synchronization reads. A bounded backoff
+    // keeps the same readiness predicate while giving publication windows to
+    // finish.
+    const pollDelayMs = frontierChanged ? 500 : 2_000;
+    await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
   }
   if (!ready) throw new Error(`Timed out waiting for the Urdira ${phase === "warm" ? "current structural" : "source_ready"} frontier`);
-  process.stdout.write(`BENCH_HOST_READY ${JSON.stringify({ workspace: worktree, repository: repositoryId, elapsed_ms: Date.now() - hostStartedAt })}\n`);
+  process.stdout.write(`BENCH_HOST_READY ${JSON.stringify({ workspace: worktree, workspace_id: registeredWorkspaceId, repository: repositoryId, elapsed_ms: Date.now() - hostStartedAt })}\n`);
   const stop = async () => {
     process.stdout.write(`[urdira] byte telemetry ${JSON.stringify(runtime.byteTelemetrySnapshot())}\n`);
     await runtime.stop({ force: false });

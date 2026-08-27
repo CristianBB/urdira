@@ -1,5 +1,6 @@
 import type * as parcelWatcher from "@parcel/watcher";
 import { EngineError } from "./errors.js";
+import { DEFAULT_WORKSPACE_INCLUSION } from "./directory-provider.js";
 
 export type WatcherEventClass =
   | "presence"
@@ -206,6 +207,37 @@ export interface ParcelWatcherAdapterOptions {
   readonly rearm_delay_ms?: number;
 }
 
+/**
+ * Projects the engine's workspace inclusion policy onto the watcher API.
+ * Path entries let FSEvents exclude common top-level generated trees before
+ * they reach its client queue; glob entries cover the same trees when they are
+ * nested. Git worktree bindings retain `.git` because branch/index and
+ * worktree-administration events are part of that provider contract.
+ */
+export function watcherOptionsForSourceProvider(sourceProvider: string): parcelWatcher.Options {
+  const excludedGlobs = DEFAULT_WORKSPACE_INCLUSION.exclude.filter((pattern) => sourceProvider !== "core:git_worktree_source_provider" || pattern !== ".git/**");
+  const excludedPaths = excludedGlobs.map((pattern) => pattern.endsWith("/**") ? pattern.slice(0, -3) : pattern);
+  // FSEvents reports a client-side drop when the Node callback cannot drain
+  // its event stream while a large repository is being indexed. @parcel/
+  // watcher ships kqueue on macOS as an explicit alternative; it watches the
+  // directory tree directly and has no FSEvents client queue to overflow.
+  // Keep the selection local to macOS: Linux/Windows use their native default
+  // backends, and @parcel/watcher falls back to its platform default if a
+  // compiled backend is unavailable. The package's declaration file omits
+  // kqueue even though the native backend accepts it, hence the narrow cast.
+  return {
+    ignore: [...new Set([...excludedPaths, ...excludedGlobs])],
+    ...(process.platform === "darwin" ? { backend: "kqueue" as unknown as parcelWatcher.Options["backend"] } : {}),
+  } as parcelWatcher.Options;
+}
+
+function watcherBackendErrorKind(error: Error): "user_dropped" | "kernel_dropped" | "too_many_events" | "other" {
+  if (error.message.includes("FSEvents client")) return "user_dropped";
+  if (error.message.includes("kernel")) return "kernel_dropped";
+  if (error.message.includes("Too many events")) return "too_many_events";
+  return "other";
+}
+
 function slashPath(path: string): string {
   const normalized = path.replace(/\\/gu, "/").replace(/\/{2,}/gu, "/");
   return normalized.length > 1 ? normalized.replace(/\/+$/u, "") : normalized;
@@ -312,7 +344,7 @@ export class ParcelWatcherAdapter {
           // goes unnoticed for a whole process's life. `on_error` (below)
           // remains the mechanism a caller uses to actually REACT (e.g. the
           // `provider_reset` hint delivery just below already does).
-          console.error(`[urdira] watcher error for workspace ${this.#binding.workspace_id} root=${this.#binding.root} (attempt ${consecutiveErrors}/${MAX_CONSECUTIVE_REARM_ATTEMPTS}): ${error.message || String(error)}`);
+          console.error(`[urdira] watcher error for workspace ${this.#binding.workspace_id} root=${this.#binding.root} kind=${watcherBackendErrorKind(error)} (attempt ${consecutiveErrors}/${MAX_CONSECUTIVE_REARM_ATTEMPTS}): ${error.message || String(error)}`);
           this.#onError?.(error);
           this.#deliver(handler, this.#batch([this.#hint("provider_reset", "")]));
           const failedSubscription = active;

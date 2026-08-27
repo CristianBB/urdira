@@ -9,7 +9,7 @@ import type { DurableStorage, ForkPublicationPlanInput, SqliteDatabase, Workspac
 import { buildForkPublicationPlan, publicationTransactionCommands, computeForkSnapshotDigestFields, normalizeObservationBatchIds, snapshotDigest } from "@urdira/storage";
 import type { GitIgnoreRules, InclusionRules } from "@urdira/security";
 import { ISOMORPHIC_GIT_OBJECT_PORT, peeledHeadFor, type GitObjectPort } from "./git-providers.js";
-import { DirectorySourceProvider, type EncodedObservationBatch } from "./directory-provider.js";
+import { DEFAULT_WORKSPACE_INCLUSION, DirectorySourceProvider, type EncodedObservationBatch } from "./directory-provider.js";
 import { GenericSourceIndexer } from "./source-indexer.js";
 import { sourceProviderRequestDigest } from "./source-provider.js";
 import type { RegisteredWorkspace, WorkspaceRegistry } from "./workspaces.js";
@@ -28,7 +28,7 @@ import type { WorkspaceScanPluginProvider } from "./workspace-indexing-session.j
  * result.
  */
 
-export const DEFAULT_FORK_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false };
+export const DEFAULT_FORK_INCLUSION: InclusionRules = DEFAULT_WORKSPACE_INCLUSION;
 export const DEFAULT_FORK_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
 const DEFAULT_FORK_SCAN_MAX_DURATION_MS = 600_000;
 const DEFAULT_FORK_SCAN_MAX_RESPONSE_BYTES = 64_000_000;

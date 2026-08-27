@@ -11,6 +11,7 @@
 // natural Phase 5 hook, once `SupervisedPluginRuntime` is wired up.
 import { Worker } from "node:worker_threads";
 import type { PluginWorkerRequestEnvelope, WorkerTransport } from "@urdira/plugin-sdk";
+import { createJavascriptTypescriptWorker } from "./worker.js";
 
 export interface JavascriptTypescriptThreadDescriptor {
   readonly compatibility_declaration_digest?: string;
@@ -35,6 +36,7 @@ interface ThreadResponseMessage {
 interface PendingRequest {
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: Error) => void;
+  readonly retry_in_process: () => Promise<unknown>;
 }
 
 /**
@@ -62,6 +64,12 @@ export function createJavascriptTypescriptThreadTransport(descriptor: Javascript
   const worker = new Worker(workerThreadUrl(), { workerData: descriptor });
   let nextId = 1;
   let closed = false;
+  // macOS can report `spawn EBADF` while the process is under heavy file and
+  // thread pressure. The worker thread is then permanently unusable, but the
+  // language plugin itself is still valid. Keep the same transport contract
+  // and continue in-process so one transient OS resource failure cannot leave
+  // a workspace stuck in indexing (or make the pool reuse a dead worker).
+  let inProcessFallback: WorkerTransport | undefined;
   const pending = new Map<number, PendingRequest>();
 
   const failAllPending = (error: Error): void => {
@@ -72,29 +80,64 @@ export function createJavascriptTypescriptThreadTransport(descriptor: Javascript
   worker.on("message", (message: ThreadResponseMessage) => {
     const entry = pending.get(message.id);
     if (!entry) return;
-    pending.delete(message.id);
-    if (message.kind === "error") {
-      entry.reject(new Error(`${message.error?.name ?? "Error"}: ${message.error?.message ?? "JavaScript/TypeScript worker thread failed."}`));
-    } else {
+      pending.delete(message.id);
+      if (message.kind === "error") {
+        const messageText = message.error?.message ?? "JavaScript/TypeScript worker thread failed.";
+        // A worker can survive long enough to serialize an OS-level spawn
+        // failure through the protocol instead of emitting it on Worker's
+        // `error` event. Treat both forms identically so the request is
+        // retried on the same in-process recovery transport.
+        if (!closed && messageText.includes("spawn EBADF")) {
+          inProcessFallback ??= createJavascriptTypescriptWorker(descriptor);
+          void entry.retry_in_process().then(entry.resolve, entry.reject);
+        } else {
+          entry.reject(new Error(`${message.error?.name ?? "Error"}: ${messageText}`));
+        }
+      } else {
       entry.resolve(message.result);
     }
   });
-  worker.on("error", (error) => failAllPending(error instanceof Error ? error : new Error(String(error))));
-  worker.on("exit", (code) => {
-    if (code !== 0) failAllPending(new Error(`JavaScript/TypeScript worker thread exited with code ${code}.`));
+  worker.on("error", (error) => {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    const errno = normalized as NodeJS.ErrnoException;
+    if (!closed && (errno.code === "EBADF" || normalized.message.includes("spawn EBADF"))) {
+      inProcessFallback ??= createJavascriptTypescriptWorker(descriptor);
+      const toRetry = [...pending.values()];
+      pending.clear();
+      for (const request of toRetry) void request.retry_in_process().then(request.resolve, request.reject);
+      return;
+    }
+    closed = true;
+    failAllPending(normalized);
   });
+  worker.on("exit", (code) => {
+    if (code !== 0 && inProcessFallback === undefined) {
+      closed = true;
+      failAllPending(new Error(`JavaScript/TypeScript worker thread exited with code ${code}.`));
+    }
+  });
+
+  const invokeFallback = (kind: "invoke" | "cancel" | "reset", payload?: unknown): Promise<unknown> => {
+    const fallback = inProcessFallback;
+    if (fallback === undefined) return Promise.reject(new Error("JavaScript/TypeScript worker thread fallback is unavailable."));
+    if (kind === "invoke") return fallback.invoke(payload as PluginWorkerRequestEnvelope);
+    if (kind === "cancel") return fallback.cancel(payload as { readonly cancellation_id: string });
+    return fallback.reset();
+  };
 
   function send(kind: "invoke" | "cancel" | "reset", payload?: unknown): Promise<unknown> {
     if (closed) return Promise.reject(new Error("JavaScript/TypeScript worker thread is terminated."));
+    if (inProcessFallback !== undefined) return invokeFallback(kind, payload);
     const id = nextId;
     nextId += 1;
     return new Promise<unknown>((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+      pending.set(id, { resolve, reject, retry_in_process: () => invokeFallback(kind, payload) });
       worker.postMessage({ id, kind, payload }, transferableBuffers(payload));
     });
   }
 
   return {
+    is_healthy: () => !closed,
     async invoke(request: PluginWorkerRequestEnvelope): Promise<unknown> {
       return send("invoke", request);
     },
@@ -108,9 +151,12 @@ export function createJavascriptTypescriptThreadTransport(descriptor: Javascript
       if (closed) return;
       closed = true;
       failAllPending(new Error("JavaScript/TypeScript worker thread is terminated."));
-      await worker.terminate();
+      await Promise.all([
+        worker.terminate(),
+        inProcessFallback?.terminate() ?? Promise.resolve(),
+      ]);
     },
-  };
+  } as WorkerTransport & { readonly is_healthy: () => boolean };
 }
 
 /** Collects complete, private ArrayBuffers owned by a one-shot request. */

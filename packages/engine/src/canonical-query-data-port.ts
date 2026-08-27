@@ -1532,10 +1532,21 @@ function resolveSelectorToRecords(selectorValue: unknown, maps: IdentityMaps): r
     const contextArtifact = typeof selector["context_artifact"] === "string" ? selector["context_artifact"] : undefined;
     if (contextArtifact !== undefined) {
       const container = resolveArtifactContainer(contextArtifact, maps);
-      if (container !== undefined) {
-        const narrowed = candidates.filter((record) => record.owner_artifact_id === container.owner_artifact_id);
-        if (narrowed.length > 0) candidates = narrowed;
-      }
+      // A structural snapshot normally contains a module/container record,
+      // but source-safe or partially materialized snapshots can expose the
+      // declaration's path before that container is present in `maps`. The
+      // declaration path is authoritative in both cases, so use it as a
+      // direct narrowing key and fall back to the owning artifact id when a
+      // container record is available. Without the direct check, a valid
+      // `context_artifact` was silently ignored and `core:get_source` still
+      // returned `core:selector_ambiguous`.
+      const narrowed = candidates.filter((record) =>
+        record.body["path"] === contextArtifact ||
+        record.body["name"] === contextArtifact ||
+        record.owner_artifact_id === contextArtifact ||
+        (container !== undefined && record.owner_artifact_id === container.owner_artifact_id),
+      );
+      if (narrowed.length > 0) candidates = narrowed;
     }
     if (candidates.length === 0) return [];
     if (candidates.length > 1) {

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ArtifactWorkItem, ReplacementScope, SnapshotCapabilityStateEntry } from "@urdira/contracts";
 import {
   PluginPackageDiscovery,
@@ -287,6 +287,54 @@ async function pollUntilReady(client: DaemonClient, workspaceId: string, timeout
 }
 
 describe("Daemon workspace indexing integration: core:workspace_add reaches status: ready", () => {
+  it("creates the durable workspace registration before readiness polling can observe indexing", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "u-reg-d-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "u-reg-w-"));
+    let runtime: DaemonRuntime | undefined;
+    let inspectionStorage: Awaited<ReturnType<typeof createDurableStorage>> | undefined;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await writeFile(join(workspaceRoot, "task.ts"), await readFile(join(fixtureRoot, "task.ts"), "utf8"), "utf8");
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-daemon-registration-order",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        plugin_catalog: [{ ...bundledPluginCatalogEntry, capability_declarations: JAVASCRIPT_TYPESCRIPT_CAPABILITIES }],
+        resolve_plugin_provider: resolvePluginProvider,
+        lexical_index: false,
+        semantic_index: false,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+      const added = await client.call("core:workspace_add", {
+        args: [workspaceRoot],
+        confirmed: true,
+        selected_technology_ids: ["typescript"],
+        selected_plugin_ids: [JAVASCRIPT_TYPESCRIPT_PLUGIN_ID],
+      });
+      expect(added.outcome).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+
+      // This inspection is deliberately performed immediately after the
+      // public add call, before waiting for the asynchronous scan. The
+      // catalog row and database file must already exist at this boundary.
+      inspectionStorage = await createDurableStorage({ rootDir: dataRoot, skip_startup_recovery: true });
+      await expect(inspectionStorage.catalog.getWorkspace(workspaceId)).resolves.toMatchObject({ workspace_id: workspaceId });
+      const status = await client.call("core:index_status", { workspace_ids: [workspaceId] });
+      expect(status.outcome).toBe("success");
+      expect(warnSpy.mock.calls.flat().map((call) => call.map(String).join(" ")).join("\n")).not.toContain("storage:workspace_not_found");
+      expect(errorSpy.mock.calls.flat().map((call) => call.map(String).join(" ")).join("\n")).not.toContain("workspace fork skipped");
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+      await inspectionStorage?.close().catch(() => undefined);
+      await runtime?.stop().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   it("scans a real directory end to end through the daemon's public IPC surface, with no manual candidate choreography", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-indexing-data-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-indexing-workspace-"));
