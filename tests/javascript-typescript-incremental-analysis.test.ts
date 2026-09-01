@@ -41,6 +41,48 @@ function fileText(files: readonly AnalyzerFile[], path: string): string {
 }
 
 describe("JsTsAnalysisSession incremental analysis: differential correctness", () => {
+  it("derives checker facts for one Rust-scoped owner without rebuilding Rust structural output", () => {
+    const files: AnalyzerFile[] = [
+      { path: "src/dependency.ts", text: "export function helper(value: number): number { return value + 1; }" },
+      { path: "src/main.ts", text: 'import { helper } from "./dependency"; export function main(value: number): number { return helper(value); }' },
+      { path: "src/empty.ts", text: "// no semantic constructs\n" },
+    ];
+    const rootNames = files.map((file) => file.path);
+    const fresh = analyzeProject({ files, root_names: rootNames });
+    const session = new JsTsAnalysisSession();
+    try {
+      expect(session.prepareRustSemanticState({
+        files,
+        root_names: rootNames,
+        rust_semantic_scope: { authority: "urdira:jsts-syntax-worker", changed_paths: rootNames, affected_paths: rootNames },
+      })).toBe("full");
+      const semantic = session.analyzeRustSemanticOwner({ files, owner_path: "src/main.ts" });
+      const semanticKinds = new Set(["core:references", "core:call", "core:inherits", "core:implements", "core:covers"]);
+      expect(semantic.relations.filter((relation) => relation.path === "src/main.ts" && semanticKinds.has(relation.kind)))
+        .toEqual(fresh.relations.filter((relation) => relation.path === "src/main.ts" && semanticKinds.has(relation.kind)));
+      expect(semantic.entities.filter((entity) => entity.path === "src/main.ts" && entity.type !== undefined))
+        .toEqual(fresh.entities.filter((entity) => entity.path === "src/main.ts" && entity.type !== undefined));
+      expect(semantic.diagnostics.filter((diagnostic) => diagnostic.path === "src/main.ts"))
+        .toEqual(fresh.diagnostics.filter((diagnostic) => diagnostic.path === "src/main.ts"));
+      expect(semantic.relations.some((relation) => ["core:contains", "core:import", "core:export"].includes(relation.kind))).toBe(false);
+      session.beginRustSemanticOwnerGroup(["src/main.ts", "src/dependency.ts", "src/empty.ts"]);
+      expect(() => session.beginRustSemanticOwnerGroup(["src/main.ts"])).toThrow(/cannot overlap/iu);
+      const groupedMain = session.analyzeRustSemanticOwner({ files, owner_path: "src/main.ts" });
+      const groupedDependency = session.analyzeRustSemanticOwner({ files, owner_path: "src/dependency.ts" });
+      session.endRustSemanticOwnerGroup();
+      expect(groupedMain.relations).toEqual(semantic.relations);
+      expect(groupedMain.diagnostics).toEqual(semantic.diagnostics);
+      expect(groupedDependency.relations.every((relation) => relation.path === "src/dependency.ts")).toBe(true);
+      const groupedEmpty = session.analyzeRustSemanticOwner({ files, owner_path: "src/empty.ts" });
+      expect(groupedEmpty.entities).toEqual([]);
+      expect(groupedEmpty.relations).toEqual([]);
+      expect(groupedEmpty.diagnostics).toEqual(fresh.diagnostics.filter((diagnostic) => diagnostic.path === "src/empty.ts"));
+      expect(session.analyzeRustSemanticOwner({ files, owner_path: "src/main.ts" }).relations).toEqual(semantic.relations);
+    } finally {
+      session.close();
+    }
+  });
+
   it("matches a fresh analyzeProject across a realistic sequence of edits (leaf, barrel, widely-imported type, compiler error, test file)", async () => {
     const base = await fixtureFiles();
     expect(base.length).toBeGreaterThan(5);
@@ -463,5 +505,212 @@ describe("JsTsAnalysisSession incremental analysis: dependent-visible change gat
     expect(result2.result).toEqual(analyzeProject({ files: edited2 }));
     expect(result2.impactful_changed_paths).toEqual([]);
     seeded.close();
+  });
+});
+
+// E1c cutover (design doc E1): with `rust_hybrid_pending_sites` on hand, the
+// owner walk descends straight to each Rust-reported site
+// (`descendToPendingSiteSpan`) instead of re-walking the whole file
+// (`collectAll`). This section exercises that localized descent directly at
+// the `JsTsAnalysisSession` API level -- heritage-clause dedup
+// (`nearestHeritageClause`), the constructor identity fix
+// (`constructorKeywordStart`) reached through the pending-site path, every
+// `rustSemanticDeclarationShape` kind the fixture below can trigger, and the
+// same pending-site resolution both ungrouped (`analyzeRustSemanticOwner`)
+// and grouped (`beginRustSemanticOwnerGroup`).
+describe("JsTsAnalysisSession incremental analysis: E1c hybrid pending-site descent", () => {
+  const widgetSource = `export interface IFoo {
+  fooMethod(): number;
+}
+export interface IBar {
+  barMethod(): number;
+}
+export class BaseWidget {
+  baseValue: number = 0;
+}
+export function helperOne(inputOne: number): number {
+  return inputOne + 1;
+}
+export function helperTwo(inputTwo: number): number {
+  return inputTwo + 2;
+}
+export class DerivedWidget extends BaseWidget implements IFoo, IBar {
+  private constructor(ctorParam: number) {
+    super();
+    this.baseValue = helperOne(ctorParam);
+  }
+  fooMethod(): number {
+    return helperOne(this.baseValue);
+  }
+  barMethod(): number {
+    return this.baseValue;
+  }
+  get widgetGetter(): number {
+    return helperTwo(this.baseValue);
+  }
+  set widgetSetter(nextValue: number) {
+    this.baseValue = helperTwo(nextValue);
+  }
+  static create(factoryParam: number): DerivedWidget {
+    return new DerivedWidget(factoryParam);
+  }
+}
+export type WidgetKind = "base" | "derived";
+export enum WidgetStatus { Active, Inactive }
+export namespace WidgetNamespace {
+  export const version = 1;
+}
+export const sharedWidget: DerivedWidget = DerivedWidget.create(9);
+`;
+
+  type PendingSite = { readonly start_utf16: number; readonly end_utf16: number; readonly site_kind: "identifier_ref" | "call" | "heritage" | "typed_decl" };
+
+  function spanFor(text: string, needle: string): { readonly start: number; readonly end: number } {
+    const start = text.indexOf(needle);
+    if (start < 0) throw new Error(`fixture text is missing ${JSON.stringify(needle)}`);
+    return { start, end: start + needle.length };
+  }
+
+  /** Every span below is deliberately built from a UNIQUE substring of
+   * `widgetSource` (verified by construction, not by assertion) so each
+   * resolves to exactly the AST node this test intends -- heritage entries,
+   * call expressions, a modifier-guarded constructor, and one declaration of
+   * every kind `rustSemanticDeclarationShape` recognizes. */
+  function widgetPendingSites(text: string): readonly PendingSite[] {
+    const extendsBase = spanFor(text, "extends BaseWidget");
+    const implementsFoo = spanFor(text, "implements IFoo");
+    const implementsBar = spanFor(text, ", IBar");
+    const ctorCall = spanFor(text, "helperOne(ctorParam)");
+    const fooCall = spanFor(text, "helperOne(this.baseValue)");
+    const getterCall = spanFor(text, "helperTwo(this.baseValue)");
+    const setterCall = spanFor(text, "helperTwo(nextValue)");
+    const ctorParam = spanFor(text, "ctorParam: number");
+    const typeAliasStart = text.indexOf("export type WidgetKind");
+    const typeAliasEnd = text.indexOf(";", typeAliasStart) + 1;
+    const enumStart = text.indexOf("export enum WidgetStatus");
+    const enumEnd = text.indexOf("}", enumStart) + 1;
+    const namespaceStart = text.indexOf("export namespace WidgetNamespace");
+    const namespaceEnd = text.indexOf("}", namespaceStart) + 1;
+    const variableStart = text.indexOf("sharedWidget:");
+    const variableEnd = text.indexOf(";", variableStart);
+    const factoryParamUsage = text.lastIndexOf("factoryParam");
+    const sites: PendingSite[] = [
+      { start_utf16: extendsBase.start + "extends ".length, end_utf16: extendsBase.start + "extends ".length + "BaseWidget".length, site_kind: "heritage" },
+      { start_utf16: implementsFoo.start + "implements ".length, end_utf16: implementsFoo.start + "implements ".length + "IFoo".length, site_kind: "heritage" },
+      { start_utf16: implementsBar.start + ", ".length, end_utf16: implementsBar.start + ", ".length + "IBar".length, site_kind: "heritage" },
+      { start_utf16: ctorCall.start, end_utf16: ctorCall.end, site_kind: "call" },
+      { start_utf16: fooCall.start, end_utf16: fooCall.end, site_kind: "call" },
+      { start_utf16: getterCall.start, end_utf16: getterCall.end, site_kind: "call" },
+      { start_utf16: setterCall.start, end_utf16: setterCall.end, site_kind: "call" },
+      { start_utf16: ctorParam.start, end_utf16: ctorParam.end, site_kind: "typed_decl" },
+      { start_utf16: typeAliasStart, end_utf16: typeAliasEnd, site_kind: "typed_decl" },
+      { start_utf16: enumStart, end_utf16: enumEnd, site_kind: "typed_decl" },
+      { start_utf16: namespaceStart, end_utf16: namespaceEnd, site_kind: "typed_decl" },
+      { start_utf16: variableStart, end_utf16: variableEnd, site_kind: "typed_decl" },
+      { start_utf16: factoryParamUsage, end_utf16: factoryParamUsage + "factoryParam".length, site_kind: "identifier_ref" },
+    ];
+    return sites.sort((left, right) => left.start_utf16 - right.start_utf16);
+  }
+
+  it("descends straight to every pending site (nested spans, cursor rewind, multi-type heritage dedup, modifier-guarded constructor)", () => {
+    const files: AnalyzerFile[] = [{ path: "src/widgets.ts", text: widgetSource }];
+    const rootNames = files.map((file) => file.path);
+    const pendingSites = widgetPendingSites(widgetSource);
+    const session = new JsTsAnalysisSession();
+    try {
+      expect(session.prepareRustSemanticState({
+        files, root_names: rootNames,
+        rust_semantic_scope: { authority: "urdira:jsts-syntax-worker", changed_paths: rootNames, affected_paths: rootNames },
+      })).toBe("full");
+      const result = session.analyzeRustSemanticOwner({ files, owner_path: "src/widgets.ts", pending_sites: pendingSites });
+
+      const entityKind = (kind: string, name: string) => result.entities.find((entity) => entity.kind === kind && entity.name === name);
+      // Heritage targets (BaseWidget/IFoo/IBar) and the constructor itself are
+      // reached only by climbing the parent chain from a pending-site node --
+      // never independently listed as their own site -- so their presence
+      // here is proof the descent + entityForDeclaration climb both work.
+      expect(entityKind("class", "BaseWidget")).toBeDefined();
+      // Never itself a pending-site target -- reached only because any of
+      // its members' OWN entity needs a `parent` (`entityForDeclaration`'s
+      // parent-chain climb), proving that climb still works under the
+      // localized descent.
+      expect(entityKind("class", "DerivedWidget")).toBeDefined();
+      expect(entityKind("interface", "IFoo")).toBeDefined();
+      expect(entityKind("interface", "IBar")).toBeDefined();
+      expect(entityKind("type", "WidgetKind")).toBeDefined();
+      expect(entityKind("enum", "WidgetStatus")).toBeDefined();
+      expect(entityKind("namespace", "WidgetNamespace")).toBeDefined();
+      expect(entityKind("variable", "sharedWidget")).toBeDefined();
+      expect(entityKind("parameter", "ctorParam")).toBeDefined();
+      expect(entityKind("parameter", "factoryParam")).toBeDefined();
+      expect(entityKind("method", "fooMethod")).toBeDefined();
+      expect(entityKind("getter", "widgetGetter")).toBeDefined();
+      expect(entityKind("setter", "widgetSetter")).toBeDefined();
+      expect(entityKind("method", "create")).toBeDefined();
+      const constructorEntity = result.entities.find((entity) => entity.kind === "constructor");
+      expect(constructorEntity).toBeDefined();
+      expect(constructorEntity!.name).toBe("constructor");
+      // `private constructor(...)` -- constructorKeywordStart must have
+      // skipped the accessibility modifier to anchor identity on the
+      // "constructor" keyword itself, matching a fresh (non-hybrid) build.
+      const fresh = analyzeProject({ files, root_names: rootNames });
+      expect(constructorEntity!.id).toBe(fresh.entities.find((entity) => entity.kind === "constructor")!.id);
+
+      // Multi-type heritage clause dedup: two `heritage` pending sites for
+      // `implements IFoo, IBar` must resolve onto the SAME HeritageClause
+      // node (`nearestHeritageClause`) and be visited exactly once, so the
+      // clause's own type loop still emits exactly one relation per type --
+      // never doubled by a second, redundant `visit()`.
+      const implementsRelations = result.relations.filter((relation) => relation.kind === "core:implements");
+      expect(implementsRelations).toHaveLength(2);
+      expect(implementsRelations.map((relation) => relation.target_id).sort()).toEqual(
+        [entityKind("interface", "IFoo")!.id, entityKind("interface", "IBar")!.id].sort(),
+      );
+      const inheritsRelations = result.relations.filter((relation) => relation.kind === "core:inherits");
+      expect(inheritsRelations).toHaveLength(1);
+      expect(inheritsRelations[0]!.target_id).toBe(entityKind("class", "BaseWidget")!.id);
+      // These exactly match a fresh (non-hybrid) build's own heritage
+      // relations for this file -- same ids, same order.
+      expect(implementsRelations).toEqual(fresh.relations.filter((relation) => relation.path === "src/widgets.ts" && relation.kind === "core:implements"));
+      expect(inheritsRelations).toEqual(fresh.relations.filter((relation) => relation.path === "src/widgets.ts" && relation.kind === "core:inherits"));
+
+      const callRelations = result.relations.filter((relation) => relation.kind === "core:call");
+      expect(callRelations.filter((relation) => relation.target_id === entityKind("function", "helperOne")!.id)).toHaveLength(2);
+      expect(callRelations.filter((relation) => relation.target_id === entityKind("function", "helperTwo")!.id)).toHaveLength(2);
+      expect(result.relations.some((relation) => relation.kind === "core:references" && relation.target_id === entityKind("parameter", "factoryParam")!.id)).toBe(true);
+
+      // Grouped path: the very same pending sites, resolved through
+      // `beginRustSemanticOwnerGroup`'s own pending-site branch, must produce
+      // an identical result -- and a sibling owner with an EMPTY pending-site
+      // list (Rust proved nothing is left for the checker) must short-circuit
+      // to no entities/relations without touching the checker at all.
+      const filesWithEmpty: AnalyzerFile[] = [...files, { path: "src/empty-owner.ts", text: "// nothing pending here\n" }];
+      expect(session.prepareRustSemanticState({
+        files: filesWithEmpty, root_names: [...rootNames, "src/empty-owner.ts"],
+        rust_semantic_scope: { authority: "urdira:jsts-syntax-worker", changed_paths: filesWithEmpty.map((file) => file.path), affected_paths: filesWithEmpty.map((file) => file.path) },
+      })).toBe("full");
+      session.beginRustSemanticOwnerGroup(
+        ["src/widgets.ts", "src/empty-owner.ts"],
+        true,
+        new Map([["src/widgets.ts", pendingSites], ["src/empty-owner.ts", []]]),
+      );
+      const groupedWidgets = session.analyzeRustSemanticOwner({ files: filesWithEmpty, owner_path: "src/widgets.ts" });
+      const groupedEmpty = session.analyzeRustSemanticOwner({ files: filesWithEmpty, owner_path: "src/empty-owner.ts" });
+      session.endRustSemanticOwnerGroup();
+      expect(groupedWidgets.relations).toEqual(result.relations);
+      expect(groupedWidgets.entities).toEqual(result.entities);
+      expect(groupedEmpty.entities).toEqual([]);
+      expect(groupedEmpty.relations).toEqual([]);
+
+      // `includeInferredTypes: false` must still resolve pending sites
+      // without crashing (declarationNodes fed from the resolution stay
+      // empty rather than driving a checker type query).
+      session.beginRustSemanticOwnerGroup(["src/widgets.ts"], false, new Map([["src/widgets.ts", pendingSites]]));
+      const untypedGrouped = session.analyzeRustSemanticOwner({ files: filesWithEmpty, owner_path: "src/widgets.ts" });
+      session.endRustSemanticOwnerGroup();
+      expect(untypedGrouped.entities.every((entity) => entity.type === undefined)).toBe(true);
+    } finally {
+      session.close();
+    }
   });
 });

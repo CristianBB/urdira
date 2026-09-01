@@ -233,7 +233,7 @@ describe("dependency-free runtime bootstrap", () => {
         const privateManifest = JSON.parse(await readFile(join(staging_root, "package.json"), "utf8"));
         expect(privateManifest).toMatchObject({
           dependencies: { "@urdira/runtime": "0.3.3" },
-          overrides: { "adm-zip": "0.6.0", sharp: "0.35.3" },
+          overrides: { "adm-zip": "0.6.0", sharp: "0.35.3", protobufjs: "7.6.5" },
           allowScripts: RUNTIME_INSTALL_SCRIPT_APPROVALS,
         });
         const packageRoot = join(staging_root, "node_modules", "@urdira", "runtime");

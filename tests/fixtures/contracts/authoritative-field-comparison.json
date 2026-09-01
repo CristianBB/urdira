@@ -4,7 +4,7 @@
       "model": "Codebase",
       "field": "codebase_id",
       "logical_type": "Identifier",
-      "description": "`Codebase.codebase_id` is the random stable identity of one optional grouping; `display_name` is mutable presentation metadata and `vcs_identity` is an optional matching hint, never identity authority.",
+      "description": "`Codebase.codebase_id` is the random stable identity of one project grouping; `display_name` is mutable presentation metadata and `vcs_identity` is an optional matching hint, never identity authority.",
       "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
     },
     {

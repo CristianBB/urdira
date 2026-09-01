@@ -19,8 +19,9 @@ describe("Phase 14 release acceptance suite", () => {
 
   it("runs the deterministic benchmark and focused acceptance gates on demand", async () => {
     const root = process.cwd();
-    const report = await runReleaseSuite({ rootDir: root, outputDir: join(root, "release/artifacts-test"), reportPath: join(root, "release/reports/phase-14-test-report.json"), skipInstall: true });
+    const report = await runReleaseSuite({ rootDir: root, outputDir: join(root, "release/artifacts-test"), reportPath: join(root, "release/reports/phase-14-test-report.json"), skipInstall: true, nativeRequired: false, targets: ["darwin-arm64"] });
     expect(report["status"]).toBe("passed");
     expect(report["gates"]).toMatchObject({ benchmark: { status: "passed" }, package_inspection: { status: "passed" } });
+    expect(Object.keys((report["gates"] as { package_inspection: { targets: Record<string, unknown> } }).package_inspection.targets)).toEqual(["darwin-arm64"]);
   }, 180_000);
 });

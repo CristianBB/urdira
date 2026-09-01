@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -25,6 +25,7 @@ import {
   type JsTsDirectDependency,
 } from "../packages/plugin-javascript-typescript/src/index.js";
 import { detectWorkspaceTechnologies } from "../packages/engine/src/index.js";
+import { factDeltaStreamCanonicalRow } from "@urdira/plugin-sdk";
 
 describe("bundled JavaScript/TypeScript analyzer", () => {
   it("publishes the approved three structural stages in dependency order", () => {
@@ -193,6 +194,113 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
     await worker.terminate();
   });
 
+  it("rejects native-bound stage-one work before TypeScript reads or parses source", async () => {
+    const worker = createJavascriptTypescriptWorker({ runtime_executable_binding_digest: `sha256:${"a".repeat(64)}` });
+    await expect(worker.invoke({
+      protocol_version: "1.0.0",
+      request_id: "request-native-stage-one",
+      request_digest: "digest-native-stage-one",
+      call: "analyze_artifact",
+      deadline: "2030-01-01T00:00:00.000Z",
+      cancellation_id: "cancel-native-stage-one",
+      payload: {
+        publication_stage_id: "jsts:structural_stage_1",
+        files: [{ path: "../would-fail-if-read.ts", text: "export const duplicate = true;" }],
+      },
+    })).rejects.toThrow(/exclusive-work violation/iu);
+    await worker.terminate();
+  });
+
+  it("rejects native-bound semantic work that omits the Rust-authoritative affected scope", async () => {
+    const worker = createJavascriptTypescriptWorker({ runtime_executable_binding_digest: `sha256:${"a".repeat(64)}` });
+    try {
+      await expect(worker.invoke({
+        protocol_version: "1.0.0",
+        request_id: "request-native-semantic-without-scope",
+        request_digest: "digest-native-semantic-without-scope",
+        call: "analyze_artifact",
+        deadline: "2030-01-01T00:00:00.000Z",
+        cancellation_id: "cancel-native-semantic-without-scope",
+        payload: {
+          publication_stage_id: "jsts:structural_stage_2",
+          files: [{ path: "src/main.ts", text: "export const value = 1;" }],
+          root_names: ["src/main.ts"],
+        },
+      })).rejects.toThrow(/exclusive-work violation.*Rust-authoritative affected scope/iu);
+    } finally {
+      await worker.terminate();
+    }
+  });
+
+  it("prepares the checker once across semantic stages without rebuilding Rust-owned dependency work", async () => {
+    let analysisBuilds = 0;
+    const worker = createJavascriptTypescriptWorker({
+      runtime_executable_binding_digest: `sha256:${"b".repeat(64)}`,
+      on_analysis_build: () => { analysisBuilds += 1; },
+    });
+    const files = [
+      { path: "src/main.ts", text: 'import { helper } from "./helper"; export const main = helper();' },
+      { path: "src/helper.ts", text: "export function helper(): number { return 1; }" },
+    ];
+    const payload = {
+      files,
+      root_names: files.map((file) => file.path),
+      rust_semantic_scope: {
+        authority: "urdira:jsts-syntax-worker",
+        changed_paths: files.map((file) => file.path),
+        affected_paths: files.map((file) => file.path),
+      },
+    };
+    const invokeStage = async (stage: "jsts:structural_stage_2" | "jsts:structural_stage_3", requestId: string) => await worker.invoke({
+      protocol_version: "1.0.0",
+      request_id: requestId,
+      request_digest: `digest:${requestId}`,
+      call: "analyze_closure",
+      deadline: "2030-01-01T00:00:00.000Z",
+      cancellation_id: `cancel:${requestId}`,
+      payload: { ...payload, publication_stage_id: stage },
+    }) as { readonly payload: Readonly<Record<string, unknown>> };
+    try {
+      const stage2 = await invokeStage("jsts:structural_stage_2", "request-native-semantic-2");
+      const stage3 = await invokeStage("jsts:structural_stage_3", "request-native-semantic-3");
+      for (const result of [stage2, stage3]) {
+        expect(result.payload).toMatchObject({ semantic_state_prepared: true, dependency_authority: "urdira:jsts-syntax-worker" });
+        expect(result.payload).not.toHaveProperty("dependency_graph");
+        expect(result.payload).not.toHaveProperty("dependency_closures");
+        expect(result.payload).not.toHaveProperty("impactful_changed_paths");
+      }
+      expect(analysisBuilds).toBe(1);
+    } finally {
+      await worker.terminate();
+    }
+  });
+
+  it("fails closed on a Rust semantic scope that is not a subset of root_names", async () => {
+    const worker = createJavascriptTypescriptWorker({ runtime_executable_binding_digest: `sha256:${"c".repeat(64)}` });
+    try {
+      await expect(worker.invoke({
+        protocol_version: "1.0.0",
+        request_id: "request-invalid-native-semantic-scope",
+        request_digest: "digest:invalid-native-semantic-scope",
+        call: "analyze_closure",
+        deadline: "2030-01-01T00:00:00.000Z",
+        cancellation_id: "cancel:invalid-native-semantic-scope",
+        payload: {
+          files: [{ path: "src/main.ts", text: "export const main = 1;" }],
+          root_names: ["src/main.ts"],
+          publication_stage_id: "jsts:structural_stage_2",
+          rust_semantic_scope: {
+            authority: "urdira:jsts-syntax-worker",
+            changed_paths: ["src/outside.ts"],
+            affected_paths: ["src/outside.ts"],
+          },
+        },
+      })).rejects.toThrow(/members of root_names|outside root_names/iu);
+    } finally {
+      await worker.terminate();
+    }
+  });
+
   it("hydrates a verified source reference directly from CAS", async () => {
     const casRoot = await mkdtemp(join(tmpdir(), "urdira-jsts-cas-"));
     const source = new TextEncoder().encode("export const value = 1;\n");
@@ -224,6 +332,131 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
     } finally {
       await worker.terminate();
       await rm(casRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses the verified checker snapshot for owner publication without rereading CAS source bytes", async () => {
+    const casRoot = await mkdtemp(join(tmpdir(), "urdira-jsts-prepared-cas-"));
+    const source = new TextEncoder().encode("export function main(value: number): number { return value; }\n");
+    const hex = createHash("sha256").update(source).digest("hex");
+    const contentHash = `sha256:${hex}`;
+    const casPath = join(casRoot, "sha256", hex.slice(0, 2), hex.slice(2));
+    await mkdir(join(casRoot, "sha256", hex.slice(0, 2)), { recursive: true });
+    await writeFile(casPath, source);
+    const worker = createJavascriptTypescriptWorker({
+      cas_root: casRoot,
+      runtime_executable_binding_digest: `sha256:${"e".repeat(64)}`,
+    });
+    const files = [{
+      path: "src/main.ts",
+      content_hash: contentHash,
+      artifact_id: "artifact:main",
+      artifact_version_id: "version:main",
+    }];
+    const rustScope = {
+      authority: "urdira:jsts-syntax-worker",
+      changed_paths: ["src/main.ts"],
+      affected_paths: ["src/main.ts"],
+    } as const;
+    try {
+      await worker.invoke({
+        protocol_version: "1.0.0", request_id: "request-prepared-cas-closure", request_digest: "digest:prepared-cas-closure",
+        call: "analyze_closure", deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:prepared-cas-closure",
+        payload: { files, root_names: ["src/main.ts"], publication_stage_id: "jsts:structural_stage_2", rust_semantic_scope: rustScope },
+      });
+      await unlink(casPath);
+      await expect(worker.invoke({
+        protocol_version: "1.0.0", request_id: "request-prepared-cas-owner", request_digest: "digest:prepared-cas-owner",
+        call: "analyze_artifact", deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:prepared-cas-owner",
+        payload: {
+          files,
+          root_names: ["src/main.ts"],
+          owner_path: "src/main.ts",
+          publication_stage_id: "jsts:structural_stage_2",
+          rust_semantic_scope: rustScope,
+          work_item: {
+            candidate_generation_id: "candidate:prepared-cas", workspace_id: "workspace:prepared-cas", artifact_id: "artifact:main",
+            target_artifact_version_id: "version:main", work_item_id: "work:prepared-cas", plugin_id: "urdira:javascript_typescript",
+            plugin_version: "0.4.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:prepared-cas", owner_artifact_id: "artifact:main",
+              owner_artifact_version_id: "version:main", capability: "core:call_relationships", record_categories: ["entity", "relation", "diagnostic"],
+              record_kinds: ["jsts:relation_call", "jsts:relation_references", "jsts:relation_inherits", "jsts:relation_implements"],
+              base_record_set_digest: "sha256:empty", output_completeness: "complete" }],
+          },
+          accepted_manifest: { plugin_input_access_manifest_id: "manifest:prepared-cas", manifest_digest: "sha256:manifest-prepared-cas", artifact_version_entries: [{ artifact_version_id: "version:main" }], record_entries: [] },
+        },
+      })).resolves.toMatchObject({ outcome: "success", payload: { outcome: "success", result_type: "fact_delta" } });
+    } finally {
+      await worker.terminate();
+      await rm(casRoot, { recursive: true, force: true });
+    }
+  });
+
+  // E1c cutover (design doc E1, step 3): `rust_hybrid_pending_sites` on an
+  // `analyze_artifact` payload is the wire carrier for the Rust worker's own
+  // localized-descent sites (`pendingSitesFromPayload` in worker.ts). This
+  // exercises the wiring end to end -- ungrouped (a single `analyze_artifact`
+  // call) and grouped (`invokeFactDeltaStreamGroup`, which additionally
+  // routes every request's own sites through `pendingSitesByOwnerFromRequests`
+  // into `beginRustSemanticOwnerGroup`) -- and confirms malformed entries are
+  // dropped rather than failing the owner.
+  it("wires rust_hybrid_pending_sites through analyze_artifact (ungrouped and grouped), dropping malformed entries", async () => {
+    const worker = createJavascriptTypescriptWorker({ runtime_executable_binding_digest: `sha256:${"f".repeat(64)}` });
+    const files = [{ path: "src/main.ts", text: "export function helper(value: number): number { return value + 1; }\nexport function main(value: number): number { return helper(value); }" }];
+    const rustScope = { authority: "urdira:jsts-syntax-worker", changed_paths: ["src/main.ts"], affected_paths: ["src/main.ts"] } as const;
+    const callSpanStart = files[0]!.text.indexOf("helper(value)");
+    const malformedSites = [
+      { start_utf16: "not-a-number", end_utf16: 5, site_kind: "call" },
+      { start_utf16: 0, end_utf16: 5, site_kind: "not-a-real-kind" },
+      null,
+      "not-an-object",
+    ];
+    const workItem = (id: string) => ({
+      candidate_generation_id: `candidate:${id}`, workspace_id: `workspace:${id}`, artifact_id: "artifact:main",
+      target_artifact_version_id: "version:main", work_item_id: `work:${id}`, plugin_id: "urdira:javascript_typescript",
+      plugin_version: "0.4.0", expected_replacement_scopes: [{ replacement_scope_id: `scope:${id}`, owner_artifact_id: "artifact:main",
+        owner_artifact_version_id: "version:main", capability: "core:call_relationships", record_categories: ["entity", "relation", "diagnostic"],
+        record_kinds: ["jsts:relation_call", "jsts:relation_references", "jsts:relation_inherits", "jsts:relation_implements"],
+        base_record_set_digest: "sha256:empty", output_completeness: "complete" }],
+    });
+    const acceptedManifest = (id: string) => ({ plugin_input_access_manifest_id: `manifest:${id}`, manifest_digest: `sha256:manifest-${id}`, artifact_version_entries: [{ artifact_version_id: "version:main" }], record_entries: [] });
+    try {
+      await worker.invoke({
+        protocol_version: "1.0.0", request_id: "request-pending-sites-prepare", request_digest: "digest:pending-sites-prepare",
+        call: "analyze_closure", deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:pending-sites-prepare",
+        payload: { files, root_names: ["src/main.ts"], publication_stage_id: "jsts:structural_stage_2", rust_semantic_scope: rustScope },
+      });
+      const result = await worker.invoke({
+        protocol_version: "1.0.0", request_id: "request-pending-sites-owner", request_digest: "digest:pending-sites-owner",
+        call: "analyze_artifact", deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:pending-sites-owner",
+        payload: {
+          files, root_names: ["src/main.ts"], owner_path: "src/main.ts", publication_stage_id: "jsts:structural_stage_2", rust_semantic_scope: rustScope,
+          rust_hybrid_pending_sites: [{ start_utf16: callSpanStart, end_utf16: callSpanStart + "helper(value)".length, site_kind: "call" }, ...malformedSites],
+          work_item: workItem("pending-sites"),
+          accepted_manifest: acceptedManifest("pending-sites"),
+        },
+      }) as { readonly payload: { readonly outcome: string; readonly validation_input: { readonly raw_delta: { readonly proposed_records: readonly { readonly kind: string; readonly body: Readonly<Record<string, unknown>> }[] } } } };
+      expect(result.payload.outcome).toBe("success");
+      const records = result.payload.validation_input.raw_delta.proposed_records;
+      expect(records.some((record) => record.kind === "jsts:relation_call")).toBe(true);
+
+      // Grouped path: the same sites, but routed through
+      // `pendingSitesByOwnerFromRequests` into `beginRustSemanticOwnerGroup`.
+      const groupRequest = {
+        protocol_version: "1.0.0", request_id: "request-pending-sites-group", request_digest: "digest:pending-sites-group",
+        call: "analyze_artifact" as const, deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:pending-sites-group",
+        payload: {
+          files, root_names: ["src/main.ts"], owner_path: "src/main.ts", publication_stage_id: "jsts:structural_stage_2", rust_semantic_scope: rustScope,
+          rust_hybrid_pending_sites: [{ start_utf16: callSpanStart, end_utf16: callSpanStart + "helper(value)".length, site_kind: "call" }],
+          work_item: workItem("pending-sites-group"),
+          accepted_manifest: acceptedManifest("pending-sites-group"),
+        },
+      };
+      const [groupedStream] = await worker.invokeFactDeltaStreamGroup([groupRequest]);
+      const groupedRecords: string[] = [];
+      for await (const batch of groupedStream!.batches) groupedRecords.push(...batch.records.map((record) => record.kind));
+      expect(groupedRecords).toContain("jsts:relation_call");
+    } finally {
+      await worker.terminate();
     }
   });
 
@@ -276,6 +509,96 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
       },
     })).rejects.toThrow(/record_entries/);
     await worker.terminate();
+  });
+
+  it("publishes type information as semantic records without reconstructing stage-one declaration records", async () => {
+    const cacheDir = await mkdtemp(join(tmpdir(), "urdira-jsts-semantic-spool-"));
+    let semanticOwnerWalks = 0;
+    let semanticGroupPreparations = 0;
+    const worker = createJavascriptTypescriptWorker({
+      runtime_executable_binding_digest: `sha256:${"d".repeat(64)}`,
+      analysis_cache_dir: cacheDir,
+      on_rust_semantic_owner_analyze: () => { semanticOwnerWalks += 1; },
+      on_rust_semantic_group_prepare: () => { semanticGroupPreparations += 1; },
+    });
+    const files = [{ path: "src/main.ts", text: "export function helper(value: number): number { return value; }\nexport function main(value: number): number { return helper(value); }" }];
+    const rustScope = { authority: "urdira:jsts-syntax-worker", changed_paths: ["src/main.ts"], affected_paths: ["src/main.ts"] };
+    try {
+      await worker.invoke({
+        protocol_version: "1.0.0", request_id: "request-stage2-prepare-spool", request_digest: "digest:stage2-prepare-spool",
+        call: "analyze_closure", deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:stage2-prepare-spool",
+        payload: { files, root_names: ["src/main.ts"], publication_stage_id: "jsts:structural_stage_2", rust_semantic_scope: rustScope },
+      });
+      const stage2Streams = await worker.invokeFactDeltaStreamGroup([{
+        protocol_version: "1.0.0", request_id: "request-stage2-facts-spool", request_digest: "digest:stage2-facts-spool",
+        call: "analyze_artifact" as const, deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:stage2-facts-spool",
+        payload: {
+          files, root_names: ["src/main.ts"], owner_path: "src/main.ts", publication_stage_id: "jsts:structural_stage_2", rust_semantic_scope: rustScope,
+          work_item: {
+            candidate_generation_id: "candidate:stage2-spool", workspace_id: "workspace:stage2-spool", artifact_id: "artifact:main",
+            target_artifact_version_id: "version:main", work_item_id: "work:stage2-spool", plugin_id: "urdira:javascript_typescript",
+            plugin_version: "0.4.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:stage2-spool", owner_artifact_id: "artifact:main",
+              owner_artifact_version_id: "version:main", capability: "core:call_relationships", record_categories: ["entity", "relation", "diagnostic"],
+              record_kinds: ["jsts:relation_call", "jsts:relation_references", "jsts:relation_inherits", "jsts:relation_implements"],
+              base_record_set_digest: "sha256:empty", output_completeness: "complete" }],
+          },
+          accepted_manifest: { plugin_input_access_manifest_id: "manifest:stage2-spool", manifest_digest: "sha256:manifest-stage2-spool", artifact_version_entries: [{ artifact_version_id: "version:main" }], record_entries: [] },
+        },
+      }]);
+      for await (const _batch of stage2Streams[0]!.batches) { /* seal the checker-backed stage-2 owner */ }
+      expect(semanticGroupPreparations).toBe(1);
+      await worker.invoke({
+        protocol_version: "1.0.0", request_id: "request-stage3-prepare", request_digest: "digest:stage3-prepare",
+        call: "analyze_closure", deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:stage3-prepare",
+        payload: { files, root_names: ["src/main.ts"], publication_stage_id: "jsts:structural_stage_3", rust_semantic_scope: rustScope },
+      });
+      const stage3Request = {
+        protocol_version: "1.0.0", request_id: "request-stage3-facts", request_digest: "digest:stage3-facts",
+        call: "analyze_artifact" as const, deadline: "2030-01-01T00:00:00.000Z", cancellation_id: "cancel:stage3-facts",
+        payload: {
+          files,
+          root_names: ["src/main.ts"],
+          owner_path: "src/main.ts",
+          publication_stage_id: "jsts:structural_stage_3",
+          rust_semantic_scope: rustScope,
+          work_item: {
+            candidate_generation_id: "candidate:stage3", workspace_id: "workspace:stage3", artifact_id: "artifact:main",
+            target_artifact_version_id: "version:main", work_item_id: "work:stage3", plugin_id: "urdira:javascript_typescript",
+            plugin_version: "0.4.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:stage3", owner_artifact_id: "artifact:main",
+              owner_artifact_version_id: "version:main", capability: "core:type_information", record_categories: ["entity", "relation", "diagnostic"],
+              record_kinds: ["jsts:entity_inferred_type", "jsts:relation_type_of", "jsts:relation_covers", "jsts:diagnostic"],
+              base_record_set_digest: "sha256:empty", output_completeness: "complete" }],
+          },
+          accepted_manifest: { plugin_input_access_manifest_id: "manifest:stage3", manifest_digest: "sha256:manifest-stage3", artifact_version_entries: [{ artifact_version_id: "version:main" }], record_entries: [] },
+        },
+      };
+      const grouped = await worker.invokeFactDeltaStreamGroup([stage3Request]);
+      const oracleRecords: string[] = [];
+      const oracleDependencies: string[] = [];
+      for await (const batch of grouped[0]!.batches) {
+        oracleRecords.push(...batch.records.map(factDeltaStreamCanonicalRow));
+        oracleDependencies.push(...batch.dependencies.map(factDeltaStreamCanonicalRow));
+      }
+      const direct = await worker.invokeRustSemanticObservationGroup([stage3Request]);
+      expect(direct).toHaveLength(1);
+      expect(direct[0]!.batches.flatMap((batch) => batch.canonical_records)).toEqual(oracleRecords);
+      expect(direct[0]!.batches.flatMap((batch) => batch.canonical_dependencies)).toEqual(oracleDependencies);
+      expect(direct[0]!.batches[0]!.delta_digest).toBe(grouped[0]!.header.delta_digest);
+      expect(direct[0]!.batches[0]!.fact_delta_id).toBe(`${grouped[0]!.header.fact_delta_id}:0`);
+      expect(semanticGroupPreparations).toBe(1);
+      const result = await worker.invoke(stage3Request) as { readonly payload: { readonly validation_input: { readonly raw_delta: { readonly proposed_records: readonly { readonly kind: string; readonly body: Readonly<Record<string, unknown>> }[] } } } };
+      const records = result.payload.validation_input.raw_delta.proposed_records;
+      expect(records.some((record) => record.kind === "jsts:entity_inferred_type"
+        && record.body["name"] === "inferred type of src/main.ts.main"
+        && record.body["type"] === "(value: number) => number")).toBe(true);
+      expect(records.some((record) => record.kind === "jsts:relation_type_of")).toBe(true);
+      expect(records.some((record) => ["jsts:entity_type", "jsts:entity_callable", "jsts:entity_variable", "jsts:entity_parameter", "jsts:entity_container"].includes(record.kind))).toBe(false);
+      expect(records.some((record) => ["jsts:relation_contains", "jsts:relation_import", "jsts:relation_export"].includes(record.kind))).toBe(false);
+      expect(semanticOwnerWalks).toBe(1);
+    } finally {
+      await worker.terminate();
+      await rm(cacheDir, { recursive: true, force: true });
+    }
   });
 
   it("rejects scanner-only analyze_artifact calls without a core work item", async () => {

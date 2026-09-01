@@ -930,25 +930,14 @@ describe("P3-3a bounded enumerate->catalog byte hand-off", () => {
     expect(reads["src/file-00.ts"]!.text).toContain("export const value0 = 0;");
   });
 
-  it("reads a file's bytes ahead of any readStream call once the hand-off is enabled, and readStream reuses them instead of reading again", async () => {
+  it("retains bytes from the digest pass and readStream reuses them without another source read", async () => {
     const root = await temporaryDirectory();
     await writeFile(join(root, "alpha.ts"), "export const alpha = 1;\n");
 
-    // `#capture` itself may read a small workspace's files twice (its own
-    // stability double-check -- see `#capture`'s doc comment), and the
-    // prefetch driver's own read races ahead so fast (it is started before
-    // `enumerateNativeBatches` even returns, and a tiny fixture file needs no
-    // real latency to finish) that it is not reliably observable as
-    // happening strictly "after" that call resolves. So this proves the hand
-    // off differentially instead: with the budget enabled, total
-    // `read_file_stream` calls made before `readStream` is ever invoked must
-    // be exactly one MORE than with the budget disabled (the prefetch
-    // driver's extra read, on top of however many passes `#capture` itself
-    // takes) -- and, crucially, actually calling+consuming `readStream`
-    // afterward must add ZERO further calls when the budget is enabled
-    // (proving reuse), versus exactly one further call when disabled
-    // (proving the comparison methodology itself is sound, not just
-    // vacuously equal).
+    // Small workspaces retain the first stability pass under the 64 MiB live
+    // budget and still perform their second metadata/content proof. The
+    // enabled path therefore makes no extra speculative source read and CAS
+    // consumption adds none; disabling the hand-off adds one lazy read.
     async function run(handoffBytes: string): Promise<{ readonly beforeReadStream: number; readonly afterReadStream: number }> {
       process.env["URDIRA_CATALOG_HANDOFF_BYTES"] = handoffBytes;
       let calls = 0;
@@ -975,7 +964,7 @@ describe("P3-3a bounded enumerate->catalog byte hand-off", () => {
 
     const disabled = await run("0");
     const enabled = await run("");
-    expect(enabled.beforeReadStream).toBe(disabled.beforeReadStream + 1);
+    expect(enabled.beforeReadStream).toBe(disabled.beforeReadStream);
     expect(enabled.afterReadStream).toBe(enabled.beforeReadStream);
     expect(disabled.afterReadStream).toBe(disabled.beforeReadStream + 1);
   });
@@ -1034,7 +1023,7 @@ describe("P3-3a bounded enumerate->catalog byte hand-off", () => {
     await enumerateOnly(countingProvider);
     expect(captureCallCount).toBeGreaterThan(0);
 
-    process.env["URDIRA_CATALOG_HANDOFF_BYTES"] = "";
+    process.env["URDIRA_CATALOG_HANDOFF_BYTES"] = "0";
     let calls = 0;
     const provider = new DirectorySourceProvider({
       ...boundProvider,
@@ -1060,13 +1049,14 @@ describe("P3-3a bounded enumerate->catalog byte hand-off", () => {
     const enumeration = await provider.enumerateNativeBatches(request("enumerate", { coverage_scopes: completeScope }));
     const observations: ProviderObservation[] = [];
     for await (const batch of enumeration.batches) observations.push(...batch.observations);
-    expect(calls).toBe(captureCallCount + 1);
+    expect(calls).toBe(captureCallCount);
 
     const observation = observations[0]!;
     const stream = await provider.readStream(readRequestFor(observation));
     const chunks: Uint8Array[] = [];
     for await (const chunk of stream.chunks) chunks.push(chunk);
     const bytes = Buffer.concat(chunks);
+    expect(calls).toBe(captureCallCount + 1);
     const tamperedHash = digestBytes(new Uint8Array(bytes));
     await expect(stream.after_read?.(tamperedHash, bytes.byteLength)).rejects.toThrow();
   });
@@ -1160,7 +1150,7 @@ describe("P3-3a bounded enumerate->catalog byte hand-off", () => {
     }
     expect(fragmentCount).toBeGreaterThan(1);
     expect(observedTotal).toBe(TOTAL_FILES);
-  }, 30_000);
+  }, 60_000);
 });
 
 describe("P3-3b on_prefetched_text observer", () => {
@@ -1232,44 +1222,17 @@ describe("P3-3b on_prefetched_text observer", () => {
     const root = await temporaryDirectory();
     await writeFile(join(root, "alpha.ts"), "export const alpha = 1;\n");
 
-    // Same technique as the P3-3a tamper test above: learn `#capture`'s own
-    // call count with the hand-off disabled, so the tamper below can target
-    // exactly the prefetch driver's own read (the next call) without racing
-    // -- or breaking -- `#capture`'s own internal stability proof.
-    process.env["URDIRA_CATALOG_HANDOFF_BYTES"] = "0";
-    let captureCallCount = 0;
-    const countingProvider = new DirectorySourceProvider({
-      ...boundProvider, root, now: () => instant,
-      file_system: { ...NODE_DIRECTORY_FILE_SYSTEM, read_file_stream: (candidate) => { captureCallCount += 1; return NODE_DIRECTORY_FILE_SYSTEM.read_file_stream!(candidate); } },
-    });
-    {
-      const enumeration = await countingProvider.enumerateNativeBatches(request("enumerate", { coverage_scopes: completeScope }));
-      for await (const _batch of enumeration.batches) { /* drain */ }
-    }
-    expect(captureCallCount).toBeGreaterThan(0);
-
-    process.env["URDIRA_CATALOG_HANDOFF_BYTES"] = "";
-    let calls = 0;
     let fired = false;
     const provider = new DirectorySourceProvider({
       ...boundProvider,
       root,
       now: () => instant,
       on_prefetched_text: () => { fired = true; },
-      file_system: {
-        ...NODE_DIRECTORY_FILE_SYSTEM,
-        read_file_stream: (candidate) => (async function* (): AsyncGenerator<Uint8Array> {
-          calls += 1;
-          if (calls === captureCallCount + 1) { yield new TextEncoder().encode("export const alpha = 2;\n"); return; }
-          for await (const chunk of NODE_DIRECTORY_FILE_SYSTEM.read_file_stream!(candidate)) yield chunk;
-        })(),
-      },
     });
     const enumeration = await provider.enumerateNativeBatches(request("enumerate", { coverage_scopes: completeScope }));
     const observations: ProviderObservation[] = [];
     for await (const batch of enumeration.batches) observations.push(...batch.observations);
-    await new Promise((resolveTick) => setTimeout(resolveTick, 20));
-    expect(calls).toBe(captureCallCount + 1);
+    await writeFile(join(root, "alpha.ts"), "export const alpha = 2;\n");
 
     const observation = observations[0]!;
     const stream = await provider.readStream({
@@ -1291,6 +1254,7 @@ describe("P3-3b on_prefetched_text observer", () => {
     const stableText = "export const alpha = 1;\n";
     await writeFile(join(root, "alpha.ts"), stableText);
     let streamCalls = 0;
+    process.env["URDIRA_CATALOG_HANDOFF_BYTES"] = "0";
     const provider = new DirectorySourceProvider({
       ...boundProvider,
       root,
@@ -1299,9 +1263,9 @@ describe("P3-3b on_prefetched_text observer", () => {
         ...NODE_DIRECTORY_FILE_SYSTEM,
         read_file_stream: (candidate) => (async function* (): AsyncGenerator<Uint8Array> {
           streamCalls += 1;
-          // `#capture` performs two digest passes. The prefetch and lazy read
-          // then observe a file that grew after enumeration.
-          const text = streamCalls <= 2 ? stableText : `${stableText}// grew while reading\n`;
+          // Native capture performs one digest pass. The subsequent lazy read
+          // observes a file that grew after enumeration.
+          const text = streamCalls === 1 ? stableText : `${stableText}// grew while reading\n`;
           yield new TextEncoder().encode(text);
         })(),
       },

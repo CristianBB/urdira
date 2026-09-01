@@ -3,9 +3,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
-import { ContentAddressedStore, createDurableStorage, createFaultInjector, openSqliteDatabase, SerializedWriter } from "../packages/storage/src/index.js";
+import { ContentAddressedStore, createDurableStorage, createFaultInjector, openSqliteDatabase, SerializedWriter, WORKSPACE_WRITER_BUSY_CODE } from "../packages/storage/src/index.js";
 import type { SqliteCommand, SqliteValue } from "../packages/storage/src/index.js";
 import type {
   ArtifactTombstone,
@@ -275,6 +275,61 @@ describe("Phase 4 durable storage", () => {
     release();
     await Promise.all([first, second, foreground]);
     expect(order).toEqual(["background-1", "foreground", "background-2"]);
+  });
+  it("throws a retryable busy error when a foreground writer lock is held past its deadline", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-writer-lock-busy-"));
+    try {
+      const storage = await createDurableStorage({ rootDir: root });
+      try {
+        await mkdir(join(root, "busy"), { recursive: true });
+        const databasePath = join(root, "busy", "workspace.sqlite");
+        const lockPath = `${databasePath}.urdira-writer.lock`;
+        // Owned by this (alive) process, so the wait loop keeps treating the
+        // lock as legitimately held instead of recovering it as orphaned.
+        await writeFile(lockPath, `${process.pid}\n`, "utf8");
+        vi.useFakeTimers({ toFake: ["Date"] });
+        try {
+          vi.setSystemTime(new Date("2026-08-09T00:00:00.000Z"));
+          const pending = storage.catalog.registerWorkspace(workspace, databasePath);
+          const assertion = expect(pending).rejects.toMatchObject({ code: WORKSPACE_WRITER_BUSY_CODE });
+          // Let the real (unfaked) 10ms retry poll run for a bit before
+          // advancing the faked clock past the wait deadline.
+          await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+          vi.setSystemTime(new Date("2026-08-09T00:00:20.001Z"));
+          await assertion;
+        } finally {
+          vi.useRealTimers();
+        }
+      } finally {
+        await storage.close();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("recovers a writer lock orphaned by a dead owner process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-writer-lock-orphan-"));
+    try {
+      const storage = await createDurableStorage({ rootDir: root });
+      try {
+        await mkdir(join(root, "orphan"), { recursive: true });
+        const databasePath = join(root, "orphan", "workspace.sqlite");
+        const lockPath = `${databasePath}.urdira-writer.lock`;
+        const deadPid = await new Promise<number>((resolveExit, reject) => {
+          const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
+          child.once("error", reject);
+          child.once("exit", () => resolveExit(child.pid!));
+        });
+        await writeFile(lockPath, `${deadPid}\n`, "utf8");
+        const registered = await storage.catalog.registerWorkspace(workspace, databasePath);
+        expect(registered.database_path).toBe(databasePath);
+        await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await storage.close();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
   it("rejects old candidate layouts at the destructive v3 boundary", async () => {
     const root = await mkdtemp(join(tmpdir(), "urdira-candidate-schema-migration-"));
@@ -1332,6 +1387,43 @@ describe("Phase 4 durable storage", () => {
     });
   });
 
+  it("commits CAS-prepared source rows without recapturing bytes", async () => {
+    await withStorage(async (_root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      const bytes = new TextEncoder().encode("prepared source");
+      const [prepared] = await opened.prepareSourceIndexContent({
+        contents: [{ content_blob_id: "blob-prepared", bytes, media_type: "text/plain; charset=utf-8" }],
+        content_streams: [],
+      });
+      if (prepared === undefined) throw new Error("CAS preparation returned no content blob");
+      const preparedVersion = { ...artifactVersion, content_blob_id: prepared.content_blob_id, content_hash: prepared.content_hash, byte_length: prepared.byte_length };
+      await opened.sourceIndex.commit({
+        expected_state_revision: 0,
+        state: {
+          workspace_id: workspace.workspace_id,
+          current_generation: 1,
+          state_revision: 1,
+          checkpoint_id: "checkpoint-prepared",
+          provider_watermarks: "{}",
+          source_state_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          updated_at: "2026-08-09T00:00:00.000000000Z",
+        },
+        batch: { ...observationBatch, observation_batch_id: "batch-prepared", observation_count: 1 },
+        observations: [{ ...observation, observation_batch_id: "batch-prepared", source_observation_id: "obs-prepared", observed_content_hash: prepared.content_hash }],
+        artifacts: [artifact],
+        contents: [],
+        content_blobs: [prepared],
+        version_closures: [],
+        versions: [{ ...preparedVersion, created_from_observation_id: "obs-prepared" }],
+        tombstone_closures: [],
+        tombstones: [],
+      });
+      expect(await opened.repositories.sourceCatalog.getContentBlob(prepared.content_blob_id)).toEqual(prepared);
+      await opened.close();
+    });
+  });
+
   it("enforces typed envelopes and foreign keys", async () => {
     await withStorage(async (_root, storage) => {
       await storage.catalog.registerWorkspace(workspace);
@@ -1909,6 +2001,30 @@ describe("Phase 4 durable storage", () => {
       expect(await opened.repositories.snapshots.get(snapshot.snapshot_id)).toBeUndefined();
       expect(await opened.repositories.snapshots.getCurrent()).toBeUndefined();
       await opened.close();
+    });
+  });
+
+  it("keeps WAL mode and publishes while a concurrent reader pins the previous snapshot", async () => {
+    await withStorage(async (root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      await opened.repositories.registries.putSnapshot(registrySnapshot);
+      await seedPublicationControls(opened);
+      const reader = await openSqliteDatabase({ filename: join(root, "workspaces", "ws-one.sqlite") });
+      try {
+        await reader.exec("BEGIN");
+        expect(await reader.get("SELECT current_snapshot_id FROM workspace_current_state WHERE workspace_id = ?", [workspace.workspace_id])).toBeUndefined();
+
+        await expect(opened.publish({ snapshot, current_state: currentState })).resolves.toBeUndefined();
+
+        expect((await opened.database.get<{ journal_mode: string }>("PRAGMA journal_mode"))?.journal_mode).toBe("wal");
+        expect(await reader.get("SELECT current_snapshot_id FROM workspace_current_state WHERE workspace_id = ?", [workspace.workspace_id])).toBeUndefined();
+        await reader.exec("COMMIT");
+        expect(await opened.repositories.snapshots.getCurrent()).toEqual(currentState);
+      } finally {
+        await reader.close();
+        await opened.close();
+      }
     });
   });
 

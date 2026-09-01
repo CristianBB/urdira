@@ -125,7 +125,7 @@ describe("Urdira Canonical Encoding", () => {
   });
 
   it("publishes the complete core canonical registries", () => {
-    expect(canonicalSchemaRegistry).toHaveLength(46);
+    expect(canonicalSchemaRegistry).toHaveLength(48);
     expect(canonicalComparatorRegistry).toHaveLength(18);
     expect(canonicalEncodingErrorDetailContracts).toHaveLength(canonicalEncodingErrorCodeRegistry.length);
     expect(digestFieldContracts).toHaveLength(142);

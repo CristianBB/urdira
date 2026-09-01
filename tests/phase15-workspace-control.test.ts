@@ -3,6 +3,7 @@ import { describe, expect, test, vi } from "vitest";
 import {
   classifyWorkspaceConfigurationImpact,
   detectWorkspaceTechnologies,
+  summarizeWorkspaceTechnologyProposal,
   WorkspaceConfigurationCoordinator,
   resolveWorkspaceRoot,
   resolveIndexStatusRequest,
@@ -44,6 +45,24 @@ describe("workspace technology detection", () => {
     expect(proposal.proposal_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(proposal.technologies.every((technology) => technology.evidence.length > 0)).toBe(true);
     expect(detectWorkspaceTechnologies(input)).toEqual(proposal);
+  });
+
+  test("bounds transport evidence without weakening the full proposal fingerprint", () => {
+    const files = Array.from({ length: 100 }, (_, index) => ({ path: `src/unit-${String(index).padStart(3, "0")}.ts` }));
+    const proposal = detectWorkspaceTechnologies({
+      provider_fingerprint: "provider-large",
+      git_state_fingerprint: "git-large",
+      plugin_catalog_fingerprint: "catalog-large",
+      files,
+    });
+
+    const summary = summarizeWorkspaceTechnologyProposal(proposal, 8);
+    const typescript = summary.technologies.find((technology) => technology.technology_id === "typescript");
+    expect(summary.proposal_fingerprint).toBe(proposal.proposal_fingerprint);
+    expect(typescript).toMatchObject({ evidence_count: 100, evidence_complete: false });
+    expect(typescript?.evidence).toHaveLength(8);
+    expect(typescript?.evidence.map((entry) => entry.path)).toEqual(files.slice(0, 8).map((entry) => entry.path));
+    expect(summarizeWorkspaceTechnologyProposal(proposal, 8)).toEqual(summary);
   });
 });
 
@@ -156,6 +175,27 @@ describe("workspace administration CLI", () => {
     expect(prompts[0]).toContain("src/index.ts (extension.typescript)");
     expect(prompts[1]).toContain("Compatible plugins to activate: urdira:javascript_typescript");
     expect(prompts[1]).toContain("Activate these plugins and start observation?");
+  });
+
+  test("labels bounded workspace evidence instead of hiding omitted paths", async () => {
+    const prompts: string[] = [];
+    await runCli(["workspace", "add", "/tmp/project"], {
+      client: { call: async () => ({ outcome: "success", payload: { workspace_id: "workspace-1" } }) },
+      preview_admin: async () => ({
+        proposal_id: "proposal-1",
+        technologies: [{
+          technology_id: "typescript",
+          kind: "language",
+          confidence: 1,
+          compatible_plugin_ids: ["urdira:javascript_typescript"],
+          evidence: [{ path: "src/000.ts", rule: "extension.typescript" }],
+          evidence_count: 100,
+          evidence_complete: false,
+        }],
+      }),
+      prompt: async (question) => { prompts.push(question); return question.includes("Configure Urdira") ? "no" : "yes"; },
+    });
+    expect(prompts[0]).toContain("showing 1 of 100 deterministic evidence paths");
   });
 
   test("explains the exact target instead of inventing a technology proposal for configure", async () => {

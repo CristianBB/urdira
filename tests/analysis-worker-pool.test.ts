@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { AnalysisWorkerPool } from "../apps/urdira/src/analysis-worker-pool.js";
+import {
+  WholeProcessTreeRssController,
+  type IndexingResourceAccountingPort,
+  type ProcessTableRssSnapshot,
+  type ProcessTreeRssAdmissionRequest,
+  type ProcessTreeRssReservation,
+} from "../apps/urdira/src/process-tree-rss.js";
 import { canonicalSha256, type WorkerTransport } from "@urdira/plugin-sdk";
 import {
   createJavascriptTypescriptWorker,
@@ -20,6 +27,160 @@ function fakeTransport(): WorkerTransport & { readonly terminated: () => boolean
 }
 
 describe("AnalysisWorkerPool", () => {
+  it("evicts idle workers and retries whole-tree RSS admission before creating a worker", async () => {
+    let currentRss = 900;
+    const rss = new WholeProcessTreeRssController({
+      root_pid: 10,
+      ceiling_rss_bytes: 1_000,
+      sampler: {
+        sample: async (): Promise<ProcessTableRssSnapshot> => ({
+          sampled_at_ms: Date.now(), source: "test", complete: true,
+          processes: [{ pid: 10, parent_pid: 1, rss_bytes: currentRss }],
+        }),
+      },
+    });
+    const created: ReturnType<typeof fakeTransport>[] = [];
+    const pool = new AnalysisWorkerPool<{ readonly tag: string }>({
+      create: () => {
+        const worker = fakeTransport();
+        created.push(worker);
+        return worker;
+      },
+      resource_accounting: rss,
+    });
+
+    const idle = await pool.acquireWithResourceAdmission("workspace:idle", { tag: "v1" }, "digest:v1", {
+      reservation_id: "scan:idle",
+      estimated_additional_rss_bytes: 50,
+    });
+    pool.release("workspace:idle");
+    expect(idle).toBe(created[0]);
+
+    currentRss = 960;
+    const originalTerminate = created[0]!.terminate;
+    created[0]!.terminate = async () => { await originalTerminate(); currentRss = 700; };
+    const admitted = await pool.acquireWithResourceAdmission("workspace:new", { tag: "v1" }, "digest:v1", {
+      reservation_id: "scan:new",
+      estimated_additional_rss_bytes: 100,
+    });
+    expect(created[0]!.terminated()).toBe(true);
+    expect(admitted).toBe(created[1]);
+    pool.release("workspace:new");
+    await pool.closeAll();
+  });
+
+  it("does not create a worker when whole-tree RSS sampling is incomplete", async () => {
+    let creates = 0;
+    const rss = new WholeProcessTreeRssController({
+      root_pid: 10,
+      ceiling_rss_bytes: 1_000,
+      sampler: {
+        sample: async () => ({ sampled_at_ms: 1, source: "test", complete: false, processes: [], failure: "denied" }),
+      },
+    });
+    const pool = new AnalysisWorkerPool<{ readonly tag: string }>({
+      create: () => { creates += 1; return fakeTransport(); },
+      resource_accounting: rss,
+    });
+    expect(() => pool.acquire("workspace:bypass", { tag: "v1" }, "digest:v1")).toThrow(/requires acquireWithResourceAdmission/);
+    await expect(pool.acquireWithResourceAdmission("workspace:a", { tag: "v1" }, "digest:v1", {
+      reservation_id: "scan:a", estimated_additional_rss_bytes: 100,
+    })).rejects.toThrow(/RSS admission exhausted.*sample_incomplete/);
+    expect(creates).toBe(0);
+  });
+
+  it("forces a fresh process-table sample for every admitted shard", async () => {
+    const requests: ProcessTreeRssAdmissionRequest[] = [];
+    const reservations: ProcessTreeRssReservation[] = [];
+    const accounting: IndexingResourceAccountingPort = {
+      async admit(request) {
+        requests.push(request);
+        const reservation: ProcessTreeRssReservation = {
+          reservation_id: request.reservation_id,
+          reserved_rss_bytes: request.estimated_additional_rss_bytes,
+          release() { return; },
+        };
+        reservations.push(reservation);
+        return {
+          admitted: true,
+          reason: "admitted",
+          reservation,
+          telemetry: {
+            sampled_at_ms: requests.length,
+            source: "test",
+            complete: true,
+            process_tree_rss_bytes: 100,
+            peak_process_tree_rss_bytes: 100,
+            process_count: 1,
+            reserved_rss_bytes: 0,
+            requested_rss_bytes: request.estimated_additional_rss_bytes,
+            projected_rss_bytes: 100 + request.estimated_additional_rss_bytes,
+            ceiling_rss_bytes: 10_000,
+            headroom_rss_bytes: 10_000 - 100 - request.estimated_additional_rss_bytes,
+            components: [],
+            missing_component_ids: [],
+          },
+        };
+      },
+      async sampleTelemetry() { throw new Error("not used"); },
+    };
+    const pool = new AnalysisWorkerPool<{ readonly tag: string }>({
+      create: () => fakeTransport(),
+      max_active: 2,
+      resource_accounting: accounting,
+    });
+
+    await pool.acquireWithResourceAdmission("workspace:a:shard:0", { tag: "v1" }, "digest:v1", {
+      reservation_id: "scan:0",
+      estimated_additional_rss_bytes: 100,
+    });
+    await pool.acquireWithResourceAdmission("workspace:a:shard:1", { tag: "v1" }, "digest:v1", {
+      reservation_id: "scan:1",
+      estimated_additional_rss_bytes: 100,
+    });
+
+    expect(requests).toEqual([
+      { reservation_id: "scan:0", estimated_additional_rss_bytes: 100, fresh_sample: true },
+      { reservation_id: "scan:1", estimated_additional_rss_bytes: 100, fresh_sample: true },
+    ]);
+    pool.release("workspace:a:shard:0");
+    pool.release("workspace:a:shard:1");
+    await pool.closeAll();
+    expect(reservations).toHaveLength(2);
+  });
+
+  it("offers a telemetry hook that evicts only idle workers above the ceiling", async () => {
+    let currentRss = 500;
+    const rss = new WholeProcessTreeRssController({
+      root_pid: 10,
+      ceiling_rss_bytes: 1_000,
+      sampler: {
+        sample: async () => ({
+          sampled_at_ms: Date.now(), source: "test", complete: true,
+          processes: [{ pid: 10, parent_pid: 1, rss_bytes: currentRss }],
+        }),
+      },
+    });
+    const created: ReturnType<typeof fakeTransport>[] = [];
+    const pool = new AnalysisWorkerPool<{ readonly tag: string }>({
+      create: () => {
+        const worker = fakeTransport();
+        const originalTerminate = worker.terminate;
+        worker.terminate = async () => { await originalTerminate(); currentRss -= 400; };
+        created.push(worker);
+        return worker;
+      },
+      resource_accounting: rss,
+    });
+    await pool.acquireWithResourceAdmission("workspace:idle", { tag: "v1" }, "digest:v1", { reservation_id: "scan:idle", estimated_additional_rss_bytes: 0 });
+    pool.release("workspace:idle");
+    currentRss = 1_200;
+
+    const telemetry = await pool.enforceResourceCeiling();
+    expect(created[0]!.terminated()).toBe(true);
+    expect(telemetry).toMatchObject({ complete: true, process_tree_rss_bytes: 800, projected_rss_bytes: 800 });
+  });
+
   it("reuses the same worker for a key across two acquire/release cycles with the same descriptor digest", () => {
     let createCount = 0;
     const pool = new AnalysisWorkerPool<{ readonly tag: string }>({ create: () => { createCount += 1; return fakeTransport(); } });
@@ -124,7 +285,7 @@ describe("AnalysisWorkerPool", () => {
   });
 
   it("evicts an idle entry after its TTL elapses", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       const pool = new AnalysisWorkerPool<{ readonly tag: string }>({ create: () => fakeTransport(), idle_ttl_ms: 1_000 });
       const a = pool.acquire("workspace:a", { tag: "v1" }, "digest:v1") as ReturnType<typeof fakeTransport>;
@@ -139,7 +300,7 @@ describe("AnalysisWorkerPool", () => {
   });
 
   it("acquiring again before the TTL elapses cancels the pending eviction", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       const pool = new AnalysisWorkerPool<{ readonly tag: string }>({ create: () => fakeTransport(), idle_ttl_ms: 1_000 });
       const a = pool.acquire("workspace:a", { tag: "v1" }, "digest:v1") as ReturnType<typeof fakeTransport>;

@@ -9,9 +9,10 @@ import type {
   ProposedRecord,
   ReplacementScope,
 } from "@urdira/contracts";
-import { canonicalSha256, pluginInputAccessManifestDigest, pluginInputAccessManifestId, type AutomaticPluginInputAccessManifest } from "@urdira/plugin-sdk";
+import { adaptFactDeltaV1ToStream, canonicalSha256, pluginInputAccessManifestDigest, pluginInputAccessManifestId, type AutomaticPluginInputAccessManifest } from "@urdira/plugin-sdk";
 import {
   FactDeltaAcceptanceService,
+  FactDeltaStreamAcceptanceService,
   type AcceptedDeltaStore,
   type CandidateTargetRegistry,
   type FactDeltaValidationInput,
@@ -127,6 +128,12 @@ function rawDelta(overrides: Partial<FactDelta> = {}): FactDelta {
   return { ...value, fact_delta_id: "delta:1", created_at: "2026-08-10T00:01:00.000Z", delta_digest: digest(value) };
 }
 
+function rawDeltaWithId(factDeltaId: string): FactDelta {
+  const value = { ...rawDelta(), fact_delta_id: factDeltaId };
+  const { fact_delta_id: _factDeltaId, created_at: _createdAt, delta_digest: _deltaDigest, ...payload } = value;
+  return { ...value, delta_digest: digest(payload) };
+}
+
 function targetRegistry(): CandidateTargetRegistry {
   return {
     registry_snapshot_id: "registry:target",
@@ -172,6 +179,50 @@ function memoryStore(): AcceptedDeltaStore {
 }
 
 describe("Phase 9 FactDelta acceptance", () => {
+  it("validates owners independently and commits a bounded physical stream group once", async () => {
+    const committed: unknown[][] = [];
+    const service = new FactDeltaStreamAcceptanceService({
+      async stageFactDeltaStreamBatch() { throw new Error("group fallback must not run"); },
+      async completeFactDeltaStream() { throw new Error("group fallback must not run"); },
+      async commitFactDeltaStreamGroup(entries) {
+        committed.push([...entries]);
+        return ["inserted", "already_accepted"];
+      },
+    });
+    const validation = input();
+    const { raw_delta: _rawDelta, ...validationInput } = validation;
+    const first = rawDeltaWithId("delta:group:1");
+    const second = rawDeltaWithId("delta:group:2");
+    const accepted = await service.acceptValidatedGroup([
+      { stream: adaptFactDeltaV1ToStream(first, { cancellation_id: "cancel:group:1" }), input: validationInput },
+      { stream: adaptFactDeltaV1ToStream(second, { cancellation_id: "cancel:group:2" }), input: validationInput },
+    ]);
+    expect(committed).toHaveLength(1);
+    expect(committed[0]).toHaveLength(2);
+    expect(accepted.map((entry) => entry.delta.fact_delta_id)).toEqual(["delta:group:1", "delta:group:2"]);
+    expect(accepted.map((entry) => entry.acceptance)).toEqual(["inserted", "already_present"]);
+  });
+
+  it("seals physical staging before the next owner when the row budget is exhausted", async () => {
+    const committed: string[][] = [];
+    const service = new FactDeltaStreamAcceptanceService({
+      async stageFactDeltaStreamBatch() { throw new Error("group fallback must not run"); },
+      async completeFactDeltaStream() { throw new Error("group fallback must not run"); },
+      async commitFactDeltaStreamGroup(entries) {
+        committed.push(entries.map((entry) => entry.header.fact_delta_id));
+        return entries.map(() => "inserted" as const);
+      },
+    });
+    const { raw_delta: _rawDelta, ...validationInput } = input();
+    const first = rawDeltaWithId("delta:row-budget:1");
+    const second = rawDeltaWithId("delta:row-budget:2");
+    await service.acceptValidatedGroup([
+      { stream: adaptFactDeltaV1ToStream(first, { cancellation_id: "cancel:row-budget:1" }), input: validationInput },
+      { stream: adaptFactDeltaV1ToStream(second, { cancellation_id: "cancel:row-budget:2" }), input: validationInput },
+    ], { max_rows: 1 });
+    expect(committed).toEqual([["delta:row-budget:1"], ["delta:row-budget:2"]]);
+  });
+
   it("accepts a registered partial claim only when its diagnostic evidence is source-owned", async () => {
     const partialScope = scope("scope:partial", { record_categories: ["entity", "diagnostic"], record_kinds: ["test:symbol", "test:diagnostic"] });
     const diagnostic = proposedRecord({ proposal_record_key: "diagnostic:1", category: "diagnostic", kind: "test:diagnostic", universal_kind: "core:construct", identity_key: "diagnostic:1", body: { code: "test:partial" } });

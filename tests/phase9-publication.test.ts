@@ -595,6 +595,302 @@ describe("Phase 9 durable candidate publication", () => {
     });
   });
 
+  it("reserves corpus-scale immutable-row preflight for replayed file-backed publications", async () => {
+    const input = publication("candidate-authority-fresh-file-backed", "authority-fresh-file-backed", initialBase);
+    const recordWithoutValidity = { category: "fact", kind: "symbol", body: null };
+    const promotedRecordDigest = digestBytes(canonicalBytes(recordWithoutValidity));
+    const recordOpens = [{
+      owner_artifact_id: "artifact-authority-file-backed",
+      owner_artifact_version_id: "version-authority-file-backed",
+      record_without_validity: JSON.stringify(recordWithoutValidity),
+      record_id_hint: `record:${promotedRecordDigest.slice("sha256:".length)}`,
+      record_digest_hint: promotedRecordDigest,
+    }];
+    const identityAssignments = [{
+      identity_assignment_id: "identity-authority-file-backed",
+      identity_type: "entity",
+      identity_id: "entity:authority-file-backed",
+      assignment_kind: "created",
+      identity_key: "authority-file-backed",
+      identity_key_digest: digest("authority-file-backed"),
+      record_id: "record:authority-file-backed",
+    }];
+    const projectionOpens = [{
+      projection_record_id: "projection:authority-file-backed",
+      projection_kind: "graph",
+      projection_key: "authority-file-backed",
+      owner_artifact_id: "artifact-authority-file-backed",
+      owner_artifact_version_id: "version-authority-file-backed",
+      source_artifact_version_ids: ["version-authority-file-backed"],
+      source_record_ids: ["record:authority-file-backed"],
+      source_projection_record_ids: [],
+      generator: "test",
+      generator_version: "1",
+      generator_configuration_digest: digest("authority-file-backed"),
+      payload: null,
+    }];
+    const artifactDependencies = [{
+      dependency_entry_id: "dependency:authority-file-backed",
+      record_id: "record:authority-file-backed",
+      owner_artifact_id: "artifact-authority-file-backed",
+      owner_artifact_version_id: "version-authority-file-backed",
+      dependency_artifact_id: "dependency-artifact-authority-file-backed",
+      dependency_artifact_version_id: "dependency-version-authority-file-backed",
+    }];
+    const lookupDependencies = [{
+      lookup_dependency_id: "lookup:authority-file-backed",
+      consumer_type: "record",
+      consumer_id: "record:authority-file-backed",
+      operation: "resolve",
+      normalized_selector_or_address: "authority-file-backed",
+    }];
+    Object.defineProperty(recordOpens, Symbol.for("urdira.file_backed_readonly_array"), { value: true });
+    Object.defineProperty(identityAssignments, Symbol.for("urdira.file_backed_readonly_array"), { value: true });
+    const queries: string[] = [];
+    const database = {
+      get: async <T>(sql: string) => {
+        queries.push(sql);
+        if (sql.includes("COUNT(*)") && (sql.includes("record_occurrences") || sql.includes("identity_assignments"))) return { count: 1 } as T;
+        return undefined;
+      },
+      all: async <T>(sql: string) => { queries.push(sql); return [] as T[]; },
+    };
+
+    await expect(buildCandidatePublicationPlan({
+      input: withTemplateSets(input, {
+        record_opens: recordOpens,
+        identity_assignments: identityAssignments,
+        artifact_dependencies: artifactDependencies,
+        lookup_dependencies: lookupDependencies,
+      }, { projection_open_template_sets: [JSON.stringify(projectionOpens)] }),
+      storedCandidate: { ...input.candidate, state: "ready" } as never,
+      workspaceId: workspace.workspace_id,
+      database: database as never,
+      faults: createFaultInjector([]),
+      generation: 2,
+      publishedAt: now,
+    })).resolves.toBeDefined();
+
+    expect(queries.some((sql) => sql.includes("COUNT(*)") && sql.includes("record_occurrences"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("COUNT(*)") && sql.includes("identity_assignments"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("SELECT * FROM record_occurrences WHERE"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("SELECT * FROM identity_assignments WHERE"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("SELECT * FROM projection_occurrences WHERE"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("SELECT * FROM projection_occurrence_dependencies WHERE"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("SELECT * FROM artifact_dependencies WHERE"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("SELECT * FROM candidate_lookup_dependencies WHERE"))).toBe(false);
+
+    // The in-memory large-candidate path carries the same promoted hints via
+    // a zero-allocation map marker even though neither sequence is
+    // file-backed. It receives the identical fresh-publication shortcut.
+    const ordinaryRecordOpens = [...recordOpens];
+    const ordinaryIdentityAssignments = [...identityAssignments];
+    const promotedMemo = new Map([[ordinaryRecordOpens[0]!, {
+      recordId: ordinaryRecordOpens[0]!.record_id_hint,
+      recordDigest: ordinaryRecordOpens[0]!.record_digest_hint,
+    }]]);
+    Object.defineProperty(promotedMemo, Symbol.for("urdira.promoted_record_open_memo"), { value: true });
+    queries.length = 0;
+    const stagingQueries: string[] = [];
+    const stagingDatabase = {
+      get: async <T>(sql: string) => {
+        stagingQueries.push(sql);
+        return { count: 0 } as T;
+      },
+    };
+    await expect(buildCandidatePublicationPlan({
+      input: {
+        ...withTemplateSets(input, {
+          record_opens: ordinaryRecordOpens,
+          identity_assignments: ordinaryIdentityAssignments,
+          artifact_dependencies: artifactDependencies,
+          lookup_dependencies: lookupDependencies,
+        }, { projection_open_template_sets: [JSON.stringify(projectionOpens)] }),
+        record_open_memo: promotedMemo,
+      },
+      storedCandidate: { ...input.candidate, state: "ready" } as never,
+      workspaceId: workspace.workspace_id,
+      database: database as never,
+      stagingDatabase: stagingDatabase as never,
+      faults: createFaultInjector([]),
+      generation: 2,
+      publishedAt: now,
+    })).resolves.toBeDefined();
+    expect(stagingQueries.some((sql) => sql.includes("candidate_staged_records"))).toBe(true);
+    expect(queries.some((sql) => sql.includes("SELECT * FROM projection_occurrences WHERE"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("SELECT * FROM artifact_dependencies WHERE"))).toBe(false);
+
+    // The production Rust cutover marks the same path explicitly. Exercise
+    // the descriptor-backed branch so the authority never regresses to
+    // rebuilding the structural rows in TypeScript when Rust has already
+    // staged them.
+    const rustStagingDatabase = {
+      transactionChunked: async (commands: Iterable<unknown>) => {
+        // Drive the generator so the Rust-promoted publication branch is
+        // exercised without rebuilding any structural rows in this oracle.
+        for (const _command of commands) { /* no-op test transport */ }
+        return [];
+      },
+      get: async <T>(sql: string) => {
+        if (sql.includes("candidate_publication_descriptors")) return {
+          record_count: 1,
+          facet_count: 0,
+          identity_count: 1,
+          canonical_byte_length: 0,
+          first_record_id: null,
+          last_record_id: null,
+          record_sequence_digest: "rust:pending",
+          identity_sequence_digest: "rust:pending",
+          closure_count: 0,
+        } as T;
+        if (sql.includes("candidate_publication_record_closures")) return { count: 0 } as T;
+        if (sql.includes("CASE") && sql.includes("candidate_publication_record_occurrences")) return { count: 1 } as T;
+        return undefined;
+      },
+    };
+    await expect(buildCandidatePublicationPlan({
+      input: {
+        ...withTemplateSets(input, {
+          record_opens: ordinaryRecordOpens,
+          identity_assignments: ordinaryIdentityAssignments,
+          artifact_dependencies: artifactDependencies,
+          lookup_dependencies: lookupDependencies,
+        }, { projection_open_template_sets: [JSON.stringify(projectionOpens)] }),
+        record_open_memo: promotedMemo,
+        rust_promoted_structural_rows: true,
+      },
+      storedCandidate: { ...input.candidate, state: "ready" } as never,
+      workspaceId: workspace.workspace_id,
+      database: database as never,
+      stagingDatabase: rustStagingDatabase as never,
+      faults: createFaultInjector([]),
+      generation: 2,
+      publishedAt: now,
+    })).resolves.toBeDefined();
+
+    const rustPlan = await buildCandidatePublicationPlan({
+      input: {
+        ...withTemplateSets(input, {
+          record_opens: ordinaryRecordOpens,
+          identity_assignments: ordinaryIdentityAssignments,
+          artifact_dependencies: artifactDependencies,
+          lookup_dependencies: lookupDependencies,
+        }, { projection_open_template_sets: [JSON.stringify(projectionOpens)] }),
+        record_open_memo: promotedMemo,
+        rust_promoted_structural_rows: true,
+      },
+      storedCandidate: { ...input.candidate, state: "ready" } as never,
+      workspaceId: workspace.workspace_id,
+      database: database as never,
+      stagingDatabase: rustStagingDatabase as never,
+      faults: createFaultInjector([]),
+      generation: 2,
+      publishedAt: now,
+    });
+    expect(rustPlan.canonicalStream).toBeDefined();
+    // Materialize the stream to cover the descriptor rebind and set-based
+    // INSERT ... SELECT path used after Rust has committed its staging rows.
+    expect(Array.from(publicationTransactionCommands(rustPlan)).some((command) => command.kind === "run" && command.sql.includes("candidate_publication_record_occurrences"))).toBe(true);
+
+    // Exercise the right-hand side of the direct-promotion guard: the Rust
+    // marker must still win when the template cardinalities are temporarily
+    // different (the checker can emit a later identity page).
+    const unequalIdentityAssignments = [
+      ...ordinaryIdentityAssignments,
+      { ...ordinaryIdentityAssignments[0]!, identity_assignment_id: "identity-authority-file-backed-extra", identity_id: "entity:authority-file-backed-extra", identity_key: "authority-file-backed-extra" },
+    ];
+    const unequalRustStagingDatabase = {
+      transactionChunked: rustStagingDatabase.transactionChunked,
+      get: async <T>(sql: string) => {
+        const row = await rustStagingDatabase.get<T>(sql);
+        if (sql.includes("candidate_publication_descriptors") && row !== undefined && typeof row === "object") return { ...row, identity_count: 2 } as T;
+        return row;
+      },
+    };
+    const unequalRustPlan = await buildCandidatePublicationPlan({
+      input: {
+        ...withTemplateSets(input, {
+          record_opens: ordinaryRecordOpens,
+          identity_assignments: unequalIdentityAssignments,
+          artifact_dependencies: artifactDependencies,
+          lookup_dependencies: lookupDependencies,
+        }, { projection_open_template_sets: [JSON.stringify(projectionOpens)] }),
+        record_open_memo: promotedMemo,
+        rust_promoted_structural_rows: true,
+      },
+      storedCandidate: { ...input.candidate, state: "ready" } as never,
+      workspaceId: workspace.workspace_id,
+      database: database as never,
+      stagingDatabase: unequalRustStagingDatabase as never,
+      faults: createFaultInjector([]),
+      generation: 2,
+      publishedAt: now,
+    });
+    expect(unequalRustPlan.canonicalStream).toBeDefined();
+
+    // Also cover the conservative rejection path when Rust left a pending
+    // descriptor whose cardinalities do not match and no explicit marker is
+    // present; this must not be mistaken for a pre-staged publication.
+    const mismatchedRustStagingDatabase = {
+      transactionChunked: rustStagingDatabase.transactionChunked,
+      get: async <T>(sql: string) => {
+        const row = await rustStagingDatabase.get<T>(sql);
+        if (sql.includes("candidate_publication_descriptors") && row !== undefined && typeof row === "object") return { ...row, record_count: 0, identity_count: 0 } as T;
+        return row;
+      },
+    };
+    const mismatchedRustPlan = await buildCandidatePublicationPlan({
+      input: {
+        ...withTemplateSets(input, {
+          record_opens: ordinaryRecordOpens,
+          identity_assignments: ordinaryIdentityAssignments,
+          artifact_dependencies: artifactDependencies,
+          lookup_dependencies: lookupDependencies,
+        }, { projection_open_template_sets: [JSON.stringify(projectionOpens)] }),
+        record_open_memo: promotedMemo,
+      },
+      storedCandidate: { ...input.candidate, state: "ready" } as never,
+      workspaceId: workspace.workspace_id,
+      database: database as never,
+      stagingDatabase: mismatchedRustStagingDatabase as never,
+      faults: createFaultInjector([]),
+      generation: 2,
+      publishedAt: now,
+    });
+    expect(mismatchedRustPlan.canonicalStream).toBeUndefined();
+
+    // Keep the record count aligned but reject the identity count. This
+    // forces evaluation of the final equality in the descriptor predicate
+    // (the previous case short-circuits at the record-count comparison).
+    const identityMismatchRustStagingDatabase = {
+      transactionChunked: rustStagingDatabase.transactionChunked,
+      get: async <T>(sql: string) => {
+        const row = await rustStagingDatabase.get<T>(sql);
+        if (sql.includes("candidate_publication_descriptors") && row !== undefined && typeof row === "object") return { ...row, record_count: 1, identity_count: 0 } as T;
+        return row;
+      },
+    };
+    const identityMismatchRustPlan = await buildCandidatePublicationPlan({
+      input: {
+        ...withTemplateSets(input, {
+          record_opens: ordinaryRecordOpens,
+          identity_assignments: ordinaryIdentityAssignments,
+          artifact_dependencies: artifactDependencies,
+          lookup_dependencies: lookupDependencies,
+        }, { projection_open_template_sets: [JSON.stringify(projectionOpens)] }),
+        record_open_memo: promotedMemo,
+      },
+      storedCandidate: { ...input.candidate, state: "ready" } as never,
+      workspaceId: workspace.workspace_id,
+      database: database as never,
+      stagingDatabase: identityMismatchRustStagingDatabase as never,
+      faults: createFaultInjector([]),
+      generation: 2,
+      publishedAt: now,
+    });
+    expect(identityMismatchRustPlan.canonicalStream).toBeUndefined();
+  });
+
   it.each(["artifact_versions", "artifact_tombstones"] as const)("maps a pre-existing %s mismatch to a typed authority conflict", async (table) => {
     const input = publication(`candidate-authority-${table}-conflict`, `authority-${table}-conflict`, initialBase);
     const sourceTransition = table === "artifact_versions"
@@ -1240,12 +1536,54 @@ describe("Phase 9 durable candidate publication", () => {
       }).sort((left, right) => left.record_id_hint.localeCompare(right.record_id_hint));
       const secondBaseWithoutDigest = { snapshot_id: first.snapshot_id, generation: first.generation, registry_snapshot_id: "registry-facet-closure-1", resolution_lock_id: "lock-facet-closure-1", configuration_revision_id: "configuration-facet-closure-1", source_state_digest: "source-initial", source_observation_batch_ids: [] };
       const secondBase = { ...secondBaseWithoutDigest, tuple_digest: tupleDigest(secondBaseWithoutDigest) };
-      const secondInput = withTemplateSets(publication("candidate-facet-closure-2", "facet-closure-2", secondBase), {
+      const baseSecondInput = withTemplateSets(publication("candidate-facet-closure-2", "facet-closure-2", secondBase), {
         record_opens: streamedRecords,
-        record_closures: priorRecords.map((record) => ({ record_id: record.record_id_hint })),
       });
+      const streamedProjections = streamedRecords.slice(0, 3).map((record, index) => ({
+        projection_record_id: `projection:set-based:${index}`,
+        projection_kind: "generic",
+        projection_key: `projection:set-based:${index}`,
+        owner_artifact_id: "artifact-facet-closure",
+        owner_artifact_version_id: "version-facet-closure",
+        source_artifact_version_ids: ["version-facet-closure"],
+        source_record_ids: [record.record_id_hint],
+        source_projection_record_ids: index === 0 ? [] : [`projection:set-based:${index - 1}`],
+        generator: "test:set-based",
+        generator_version: "1",
+        generator_configuration_digest: digest("set-based-projection-configuration"),
+        payload: { index, nested: { enabled: true }, labels: ["typed", "staging"] },
+      }));
+      const secondInput = {
+        ...baseSecondInput,
+        materialization: { ...baseSecondInput.materialization, projection_open_template_sets: [JSON.stringify(streamedProjections)] },
+      } as unknown as CandidatePublicationInput;
       const second = await publishStoredCandidate(opened, secondInput);
       expect(second.generation).toBe(2);
+
+      // A second large successor covers the non-empty typed-closure branch;
+      // generation 2 above deliberately covered the zero-closure descriptor.
+      // Both must remain set-based because cold and incremental candidates use
+      // the same typed publication relation set.
+      const closureCarrierRecords = Array.from({ length: streamedCount }, (_, index) => {
+        const record_without_validity = JSON.stringify({ category: "fact", kind: "streaming-closure-carrier", universal_kind: "streaming-closure-carrier", schema_version: 1, body: { index } });
+        const record_digest_hint = digestBytes(canonicalBytes(JSON.parse(record_without_validity)));
+        return { record_without_validity, owner_artifact_id: "artifact-facet-closure", owner_artifact_version_id: "version-facet-closure", record_id_hint: `record:${record_digest_hint.slice("sha256:".length)}`, record_digest_hint };
+      }).sort((left, right) => left.record_id_hint.localeCompare(right.record_id_hint));
+      const thirdBaseWithoutDigest = {
+        snapshot_id: second.snapshot_id,
+        generation: second.generation,
+        registry_snapshot_id: secondInput.target_registry.registry_snapshot_id,
+        resolution_lock_id: secondInput.target_resolution_lock.resolution_lock_id,
+        configuration_revision_id: secondInput.target_configuration.configuration_revision_id,
+        source_state_digest: "source-initial",
+        source_observation_batch_ids: [],
+      };
+      const thirdInput = withTemplateSets(publication("candidate-facet-closure-3", "facet-closure-3", { ...thirdBaseWithoutDigest, tuple_digest: tupleDigest(thirdBaseWithoutDigest) }), {
+        record_opens: closureCarrierRecords,
+        record_closures: priorRecords.map((record) => ({ record_id: record.record_id_hint })),
+      });
+      const third = await publishStoredCandidate(opened, thirdInput);
+      expect(third.generation).toBe(3);
 
       // Every streamed record's 2 facets persisted, matching what the
       // per-record content actually said -- not merely a row count check.
@@ -1262,13 +1600,23 @@ describe("Phase 9 durable candidate publication", () => {
         expect(facetsByRecordId.get(record.record_id_hint)).toEqual(parsedFacets);
       }
 
-      // Generation 1's records are now closed at generation 2; the streamed
-      // records opened in generation 2 are not.
+      // Generation 1's records are now closed set-wise at generation 3; the
+      // streamed records opened in generation 2 are not.
       const priorRows = await opened.database.all<{ record_id: string; valid_to_generation: number | null }>(`SELECT record_id, valid_to_generation FROM record_occurrences WHERE record_id IN (${priorRecords.map(() => "?").join(",")}) ORDER BY record_id`, priorRecords.map((record) => record.record_id_hint));
       expect(priorRows).toHaveLength(priorRecords.length);
-      expect(priorRows.every((row) => row.valid_to_generation === 2)).toBe(true);
+      expect(priorRows.every((row) => row.valid_to_generation === 3)).toBe(true);
       const streamedOpenCount = await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM record_occurrences WHERE valid_from_generation = 2 AND valid_to_generation IS NULL");
       expect(streamedOpenCount?.count).toBe(streamedCount);
+
+      const projectionRows = await opened.database.all<{ projection_record_id: string; content_digest: string }>("SELECT projection_record_id, content_digest FROM projection_occurrences WHERE valid_from_generation = 2 ORDER BY projection_record_id");
+      expect(projectionRows.map((row) => row.projection_record_id)).toEqual(streamedProjections.map((row) => row.projection_record_id));
+      expect(projectionRows.every((row) => row.content_digest.length > 0)).toBe(true);
+      const projectionDependencyCount = await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM projection_occurrence_dependencies WHERE valid_from_generation = 2");
+      expect(projectionDependencyCount?.count).toBe(8);
+      const projectionValueNodeCount = await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM projection_value_nodes WHERE valid_from_generation = 2");
+      expect(projectionValueNodeCount?.count).toBeGreaterThan(streamedProjections.length);
+      const typedStagingRows = await opened.database.get<{ count: number }>("SELECT (SELECT COUNT(*) FROM candidate_publication_projection_occurrences) + (SELECT COUNT(*) FROM candidate_publication_projection_dependencies) + (SELECT COUNT(*) FROM candidate_publication_projection_value_nodes) + (SELECT COUNT(*) FROM candidate_publication_projection_descriptors) AS count");
+      expect(typedStagingRows?.count).toBe(0);
 
       // The snapshot committed with a real digest -- unaffected by command
       // transport shape (digests are computed from `sortedVisible`/record
@@ -1276,7 +1624,7 @@ describe("Phase 9 durable candidate publication", () => {
       const snapshotRow = await opened.database.get<{ snapshot_digest: string }>("SELECT snapshot_digest FROM snapshots WHERE snapshot_id = ?", [second.snapshot_id]);
       expect(snapshotRow?.snapshot_digest.length).toBeGreaterThan(0);
     });
-  }, 30_000);
+  }, 45_000);
 
   it("bounds large projection occurrence batches without dropping dependent values", async () => {
     const input = publication("candidate-authority-projection-streaming", "authority-projection-streaming", initialBase);
@@ -1410,7 +1758,10 @@ describe("Phase 9 durable candidate publication", () => {
   });
 
   it.each(["materialization", "manifest", "snapshot"] as const)("maps a different-ID same-digest %s collision to a typed publication conflict", async (kind) => {
-    vi.useFakeTimers();
+    // Only the publication timestamp is under test. Faking hrtime and the
+    // timer queue leaks clock jumps into real-daemon suites when Vitest runs
+    // files concurrently in worker threads.
+    vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-08-10T00:00:00.000Z"));
     try {
       await withWorkspace(async (opened) => {

@@ -2,7 +2,7 @@ import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ArtifactWorkItem, QueryRequest, ReplacementScope, SnapshotCapabilityStateEntry } from "@urdira/contracts";
 import {
   PluginPackageDiscovery,
@@ -26,6 +26,7 @@ import {
   candidateTargetRegistryFromSnapshot,
   createCanonicalPluginDigestAuthority,
   runFullWorkspaceScan,
+  runProgressiveWorkspaceScan,
   runSourceOnlyWorkspaceScan,
   type AcceptedFactDelta,
   type WorkspaceScanPluginProvider,
@@ -41,7 +42,7 @@ import {
   createJavascriptTypescriptWorker,
   languageForPath,
 } from "../packages/plugin-javascript-typescript/src/index.js";
-import { createDurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
+import { createDurableStorage, WORKSPACE_WRITER_BUSY_CODE, type WorkspaceDatabase } from "../packages/storage/src/index.js";
 
 // `runFullWorkspaceScan` is typed against `@urdira/storage`'s published (dist)
 // `WorkspaceDatabase` declaration, since that is the real dependency
@@ -452,6 +453,186 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
     }
   }, 60_000);
 
+  // Regression coverage for the opt-in `URDIRA_STORAGE_DEBUG_TIMING=1`
+  // instrumentation added alongside the writer-lock retry work
+  // (`packages/engine/src/debug-timing.ts`'s `count`/`snapshotCounters` and
+  // the `source_cas_write`/`source_read_all`/`source_prior_frontier` spans
+  // in `packages/engine/src/source-indexer.ts`): a full scan routed through
+  // an injected Rust writer (so `source_cas_write` actually fires, matching
+  // "routes a generic source-only scan through the injected Rust writer"
+  // above) must still publish normally with the flag on, and the aggregate
+  // `unattributed_ms`/`counts` log line documented next to `runFullWorkspaceScan`
+  // must be emitted exactly once per scan.
+  it("emits the opt-in engine timing summary line for a full scan routed through an injected Rust writer", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-debug-timing";
+    const prepared = await prepareRegistry(workspaceId);
+    const basePlugin = buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`);
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-debug-timing-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    const previousFlag = process.env["URDIRA_STORAGE_DEBUG_TIMING"];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: fixtureRoot, display_root: fixtureRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const database = asStorageDatabase(opened);
+        // Rust source commits (`source_cas_write`) require a full Rust
+        // structural boundary, not just a source-only scan -- once
+        // `plugin.indexing_core` is present the TypeScript structural
+        // publication path is unavailable (see "propagates a provider-owned
+        // Rust boundary" above), so `analyze` must supply its own
+        // `external_publication` the way a real Rust-owned plugin would.
+        const plugin: WorkspaceScanPluginProvider = {
+          ...basePlugin,
+          indexing_core: {
+            cancel: async () => undefined,
+            commit_source_index: async ({ commits: captured }) => {
+              for (const commit of captured as { readonly expected_state_revision: number }[]) {
+                await database.sourceIndex.commit(commit as never);
+              }
+            },
+          },
+          analyze: async () => ({
+            accepted_deltas: [],
+            capability_state_entries: [],
+            external_publication: async (context) => ({
+              candidate_generation_id: context.candidate.candidate_generation_id,
+              snapshot_id: `snapshot:${context.candidate.candidate_generation_id}`,
+              generation_manifest_id: `generation-manifest:${context.candidate.candidate_generation_id}`,
+              generation: 1,
+              published_at: now,
+              status: "published" as const,
+            }),
+          }),
+        };
+        process.env["URDIRA_STORAGE_DEBUG_TIMING"] = "1";
+        const result = await runFullWorkspaceScan({
+          root: fixtureRoot,
+          database,
+          workspace_id: workspaceId,
+          plugin,
+          inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false },
+          now: () => now,
+        });
+        expect(result.status).toBe("published");
+        const summaryLine = errorSpy.mock.calls.map((call) => String(call[0])).find((line) => line.includes("engine timings source_catalog"));
+        expect(summaryLine).toBeDefined();
+        expect(summaryLine).toContain(`workspace:${workspaceId}`);
+        expect(summaryLine).toMatch(/unattributed_ms=\d+/);
+        expect(summaryLine).toMatch(/counts=\{.*"source_cas_blobs_written":\d+.*\}/);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      errorSpy.mockRestore();
+      if (previousFlag === undefined) delete process.env["URDIRA_STORAGE_DEBUG_TIMING"];
+      else process.env["URDIRA_STORAGE_DEBUG_TIMING"] = previousFlag;
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("propagates a provider-owned Rust boundary and never enters the TypeScript publication path", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-rust-boundary";
+    const prepared = await prepareRegistry(workspaceId);
+    const registrySnapshotId = prepared.registry.registry_snapshot_id;
+    const configurationRevisionId = `configuration:${workspaceId}`;
+    const basePlugin = buildPluginProvider(prepared, workspaceId, registrySnapshotId, configurationRevisionId);
+    const rustBoundary = { cancel: async (): Promise<void> => undefined };
+    let observedBoundary: unknown;
+    let observedManifest: unknown;
+    let externalPublicationCalls = 0;
+    const plugin: WorkspaceScanPluginProvider = {
+      ...basePlugin,
+      indexing_core: rustBoundary,
+      analyze: async (input) => {
+        observedBoundary = input.indexing_core;
+        observedManifest = input.candidate_work_manifest;
+        return {
+          accepted_deltas: [],
+          capability_state_entries: [],
+          external_publication: async (context) => {
+            externalPublicationCalls += 1;
+            return {
+              candidate_generation_id: context.candidate.candidate_generation_id,
+              snapshot_id: `snapshot:${context.candidate.candidate_generation_id}`,
+              generation_manifest_id: `generation-manifest:${context.candidate.candidate_generation_id}`,
+              generation: 1,
+              published_at: now,
+              status: "published" as const,
+            };
+          },
+        };
+      },
+    };
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-rust-boundary-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: fixtureRoot, display_root: fixtureRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const result = await runFullWorkspaceScan({
+          root: fixtureRoot,
+          database: asStorageDatabase(opened),
+          workspace_id: workspaceId,
+          plugin,
+          inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false },
+          now: () => now,
+        });
+        expect(result.status).toBe("published");
+        expect(observedBoundary).toBe(rustBoundary);
+        expect(observedManifest).toBeUndefined();
+        expect(externalPublicationCalls).toBe(1);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("rejects structural TypeScript deltas when the Rust boundary is active", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-rust-exclusive-deltas";
+    const prepared = await prepareRegistry(workspaceId);
+    const registrySnapshotId = prepared.registry.registry_snapshot_id;
+    const configurationRevisionId = `configuration:${workspaceId}`;
+    const basePlugin = buildPluginProvider(prepared, workspaceId, registrySnapshotId, configurationRevisionId);
+    const rustBoundary = { cancel: async (): Promise<void> => undefined };
+    const plugin: WorkspaceScanPluginProvider = {
+      ...basePlugin,
+      indexing_core: rustBoundary,
+      analyze: async () => ({
+        // This is intentionally malformed: the Rust-owned route must reject
+        // any owner-oriented TypeScript delta before it can reach acceptance,
+        // materialization, or publication.
+        accepted_deltas: [{} as unknown as AcceptedFactDelta],
+        capability_state_entries: [],
+      }),
+    };
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-rust-exclusive-deltas-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: fixtureRoot, display_root: fixtureRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        await expect(runFullWorkspaceScan({
+          root: fixtureRoot,
+          database: asStorageDatabase(opened),
+          workspace_id: workspaceId,
+          plugin,
+          inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false },
+          now: () => now,
+        })).rejects.toThrow(/Rust-owned structural indexing cannot return TypeScript structural deltas/iu);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   // Regression test for the confirmed bug: `runFullWorkspaceScan` always froze
   // its candidate's base tuple from scratch (empty `present`/`absent`,
   // `state_revision: 0`, and no `snapshot_id`/`generation`/`registry_snapshot_id`/
@@ -530,6 +711,64 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
     }
   }, 60_000);
 
+  it("gives a persistent analyzer the complete artifact manifest during a targeted capture and propagates cancellation", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-complete-manifest";
+    const prepared = await prepareRegistry(workspaceId);
+    const basePlugin = buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`);
+    const analyzedInputs: Array<{
+      readonly artifacts: readonly WorkspaceScanSourceArtifact[];
+      readonly changed_artifact_ids?: readonly string[];
+      readonly signal?: AbortSignal;
+    }> = [];
+    const plugin: WorkspaceScanPluginProvider = {
+      ...basePlugin,
+      requires_complete_artifact_manifest: true,
+      analyze: async (input) => {
+        analyzedInputs.push({
+          artifacts: [...input.artifacts],
+          ...(input.changed_artifact_ids === undefined ? {} : { changed_artifact_ids: [...input.changed_artifact_ids] }),
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+        });
+        return basePlugin.analyze(input);
+      },
+    };
+
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-complete-manifest-root-"));
+    await cp(fixtureRoot, workspaceRoot, { recursive: true });
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-complete-manifest-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: workspaceRoot, display_root: workspaceRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const scanOptions = { root: workspaceRoot, database: asStorageDatabase(opened), workspace_id: workspaceId, plugin, inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false }, now: () => now };
+        const first = await runFullWorkspaceScan(scanOptions);
+        expect(first.status).toBe("published");
+        const initialPaths = analyzedInputs[0]!.artifacts.map((artifact) => artifact.path).sort();
+
+        const changedPath = "src/domain/task.ts";
+        const original = await readFile(join(workspaceRoot, changedPath), "utf8");
+        await writeFile(join(workspaceRoot, changedPath), `${original}\nexport const persistentAnalyzerMarker = true;\n`, "utf8");
+        const controller = new AbortController();
+        const second = await runFullWorkspaceScan({ ...scanOptions, changed_uris: [changedPath], signal: controller.signal });
+        expect(second.status).toBe("published");
+
+        const targetedInput = analyzedInputs.at(-1)!;
+        expect(targetedInput.artifacts.map((artifact) => artifact.path).sort()).toEqual(initialPaths);
+        const changedArtifact = targetedInput.artifacts.find((artifact) => artifact.path === changedPath);
+        expect(changedArtifact).toBeDefined();
+        expect(targetedInput.changed_artifact_ids).toEqual([changedArtifact!.artifact_id]);
+        expect(targetedInput.signal).toBe(controller.signal);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it("publishes an authoritative delete without a full source walk, then handles the rename presence in the successor generation", async () => {
     const workspaceId = "workspace:workspace-indexing-session-authoritative-rename";
     const prepared = await prepareRegistry(workspaceId);
@@ -596,6 +835,157 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
       await rm(root, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("routes a generic source-only scan through the injected Rust writer", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-source-rust-writer";
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-source-rust-writer-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: fixtureRoot, display_root: fixtureRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const database = asStorageDatabase(opened);
+        const commits: unknown[] = [];
+        const source = await runSourceOnlyWorkspaceScan({
+          root: fixtureRoot,
+          database,
+          workspace_id: workspaceId,
+          inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false },
+          indexing_core: {
+            cancel: async () => undefined,
+            commit_source_index: async ({ commits: captured }) => {
+              commits.push(...captured);
+              for (const commit of captured as { readonly expected_state_revision: number }[]) {
+                await database.sourceIndex.commit(commit as never);
+              }
+            },
+          },
+        });
+        expect(source.status).toBe("source_ready");
+        expect(commits.length).toBeGreaterThan(0);
+        expect(await opened.repositories.snapshots.getCurrent()).toBeUndefined();
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  // Regression for docs/evidence/2026-09-01-f1-resultado.md: after chunking
+  // detached lexical maintenance so it periodically yields the Rust
+  // workspace writer lease, a foreground source commit that still loses that
+  // race (`crates/urdira-indexing-core/src/lib.rs`'s `workspace_lease`,
+  // wrapped by `IndexingCore::open_with_lease_wait` for exactly this path)
+  // used to reach the daemon as a plain `Error` with no usable `.code` --
+  // `scanFailureErrorCode` (`packages/daemon/src/runtime.ts`) then filed it
+  // under the generic, terminal `core:workspace_scan_failed` instead of the
+  // retryable `storage:workspace_writer_busy` path. This mock stands in for
+  // the Rust worker having exhausted `open_with_lease_wait`'s bounded wait
+  // and reported the same lease-contention message `IndexingEvent::Error`
+  // carries for `core:source_index_commit_failed`
+  // (`crates/urdira-indexing-worker/src/main.rs`); the scan must still
+  // surface `WORKSPACE_WRITER_BUSY_CODE` so the daemon's re-enqueue path
+  // picks it up.
+  it("tags a contended Rust source-commit writer lease with the retryable busy code", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-source-writer-busy";
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-source-writer-busy-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: fixtureRoot, display_root: fixtureRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const database = asStorageDatabase(opened);
+        await expect(runSourceOnlyWorkspaceScan({
+          root: fixtureRoot,
+          database,
+          workspace_id: workspaceId,
+          inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false },
+          indexing_core: {
+            cancel: async () => undefined,
+            commit_source_index: async () => {
+              throw new Error("core:source_index_commit_failed: workspace structural writer is already active");
+            },
+          },
+        })).rejects.toMatchObject({ code: WORKSPACE_WRITER_BUSY_CODE });
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("leaves an unrelated Rust source-commit error untagged", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-source-writer-other-error";
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-source-writer-other-error-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: fixtureRoot, display_root: fixtureRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const database = asStorageDatabase(opened);
+        await expect(runSourceOnlyWorkspaceScan({
+          root: fixtureRoot,
+          database,
+          workspace_id: workspaceId,
+          inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false },
+          indexing_core: {
+            cancel: async () => undefined,
+            commit_source_index: async () => {
+              throw new Error("core:source_index_commit_failed: disk is full");
+            },
+          },
+        })).rejects.toMatchObject({ message: expect.stringContaining("disk is full") });
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("passes through a non-Error thrown by the Rust source commit unchanged", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-source-writer-non-error";
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-source-writer-non-error-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: fixtureRoot, display_root: fixtureRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const database = asStorageDatabase(opened);
+        await expect(runSourceOnlyWorkspaceScan({
+          root: fixtureRoot,
+          database,
+          workspace_id: workspaceId,
+          inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false },
+          indexing_core: {
+            cancel: async () => undefined,
+            commit_source_index: async () => {
+              throw "workspace structural writer is already active";
+            },
+          },
+        })).rejects.toBe("workspace structural writer is already active");
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("rejects a source-only scan cancelled before capture", async () => {
+    await expect(runSourceOnlyWorkspaceScan({
+      root: fixtureRoot,
+      database: undefined as never,
+      workspace_id: "workspace:source-cancelled",
+      signal: AbortSignal.abort(),
+    })).rejects.toMatchObject({ code: "core:operation_cancelled" });
+  });
 
   // Phase 5.2 (base-record reuse at seal): unlike the rescan test above,
   // this plugin provider re-analyzes EVERY scanned owner on every scan
@@ -1509,6 +1899,189 @@ describe("Workspace indexing session: real filesystem scan through CandidateInde
         await opened.close();
       }
     } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("carries the stage-one transition set through later progressive stages and publishes nothing on an unchanged repeat", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-progressive-transition-set";
+    const prepared = await prepareRegistry(workspaceId);
+    const basePlugin = buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`);
+    const calls: Array<{ readonly stage: string | undefined; readonly changed: readonly string[] | undefined }> = [];
+    const plugin: WorkspaceScanPluginProvider = {
+      ...basePlugin,
+      supports_progressive_publication: true,
+      analyze: async (input) => {
+        calls.push({ stage: input.publication_stage_id, changed: input.changed_artifact_ids });
+        return basePlugin.analyze(input);
+      },
+    };
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-progressive-transition-set-root-"));
+    await cp(fixtureRoot, workspaceRoot, { recursive: true });
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-progressive-transition-set-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: workspaceRoot, display_root: workspaceRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const options = { root: workspaceRoot, database: asStorageDatabase(opened), workspace_id: workspaceId, plugin, inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false }, now: () => now };
+        const first = await runProgressiveWorkspaceScan(options);
+        expect(first.status).toBe("published");
+        expect(calls.map((call) => call.stage)).toEqual(["jsts:structural_stage_1", "jsts:structural_stage_2", "jsts:structural_stage_3"]);
+        expect(calls.every((call) => call.changed === undefined)).toBe(true);
+
+        calls.length = 0;
+        await writeFile(join(workspaceRoot, "src", "index.ts"), `${await readFile(join(workspaceRoot, "src", "index.ts"), "utf8")}\nexport const progressiveMarker = 1;\n`, "utf8");
+        const changed = await runProgressiveWorkspaceScan(options);
+        expect(changed.status).toBe("published");
+        expect(calls.map((call) => call.stage)).toEqual(["jsts:structural_stage_1", "jsts:structural_stage_2", "jsts:structural_stage_3"]);
+        expect(calls[0]?.changed).toHaveLength(1);
+        expect(calls[1]?.changed).toEqual(calls[0]?.changed);
+        expect(calls[2]?.changed).toEqual(calls[0]?.changed);
+
+        calls.length = 0;
+        const unchanged = await runProgressiveWorkspaceScan(options);
+        expect(unchanged.status).toBe("already_published");
+        expect(unchanged.snapshot_id).toBe(changed.snapshot_id);
+        expect(calls).toEqual([]);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("keeps first-publication progressive deltas streamable through every structural stage", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-progressive-first-stream";
+    const prepared = await prepareRegistry(workspaceId);
+    const basePlugin = buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`);
+    const callbacks: Array<{ readonly stage: string | undefined; readonly included: readonly string[] | undefined; readonly available: boolean }> = [];
+    const plugin: WorkspaceScanPluginProvider = {
+      ...basePlugin,
+      supports_progressive_publication: true,
+      initial_publication_stage_groups: [{ stage_ids: ["jsts:structural_stage_2", "jsts:structural_stage_3"] }],
+      analyze: async (input) => {
+        callbacks.push({ stage: input.publication_stage_id, included: input.included_publication_stage_ids, available: input.on_accepted_delta !== undefined });
+        return basePlugin.analyze(input);
+      },
+    };
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-progressive-first-stream-root-"));
+    await cp(fixtureRoot, workspaceRoot, { recursive: true });
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-progressive-first-stream-"));
+    const storage = await createDurableStorage({ rootDir: root });
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: workspaceRoot, display_root: workspaceRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      const opened = await storage.openWorkspace(workspaceId);
+      try {
+        const options = { root: workspaceRoot, database: asStorageDatabase(opened), workspace_id: workspaceId, plugin, inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false }, now: () => now };
+        await expect(runProgressiveWorkspaceScan({
+          ...options,
+          on_stage_published: (stage) => {
+            if (stage.ordinal === 1) throw new Error("simulated initial-publication restart");
+          },
+        })).rejects.toThrow("simulated initial-publication restart");
+        expect(callbacks).toEqual([
+          { stage: "jsts:structural_stage_1", included: undefined, available: true },
+        ]);
+
+        callbacks.length = 0;
+        const result = await runProgressiveWorkspaceScan(options);
+        expect(result.status).toBe("published");
+        expect(callbacks).toEqual([
+          { stage: "jsts:structural_stage_3", included: ["jsts:structural_stage_2", "jsts:structural_stage_3"], available: true },
+        ]);
+      } finally {
+        await opened.close();
+      }
+    } finally {
+      await storage.close();
+      await rm(root, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("durably resumes later progressive stages with the original stage-one transition set after a crash", async () => {
+    const workspaceId = "workspace:workspace-indexing-session-progressive-resume";
+    const prepared = await prepareRegistry(workspaceId);
+    const basePlugin = buildPluginProvider(prepared, workspaceId, prepared.registry.registry_snapshot_id, `configuration:${workspaceId}`);
+    const calls: Array<{ readonly stage: string | undefined; readonly changed: readonly string[] | undefined }> = [];
+    const plugin: WorkspaceScanPluginProvider = {
+      ...basePlugin,
+      supports_progressive_publication: true,
+      analyze: async (input) => {
+        calls.push({ stage: input.publication_stage_id, changed: input.changed_artifact_ids });
+        return basePlugin.analyze(input);
+      },
+    };
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-progressive-resume-root-"));
+    await cp(fixtureRoot, workspaceRoot, { recursive: true });
+    const root = await mkdtemp(join(tmpdir(), "urdira-workspace-indexing-session-progressive-resume-"));
+    let storage = await createDurableStorage({ rootDir: root });
+    let opened: WorkspaceDatabase | undefined;
+    try {
+      await storage.catalog.registerWorkspace({ workspace_id: workspaceId, canonical_root: workspaceRoot, display_root: workspaceRoot, source_provider_bindings: [], status: "registered", registered_at: now });
+      opened = await storage.openWorkspace(workspaceId);
+      const options = () => ({ root: workspaceRoot, database: asStorageDatabase(opened!), workspace_id: workspaceId, plugin, inclusion_rules: { include: [], exclude: ["dist/**", "node_modules/**"], allow_external_root: false }, now: () => now });
+
+      const baseline = await runProgressiveWorkspaceScan(options());
+      expect(baseline.status).toBe("published");
+      calls.length = 0;
+
+      await writeFile(join(workspaceRoot, "src", "index.ts"), `${await readFile(join(workspaceRoot, "src", "index.ts"), "utf8")}\nexport const durableProgressiveMarker = 1;\n`, "utf8");
+      await expect(runProgressiveWorkspaceScan({
+        ...options(),
+        on_stage_published: (stage) => {
+          if (stage.ordinal === 1) throw new Error("simulated crash after stage one");
+        },
+      })).rejects.toThrow("simulated crash after stage one");
+
+      const stageOneCall = calls.at(-1);
+      expect(stageOneCall?.stage).toBe("jsts:structural_stage_1");
+      expect(stageOneCall?.changed).toHaveLength(1);
+      const originalChanged = [...stageOneCall!.changed!];
+      const partialState = await opened.repositories.snapshots.getCurrent();
+      const partialSnapshot = partialState === undefined ? undefined : await opened.repositories.snapshots.get(partialState.current_snapshot_id);
+      expect(partialSnapshot?.publication_stage_ordinal).toBe(1);
+      // One immutable checkpoint belongs to the baseline source snapshot and
+      // one to the changed source snapshot that stopped after stage 1.
+      expect((await opened.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM control_plane_state WHERE workspace_id = ? AND state_kind = ?", [workspaceId, "progressive_changed_artifact_checkpoint"]))?.count).toBe(2);
+
+      // The persisted work set is accepted only under its exact authority
+      // coordinates. Simulate durable corruption/configuration drift and
+      // prove recovery fails before any later stage can publish an empty
+      // complete capability, then restore the row for the positive restart.
+      const checkpointRows = await opened.database.all<{ state_key: string; state_json: string }>("SELECT state_key, state_json FROM control_plane_state WHERE workspace_id = ? AND state_kind = ?", [workspaceId, "progressive_changed_artifact_checkpoint"]);
+      const partialCheckpoint = checkpointRows.find((row) => (JSON.parse(row.state_json) as { source_snapshot_id?: string }).source_snapshot_id === partialSnapshot?.source_snapshot_id);
+      expect(partialCheckpoint).toBeDefined();
+      const corruptedCheckpoint = { ...(JSON.parse(partialCheckpoint!.state_json) as Record<string, unknown>), configuration_revision_id: "configuration:corrupt" };
+      await opened.database.run("UPDATE control_plane_state SET state_json = ? WHERE workspace_id = ? AND state_key = ?", [JSON.stringify(corruptedCheckpoint), workspaceId, partialCheckpoint!.state_key]);
+      await expect(runProgressiveWorkspaceScan(options())).rejects.toMatchObject({ code: "engine:workspace_scan_stale" });
+      await opened.database.run("UPDATE control_plane_state SET state_json = ? WHERE workspace_id = ? AND state_key = ?", [partialCheckpoint!.state_json, workspaceId, partialCheckpoint!.state_key]);
+
+      // Reopen the durable store to ensure no in-memory PreparedWorkspaceScan
+      // or captured-byte lease can participate in recovery.
+      await opened.close();
+      opened = undefined;
+      await storage.close();
+      storage = await createDurableStorage({ rootDir: root });
+      opened = await storage.openWorkspace(workspaceId);
+      calls.length = 0;
+
+      const resumed = await runProgressiveWorkspaceScan(options());
+      expect(resumed.status).toBe("published");
+      expect(calls.map((call) => call.stage)).toEqual(["jsts:structural_stage_2", "jsts:structural_stage_3"]);
+      expect(calls[0]?.changed).toEqual(originalChanged);
+      expect(calls[1]?.changed).toEqual(originalChanged);
+      expect(calls.every((call) => (call.changed?.length ?? 0) > 0)).toBe(true);
+      const resumedSnapshot = await opened.repositories.snapshots.get(resumed.snapshot_id);
+      expect(resumedSnapshot?.publication_stage_ordinal).toBe(3);
+    } finally {
+      await opened?.close();
       await storage.close();
       await rm(root, { recursive: true, force: true });
       await rm(workspaceRoot, { recursive: true, force: true });

@@ -223,6 +223,37 @@ describe("Phase 7 generic source indexing", () => {
     await storage.close();
   });
 
+  it("advances the source generation for an accepted partial change", async () => {
+    const { storage } = await temporaryStorage();
+    const registration = workspace("workspace:partial-generation");
+    await storage.catalog.registerWorkspace(registration);
+    const opened = await storage.openWorkspace(registration.workspace_id);
+    const initialBytes = new TextEncoder().encode("export const value = 1;\n");
+    const changedBytes = new TextEncoder().encode("export const value = 2;\n");
+    const initial = providerObservation(registration.workspace_id, "batch:partial-initial", "src/value.ts", initialBytes);
+    const changed = providerObservation(registration.workspace_id, "batch:partial-change", "src/value.ts", changedBytes);
+
+    await testIndexer(opened).apply({
+      response: batchResponse(registration.workspace_id, "batch:partial-initial", [initial]),
+      read: readFixture({ [initial.normalized_uri]: initialBytes }),
+    });
+    const partialResponse = batchResponse(registration.workspace_id, "batch:partial-change", [changed], { complete: false, authoritative: false });
+    const encodedBatch = JSON.parse((partialResponse.payload as { observation_batch: string }).observation_batch) as { batch: unknown; observations: readonly unknown[] };
+    const result = await testIndexer(opened).apply({
+      response: partialResponse,
+      read: readFixture({ [changed.normalized_uri]: changedBytes }),
+      native_batches: (async function* () { yield encodedBatch as never; })(),
+      allow_partial: true,
+      publication_current_generation: 3,
+    });
+
+    expect(result).toMatchObject({ status: "published", generation: 4, changed: true });
+    expect(await opened.sourceIndex.getState()).toMatchObject({ current_generation: 4 });
+    expect(await versionAtGeneration(opened, changed.artifact_id, 4)).toMatchObject({ content_hash: digestBytes(changedBytes) });
+    await opened.close();
+    await storage.close();
+  });
+
   it("commits complete captures as bounded fragments and authorizes deletion only at completion", async () => {
     const { storage } = await temporaryStorage();
     const registration = workspace("workspace:fragmented-source");

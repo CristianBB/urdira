@@ -1,10 +1,21 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import { analyzeProject, createJavascriptTypescriptWorker, discoverProjects, type AnalyzerFile } from "../packages/plugin-javascript-typescript/src/index.js";
+import { afterEach, describe, expect, it } from "vitest";
+import type { ProposedRecord } from "@urdira/contracts";
+import {
+  JSTS_RUST_SYNTAX_BUILD_IDENTITY,
+  analyzeProject,
+  createJavascriptTypescriptProcessTransport,
+  createJavascriptTypescriptWorker,
+  createRustSyntaxAnalyzeRequest,
+  discoverProjects,
+  type AnalyzerFile,
+} from "../packages/plugin-javascript-typescript/src/index.js";
 
 const run = promisify(execFile);
 const fixtureRoot = resolve(dirname(fileURLToPath(import.meta.url)), "fixtures", "codebases", "javascript", "task-planner");
@@ -99,5 +110,190 @@ describe("JavaScript/TypeScript production-plugin E2E", () => {
     expect(payload.validation_input.raw_delta.owner_artifact_id).toBe("artifact:task-service");
     expect(payload.validation_input.raw_delta.proposed_records.length).toBeGreaterThan(0);
     await worker.terminate();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E0: entity identity unification between the Rust syntax worker and the
+// TypeScript checker (docs/evidence/2026-09-01-f5-hybrid-design.md, Hallazgo
+// A). Both producers now key an entity's identity on the START OF THE NAME
+// IDENTIFIER (`identifier.span.start` in Rust, the equivalent name-node start
+// in analyzer.ts) instead of the declaration's own start -- this is what lets
+// a future merge point treat "the same declaration produced by either
+// producer" as literally the same record id.
+// ---------------------------------------------------------------------------
+
+const rustWorkerExecutable = process.env["URDIRA_JSTS_RUST_WORKER"];
+const identityTemporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(identityTemporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+async function identitySourceInput(path: string, text: string) {
+  const bytes = new TextEncoder().encode(text);
+  const directory = await mkdtemp(join(tmpdir(), "urdira-identity-source-"));
+  identityTemporaryDirectories.push(directory);
+  const sourceBlobPath = join(directory, "source.blob");
+  await writeFile(sourceBlobPath, bytes);
+  const contentDigest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  return { path, artifact_id: `artifact:${path}`, artifact_version_id: `version:${path}:${contentDigest.slice(-12)}`, source_blob_path: sourceBlobPath, byte_length: bytes.byteLength, content_digest: contentDigest };
+}
+
+async function readAllOwnerFacts(transport: ReturnType<typeof createJavascriptTypescriptProcessTransport>, projectKey: string, path: string, cancellationId: string): Promise<readonly ProposedRecord[]> {
+  const records: ProposedRecord[] = [];
+  let cursor: { readonly imports_offset: number; readonly records_offset: number; readonly dependencies_offset: number } | undefined;
+  do {
+    const page = await transport.readFacts({ project_key: projectKey, path, ...(cursor === undefined ? {} : { cursor }), max_output_bytes: 4 * 1024 * 1024, max_rows: 4096, cancellation_id: cancellationId });
+    records.push(...page.records);
+    cursor = page.next_cursor;
+  } while (cursor !== undefined);
+  return records;
+}
+
+// Deliberately exercises every declaration shape the task called out:
+// function/class/interface/enum/variable/method/parameter, an ambient
+// (`declare`) ombination, a named `export default`, a TS 5 class decorator,
+// a TS parameter-property (modifiers preceding a parameter's name), and an
+// emoji + accented-letter preamble that makes UTF-8-byte and UTF-16-code-unit
+// offsets diverge ahead of the `niño` declaration -- if either producer's
+// offset arithmetic (Rust's `Utf8ToUtf16`, lib.rs:1689) were wrong, that
+// divergence would show up as a mismatched identity_key below.
+const IDENTITY_FIXTURE_PATH = "identity.ts";
+const IDENTITY_FIXTURE_TEXT = [
+  "function sealed(_target: unknown) { return _target; }",
+  "",
+  'const banner = "\u{1F600} café niño — helló wörld";',
+  "",
+  "export function niño(): string {",
+  '  return "café";',
+  "}",
+  "",
+  "@sealed",
+  "export class Widget {",
+  "  private readonly label: string;",
+  "  constructor(private readonly owner: string) {",
+  "    this.label = owner;",
+  "  }",
+  "  public async render(size: number): Promise<string> {",
+  '    return this.label + ":" + size;',
+  "  }",
+  "  public get area(): number {",
+  "    return 0;",
+  "  }",
+  "  public set area(value: number) {}",
+  "}",
+  "",
+  "export interface Shape {",
+  "  area(): number;",
+  "}",
+  "",
+  "export enum Color {",
+  "  Red,",
+  "  Green,",
+  "}",
+  "",
+  "export type Alias = string;",
+  "",
+  "export const single = 1;",
+  "",
+  "export default function named(): void {}",
+  "",
+].join("\n");
+
+// Kinds `EntityKind` (crates/urdira-jsts-syntax-worker/src/lib.rs) also
+// produces today -- these must match the checker's id byte-for-byte.
+const RUST_OVERLAPPING_DECLARATIONS: ReadonlyArray<readonly [kind: string, name: string]> = [
+  ["function", "sealed"],
+  ["variable", "banner"],
+  ["function", "niño"],
+  ["class", "Widget"],
+  ["interface", "Shape"],
+  ["enum", "Color"],
+  ["type", "Alias"],
+  ["variable", "single"],
+  ["function", "named"],
+];
+
+// Checker-only kinds (Rust has no `EntityKind` for these yet -- member-level
+// declarations remain the checker's job, Hallazgo B). Each is chosen so a
+// modifier/keyword precedes the name, meaning the declaration's own start and
+// the name identifier's start are DIFFERENT positions -- a real regression
+// check, not a vacuous one.
+const CHECKER_ONLY_MODIFIED_DECLARATIONS: ReadonlyArray<readonly [kind: string, name: string]> = [
+  ["property", "label"],
+  ["parameter", "owner"],
+  ["method", "render"],
+  ["getter", "area"],
+  ["setter", "area"],
+];
+
+describe("JavaScript/TypeScript E0 entity identity unification (Rust syntax worker vs. checker)", () => {
+  it.skipIf(rustWorkerExecutable === undefined)("keys checker entity ids on the same name-identifier start the Rust syntax worker uses", async () => {
+    const files: readonly AnalyzerFile[] = [{ path: IDENTITY_FIXTURE_PATH, text: IDENTITY_FIXTURE_TEXT }];
+
+    // 1. The checker path (analyzer.ts, the code this task fixes).
+    const checkerAnalysis = analyzeProject({ files, root_names: files.map((file) => file.path) });
+    const checkerIdByKey = new Map<string, string>(checkerAnalysis.entities.map((entity) => [`${entity.kind}:${entity.name}`, entity.id]));
+
+    // 2. The real Rust syntax worker, over the identical source text.
+    const transport = createJavascriptTypescriptProcessTransport({ command: rustWorkerExecutable!, expected_build_identity: JSTS_RUST_SYNTAX_BUILD_IDENTITY });
+    const projectKey = "project:e0-identity";
+    try {
+      const rustFile = await identitySourceInput(IDENTITY_FIXTURE_PATH, IDENTITY_FIXTURE_TEXT);
+      const analyzeResult = await transport.analyze(createRustSyntaxAnalyzeRequest({
+        request_id: "analyze:e0-identity",
+        cancellation_id: "cancel:e0-identity",
+        project_key: projectKey,
+        configuration_digest: `sha256:${"3".repeat(64)}`,
+        root_names: [IDENTITY_FIXTURE_PATH],
+        files: [rustFile],
+        max_output_bytes: 1024 * 1024,
+        max_files: 8,
+        max_source_bytes: 1024 * 1024,
+      }));
+      const rustRecords = await readAllOwnerFacts(transport, projectKey, IDENTITY_FIXTURE_PATH, "cancel:facts:e0-identity");
+      expect(analyzeResult.affected_files).toEqual([IDENTITY_FIXTURE_PATH]);
+      const rustEntityIdByKey = new Map<string, string>(
+        rustRecords
+          .filter((record) => record.category === "entity")
+          .map((record) => [`${(record.body as { readonly kind: string }).kind}:${(record.body as { readonly name: string }).name}`, record.identity_key]),
+      );
+
+      // Every declaration Rust and the checker BOTH model must resolve to the
+      // exact same identity_key -- this is the core E0 assertion.
+      expect(RUST_OVERLAPPING_DECLARATIONS.length).toBeGreaterThan(0);
+      for (const [kind, name] of RUST_OVERLAPPING_DECLARATIONS) {
+        const key = `${kind}:${name}`;
+        const rustId = rustEntityIdByKey.get(key);
+        const checkerId = checkerIdByKey.get(key);
+        expect(rustId, `Rust did not emit ${key}`).toBeDefined();
+        expect(checkerId, `checker did not emit ${key}`).toBeDefined();
+        expect(checkerId, `${key} identity_key mismatch between checker and Rust`).toBe(rustId);
+      }
+      // No coverage drift: Rust models exactly this many entities in the
+      // overlapping kind set (module aside), and the checker must not have
+      // silently dropped or duplicated any of them.
+      const rustOverlappingCount = [...rustEntityIdByKey.keys()].filter((key) => key !== `module:${IDENTITY_FIXTURE_PATH}`).length;
+      expect(rustOverlappingCount).toBe(RUST_OVERLAPPING_DECLARATIONS.length);
+
+      await transport.commitAnalysis({ project_key: projectKey, analysis_token: analyzeResult.analysis_token });
+    } finally {
+      await transport.terminate();
+    }
+
+    // 3. Checker-only member declarations: Rust has no counterpart to diff
+    // against, so assert directly against the source text that the id's
+    // offset lands exactly on the name identifier -- not on a preceding
+    // modifier/keyword, which is what the pre-E0 `node.getStart()` convention
+    // would have produced for every one of these.
+    for (const [kind, name] of CHECKER_ONLY_MODIFIED_DECLARATIONS) {
+      const id = checkerIdByKey.get(`${kind}:${name}`);
+      expect(id, `checker did not emit ${kind}:${name}`).toBeDefined();
+      const match = /^jsts:[a-z]+:[^:]+:(\d+):[^:]+$/.exec(id!);
+      expect(match, `unexpected id shape for ${kind}:${name}: ${id}`).not.toBeNull();
+      const offset = Number(match![1]);
+      expect(IDENTITY_FIXTURE_TEXT.slice(offset, offset + name.length), `${kind}:${name} id offset ${offset} does not point at the name identifier`).toBe(name);
+    }
   });
 });

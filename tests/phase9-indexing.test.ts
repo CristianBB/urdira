@@ -91,6 +91,192 @@ describe("Phase 9 candidate coordinator", () => {
     ]);
   });
 
+  it("lets an external writer publish without TypeScript sealing or materialization", async () => {
+    const port = workspace();
+    const seal = vi.fn(async () => { throw new Error("TypeScript seal must not run"); });
+    const external = vi.fn(async () => ({
+      candidate_generation_id: "candidate:one",
+      snapshot_id: "snapshot:candidate:one",
+      generation_manifest_id: "manifest:candidate:one",
+      generation: 2,
+      published_at: "2026-08-10T00:00:01.000Z",
+      status: "published" as const,
+    }));
+    const result = await new CandidateIndexer({ workspace: port }).run(trigger(port, { seal, external_publication: external }));
+
+    expect(result).toMatchObject({ state: "published", generation: 2 });
+    expect(external).toHaveBeenCalledOnce();
+    expect(seal).not.toHaveBeenCalled();
+    expect(port.candidates.saveMaterialization).not.toHaveBeenCalled();
+    expect(port.publishCandidate).not.toHaveBeenCalled();
+  });
+
+  it("runs the Rust-owned lifecycle without touching the TypeScript workspace port", async () => {
+    const port = workspace();
+    const buildPlan = vi.fn(async () => ({ manifest: {} as never, dag: { levels: [], prerequisites: new Map(), dag_digest: "digest", work_items: new Map() } as never, invalidation: {} as never, artifact_work_items: [], projection_work_items: [], lookup_decisions: [] }));
+    const execute = vi.fn(async () => []);
+    const external = vi.fn(async () => ({
+      candidate_generation_id: "candidate:one",
+      snapshot_id: "snapshot:candidate:one",
+      generation_manifest_id: "manifest:candidate:one",
+      generation: 2,
+      published_at: "2026-08-10T00:00:01.000Z",
+      status: "published" as const,
+    }));
+    const result = await new CandidateIndexer({ workspace: port }).runRustOwned(trigger(port, {
+      rust_owned_lifecycle: true,
+      buildPlan,
+      execute,
+      external_publication: external,
+    }));
+
+    expect(result).toMatchObject({ state: "published", generation: 2 });
+    expect(buildPlan).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledOnce();
+    expect(external).toHaveBeenCalledOnce();
+    expect(port.candidates.insert).not.toHaveBeenCalled();
+    expect(port.candidates.transition).not.toHaveBeenCalled();
+    expect(port.acquireBaseLease).not.toHaveBeenCalled();
+    expect(port.publishCandidate).not.toHaveBeenCalled();
+  });
+
+  it("keeps an equivalent Rust-owned generation on the already-published path", async () => {
+    const port = workspace();
+    const external = vi.fn();
+    const result = await new CandidateIndexer({ workspace: port }).runRustOwned(trigger(port, {
+      rust_owned_lifecycle: true,
+      equivalent: true,
+      external_publication: external,
+    }));
+
+    expect(result).toMatchObject({ status: "already_published", state: "published", generation: 1 });
+    expect(external).not.toHaveBeenCalled();
+    expect(port.candidates.insert).not.toHaveBeenCalled();
+  });
+
+  it("covers the no-op and degraded compatibility branches without opening a candidate", async () => {
+    const port = workspace();
+    port.recordFreshness = vi.fn(async () => undefined);
+    const indexer = new CandidateIndexer({ workspace: port });
+
+    const equivalent = await indexer.run(trigger(port, {
+      equivalent: true,
+      source_plan: { transitions: [], seeds: [], equivalent: true, next_freshness_checkpoint: { watermark: "watch:one" } as never },
+    }));
+    expect(equivalent.status).toBe("already_published");
+    expect(port.recordFreshness).toHaveBeenCalledOnce();
+
+    const degraded = await indexer.stageSourceBatch({
+      observations: { outcome: "error", stable: false, coverage_completeness: "none" } as never,
+      base: { present: [], absent: [] } as never,
+      trigger: trigger(port),
+    });
+    expect(degraded.status).toBe("degraded");
+    await expect(degraded.publish()).resolves.toMatchObject({ status: "equivalent", generation: 0 });
+
+    const partialEquivalent = await indexer.stageSourceBatch({
+      observations: { outcome: "success", stable: true, coverage_completeness: "partial" } as never,
+      base: { present: [], absent: [] } as never,
+      allow_partial_coverage: true,
+      precomputed_plan: { transitions: [], seeds: [], equivalent: true, next_freshness_checkpoint: {} as never },
+      trigger: trigger(port),
+    });
+    expect(partialEquivalent.status).toBe("equivalent");
+    await expect(partialEquivalent.publish()).resolves.toMatchObject({ status: "equivalent", generation: 0 });
+  });
+
+  it("uses the compatibility executor when an explicit execution input is supplied", async () => {
+    const port = workspace();
+    const execute = vi.fn(async () => []);
+    const executorTrigger = trigger(port, { executionInput: {} as never });
+    delete (executorTrigger as any).execute;
+    const result = await new CandidateIndexer({ workspace: port, executor: { execute } as never }).run(executorTrigger);
+    expect(result.status).toBe("published");
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("ignores cleanup for a candidate that has already disappeared", async () => {
+    const port = workspace();
+    await expect(new CandidateIndexer({ workspace: port }).cleanup("candidate:missing")).resolves.toBeUndefined();
+    expect(port.events).toEqual([]);
+  });
+
+  it("fails closed when the compatibility planner or materializer input is absent", async () => {
+    const port = workspace();
+    const plannerTrigger = trigger(port);
+    delete (plannerTrigger as any).buildPlan;
+    await expect(new CandidateIndexer({ workspace: port }).run(plannerTrigger)).rejects.toThrow("missing planner input");
+    const materializerTrigger = trigger(port);
+    delete (materializerTrigger as any).seal;
+    await expect(new CandidateIndexer({ workspace: port }).run(materializerTrigger)).rejects.toThrow("missing materialization input");
+  });
+
+  it("rejects Rust-owned execution without its exclusive publication contract", async () => {
+    const port = workspace();
+    await expect(new CandidateIndexer({ workspace: port }).runRustOwned(trigger(port))).rejects.toThrow("Rust-owned candidate execution requires");
+  });
+
+  it("does not create a candidate for a stable partial reconcile with no source transitions", async () => {
+    const port = workspace();
+    port.recordFreshness = vi.fn(async () => undefined);
+    const staged = await new CandidateIndexer({ workspace: port }).stageSourceBatch({
+      observations: {
+        outcome: "success",
+        stable: true,
+        workspace_id: "workspace:one",
+        observation_batch_id: "batch:duplicate-hint",
+        source_provider_binding_id: "binding:one",
+        source_provider: "core:directory_source_provider",
+        source_provider_version: "1.0.0",
+        watermark: "watch:duplicate-hint",
+        completed_at: "2026-08-10T00:00:00.000Z",
+        coverage_completeness: "partial",
+        deletion_authority: "none",
+        coverage_scopes: [{ scope_type: "source_root", normalized_scope_key: "src/one.ts" }],
+        supports_authoritative_delete_events: false,
+        observations: [{
+          observed_state: "present",
+          source_observation_id: "observation:duplicate-hint",
+          artifact: {
+            artifact_id: "artifact:one",
+            workspace_id: "workspace:one",
+            normalized_uri: "src/one.ts",
+            normalized_path: "src/one.ts",
+            display_path: "src/one.ts",
+            artifact_kind: "physical_file",
+          },
+          content_blob_id: "content:old",
+          content_hash: "sha256:old",
+          byte_length: 3,
+          encoding: "utf-8",
+          language_hint: "typescript",
+          analysis_metadata_digest: "sha256:metadata-old",
+        }],
+      },
+      base: {
+        workspace_id: "workspace:one",
+        state_revision: 1,
+        provider_watermarks: {},
+        source_state_digest: "sha256:base-present",
+        present: [{
+          artifact: { artifact_id: "artifact:one", normalized_uri: "src/one.ts" },
+          version: {
+            artifact_version_id: "version:old",
+            content_hash: "sha256:old",
+            analysis_metadata_digest: "sha256:metadata-old",
+          },
+        }],
+        absent: [],
+      },
+      allow_partial_coverage: true,
+      trigger: trigger(port),
+    });
+
+    expect(staged).toMatchObject({ status: "equivalent", plan: { transitions: [] } });
+    expect(port.recordFreshness).not.toHaveBeenCalled();
+    expect(port.candidates.insert).not.toHaveBeenCalled();
+  });
+
   it("publishes confirmed absence before identical reappearance", async () => {
     const port = workspace();
     const first = trigger(port, { candidate: { ...baseCandidate, candidate_generation_id: "candidate:delete", trigger_kind: "confirmed_delete" } as never });

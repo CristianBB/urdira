@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { canonicalBytes, digestBytes, digestCanonicalArray } from "@urdira/canonical";
 import { createDurableStorage, type CandidatePublicationInput, type CandidateTemplateSets, type WorkspaceDatabase } from "../packages/storage/src/index.js";
-import { createWorkspaceCandidatePort } from "../packages/engine/src/index.js";
+import { createWorkspaceCandidatePort, validateIndexGenerationRequest } from "../packages/engine/src/index.js";
 
 // `createWorkspaceCandidatePort` is typed against `@urdira/storage`'s published
 // (dist) declarations, since that is the real dependency `packages/engine`
@@ -31,6 +31,24 @@ const workspace = {
 
 const now = "2026-08-11T00:00:00.000Z";
 const digest = (value: unknown): string => digestBytes(canonicalBytes(value));
+
+describe("Rust indexing-core generation port", () => {
+  const request = {
+    operation_id: "operation:port", workspace_id: "workspace:port", candidate_generation_id: "candidate:port", database_path: ":memory:",
+    cas_root: "/tmp/urdira-cas",
+    source_snapshot_id: "snapshot:port", source_state_digest: "sha256:test", base_generation: 0,
+    registry_snapshot_id: "registry:port", configuration_revision_id: "configuration:port", resolution_lock_id: "resolution:port",
+    change_set: { kind: "full" as const }, engine: { engine_id: "engine:test", engine_version: "1", implementation_digest: "sha256:test" },
+  };
+
+  it("accepts a complete generation envelope and rejects malformed authority identifiers", () => {
+    expect(() => validateIndexGenerationRequest(request)).not.toThrow();
+    expect(() => validateIndexGenerationRequest({ ...request, operation_id: "" })).toThrow(/operation_id/iu);
+    expect(() => validateIndexGenerationRequest({ ...request, cas_root: "relative/cas" })).toThrow(/cas_root/iu);
+    expect(() => validateIndexGenerationRequest({ ...request, base_generation: -1 })).toThrow(/base generation/iu);
+    expect(() => validateIndexGenerationRequest({ ...request, deadline_ms: 0 })).toThrow(/deadline/iu);
+  });
+});
 
 // Mirrors `packages/engine/src/candidate-materialization.ts`'s `orderedSetDescriptor`:
 // the materialization's template-set fields carry a small, bounded

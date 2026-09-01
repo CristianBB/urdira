@@ -45,9 +45,12 @@ async function withHashEmbeddingsProvider<T>(run: () => Promise<T>): Promise<T> 
 }
 
 async function pollUntilReady(client: DaemonClient, workspaceId: string, timeoutMs = 60_000): Promise<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> {
-  const deadline = Date.now() + timeoutMs;
+  // Use a monotonic deadline. Other suites deliberately exercise frozen wall
+  // clocks; a wall-clock jump must never turn this real-daemon poll into an
+  // immediate timeout when the coverage runner reuses a worker process.
+  const deadline = process.hrtime.bigint() + BigInt(timeoutMs) * 1_000_000n;
   let last: { readonly workspace_id: string; readonly workspace_status: string } | undefined;
-  while (Date.now() < deadline) {
+  while (process.hrtime.bigint() < deadline) {
     const response = await client.call("core:index_status", {});
     if (response.outcome !== "success") throw new Error(`core:index_status did not succeed: ${JSON.stringify(response)}`);
     const payload = response.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_id: string; readonly workspace_status: string }> };
@@ -67,6 +70,12 @@ async function pollUntilReady(client: DaemonClient, workspaceId: string, timeout
       const detailPayload = detail.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> };
       const detailWorkspace = detailPayload.workspaces[0];
       if (detailWorkspace === undefined) throw new Error("core:index_status (detail) returned no workspace entry.");
+      // A watcher-triggered follow-up scan can begin between the aggregate
+      // and scoped reads. Treat that as an observation race, not readiness.
+      if (detailWorkspace.workspace_status !== "ready" && detailWorkspace.workspace_status !== "degraded") {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        continue;
+      }
       return detailWorkspace;
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
@@ -149,6 +158,7 @@ describe("Urdira application runner", () => {
       started_at: "2026-08-25T00:00:00.000Z",
     });
     const descriptor = new EndpointDescriptorStore(paths);
+    let previewDeadline: string | undefined;
     const server = new LocalIpcServer({
       endpoint: paths.endpoint,
       handler: async (request, context) => {
@@ -156,6 +166,7 @@ describe("Urdira application runner", () => {
           throw new DaemonError("core:ipc_timeout", "The live daemon is temporarily busy.");
         }
         if (request.call === "core:workspace_preview") {
+          previewDeadline = request.deadline_at;
           context.reportProgress({
             phase: "workspace_discovery",
             completed: 1,
@@ -192,6 +203,7 @@ describe("Urdira application runner", () => {
           engine_build_id: "build-app-live-daemon",
           scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
         },
+        admin_request_timeout_ms: 3_600_000,
         on_progress: (entry) => progress.push(entry),
       });
 
@@ -203,6 +215,7 @@ describe("Urdira application runner", () => {
         "workspace_preview",
         "workspace_discovery",
       ]));
+      expect(Date.parse(previewDeadline!) - Date.now()).toBeGreaterThan(3_500_000);
 
       const shutdownProgress: string[] = [];
       const stopped = await runUrdira(["daemon", "stop"], {
@@ -215,6 +228,52 @@ describe("Urdira application runner", () => {
       });
       expect(stopped.data).toMatchObject({ command: "stop", result: { state: "stopping" } });
       expect(shutdownProgress).toContain("daemon_shutdown_wait");
+    } finally {
+      await server.close();
+      await descriptor.remove();
+      await lock.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates a typed workspace-preview IPC failure instead of confirming an undefined preview", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-preview-error-"));
+    const paths = await daemonPaths(root);
+    const lock = await ProcessLock.acquire(paths.process_lock, {
+      pid: process.pid,
+      started_at: "2026-08-28T00:00:00.000Z",
+    });
+    const descriptor = new EndpointDescriptorStore(paths);
+    const server = new LocalIpcServer({
+      endpoint: paths.endpoint,
+      handler: async (request) => {
+        if (request.call === "core:status") throw new DaemonError("core:ipc_timeout", "The live daemon is temporarily busy.");
+        if (request.call === "core:workspace_preview") throw new DaemonError("core:ipc_frame_too_large", "The workspace preview is too large.");
+        throw new DaemonError("core:unknown_call", `Unexpected test call ${request.call}.`);
+      },
+    });
+
+    try {
+      await server.listen();
+      await descriptor.write({
+        protocol_version: 1,
+        private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION,
+        rpc_capabilities: daemonRpcCapabilities(true),
+        endpoint: paths.endpoint,
+        pid: process.pid,
+        owner_uid: process.getuid?.() ?? 0,
+        engine_build_id: "build-app-preview-error",
+        started_at: "2026-08-28T00:00:00.000Z",
+      });
+
+      await expect(runUrdira(["workspace", "add", fixtureRoot, "--dry-run"], {
+        daemon: {
+          data_root: root,
+          engine_build_id: "build-app-preview-error",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+        admin_request_timeout_ms: 60_000,
+      })).rejects.toMatchObject({ code: "core:ipc_frame_too_large" });
     } finally {
       await server.close();
       await descriptor.remove();

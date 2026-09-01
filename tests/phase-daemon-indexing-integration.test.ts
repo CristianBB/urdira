@@ -45,7 +45,7 @@ import {
   languageForPath,
 } from "../packages/plugin-javascript-typescript/src/index.js";
 import { DaemonClient, DaemonRuntime, type DaemonRuntimeOptions } from "../packages/daemon/src/index.js";
-import { createDurableStorage } from "../packages/storage/src/index.js";
+import { createDurableStorage, WORKSPACE_WRITER_BUSY_CODE } from "../packages/storage/src/index.js";
 
 // `packages/daemon/src/runtime.ts` types `DaemonRuntimeOptions.workspace_registry`
 // against `@urdira/engine`'s published (dist) `WorkspaceRegistry` declaration
@@ -378,6 +378,74 @@ describe("Daemon workspace indexing integration: core:workspace_add reaches stat
       expect(settled.current_snapshot_id).toBeTypeOf("string");
       expect(settled.current_snapshot_id?.length).toBeGreaterThan(0);
     } finally {
+      if (runtime) await runtime.stop();
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  // Regression coverage for `storage:workspace_writer_busy`'s daemon-side
+  // retry path (`packages/daemon/src/runtime.ts`'s `workspaceWriterBusyRetries`
+  // map, next to the `core:source_changed` retry above it): a foreground
+  // SQLite mutation that could not acquire the cross-process writer lock
+  // (`packages/storage/src/storage.ts`'s `acquireWorkspaceMutationLock`) must
+  // not pin the workspace to a terminal failure -- the daemon retries a
+  // bounded number of times with a short delay instead. This simulates the
+  // failure at the plugin boundary (an `analyze` call throwing the exact
+  // typed `.code`) rather than actually contending the real file lock for 20
+  // real seconds, but exercises the same daemon retry-then-reset logic a
+  // genuine lease contention would.
+  it("retries a scan after a transient workspace-writer-busy failure and still reaches ready", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-writer-busy-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-writer-busy-workspace-"));
+    let runtime: DaemonRuntime | undefined;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await writeFile(join(workspaceRoot, "task.ts"), await readFile(join(fixtureRoot, "task.ts"), "utf8"), "utf8");
+      let attempts = 0;
+      const busyResolvePluginProvider: NonNullable<DaemonRuntimeOptions["resolve_plugin_provider"]> = async (workspace) => {
+        if (!(workspace.selected_plugin_ids ?? []).includes(JAVASCRIPT_TYPESCRIPT_PLUGIN_ID)) return undefined;
+        const prepared = await prepareRegistry(workspace.workspace_id);
+        const registrySnapshotId = prepared.registry.registry_snapshot_id;
+        const configurationRevisionId = `configuration:${workspace.workspace_id}`;
+        const basePlugin = buildPluginProvider(prepared, workspace.workspace_id, registrySnapshotId, configurationRevisionId);
+        return {
+          ...basePlugin,
+          analyze: async (input: Parameters<typeof basePlugin.analyze>[0]) => {
+            attempts += 1;
+            if (attempts === 1) {
+              const busyError = new Error("workspace structural writer is already active (test-injected)") as Error & { code: string };
+              busyError.code = WORKSPACE_WRITER_BUSY_CODE;
+              throw busyError;
+            }
+            return basePlugin.analyze(input);
+          },
+        };
+      };
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-daemon-writer-busy",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        plugin_catalog: [{ ...bundledPluginCatalogEntry, capability_declarations: JAVASCRIPT_TYPESCRIPT_CAPABILITIES }],
+        resolve_plugin_provider: busyResolvePluginProvider,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+      const added = await client.call("core:workspace_add", {
+        args: [workspaceRoot],
+        confirmed: true,
+        selected_technology_ids: ["typescript"],
+        selected_plugin_ids: [JAVASCRIPT_TYPESCRIPT_PLUGIN_ID],
+      });
+      expect(added.outcome).toBe("success");
+      const addedPayload = added.payload as { readonly workspace_id: string };
+      const settled = await pollUntilReady(client, addedPayload.workspace_id);
+      expect(settled.workspace_status).toBe("ready");
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      const warnedBusy = warnSpy.mock.calls.map((call) => call.map(String).join(" ")).some((line) => line.includes("workspace writer busy") && line.includes("attempt 1/8"));
+      expect(warnedBusy).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
       if (runtime) await runtime.stop();
       await rm(dataRoot, { recursive: true, force: true });
       await rm(workspaceRoot, { recursive: true, force: true });

@@ -177,7 +177,7 @@ describe("Task 2 contract registries", () => {
   it("publishes the authoritative model inventory without duplicates", () => {
     expect(modelRegistry).toHaveLength(modelInventoryFixture.authoritative_model_count);
     expect(authoritativeModelNames).toHaveLength(modelInventoryFixture.authoritative_model_count);
-    expect(new Set(modelRegistry.map((model) => model.name)).size).toBe(400);
+    expect(new Set(modelRegistry.map((model) => model.name)).size).toBe(401);
     expect(modelContractRegistry).toHaveLength(modelInventoryFixture.authoritative_model_count);
     expect(modelInventoryFixture.required_field_metadata).toBe(true);
     expect(modelContractRegistry.every((model) => model.owner_decision.length > 0 && model.fields.length > 0)).toBe(true);
@@ -585,10 +585,10 @@ describe("Task 2 contract registries", () => {
   it("keeps the initial core registry counts aligned with the approved registries", () => {
     expect(operationRegistry).toHaveLength(18);
     expect(recipeRegistry).toHaveLength(11);
-    expect(canonicalSchemaRegistry).toHaveLength(46);
+    expect(canonicalSchemaRegistry).toHaveLength(48);
     expect(comparatorRegistry).toHaveLength(18);
     expect(operationErrorRegistry).toHaveLength(48);
-    expect(Object.keys(generatedJsonSchemaRegistry)).toHaveLength(46);
+    expect(Object.keys(generatedJsonSchemaRegistry)).toHaveLength(48);
     expect(Object.values(generatedJsonSchemaRegistry).every((schema) => schema.$schema === "https://json-schema.org/draft/2020-12/schema")).toBe(true);
     expect(operationDefinitions.every((operation) => operation.operation_id && operation.operation_version && operation.argument_schema_id)).toBe(true);
     expect(new Set(operationDefinitions.map((operation) => operation.argument_schema_id)).size).toBeGreaterThan(1);
@@ -662,7 +662,7 @@ describe("Task 2 contract registries", () => {
   });
 
   it("covers every authoritative field, registry payload, and canonical schema through the package entrypoint", () => {
-    expect(modelContractRegistry).toHaveLength(400);
+    expect(modelContractRegistry).toHaveLength(401);
     expect(modelContractRegistry.every((model) => model.fields.every((field) => field.logical_type.length > 0 && field.description.length > 0 && field.source.length > 0))).toBe(true);
     expect(modelContractRegistry.find((model) => model.name === "PluginPackageManifest")?.fields.find((field) => field.name === "package_files")).toMatchObject({ logical_type: "OrderedSet<PackageFileEntry, core:package_file_path_order@1>" });
     expect(modelContractRegistry.find((model) => model.name === "RuntimeComponentBehaviorManifest")?.fields.find((field) => field.name === "contract_bindings")).toMatchObject({ logical_type: "Set<RuntimeComponentContractBinding>" });
@@ -758,7 +758,7 @@ describe("Task 2 contract registries", () => {
     expect(getGeneratedJsonSchema("core:ModelAssetManifest", 1)).toMatchObject({ $ref: expect.stringContaining("ModelAssetManifest") });
     expect(() => getGeneratedJsonSchema("core:does_not_exist@1")).not.toThrow();
     expect(getGeneratedJsonSchema("core:does_not_exist@1")).toBeUndefined();
-    expect(coreSchemaDefinitions).toHaveLength(46);
+    expect(coreSchemaDefinitions).toHaveLength(48);
     for (const definition of coreSchemaDefinitions) {
       expect(() => validateSchemaDefinition(definition)).not.toThrow();
       const generated = generatedJsonSchemaRegistry[`${definition.schema_id}@${definition.schema_version}`];

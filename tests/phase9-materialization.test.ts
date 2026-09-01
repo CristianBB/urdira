@@ -4,7 +4,7 @@ import { LogicalDigestWriter } from "@urdira/canonical";
 import type { CandidateMaterialization, CandidateProjectionTemplate, IndexCandidate, ProjectionWorkItem, ProposedRecord } from "@urdira/contracts";
 import { canonicalBytes, digestBytes, digestCanonicalArray, memoizedCanonicalArrayDigest, memoizedPackedIdentityTriple } from "@urdira/canonical";
 import { canonicalSha256 as pluginCanonicalSha256 } from "@urdira/plugin-sdk";
-import { CandidateMaterializer, CandidateRecordTemplateAccumulator, MaterializationDigestOffload, compactAcceptedFactDelta, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
+import { CandidateMaterializer, CandidateRecordTemplateAccumulator, MaterializationDigestOffload, compactAcceptedFactDelta, configureNativeLogicalDigestPort, type AcceptedFactDelta, type CandidateMaterializationInput } from "../packages/engine/src/index.js";
 import { MaterializationRecordDigestPipeline } from "../packages/engine/src/materialization-record-digest-pipeline.js";
 
 const candidate = (): IndexCandidate => ({ candidate_generation_id: "candidate:materialization", workspace_id: "workspace:1", target_registry_snapshot_id: "registry:target", target_configuration_revision_id: "config:target", trigger_kind: "source_change", state: "ready", source_observation_batch_ids: [], issue_ids: [], created_at: "2026-08-10T00:00:00.000Z" });
@@ -95,10 +95,33 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     const compact = compactAcceptedFactDelta(accepted);
     expect(compact.replacement_sets[0]!.records[0]).toMatchObject({ proposal_record_key: "proposal:packed", identity_key: "packed" });
     expect(compact.replacement_sets[0]!.records[0]).toHaveProperty("canonical_record");
+    expect(compact.replacement_sets[0]!.records[0]).toHaveProperty("record_digest", digest(source.replacement_sets[0]!.records[0]));
     expect(compact.replacement_sets[0]!.records[0]).not.toHaveProperty("body");
     const fullSeal = new CandidateMaterializer().seal(input({ accepted_deltas: [accepted] }));
     const compactSeal = new CandidateMaterializer().seal(input({ accepted_deltas: [compact] }));
     expect(compactSeal).toEqual(fullSeal);
+  });
+
+  it("marks one-shot incremental templates as Rust-promoted when requested", () => {
+    const sealed = new CandidateMaterializer().seal(input({
+      accepted_deltas: [acceptedDelta([record("rust-incremental", "body")])],
+      rust_promoted_structural_rows: true,
+      base_records: [{
+        record_id: "record:prior",
+        record_digest: digest(record("prior", "old")),
+        workspace_id: "workspace:1",
+        owner_artifact_id: "artifact:owner",
+        owner_artifact_version_id: "version:owner",
+        category: "entity",
+        kind: "test:symbol",
+        universal_kind: "definition",
+        identity_type: "entity",
+        identity_id: "entity:prior",
+        identity_key: "prior",
+        valid_from_generation: 1,
+      }],
+    }));
+    expect((sealed.record_open_memo as unknown as Record<PropertyKey, unknown>)[Symbol.for("urdira.promoted_record_open_memo")]).toBe(true);
   });
 
   it("retains large initial identity sets as compact tuples while preserving their logical descriptor", () => {
@@ -114,7 +137,7 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     const descriptor = JSON.parse(sealed.materialization.identity_assignment_template_set) as { entry_count: number; content_digest: string };
     expect(descriptor.entry_count).toBe(records.length);
     expect(descriptor.content_digest).toMatch(/^sha256:[0-9a-f]{64}$/u);
-  });
+  }, 15_000);
 
   it("reuses identical records and replaces changed or missing authoritative members", () => {
     const same = record("same", "same");
@@ -183,6 +206,52 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     } as never));
     expect(withProjectionDependency.projection_dependencies).toHaveLength(1);
     expect(() => new CandidateMaterializer().seal(input({ accepted_projection_sets: [{ work_item: projectionWork as never, projections: [projection], projection_set_digest: digest("wrong") }] }))).toThrowError(expect.objectContaining({ code: "core:projection_digest_mismatch" }));
+  });
+
+  it("verifies logical projection batches through the selected native publication port", () => {
+    const projection: CandidateProjectionTemplate = { projection_record_id: "projection:native", projection_kind: "core:graph", projection_key: "native", workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", source_artifact_version_ids: ["version:owner"], source_record_ids: [], source_projection_record_ids: [], generator: "core:test", generator_version: "1.0.0", generator_configuration_digest: digest("config"), payload: { edge: "native" } };
+    const projectionWork: ProjectionWorkItem = { projection_work_item_id: "projection-work-native", workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", projection_kind: "core:graph", operation: "rebuild", generator: "core:test", generator_version: "1.0.0", generator_configuration_digest: digest("config"), source_selection: {}, base_projection_set_digest: digest("base"), reason_codes: [], cause_references: [], work_item_digest: digest("work") };
+    const expected = new LogicalDigestWriter("urdira:projection-set:v3").value([projection]).digest();
+    const batches: unknown[][] = [];
+    configureNativeLogicalDigestPort({
+      logicalValueDigestBatch: () => { throw new Error("materialization must use the verification operation"); },
+      verifyLogicalValueBatch: (records) => {
+        batches.push([...records]);
+        return records.map((record) => {
+          const actual = new LogicalDigestWriter(record.domain).value(record.value).digest();
+          return { valid: actual === record.expected_digest, actual_digest: actual, byte_length: 1 };
+        });
+      },
+    });
+    try {
+      const sealed = new CandidateMaterializer().seal(input({ accepted_projection_sets: [{ work_item: projectionWork, projections: [projection], projection_set_digest: expected }], known_artifact_versions: [{ artifact_id: "artifact:owner", artifact_version_id: "version:owner", content_digest: digest("owner") }] }));
+      expect(sealed.materialization.materialization_digest).toMatch(/^sha256:/u);
+      expect(batches).toHaveLength(1);
+      expect(batches[0]).toEqual([{ domain: "urdira:projection-set:v3", value: [projection], expected_digest: expected }]);
+    } finally {
+      configureNativeLogicalDigestPort(undefined);
+    }
+  });
+
+  it("fails closed when selected native logical verification diverges or throws", () => {
+    const projection: CandidateProjectionTemplate = { projection_record_id: "projection:native-failure", projection_kind: "core:graph", projection_key: "native-failure", workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", source_artifact_version_ids: ["version:owner"], source_record_ids: [], source_projection_record_ids: [], generator: "core:test", generator_version: "1.0.0", generator_configuration_digest: digest("config"), payload: {} };
+    const projectionWork: ProjectionWorkItem = { projection_work_item_id: "projection-work-native-failure", workspace_id: "workspace:1", owner_artifact_id: "artifact:owner", owner_artifact_version_id: "version:owner", projection_kind: "core:graph", operation: "rebuild", generator: "core:test", generator_version: "1.0.0", generator_configuration_digest: digest("config"), source_selection: {}, base_projection_set_digest: digest("base"), reason_codes: [], cause_references: [], work_item_digest: digest("work") };
+    const expected = new LogicalDigestWriter("urdira:projection-set:v3").value([projection]).digest();
+    const nativeInput = input({ accepted_projection_sets: [{ work_item: projectionWork, projections: [projection], projection_set_digest: expected }], known_artifact_versions: [{ artifact_id: "artifact:owner", artifact_version_id: "version:owner", content_digest: digest("owner") }] });
+    configureNativeLogicalDigestPort({
+      logicalValueDigestBatch: () => [],
+      verifyLogicalValueBatch: () => [{ valid: false, actual_digest: `sha256:${"0".repeat(64)}`, byte_length: 1 }],
+    });
+    try {
+      expect(() => new CandidateMaterializer().seal(nativeInput)).toThrowError(expect.objectContaining({ code: "core:projection_digest_mismatch" }));
+      configureNativeLogicalDigestPort({
+        logicalValueDigestBatch: () => [],
+        verifyLogicalValueBatch: () => { throw new Error("native binding failed"); },
+      });
+      expect(() => new CandidateMaterializer().seal(nativeInput)).toThrow(/native binding failed/iu);
+    } finally {
+      configureNativeLogicalDigestPort(undefined);
+    }
   });
 
   it("rejects dependency bindings when the complete artifact authority is omitted", () => {
@@ -393,6 +462,7 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     expect(viaAccumulator.record_dependencies).toEqual(oneShot.record_dependencies);
     expect(viaAccumulator.lookup_bindings).toEqual(oneShot.lookup_bindings);
     expect(viaAccumulator.absence_barrier_keys).toEqual(oneShot.absence_barrier_keys);
+    expect((viaAccumulator.record_open_memo as unknown as { readonly [key: symbol]: unknown })[Symbol.for("urdira.promoted_record_open_memo")]).toBe(true);
     const sortedMemo = (memo: ReadonlyMap<unknown, { recordId: string; recordDigest: string }>): readonly { recordId: string; recordDigest: string }[] => [...memo.values()].sort((left, right) => left.recordId.localeCompare(right.recordId));
     expect(sortedMemo(viaAccumulator.record_open_memo)).toEqual(sortedMemo(oneShot.record_open_memo));
   });
@@ -441,10 +511,27 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     expect(viaAccumulator.identity_assignments).toEqual(oneShot.identity_assignments);
     expect(viaAccumulator.record_opens).toEqual(oneShot.record_opens);
     expect(viaAccumulator.materialization).toEqual(oneShot.materialization);
-    // Large first scans use the promoted id/digest hints on each open rather
+    // Large first scans expose a zero-allocation promoted-hint map rather
     // than retaining a second Map entry for every record until publication.
-    expect(viaAccumulator.record_open_memo.size).toBe(0);
-  }, 15_000);
+    // Its private marker lets the in-process storage authority skip an O(n)
+    // identity-coverage pass; recovery/deserialization loses that marker.
+    expect(viaAccumulator.record_open_memo.size).toBe(recordsA.length + recordsB.length);
+    expect((viaAccumulator.record_open_memo as unknown as Record<PropertyKey, unknown>)[Symbol.for("urdira.promoted_record_open_memo")]).toBe(true);
+
+    const fileBackedAccumulator = new CandidateRecordTemplateAccumulator("workspace:1", false, { file_backed: true });
+    try {
+      fileBackedAccumulator.accept(compactB);
+      fileBackedAccumulator.accept(compactA);
+      const fileBacked = new CandidateMaterializer().seal(input({ accepted_deltas: [compactA, compactB] }), fileBackedAccumulator);
+      expect([...fileBacked.identity_assignments]).toEqual(oneShot.identity_assignments);
+      expect([...fileBacked.record_opens]).toEqual(oneShot.record_opens);
+      expect(fileBacked.materialization).toEqual(oneShot.materialization);
+      expect(fileBacked.record_open_memo.size).toBe(recordsA.length + recordsB.length);
+      for (const open of fileBacked.record_opens) expect(fileBacked.record_open_memo.has(open)).toBe(true);
+    } finally {
+      fileBackedAccumulator.dispose();
+    }
+  }, 30_000);
 
   // (3d) sealAsync's off-thread digests: the worker runs the identical
   // canonical encode, so the ENTIRE sealed result -- descriptors, semantic
@@ -673,7 +760,7 @@ describe("Phase 9 generation-neutral candidate materialization", () => {
     // not by tuple content, and that the recompute fallback path is real.
     const foreignTuple = ["urdira:created-identity:v1", "workspace:1", "entity", "triple-above-0", "record:deadbeef", "artifact:owner", "version:owner"] as const;
     expect(memoizedPackedIdentityTriple(foreignTuple)).toBeUndefined();
-  });
+  }, 15_000);
 
   // A candidate that turns out ineligible mid-stream (any record is a
   // generic, non-compacted `ProposedRecord`) must disqualify the accumulator

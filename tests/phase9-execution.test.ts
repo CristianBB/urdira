@@ -3,7 +3,7 @@ import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import type { ArtifactWorkItem, IndexCandidate, ProjectionWorkItem } from "@urdira/contracts";
 import { LogicalDigestWriter } from "@urdira/canonical";
 import { canonicalSha256 } from "@urdira/plugin-sdk";
-import { CandidateExecutor, buildCandidateExecutionDag, type AcceptedManifestPersistencePort, type CandidateExecutionInput, type ValidatedStagedRecord } from "../packages/engine/src/index.js";
+import { CandidateExecutor, buildCandidateExecutionDag, configureNativeLogicalDigestPort, type AcceptedManifestPersistencePort, type CandidateExecutionInput, type ValidatedStagedRecord } from "../packages/engine/src/index.js";
 
 const digest = (value: unknown): string => canonicalSha256(value);
 
@@ -114,6 +114,45 @@ describe("Phase 9 candidate execution", () => {
 
   it("accepts the v3 logical projection-set digest emitted by plugins", async () => {
     await expect(new CandidateExecutor().execute(projectionExecutionInput([projectionRecord()], {}, "logical"))).resolves.toHaveLength(1);
+  });
+
+  it("uses the selected native logical digest batch and fails closed on divergence", async () => {
+    const calls: unknown[][] = [];
+    configureNativeLogicalDigestPort({
+      logicalValueDigestBatch(records) {
+        calls.push(records.map((record) => record.value));
+        return records.map((record) => ({
+          digest: new LogicalDigestWriter(record.domain).value(record.value).digest(),
+          byte_length: 1,
+        }));
+      },
+      verifyLogicalValueBatch() { throw new Error("verification is owned by materialization"); },
+    });
+    try {
+      await expect(new CandidateExecutor().execute(projectionExecutionInput([projectionRecord()], {}, "logical"))).resolves.toHaveLength(1);
+      expect(calls).toHaveLength(1);
+
+      configureNativeLogicalDigestPort({
+        logicalValueDigestBatch(records) {
+          return records.map(() => ({ digest: digest("native-divergence"), byte_length: 1 }));
+        },
+        verifyLogicalValueBatch() { throw new Error("verification is owned by materialization"); },
+      });
+      await expect(new CandidateExecutor().execute(projectionExecutionInput([projectionRecord()], {}, "logical"))).rejects.toMatchObject({
+        code: "core:projection_digest_mismatch",
+      });
+
+      configureNativeLogicalDigestPort({
+        logicalValueDigestBatch() { throw new Error("native digest unavailable"); },
+        verifyLogicalValueBatch() { throw new Error("verification is owned by materialization"); },
+      });
+      await expect(new CandidateExecutor().execute(projectionExecutionInput([projectionRecord()], {}, "logical"))).rejects.toMatchObject({
+        code: "core:projection_digest_mismatch",
+        scope: expect.objectContaining({ native_error: "native digest unavailable" }),
+      });
+    } finally {
+      configureNativeLogicalDigestPort(undefined);
+    }
   });
 
   it("rolls back when accepted-manifest persistence fails", async () => {

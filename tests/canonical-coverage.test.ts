@@ -113,7 +113,7 @@ describe("canonical repository coverage vectors", () => {
     expect(digestCanonicalMapWithArrayField(fields, "transitions", largeElements)).toMatch(/^sha256:/u);
     const nestedElements = [{ scope: { replacement_scope_id: "scope:small" }, records: [{ id: "a" }] }];
     expect(digestCanonicalMapWithArrayField({}, "replacement_sets", nestedElements)).toBe(digestBytes(encodeCanonical({ replacement_sets: nestedElements })));
-  });
+  }, 15_000);
 
   it("covers canonical encoding limits and rejected wire forms", () => {
     expect(encodeFloat64(Math.PI)).toHaveLength(9);

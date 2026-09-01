@@ -21,7 +21,7 @@ describe("Phase 14 release contract", () => {
 
   it("pins the runtime, watcher, dependency, and configure-time model policy", async () => {
     const config = await readReleaseConfig();
-    expect(config["runtime"]).toMatchObject({ node: "24.18.1", pnpm: "11.20.0", sqlite: "node:sqlite", watcher: "@parcel/watcher@2.6.0" });
+    expect(config["runtime"]).toMatchObject({ node: "24.18.1", pnpm: "11.20.0", sqlite: "node:sqlite", watcher: "@parcel/watcher@2.6.0", worker_protocol: "urdira.ipc.v2" });
     expect(config["semantic_model"]).toMatchObject({ model_id: "Xenova/all-MiniLM-L6-v2", acquisition: "configure_time_download", bundled_assets: false });
     expect(Object.values(config["dependencies"] as Record<string, string>).every((value) => !/[~^*]|workspace:/u.test(value))).toBe(true);
   });

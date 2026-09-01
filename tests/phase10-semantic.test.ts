@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   DeterministicSemanticRuntime,
   DeterministicOnnxInferencePort,
@@ -9,6 +9,7 @@ import {
   SemanticRuntimeRegistry,
   buildSemanticDocument,
   canonicalVectorBytes,
+  configureNativeExactVectorTopKPort,
   exactVectorScan,
   fuseSemanticLanes,
   rerankSemanticMatches,
@@ -60,6 +61,8 @@ function lane(overrides: Partial<SemanticProfileLane> = {}): SemanticProfileLane
 }
 
 describe("Phase 10 semantic engine", () => {
+  afterEach(() => configureNativeExactVectorTopKPort(undefined));
+
   it("builds a complete generic document and keeps enrichment optional", () => {
     const first = buildSemanticDocument({
       artifact_id: "artifact-1",
@@ -137,6 +140,55 @@ describe("Phase 10 semantic engine", () => {
     expect(result.map((item) => item.projection_record_id)).toEqual(["a"]);
     expect(result[0]).not.toHaveProperty("distance");
     expect(result[0]).toMatchObject({ rank: 1 });
+  });
+
+  it("uses the configured native exact-vector kernel with canonical packed vectors", () => {
+    const requests: unknown[] = [];
+    configureNativeExactVectorTopKPort({
+      exactVectorTopKBatch(batch) {
+        requests.push(...batch);
+        return [[{ projection_record_id: "native", rank: 1 }]];
+      },
+    });
+    const result = exactVectorScan([
+      { projection_record_id: "native", profile_id: "p", executable_binding_id: "b", vector: [3, 4], metadata: { language_id: "typescript" } },
+      { projection_record_id: "filtered", profile_id: "other", executable_binding_id: "b", vector: [1, 0] },
+    ], [0.6, 0.8], {
+      profile_id: "p",
+      executable_binding_id: "b",
+      dimensions: 2,
+      distance_metric: "cosine",
+      normalization: "l2",
+      filter: { language_id: "typescript" },
+      limit: 1,
+    });
+    expect(result).toEqual([{ projection_record_id: "native", rank: 1 }]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ projectionRecordIds: ["native"], dimensions: 2, elementType: "float32_le", k: 1, metric: "cosine" });
+    expect((requests[0] as { query: Uint8Array }).query).toBeInstanceOf(Uint8Array);
+    expect((requests[0] as { candidates: Uint8Array }).candidates.byteLength).toBe(8);
+  });
+
+  it("fails closed on native vector errors or malformed ordered results", () => {
+    configureNativeExactVectorTopKPort({ exactVectorTopKBatch() { throw new Error("native vector failure"); } });
+    expect(() => exactVectorScan([
+      { projection_record_id: "a", profile_id: "p", executable_binding_id: "b", vector: [1, 0] },
+    ], [1, 0], { profile_id: "p", executable_binding_id: "b", dimensions: 2, distance_metric: "cosine" })).toThrow(/native vector failure/u);
+
+    configureNativeExactVectorTopKPort({ exactVectorTopKBatch() { return [[{ projection_record_id: "unknown", rank: 2 }]]; } });
+    expect(() => exactVectorScan([
+      { projection_record_id: "a", profile_id: "p", executable_binding_id: "b", vector: [1, 0] },
+    ], [1, 0], { profile_id: "p", executable_binding_id: "b", dimensions: 2, distance_metric: "cosine" })).toThrow(/malformed result/u);
+  });
+
+  it("keeps portable UTF-8 tie ordering in the non-native oracle", () => {
+    const result = exactVectorScan(["éclair", "äther", "zeta", "alpha"].map((projection_record_id) => ({
+      projection_record_id,
+      profile_id: "p",
+      executable_binding_id: "b",
+      vector: [1, 0],
+    })), [1, 0], { profile_id: "p", executable_binding_id: "b", dimensions: 2, distance_metric: "squared_l2" });
+    expect(result.map((entry) => entry.projection_record_id)).toEqual(["alpha", "zeta", "äther", "éclair"]);
   });
 
   it("applies the declared normalization to every exact-scan vector", () => {

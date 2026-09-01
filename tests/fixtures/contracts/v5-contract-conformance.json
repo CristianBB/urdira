@@ -2973,7 +2973,7 @@
         {
           "name": "payload",
           "presence": "optional",
-          "logical_type": "JsonValue",
+          "logical_type": "SourceProviderPayload",
           "description": "Source-backed model field.",
           "source": "decisions/01-universal-data-model.md"
         },
@@ -3149,7 +3149,7 @@
         {
           "name": "content",
           "presence": "required",
-          "logical_type": "Bytes",
+          "logical_type": "Uint8Array",
           "description": "Source-backed model field.",
           "source": "decisions/01-universal-data-model.md"
         },
@@ -4468,6 +4468,13 @@
           "name": "wait_timeout_ms",
           "presence": "required",
           "logical_type": "Count",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "required_frontier",
+          "presence": "optional",
+          "logical_type": "source | syntax | structural | semantic",
           "description": "Source-backed model field.",
           "source": "decisions/01-universal-data-model.md"
         },
@@ -9510,6 +9517,82 @@
           "name": "effective_capabilities",
           "presence": "required",
           "logical_type": "Sequence<Text>",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "runtime_executable_binding",
+          "presence": "optional",
+          "logical_type": "PluginRuntimeExecutableBinding",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        }
+      ]
+    },
+    {
+      "name": "PluginRuntimeExecutableBinding",
+      "owner_decision": "decisions/01-universal-data-model.md",
+      "fields": [
+        {
+          "name": "plugin_id",
+          "presence": "required",
+          "logical_type": "Text",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "plugin_version",
+          "presence": "required",
+          "logical_type": "Text",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "runtime_target_id",
+          "presence": "required",
+          "logical_type": "Text",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "runtime_contract_version",
+          "presence": "required",
+          "logical_type": "Count",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "runtime_component_build_id",
+          "presence": "required",
+          "logical_type": "Text",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "implementation_digest",
+          "presence": "required",
+          "logical_type": "Text",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "package_digest",
+          "presence": "required",
+          "logical_type": "Text",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "entrypoint_asset_digest",
+          "presence": "required",
+          "logical_type": "Text",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "binding_digest",
+          "presence": "required",
+          "logical_type": "Text",
           "description": "Source-backed model field.",
           "source": "decisions/01-universal-data-model.md"
         }
@@ -17267,6 +17350,13 @@
           "logical_type": "QueryStageArguments",
           "description": "Source-backed model field.",
           "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "operation_version",
+          "presence": "optional",
+          "logical_type": "Count",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
         }
       ]
     },
@@ -17284,6 +17374,13 @@
         {
           "name": "output",
           "presence": "required",
+          "logical_type": "Text",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "name",
+          "presence": "optional",
           "logical_type": "Text",
           "description": "Source-backed model field.",
           "source": "decisions/01-universal-data-model.md"
@@ -17737,6 +17834,13 @@
           "name": "wait_timeout_ms",
           "presence": "required",
           "logical_type": "Count",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "required_frontier",
+          "presence": "optional",
+          "logical_type": "source | syntax | structural | semantic",
           "description": "Source-backed model field.",
           "source": "decisions/01-universal-data-model.md"
         },
@@ -20583,6 +20687,20 @@
           "source": "decisions/01-universal-data-model.md"
         },
         {
+          "name": "syntax_ready",
+          "presence": "optional",
+          "logical_type": "Boolean",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
+          "name": "structural_stage_1_ready",
+          "presence": "optional",
+          "logical_type": "Boolean",
+          "description": "Source-backed model field.",
+          "source": "decisions/01-universal-data-model.md"
+        },
+        {
           "name": "structural_ready",
           "presence": "optional",
           "logical_type": "Boolean",
@@ -22007,6 +22125,14 @@
     },
     {
       "schema_id": "core:RuntimeComponentImplementationManifest",
+      "schema_version": 1
+    },
+    {
+      "schema_id": "core:RuntimeComponentImplementationManifest",
+      "schema_version": 2
+    },
+    {
+      "schema_id": "core:PluginRuntimeExecutableBinding",
       "schema_version": 1
     },
     {

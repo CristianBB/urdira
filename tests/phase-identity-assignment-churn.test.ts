@@ -33,8 +33,8 @@ async function withHashEmbeddingsProvider<T>(run: () => Promise<T>): Promise<T> 
 }
 
 async function pollUntilReady(client: DaemonClient, workspaceId: string, timeoutMs = 60_000): Promise<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = process.hrtime.bigint() + BigInt(timeoutMs) * 1_000_000n;
+  while (process.hrtime.bigint() < deadline) {
     const response = await client.call("core:index_status", {});
     if (response.outcome !== "success") throw new Error(JSON.stringify(response));
     const payload = response.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_id: string; readonly workspace_status: string }> };
@@ -42,8 +42,21 @@ async function pollUntilReady(client: DaemonClient, workspaceId: string, timeout
     if (workspace === undefined) throw new Error(`core:index_status did not report workspace ${workspaceId}.`);
     if (workspace.workspace_status === "ready" || workspace.workspace_status === "degraded") {
       const detail = await client.call("core:index_status", { workspace_ids: [workspaceId] });
+      if (detail.outcome !== "success") {
+        if (detail.error?.code === "core:index_unavailable" && detail.error.details?.["index_state"] === "indexing") {
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+          continue;
+        }
+        throw new Error(JSON.stringify(detail));
+      }
       const detailPayload = detail.payload as { readonly workspaces: ReadonlyArray<{ readonly workspace_status: string; readonly current_snapshot_id?: string }> };
-      return detailPayload.workspaces[0]!;
+      const detailedWorkspace = detailPayload.workspaces[0];
+      if (detailedWorkspace === undefined) throw new Error(`core:index_status did not return detail for ${workspaceId}.`);
+      if (detailedWorkspace.workspace_status !== "ready" && detailedWorkspace.workspace_status !== "degraded") {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        continue;
+      }
+      return detailedWorkspace;
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
   }
