@@ -534,11 +534,13 @@ fn promote_direct_publication_metadata(
     transaction: &Transaction<'_>,
     request: &GenerationRequest,
 ) -> Result<(), CoreError> {
+    let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
     // Direct publication does not materialise candidate bodies.  Do not build
     // the legacy publication-order TEMP relation either: the core owner-row
     // covering index already has the exact deterministic order required for
     // the descriptor endpoints, and the finalizer scans that same order once
     // when it inserts durable rows.
+    let delete_started = Instant::now();
     for table in [
         "candidate_publication_record_occurrences",
         "candidate_publication_record_facets",
@@ -551,7 +553,14 @@ fn promote_direct_publication_metadata(
             )
             .map_err(sql_error)?;
     }
+    if debug_timing {
+        eprintln!(
+            "[urdira-indexing-core] promote_direct_publication_metadata candidate_delete_ms={}",
+            delete_started.elapsed().as_millis()
+        );
+    }
     let generation = descriptor_generation(request);
+    let closures_started = Instant::now();
     transaction
         .execute(
             DIRECT_PUBLICATION_CLOSURES_SQL,
@@ -564,6 +573,13 @@ fn promote_direct_publication_metadata(
             ],
         )
         .map_err(sql_error)?;
+    if debug_timing {
+        eprintln!(
+            "[urdira-indexing-core] promote_direct_publication_metadata direct_publication_closures_ms={}",
+            closures_started.elapsed().as_millis()
+        );
+    }
+    let descriptor_upsert_started = Instant::now();
     transaction
         .execute(
             "INSERT INTO candidate_publication_descriptors (candidate_generation_id, workspace_id, record_count, facet_count, identity_count, canonical_byte_length, first_record_id, last_record_id, record_sequence_digest, identity_sequence_digest, sealed_at) VALUES (?1, ?2, COALESCE((SELECT record_count FROM urdira_core_generation_stats WHERE operation_id = ?3 AND candidate_generation_id = ?1), 0), COALESCE((SELECT facet_count FROM urdira_core_generation_stats WHERE operation_id = ?3 AND candidate_generation_id = ?1), 0), COALESCE((SELECT identity_count FROM urdira_core_generation_stats WHERE operation_id = ?3 AND candidate_generation_id = ?1), 0), COALESCE((SELECT body_byte_length FROM urdira_core_generation_stats WHERE operation_id = ?3 AND candidate_generation_id = ?1), 0), (SELECT first_record_id FROM urdira_core_generation_stats WHERE operation_id = ?3 AND candidate_generation_id = ?1), (SELECT last_record_id FROM urdira_core_generation_stats WHERE operation_id = ?3 AND candidate_generation_id = ?1), 'rust:pending', 'rust:pending', ?4) ON CONFLICT(candidate_generation_id) DO UPDATE SET workspace_id = excluded.workspace_id, record_count = excluded.record_count, facet_count = excluded.facet_count, identity_count = excluded.identity_count, canonical_byte_length = excluded.canonical_byte_length, first_record_id = excluded.first_record_id, last_record_id = excluded.last_record_id, record_sequence_digest = excluded.record_sequence_digest, identity_sequence_digest = excluded.identity_sequence_digest, sealed_at = excluded.sealed_at WHERE candidate_publication_descriptors.workspace_id = excluded.workspace_id AND candidate_publication_descriptors.record_count = excluded.record_count AND candidate_publication_descriptors.facet_count = excluded.facet_count AND candidate_publication_descriptors.identity_count = excluded.identity_count AND candidate_publication_descriptors.canonical_byte_length = excluded.canonical_byte_length AND candidate_publication_descriptors.first_record_id IS excluded.first_record_id AND candidate_publication_descriptors.last_record_id IS excluded.last_record_id AND candidate_publication_descriptors.record_sequence_digest = excluded.record_sequence_digest AND candidate_publication_descriptors.identity_sequence_digest = excluded.identity_sequence_digest",
@@ -581,7 +597,87 @@ fn promote_direct_publication_metadata(
             params![&request.candidate_generation_id, &request.workspace_id, &request.operation_id],
         )
         .map_err(sql_error)?;
+    if debug_timing {
+        eprintln!(
+            "[urdira-indexing-core] promote_direct_publication_metadata descriptor_upsert_ms={}",
+            descriptor_upsert_started.elapsed().as_millis()
+        );
+    }
     Ok(())
+}
+
+/// The secondary accelerator indexes over `record_occurrences`,
+/// `identity_assignments` and `artifact_dependencies` that the incremental
+/// publication path (`DIRECT_PUBLICATION_CLOSURES_SQL` and its downstream
+/// promotion/dependency joins) depends on for indexed `SEARCH` plans instead
+/// of full table scans. Mirrors the two index lists split across the cold
+/// commit's inline recreation and the worker's detached secondary-index
+/// rebuild (`urdira-indexing-worker/src/main.rs`); kept here purely for the
+/// `URDIRA_DEBUG_TIMING` missing-index detector below, so it stays a single
+/// source of truth even though it does not create anything itself.
+const EXPECTED_INCREMENTAL_INDEXES: &[&str] = &[
+    "record_occurrences_visible_idx",
+    "record_occurrences_workspace_owner_idx",
+    "record_occurrences_workspace_owner_version_idx",
+    "record_occurrences_digest_order_idx",
+    "identity_assignments_lookup_idx",
+    "identity_assignments_key_idx",
+    "identity_assignments_owner_key_idx",
+    "identity_assignments_record_idx",
+    "artifact_dependencies_reverse_idx",
+    "artifact_dependencies_direct_idx",
+];
+
+/// Logs (under `URDIRA_DEBUG_TIMING`) which of `EXPECTED_INCREMENTAL_INDEXES`
+/// are absent from the database at the moment an incremental (non
+/// cold-direct) publish begins. A missing index here silently degrades
+/// `DIRECT_PUBLICATION_CLOSURES_SQL` and the dependency-promotion joins from
+/// an indexed `SEARCH` to a full `SCAN` of `record_occurrences` /
+/// `identity_assignments` / `artifact_dependencies` -- the exact failure
+/// mode that turned a routine edit's incremental publish into a 14s full
+/// scan of 3.19M rows (docs/evidence/2026-09-01-f5-e3-cierre-tanda.md, A1).
+fn debug_log_missing_incremental_indexes(connection: &Connection) {
+    if std::env::var_os("URDIRA_DEBUG_TIMING").is_none() {
+        return;
+    }
+    let mut statement = match connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'index'")
+    {
+        Ok(statement) => statement,
+        Err(error) => {
+            eprintln!(
+                "[urdira-indexing-core] missing-index detector could not read sqlite_schema: {error}"
+            );
+            return;
+        }
+    };
+    let existing: HashSet<String> = match statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .and_then(Iterator::collect)
+    {
+        Ok(names) => names,
+        Err(error) => {
+            eprintln!(
+                "[urdira-indexing-core] missing-index detector could not enumerate indexes: {error}"
+            );
+            return;
+        }
+    };
+    let missing: Vec<&str> = EXPECTED_INCREMENTAL_INDEXES
+        .iter()
+        .copied()
+        .filter(|name| !existing.contains(*name))
+        .collect();
+    if missing.is_empty() {
+        eprintln!(
+            "[urdira-indexing-core] incremental publish: all expected accelerator indexes present"
+        );
+    } else {
+        eprintln!(
+            "[urdira-indexing-core] incremental publish: MISSING accelerator indexes: {}",
+            missing.join(", ")
+        );
+    }
 }
 
 fn descriptor_generation(request: &GenerationRequest) -> i64 {
@@ -879,27 +975,45 @@ impl IndexingCore {
     /// failure with a bounded backoff instead of failing on the very first
     /// attempt. `open` (and the process-local `workspace_lease` it calls)
     /// intentionally stays single-attempt: administrative/maintenance
-    /// callers -- detached lexical reconcile, WAL checkpoint, secondary
-    /// index rebuild, GC, fork -- call `open` directly and already implement
-    /// their own longer-lived outer retry loops with different pacing (see
-    /// `schedule_lexical_reconcile` in `urdira-indexing-worker`), so they
-    /// must keep failing fast here rather than silently absorbing a real
-    /// one-writer violation underneath those loops.
+    /// callers that only need to eventually run -- WAL checkpoint,
+    /// secondary index rebuild, GC, fork -- call `open` directly and
+    /// already implement their own longer-lived outer retry loops with
+    /// different pacing, so they must keep failing fast here rather than
+    /// silently absorbing a real one-writer violation underneath those
+    /// loops.
     ///
-    /// This wrapper exists for the opposite case: a foreground scan/source
-    /// commit/indexing generation that loses a brief race against a chunk of
-    /// the now-chunked lexical maintenance pass (`reconcile_lexical`, which
-    /// yields the lease every few seconds via `yield_mutation_lease` instead
-    /// of holding it for the pass's whole multi-minute duration). Before
-    /// this wrapper, that race surfaced instantly as
-    /// `core:source_index_commit_failed`/`core:index_open_failed`
-    /// ("workspace structural writer is already active") and the caller
-    /// (`packages/daemon/src/runtime.ts`) had no code to retry on, pinning a
-    /// terminal `last_scan_error` (docs/evidence/2026-09-01-f1-resultado.md).
+    /// This wrapper exists for callers whose own outer retry loop pays
+    /// disproportionately for every lease-contention failure instead of
+    /// simply waiting the current holder out. Two such callers:
+    ///
+    /// - A foreground scan/source commit/indexing generation that loses a
+    ///   brief race against a chunk of the now-chunked lexical maintenance
+    ///   pass (`reconcile_lexical`, which yields the lease every few seconds
+    ///   via `yield_mutation_lease` instead of holding it for the pass's
+    ///   whole multi-minute duration). Before this wrapper, that race
+    ///   surfaced instantly as
+    ///   `core:source_index_commit_failed`/`core:index_open_failed`
+    ///   ("workspace structural writer is already active") and the caller
+    ///   (`packages/daemon/src/runtime.ts`) had no code to retry on, pinning
+    ///   a terminal `last_scan_error`
+    ///   (docs/evidence/2026-09-01-f1-resultado.md).
+    /// - `schedule_lexical_reconcile` in `urdira-indexing-worker` itself:
+    ///   its inner attempt to (re)open the workspace after publication
+    ///   systematically lost this same race against the Node structural
+    ///   commit poller under a single-attempt `open`, each loss paying that
+    ///   loop's own 250-2000ms backoff before trying again (measured: 56
+    ///   retries / 80.5s just to acquire the lease,
+    ///   docs/evidence/2026-09-01-f5-e3-cierre-tanda.md, B1). It now opens
+    ///   with this wrapper instead, and keeps its own outer 10-minute
+    ///   deadline purely as a safety net for the rare case that this
+    ///   wrapper's 30s budget is exhausted too (e.g. a structural generation
+    ///   that legitimately runs for minutes).
+    ///
     /// A short bounded wait here almost always resolves within one or two
-    /// chunk boundaries instead. Does not change single-writer semantics:
-    /// this only waits for the existing lease to become free, exactly as
-    /// `open` would eventually succeed if called again a moment later.
+    /// lease-holder turnovers instead. Does not change single-writer
+    /// semantics: this only waits for the existing lease to become free,
+    /// exactly as `open` would eventually succeed if called again a moment
+    /// later.
     pub fn open_with_lease_wait(
         path: &str,
         request: &GenerationRequest,
@@ -1585,6 +1699,7 @@ impl IndexingCore {
             self.connection
                 .execute_batch("CREATE INDEX IF NOT EXISTS urdira_core_owner_rows_publication_order ON urdira_core_owner_rows (lane, publication_record_id, owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, row_ordinal); CREATE INDEX IF NOT EXISTS urdira_core_owner_rows_record_id ON urdira_core_owner_rows (lane, publication_record_id); CREATE INDEX IF NOT EXISTS urdira_core_owner_rows_dependency_binding ON urdira_core_owner_rows (owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, lane, proposal_key); CREATE INDEX IF NOT EXISTS urdira_core_owner_facets_join ON urdira_core_owner_facets (owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, row_ordinal, facet_ordinal);")
                 .map_err(sql_error)?;
+            debug_log_missing_incremental_indexes(&self.connection);
         }
         let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
         if debug_timing {

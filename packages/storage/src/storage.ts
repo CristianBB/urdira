@@ -1,4 +1,5 @@
 import { access, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalBytes, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
@@ -1595,13 +1596,33 @@ async function pathExists(path: string): Promise<boolean> {
 
 /**
  * Enforces the CAS shard-layout marker (docs/decisions/22: destructive-only
- * migration, no in-place upgrade). A `cas/` directory without the marker but
- * with existing `sha256/` entries predates the single-level shard flattening
- * and must never be reinterpreted under the new layout -- reject it exactly
- * like `ensureWorkspaceSchemaCompatibility`/`ensureCatalogSchemaCompatibility`
- * reject other pre-v3 contract mismatches (`schema.ts`). A fresh or genuinely
- * empty `cas/` directory gets the marker stamped so this check is O(1) (a
- * single file read) on every subsequent open.
+ * migration, no in-place upgrade). A `cas/` directory without the marker
+ * predates the marker convention itself, so its `sha256/` entries (if any)
+ * are inspected for the genuine legacy SHAPE -- reject it exactly like
+ * `ensureWorkspaceSchemaCompatibility`/`ensureCatalogSchemaCompatibility`
+ * reject other pre-v3 contract mismatches (`schema.ts`) -- while a fresh,
+ * genuinely empty, OR already single-level-shaped `cas/` directory gets the
+ * marker (re)stamped so this check is O(1) (a single file read) on every
+ * subsequent open.
+ *
+ * The legacy two-level layout this guards against nests `sha256/<2-hex
+ * shard>/<2-hex shard>/<60-hex rest>` (a shard DIRECTORY containing further
+ * shard DIRECTORIES); the current single-level layout
+ * (`casObjectRelativeParts`, `cas.ts`) is `sha256/<2-hex shard>/<62-hex
+ * rest>` (a shard directory containing blob FILES directly). Checking mere
+ * *presence* of `sha256/` entries -- rather than this shape -- is a false
+ * positive on any v3 root whose CAS content exists before its marker has
+ * been (re)written: `DurableStorage.open` is called independently, on the
+ * SAME `rootDir`, by the main daemon runtime and by every maintenance
+ * job's own worker thread/process (`lexical-worker-thread.ts`,
+ * `semantic-worker-thread.ts`, `semantic-maintenance-process.ts`,
+ * `index-pack-export-worker-thread.ts` -- none of them serialized against
+ * each other or against the main runtime's own open), so nothing in this
+ * module guarantees the marker is durably written before some caller's own
+ * blobs land in `sha256/`. A single-level-shaped `sha256/` is unambiguous
+ * proof the content is already current-layout, no matter which caller's
+ * write raced the marker stamp -- so it is accepted and the marker is
+ * (re)stamped, never rejected.
  */
 async function enforceCasLayoutMarker(casDir: string): Promise<void> {
   const markerPath = join(casDir, CAS_LAYOUT_MARKER_FILENAME);
@@ -1612,12 +1633,32 @@ async function enforceCasLayoutMarker(casDir: string): Promise<void> {
   if (markerContent !== undefined) {
     throw new StorageError("core:index_contract_unsupported", "The workspace data root's CAS layout marker is not recognized by this Urdira v3 runtime; create a fresh v3 data root and reindex.", { contract_kind: "cas_layout", data_format_version: 3 });
   }
-  let shardEntries: readonly string[] = [];
-  try { shardEntries = await readdir(join(casDir, "sha256")); } catch (error) { if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error; }
-  if (shardEntries.length > 0) {
+  if (await hasLegacyTwoLevelCasShard(casDir)) {
     throw new StorageError("core:index_contract_unsupported", "The CAS layout predates this runtime's single-level shard directories; create a fresh v3 data root and reindex.", { contract_kind: "cas_layout", data_format_version: 3 });
   }
   await writeCasLayoutMarker(casDir);
+}
+
+/**
+ * True only when `casDir/sha256/` actually has the legacy two-level SHAPE
+ * (a shard directory whose own children are further directories, not blob
+ * files) -- see `enforceCasLayoutMarker`'s doc comment above for why mere
+ * entry presence is not a reliable legacy signal. A shard directory that is
+ * empty, or whose children are files (the current single-level layout), is
+ * never legacy.
+ */
+async function hasLegacyTwoLevelCasShard(casDir: string): Promise<boolean> {
+  let shardEntries: readonly Dirent[] = [];
+  try { shardEntries = await readdir(join(casDir, "sha256"), { withFileTypes: true }); }
+  catch (error) { if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error; return false; }
+  for (const entry of shardEntries) {
+    if (!entry.isDirectory()) continue;
+    let nestedEntries: readonly Dirent[] = [];
+    try { nestedEntries = await readdir(join(casDir, "sha256", entry.name), { withFileTypes: true }); }
+    catch (error) { if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    if (nestedEntries.some((nested) => nested.isDirectory())) return true;
+  }
+  return false;
 }
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {

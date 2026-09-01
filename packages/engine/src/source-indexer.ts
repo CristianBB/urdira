@@ -208,24 +208,120 @@ function parseWatermarks(value: string | undefined): Record<string, string> {
   } catch { return {}; }
 }
 
-function sourceStateDigest(state: PlannedState): string {
-  // The source frontier can contain hundreds of thousands of URIs. Keep the
-  // state maps as the provider's authoritative lookup structures and compose
-  // two content-addressed roots instead of allocating/sorting a second full
-  // corpus solely for the publication digest.
+function presentMember(normalized_uri: string, occurrence: CurrentSourceOccurrence): { readonly member_digest: string; readonly logical_digest: string } {
+  const value = { normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_version_id: occurrence.version.artifact_version_id, content_hash: occurrence.version.content_hash, analysis_metadata_digest: occurrence.version.analysis_metadata_digest };
+  return { member_digest: digestLogicalValue(normalized_uri, "urdira:source-member:v3"), logical_digest: digestLogicalValue(value, "urdira:source-entry:v3") };
+}
+
+function absentMember(normalized_uri: string, occurrence: CurrentSourceAbsence): { readonly member_digest: string; readonly logical_digest: string } {
+  const value = { normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_tombstone_id: occurrence.tombstone.artifact_tombstone_id, absence_kind: occurrence.tombstone.absence_kind };
+  return { member_digest: digestLogicalValue(normalized_uri, "urdira:source-member:v3"), logical_digest: digestLogicalValue(value, "urdira:source-entry:v3") };
+}
+
+function digestFromTrees(present: MerkleRadixSet, absent: MerkleRadixSet): string {
+  return digestLogicalValue({ present: { root: present.root(), member_count: present.size() }, absent: { root: absent.root(), member_count: absent.size() } }, "urdira:source-state:v3");
+}
+
+/**
+ * Full from-scratch rebuild: two SHA-256 digests per present/absent member
+ * plus a bottom-up radix pass over the whole frontier -- the historical cost
+ * of `sourceStateDigest`. Used to seed/resync the hot cache below (first scan
+ * of a process, or whenever the cache can't be proven to still match `prior`)
+ * and remains the source of truth the incremental path must always agree
+ * with -- see the equivalence check in tests/phase7-indexing.test.ts.
+ */
+function fullSourceStateDigest(state: PlannedState): { readonly present: MerkleRadixSet; readonly absent: MerkleRadixSet; readonly digest: string } {
   const present = MerkleRadixSet.from((function* () {
-    for (const [normalized_uri, occurrence] of state.present) {
-      const value = { normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_version_id: occurrence.version.artifact_version_id, content_hash: occurrence.version.content_hash, analysis_metadata_digest: occurrence.version.analysis_metadata_digest };
-      yield { member_digest: digestLogicalValue(normalized_uri, "urdira:source-member:v3"), logical_digest: digestLogicalValue(value, "urdira:source-entry:v3") };
-    }
+    for (const [normalized_uri, occurrence] of state.present) yield presentMember(normalized_uri, occurrence);
   })());
   const absent = MerkleRadixSet.from((function* () {
-    for (const [normalized_uri, occurrence] of state.absent) {
-      const value = { normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_tombstone_id: occurrence.tombstone.artifact_tombstone_id, absence_kind: occurrence.tombstone.absence_kind };
-      yield { member_digest: digestLogicalValue(normalized_uri, "urdira:source-member:v3"), logical_digest: digestLogicalValue(value, "urdira:source-entry:v3") };
-    }
+    for (const [normalized_uri, occurrence] of state.absent) yield absentMember(normalized_uri, occurrence);
   })());
-  return digestLogicalValue({ present: { root: present.root(), member_count: present.size() }, absent: { root: absent.root(), member_count: absent.size() } }, "urdira:source-state:v3");
+  return { present, absent, digest: digestFromTrees(present, absent) };
+}
+
+interface HotSourceMerkleState {
+  readonly state_revision: number;
+  readonly digest: string;
+  readonly present: MerkleRadixSet;
+  readonly absent: MerkleRadixSet;
+}
+
+// `GenericSourceIndexer` is recreated fresh for every scan (see its
+// constructor's call sites), so the built trees themselves -- not any
+// instance field -- are what needs to survive between scans of the same
+// workspace for `set`/`delete`'s O(touched) cost to actually be reachable.
+// Keyed by workspace id and bounded to a handful of concurrently hot
+// workspaces (plain least-recently-touched eviction via Map insertion
+// order) so a long-lived process that cycles through many workspaces over
+// its lifetime cannot grow this without bound.
+const MAX_HOT_SOURCE_MERKLE_WORKSPACES = 8;
+const hotSourceMerkleTrees = new Map<string, HotSourceMerkleState>();
+
+function rememberHotSourceMerkleTree(workspaceId: string, state: HotSourceMerkleState): void {
+  hotSourceMerkleTrees.delete(workspaceId);
+  hotSourceMerkleTrees.set(workspaceId, state);
+  while (hotSourceMerkleTrees.size > MAX_HOT_SOURCE_MERKLE_WORKSPACES) {
+    const oldest = hotSourceMerkleTrees.keys().next().value;
+    if (oldest === undefined) break;
+    hotSourceMerkleTrees.delete(oldest);
+  }
+}
+
+/**
+ * `MerkleRadixSet.set`/`delete` (packages/canonical/src/merkle-radix.ts) each
+ * touch one leaf and at most 64 radix nodes, independent of the frontier's
+ * total size, and the class's root is independent of insertion order. This
+ * reuses the previous scan's fully-built present/absent trees for the SAME
+ * workspace and applies only `touchedUris` -- the URIs THIS scan's own
+ * assembly loop actually added, changed, or removed in `planned` -- instead
+ * of re-hashing and rebuilding the whole present/absent frontier (hundreds
+ * of thousands of URIs on a large workspace) on every scan.
+ *
+ * Falls back to `fullSourceStateDigest` (and reseeds the hot cache from its
+ * result) whenever the cache can't be PROVEN to still match `prior`: no hot
+ * entry yet (first scan of this process, or a workspace new to it), or a
+ * revision/digest mismatch (a concurrent write lost the optimistic-locking
+ * race, a workspace was forked/reset to a different lineage, or the
+ * previous scan's own commit never landed -- see the call sites' comments).
+ * `touchedUris === undefined` (a call site not wired to track deltas) also
+ * falls back. The cheap `hot.digest === prior.source_state_digest` check
+ * guards identity even when `state_revision` alone would coincidentally
+ * match (e.g. a workspace reset back to a low revision).
+ */
+function sourceStateDigest(workspaceId: string, prior: SourceIndexState | undefined, planned: PlannedState, touchedUris: ReadonlySet<string> | undefined): string {
+  const priorRevision = prior?.state_revision ?? 0;
+  const hot = hotSourceMerkleTrees.get(workspaceId);
+  if (prior !== undefined && touchedUris !== undefined && hot !== undefined && hot.state_revision === priorRevision && hot.digest === prior.source_state_digest) {
+    for (const uri of touchedUris) {
+      const memberKey = digestLogicalValue(uri, "urdira:source-member:v3");
+      const presentOccurrence = planned.present.get(uri);
+      if (presentOccurrence !== undefined) {
+        const { member_digest, logical_digest } = presentMember(uri, presentOccurrence);
+        hot.present.set(member_digest, logical_digest);
+        hot.absent.delete(memberKey);
+        continue;
+      }
+      const absentOccurrence = planned.absent.get(uri);
+      if (absentOccurrence !== undefined) {
+        const { member_digest, logical_digest } = absentMember(uri, absentOccurrence);
+        hot.absent.set(member_digest, logical_digest);
+        hot.present.delete(memberKey);
+        continue;
+      }
+      // A touched URI that ended up in neither map (not expected in
+      // practice -- every observed artifact lands in exactly one) is still
+      // handled correctly: drop it from both trees.
+      hot.present.delete(memberKey);
+      hot.absent.delete(memberKey);
+    }
+    const digest = digestFromTrees(hot.present, hot.absent);
+    rememberHotSourceMerkleTree(workspaceId, { state_revision: priorRevision + 1, digest, present: hot.present, absent: hot.absent });
+    return digest;
+  }
+  const { present, absent, digest } = fullSourceStateDigest(planned);
+  rememberHotSourceMerkleTree(workspaceId, { state_revision: priorRevision + 1, digest, present, absent });
+  return digest;
 }
 
 function normalizedPath(uri: string): string | undefined {
@@ -837,6 +933,12 @@ export class GenericSourceIndexer {
     const tombstoneClosures: ArtifactTombstoneRecord[] = [];
     const tombstones: ArtifactTombstoneRecord[] = [];
     let changed = false;
+    // Every URI whose final `planned.present`/`planned.absent` membership or
+    // value THIS call actually changes -- fed to `nextState`'s incremental
+    // digest path (see `sourceStateDigest`, above) so it can apply exactly
+    // this delta with `MerkleRadixSet.set`/`delete` instead of rebuilding the
+    // whole frontier.
+    const touchedUris = new Set<string>();
 
     // `source_fragment_assemble` times this fragment's whole in-memory row
     // build: per-observation artifact/version/tombstone-closure construction
@@ -860,6 +962,7 @@ export class GenericSourceIndexer {
         observations.push(observation);
         if (equivalent) { count("source_observations_equivalent"); continue; }
         changed = true;
+        touchedUris.add(read.observation.normalized_uri);
         if (existing) versionClosures.push({ ...existing.version, valid_to_generation: generation });
         const byteLength = read.bytes?.byteLength ?? read.stream?.byte_length;
         if (byteLength === undefined) throw new EngineError("engine:source_index_read_invalid", "Validated source read has no byte length.");
@@ -896,6 +999,7 @@ export class GenericSourceIndexer {
         for (const [uri, occurrence] of [...planned.present]) {
           if (observedUris.has(uri) || !scopes.some((scope) => scopeContainsUri(scope, uri))) continue;
           changed = true;
+          touchedUris.add(uri);
           versionClosures.push({ ...occurrence.version, valid_to_generation: generation });
           const tombstone = this.newTombstone(occurrence, batch, generation, "deleted", { cause_type: "artifact_version", cause_id: occurrence.version.artifact_version_id });
           tombstones.push(tombstone);
@@ -926,7 +1030,7 @@ export class GenericSourceIndexer {
     // identity cannot collide with the prior full scan.
     const committedGeneration = (complete || allowPartial) && changed ? generation : priorState?.current_generation ?? 0;
     const status = complete ? (changed ? "published" : "equivalent") : allowPartial ? (changed ? "published" : "equivalent") : "degraded";
-    const state = this.nextState(priorState, batch.source_provider_binding_id, watermark, committedGeneration, batch.completed_at, planned, batch.observation_batch_id);
+    const state = this.nextState(priorState, batch.source_provider_binding_id, watermark, committedGeneration, batch.completed_at, planned, batch.observation_batch_id, touchedUris);
     let contentBlobs: readonly ContentBlob[] | undefined;
     // `sourceInput.prepare_content_blobs` (Rust-owned captures only) resolves
     // to `@urdira/storage`'s `prepareSourceIndexContent`
@@ -1026,8 +1130,10 @@ export class GenericSourceIndexer {
     const batch = this.watchBatch(input.response, batchId, parsed.watermark, observations, unique.map(({ event }) => event.normalized_uri));
     const versionClosures: ArtifactVersionRecord[] = [];
     const tombstones: ArtifactTombstoneRecord[] = [];
+    const touchedUris = new Set<string>();
     for (const { event, occurrence, observation } of unique) {
       if (!occurrence) continue;
+      touchedUris.add(event.normalized_uri);
       versionClosures.push({ ...occurrence.version, valid_to_generation: generation });
       const tombstone = this.newTombstone(occurrence, batch, generation, "deleted", { cause_type: "source_observation", cause_id: observation.source_observation_id });
       tombstones.push(tombstone);
@@ -1035,7 +1141,7 @@ export class GenericSourceIndexer {
       planned.absent.set(event.normalized_uri, { artifact: occurrence.artifact, tombstone });
     }
     const committedGeneration = tombstones.length > 0 ? generation : priorState?.current_generation ?? 0;
-    const state = this.nextState(priorState, bindingId, parsed.watermark, committedGeneration, batch.completed_at, planned, batchId);
+    const state = this.nextState(priorState, bindingId, parsed.watermark, committedGeneration, batch.completed_at, planned, batchId, touchedUris);
     const commitInput: SourceIndexCommitInput = { expected_state_revision: priorState?.state_revision ?? 0, state, batch, observations, artifacts: [], contents: [], version_closures: versionClosures, versions: [], tombstone_closures: [], tombstones };
     if (input.defer_commit !== undefined) await input.defer_commit(commitInput);
     else if (input.require_rust_commit === true) throw new EngineError("core:rust_writer_required", "Production source ingestion requires the Rust indexing-core writer.");
@@ -1102,7 +1208,7 @@ export class GenericSourceIndexer {
     };
   }
 
-  private nextState(prior: SourceIndexState | undefined, bindingId: string, watermark: string, generation: number, updatedAt: string, planned: PlannedState, batchId: string): SourceIndexState {
+  private nextState(prior: SourceIndexState | undefined, bindingId: string, watermark: string, generation: number, updatedAt: string, planned: PlannedState, batchId: string, touchedUris?: ReadonlySet<string>): SourceIndexState {
     const watermarks = parseWatermarks(prior?.provider_watermarks);
     watermarks[bindingId] = watermark;
     const revision = (prior?.state_revision ?? 0) + 1;
@@ -1112,7 +1218,7 @@ export class GenericSourceIndexer {
       state_revision: revision,
       checkpoint_id: stableId("freshness-checkpoint", { workspace_id: this.workspace.workspaceId, binding_id: bindingId, watermark, batch_id: batchId, revision }),
       provider_watermarks: JSON.stringify(Object.fromEntries(Object.entries(watermarks).sort(([left], [right]) => left.localeCompare(right)))),
-      source_state_digest: sourceStateDigest(planned),
+      source_state_digest: timedSync("source_state_digest", () => sourceStateDigest(this.workspace.workspaceId, prior, planned, touchedUris)),
       updated_at: updatedAt,
     };
   }

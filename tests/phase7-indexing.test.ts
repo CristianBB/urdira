@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { digestBytes } from "@urdira/canonical";
+import { digestBytes, digestLogicalValue, MerkleRadixSet } from "@urdira/canonical";
 import type { JsonValue, SourceProviderPayload, SourceProviderResponseEnvelope } from "@urdira/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GenericSourceIndexer, sourceObservationBatchDigest, type ProviderObservation, type SourceIndexWorkspacePort } from "../packages/engine/src/index.js";
@@ -791,6 +791,82 @@ describe("Phase 7 generic source indexing", () => {
     const report = await opened.maintenance.verify();
     expect(report.failures).toEqual([]);
     expect(report.ok).toBe(true);
+    await opened.close();
+    await storage.close();
+  });
+
+  // `source-indexer.ts`'s `sourceStateDigest` keeps a hot Merkle-radix tree
+  // pair between scans of the same workspace and applies each scan's own
+  // add/change/delete delta with `MerkleRadixSet.set`/`delete` instead of
+  // rebuilding the whole present/absent frontier from scratch. This is the
+  // equivalence check that optimization must never fail: after every one of a long
+  // random sequence of scans (adds, content changes, deletes, re-adds, and
+  // deliberately-unchanged re-observations, which exercise the
+  // present<->absent cross-tree transitions and the "equivalent, no touch"
+  // skip respectively), the digest the indexer actually persisted must equal
+  // an independent from-scratch `MerkleRadixSet.from` rebuild over the same
+  // committed occurrences/absences read back from storage -- built here with
+  // the same domain-tagged digest construction `sourceStateDigest` uses, but
+  // without relying on any of its internal (hot-cache) state.
+  it("keeps the persisted source_state_digest identical to a from-scratch Merkle rebuild across a random add/change/delete/re-add sequence", async () => {
+    const { storage } = await temporaryStorage();
+    const registration = workspace("workspace:incremental-digest-equivalence");
+    await storage.catalog.registerWorkspace(registration);
+    const opened = await storage.openWorkspace(registration.workspace_id);
+
+    // Deterministic mulberry32 PRNG so a failure is always reproducible from
+    // this fixed seed alone.
+    let a = 0x2f6e2b1;
+    const random = (): number => {
+      a |= 0; a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+
+    async function referenceDigest(): Promise<string> {
+      const occurrences = await opened.sourceIndex.currentOccurrences("binding:one");
+      const absences = await opened.sourceIndex.currentAbsences("binding:one");
+      const presentTree = MerkleRadixSet.from(occurrences.map((occurrence) => {
+        const value = { normalized_uri: occurrence.artifact.normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_version_id: occurrence.version.artifact_version_id, content_hash: occurrence.version.content_hash, analysis_metadata_digest: occurrence.version.analysis_metadata_digest };
+        return { member_digest: digestLogicalValue(occurrence.artifact.normalized_uri, "urdira:source-member:v3"), logical_digest: digestLogicalValue(value, "urdira:source-entry:v3") };
+      }));
+      const absentTree = MerkleRadixSet.from(absences.map((occurrence) => {
+        const value = { normalized_uri: occurrence.artifact.normalized_uri, artifact_id: occurrence.artifact.artifact_id, artifact_tombstone_id: occurrence.tombstone.artifact_tombstone_id, absence_kind: occurrence.tombstone.absence_kind };
+        return { member_digest: digestLogicalValue(occurrence.artifact.normalized_uri, "urdira:source-member:v3"), logical_digest: digestLogicalValue(value, "urdira:source-entry:v3") };
+      }));
+      return digestLogicalValue({ present: { root: presentTree.root(), member_count: presentTree.size() }, absent: { root: absentTree.root(), member_count: absentTree.size() } }, "urdira:source-state:v3");
+    }
+
+    const universe = Array.from({ length: 14 }, (_, index) => `dir/file-${index}.txt`);
+    const contentVersion = new Map<string, number>();
+    const present = new Set<string>();
+
+    for (let round = 0; round < 16; round += 1) {
+      for (const uri of universe) {
+        const roll = random();
+        if (present.has(uri)) {
+          if (roll < 0.2) { present.delete(uri); continue; } // delete: present -> absent
+          if (roll < 0.6) contentVersion.set(uri, (contentVersion.get(uri) ?? 0) + 1); // change; else left byte-identical (equivalent, no touch)
+        } else if (roll < 0.5) {
+          present.add(uri); // add or re-add: absent -> present
+          contentVersion.set(uri, (contentVersion.get(uri) ?? 0) + 1);
+        }
+      }
+      const contents: Record<string, Uint8Array> = {};
+      for (const uri of present) contents[uri] = new TextEncoder().encode(`${uri}:v${contentVersion.get(uri) ?? 0}`);
+      const observations = Object.keys(contents).sort().map((uri) => providerObservation(registration.workspace_id, `batch:round-${round}`, uri, contents[uri]!));
+
+      const result = await new GenericSourceIndexer(opened).apply({
+        response: batchResponse(registration.workspace_id, `batch:round-${round}`, observations),
+        read: readFixture(contents),
+      });
+      expect(["published", "equivalent"]).toContain(result.status);
+
+      const persisted = await opened.sourceIndex.getState();
+      expect(persisted?.source_state_digest).toBe(await referenceDigest());
+    }
+
     await opened.close();
     await storage.close();
   });

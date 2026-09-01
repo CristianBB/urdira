@@ -769,6 +769,43 @@ function capturedArtifactVersionsDigest(artifacts: readonly WorkspaceScanSourceA
   }));
 }
 
+interface HotCapturedArtifactVersionsDigest {
+  readonly generation: number;
+  readonly digest: string;
+}
+
+// A single `runFullWorkspaceScan` call (`capturedArtifactVersionsDigest`'s
+// only caller) reads this digest up to twice for the SAME `scannedArtifacts`
+// -- once to build `sourceOperationId`, once as `plugin.analyze`'s
+// `source_state_digest` -- and progressive publication re-invokes the whole
+// function once per structural stage with the SAME captured generation
+// (`preparedScan.source_artifacts`/`sourceIndexResult.generation` are fixed
+// for the whole multi-stage scan; only `scannedArtifacts`' array/object
+// IDENTITY changes between stages, via `preparedScan.source_artifacts.map
+// ((artifact) => ({ ...artifact }))`, not its content). The generation
+// number is this workspace's stable content identity for that captured
+// frontier -- it only advances when the frontier actually changes -- so
+// caching by (workspace id, generation) is safe across both the intra-call
+// and the cross-stage repeats, without re-hashing all ~14k+ artifacts each
+// time. Bounded the same way as `source-indexer.ts`'s hot Merkle cache, for
+// the same long-lived-process reason.
+const MAX_HOT_CAPTURED_DIGEST_WORKSPACES = 8;
+const hotCapturedArtifactVersionsDigests = new Map<string, HotCapturedArtifactVersionsDigest>();
+
+function capturedArtifactVersionsDigestFor(workspaceId: string, generation: number, artifacts: readonly WorkspaceScanSourceArtifact[]): string {
+  const cached = hotCapturedArtifactVersionsDigests.get(workspaceId);
+  if (cached !== undefined && cached.generation === generation) return cached.digest;
+  const digest = timedSyncEngine("stage_plan_captured_digest", () => capturedArtifactVersionsDigest(artifacts));
+  hotCapturedArtifactVersionsDigests.delete(workspaceId);
+  hotCapturedArtifactVersionsDigests.set(workspaceId, { generation, digest });
+  while (hotCapturedArtifactVersionsDigests.size > MAX_HOT_CAPTURED_DIGEST_WORKSPACES) {
+    const oldest = hotCapturedArtifactVersionsDigests.keys().next().value;
+    if (oldest === undefined) break;
+    hotCapturedArtifactVersionsDigests.delete(oldest);
+  }
+  return digest;
+}
+
 // Default duration budget is sized for full enumeration of large real-world
 // repositories (hundreds of files, two stability inventories); 60s proved too
 // tight and spuriously tripped `resource_exhausted` mid-enumeration.
@@ -1481,17 +1518,17 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
   // route only.
   if (rustCore !== undefined) {
     const rustPlan = precomputedRustPlan!;
-    const sourceOperationId = `source-index:${workspaceId}:${sourceIndexResult.generation}:${capturedArtifactVersionsDigest(scannedArtifacts)}`;
+    const sourceOperationId = `source-index:${workspaceId}:${sourceIndexResult.generation}:${capturedArtifactVersionsDigestFor(workspaceId, sourceIndexResult.generation, scannedArtifacts)}`;
     try {
       if (rustPlan.equivalent) {
         if (sourceCommit !== undefined && deferredSourceCommits.length > 0) {
-          await commitRustSourceCapture({
+          await timed("stage_plan_commit_rust_source_capture", () => commitRustSourceCapture({
             commit: sourceCommit,
             operation_id: sourceOperationId,
             workspace_id: workspaceId,
             database_path: database.database.filename,
             commits: deferredSourceCommits,
-          });
+          }));
         }
         templateAccumulator?.dispose();
         stageTimings["stage_plan"] = Math.round(performance.now() - stagePlanStartedAt);
@@ -1507,13 +1544,13 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         };
       }
       if (sourceCommit !== undefined && deferredSourceCommits.length > 0) {
-        await commitRustSourceCapture({
+        await timed("stage_plan_commit_rust_source_capture", () => commitRustSourceCapture({
           commit: sourceCommit,
           operation_id: sourceOperationId,
           workspace_id: workspaceId,
           database_path: database.database.filename,
           commits: deferredSourceCommits,
-        });
+        }));
       }
       stageTimings["stage_plan"] = Math.round(performance.now() - stagePlanStartedAt);
       throwIfCancelled();
@@ -1529,7 +1566,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         workspace_id: workspaceId,
         candidate,
         frozen_base: frozenBase,
-        source_state_digest: capturedArtifactVersionsDigest(scannedArtifacts),
+        source_state_digest: capturedArtifactVersionsDigestFor(workspaceId, sourceIndexResult.generation, scannedArtifacts),
         source_snapshot_id: `source-snapshot:${sourceIndexResult.generation}`,
         artifacts: [],
         ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -1664,7 +1701,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         // corpus-sized accepted_deltas array until sealing.
         const onAcceptedDelta = templateAccumulator === undefined ? undefined : (delta: MaterializationAcceptedFactDelta): void => { templateAccumulator.accept(delta); };
         const analyzeStartedAt = engineTimingEnabled() ? performance.now() : 0;
-        analysis = await timed("plugin_analyze", () => input.plugin.analyze({ workspace_id: workspaceId, candidate: executingCandidate, frozen_base: frozenBase, source_state_digest: capturedArtifactVersionsDigest(scannedArtifacts), source_snapshot_id: `source-snapshot:${sourceIndexResult.generation}`, candidate_work_manifest: plan.manifest, artifacts: analysisArtifacts, ...(input.signal === undefined ? {} : { signal: input.signal }), ...(changedArtifactIds === undefined ? {} : { changed_artifact_ids: changedArtifactIds }), ...(input.publication_stage_id === undefined ? {} : { publication_stage_id: input.publication_stage_id }), ...(input.included_publication_stage_ids === undefined ? {} : { included_publication_stage_ids: input.included_publication_stage_ids }), ...(onAcceptedDelta === undefined ? {} : { on_accepted_delta: onAcceptedDelta }) }));
+        analysis = await timed("plugin_analyze", () => input.plugin.analyze({ workspace_id: workspaceId, candidate: executingCandidate, frozen_base: frozenBase, source_state_digest: capturedArtifactVersionsDigestFor(workspaceId, sourceIndexResult.generation, scannedArtifacts), source_snapshot_id: `source-snapshot:${sourceIndexResult.generation}`, candidate_work_manifest: plan.manifest, artifacts: analysisArtifacts, ...(input.signal === undefined ? {} : { signal: input.signal }), ...(changedArtifactIds === undefined ? {} : { changed_artifact_ids: changedArtifactIds }), ...(input.publication_stage_id === undefined ? {} : { publication_stage_id: input.publication_stage_id }), ...(input.included_publication_stage_ids === undefined ? {} : { included_publication_stage_ids: input.included_publication_stage_ids }), ...(onAcceptedDelta === undefined ? {} : { on_accepted_delta: onAcceptedDelta }) }));
         const analyzeElapsedMs = engineTimingEnabled() ? performance.now() - analyzeStartedAt : 0;
         // (3a) Feed each delta into the template accumulator as its native
         // batch's own durable write confirms, keyed by `fact_delta_id` (the
@@ -1982,7 +2019,7 @@ export async function runFullWorkspaceScan(input: RunFullWorkspaceScanInput): Pr
         // Observation batch ids can be reused by watcher coalescing. Include
         // the captured source frontier so a real incremental source commit
         // cannot be mistaken for an idempotent replay of the prior generation.
-        operation_id: `source-index:${workspaceId}:${sourceIndexResult.generation}:${capturedArtifactVersionsDigest(scannedArtifacts)}`,
+        operation_id: `source-index:${workspaceId}:${sourceIndexResult.generation}:${capturedArtifactVersionsDigestFor(workspaceId, sourceIndexResult.generation, scannedArtifacts)}`,
         workspace_id: workspaceId,
         database_path: database.database.filename,
         commits: deferredSourceCommits,

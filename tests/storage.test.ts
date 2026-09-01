@@ -1568,6 +1568,39 @@ describe("Phase 4 durable storage", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  // Regression test for a false positive found on a benchmark run: a v3 data
+  // root freshly created by THIS runtime -- `DurableStorage.open` is called
+  // independently (same `rootDir`) by the main daemon runtime AND by every
+  // maintenance job's own worker thread/process (lexical, semantic, semantic
+  // maintenance, index-pack export -- see `enforceCasLayoutMarker`'s doc
+  // comment in `storage.ts`), so nothing serializes a blob write against the
+  // marker stamp. This reproduces exactly the reachable filesystem state a
+  // race like that leaves behind -- single-level-shaped CAS content, no
+  // marker yet -- WITHOUT needing the race itself: a fresh root's `cas/`
+  // never gets this shape from a genuinely pre-flattening layout.
+  it("does not reject a fresh v3 root whose single-level CAS content exists before its layout marker is written", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-cas-layout-race-"));
+    try {
+      const shardDirectory = join(root, "cas", "sha256", "ab");
+      await mkdir(shardDirectory, { recursive: true });
+      await writeFile(join(shardDirectory, "c".repeat(62)), "single-level-object");
+      const storage = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
+      await storage.close();
+      // Self-heals: the marker is stamped so every later open short-circuits.
+      await expect(readFile(join(root, "cas", ".layout"), "utf8")).resolves.toBe("2");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("does not reject a fresh v3 root with an empty CAS shard directory and no marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-cas-layout-empty-shard-"));
+    try {
+      await mkdir(join(root, "cas", "sha256", "ab"), { recursive: true });
+      const storage = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
+      await storage.close();
+      await expect(readFile(join(root, "cas", ".layout"), "utf8")).resolves.toBe("2");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("allows lifecycle closure only once and never reopens a closed version or tombstone", async () => {
     await withStorage(async (_root, storage) => {
       await storage.catalog.registerWorkspace(workspace);
