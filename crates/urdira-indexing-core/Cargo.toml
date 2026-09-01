@@ -1,0 +1,15 @@
+[package]
+name = "urdira-indexing-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+unicode-normalization.workspace = true
+urdira-native-core = { version = "=0.1.0", path = "../urdira-native-core" }
+urdira-worker-protocol = { version = "=0.1.0", path = "../urdira-worker-protocol" }

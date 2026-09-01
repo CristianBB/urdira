@@ -1,0 +1,21 @@
+[package]
+name = "urdira-indexing-worker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "urdira-indexing-worker"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+urdira-indexing-core = { version = "=0.1.0", path = "../urdira-indexing-core" }
+urdira-jsts-indexing-engine = { version = "=0.1.0", path = "../urdira-jsts-indexing-engine" }
+urdira-jsts-syntax-worker = { version = "=0.3.0", path = "../urdira-jsts-syntax-worker" }
+urdira-worker-protocol = { version = "=0.1.0", path = "../urdira-worker-protocol" }

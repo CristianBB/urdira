@@ -1,0 +1,12 @@
+[package]
+name = "urdira-launcher"
+version = "0.3.3"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+
