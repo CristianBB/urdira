@@ -58,6 +58,8 @@ export interface SourceIndexCommitInput {
   readonly observations: readonly SourceObservationRecord[];
   readonly artifacts: readonly SourceArtifact[];
   readonly contents: readonly SourceIndexContentInput[];
+  /** Metadata for CAS objects already durably written by a capture owner. */
+  readonly content_blobs?: readonly ContentBlob[];
   readonly content_streams?: readonly SourceIndexContentStreamInput[];
   readonly version_closures: readonly ArtifactVersionRecord[];
   readonly versions: readonly ArtifactVersionRecord[];
@@ -597,7 +599,9 @@ export class WorkspaceSourceIndexRepository {
   private async commitInternal(input: SourceIndexCommitInput): Promise<void> {
     if (input.state.workspace_id !== this.workspaceId || input.batch.workspace_id !== this.workspaceId) throw new TypeError("Source-index commit workspace mismatch.");
     resetTimings();
-    const stagedContents = new Map<string, ContentBlob>();
+    const stagedContents = new Map<string, ContentBlob>(
+      (input.content_blobs ?? []).map((content) => [content.content_blob_id, content]),
+    );
     // `putMany` writes every content blob in this batch through the same
     // durable per-blob fsync sequence `cas.put` used one call at a time, but
     // with bounded concurrency across blobs and one coalesced
@@ -606,6 +610,7 @@ export class WorkspaceSourceIndexRepository {
     // `packages/storage/src/cas.ts`, for exactly what durability ordering
     // that does and does not change).
     await timed("source_index_cas_put_loop", async () => {
+      if (input.content_blobs !== undefined && input.contents.length === 0 && (input.content_streams?.length ?? 0) === 0) return;
       const references = await this.blobs.cas.putMany(input.contents.map((content) => ({ bytes: content.bytes, options: { media_type: content.media_type } })));
       for (let index = 0; index < input.contents.length; index += 1) {
         const content = input.contents[index] as SourceIndexContentInput;
@@ -654,16 +659,53 @@ export class WorkspaceSourceIndexRepository {
 
   private *commitCommands(input: SourceIndexCommitInput, stagedContents: ReadonlyMap<string, ContentBlob>): Generator<SqliteCommand> {
     yield this.batchCommand(input.batch);
-    for (const artifact of input.artifacts) yield this.artifactCommand(artifact);
-    for (const content of stagedContents.values()) yield this.contentCommand(content);
-    for (const observation of input.observations) yield this.observationCommand(observation);
-    for (const version of input.version_closures) yield this.closeVersionCommand(version);
-    for (const version of input.versions) yield this.versionCommand(version);
-    for (const tombstone of input.tombstone_closures) yield this.closeTombstoneCommand(tombstone);
-    for (const tombstone of input.tombstones) yield this.tombstoneCommand(tombstone);
+    yield* this.batchedRunCommands(input.artifacts, (value) => this.artifactCommand(value));
+    yield* this.batchedRunCommands(stagedContents.values(), (value) => this.contentCommand(value));
+    yield* this.batchedRunCommands(input.observations, (value) => this.observationCommand(value));
+    yield* this.batchedRunCommands(input.version_closures, (value) => this.closeVersionCommand(value));
+    yield* this.batchedRunCommands(input.versions, (value) => this.versionCommand(value));
+    yield* this.batchedRunCommands(input.tombstone_closures, (value) => this.closeTombstoneCommand(value));
+    yield* this.batchedRunCommands(input.tombstones, (value) => this.tombstoneCommand(value));
     yield { kind: "transaction_checkpoint" };
     yield* this.stateCommands(input.state, input.expected_state_revision);
     yield { kind: "assert_transaction_changes", expected: 1 };
+  }
+
+  /** Collapse same-statement source rows into one bounded worker command.
+   * `run_batch` still executes the unchanged prepared statement once per row
+   * and contributes every row's `changes` count to transaction checkpoints;
+   * only the JavaScript object and IPC command cardinality changes. */
+  private *batchedRunCommands<T>(values: Iterable<T>, build: (value: T) => SqliteCommand, batchSize = 512): Generator<SqliteCommand> {
+    let sql: string | undefined;
+    let paramsPerRow: number | undefined;
+    let rows = 0;
+    let params: SqliteValue[] = [];
+    const flush = (): SqliteCommand | undefined => {
+      if (rows === 0 || sql === undefined) return undefined;
+      const command: SqliteCommand = rows === 1
+        ? { kind: "run", sql, ...(params.length === 0 ? {} : { params }) }
+        : { kind: "run_batch", sql, rows, params_flat: params };
+      sql = undefined;
+      paramsPerRow = undefined;
+      rows = 0;
+      params = [];
+      return command;
+    };
+    for (const value of values) {
+      const command = build(value);
+      if (command.kind !== "run") throw new TypeError("Source-index row batching accepts only run commands.");
+      const rowParams = command.params ?? [];
+      if (sql !== undefined && (command.sql !== sql || rowParams.length !== paramsPerRow || rows >= batchSize)) {
+        const ready = flush();
+        if (ready !== undefined) yield ready;
+      }
+      sql ??= command.sql;
+      paramsPerRow ??= rowParams.length;
+      params.push(...rowParams);
+      rows += 1;
+    }
+    const ready = flush();
+    if (ready !== undefined) yield ready;
   }
 
   private batchCommand(value: SourceObservationBatchRecord): SqliteCommand {

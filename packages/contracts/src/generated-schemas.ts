@@ -4,6 +4,8 @@ import {
 } from "./registries.js";
 import {
   generateJsonSchema,
+  pluginRuntimeExecutableBindingSchemaV1,
+  runtimeComponentImplementationManifestSchemaV2,
   type CanonicalSchemaDefinition,
   type CanonicalTypeExpression,
   type JsonSchema,
@@ -61,6 +63,12 @@ const schemaBoundByteCoordinates: Readonly<Record<string, readonly [string, stri
 };
 
 export const coreSchemaDefinitions: CanonicalSchemaDefinition[] = canonicalSchemaRegistry.map((entry: RegistryEntry) => {
+  const decision25Schema = entry.id === "core:RuntimeComponentImplementationManifest@2"
+    ? runtimeComponentImplementationManifestSchemaV2
+    : entry.id === "core:PluginRuntimeExecutableBinding@1"
+      ? pluginRuntimeExecutableBindingSchemaV1
+      : undefined;
+  if (decision25Schema !== undefined) return { ...decision25Schema, description: entry.description, lifecycle_state: entry.lifecycle_state };
   const spec = inlineSchemaSpecs.find((candidate) => candidate.id === entry.id);
   const modelReference = entry.id.match(/^core:(ModelAssetManifest|ModelPackRuntimeConfiguration|TokenizerAssetManifest)@1$/)?.[1];
   if (modelReference) {

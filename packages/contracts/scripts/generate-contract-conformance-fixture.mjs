@@ -15,7 +15,7 @@ const inventoryStart = udmText.indexOf("## Model inventory and traceability");
 const inventoryEnd = udmText.indexOf("\n## ", inventoryStart + 3);
 const inventoryText = udmText.slice(inventoryStart, inventoryEnd < 0 ? undefined : inventoryEnd);
 const modelNames = [...inventoryText.matchAll(/^\|\s*`([A-Za-z][A-Za-z0-9]+)`\s*\|/gm)].map((match) => match[1]);
-if (modelNames.length !== 400) throw new Error(`Normative model inventory must contain 400 models, found ${modelNames.length}`);
+if (modelNames.length !== 401) throw new Error(`Normative model inventory must contain 401 models, found ${modelNames.length}`);
 
 const models = modelNames.map((name) => {
   return {

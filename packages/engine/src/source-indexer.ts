@@ -2,6 +2,7 @@ import { digestBytes, digestLogicalValue, MerkleRadixSet } from "@urdira/canonic
 import type {
   ArtifactTombstone,
   ArtifactVersion,
+  ContentBlob,
   JsonValue,
   SourceArtifact,
   SourceProviderReadResult,
@@ -14,13 +15,15 @@ import type {
   CurrentSourceAbsence,
   CurrentSourceOccurrence,
   SourceIndexCommitInput,
+  SourceIndexContentInput,
+  SourceIndexContentStreamInput,
   SourceIndexPublicationInput,
   SourceIndexState,
   SourceObservationBatchRecord,
   SourceObservationRecord,
 } from "@urdira/storage";
 import { mapWithConcurrency } from "./concurrency.js";
-import { record, timed, timedSync, timingEnabled } from "./debug-timing.js";
+import { count, record, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import type { DirectorySourceByteStream, EncodedObservationBatch, ProviderObservation } from "./directory-provider.js";
 import { EngineError } from "./errors.js";
 import { sourceObservationBatchDigest } from "./source-batch-digest.js";
@@ -68,8 +71,10 @@ export interface SourceIndexApplyInput {
   readonly native_batches?: AsyncIterable<EncodedObservationBatch>;
   /**
    * Accept one stable partial native batch as an incremental source update.
-   * Partial updates never authorize deletion and keep the prior source
-   * generation until the surrounding candidate publication completes.
+   * Partial updates never authorize deletion. A changed accepted batch
+   * advances the source generation exactly like a changed complete capture;
+   * internal fragments do not use this flag and remain unpublished until
+   * their completion fragment commits.
    */
   readonly allow_partial?: boolean;
   /**
@@ -90,6 +95,15 @@ export interface SourceIndexApplyInput {
    * upcoming publish will actually use.
    */
   readonly publication_current_generation?: number;
+  /** Rust writes CAS bytes during capture and persists workspace rows at publish. */
+  readonly prepare_content_blobs?: (input: {
+    readonly contents: readonly SourceIndexContentInput[];
+    readonly content_streams: readonly SourceIndexContentStreamInput[];
+  }) => Promise<readonly ContentBlob[]>;
+  /** Collect source rows for the Rust-owned publication transaction. */
+  readonly defer_commit?: (input: SourceIndexCommitInput) => Promise<void>;
+  /** Fail closed when a production composition worker is expected. */
+  readonly require_rust_commit?: boolean;
 }
 
 export interface SourceIndexApplyResult {
@@ -103,6 +117,10 @@ export interface SourceIndexApplyResult {
   /** Watch-driven authoritative absence provenance for candidate planning. */
   readonly watch_absences?: readonly { readonly artifact_id: string; readonly normalized_uri: string; readonly source_observation_id: string }[];
   readonly observation_batch_id?: string;
+  /** Internal frontier used when SQLite source-row writes are deferred to Rust. */
+  readonly current_occurrences?: readonly CurrentSourceOccurrence[];
+  readonly current_absences?: readonly CurrentSourceAbsence[];
+  readonly next_state?: SourceIndexState;
 }
 
 export interface SourceIndexWorkspacePort {
@@ -212,6 +230,22 @@ function sourceStateDigest(state: PlannedState): string {
 
 function normalizedPath(uri: string): string | undefined {
   return /^[A-Za-z][A-Za-z0-9+.-]*:/.test(uri) ? undefined : uri;
+}
+
+/**
+ * True when a freshly observed occurrence's content/metadata are byte-for-byte
+ * the same as the currently committed version. The observation's hashes were
+ * computed (and batch-digest-verified, see `source_batch_digest_verify`) by
+ * this same scan's own capture pass, so this comparison alone -- no re-read,
+ * no re-stat -- is sufficient proof that there is nothing new to ingest for
+ * this artifact. Shared by `readAll` (to skip provider I/O entirely for an
+ * equivalent observation) and `applyBatch`'s row-assembly loop (the
+ * authoritative decision of whether to version/commit it), so the two never
+ * drift apart.
+ */
+function isEquivalentObservation(existing: CurrentSourceOccurrence | undefined, observation: ProviderObservation): boolean {
+  return existing !== undefined && existing.version.content_hash === observation.observed_content_hash
+    && existing.version.analysis_metadata_digest === observation.observed_metadata_digest;
 }
 
 function validateEnvelope(response: SourceProviderResponseEnvelope, workspaceId: string): SourceProviderOutcome {
@@ -434,25 +468,37 @@ function parseWatchEvents(response: SourceProviderResponseEnvelope): { readonly 
 export class GenericSourceIndexer {
   constructor(private readonly workspace: SourceIndexWorkspacePort) {}
 
+  // One apply call may be delivered as many native fragments. Rust-owned
+  // captures defer the SQLite rows until structural publication, so retain the
+  // in-memory frontier between fragments instead of rereading the unchanged
+  // database view after each fragment. This field is scoped to the indexer
+  // instance (one scan) and is cleared in the finally block below.
+  private deferredPlannedState: PlannedState | undefined;
+
   async apply(input: SourceIndexApplyInput): Promise<SourceIndexApplyResult> {
-    const outcome = validateEnvelope(input.response, this.workspace.workspaceId);
-    const priorState = await this.workspace.sourceIndex.getState();
-    if (outcome !== "success") return this.degraded(priorState, `core:source_provider_${outcome}`);
-    if (input.response.call === "watch") return await this.applyWatch(input, priorState);
-    if (input.native_batches !== undefined) return await this.applyNativeBatches(input, priorState);
-    const result = parseBatch(input.response, input.parsed_batch);
-    if (!result.stable) return this.degraded(priorState, "core:source_provider_source_changed");
-    if (result.observations.length > SOURCE_INDEX_BATCH_MAX_ROWS) {
-      return await this.applyFragmented(result, input, priorState);
+    this.deferredPlannedState = undefined;
+    try {
+      const outcome = validateEnvelope(input.response, this.workspace.workspaceId);
+      const priorState = await this.workspace.sourceIndex.getState();
+      if (outcome !== "success") return this.degraded(priorState, `core:source_provider_${outcome}`);
+      if (input.response.call === "watch") return await this.applyWatch(input, priorState);
+      if (input.native_batches !== undefined) return await this.applyNativeBatches(input, priorState);
+      const result = parseBatch(input.response, input.parsed_batch);
+      if (!result.stable) return this.degraded(priorState, "core:source_provider_source_changed");
+      if (result.observations.length > SOURCE_INDEX_BATCH_MAX_ROWS) {
+        return await this.applyFragmented(result, input, priorState);
+      }
+      const reusable = input.read_stream !== undefined && input.allow_partial !== true
+        ? new Map((await timed("source_prior_frontier", () => this.workspace.sourceIndex.currentOccurrencesForIndex
+          ? this.workspace.sourceIndex.currentOccurrencesForIndex(result.batch.source_provider_binding_id)
+          : this.workspace.sourceIndex.currentOccurrences(result.batch.source_provider_binding_id))).map((value) => [value.artifact.normalized_uri, value]))
+        : undefined;
+      const reads = await timed("source_read_all", () => this.readAll(result.observations, input.read, input.read_stream, input.io_concurrency, reusable));
+      if (reads === undefined) return this.degraded(priorState, "core:source_provider_read_incomplete");
+      return await this.applyBatch(result.batch, reads, result.scopes, result.watermark, priorState, input.publication_current_generation ?? 0, undefined, false, false, input);
+    } finally {
+      this.deferredPlannedState = undefined;
     }
-    const reusable = input.read_stream !== undefined && input.allow_partial !== true
-      ? new Map((await (this.workspace.sourceIndex.currentOccurrencesForIndex
-        ? this.workspace.sourceIndex.currentOccurrencesForIndex(result.batch.source_provider_binding_id)
-        : this.workspace.sourceIndex.currentOccurrences(result.batch.source_provider_binding_id))).map((value) => [value.artifact.normalized_uri, value]))
-      : undefined;
-    const reads = await this.readAll(result.observations, input.read, input.read_stream, input.io_concurrency, reusable);
-    if (reads === undefined) return this.degraded(priorState, "core:source_provider_read_incomplete");
-    return await this.applyBatch(result.batch, reads, result.scopes, result.watermark, priorState, input.publication_current_generation ?? 0);
   }
 
   private async applyNativeBatches(input: SourceIndexApplyInput, initialState: SourceIndexState | undefined): Promise<SourceIndexApplyResult> {
@@ -461,21 +507,40 @@ export class GenericSourceIndexer {
     let final: SourceIndexApplyResult | undefined;
     const seenUris = new Set<string>();
     let acceptedPartial = false;
-    // Manual iteration (rather than `for await...of`) so the wait for each
-    // batch -- the provider's own enumeration/encoding work in
-    // `directory-provider.ts`, deliberately not instrumented there directly
-    // -- can be measured at this, the consumption site, separately from the
-    // loop body's own already-timed spans (`source_batch_digest_verify`,
-    // `source_provider_read`). Summed across a scan's thousands of batches,
-    // `source_provider_batch_wait` is what's left of `source_catalog`'s wall
-    // time once those per-batch buckets and storage's own `source_catalog`
-    // timing line are subtracted out.
     const nativeBatchIterator = input.native_batches![Symbol.asyncIterator]();
-    for (;;) {
+
+    type PreparedStep =
+      | { readonly kind: "done" }
+      | { readonly kind: "read_incomplete" }
+      | { readonly kind: "batch"; readonly batch: SourceObservationBatchRecord; readonly scopes: readonly ValidatedCoverageScope[]; readonly reads: readonly ValidatedRead[] };
+
+    // Everything up to (and including) `readAll` for one batch -- iterator
+    // wait, envelope validation, digest verification, and the read/stat work
+    // for its observations -- has no data dependency on the PRECEDING batch's
+    // own CAS write (`applyBatch`, called by the loop below): both only ever
+    // *read* `this.deferredPlannedState`, and `applyBatch` publishes it right
+    // after assembling its rows, before its CAS write starts (see the comment
+    // there). So this method prepares batch N+1 concurrently with applying
+    // batch N, instead of preparing it only after batch N's CAS write (pure
+    // I/O wait) has finished -- pipeline depth 2. `applyBatch` calls
+    // themselves stay strictly sequential below (never overlapping), so
+    // commit order -- and therefore `defer_commit` order -- is unchanged:
+    // batch N+1 is never applied before batch N's own `applyBatch` call has
+    // returned.
+    const prepareNext = async (): Promise<PreparedStep> => {
+      // Manual iteration (rather than `for await...of`) so the wait for each
+      // batch -- the provider's own enumeration/encoding work in
+      // `directory-provider.ts`, deliberately not instrumented there directly
+      // -- can be measured at this, the consumption site, separately from the
+      // loop body's own already-timed spans (`source_batch_digest_verify`,
+      // `source_provider_read`). Summed across a scan's thousands of batches,
+      // `source_provider_batch_wait` is what's left of `source_catalog`'s wall
+      // time once those per-batch buckets and storage's own `source_catalog`
+      // timing line are subtracted out.
       const batchWaitStartedAt = timingEnabled() ? performance.now() : 0;
       const step = await nativeBatchIterator.next();
       if (timingEnabled()) record("source_provider_batch_wait", performance.now() - batchWaitStartedAt);
-      if (step.done) break;
+      if (step.done) return { kind: "done" };
       const encoded = step.value;
       const batch = encoded.batch as SourceObservationBatchRecord;
       if (batch.workspace_id !== input.response.workspace_id || batch.source_provider_binding_id !== input.response.source_provider_binding_id
@@ -485,7 +550,15 @@ export class GenericSourceIndexer {
       if (encoded.observations.length !== batch.observation_count || new Set(encoded.observations.map((observation) => observation.normalized_uri)).size !== encoded.observations.length) {
         throw new EngineError("engine:source_index_result_invalid", "Native observation batch count or URI uniqueness is invalid.");
       }
-      const observations = encoded.observations.map((observation) => parseObservation(observation, batch));
+      // `source_batch_parse` covers every synchronous per-batch step that
+      // used to run unattributed between the iterator wait and
+      // `source_batch_digest_verify`/`source_read_all`: per-observation field
+      // validation, coverage-scope parsing, and (below) turning the prior
+      // frontier into this batch's `reusable`-lookup Map.
+      const { observations, scopes } = timedSync("source_batch_parse", () => ({
+        observations: encoded.observations.map((observation) => parseObservation(observation, batch)),
+        scopes: parseCoverageScopes(batch),
+      }));
       // See the identical `source_batch_digest_verify` note in `parseBatch`,
       // above -- this is the native-batch path's counterpart, taken on every
       // real (non-JSON-envelope) directory scan, so it's the one that
@@ -506,31 +579,51 @@ export class GenericSourceIndexer {
         observation_count: batch.observation_count,
         unavailable_count: batch.unavailable_count,
       }, observations)) !== batch.batch_digest) throw new EngineError("engine:source_index_result_invalid", "Native observation batch digest does not match its logical contents.");
-      const scopes = parseCoverageScopes(batch);
-      const reusable = input.read_stream !== undefined && input.allow_partial !== true
-        ? new Map((await (this.workspace.sourceIndex.currentOccurrencesForIndex
-          ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
-          : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id))).map((value) => [value.artifact.normalized_uri, value]))
+      const priorEntries = input.read_stream !== undefined && input.allow_partial !== true
+        ? (this.deferredPlannedState === undefined
+          ? await timed("source_prior_frontier", () => this.workspace.sourceIndex.currentOccurrencesForIndex
+            ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
+            : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id))
+          : [...this.deferredPlannedState.present.values()])
         : undefined;
-      const reads = await this.readAll(observations, input.read, input.read_stream, input.io_concurrency, reusable);
-      if (reads === undefined) return this.degraded(state, "core:source_provider_read_incomplete");
+      const reusable = priorEntries === undefined ? undefined : timedSync("source_batch_parse", () => new Map(priorEntries.map((value) => [value.artifact.normalized_uri, value])));
+      const reads = await timed("source_read_all", () => this.readAll(observations, input.read, input.read_stream, input.io_concurrency, reusable));
+      if (reads === undefined) return { kind: "read_incomplete" };
+      return { kind: "batch", batch, scopes, reads };
+    };
+
+    let pending = prepareNext();
+    for (;;) {
+      const prepared = await pending;
+      if (prepared.kind === "done") break;
+      if (prepared.kind === "read_incomplete") return this.degraded(state, "core:source_provider_read_incomplete");
+      // Kick off batch N+1's preparation now, before applying batch N below,
+      // so its CPU work (and any real provider I/O a genuinely changed file
+      // still needs) overlaps batch N's CAS write. Attach a no-op rejection
+      // handler immediately: if applying batch N throws, this loop exits
+      // without ever awaiting `pending` again, and an unattached rejection
+      // from the abandoned prepare would otherwise surface as an unhandled
+      // rejection alongside the real error.
+      pending = prepareNext();
+      pending.catch(() => { /* observed defensively; the real error (if any) surfaces via the next `await pending`. */ });
+      const { batch, scopes, reads } = prepared;
       const complete = batch.coverage_completeness === "complete";
       if (complete) {
-        final = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0, seenUris, changed);
-        state = await this.workspace.sourceIndex.getState();
+        final = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0, seenUris, changed, false, input);
+        state = final.next_state ?? await this.workspace.sourceIndex.getState();
         break;
       }
       if (input.allow_partial) {
         if (acceptedPartial) return this.degraded(state, "core:source_provider_partial_coverage");
-        final = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0, undefined, false, true);
+        final = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0, undefined, false, true, input);
         acceptedPartial = true;
-        state = await this.workspace.sourceIndex.getState();
+        state = final.next_state ?? await this.workspace.sourceIndex.getState();
         break;
       }
-      const fragmentResult = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0);
+      const fragmentResult = await this.applyBatch(batch, reads, scopes, requiredString(batch.provider_cursor_after, "Native batch provider cursor"), state, input.publication_current_generation ?? 0, undefined, false, false, input);
       changed ||= fragmentResult.changed === true;
-      state = await this.workspace.sourceIndex.getState();
-      for (const observation of observations) seenUris.add(observation.normalized_uri);
+      state = fragmentResult.next_state ?? await this.workspace.sourceIndex.getState();
+      for (const read of reads) seenUris.add(read.observation.normalized_uri);
     }
     return final ?? this.degraded(state, "core:source_provider_read_incomplete");
   }
@@ -569,15 +662,17 @@ export class GenericSourceIndexer {
       const observations = result.observations.slice(start, offset);
       const batch = fragmentBatch(result.batch, observations, fragmentIndex, false);
       const reusable = input.read_stream !== undefined && input.allow_partial !== true
-        ? new Map((await (this.workspace.sourceIndex.currentOccurrencesForIndex
-          ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
-          : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id))).map((value) => [value.artifact.normalized_uri, value]))
+        ? new Map((this.deferredPlannedState === undefined
+          ? await timed("source_prior_frontier", () => this.workspace.sourceIndex.currentOccurrencesForIndex
+            ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
+            : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id))
+          : [...this.deferredPlannedState.present.values()]).map((value) => [value.artifact.normalized_uri, value]))
         : undefined;
-      const reads = await this.readAll(observations, input.read, input.read_stream, input.io_concurrency, reusable);
+      const reads = await timed("source_read_all", () => this.readAll(observations, input.read, input.read_stream, input.io_concurrency, reusable));
       if (reads === undefined) return this.degraded(state, "core:source_provider_read_incomplete");
-      const fragmentResult = await this.applyBatch(batch, reads, result.scopes, result.watermark, state, input.publication_current_generation ?? 0);
+      const fragmentResult = await this.applyBatch(batch, reads, result.scopes, result.watermark, state, input.publication_current_generation ?? 0, undefined, false, false, input);
       changed ||= fragmentResult.changed === true;
-      state = await this.workspace.sourceIndex.getState();
+      state = fragmentResult.next_state ?? await this.workspace.sourceIndex.getState();
       fragmentIndex += 1;
       for (const observation of observations) seenUris.add(observation.normalized_uri);
     }
@@ -587,7 +682,7 @@ export class GenericSourceIndexer {
     // so a complete scan cannot accidentally tombstone a file from an earlier
     // fragment.
     const completionBatch = fragmentBatch(result.batch, [], fragmentIndex, true);
-    const completion = await this.applyBatch(completionBatch, [], result.scopes, result.watermark, state, input.publication_current_generation ?? 0, seenUris, changed);
+    const completion = await this.applyBatch(completionBatch, [], result.scopes, result.watermark, state, input.publication_current_generation ?? 0, seenUris, changed, false, input);
     return completion;
   }
 
@@ -614,8 +709,20 @@ export class GenericSourceIndexer {
       try {
         if (readStream !== undefined) {
           const existing = reusable?.get(observation.normalized_uri);
-          const equivalent = existing?.version.content_hash === observation.observed_content_hash
-            && existing.version.analysis_metadata_digest === observation.observed_metadata_digest;
+          if (isEquivalentObservation(existing, observation)) {
+            // This scan's own capture already computed and batch-digest-verified
+            // `observed_content_hash`/`observed_metadata_digest`, and they match
+            // the currently committed version exactly -- see
+            // `isEquivalentObservation`. There is nothing to read and, since
+            // `applyBatch`'s assemble loop below only ever consults
+            // `read.bytes`/`read.stream` on the non-equivalent branch, nothing
+            // further this call needs to produce. Skipping `readStream` here
+            // avoids a provider round trip (`lstat`/`realpath`/`stat` on the
+            // native path) per unchanged file -- the dominant cost of an
+            // incremental `source_catalog` scan when most of the tree hasn't
+            // changed.
+            return { kind: "value", read: { observation } };
+          }
           // `source_provider_read` times the provider round-trip itself
           // (boundary re-check: `lstat`/`stat` on the native path -- the
           // returned `stream.chunks` is a lazy generator that CAS only
@@ -623,14 +730,13 @@ export class GenericSourceIndexer {
           // so this bucket deliberately does NOT include the actual file
           // read for the native path; it does for the legacy `read` branch
           // below, which returns fully-read bytes).
-          const stream = await timed("source_provider_read", () => readStream(observation, equivalent ? { reuse_existing: true } : undefined));
+          const stream = await timed("source_provider_read", () => readStream(observation));
           if (stream.artifact_id !== observation.artifact_id || stream.provider_version_token !== observation.provider_version_token
             || stream.content_hash !== observation.observed_content_hash || stream.byte_length < 0
             || stream.metadata_digest !== observation.observed_metadata_digest) {
             throw new EngineError("engine:source_index_read_invalid", "Native source stream metadata does not match the stable observed occurrence.");
           }
-          if (equivalent && stream.reused_existing !== true) throw new EngineError("engine:source_index_read_invalid", "Native source provider did not honor the requested equivalent-content reuse.");
-          if (!equivalent && stream.reused_existing === true) throw new EngineError("engine:source_index_read_invalid", "Native source provider reused content for a changed occurrence.");
+          if (stream.reused_existing === true) throw new EngineError("engine:source_index_read_invalid", "Native source provider reused content for a changed occurrence.");
           return { kind: "value", read: { observation, stream } };
         }
         // Legacy in-process path: `read` returns fully-read bytes, so unlike
@@ -683,13 +789,18 @@ export class GenericSourceIndexer {
     completeObservedUris?: ReadonlySet<string>,
     stagedChanges = false,
     allowPartial = false,
+    sourceInput?: SourceIndexApplyInput,
   ): Promise<SourceIndexApplyResult> {
-    const current = await (this.workspace.sourceIndex.currentOccurrencesForIndex
-      ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
-      : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id));
-    const absent = await (this.workspace.sourceIndex.currentAbsencesForIndex
-      ? this.workspace.sourceIndex.currentAbsencesForIndex(batch.source_provider_binding_id)
-      : this.workspace.sourceIndex.currentAbsences(batch.source_provider_binding_id));
+    const current = this.deferredPlannedState === undefined
+      ? await timed("source_prior_frontier", () => this.workspace.sourceIndex.currentOccurrencesForIndex
+        ? this.workspace.sourceIndex.currentOccurrencesForIndex(batch.source_provider_binding_id)
+        : this.workspace.sourceIndex.currentOccurrences(batch.source_provider_binding_id))
+      : [...this.deferredPlannedState.present.values()];
+    const absent = this.deferredPlannedState === undefined
+      ? await timed("source_prior_frontier", () => this.workspace.sourceIndex.currentAbsencesForIndex
+        ? this.workspace.sourceIndex.currentAbsencesForIndex(batch.source_provider_binding_id)
+        : this.workspace.sourceIndex.currentAbsences(batch.source_provider_binding_id))
+      : [...this.deferredPlannedState.absent.values()];
     const planned: PlannedState = {
       present: new Map(current.map((value) => [value.artifact.normalized_uri, value])),
       absent: new Map(absent.map((value) => [value.artifact.normalized_uri, value])),
@@ -735,19 +846,19 @@ export class GenericSourceIndexer {
     // work is separately timed by `@urdira/storage`'s `debug-timing.ts`).
     timedSync("source_fragment_assemble", () => {
       for (const read of reads) {
+        count("source_observations_processed");
         const existing = planned.present.get(read.observation.normalized_uri);
         const priorAbsence = planned.absent.get(read.observation.normalized_uri);
         const priorArtifact = existing?.artifact ?? priorAbsence?.artifact;
         if (priorArtifact !== undefined && priorArtifact.artifact_id !== read.observation.artifact_id) {
           throw new EngineError("engine:source_index_result_invalid", "Provider observation artifact identity changed for an existing source address.");
         }
-        const equivalent = existing?.version.content_hash === read.observation.observed_content_hash
-          && existing.version.analysis_metadata_digest === read.observation.observed_metadata_digest;
+        const equivalent = isEquivalentObservation(existing, read.observation);
         const artifact = priorArtifact ?? this.newArtifact(batch, read.observation);
         if (priorArtifact === undefined) artifacts.push(artifact);
         const observation = this.storedObservation(read.observation, batch);
         observations.push(observation);
-        if (equivalent) continue;
+        if (equivalent) { count("source_observations_equivalent"); continue; }
         changed = true;
         if (existing) versionClosures.push({ ...existing.version, valid_to_generation: generation });
         const byteLength = read.bytes?.byteLength ?? read.stream?.byte_length;
@@ -794,31 +905,66 @@ export class GenericSourceIndexer {
       }
     });
 
+    // Published as soon as this fragment's rows are fully assembled -- before
+    // the CAS write and `defer_commit` below, both of which are pure I/O with
+    // no further effect on `planned`'s contents -- so `applyNativeBatches`'s
+    // depth-2 pipeline can start preparing (parsing/digest-verifying/reading)
+    // the NEXT batch immediately, concurrently with this batch's CAS write,
+    // instead of waiting for it. Safe even if the CAS write or `defer_commit`
+    // below then throws: `apply()`'s `finally` clears `deferredPlannedState`
+    // unconditionally, and a thrown error here aborts the whole `apply()`
+    // call (and therefore the whole scan) before anything downstream could
+    // observe the early publish of a fragment whose commit never lands.
+    this.deferredPlannedState = planned;
+
     changed ||= stagedChanges;
-    // Fragment rows are stamped for the pending generation but the source
-    // state must not advertise that generation until the completion fragment
-    // has reconciled deletions and the complete capture has been confirmed.
-    const committedGeneration = complete && changed ? generation : priorState?.current_generation ?? 0;
+    // Internal fragments are stamped for the pending generation but do not
+    // advertise it until their complete capture reconciles deletions. An
+    // explicitly accepted standalone partial batch is different: it is an
+    // authoritative positive update for its observed URIs, cannot infer any
+    // deletion, and must advance the source generation so its source-snapshot
+    // identity cannot collide with the prior full scan.
+    const committedGeneration = (complete || allowPartial) && changed ? generation : priorState?.current_generation ?? 0;
     const status = complete ? (changed ? "published" : "equivalent") : allowPartial ? (changed ? "published" : "equivalent") : "degraded";
     const state = this.nextState(priorState, batch.source_provider_binding_id, watermark, committedGeneration, batch.completed_at, planned, batch.observation_batch_id);
+    let contentBlobs: readonly ContentBlob[] | undefined;
+    // `sourceInput.prepare_content_blobs` (Rust-owned captures only) resolves
+    // to `@urdira/storage`'s `prepareSourceIndexContent`
+    // (`packages/storage/src/storage.ts`), which writes straight to CAS
+    // (`cas.putMany`/`putStreamsMany`) without ever going through
+    // `commitInternal` -- the only place `@urdira/storage`'s own
+    // `debug-timing.ts` resets/snapshots, so its own `source_catalog` timing
+    // line never fires on this path. `source_cas_write` is this call's own
+    // wall time so it still shows up in this module's aggregate.
+    if (sourceInput?.prepare_content_blobs !== undefined && (contents.length > 0 || contentStreams.length > 0)) {
+      const prepareContentBlobs = sourceInput.prepare_content_blobs;
+      contentBlobs = await timed("source_cas_write", () => prepareContentBlobs({ contents, content_streams: contentStreams }));
+      if (contentBlobs.length !== contents.length + contentStreams.length) throw new EngineError("engine:source_index_result_invalid", "Prepared CAS content count does not match the source commit.");
+      if (timingEnabled()) {
+        count("source_cas_blobs_written", contentBlobs.length);
+        count("source_cas_bytes_written", contentBlobs.reduce((total, blob) => total + blob.byte_length, 0));
+      }
+    }
     const commitInput: SourceIndexCommitInput = {
       expected_state_revision: priorState?.state_revision ?? 0,
       state,
       batch,
       observations,
       artifacts,
-      contents,
-      content_streams: contentStreams,
+      contents: contentBlobs === undefined ? contents : [],
+      ...(contentBlobs === undefined ? { content_streams: contentStreams } : { content_blobs: contentBlobs }),
       version_closures: versionClosures,
       versions,
       tombstone_closures: tombstoneClosures,
       tombstones,
     };
-    if (this.workspace.publishCandidate) await this.workspace.publishCandidate({ source_index: commitInput });
+    if (sourceInput?.defer_commit !== undefined) await sourceInput.defer_commit(commitInput);
+    else if (sourceInput?.require_rust_commit === true) throw new EngineError("core:rust_writer_required", "Production source ingestion requires the Rust indexing-core writer.");
+    else if (this.workspace.publishCandidate) await this.workspace.publishCandidate({ source_index: commitInput });
     else await this.workspace.sourceIndex.commit(commitInput);
     return status === "degraded"
-      ? { status, generation: committedGeneration, checkpoint_id: state.checkpoint_id, retryable: true, error_code: "core:source_provider_partial_coverage", changed }
-      : { status, generation: committedGeneration, checkpoint_id: state.checkpoint_id, changed };
+      ? { status, generation: committedGeneration, checkpoint_id: state.checkpoint_id, retryable: true, error_code: "core:source_provider_partial_coverage", changed, current_occurrences: [...planned.present.values()], current_absences: [...planned.absent.values()], next_state: state }
+      : { status, generation: committedGeneration, checkpoint_id: state.checkpoint_id, changed, current_occurrences: [...planned.present.values()], current_absences: [...planned.absent.values()], next_state: state };
   }
 
   private async applyWatch(input: SourceIndexApplyInput, priorState: SourceIndexState | undefined): Promise<SourceIndexApplyResult> {
@@ -830,8 +976,12 @@ export class GenericSourceIndexer {
     const authoritative = parsed.events.filter((event) => event.authority === "authoritative_delete" && AUTHORITATIVE_DELETE_EVENTS.has(event.event_class));
     if (authoritative.length === 0) return this.degraded(priorState, "core:source_provider_non_authoritative_hint");
     const bindingId = input.response.source_provider_binding_id;
-    const current = await this.workspace.sourceIndex.currentOccurrences(bindingId);
-    const absences = await this.workspace.sourceIndex.currentAbsences(bindingId);
+    const current = this.deferredPlannedState === undefined
+      ? await this.workspace.sourceIndex.currentOccurrences(bindingId)
+      : [...this.deferredPlannedState.present.values()];
+    const absences = this.deferredPlannedState === undefined
+      ? await this.workspace.sourceIndex.currentAbsences(bindingId)
+      : [...this.deferredPlannedState.absent.values()];
     const planned: PlannedState = { present: new Map(current.map((value) => [value.artifact.normalized_uri, value])), absent: new Map(absences.map((value) => [value.artifact.normalized_uri, value])) };
     // See `applyBatch`'s identical computation, above, for why the stage-1
     // source counter alone (`priorState?.current_generation`) can fall behind
@@ -887,14 +1037,20 @@ export class GenericSourceIndexer {
     const committedGeneration = tombstones.length > 0 ? generation : priorState?.current_generation ?? 0;
     const state = this.nextState(priorState, bindingId, parsed.watermark, committedGeneration, batch.completed_at, planned, batchId);
     const commitInput: SourceIndexCommitInput = { expected_state_revision: priorState?.state_revision ?? 0, state, batch, observations, artifacts: [], contents: [], version_closures: versionClosures, versions: [], tombstone_closures: [], tombstones };
-    if (this.workspace.publishCandidate) await this.workspace.publishCandidate({ source_index: commitInput });
+    if (input.defer_commit !== undefined) await input.defer_commit(commitInput);
+    else if (input.require_rust_commit === true) throw new EngineError("core:rust_writer_required", "Production source ingestion requires the Rust indexing-core writer.");
+    else if (this.workspace.publishCandidate) await this.workspace.publishCandidate({ source_index: commitInput });
     else await this.workspace.sourceIndex.commit(commitInput);
+    this.deferredPlannedState = planned;
     return {
       status: tombstones.length > 0 ? "published" : "equivalent",
       generation: committedGeneration,
       checkpoint_id: state.checkpoint_id,
       observation_batch_id: batchId,
       watch_absences: unique.map(({ event, observation }) => ({ artifact_id: observation.artifact_id, normalized_uri: event.normalized_uri, source_observation_id: observation.source_observation_id })),
+      current_occurrences: [...planned.present.values()],
+      current_absences: [...planned.absent.values()],
+      next_state: state,
     };
   }
 

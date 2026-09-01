@@ -1,4 +1,8 @@
 import { canonicalJson, canonicalSha256 } from "@urdira/plugin-sdk";
+import { closeSync, mkdtempSync, openSync, readSync, rmSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { deserialize, serialize } from "node:v8";
 import { canonicalBytes, digestBytes, digestCanonicalArray, digestCanonicalMapWithArrayFields, digestMappedCanonicalArray, LogicalDigestWriter, memoizedPackedIdentityTriple, rememberPackedIdentityTriple, seedFrozenCanonicalArrayDigest } from "@urdira/canonical";
 import type { CanonicalEncodingLimits, DigestText } from "@urdira/canonical";
 import type { BoundPluginLookupInvalidationDependency, PluginInvalidationConsumerType, PluginInvalidationScope, PluginLookupOperation } from "@urdira/plugin-sdk";
@@ -18,6 +22,7 @@ import type {
   ProposedRecord,
   ProjectionWorkItem,
   RecordArtifactDependency,
+  ReplacementScope,
 } from "@urdira/contracts";
 import type { CandidatePlan } from "./candidate-planning.js";
 import type { SourceCandidatePlan } from "./source-candidate-planning.js";
@@ -25,12 +30,17 @@ import type { MaterializationAcceptedFactDelta, MaterializationProposedRecord, B
 import type { BaseCandidateProjection } from "./candidate-planning.js";
 import type { ProviderWatermark, SnapshotCapabilityStateEntry, CandidateWorkManifest } from "@urdira/contracts";
 import { timed, timedSync } from "./debug-timing.js";
+import { verifyNativeLogicalValueBatch } from "./native-logical-digest.js";
 
 export interface CandidateMaterializationInput {
   readonly candidate: IndexCandidate;
   readonly manifest: CandidateWorkManifest;
   readonly source_plan: SourceCandidatePlan;
   readonly accepted_deltas: readonly MaterializationAcceptedFactDelta[];
+  /** The Rust core has already promoted the structural rows for this
+   * candidate. Storage may therefore consume its typed publication relation
+   * directly instead of rebuilding it from TypeScript templates. */
+  readonly rust_promoted_structural_rows?: boolean;
   readonly accepted_projection_sets: readonly ValidatedProjectionReplacementSet[];
   readonly base_records: readonly BaseCandidateRecord[];
   /**
@@ -77,6 +87,8 @@ interface FastPathMaterializationMetadata {
   readonly proposed_dependencies: readonly FastPathProposedDependency[];
   readonly proposal_record_ids: ReadonlyMap<string, string>;
   readonly record_owners: ReadonlyMap<string, FastPathRecordOwner>;
+  readonly replacement_scopes: readonly ReplacementScope[];
+  readonly owner_artifact_ids: readonly string[];
 }
 
 export interface CandidateKnownArtifactVersion {
@@ -137,14 +149,195 @@ export interface SealedCandidateMaterialization {
   readonly absence_barrier_keys: readonly string[];
   /** Keyed by object identity of each entry in `record_opens` (3c). */
   readonly record_open_memo: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>;
+  /** True when Rust already owns structural row promotion for this candidate. */
+  readonly rust_promoted_structural_rows?: boolean;
 }
 
 function freeze<T>(value: T): T {
+  if (isFileBackedReadonlyArray(value)) return value;
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
     Object.freeze(value);
     for (const entry of Object.values(value as Record<string, unknown>)) freeze(entry);
   }
   return value;
+}
+
+// `Symbol.for` lets the storage authority recognize this private transport
+// representation without importing engine code across the package boundary.
+// The marker grants no trust in contents: every descriptor and transaction
+// assertion still verifies the logical sequence independently.
+const FILE_BACKED_READONLY_ARRAY = Symbol.for("urdira.file_backed_readonly_array");
+const PROMOTED_RECORD_OPEN_MEMO = Symbol.for("urdira.promoted_record_open_memo");
+
+interface SortedSpoolFrame<T> {
+  readonly key: string;
+  readonly value: T;
+}
+
+function writeFully(fd: number, bytes: Uint8Array): void {
+  let offset = 0;
+  while (offset < bytes.byteLength) offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
+}
+
+type ReadFullyResult = "complete" | "eof" | "truncated";
+
+function readFully(fd: number, bytes: Uint8Array): ReadFullyResult {
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const count = readSync(fd, bytes, offset, bytes.byteLength - offset, null);
+    if (count === 0) return offset === 0 ? "eof" : "truncated";
+    offset += count;
+  }
+  return "complete";
+}
+
+class SortedFrameReader<T> {
+  readonly #fd: number;
+  #closed = false;
+  constructor(path: string) { this.#fd = openSync(path, "r"); }
+  next(): SortedSpoolFrame<T> | undefined {
+    const header = Buffer.allocUnsafe(4);
+    const headerRead = readFully(this.#fd, header);
+    if (headerRead === "eof") return undefined;
+    if (headerRead === "truncated") throw new Error("A candidate template spool frame header was truncated.");
+    const payload = Buffer.allocUnsafe(header.readUInt32BE(0));
+    if (readFully(this.#fd, payload) !== "complete") throw new Error("A candidate template spool frame was truncated.");
+    return deserialize(payload) as SortedSpoolFrame<T>;
+  }
+  close(): void { if (!this.#closed) { this.#closed = true; closeSync(this.#fd); } }
+}
+
+/** Immutable array-compatible view over externally sorted frame files. */
+class FileBackedReadonlyArray<T> implements Iterable<T> {
+  readonly [FILE_BACKED_READONLY_ARRAY] = true;
+  readonly length: number;
+  readonly #paths: readonly string[];
+  constructor(paths: readonly string[], length: number) {
+    this.#paths = [...paths];
+    this.length = length;
+    Object.freeze(this);
+  }
+  *[Symbol.iterator](): Iterator<T> {
+    const readers = this.#paths.map((path) => new SortedFrameReader<T>(path));
+    type Head = { readerIndex: number; frame: SortedSpoolFrame<T> };
+    const before = (left: Head, right: Head): boolean => left.frame.key < right.frame.key
+      || (left.frame.key === right.frame.key && left.readerIndex < right.readerIndex);
+    const heads: Head[] = [];
+    const push = (head: Head): void => {
+      heads.push(head);
+      let index = heads.length - 1;
+      while (index > 0) {
+        const parent = Math.floor((index - 1) / 2);
+        if (!before(heads[index]!, heads[parent]!)) break;
+        [heads[index], heads[parent]] = [heads[parent]!, heads[index]!];
+        index = parent;
+      }
+    };
+    const pop = (): Head | undefined => {
+      const first = heads[0];
+      const last = heads.pop();
+      if (first === undefined || last === undefined) return first;
+      if (heads.length > 0) {
+        heads[0] = last;
+        let index = 0;
+        while (true) {
+          const left = index * 2 + 1;
+          const right = left + 1;
+          if (left >= heads.length) break;
+          const child = right < heads.length && before(heads[right]!, heads[left]!) ? right : left;
+          if (!before(heads[child]!, heads[index]!)) break;
+          [heads[index], heads[child]] = [heads[child]!, heads[index]!];
+          index = child;
+        }
+      }
+      return first;
+    };
+    for (const [readerIndex, reader] of readers.entries()) {
+      const frame = reader.next();
+      if (frame !== undefined) push({ readerIndex, frame });
+    }
+    try {
+      while (heads.length > 0) {
+        const selected = pop()!;
+        yield selected.frame.value;
+        const next = readers[selected.readerIndex]!.next();
+        if (next !== undefined) push({ readerIndex: selected.readerIndex, frame: next });
+      }
+    } finally { for (const reader of readers) reader.close(); }
+  }
+  every(predicate: (value: T, index: number) => unknown): boolean {
+    let index = 0;
+    for (const value of this) { if (!predicate(value, index)) return false; index += 1; }
+    return true;
+  }
+  slice(start = 0, end = this.length): T[] {
+    const result: T[] = [];
+    let index = 0;
+    for (const value of this) { if (index >= end) break; if (index >= start) result.push(value); index += 1; }
+    return result;
+  }
+}
+
+function isFileBackedReadonlyArray(value: unknown): value is FileBackedReadonlyArray<unknown> {
+  return value !== null && typeof value === "object" && (value as { readonly [FILE_BACKED_READONLY_ARRAY]?: unknown })[FILE_BACKED_READONLY_ARRAY] === true;
+}
+
+function firstSequenceEntry<T>(values: readonly T[]): T | undefined {
+  if (isFileBackedReadonlyArray(values)) {
+    const iterator = values[Symbol.iterator]();
+    try { return iterator.next().value as T | undefined; }
+    finally { iterator.return?.(); }
+  }
+  return values[0];
+}
+
+class ExternalSortedSpool<T> {
+  readonly #directory: string;
+  readonly #prefix: string;
+  readonly #paths: string[] = [];
+  #pending: SortedSpoolFrame<T>[] = [];
+  #count = 0;
+  constructor(directory: string, prefix: string, readonly chunkSize = 32_768) { this.#directory = directory; this.#prefix = prefix; }
+  push(key: string, value: T): void {
+    this.#pending.push({ key, value });
+    this.#count += 1;
+    if (this.#pending.length >= this.chunkSize) this.#flush();
+  }
+  finish(): FileBackedReadonlyArray<T> { this.#flush(); return new FileBackedReadonlyArray(this.#paths, this.#count); }
+  #flush(): void {
+    if (this.#pending.length === 0) return;
+    this.#pending.sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+    const path = join(this.#directory, `${this.#prefix}-${String(this.#paths.length).padStart(6, "0")}.bin`);
+    const fd = openSync(path, "wx", 0o600);
+    try {
+      for (const frame of this.#pending) {
+        const payload = serialize(frame);
+        const header = Buffer.allocUnsafe(4);
+        header.writeUInt32BE(payload.byteLength, 0);
+        writeFully(fd, header);
+        writeFully(fd, payload);
+      }
+    } finally { closeSync(fd); }
+    this.#paths.push(path);
+    this.#pending = [];
+  }
+}
+
+class PromotedRecordOpenMemo implements ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry> {
+  readonly [PROMOTED_RECORD_OPEN_MEMO] = true;
+  readonly #opens: readonly CandidateRecordOpenTemplate[];
+  constructor(opens: readonly CandidateRecordOpenTemplate[]) { this.#opens = opens; }
+  get size(): number { return this.#opens.length; }
+  get(key: CandidateRecordOpenTemplate): CandidateRecordOpenMemoEntry | undefined {
+    const value = key as unknown as Record<string, unknown>;
+    return typeof value["record_id_hint"] === "string" && typeof value["record_digest_hint"] === "string" ? { recordId: value["record_id_hint"], recordDigest: value["record_digest_hint"] } : undefined;
+  }
+  has(key: CandidateRecordOpenTemplate): boolean { return this.get(key) !== undefined; }
+  *entries(): MapIterator<[CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry]> { for (const value of this.#opens) yield [value, this.get(value)!]; }
+  *keys(): MapIterator<CandidateRecordOpenTemplate> { for (const value of this.#opens) yield value; }
+  *values(): MapIterator<CandidateRecordOpenMemoEntry> { for (const value of this.#opens) yield this.get(value)!; }
+  [Symbol.iterator](): MapIterator<[CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry]> { return this.entries(); }
+  forEach(callbackfn: (value: CandidateRecordOpenMemoEntry, key: CandidateRecordOpenTemplate, map: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>) => void, thisArg?: unknown): void { for (const entry of this.#opens) callbackfn.call(thisArg, this.get(entry)!, entry, this); }
 }
 
 // Sort a shallow copy without a Schwartzian transform. The old transform
@@ -297,7 +490,7 @@ function recordDigest(record: RetainedProposedRecord): string {
   // keeps the million-record VS Code candidate live through sealing. Generic
   // providers can revisit full ProposedRecord objects during replacement and
   // closure handling, so keep memoization for that compatibility path.
-  if (isMaterializationProposedRecord(record)) return digest(decodeMaterializationRecord(record));
+  if (isMaterializationProposedRecord(record)) return record.record_digest;
   const cached = recordDigestMemo.get(record);
   if (cached !== undefined) return cached;
   const value = digest(decodeMaterializationRecord(record));
@@ -655,12 +848,32 @@ function projectionTemplates(input: CandidateMaterializationInput): { readonly o
     projectionIds.add(projection.projection_record_id);
     projectionKeys.add(projection.projection_key);
   };
-  for (const set of input.accepted_projection_sets) {
+  let nativeVerifications: ReturnType<typeof verifyNativeLogicalValueBatch>;
+  try {
+    nativeVerifications = verifyNativeLogicalValueBatch(input.accepted_projection_sets.map((set) => ({
+      domain: "urdira:projection-set:v3",
+      value: set.projections,
+      expected_digest: set.projection_set_digest,
+    })));
+  } catch (error) {
+    const nativeError = error instanceof Error ? error.message : String(error);
+    throw new CandidateMaterializationError("core:projection_digest_mismatch", `Native logical digest verification failed: ${nativeError}`, { native_error: nativeError });
+  }
+  for (const [setIndex, set] of input.accepted_projection_sets.entries()) {
     // The worker payload may contain a large replacement set. Hash its
     // canonical array incrementally so validation never builds one aggregate
     // encoding merely to recompute the declared digest.
     const expectedDigest = digestCanonicalArray(set.projections);
-    const logicalDigest = new LogicalDigestWriter("urdira:projection-set:v3").value(set.projections).digest();
+    const nativeVerification = nativeVerifications?.[setIndex];
+    const logicalDigest = nativeVerification?.actual_digest
+      ?? new LogicalDigestWriter("urdira:projection-set:v3").value(set.projections).digest();
+    if (nativeVerification !== undefined && !nativeVerification.valid && set.projection_set_digest !== expectedDigest) {
+      throw new CandidateMaterializationError("core:projection_digest_mismatch", "Native logical digest verification diverged from the declared projection-set digest.", {
+        projection_work_item_id: set.work_item.projection_work_item_id,
+        expected_digest: nativeVerification.actual_digest,
+        actual_digest: set.projection_set_digest,
+      });
+    }
     if (set.projection_set_digest !== expectedDigest && set.projection_set_digest !== logicalDigest) throw new CandidateMaterializationError("core:projection_digest_mismatch", "Projection replacement set digest does not match its canonical or logical projections.", { expected_digest: logicalDigest, legacy_expected_digest: expectedDigest, actual_digest: set.projection_set_digest });
     for (const projection of set.projections) {
       validateProjection(projection, set.work_item);
@@ -946,7 +1159,7 @@ export class CandidateMaterializationError extends Error {
  * array scan whose answer was always `false`.
  */
 function orderedSetDescriptor(elementType: string, entries: readonly unknown[]): OrderedSetDescriptor {
-  const contentDigest = entries.length > 0 && isPackedCandidateTemplate(entries[0])
+  const contentDigest = entries.length > 0 && isPackedCandidateTemplate(firstSequenceEntry(entries))
     ? digestTemplateArray(entries)
     : digestCanonicalArray(entries);
   return orderedSetDescriptorFromDigest(elementType, entries.length, contentDigest);
@@ -1033,11 +1246,23 @@ export class CandidateRecordTemplateAccumulator {
   private readonly proposalRecordIds = new Map<string, string>();
   private readonly recordOpenMemo = new Map<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>();
   private readonly causeReferencesByArtifactId = new Map<string, readonly ChangeCauseReference[]>();
+  private readonly replacementScopesById = new Map<string, ReplacementScope>();
+  private readonly ownerArtifactIds = new Set<string>();
+  private readonly spoolDirectory: string | undefined;
+  private readonly openSpool: ExternalSortedSpool<CandidateRecordOpenTemplate> | undefined;
+  private readonly identitySpool: ExternalSortedSpool<CandidateIdentityAssignmentTemplate> | undefined;
+  private openCount = 0;
   private retainRecordOpenMemo = true;
 
-  constructor(workspaceId: string, retainEveryProposalId: boolean) {
+  constructor(workspaceId: string, retainEveryProposalId: boolean, options: { readonly file_backed?: boolean } = {}) {
     this.workspaceId = workspaceId;
     this.retainEveryProposalId = retainEveryProposalId;
+    if (options.file_backed === true) {
+      this.spoolDirectory = mkdtempSync(join(tmpdir(), "urdira-candidate-templates-"));
+      this.openSpool = new ExternalSortedSpool(this.spoolDirectory, "opens");
+      this.identitySpool = new ExternalSortedSpool(this.spoolDirectory, "identities");
+      this.retainRecordOpenMemo = false;
+    }
   }
 
   get isDisqualified(): boolean { return this.disqualified; }
@@ -1050,6 +1275,8 @@ export class CandidateRecordTemplateAccumulator {
       proposed_dependencies: [...this.fastPathDependencies],
       proposal_record_ids: new Map(this.proposalRecordIds),
       record_owners: new Map(this.recordOwnersById),
+      replacement_scopes: [...this.replacementScopesById.values()],
+      owner_artifact_ids: [...this.ownerArtifactIds],
     };
   }
 
@@ -1090,8 +1317,30 @@ export class CandidateRecordTemplateAccumulator {
     return references;
   }
 
+  private retainRecord(record: MaterializationProposedRecord, recordContentDigest: string, dependencyProposalKeys: ReadonlySet<string> | undefined): void {
+    const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
+    if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.proposalRecordIds.set(record.proposal_record_key, recordId);
+    if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.recordOwnersById.set(recordId, { owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id });
+    const openTemplate = fastPathOpenTemplate(record, this.causesFor(record.owner_artifact_id), recordId, recordContentDigest);
+    this.openCount += 1;
+    if (this.openSpool !== undefined && this.identitySpool !== undefined) {
+      this.openSpool.push(recordId, openTemplate);
+      const identityType = identityTypeForCategory(record.category) ?? "entity";
+      const packed = [PACKED_CREATED_IDENTITY_MARKER, this.workspaceId, identityType, record.identity_key, recordId, record.owner_artifact_id, record.owner_artifact_version_id] as unknown as CandidateIdentityAssignmentTemplate;
+      this.identitySpool.push(record.proposal_record_key, packed);
+      return;
+    }
+    this.opens.push(openTemplate);
+    if (this.retainRecordOpenMemo && this.opens.length < PACKED_IDENTITY_THRESHOLD) this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
+    else { this.retainRecordOpenMemo = false; this.recordOpenMemo.clear(); }
+  }
+
   accept(delta: MaterializationAcceptedFactDelta): void {
     this.acceptedDeltaDigests.set(delta.delta.fact_delta_id, semanticAcceptedDeltaDigest(delta));
+    for (const set of delta.replacement_sets) {
+      this.replacementScopesById.set(set.scope.replacement_scope_id, set.scope);
+      this.ownerArtifactIds.add(set.scope.owner_artifact_id);
+    }
     if (this.disqualified) return;
     const dependencyProposalKeys = this.retainEveryProposalId ? undefined : (() => {
       const keys = new Set<string>();
@@ -1113,17 +1362,7 @@ export class CandidateRecordTemplateAccumulator {
           this.recordOwnersById.clear();
           return;
         }
-        const recordContentDigest = recordDigest(record);
-        const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
-        if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.proposalRecordIds.set(record.proposal_record_key, recordId);
-        if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.recordOwnersById.set(recordId, { owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id });
-        const openTemplate = fastPathOpenTemplate(record, this.causesFor(record.owner_artifact_id), recordId, recordContentDigest);
-        this.opens.push(openTemplate);
-        if (this.retainRecordOpenMemo && this.opens.length < PACKED_IDENTITY_THRESHOLD) this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
-        else {
-          this.retainRecordOpenMemo = false;
-          this.recordOpenMemo.clear();
-        }
+        this.retainRecord(record, recordDigest(record), dependencyProposalKeys);
       }
     }
     for (const dependency of delta.delta.proposed_dependencies ?? []) {
@@ -1158,6 +1397,10 @@ export class CandidateRecordTemplateAccumulator {
    */
   acceptPrecomputed(delta: MaterializationAcceptedFactDelta, digests: readonly string[]): void {
     this.acceptedDeltaDigests.set(delta.delta.fact_delta_id, semanticAcceptedDeltaDigest(delta));
+    for (const set of delta.replacement_sets) {
+      this.replacementScopesById.set(set.scope.replacement_scope_id, set.scope);
+      this.ownerArtifactIds.add(set.scope.owner_artifact_id);
+    }
     if (this.disqualified) return;
     const disqualify = (): void => {
       this.disqualified = true;
@@ -1178,16 +1421,7 @@ export class CandidateRecordTemplateAccumulator {
         if (!isMaterializationProposedRecord(record) || digestIndex >= digests.length) { disqualify(); return; }
         const recordContentDigest = digests[digestIndex]!;
         digestIndex += 1;
-        const recordId = `record:${recordContentDigest.slice("sha256:".length)}`;
-        if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.proposalRecordIds.set(record.proposal_record_key, recordId);
-        if (this.retainEveryProposalId || dependencyProposalKeys!.has(record.proposal_record_key)) this.recordOwnersById.set(recordId, { owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id });
-        const openTemplate = fastPathOpenTemplate(record, this.causesFor(record.owner_artifact_id), recordId, recordContentDigest);
-        this.opens.push(openTemplate);
-        if (this.retainRecordOpenMemo && this.opens.length < PACKED_IDENTITY_THRESHOLD) this.recordOpenMemo.set(openTemplate, { recordId, recordDigest: recordContentDigest });
-        else {
-          this.retainRecordOpenMemo = false;
-          this.recordOpenMemo.clear();
-        }
+        this.retainRecord(record, recordContentDigest, dependencyProposalKeys);
       }
     }
     if (digestIndex !== digests.length) disqualify();
@@ -1218,6 +1452,35 @@ export class CandidateRecordTemplateAccumulator {
    */
   finish(): { readonly reused: readonly string[]; readonly opens: readonly CandidateRecordOpenTemplate[]; readonly closures: readonly CandidateRecordClosureTemplate[]; readonly identities: readonly CandidateIdentityAssignmentTemplate[]; readonly proposal_record_ids: ReadonlyMap<string, string>; readonly record_open_memo: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry> } {
     if (this.disqualified) throw new CandidateMaterializationError("core:dependency_validation_failed", "CandidateRecordTemplateAccumulator.finish() called after disqualification.", {});
+    if (this.openSpool !== undefined && this.identitySpool !== undefined) {
+      let opens = this.openSpool.finish() as unknown as readonly CandidateRecordOpenTemplate[];
+      let identities = this.identitySpool.finish() as unknown as readonly CandidateIdentityAssignmentTemplate[];
+      let recordOpenMemo: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry> = new PromotedRecordOpenMemo(opens);
+      // Preserve the historical small-candidate representation exactly even
+      // when a caller explicitly requested the file-backed implementation.
+      if (this.openCount < PACKED_IDENTITY_THRESHOLD) {
+        const materializedOpens = [...opens];
+        const materializedIdentities = [...identities].map((entry) => {
+          const [, workspaceId, identityType, identityKey, recordId, ownerArtifactId, ownerArtifactVersionId] = entry as unknown as PackedCreatedIdentityAssignment;
+          return {
+            identity_assignment_id: digest({ record_id: recordId, identity_key: identityKey }), workspace_id: workspaceId,
+            identity_type: identityType, identity_id: `${identityType}:${digest({ identity_key: identityKey }).slice("sha256:".length)}`,
+            assignment_kind: "created", identity_key: identityKey, identity_key_digest: digest(identityKey), record_id: recordId,
+            owner_artifact_id: ownerArtifactId, owner_artifact_version_id: ownerArtifactVersionId,
+          } as CandidateIdentityAssignmentTemplate;
+        });
+        materializedIdentities.sort((left, right) => left.identity_assignment_id.localeCompare(right.identity_assignment_id));
+        opens = materializedOpens;
+        identities = materializedIdentities;
+        recordOpenMemo = new Map(materializedOpens.map((open) => {
+          const value = open as unknown as Record<string, unknown>;
+          return [open, { recordId: String(value["record_id_hint"]), recordDigest: String(value["record_digest_hint"]) }] as const;
+        }));
+      }
+      this.acceptedDeltaDigests.clear();
+      this.finished = true;
+      return { reused: [], opens, closures: [], identities, proposal_record_ids: this.proposalRecordIds, record_open_memo: recordOpenMemo };
+    }
     const packIdentities = this.opens.length >= PACKED_IDENTITY_THRESHOLD;
     // Sort the already-required open templates by proposal order before
     // creating identities. This removes the former million-entry ordering
@@ -1270,7 +1533,19 @@ export class CandidateRecordTemplateAccumulator {
     // `accepted_deltas` array until it releases them after seal.
     this.acceptedDeltaDigests.clear();
     this.finished = true;
-    return { reused: [], opens, closures: [], identities, proposal_record_ids: this.proposalRecordIds, record_open_memo: this.recordOpenMemo };
+    const recordOpenMemo: ReadonlyMap<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry> = this.recordOpenMemo.size === opens.length
+      ? this.recordOpenMemo
+      : new PromotedRecordOpenMemo(opens);
+    // The accumulator is selected only for an initial or initial-progressive
+    // publication and its record ids were sealed as owner batches arrived.
+    // Storage still proves that every open has an exact native typed row; this
+    // marker only permits that independent proof for the small in-memory lane.
+    if (!(PROMOTED_RECORD_OPEN_MEMO in recordOpenMemo)) Object.defineProperty(recordOpenMemo, PROMOTED_RECORD_OPEN_MEMO, { value: true });
+    return { reused: [], opens, closures: [], identities, proposal_record_ids: this.proposalRecordIds, record_open_memo: recordOpenMemo };
+  }
+
+  dispose(): void {
+    if (this.spoolDirectory !== undefined) rmSync(this.spoolDirectory, { recursive: true, force: true });
   }
 }
 
@@ -1308,11 +1583,16 @@ export class CandidateMaterializer {
   async sealAsync(input: CandidateMaterializationInput, accumulator: CandidateRecordTemplateAccumulator | undefined, offload: { digestSet(mapping: "canonical" | "template", elements: readonly unknown[]): Promise<DigestText> } | undefined): Promise<SealedCandidateMaterialization> {
     if (offload === undefined) return this.seal(input, accumulator);
     const prepared = this.#prepare(input, accumulator);
+    if (isFileBackedReadonlyArray(prepared.recordOpens) || isFileBackedReadonlyArray(prepared.identityAssignments)) {
+      const opensSetText = timedSync("seal_ordered_digests", () => canonicalJson(orderedSetDescriptor("core:CandidateRecordOpenTemplate", prepared.recordOpens)));
+      const identitiesSetText = timedSync("seal_ordered_digests", () => canonicalJson(orderedSetDescriptor("core:CandidateIdentityAssignmentTemplate", prepared.identityAssignments)));
+      return this.#assemble(input, prepared, opensSetText, identitiesSetText);
+    }
     let opensSetText: string;
     let identitiesSetText: string;
     let preassembled: PreassembledSealPieces | undefined;
     try {
-      const identitiesPacked = prepared.identityAssignments.length > 0 && isPackedCandidateTemplate(prepared.identityAssignments[0]);
+      const identitiesPacked = prepared.identityAssignments.length > 0 && isPackedCandidateTemplate(firstSequenceEntry(prepared.identityAssignments));
       const opensPromise = offload.digestSet("canonical", prepared.recordOpens);
       const identitiesPromise = offload.digestSet(identitiesPacked ? "template" : "canonical", prepared.identityAssignments);
       // Attach no-op catches so a fast worker failure cannot surface as an
@@ -1363,7 +1643,24 @@ export class CandidateMaterializer {
     // (`workspace-indexing-session.ts`) so it's possible to tell whether a
     // slow seal is dominated by this record-templating work or by
     // everything seal() does afterward (bindings, projections, digesting).
-    const records = timedSync("seal_finish", () => accumulatorEligible ? accumulator.finish() : recordTemplates(input, owners));
+    const records = timedSync("seal_finish", () => {
+      if (input.rust_promoted_structural_rows === true) {
+        // Rust already validated, canonicalized, identified and staged every
+        // structural row. Rebuilding one template per row in V8 would
+        // duplicate the dominant cold and incremental work. Publication
+        // consumes the Rust candidate relation directly.
+        const recordOpenMemo = new Map<CandidateRecordOpenTemplate, CandidateRecordOpenMemoEntry>();
+        Object.defineProperty(recordOpenMemo, PROMOTED_RECORD_OPEN_MEMO, { value: true });
+        return { reused: [], opens: [], closures: [], identities: [], proposal_record_ids: new Map<string, string>(), record_open_memo: recordOpenMemo };
+      }
+      return accumulatorEligible ? accumulator!.finish() : recordTemplates(input, owners);
+    });
+    if (input.rust_promoted_structural_rows === true && !(PROMOTED_RECORD_OPEN_MEMO in records.record_open_memo)) {
+      // Rust has already validated and staged the opened rows for this
+      // candidate. Mark the exact memo used by publication so an incremental
+      // replacement can take the same set-based path as a cold generation.
+      Object.defineProperty(records.record_open_memo, PROMOTED_RECORD_OPEN_MEMO, { value: true });
+    }
     // `seal_validate_bindings`: `validateBindings`'s own record/lookup/
     // projection-dependency validation -- including its unconditional
     // `scopeRecords(input)` walk (the first, and only, full sort of every
@@ -1472,7 +1769,7 @@ export class CandidateMaterializer {
       ...semanticPayload,
       materialization_digest: semanticDigest,
     }));
-    return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: sourceTransitions, record_opens: prepared.recordOpens, record_closures: recordClosures, identity_assignments: prepared.identityAssignments, record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: lookupRevalidations, projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort(), record_open_memo: records.record_open_memo });
+    return freeze({ materialization, reused_record_ids: freeze(records.reused), source_transitions: sourceTransitions, record_opens: prepared.recordOpens, record_closures: recordClosures, identity_assignments: prepared.identityAssignments, record_dependencies: recordDependencies, lookup_bindings: lookupBindings, lookup_revalidations: lookupRevalidations, projection_dependencies: projectionDependencies, reused_projection_record_ids: projections.reused, absence_barrier_keys: [...barrierKeys].sort(), record_open_memo: records.record_open_memo, ...(input.rust_promoted_structural_rows === true ? { rust_promoted_structural_rows: true } : {}) });
   }
 }
 

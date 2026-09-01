@@ -1,6 +1,7 @@
 import { authoritativeModelNames } from "./model-names.js";
 import { comparatorRegistry, operationDefinitions, recipeRegistry } from "./registries.js";
 import { modelContractRegistry } from "./generated-model-contracts.js";
+import type { FactDeltaStreamBatch, FactDeltaStreamHeader, PluginRuntimeExecutableBinding, RuntimeComponentImplementationManifestV2 } from "./models.js";
 
 export type Presence = "required" | "optional";
 export type LifecycleState = "active" | "deprecated" | "retired";
@@ -1433,4 +1434,221 @@ function comparatorLogicalTypeExpression(logicalType: string): CanonicalTypeExpr
 
 function assertClosedObject(value: Record<string, unknown>, allowed: readonly string[], path: string): void {
   for (const key of Object.keys(value)) if (!allowed.includes(key)) fail(`${path}.${key}`, "unknown field");
+}
+
+const DECISION_25_RUNTIME_TARGETS = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+] as const;
+export const decision25RuntimeTargetIds: readonly string[] = DECISION_25_RUNTIME_TARGETS;
+
+const STREAM_HEADER_REQUIRED_KEYS = [
+  "protocol_version", "schema_id", "fact_delta_id", "candidate_generation_id", "workspace_id", "work_item_id", "plugin_id", "plugin_version",
+  "analysis_digest", "analysis_configuration_digest", "owner_artifact_id", "owner_artifact_version_id", "replacement_scopes", "replacement_scope_count",
+  "replacement_scopes_digest", "input_artifact_version_ids", "input_artifact_version_count", "input_artifact_versions_digest", "input_record_ids",
+  "input_record_count", "input_records_digest", "plugin_input_access_manifest_id", "plugin_input_access_manifest_digest", "analysis_input_digest",
+  "completeness_claims", "completeness_claim_count", "completeness_claims_digest", "proposed_record_count", "proposed_records_digest",
+  "proposed_dependency_count", "proposed_dependencies_digest", "created_at", "delta_digest", "cancellation_id", "backpressure", "stream_digest",
+] as const;
+const STREAM_HEADER_OPTIONAL_KEYS = ["base_snapshot_id", "publication_stage_id"] as const;
+const STREAM_BATCH_KEYS = [
+  "protocol_version", "schema_id", "fact_delta_id", "sequence", "final", "record_count", "dependency_count", "row_count", "byte_length",
+  "records", "dependencies", "chunk_digest",
+] as const;
+const RUNTIME_V2_KEYS = [
+  "runtime_component_build_id", "component_id", "component_version", "behavior_digest", "runtime_target_id", "entrypoint_asset_digest",
+  "executable_asset_digests", "native_asset_digests", "dependency_asset_digests",
+] as const;
+const EXECUTABLE_BINDING_KEYS = [
+  "plugin_id", "plugin_version", "runtime_target_id", "runtime_contract_version", "runtime_component_build_id", "implementation_digest",
+  "package_digest", "entrypoint_asset_digest", "binding_digest",
+] as const;
+const SHA256_TEXT = /^sha256:[0-9a-f]{64}$/u;
+const SEMVER_TEXT = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
+
+const IR_TEXT: TextTypeExpression = { type_kind: "text" };
+const IR_ID_TEXT: TextTypeExpression = { type_kind: "text", minimum_code_point_count: 1, maximum_code_point_count: 512 };
+const IR_DIGEST: DigestTypeExpression = { type_kind: "digest", allowed_hash_algorithms: ["sha256"] };
+const IR_COUNT: SafeIntegerTypeExpression = { type_kind: "safe_integer", minimum: 0 };
+const IR_POSITIVE: SafeIntegerTypeExpression = { type_kind: "safe_integer", minimum: 1 };
+const IR_JSON: SchemaReferenceTypeExpression = { type_kind: "schema_reference", reference_scope: "external", type_name: "JsonValue", schema_id: "core:JsonValue", schema_version: 1 };
+const irField = (field_name: string, value_type: CanonicalTypeExpression, presence: Presence = "required"): SchemaFieldDefinition => ({ field_name, description: `${field_name} contract field.`, presence, value_type });
+const irLocal = (type_name: string): SchemaReferenceTypeExpression => ({ type_kind: "schema_reference", reference_scope: "local", type_name });
+const irSequence = (element_type: CanonicalTypeExpression, maximum_item_count?: number): SequenceTypeExpression => ({ type_kind: "sequence", element_type, ...(maximum_item_count === undefined ? {} : { maximum_item_count }) });
+
+const replacementScopeIr: RecordTypeExpression = { type_kind: "record", fields: [
+  ...["replacement_scope_id", "owner_artifact_id", "owner_artifact_version_id", "capability"].map((name) => irField(name, IR_ID_TEXT)),
+  irField("record_categories", irSequence(IR_ID_TEXT)), irField("record_kinds", irSequence(IR_ID_TEXT)), irField("partition_key", IR_JSON, "optional"),
+  irField("base_record_set_digest", IR_DIGEST), irField("output_completeness", IR_ID_TEXT),
+] };
+const completenessClaimIr: RecordTypeExpression = { type_kind: "record", fields: [
+  irField("completeness_claim_id", IR_ID_TEXT), irField("capability", IR_ID_TEXT), irField("replacement_scope_ids", IR_TEXT),
+  irField("status", { type_kind: "enum", values: ["complete", "partial", "unknown", "unsupported", "stale"] }),
+  irField("reason_codes", IR_TEXT), irField("affected_artifact_ids", IR_TEXT), irField("diagnostic_proposal_keys", IR_TEXT),
+] };
+const proposedRecordIr: RecordTypeExpression = { type_kind: "record", fields: [
+  irField("proposal_record_key", IR_ID_TEXT), irField("category", IR_ID_TEXT), irField("kind", IR_ID_TEXT), irField("universal_kind", IR_ID_TEXT),
+  irField("facets", IR_TEXT), irField("schema_version", IR_POSITIVE), irField("source_span", IR_TEXT), irField("identity_key", IR_TEXT),
+  irField("body", IR_JSON), irField("evidence_references", IR_TEXT),
+] };
+const proposedDependencyIr: RecordTypeExpression = { type_kind: "record", fields: [
+  irField("proposed_dependency_id", IR_ID_TEXT), irField("proposal_record_key", IR_ID_TEXT), irField("dependency_artifact_id", IR_ID_TEXT),
+  irField("dependency_artifact_version_id", IR_ID_TEXT), irField("dependency_role", IR_ID_TEXT), irField("dependency_basis", IR_ID_TEXT), irField("source_reference", IR_JSON),
+] };
+
+export const factDeltaStreamHeaderSchemaV2: CanonicalSchemaDefinition = {
+  schema_id: "core:FactDeltaStream", definition_revision: 1, schema_version: 2, lifecycle_state: "active",
+  description: "Decision 25 bounded FactDelta stream header.",
+  root_type: { type_kind: "record", fields: [
+    irField("protocol_version", { type_kind: "safe_integer", minimum: 2, maximum: 2 }), irField("schema_id", { type_kind: "enum", values: ["core:FactDeltaStream"] }),
+    ...["fact_delta_id", "candidate_generation_id", "workspace_id"].map((name) => irField(name, IR_ID_TEXT)), irField("base_snapshot_id", IR_ID_TEXT, "optional"),
+    ...["work_item_id", "plugin_id"].map((name) => irField(name, IR_ID_TEXT)), irField("plugin_version", { type_kind: "text", identifier_kind: "semver" }),
+    irField("analysis_digest", IR_DIGEST), irField("analysis_configuration_digest", IR_DIGEST), irField("publication_stage_id", IR_ID_TEXT, "optional"),
+    irField("owner_artifact_id", IR_ID_TEXT), irField("owner_artifact_version_id", IR_ID_TEXT), irField("replacement_scopes", irSequence(irLocal("replacement_scope"))),
+    irField("replacement_scope_count", IR_COUNT), irField("replacement_scopes_digest", IR_DIGEST), irField("input_artifact_version_ids", irSequence(IR_ID_TEXT)),
+    irField("input_artifact_version_count", IR_COUNT), irField("input_artifact_versions_digest", IR_DIGEST), irField("input_record_ids", irSequence(IR_ID_TEXT)),
+    irField("input_record_count", IR_COUNT), irField("input_records_digest", IR_DIGEST), irField("plugin_input_access_manifest_id", IR_ID_TEXT),
+    irField("plugin_input_access_manifest_digest", IR_DIGEST), irField("analysis_input_digest", IR_DIGEST), irField("completeness_claims", irSequence(irLocal("completeness_claim"))),
+    irField("completeness_claim_count", IR_COUNT), irField("completeness_claims_digest", IR_DIGEST), irField("proposed_record_count", IR_COUNT),
+    irField("proposed_records_digest", IR_DIGEST), irField("proposed_dependency_count", IR_COUNT), irField("proposed_dependencies_digest", IR_DIGEST),
+    irField("created_at", IR_ID_TEXT), irField("delta_digest", IR_DIGEST), irField("cancellation_id", IR_ID_TEXT),
+    irField("backpressure", irLocal("backpressure")), irField("stream_digest", IR_DIGEST),
+  ] },
+  type_definitions: [
+    { type_name: "replacement_scope", description: "Exact replacement scope committed by the stream.", type_expression: replacementScopeIr },
+    { type_name: "completeness_claim", description: "Exact completeness claim committed by the stream.", type_expression: completenessClaimIr },
+    { type_name: "backpressure", description: "Sequential acknowledgement contract.", type_expression: { type_kind: "record", fields: [irField("acknowledgement_mode", { type_kind: "enum", values: ["per_batch"] }), irField("max_in_flight_batches", { type_kind: "safe_integer", minimum: 1, maximum: 1 })] } },
+  ],
+};
+
+export const factDeltaStreamBatchSchemaV2: CanonicalSchemaDefinition = {
+  schema_id: "core:FactDeltaStreamBatch", definition_revision: 1, schema_version: 2, lifecycle_state: "active",
+  description: "Decision 25 full-fidelity bounded FactDelta stream batch.",
+  root_type: { type_kind: "record", fields: [
+    irField("protocol_version", { type_kind: "safe_integer", minimum: 2, maximum: 2 }), irField("schema_id", { type_kind: "enum", values: ["core:FactDeltaStreamBatch"] }),
+    irField("fact_delta_id", IR_ID_TEXT), irField("sequence", IR_COUNT), irField("final", { type_kind: "boolean" }), irField("record_count", IR_COUNT),
+    irField("dependency_count", IR_COUNT), irField("row_count", { type_kind: "safe_integer", minimum: 0, maximum: 4096 }), irField("byte_length", { type_kind: "safe_integer", minimum: 0, maximum: 4 * 1024 * 1024 }),
+    irField("records", irSequence(irLocal("proposed_record"), 4096)), irField("dependencies", irSequence(irLocal("proposed_dependency"), 4096)), irField("chunk_digest", IR_DIGEST),
+  ] },
+  type_definitions: [
+    { type_name: "proposed_record", description: "One full-fidelity proposed record.", type_expression: proposedRecordIr },
+    { type_name: "proposed_dependency", description: "One full-fidelity proposed dependency.", type_expression: proposedDependencyIr },
+  ],
+};
+
+export const runtimeComponentImplementationManifestSchemaV2: CanonicalSchemaDefinition = {
+  schema_id: "core:RuntimeComponentImplementationManifest", definition_revision: 1, schema_version: 2, lifecycle_state: "active",
+  description: "Exact target-specific runtime component implementation manifest.", type_definitions: [],
+  root_type: { type_kind: "record", fields: [
+    irField("runtime_component_build_id", IR_ID_TEXT), irField("component_id", IR_ID_TEXT), irField("component_version", { type_kind: "text", identifier_kind: "semver" }),
+    irField("behavior_digest", IR_DIGEST), irField("runtime_target_id", { type_kind: "enum", values: [...DECISION_25_RUNTIME_TARGETS] }), irField("entrypoint_asset_digest", IR_DIGEST),
+    irField("executable_asset_digests", { type_kind: "set", element_type: IR_DIGEST, minimum_item_count: 1 }), irField("native_asset_digests", { type_kind: "set", element_type: IR_DIGEST }),
+    irField("dependency_asset_digests", { type_kind: "set", element_type: IR_DIGEST }),
+  ] },
+};
+
+export const pluginRuntimeExecutableBindingSchemaV1: CanonicalSchemaDefinition = {
+  schema_id: "core:PluginRuntimeExecutableBinding", definition_revision: 1, schema_version: 1, lifecycle_state: "active",
+  description: "Exact resolved plugin-to-runtime executable binding.", type_definitions: [],
+  root_type: { type_kind: "record", fields: [
+    irField("plugin_id", IR_ID_TEXT), irField("plugin_version", { type_kind: "text", identifier_kind: "semver" }),
+    irField("runtime_target_id", { type_kind: "enum", values: [...DECISION_25_RUNTIME_TARGETS] }), irField("runtime_contract_version", IR_POSITIVE),
+    irField("runtime_component_build_id", IR_ID_TEXT), irField("implementation_digest", IR_DIGEST), irField("package_digest", IR_DIGEST),
+    irField("entrypoint_asset_digest", IR_DIGEST), irField("binding_digest", IR_DIGEST),
+  ] },
+};
+
+function closedContractRecord(value: unknown, required: readonly string[], optional: readonly string[], path: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) fail(path, "must be a closed object");
+  const record = value as Record<string, unknown>;
+  assertClosedObject(record, [...required, ...optional], path);
+  for (const key of required) if (!Object.hasOwn(record, key)) fail(`${path}.${key}`, "is required");
+  return record;
+}
+
+function nonemptyContractText(value: unknown, path: string): asserts value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 512 || /[\r\n\t\0]/u.test(value)) fail(path, "must be bounded non-empty text");
+}
+
+function digestContractText(value: unknown, path: string): asserts value is string {
+  if (typeof value !== "string" || !SHA256_TEXT.test(value)) fail(path, "must be a SHA-256 digest");
+}
+
+function countContractValue(value: unknown, path: string, positive = false): asserts value is number {
+  if (!Number.isSafeInteger(value) || Number(value) < (positive ? 1 : 0)) fail(path, positive ? "must be a positive safe integer" : "must be a non-negative safe integer");
+}
+
+function digestSet(value: unknown, path: string, minimum = 0): asserts value is readonly string[] {
+  if (!Array.isArray(value) || value.length < minimum) fail(path, `must contain at least ${String(minimum)} digest values`);
+  const seen = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    digestContractText(item, `${path}[${String(index)}]`);
+    if (seen.has(item)) fail(`${path}[${String(index)}]`, "duplicates a digest");
+    seen.add(item);
+  }
+}
+
+function stringSequence(value: unknown, path: string): asserts value is readonly string[] {
+  if (!Array.isArray(value)) fail(path, "must be an array");
+  for (const [index, item] of value.entries()) nonemptyContractText(item, `${path}[${String(index)}]`);
+}
+
+/** Closed structural validation. Digest recomputation is performed by the
+ * plugin SDK, which owns the canonical transport projection. */
+export function validateFactDeltaStreamHeaderValue(value: unknown): FactDeltaStreamHeader {
+  validateSchemaValue(factDeltaStreamHeaderSchemaV2, value);
+  const record = closedContractRecord(value, STREAM_HEADER_REQUIRED_KEYS, STREAM_HEADER_OPTIONAL_KEYS, "FactDeltaStream.header");
+  if (record["protocol_version"] !== 2 || record["schema_id"] !== "core:FactDeltaStream") fail("FactDeltaStream.header", "uses an unsupported contract coordinate");
+  for (const key of ["fact_delta_id", "candidate_generation_id", "workspace_id", "work_item_id", "plugin_id", "plugin_version", "owner_artifact_id", "owner_artifact_version_id", "plugin_input_access_manifest_id", "created_at", "cancellation_id"] as const) nonemptyContractText(record[key], `FactDeltaStream.header.${key}`);
+  for (const key of ["analysis_digest", "analysis_configuration_digest", "replacement_scopes_digest", "input_artifact_versions_digest", "input_records_digest", "plugin_input_access_manifest_digest", "analysis_input_digest", "completeness_claims_digest", "proposed_records_digest", "proposed_dependencies_digest", "delta_digest", "stream_digest"] as const) digestContractText(record[key], `FactDeltaStream.header.${key}`);
+  for (const key of ["replacement_scope_count", "input_artifact_version_count", "input_record_count", "completeness_claim_count", "proposed_record_count", "proposed_dependency_count"] as const) countContractValue(record[key], `FactDeltaStream.header.${key}`);
+  if (!Array.isArray(record["replacement_scopes"]) || !Array.isArray(record["completeness_claims"])) fail("FactDeltaStream.header", "scopes and completeness must be arrays");
+  stringSequence(record["input_artifact_version_ids"], "FactDeltaStream.header.input_artifact_version_ids");
+  stringSequence(record["input_record_ids"], "FactDeltaStream.header.input_record_ids");
+  const backpressure = closedContractRecord(record["backpressure"], ["acknowledgement_mode", "max_in_flight_batches"], [], "FactDeltaStream.header.backpressure");
+  if (backpressure["acknowledgement_mode"] !== "per_batch") fail("FactDeltaStream.header.backpressure.acknowledgement_mode", "must require per-batch acknowledgement");
+  countContractValue(backpressure["max_in_flight_batches"], "FactDeltaStream.header.backpressure.max_in_flight_batches", true);
+  if (backpressure["max_in_flight_batches"] !== 1) fail("FactDeltaStream.header.backpressure.max_in_flight_batches", "must be one for sequential acceptance");
+  return value as FactDeltaStreamHeader;
+}
+
+export function validateFactDeltaStreamBatchValue(value: unknown): FactDeltaStreamBatch {
+  validateSchemaValue(factDeltaStreamBatchSchemaV2, value);
+  const record = closedContractRecord(value, STREAM_BATCH_KEYS, [], "FactDeltaStream.batch");
+  if (record["protocol_version"] !== 2 || record["schema_id"] !== "core:FactDeltaStreamBatch") fail("FactDeltaStream.batch", "uses an unsupported contract coordinate");
+  nonemptyContractText(record["fact_delta_id"], "FactDeltaStream.batch.fact_delta_id");
+  for (const key of ["sequence", "record_count", "dependency_count", "row_count", "byte_length"] as const) countContractValue(record[key], `FactDeltaStream.batch.${key}`);
+  if (typeof record["final"] !== "boolean" || !Array.isArray(record["records"]) || !Array.isArray(record["dependencies"])) fail("FactDeltaStream.batch", "rows and final marker are invalid");
+  digestContractText(record["chunk_digest"], "FactDeltaStream.batch.chunk_digest");
+  return value as FactDeltaStreamBatch;
+}
+
+export function validateRuntimeComponentImplementationManifestV2(value: unknown): RuntimeComponentImplementationManifestV2 {
+  validateSchemaValue(runtimeComponentImplementationManifestSchemaV2, value);
+  const record = closedContractRecord(value, RUNTIME_V2_KEYS, [], "RuntimeComponentImplementationManifest@2");
+  for (const key of ["runtime_component_build_id", "component_id", "component_version", "runtime_target_id"] as const) nonemptyContractText(record[key], `RuntimeComponentImplementationManifest@2.${key}`);
+  if (!SEMVER_TEXT.test(String(record["component_version"]))) fail("RuntimeComponentImplementationManifest@2.component_version", "must be SemVer");
+  if (!DECISION_25_RUNTIME_TARGETS.includes(record["runtime_target_id"] as (typeof DECISION_25_RUNTIME_TARGETS)[number])) fail("RuntimeComponentImplementationManifest@2.runtime_target_id", "must be a registered runtime target");
+  for (const key of ["behavior_digest", "entrypoint_asset_digest"] as const) digestContractText(record[key], `RuntimeComponentImplementationManifest@2.${key}`);
+  digestSet(record["executable_asset_digests"], "RuntimeComponentImplementationManifest@2.executable_asset_digests", 1);
+  digestSet(record["native_asset_digests"], "RuntimeComponentImplementationManifest@2.native_asset_digests");
+  digestSet(record["dependency_asset_digests"], "RuntimeComponentImplementationManifest@2.dependency_asset_digests");
+  if (!(record["executable_asset_digests"] as readonly string[]).includes(record["entrypoint_asset_digest"] as string)) fail("RuntimeComponentImplementationManifest@2.entrypoint_asset_digest", "must select exactly one executable asset from the manifest");
+  return value as RuntimeComponentImplementationManifestV2;
+}
+
+/** Structural validation; the SDK validator additionally verifies the
+ * binding_digest over the exact closed payload. */
+export function validatePluginRuntimeExecutableBindingValue(value: unknown): PluginRuntimeExecutableBinding {
+  validateSchemaValue(pluginRuntimeExecutableBindingSchemaV1, value);
+  const record = closedContractRecord(value, EXECUTABLE_BINDING_KEYS, [], "PluginRuntimeExecutableBinding@1");
+  for (const key of ["plugin_id", "plugin_version", "runtime_target_id", "runtime_component_build_id"] as const) nonemptyContractText(record[key], `PluginRuntimeExecutableBinding@1.${key}`);
+  if (!SEMVER_TEXT.test(String(record["plugin_version"]))) fail("PluginRuntimeExecutableBinding@1.plugin_version", "must be SemVer");
+  if (!DECISION_25_RUNTIME_TARGETS.includes(record["runtime_target_id"] as (typeof DECISION_25_RUNTIME_TARGETS)[number])) fail("PluginRuntimeExecutableBinding@1.runtime_target_id", "must be a registered runtime target");
+  countContractValue(record["runtime_contract_version"], "PluginRuntimeExecutableBinding@1.runtime_contract_version", true);
+  for (const key of ["implementation_digest", "package_digest", "entrypoint_asset_digest", "binding_digest"] as const) digestContractText(record[key], `PluginRuntimeExecutableBinding@1.${key}`);
+  return value as PluginRuntimeExecutableBinding;
 }

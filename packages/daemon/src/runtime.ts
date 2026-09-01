@@ -2,9 +2,9 @@ import { chmod, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, resolve } from "node:path";
-import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier } from "@urdira/engine";
+import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
-import { createDurableStorage, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
+import { createDurableStorage, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
 import { runIndexPackExportInThread } from "./index-pack-export-thread.js";
 import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-thread.js";
 import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths } from "./ownership.js";
@@ -43,6 +43,8 @@ export interface DaemonRuntimeOptions {
    * application (`apps/urdira`) instead of constructed here.
    */
   readonly resolve_plugin_provider?: (workspace: RegisteredWorkspace, database: WorkspaceDatabase) => Promise<WorkspaceScanPluginProvider | undefined>;
+  /** Resolves the persistent Rust source writer for generic scans without a language plugin. */
+  readonly resolve_source_indexing_core?: (workspace: RegisteredWorkspace, database: WorkspaceDatabase) => Promise<RustIndexingCoreGenerationPort | undefined>;
   /**
    * Optional overrides for the per-provider-call scan resource budget
    * (duration / response size), injected by the composing application
@@ -82,6 +84,10 @@ export interface DaemonRuntimeOptions {
    * the maintenance job's own bounded work.
    */
   readonly lexical_index?: boolean;
+  /** Rust composition-worker generations reconcile lexical projections
+   * post-publication. When enabled, the daemon does not enqueue a duplicate
+   * TypeScript lexical writer for ordinary structural scans. */
+  readonly lexical_owned_by_rust?: boolean;
   /**
    * How often (in ms) the background reconciliation sweep re-checks every
    * `ready`/`degraded` workspace against disk, independent of the file
@@ -532,6 +538,47 @@ function frontierReady(readiness: WorkspaceReadiness, frontier: "source" | "synt
   return frontier === "source" ? readiness.source_ready : frontier === "syntax" ? readiness.structural_stage_1_ready : frontier === "structural" ? readiness.structural_ready : readiness.semantic_ready;
 }
 
+// Readiness transitions are process-local scheduling events; durable state
+// remains authoritative and is re-read after every wake. The one-second timer
+// is only a recovery backstop for transitions produced outside this runtime.
+const readinessWaiters = new Map<string, Set<() => void>>();
+function notifyReadinessChanged(workspaceId: string): void {
+  const waiters = readinessWaiters.get(workspaceId);
+  if (waiters === undefined) return;
+  readinessWaiters.delete(workspaceId);
+  for (const wake of waiters) wake();
+}
+
+function waitForReadinessChanged(workspaceId: string, timeoutMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", cancel);
+      const waiters = readinessWaiters.get(workspaceId);
+      waiters?.delete(finish);
+      if (waiters?.size === 0) readinessWaiters.delete(workspaceId);
+      resolve();
+    };
+    const cancel = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const waiters = readinessWaiters.get(workspaceId);
+      waiters?.delete(finish);
+      if (waiters?.size === 0) readinessWaiters.delete(workspaceId);
+      reject(new DaemonError("core:operation_cancelled", "Freshness wait was cancelled.", { workspace_id: workspaceId }));
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    const waiters = readinessWaiters.get(workspaceId) ?? new Set<() => void>();
+    waiters.add(finish);
+    readinessWaiters.set(workspaceId, waiters);
+    signal.addEventListener("abort", cancel, { once: true });
+  });
+}
+
 function queryFreshnessWait(payload: unknown): { readonly requested: boolean; readonly timeoutMs: number } {
   const request = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
   const options = request["options"] !== null && typeof request["options"] === "object" && !Array.isArray(request["options"]) ? request["options"] as Record<string, unknown> : {};
@@ -591,7 +638,6 @@ async function waitForQueryFrontier(
   const started = Date.now();
   const deadline = Math.min(started + timeoutMs, absoluteDeadlineMs ?? Number.POSITIVE_INFINITY);
   let latest: WorkspaceReadiness | undefined;
-  let pollAttempt = 0;
   while (true) {
     if (signal.aborted) throw new DaemonError("core:operation_cancelled", "Freshness wait was cancelled.", { workspace_id: workspaceId, frontier });
     const workspace = await findQueryWorkspace(workspaceId, registry, signal);
@@ -619,21 +665,7 @@ async function waitForQueryFrontier(
         ...(latest.retry_after_ms === undefined ? {} : { retry_after_ms: latest.retry_after_ms }),
       });
     }
-    await new Promise<void>((resolve, reject) => {
-      const pollDelayMs = Math.min(1_000, 250 * 2 ** Math.min(pollAttempt, 2));
-      pollAttempt += 1;
-      const remaining = Math.max(1, Math.min(pollDelayMs, deadline - Date.now()));
-      let settled = false;
-      const timer = setTimeout(() => { settled = true; signal.removeEventListener("abort", cancel); resolve(); }, remaining);
-      const cancel = (): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        signal.removeEventListener("abort", cancel);
-        reject(new DaemonError("core:operation_cancelled", "Freshness wait was cancelled.", { workspace_id: workspaceId, frontier }));
-      };
-      signal.addEventListener("abort", cancel, { once: true });
-    });
+    await waitForReadinessChanged(workspaceId, Math.max(1, Math.min(1_000, deadline - Date.now())), signal);
   }
 }
 
@@ -1086,8 +1118,8 @@ function queryRequiresStructural(payload: unknown): boolean {
 /**
  * Resolves the target workspace (reusing `resolveIndexStatusRequest`, the
  * same readiness gating already used for `core:index_status`) and returns a
- * `QueryEngine` for it, opening and caching its `WorkspaceDatabase` and
- * `QueryEngine` the first time a given workspace is queried, then reusing
+ * `QueryEngine` for it, opening and caching a read-only `WorkspaceDatabase`
+ * and `QueryEngine` the first time a given workspace is queried, then reusing
  * both for the runtime's lifetime (closed transitively by `indexingStorage`'s
  * own `close()`, which already tracks and closes every `WorkspaceDatabase`
  * it opened -- see `DurableStorage.close()` -- plus an explicit close on
@@ -1132,7 +1164,13 @@ function queryRequiresStructural(payload: unknown): boolean {
  * cleanly after a restart, which is the safer of the two incomplete options
  * available without the full retention-lease integration above.
  */
-interface CachedWorkspaceQueryEngine { readonly database: WorkspaceDatabase; readonly engine: QueryEngine; readonly data_port: CanonicalRecordQueryDataPort; readonly snapshot_port: SqliteCanonicalQuerySnapshotPort; }
+interface CachedWorkspaceQueryEngine {
+  readonly database: WorkspaceDatabase;
+  readonly engine: QueryEngine;
+  readonly data_port: CanonicalRecordQueryDataPort;
+  readonly snapshot_port: SqliteCanonicalQuerySnapshotPort;
+  readonly operation_telemetry?: QueryOperationTelemetry;
+}
 
 const DEFAULT_WARM_RECORDS_BUDGET_MB = 3072;
 const BYTES_PER_MEGABYTE = 1024 * 1024;
@@ -1205,7 +1243,11 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
   if ("error" in resolution) throw new DaemonError(resolution.error.code, `The requested query workspace ${workspaceId} is unavailable. Call urdira_index_status with the exact workspace_root and copy query_scope.workspace_id byte-for-byte; never synthesize or shorten a workspace id.`, resolution.error.details);
   const cached = cache.get(resolution.workspace_id);
   if (cached) { touchWarmLru(lru, resolution.workspace_id); return cached; }
-  const database = await storage.openWorkspace(resolution.workspace_id);
+  // Query engines never mutate workspace state. Keep their cached handles
+  // explicitly read-only so the Rust composition worker remains the sole
+  // structural/lexical writer and a query cannot accidentally open a
+  // competing SQLite writer connection during publication.
+  const database = await storage.openWorkspaceReadOnly(resolution.workspace_id);
   // `semanticProvider` (resolved once at `DaemonRuntime.start`, see
   // `DaemonRuntimeOptions.semantic_provider`'s doc comment) is threaded
   // through as the query port's `options.semantic` -- exactly the pair the
@@ -1222,8 +1264,23 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
   // byte-for-byte duplicate.
   const snapshotPort = new SqliteCanonicalQuerySnapshotPort(database.database, storage.cas, interner);
   const dataPort = new CanonicalRecordQueryDataPort(snapshotPort, semanticProvider === undefined ? undefined : { semantic: semanticProvider });
-  const engine = new QueryEngine({ data_port: dataPort, cursor_cache: cursorCache });
-  const entry: CachedWorkspaceQueryEngine = { database, engine, data_port: dataPort, snapshot_port: snapshotPort };
+  // Query instrumentation is deliberately opt-in because canonical byte
+  // accounting and event-loop histograms add measurable work. The existing
+  // --debug-timing switch enables one bounded lifetime aggregator per cached
+  // workspace without changing MCP/query response models.
+  const operationTelemetry = readinessTimingEnabled() ? new QueryOperationTelemetry() : undefined;
+  const engine = new QueryEngine({
+    data_port: dataPort,
+    cursor_cache: cursorCache,
+    ...(operationTelemetry === undefined ? {} : { operation_telemetry: operationTelemetry }),
+  });
+  const entry: CachedWorkspaceQueryEngine = {
+    database,
+    engine,
+    data_port: dataPort,
+    snapshot_port: snapshotPort,
+    ...(operationTelemetry === undefined ? {} : { operation_telemetry: operationTelemetry }),
+  };
   cache.set(resolution.workspace_id, entry);
   touchWarmLru(lru, resolution.workspace_id);
   return entry;
@@ -1273,14 +1330,14 @@ async function detectWorkspacePreview(root: string, catalog: readonly DaemonPlug
   };
   await walk(root);
   reportProgress?.({ phase: "workspace_discovery", completed: files.length, total: files.length, message: `workspace discovery complete (${files.length} files inspected)` });
-  const detection = detectWorkspaceTechnologies({
+  const detection = summarizeWorkspaceTechnologyProposal(detectWorkspaceTechnologies({
     provider_fingerprint: workspaceDigest(root),
     git_state_fingerprint: "git:unresolved",
     plugin_catalog_fingerprint: pluginCatalogFingerprint(catalog),
     plugin_catalog: catalog,
     files,
-  });
-  const vcsState = await administrativeState(root, ISOMORPHIC_GIT_OBJECT_PORT, () => new Date().toISOString()).then((state) => state.vcs_state as unknown as Readonly<Record<string, unknown>>).catch(() => undefined);
+  }));
+  const vcsState = await administrativeState(root, ISOMORPHIC_GIT_OBJECT_PORT, () => new Date().toISOString()).then((state: { readonly vcs_state: unknown }) => state.vcs_state as Readonly<Record<string, unknown>>).catch(() => undefined);
   return { ...detection, ...(vcsState === undefined ? {} : { vcs_state: vcsState, suggested_codebase_vcs_identity: vcsState["common_repository_id"] }) };
 }
 
@@ -1751,6 +1808,19 @@ export class DaemonRuntime {
       // never re-attempts an import against an already-populated workspace).
       const pendingIndexPackPaths = new Map<string, string>();
       const activeAuthoritativeDeletePhases = new Map<string, Set<string>>();
+      // `storage:workspace_writer_busy` (see `packages/storage/src/storage.ts`)
+      // means a foreground mutation could not acquire the cross-process
+      // writer lock -- normally because detached Rust lexical maintenance
+      // holds it for one bounded chunk (`reconcile_lexical` in
+      // `crates/urdira-indexing-core/src/lib.rs`). That is a short, expected
+      // race, not a real scan failure, so it gets its own bounded retry
+      // counter here, exactly parallel to how `core:source_changed` is
+      // retried below but with an explicit delay/cap so a writer that never
+      // releases the lock cannot turn into a busy-loop. Reset on every
+      // successful scan completion (see the `WORKSPACE_WRITER_BUSY_MAX_RETRIES`
+      // usage below and its success-path resets).
+      const workspaceWriterBusyRetries = new Map<string, number>();
+      const WORKSPACE_WRITER_BUSY_MAX_RETRIES = 8;
       const pendingScans = new Map<string, {
         full: boolean;
         uris: Set<string>;
@@ -1803,6 +1873,7 @@ export class DaemonRuntime {
           return;
         }
         scanInFlight.add(workspaceId);
+        notifyReadinessChanged(workspaceId);
         const scanController = new AbortController();
         const scanGeneration = (scanGenerations.get(workspaceId) ?? 0) + 1;
         scanGenerations.set(workspaceId, scanGeneration);
@@ -1846,12 +1917,16 @@ export class DaemonRuntime {
                   });
                   database = await durableStorage.openWorkspace(workspaceId);
                   const plugin = await resolvePluginProvider(workspace, database);
-                  if (!plugin) {
+                if (!plugin) {
                     // Generic source discovery is useful without a language
                     // plugin. Leave the registry in indexing state (there is
                     // intentionally no structural snapshot to mark ready),
                     // while the durable source catalog becomes queryable via
                     // API v3 source bindings.
+                    /* c8 ignore start -- production app integration supplies this resolver; daemon unit tests use plugin-backed scans. */
+                    const sourceIndexingCore = options.resolve_source_indexing_core === undefined
+                      ? undefined
+                      : await options.resolve_source_indexing_core(workspace, database);
                     await runSourceOnlyWorkspaceScan({
                       root: workspace.canonical_root,
                       database,
@@ -1862,7 +1937,10 @@ export class DaemonRuntime {
                       ...(requestedUris === undefined ? {} : { changed_uris: requestedUris }),
                       ...(authoritativeDeletes.length === 0 ? {} : { authoritative_delete_events: authoritativeDeletes }),
                       signal: scanController.signal,
+                      ...(sourceIndexingCore === undefined ? {} : { indexing_core: sourceIndexingCore }),
                     });
+                    /* c8 ignore stop */
+                    workspaceWriterBusyRetries.delete(workspaceId);
                     console.error(`[urdira] source catalog ready for ${workspaceId}; no compatible language plugin is active`);
                     return undefined;
                   }
@@ -1880,11 +1958,21 @@ export class DaemonRuntime {
                   // cataloged, and republishes an equivalent generation).
                   // `URDIRA_WORKSPACE_FORK=0` (kill switch, default ON) disables
                   // this entirely -- see `DaemonRuntimeOptions.workspace_fork`.
-                  if (priorSnapshotId === undefined && options.workspace_fork !== false && hasPotentialWorkspaceForkDonor(workspace, registry)) {
+                  // The Rust cutover also bypasses this compatibility copier
+                  // until donor-row publication has a Rust-native command.
+                  // The compatibility fork copier still uses the TypeScript
+                  // bulk-copy API for donor rows. Until that copier is a
+                  // first-class Rust worker command, never enter it on the
+                  // production cutover route: falling through to the normal
+                  // Rust generation is slower than a fork but preserves the
+                  // single-writer invariant and avoids a second structural
+                  // SQLite owner.
+                  if (priorSnapshotId === undefined && plugin.indexing_core === undefined && options.workspace_fork !== false && hasPotentialWorkspaceForkDonor(workspace, registry)) {
                     try {
-                      const forkOutcome = await attemptWorkspaceFork({ workspace, database, storage: durableStorage, registry, plugin, ...(options.workspace_fork_verify === undefined ? {} : { verify_mode: options.workspace_fork_verify }) });
+                      const forkOutcome = await attemptWorkspaceFork({ workspace, database, storage: durableStorage, registry, plugin, ...(plugin.indexing_core === undefined ? {} : { indexing_core: plugin.indexing_core }), ...(options.workspace_fork_verify === undefined ? {} : { verify_mode: options.workspace_fork_verify }) });
                       if (forkOutcome.status === "forked") {
                         registry.markReady(workspaceId, forkOutcome.snapshot_id, "ready");
+                        workspaceWriterBusyRetries.delete(workspaceId);
                         submitLexicalMaintenance(workspaceId);
                         submitSemanticMaintenance(workspaceId);
                         return undefined;
@@ -1903,16 +1991,24 @@ export class DaemonRuntime {
                   // above) -- the registered path is the real opt-in;
                   // `options.index_pack !== false` is only a kill switch.
                   // `attemptIndexPackImport` never throws either, same
-                  // contract as `attemptWorkspaceFork`.
-                  if (priorSnapshotId === undefined) {
+                  // contract as `attemptWorkspaceFork`; it is compatibility-
+                  // only while Rust owns production writes.
+                  // As with workspace forks, pack bulk-copy remains an
+                  // oracle/test implementation until its publication is
+                  // driven by the Rust composition protocol. Production
+                  // Rust generations must not be followed by a TypeScript
+                  // structural transaction.
+                  if (priorSnapshotId === undefined && plugin.indexing_core === undefined) {
                     const pendingPackPath = pendingIndexPackPaths.get(workspaceId);
                     if (pendingPackPath !== undefined) {
                       pendingIndexPackPaths.delete(workspaceId);
                       if (options.index_pack !== false) {
                         try {
-                          const importOutcome = await attemptIndexPackImport({ workspace, database, storage: durableStorage, registry, plugin, pack_path: pendingPackPath, ...(options.index_pack_verify === undefined ? {} : { verify_mode: options.index_pack_verify }) });
+                          /* c8 ignore next -- the production resolver supplies the Rust writer; pack-import unit tests use the compatibility oracle. */
+                          const importOutcome = await attemptIndexPackImport({ workspace, database, storage: durableStorage, registry, plugin, ...(plugin.indexing_core === undefined ? {} : { indexing_core: plugin.indexing_core }), pack_path: pendingPackPath, ...(options.index_pack_verify === undefined ? {} : { verify_mode: options.index_pack_verify }) });
                           if (importOutcome.status === "imported") {
                             registry.markReady(workspaceId, importOutcome.snapshot_id, "ready");
+                            workspaceWriterBusyRetries.delete(workspaceId);
                             submitLexicalMaintenance(workspaceId);
                             submitSemanticMaintenance(workspaceId);
                             return undefined;
@@ -1923,6 +2019,11 @@ export class DaemonRuntime {
                         }
                       }
                     }
+                  } else if (priorSnapshotId === undefined && plugin.indexing_core !== undefined) {
+                    // Consume a pending pack request even when the legacy
+                    // copier is intentionally bypassed, so it cannot be
+                    // replayed after the Rust full generation publishes.
+                    pendingIndexPackPaths.delete(workspaceId);
                   }
                   const result = await runProgressiveWorkspaceScan({
                     root: workspace.canonical_root,
@@ -1942,9 +2043,12 @@ export class DaemonRuntime {
                       // never enter this callback and stay labeled checking.
                       scanActivities.set(workspaceId, "indexing");
                       if (stage.ordinal < stage.stage_count) registry.markStructuralStagePublished(workspaceId, stageResult.snapshot_id);
+                      notifyReadinessChanged(workspaceId);
                     },
                   });
                   registry.markReady(workspaceId, result.snapshot_id, "ready");
+                  workspaceWriterBusyRetries.delete(workspaceId);
+                  notifyReadinessChanged(workspaceId);
                   // Do not start the full query-corpus prewarm here. Source-
                   // safe requests (including benchmark artifact discovery)
                   // are allowed as soon as the source snapshot is published,
@@ -1991,6 +2095,38 @@ export class DaemonRuntime {
                     });
                     return undefined;
                   }
+                  // `storage:workspace_writer_busy`: the foreground SQLite
+                  // mutation could not acquire the cross-process writer lock
+                  // within its bounded wait (`packages/storage/src/storage.ts`'s
+                  // `acquireWorkspaceMutationLock`), almost always because
+                  // detached Rust lexical maintenance is mid-chunk with the
+                  // lease (`reconcile_lexical`,
+                  // `crates/urdira-indexing-core/src/lib.rs`). That lease is
+                  // released between chunks, so a short, capped, delayed
+                  // retry is normally enough -- this is not an indexing
+                  // failure and, like `core:source_changed` above, must not
+                  // pin the workspace to a stale degraded snapshot or record
+                  // a `last_scan_error` that would otherwise stick until the
+                  // next successful scan.
+                  if (failureCode === WORKSPACE_WRITER_BUSY_CODE) {
+                    const attempts = (workspaceWriterBusyRetries.get(workspaceId) ?? 0) + 1;
+                    if (attempts <= WORKSPACE_WRITER_BUSY_MAX_RETRIES) {
+                      workspaceWriterBusyRetries.set(workspaceId, attempts);
+                      const delayMs = Math.min(2_000, 1_000 + attempts * 250);
+                      console.warn(`[urdira] workspace scan deferred for ${workspaceId}: workspace writer busy (attempt ${attempts}/${WORKSPACE_WRITER_BUSY_MAX_RETRIES}); retrying in ${delayMs}ms`);
+                      setTimeout(() => scheduleWorkspaceScan(workspaceId, requestedUris, authoritativeDeletes, "indexing"), delayMs);
+                      return undefined;
+                    }
+                    // The lease has stayed contended across every retry --
+                    // no longer treated as a normal race. Clear the counter
+                    // and fall through to the terminal failure handling
+                    // below so this is at least diagnosable (recorded
+                    // `last_scan_error`, workspace re-pinned to degraded).
+                    workspaceWriterBusyRetries.delete(workspaceId);
+                    console.error(`[urdira] workspace scan giving up for ${workspaceId} after ${attempts} workspace-writer-busy retries`);
+                  } else {
+                    workspaceWriterBusyRetries.delete(workspaceId);
+                  }
                   // A first-ever scan failure leaves the workspace "indexing" with
                   // no visible failure state, so the error must at least reach
                   // stderr or the failure is completely undiagnosable.
@@ -2009,12 +2145,14 @@ export class DaemonRuntime {
                   if (priorSnapshotId !== undefined) {
                     try { registry.markReady(workspaceId, priorSnapshotId, "degraded"); } catch { /* superseded by a concurrent scan or lifecycle change */ }
                   }
+                  notifyReadinessChanged(workspaceId);
                 } finally {
                   if (database) await database.close().catch(() => undefined);
                 }
                 return undefined;
               } finally {
                 scanInFlight.delete(workspaceId);
+                notifyReadinessChanged(workspaceId);
                 activeAuthoritativeDeletePhases.delete(workspaceId);
                 // Run exactly one coalesced follow-up scan for every hint that
                 // arrived while this scan was in flight, instead of dropping
@@ -2060,6 +2198,7 @@ export class DaemonRuntime {
           // stopping): the workspace stays "indexing"; a future
           // reconciliation attempt (watcher event or `workspace add`) retries.
           scanInFlight.delete(workspaceId);
+          notifyReadinessChanged(workspaceId);
           activeAuthoritativeDeletePhases.delete(workspaceId);
           scanActivities.delete(workspaceId);
         }
@@ -2078,6 +2217,7 @@ export class DaemonRuntime {
       const lexicalMaintenancePending = new Set<string>();
       const submitLexicalMaintenance = (workspaceId: string): void => {
         if (options.lexical_index === false) return;
+        if (options.lexical_owned_by_rust === true) return;
         const durableStorage = indexingStorage;
         if (!durableStorage) return;
         if (lexicalMaintenanceInFlight.has(workspaceId)) { lexicalMaintenancePending.add(workspaceId); return; }
@@ -2405,7 +2545,8 @@ export class DaemonRuntime {
               }
             }
           }
-          const engine = (await acquireWorkspaceQueryEngine(workspaceId, registry, storage, cache, queryEngines, recordBodyInterner, warmRecordsLru, semanticProvider, queryUsesSourceBinding(request.payload))).engine;
+          const cachedQuery = await acquireWorkspaceQueryEngine(workspaceId, registry, storage, cache, queryEngines, recordBodyInterner, warmRecordsLru, semanticProvider, queryUsesSourceBinding(request.payload));
+          const engine = cachedQuery.engine;
           // A cold `core:query`/`core:query_continue` can itself trigger a
           // full `records()` load (see `acquireWorkspaceQueryEngine`'s own
           // doc comment) exactly like an explicit warm -- re-checking the
@@ -2418,6 +2559,7 @@ export class DaemonRuntime {
             const hydrationStartedAt = Date.now();
             try {
               const page = attachIndexFreshness(await engine.execute(queryRequest, context.signal), registry.get(workspaceId));
+              if (cachedQuery.operation_telemetry !== undefined) emitTiming("operation_metrics", `operation_metrics=${JSON.stringify(cachedQuery.operation_telemetry.snapshot())}`);
               emitTiming("hydration", `hydration_ms=${Math.max(0, Date.now() - hydrationStartedAt)}`);
               emitTiming("execution", `execution_ms=${Math.max(0, Date.now() - executionStartedAt)}`);
               return page;
@@ -2875,6 +3017,15 @@ export class DaemonRuntime {
   status(): DaemonStatus { return { state: this.state, pid: process.pid, engine_build_id: this.options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: daemonRpcCapabilities(this.options.workspace_registry !== undefined), endpoint: this.endpoint, active_jobs: this.scheduler.activeCount, restart_leases: this.scheduler.restartLeaseCount }; }
   byteTelemetrySnapshot(): Readonly<Record<string, unknown>> {
     return this.indexingStorage?.byteTelemetry.snapshot() ?? {};
+  }
+  /** Internal diagnostic snapshot; never exposed by MCP or query responses. */
+  queryOperationTelemetrySnapshot(): Readonly<Record<string, readonly QueryOperationTelemetrySummary[]>> {
+    return Object.fromEntries(
+      [...(this.queryEnginesForTest?.entries() ?? [])]
+        .filter((entry): entry is [string, CachedWorkspaceQueryEngine & { readonly operation_telemetry: QueryOperationTelemetry }] => entry[1].operation_telemetry !== undefined)
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+        .map(([workspaceId, cached]) => [workspaceId, cached.operation_telemetry.snapshot()]),
+    );
   }
   async stop(options: { readonly force?: boolean } = {}): Promise<void> {
     if (this.state === "stopping") return;

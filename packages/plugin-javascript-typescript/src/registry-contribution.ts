@@ -24,6 +24,7 @@ export const JAVASCRIPT_TYPESCRIPT_RECORD_KINDS = Object.freeze([
   "jsts:entity_variable",
   "jsts:entity_parameter",
   "jsts:entity_container",
+  "jsts:entity_inferred_type",
   "jsts:relation_contains",
   "jsts:relation_call",
   "jsts:relation_import",
@@ -32,6 +33,7 @@ export const JAVASCRIPT_TYPESCRIPT_RECORD_KINDS = Object.freeze([
   "jsts:relation_covers",
   "jsts:relation_inherits",
   "jsts:relation_implements",
+  "jsts:relation_type_of",
   "jsts:diagnostic",
 ] as const);
 
@@ -155,6 +157,7 @@ const relationFacets = ["core:structural_relation", "core:reference_relation", "
 export interface JavascriptTypescriptContributionInput {
   readonly digests: PluginDigestAuthority;
   readonly runtime_behavior_digest: string;
+  readonly runtime_contract_version?: 1 | 2;
 }
 
 export function createJavascriptTypescriptRegistryContribution(input: JavascriptTypescriptContributionInput): PluginRegistryContribution {
@@ -173,7 +176,7 @@ export function createJavascriptTypescriptRegistryContribution(input: Javascript
       definition_revision: 1,
       schema_version: 1,
       component_version: JAVASCRIPT_TYPESCRIPT_VERSION,
-      component_contracts: [{ component_kind: "projection_generator" as const, contract_version: "1" }],
+      component_contracts: [{ component_kind: "projection_generator" as const, contract_version: String(input.runtime_contract_version ?? 1) }],
       description: "Deterministic JavaScript and TypeScript semantic-preparation projection generator.",
       behavior_digest: input.runtime_behavior_digest,
       plugin_owner: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
@@ -201,6 +204,7 @@ export function createJavascriptTypescriptRegistryContribution(input: Javascript
       recordKind("jsts:entity_variable", "entity", "core:value", "jsts:entity_payload", entityFacets),
       recordKind("jsts:entity_parameter", "entity", "core:parameter", "jsts:entity_payload", entityFacets),
       recordKind("jsts:entity_container", "entity", "core:container", "jsts:entity_payload", entityFacets),
+      recordKind("jsts:entity_inferred_type", "entity", "core:type", "jsts:entity_payload", []),
       recordKind("jsts:relation_contains", "relation", "core:contains", "jsts:relation_payload", relationFacets),
       recordKind("jsts:relation_call", "relation", "core:call", "jsts:relation_payload", relationFacets),
       recordKind("jsts:relation_import", "relation", "core:import", "jsts:relation_payload", relationFacets),
@@ -209,6 +213,7 @@ export function createJavascriptTypescriptRegistryContribution(input: Javascript
       recordKind("jsts:relation_covers", "relation", "core:covers", "jsts:relation_payload", relationFacets),
       recordKind("jsts:relation_inherits", "relation", "core:inherits", "jsts:relation_payload", relationFacets),
       recordKind("jsts:relation_implements", "relation", "core:implements", "jsts:relation_payload", relationFacets),
+      recordKind("jsts:relation_type_of", "relation", "core:type_of", "jsts:relation_payload", relationFacets),
       recordKind("jsts:diagnostic", "diagnostic", "core:construct", "jsts:diagnostic_payload", []),
     ],
     facet_definitions: [],
@@ -244,16 +249,37 @@ export interface JavascriptTypescriptPackageAsset {
   readonly role: "parser" | "rule" | "dependency" | "model";
 }
 
+export interface JavascriptTypescriptNativeRuntimeInput {
+  readonly runtime_target_id: string;
+  readonly runtime_component_build_id: string;
+  readonly addon: { readonly normalized_relative_path: string; readonly bytes: Uint8Array };
+  readonly worker: { readonly normalized_relative_path: string; readonly bytes: Uint8Array };
+}
+
 export function createJavascriptTypescriptInstalledBundle(input: {
   readonly digests: PluginDigestAuthority;
   readonly package_locator: string;
-  readonly target_triple: string;
+  /** Legacy v1 target coordinate. Required when native_runtime is absent. */
+  readonly target_triple?: string;
   readonly assets: readonly JavascriptTypescriptPackageAsset[];
+  readonly native_runtime?: JavascriptTypescriptNativeRuntimeInput;
 }): InstalledPluginBundle {
-  if (input.assets.length === 0 || !input.assets.some((asset) => asset.executable)) throw new TypeError("The production JavaScript/TypeScript bundle requires an executable analyzer asset.");
-  const packageFiles = input.assets.map((asset) => ({ normalized_relative_path: asset.normalized_relative_path, content_digest: sha256Bytes(asset.bytes), byte_length: asset.bytes.byteLength, executable: asset.executable }));
+  const native = input.native_runtime;
+  if (native === undefined && (input.target_triple === undefined || input.assets.length === 0 || !input.assets.some((asset) => asset.executable))) throw new TypeError("The v1 JavaScript/TypeScript bundle requires a target and executable analyzer asset.");
+  if (native !== undefined && (input.target_triple !== undefined || !/^sha256:[0-9a-f]{64}$/u.test(native.runtime_component_build_id) || native.addon.bytes.byteLength === 0 || native.worker.bytes.byteLength === 0 || native.addon.normalized_relative_path === native.worker.normalized_relative_path)) {
+    throw new TypeError("The native JavaScript/TypeScript bundle requires one exact target closure and build identity.");
+  }
+  const nativeAssets = native === undefined ? [] : [
+    { normalized_relative_path: native.addon.normalized_relative_path, bytes: native.addon.bytes, executable: false },
+    { normalized_relative_path: native.worker.normalized_relative_path, bytes: native.worker.bytes, executable: true },
+  ];
+  const allAssets = [...input.assets, ...nativeAssets];
+  if (new Set(allAssets.map((asset) => asset.normalized_relative_path)).size !== allAssets.length) throw new TypeError("The JavaScript/TypeScript bundle asset paths must be unique.");
+  const packageFiles = allAssets.map((asset) => ({ normalized_relative_path: asset.normalized_relative_path, content_digest: sha256Bytes(asset.bytes), byte_length: asset.bytes.byteLength, executable: asset.executable }));
   const executableDigests = packageFiles.filter((entry) => entry.executable).map((entry) => entry.content_digest);
   const roleDigests = (role: JavascriptTypescriptPackageAsset["role"]): string[] => input.assets.flatMap((asset, index) => asset.role === role && !asset.executable ? [packageFiles[index]!.content_digest] : []);
+  const addonDigest = native === undefined ? undefined : sha256Bytes(native.addon.bytes);
+  const workerDigest = native === undefined ? undefined : sha256Bytes(native.worker.bytes);
   const manifest = { package_format_id: "core:plugin", package_format_version: 1, plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, plugin_version: JAVASCRIPT_TYPESCRIPT_VERSION, package_files: packageFiles };
   const analyzer = {
     plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
@@ -264,14 +290,14 @@ export function createJavascriptTypescriptInstalledBundle(input: {
     parser_asset_digests: roleDigests("parser"),
     rule_asset_digests: roleDigests("rule"),
     model_asset_digests: roleDigests("model"),
-    dependency_asset_digests: roleDigests("dependency"),
+    dependency_asset_digests: [...roleDigests("dependency"), ...(addonDigest === undefined ? [] : [addonDigest])],
     supported_capabilities: JAVASCRIPT_TYPESCRIPT_CAPABILITIES.map((entry) => entry.capability),
   };
   const behavior = {
     component_id: "jsts:semantic_projection",
     component_version: JAVASCRIPT_TYPESCRIPT_VERSION,
     component_kind: "projection_generator" as const,
-    contract_bindings: [{ component_kind: "projection_generator" as const, contract_version: "1" }],
+    contract_bindings: [{ component_kind: "projection_generator" as const, contract_version: String(native === undefined ? 1 : 2) }],
     configuration_schema_ids: [],
     algorithm_ids: ["jsts:typescript_checker_semantic_preparation"],
     supported_format_ids: ["jsts:plain_text"],
@@ -279,16 +305,28 @@ export function createJavascriptTypescriptInstalledBundle(input: {
     portable_behavior_rules: ["Canonical UTF-8 source order", "No embeddings or ranking"],
   };
   const behaviorDigest = input.digests.runtime_behavior(behavior);
-  const contribution = createJavascriptTypescriptRegistryContribution({ digests: input.digests, runtime_behavior_digest: behaviorDigest });
-  const implementation = {
-    runtime_component_build_id: `jsts:semantic_projection_${input.target_triple.replace(/[^a-zA-Z0-9_]/gu, "_")}`,
+  const runtimeContractVersion = native === undefined ? 1 : 2;
+  const contribution = createJavascriptTypescriptRegistryContribution({ digests: input.digests, runtime_behavior_digest: behaviorDigest, runtime_contract_version: runtimeContractVersion });
+  const implementationBase = {
+    runtime_component_build_id: native?.runtime_component_build_id ?? `jsts:semantic_projection_${input.target_triple!.replace(/[^a-zA-Z0-9_]/gu, "_")}`,
     component_id: behavior.component_id,
     component_version: behavior.component_version,
     behavior_digest: behaviorDigest,
-    target_triple: input.target_triple,
+  };
+  const implementationV1 = native === undefined ? {
+    ...implementationBase,
+    target_triple: input.target_triple!,
     executable_asset_digests: executableDigests,
     native_asset_digests: [],
     dependency_asset_digests: packageFiles.filter((entry) => !entry.executable).map((entry) => entry.content_digest),
+  } : undefined;
+  const implementationV2 = native === undefined ? undefined : {
+    ...implementationBase,
+    runtime_target_id: native.runtime_target_id,
+    entrypoint_asset_digest: workerDigest!,
+    executable_asset_digests: executableDigests,
+    native_asset_digests: [addonDigest!],
+    dependency_asset_digests: packageFiles.filter((entry) => !entry.executable && entry.content_digest !== addonDigest).map((entry) => entry.content_digest),
   };
   const configuration = { configuration_schema_id: "core:bytes", configuration_schema_version: 1, normalized_configuration: new TextEncoder().encode(JSON.stringify({ compiler: TYPESCRIPT_COMPILER_VERSION, deterministic: true })) };
   const compatibilityCore = {
@@ -296,7 +334,7 @@ export function createJavascriptTypescriptInstalledBundle(input: {
     plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
     plugin_version: JAVASCRIPT_TYPESCRIPT_VERSION,
     namespace: JAVASCRIPT_TYPESCRIPT_NAMESPACE,
-    supported_plugin_contract_versions: [1],
+    supported_plugin_contract_versions: [runtimeContractVersion],
     supported_registry_contract_versions: [1],
     dependencies: [],
     offered_capabilities: JAVASCRIPT_TYPESCRIPT_CAPABILITIES.map((entry) => ({ capability: entry.capability, version_requirement: "1.0.0" })),
@@ -304,16 +342,36 @@ export function createJavascriptTypescriptInstalledBundle(input: {
     package_digest: input.digests.plugin_package(manifest),
     analysis_digest: input.digests.analyzer_implementation(analyzer),
   };
+  const implementationDigest = implementationV2 === undefined
+    ? input.digests.runtime_implementation(implementationV1!)
+    : (() => {
+        if (input.digests.runtime_implementation_v2 === undefined) throw new TypeError("The native JavaScript/TypeScript bundle requires the v2 implementation digest authority.");
+        return input.digests.runtime_implementation_v2(implementationV2);
+      })();
+  const packageDigest = compatibilityCore.package_digest;
+  const bindingPayload = implementationV2 === undefined ? undefined : {
+    plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
+    plugin_version: JAVASCRIPT_TYPESCRIPT_VERSION,
+    runtime_target_id: implementationV2.runtime_target_id,
+    runtime_contract_version: runtimeContractVersion,
+    runtime_component_build_id: implementationV2.runtime_component_build_id,
+    implementation_digest: implementationDigest,
+    package_digest: packageDigest,
+    entrypoint_asset_digest: implementationV2.entrypoint_asset_digest,
+  };
+  if (bindingPayload !== undefined && input.digests.runtime_executable_binding === undefined) throw new TypeError("The native JavaScript/TypeScript bundle requires the executable binding digest authority.");
+  const runtimeExecutableBinding = bindingPayload === undefined ? undefined : { ...bindingPayload, binding_digest: input.digests.runtime_executable_binding!(bindingPayload) };
   return Object.freeze({
     package_locator: input.package_locator,
     manifest,
     compatibility: { ...compatibilityCore, declaration_digest: input.digests.compatibility_declaration(compatibilityCore as never) },
     contribution,
-    runtime_builds: [{ runtime_component_build_id: implementation.runtime_component_build_id, schema_version: 1, component_id: implementation.component_id, component_version: implementation.component_version, behavior_digest: behaviorDigest, implementation_digest: input.digests.runtime_implementation(implementation), available_from: JAVASCRIPT_TYPESCRIPT_VERSION, selectable_to: "", removed_at: "" }],
+    runtime_builds: [{ runtime_component_build_id: implementationBase.runtime_component_build_id, schema_version: 1, component_id: implementationBase.component_id, component_version: implementationBase.component_version, behavior_digest: behaviorDigest, implementation_digest: implementationDigest, available_from: JAVASCRIPT_TYPESCRIPT_VERSION, selectable_to: "", removed_at: "" }],
     analyzer_implementation_manifest: analyzer,
     analysis_configuration: configuration,
     runtime_behavior_manifests: [behavior],
-    runtime_implementation_manifests: [implementation],
+    runtime_implementation_manifests: implementationV1 === undefined ? [] : [implementationV1],
+    ...(implementationV2 === undefined ? {} : { runtime_implementation_manifests_v2: [implementationV2], runtime_executable_binding: runtimeExecutableBinding! }),
   });
 }
 

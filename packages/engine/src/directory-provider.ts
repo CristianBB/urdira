@@ -210,6 +210,9 @@ interface Capture {
 export const DEFAULT_WORKSPACE_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false };
 const DEFAULT_INCLUSION: InclusionRules = DEFAULT_WORKSPACE_INCLUSION;
 const DEFAULT_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
+// The walk is metadata/hash I/O bound. Sixteen lanes keep directory
+// enumeration overlapped with the Rust hand-off without creating a second
+// source pipeline or retaining more than the bounded prefetch window.
 const DEFAULT_WALK_CONCURRENCY = 16;
 const BINARY_EXTENSIONS = new Set([".7z", ".avi", ".bin", ".bmp", ".class", ".dll", ".dylib", ".eot", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".mov", ".mp3", ".mp4", ".o", ".pdf", ".png", ".so", ".tar", ".wasm", ".webp", ".woff", ".woff2", ".zip"]);
 
@@ -282,7 +285,7 @@ const BINARY_EXTENSIONS = new Set([".7z", ".avi", ".bin", ".bmp", ".class", ".dl
 // live: fixing only the claim-time release above still wedged a multi-file
 // repro on 4 permanently-starved entries). `BudgetGate` is now strictly
 // FIFO so a queued waiter's position is a guarantee.
-const PREFETCH_CONCURRENCY = 16;
+const PREFETCH_CONCURRENCY = 8;
 const DEFAULT_CATALOG_HANDOFF_BYTES = 64 * 1024 * 1024;
 
 function catalogHandoffBudgetBytes(): number {
@@ -321,6 +324,11 @@ class BudgetGate {
   #used = 0;
   #waiters: { readonly bytes: number; readonly resolve: () => void }[] = [];
   constructor(capacity: number) { this.#capacity = capacity; }
+  tryAcquire(bytes: number): boolean {
+    if (this.#waiters.length > 0 || (this.#used > 0 && this.#used + bytes > this.#capacity)) return false;
+    this.#used += bytes;
+    return true;
+  }
   async acquire(bytes: number): Promise<void> {
     // Fair-queue check: admit immediately ONLY when nobody is already ahead
     // in line AND (nothing else is in flight OR this request fits) --
@@ -595,14 +603,14 @@ export class DirectorySourceProvider implements SourceProvider {
           // boundary cannot authorize an incremental publication. Fall back
           // to the existing complete capture so deletion/rename handling
           // remains authoritative and safe.
-          capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
+          capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key), true);
         }
       } else if (options?.allow_empty_incremental === true) {
         const emptyFingerprint = digestFields([]);
         capture = { files: [], start_fingerprint: emptyFingerprint, end_fingerprint: emptyFingerprint, stable: true };
         incremental = true;
       } else {
-        capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key));
+        capture = await this.#capture(scopes.map((scope) => scope.normalized_scope_key), true);
       }
       if (!capture.stable) throw new SourceProviderOutcomeError("source_changed", "core:source_changed", "retryable", "The source changed during enumeration.");
       if (capture.files.length > budget.max_observations) throw new SourceProviderOutcomeError("resource_exhausted", "core:source_provider_observations_exhausted", "retryable", "The observation budget was exhausted.");
@@ -857,33 +865,33 @@ export class DirectorySourceProvider implements SourceProvider {
     });
   }
 
-  async #capture(scopeKeys: readonly string[]): Promise<Capture> {
-    // The stability proof reads every eligible file's bytes twice (this pass,
-    // then again below) to prove nothing changed between the two passes. The
-    // enumeration response carries only metadata and digests, so retaining a
-    // complete first-pass byte image on `Capture`/`CapturedFile` here would
-    // still be dead memory: nothing downstream of THIS type reads it back.
-    // Bytes ARE retained now, but on a separate, bounded, short-lived path --
-    // `#metadataCache` (cheap has_nul/valid_utf8/byte_length per uri, kept for
-    // the whole scan) plus `#startPrefetch`'s live-budget-gated read-ahead
-    // (actual bytes, budget released the moment `readStream` claims each
-    // file, not when its CAS put durably lands -- see the ownership
-    // contract above `PREFETCH_CONCURRENCY`) -- so this method's own return
-    // type stays
-    // digest-only and the stability proof below is unchanged. See the
-    // `readStream` doc comment for how that hand-off changes the window the
-    // read-time correctness checks prove over.
-    const first = await this.#inventory(scopeKeys, true, false);
+  async #capture(scopeKeys: readonly string[], retainHandoffBytes = false): Promise<Capture> {
+    // The native catalog path retains at most the configured hand-off budget
+    // while computing each digest. Its per-file stat-before/stat-after proof,
+    // followed by readStream's post-CAS boundary check, is sufficient without
+    // reopening every source in a second complete inventory. Public provider
+    // calls keep the stronger legacy double-inventory proof because they do
+    // not have the later CAS boundary.
+    if (retainHandoffBytes) {
+      await this.abortPrefetch();
+      this.#prefetchAborted = false;
+      this.#prefetchGate = new BudgetGate(catalogHandoffBudgetBytes());
+    }
+    let first: Inventory;
+    try {
+      first = await this.#inventory(scopeKeys, true, false, undefined, retainHandoffBytes);
+    } catch (error) {
+      if (retainHandoffBytes) await this.abortPrefetch();
+      throw error;
+    }
     const firstBefore = first.before_fingerprint;
     const firstAfter = first.after_fingerprint;
     const firstStable = first.internally_stable;
-    // On very large repositories a second complete walk is itself long
-    // enough for filesystem ctime/inode observations to race unrelated
-    // repository activity. The first pass already checks each file boundary
-    // around its streamed digest, and readStream repeats that check before
-    // CAS publication; keep the stronger double-walk proof for normal-sized
-    // workspaces without making large workspaces retry forever.
-    if (first.files.length > 8_192) return { files: first.files, start_fingerprint: firstBefore, end_fingerprint: firstAfter, stable: firstStable };
+    if (retainHandoffBytes) {
+      if (!firstStable) await this.abortPrefetch();
+      else await this.#retainCanonicalPrefetchPrefix(first.files);
+      return { files: first.files, start_fingerprint: firstBefore, end_fingerprint: firstAfter, stable: firstStable };
+    }
     // For ordinary workspaces retain the original strong proof: a second
     // complete inventory also supplies the current observation set when a
     // file appears/disappears during reconciliation. Large workspaces take
@@ -935,12 +943,12 @@ export class DirectorySourceProvider implements SourceProvider {
     };
   }
 
-  async #inventory(scopeKeys: readonly string[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<Inventory> {
+  async #inventory(scopeKeys: readonly string[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>, retainHandoffBytes = false): Promise<Inventory> {
     const files: CapturedFile[] = [];
     try {
       for (const scopeKey of [...new Set(scopeKeys)].sort()) {
         const normalizedScope = normalizeWorkspacePath(this.#root, scopeKey);
-        await this.#walk(normalizedScope, files, digestOnly, metadataOnly, knownUris);
+        await this.#walk(normalizedScope, files, digestOnly, metadataOnly, knownUris, retainHandoffBytes);
       }
     } catch (error) {
       return unavailable(error);
@@ -954,12 +962,12 @@ export class DirectorySourceProvider implements SourceProvider {
     };
   }
 
-  async #walk(relativePath: string, files: CapturedFile[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<void> {
+  async #walk(relativePath: string, files: CapturedFile[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>, retainHandoffBytes = false): Promise<void> {
     const absolute = resolve(this.#root, relativePath);
     if (!isWithinRoot(this.#root, absolute)) throw new SourceProviderOutcomeError("failed", "core:source_provider_uri_invalid", "never", "The coverage scope escapes the provider root.");
     const rootStat = await this.#fileSystem.lstat(absolute);
     if (!rootStat.is_directory) {
-      await this.#captureFile(relativePath, absolute, rootStat, files, digestOnly, metadataOnly, knownUris);
+      await this.#captureFile(relativePath, absolute, rootStat, files, digestOnly, metadataOnly, knownUris, retainHandoffBytes);
       return;
     }
     const entries = [...await this.#fileSystem.read_directory(absolute)].sort((left, right) => left.name.localeCompare(right.name));
@@ -989,13 +997,13 @@ export class DirectorySourceProvider implements SourceProvider {
           byte_length: 0,
           media_type: "text/plain",
         }, this.#inclusion, this.#gitignore);
-        if (decision.included) await this.#walk(child, files, digestOnly, metadataOnly, knownUris);
+        if (decision.included) await this.#walk(child, files, digestOnly, metadataOnly, knownUris, retainHandoffBytes);
       }
-      else await this.#captureFile(child, childPath, childStat, files, digestOnly, metadataOnly, knownUris);
+      else await this.#captureFile(child, childPath, childStat, files, digestOnly, metadataOnly, knownUris, retainHandoffBytes);
     });
   }
 
-  async #captureFile(uri: string, path: string, initial: DirectoryFileStat, files: CapturedFile[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>): Promise<boolean> {
+  async #captureFile(uri: string, path: string, initial: DirectoryFileStat, files: CapturedFile[], digestOnly: boolean, metadataOnly = false, knownUris?: ReadonlySet<string>, retainHandoffBytes = false): Promise<boolean> {
     if (initial.is_directory || initial.is_special) return false;
     const before = await this.#inspectBoundary(uri, path);
     if (metadataOnly) {
@@ -1008,10 +1016,29 @@ export class DirectorySourceProvider implements SourceProvider {
       return after.included;
     }
     if (!before.included) return false;
-    const digest = await this.#digestFile(before.target_path);
+    const gate = this.#prefetchGate;
+    const retainBytes = retainHandoffBytes && before.target_stat.size <= catalogHandoffBudgetBytes() && gate?.tryAcquire(before.target_stat.size) === true;
+    let digest: { readonly content_hash: string; readonly byte_length: number; readonly has_nul: boolean; readonly valid_utf8: boolean; readonly retained_bytes?: Uint8Array };
+    try {
+      digest = await this.#digestFile(before.target_path, retainBytes);
+    } catch (error) {
+      if (retainBytes) gate?.release(before.target_stat.size);
+      throw error;
+    }
     const mediaBytes = digest.has_nul || !digest.valid_utf8 ? Uint8Array.of(0) : new Uint8Array();
-    if (!this.#included(uri, before, mediaBytes)) return false;
+    if (!this.#included(uri, before, mediaBytes)) {
+      if (digest.retained_bytes !== undefined) gate?.release(before.target_stat.size);
+      return false;
+    }
     const after = await this.#inspectBoundary(uri, path, mediaBytes);
+    const stable = after.included && before.token === after.token;
+    if (digest.retained_bytes !== undefined) {
+      if (stable) {
+        this.#prefetchPromises.set(uri, Promise.resolve({ bytes: digest.retained_bytes, byte_length: digest.byte_length, reserved_bytes: before.target_stat.size }));
+      } else {
+        gate?.release(before.target_stat.size);
+      }
+    }
     // Retained for the whole scan (see `#metadataCache`'s doc comment): a
     // later `readStream` prefetch hit reuses `has_nul`/`valid_utf8`/
     // `byte_length` instead of re-deriving them from a second read, and
@@ -1030,7 +1057,7 @@ export class DirectorySourceProvider implements SourceProvider {
       token_before: versionToken,
       token_after: after.included ? contentVersionToken(after.token, digest.content_hash) : `ineligible:${after.token}`,
     });
-    return after.included && before.token === after.token;
+    return stable;
   }
 
   /**
@@ -1051,17 +1078,22 @@ export class DirectorySourceProvider implements SourceProvider {
     const budget = catalogHandoffBudgetBytes();
     if (budget <= 0 || files.length === 0) return;
     this.#prefetchAborted = false;
-    const gate = new BudgetGate(budget);
+    const gate = this.#prefetchGate ?? new BudgetGate(budget);
     this.#prefetchGate = gate;
+    const lanes = new BudgetGate(PREFETCH_CONCURRENCY);
     const fileSystem = this.#fileSystem;
     const eligible = files.filter((file) => {
       const meta = this.#metadataCache.get(file.uri);
       // A lone file bigger than the entire budget can never be admitted
       // (`BudgetGate.acquire` would otherwise wait forever once something
       // else is in flight); leave it to the unchanged fallback path.
-      return meta !== undefined && meta.byte_length <= budget;
+      return meta !== undefined && meta.byte_length <= budget && !this.#prefetchPromises.has(file.uri);
     });
-    void mapWithConcurrency(eligible, PREFETCH_CONCURRENCY, async (file) => {
+    // Register every promise before returning. Registration must not be lazy:
+    // readStream can otherwise miss an entry, take the fallback path, and
+    // leave a later prefetch for that same uri holding byte budget forever.
+    // The lane gate still limits actual reads to PREFETCH_CONCURRENCY.
+    for (const file of eligible) {
       const meta = this.#metadataCache.get(file.uri)!;
       const promise = (async (): Promise<PrefetchedContent | undefined> => {
         // Checked both before AND after `acquire`: a worker that was already
@@ -1070,8 +1102,10 @@ export class DirectorySourceProvider implements SourceProvider {
         // instead of reading -- so the drain never waits on a read that
         // no longer has a consumer.
         if (this.#prefetchAborted) return undefined;
+        await lanes.acquire(1);
+        if (this.#prefetchAborted) { lanes.release(1); return undefined; }
         await gate.acquire(meta.byte_length);
-        if (this.#prefetchAborted) { gate.release(meta.byte_length); return undefined; }
+        if (this.#prefetchAborted) { gate.release(meta.byte_length); lanes.release(1); return undefined; }
         // On any failure below, this worker owns the acquired budget and
         // must release it itself here. A successful result instead hands
         // budget ownership to whichever `readStream` call claims this entry
@@ -1096,11 +1130,34 @@ export class DirectorySourceProvider implements SourceProvider {
         } catch {
           gate.release(meta.byte_length);
           return undefined;
+        } finally {
+          lanes.release(1);
         }
       })();
       this.#prefetchPromises.set(file.uri, promise);
-      await promise;
-    }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Concurrent digest completion can retain a later uri before an earlier
+   * one. Keeping such holes would let later, unclaimed bytes fill the gate
+   * while an earlier read waits for budget. Retain only the contiguous
+   * canonical prefix; released entries are safely eligible for the eager
+   * promise registration in #startPrefetch.
+   */
+  async #retainCanonicalPrefetchPrefix(files: readonly CapturedFile[]): Promise<void> {
+    const gate = this.#prefetchGate;
+    if (gate === undefined) return;
+    let prefix = true;
+    for (const file of files) {
+      const promise = this.#prefetchPromises.get(file.uri);
+      if (prefix && promise !== undefined) continue;
+      prefix = false;
+      if (promise === undefined) continue;
+      this.#prefetchPromises.delete(file.uri);
+      const content = await promise;
+      if (content !== undefined) gate.release(content.reserved_bytes);
+    }
   }
 
   /**
@@ -1137,7 +1194,7 @@ export class DirectorySourceProvider implements SourceProvider {
     }
   }
 
-  async #digestFile(path: string): Promise<{ readonly content_hash: string; readonly byte_length: number; readonly has_nul: boolean; readonly valid_utf8: boolean }> {
+  async #digestFile(path: string, retainBytes = false): Promise<{ readonly content_hash: string; readonly byte_length: number; readonly has_nul: boolean; readonly valid_utf8: boolean; readonly retained_bytes?: Uint8Array }> {
     const stream = this.#fileSystem.read_file_stream?.(path);
     if (stream !== undefined) {
       const hash = createHash("sha256");
@@ -1145,9 +1202,11 @@ export class DirectorySourceProvider implements SourceProvider {
       let byteLength = 0;
       let hasNul = false;
       let validUtf8 = true;
+      const retainedChunks: Uint8Array[] | undefined = retainBytes ? [] : undefined;
       for await (const chunk of stream) {
         if (!(chunk instanceof Uint8Array)) throw new SourceProviderOutcomeError("failed", "core:source_provider_read_invalid", "never", "The source stream yielded a non-byte chunk.");
         hash.update(chunk);
+        retainedChunks?.push(new Uint8Array(chunk));
         byteLength += chunk.byteLength;
         hasNul ||= chunk.some((byte) => byte === 0);
         if (validUtf8) {
@@ -1155,13 +1214,13 @@ export class DirectorySourceProvider implements SourceProvider {
         }
       }
       if (validUtf8) { try { decoder.decode(); } catch { validUtf8 = false; } }
-      return { content_hash: `sha256:${hash.digest("hex")}`, byte_length: byteLength, has_nul: hasNul, valid_utf8: validUtf8 };
+      return { content_hash: `sha256:${hash.digest("hex")}`, byte_length: byteLength, has_nul: hasNul, valid_utf8: validUtf8, ...(retainedChunks === undefined ? {} : { retained_bytes: byteLength === 0 ? new Uint8Array() : concatChunks(retainedChunks, byteLength) }) };
     }
     // Test-only file systems may implement only read_file. Keep their
     // contract working without making the native Node provider pay this
     // aggregate allocation.
     const bytes = await this.#fileSystem.read_file(path);
-    return { content_hash: rawDigest(bytes), byte_length: bytes.byteLength, has_nul: bytes.some((byte) => byte === 0), valid_utf8: (() => { try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); return true; } catch { return false; } })() };
+    return { content_hash: rawDigest(bytes), byte_length: bytes.byteLength, has_nul: bytes.some((byte) => byte === 0), valid_utf8: (() => { try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); return true; } catch { return false; } })(), ...(retainBytes ? { retained_bytes: bytes } : {}) };
   }
 
   async #inspectBoundary(uri: string, path: string, bytes?: Uint8Array): Promise<FileBoundary> {

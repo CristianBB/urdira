@@ -1,4 +1,4 @@
-import type { JsonValue, PluginCompatibilityIssue, PluginResolutionLock, ResolvedPlugin } from "@urdira/contracts";
+import { validatePluginRuntimeExecutableBindingValue, type JsonValue, type PluginCompatibilityIssue, type PluginResolutionLock, type PluginRuntimeExecutableBinding, type ResolvedPlugin } from "@urdira/contracts";
 import { canonicalJson, deepFreeze, hasExactKeys } from "./canonical.js";
 import type { PluginDigestAuthority, PluginResolutionLockDigestInput } from "./digest-authority.js";
 import { compareUtf8Bytes } from "./ordering.js";
@@ -121,7 +121,8 @@ function requirementsIntersect(left: StructuredVersionRequirement, right: Struct
   }));
 }
 function compatibleBuilds(candidate: DiscoveredPluginPackage, contract: number) {
-  return candidate.runtime_builds.filter((build) => candidate.contribution.runtime_component_definitions.some((definition) =>
+  if (candidate.runtime_executable_binding !== undefined && candidate.runtime_executable_binding.runtime_contract_version !== contract) return [];
+  return candidate.runtime_builds.filter((build) => (candidate.runtime_executable_binding === undefined || build.runtime_component_build_id === candidate.runtime_executable_binding.runtime_component_build_id) && candidate.contribution.runtime_component_definitions.some((definition) =>
     definition.component_id === build.component_id && definition.component_version === build.component_version && definition.component_contracts.some((binding) => Number(binding.contract_version) === contract),
   )).sort((left, right) => compareUtf8Bytes(left.runtime_component_build_id, right.runtime_component_build_id));
 }
@@ -198,6 +199,7 @@ const RESOLVED_PLUGIN_KEYS = [
   "plugin_id", "plugin_version", "namespace", "package_digest", "declaration_digest", "contribution_digest", "analysis_digest",
   "analysis_configuration_digest", "plugin_contract_version", "registry_contract_version", "resolved_dependency_plugin_ids", "effective_capabilities",
 ] as const;
+const RESOLVED_PLUGIN_OPTIONAL_KEYS = ["runtime_executable_binding"] as const;
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const NAMESPACED = /^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*$/u;
 const NAMESPACE = /^[a-z][a-z0-9_]*$/u;
@@ -222,7 +224,7 @@ function materializeStringArray(value: unknown): string[] | undefined {
 }
 
 function materializeResolvedPlugin(value: unknown): ResolvedPlugin | undefined {
-  if (!hasExactKeys(value, RESOLVED_PLUGIN_KEYS)) return undefined;
+  if (!hasExactKeys(value, RESOLVED_PLUGIN_KEYS, RESOLVED_PLUGIN_OPTIONAL_KEYS)) return undefined;
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return undefined;
   const pluginId = value["plugin_id"];
@@ -237,6 +239,10 @@ function materializeResolvedPlugin(value: unknown): ResolvedPlugin | undefined {
   const registryContractVersion = value["registry_contract_version"];
   const dependencyIds = materializeStringArray(value["resolved_dependency_plugin_ids"]);
   const capabilities = materializeStringArray(value["effective_capabilities"]);
+  let runtimeExecutableBinding: PluginRuntimeExecutableBinding | undefined;
+  if (value["runtime_executable_binding"] !== undefined) {
+    try { runtimeExecutableBinding = validatePluginRuntimeExecutableBindingValue(value["runtime_executable_binding"]); } catch { return undefined; }
+  }
   if (typeof pluginId !== "string" || !NAMESPACED.test(pluginId) || !validSemVer(pluginVersion) || typeof namespace !== "string" || !NAMESPACE.test(namespace) || namespace === "core" ||
       typeof packageDigest !== "string" || !DIGEST.test(packageDigest) || typeof declarationDigest !== "string" || !DIGEST.test(declarationDigest) ||
       typeof contributionDigest !== "string" || !DIGEST.test(contributionDigest) || typeof analysisDigest !== "string" || !DIGEST.test(analysisDigest) ||
@@ -246,7 +252,8 @@ function materializeResolvedPlugin(value: unknown): ResolvedPlugin | undefined {
   return { plugin_id: pluginId, plugin_version: pluginVersion, namespace, package_digest: packageDigest, declaration_digest: declarationDigest,
     contribution_digest: contributionDigest, analysis_digest: analysisDigest, analysis_configuration_digest: analysisConfigurationDigest,
     plugin_contract_version: pluginContractVersion, registry_contract_version: registryContractVersion,
-    resolved_dependency_plugin_ids: dependencyIds, effective_capabilities: capabilities };
+    resolved_dependency_plugin_ids: dependencyIds, effective_capabilities: capabilities,
+    ...(runtimeExecutableBinding === undefined ? {} : { runtime_executable_binding: runtimeExecutableBinding }) };
 }
 
 function materializeExistingLock(value: unknown): SdkPluginResolutionLock | undefined {
@@ -286,6 +293,15 @@ function lockDigest(digests: PluginDigestAuthority, value: PluginResolutionLockD
     const digest = digests.resolution_lock(value);
     return /^sha256:[0-9a-f]{64}$/u.test(digest) ? digest : undefined;
   } catch { return undefined; }
+}
+
+function validExecutableBinding(digests: PluginDigestAuthority, value: PluginRuntimeExecutableBinding): boolean {
+  try {
+    validatePluginRuntimeExecutableBindingValue(value);
+    if (digests.runtime_executable_binding === undefined) return false;
+    const { binding_digest: _digest, ...payload } = value;
+    return digests.runtime_executable_binding(payload) === value.binding_digest;
+  } catch { return false; }
 }
 
 /**
@@ -342,6 +358,8 @@ function preserveExistingLock(input: PluginResolutionInput, digests: PluginDiges
         !item.compatibility.supported_plugin_contract_versions.includes(contractNumber(locked.plugin_contract_version) ?? -1) ||
         !item.compatibility.supported_registry_contract_versions.includes(contractNumber(locked.registry_contract_version) ?? -1) ||
         item.contribution.registry_contract_version !== locked.registry_contract_version ||
+        canonicalJson(item.runtime_executable_binding ?? null) !== canonicalJson(locked.runtime_executable_binding ?? null) ||
+        (locked.runtime_executable_binding !== undefined && !validExecutableBinding(digests, locked.runtime_executable_binding)) ||
         canonicalJson([...item.compatibility.dependencies.map((dependency) => dependency.plugin_id)].sort(compareUtf8Bytes)) !== canonicalJson([...locked.resolved_dependency_plugin_ids].sort(compareUtf8Bytes)) ||
         canonicalJson([...item.compatibility.offered_capabilities.map((capability) => capability.capability)].sort(compareUtf8Bytes)) !== canonicalJson([...locked.effective_capabilities].sort(compareUtf8Bytes))) return { kind: "stale" };
     packages.push(item);
@@ -368,6 +386,11 @@ export class PluginResolver {
   constructor(private readonly digests: PluginDigestAuthority) {}
 
   resolve(input: PluginResolutionInput): PluginResolutionResult {
+    const invalidBindingPackage = input.packages.find((candidate) => candidate.runtime_executable_binding !== undefined &&
+      (!validExecutableBinding(this.digests, candidate.runtime_executable_binding) || candidate.runtime_executable_binding.plugin_id !== candidate.plugin_id ||
+       candidate.runtime_executable_binding.plugin_version !== candidate.plugin_version || candidate.runtime_executable_binding.package_digest !== candidate.package_digest ||
+       !candidate.runtime_builds.some((build) => build.runtime_component_build_id === candidate.runtime_executable_binding!.runtime_component_build_id && build.implementation_digest === candidate.runtime_executable_binding!.implementation_digest)));
+    if (invalidBindingPackage !== undefined) return deepFreeze({ ok: false, issues: [compatibilityIssue(input, { code: "PLUGIN_VERSION_CONFLICT", plugin_ids: [invalidBindingPackage.plugin_id], payload: { runtime_executable_binding_invalid: true } })] });
     let rawExistingLock: unknown;
     try { rawExistingLock = input.existing_lock; } catch { rawExistingLock = null; }
     const hasExistingLock = rawExistingLock !== undefined;
@@ -397,6 +420,7 @@ export class PluginResolver {
           declaration_digest: item.declaration_digest, contribution_digest: item.contribution_digest, analysis_digest: item.compatibility.analysis_digest,
           analysis_configuration_digest: item.analysis_configuration_digest, plugin_contract_version: `${String(runtimeContract)}.0.0`, registry_contract_version: `${String(registryContract)}.0.0`,
           resolved_dependency_plugin_ids: item.compatibility.dependencies.map((dependency) => dependency.plugin_id).sort(compareUtf8Bytes), effective_capabilities: item.compatibility.offered_capabilities.map((entry) => entry.capability).sort(compareUtf8Bytes),
+          ...(item.runtime_executable_binding === undefined ? {} : { runtime_executable_binding: item.runtime_executable_binding }),
       }));
       const core = { resolution_lock_id: sourceValue(input.id_source), workspace_id: input.workspace_id, resolver_version: input.resolver_version, resolved_plugins };
       const digest = lockDigest(this.digests, lockDigestInput(core));

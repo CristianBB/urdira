@@ -26,7 +26,8 @@ export type SqliteCommand =
   | { readonly kind: "run_batch"; readonly sql: string; readonly rows: number; readonly params_flat: readonly SqliteValue[] }
   | { readonly kind: "get"; readonly sql: string; readonly params?: readonly SqliteValue[] }
   | { readonly kind: "all"; readonly sql: string; readonly params?: readonly SqliteValue[] }
-  | { readonly kind: "staged_fact_delta_batch"; readonly workspace_id: string; readonly candidate_generation_id: string; readonly fact_delta_id: string; readonly accepted_at: string; readonly batch: FactDeltaBatch }
+  | { readonly kind: "staged_fact_delta_batch"; readonly workspace_id: string; readonly candidate_generation_id: string; readonly fact_delta_id: string; readonly accepted_at: string; readonly producer_id?: string; readonly producer_version?: string; readonly owner_artifact_id?: string; readonly owner_artifact_version_id?: string; readonly analysis_digest?: string; readonly analysis_configuration_digest?: string; readonly batch: FactDeltaBatch }
+  | { readonly kind: "staged_fact_delta_group"; readonly workspace_id: string; readonly candidate_generation_id: string; readonly accepted_at: string; readonly entries: readonly { readonly fact_delta_id: string; readonly delta_digest: string; readonly producer_id?: string; readonly producer_version?: string; readonly owner_artifact_id?: string; readonly owner_artifact_version_id?: string; readonly analysis_digest?: string; readonly analysis_configuration_digest?: string; readonly batches: readonly FactDeltaBatch[] }[] }
   | { readonly kind: "transaction_checkpoint" }
   | { readonly kind: "fault"; readonly boundary: string }
   | { readonly kind: "assert_transaction_changes"; readonly expected: number; readonly context?: string };
@@ -195,7 +196,15 @@ const SQLITE_WORKER_SOURCE = String.raw`
     opened.exec("PRAGMA busy_timeout = " + busyTimeout + ";");
     opened.exec("PRAGMA foreign_keys = ON;");
     opened.exec("PRAGMA trusted_schema = OFF;");
-    if (!workerData.readOnly) { opened.exec("PRAGMA journal_mode = WAL;"); opened.exec("PRAGMA synchronous = FULL;"); }
+    if (!workerData.readOnly) {
+      // New workspace databases reclaim transient candidate-staging pages in
+      // bounded background increments after publication. Existing databases
+      // that predate this flag remain valid; SQLite leaves their mode
+      // unchanged until an explicit migration VACUUM.
+      opened.exec("PRAGMA auto_vacuum = INCREMENTAL;");
+      opened.exec("PRAGMA journal_mode = WAL;");
+      opened.exec("PRAGMA synchronous = FULL;");
+    }
     return opened;
   }
 
@@ -401,7 +410,11 @@ const SQLITE_WORKER_SOURCE = String.raw`
     return wrapped;
   }
 
-  const FACT_DELTA_SECTIONS = ["records", "graph_edges", "identities", "dependencies"];
+  // Records and dependencies are the complete accepted authority. Graph-edge
+  // and identity rows are deterministic secondary projections and therefore
+  // remain empty in the current producer contract; retaining the lanes keeps
+  // the v2 shape additive without paying duplicate durable writes.
+  const FACT_DELTA_SECTIONS = ["records", "dependencies"];
   // The bundled SQLite build may expose either the historical 999-variable
   // limit or a newer compile-time limit.  Use the conservative value for
   // generated multi-row statements; single-row statements can still use the
@@ -429,8 +442,10 @@ const SQLITE_WORKER_SOURCE = String.raw`
   const FACT_DELTA_RECEIPT_SQL = "SELECT byte_length, is_final FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ? AND sequence = ?";
   const FACT_DELTA_LATEST_SQL = "SELECT MAX(sequence) AS sequence, MAX(is_final) AS is_final FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?";
   const FACT_DELTA_INSERT_SQL = "INSERT INTO candidate_fact_delta_batches (workspace_id, candidate_generation_id, fact_delta_id, sequence, byte_length, is_final, accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
-  const FACT_DELTA_NAMESPACE_INSERT_SQL = "INSERT INTO candidate_fact_delta_namespaces (workspace_id, candidate_generation_id, fact_delta_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING";
-  const FACT_DELTA_KEY_SQL = "SELECT fact_delta_key FROM candidate_fact_delta_namespaces WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?";
+  const FACT_DELTA_NAMESPACE_INSERT_SQL = "INSERT INTO candidate_fact_delta_namespaces (workspace_id, candidate_generation_id, fact_delta_id, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, analysis_digest, analysis_configuration_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workspace_id, candidate_generation_id, fact_delta_id) DO UPDATE SET producer_id = COALESCE(candidate_fact_delta_namespaces.producer_id, excluded.producer_id), producer_version = COALESCE(candidate_fact_delta_namespaces.producer_version, excluded.producer_version), owner_artifact_id = COALESCE(candidate_fact_delta_namespaces.owner_artifact_id, excluded.owner_artifact_id), owner_artifact_version_id = COALESCE(candidate_fact_delta_namespaces.owner_artifact_version_id, excluded.owner_artifact_version_id), analysis_digest = COALESCE(candidate_fact_delta_namespaces.analysis_digest, excluded.analysis_digest), analysis_configuration_digest = COALESCE(candidate_fact_delta_namespaces.analysis_configuration_digest, excluded.analysis_configuration_digest) WHERE (candidate_fact_delta_namespaces.producer_id IS NULL OR candidate_fact_delta_namespaces.producer_id IS excluded.producer_id) AND (candidate_fact_delta_namespaces.producer_version IS NULL OR candidate_fact_delta_namespaces.producer_version IS excluded.producer_version) AND (candidate_fact_delta_namespaces.owner_artifact_id IS NULL OR candidate_fact_delta_namespaces.owner_artifact_id IS excluded.owner_artifact_id) AND (candidate_fact_delta_namespaces.owner_artifact_version_id IS NULL OR candidate_fact_delta_namespaces.owner_artifact_version_id IS excluded.owner_artifact_version_id) AND (candidate_fact_delta_namespaces.analysis_digest IS NULL OR candidate_fact_delta_namespaces.analysis_digest IS excluded.analysis_digest) AND (candidate_fact_delta_namespaces.analysis_configuration_digest IS NULL OR candidate_fact_delta_namespaces.analysis_configuration_digest IS excluded.analysis_configuration_digest)";
+  const FACT_DELTA_KEY_SQL = "SELECT fact_delta_key, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, analysis_digest, analysis_configuration_digest FROM candidate_fact_delta_namespaces WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?";
+  const FACT_DELTA_ACCEPTED_SQL = "SELECT delta_digest FROM candidate_fact_deltas WHERE workspace_id = ? AND candidate_generation_id = ? AND fact_delta_id = ?";
+  const FACT_DELTA_ACCEPT_SQL = "INSERT INTO candidate_fact_deltas (fact_delta_id, workspace_id, candidate_generation_id, delta_digest, accepted_at) VALUES (?, ?, ?, ?, ?)";
 
   // This is deliberately executed inside the SQLite worker. The parent only
   // validates ownership and transfers the seven arenas per section; it does
@@ -458,12 +473,19 @@ const SQLITE_WORKER_SOURCE = String.raw`
       finalError.code = "storage:fact_delta_sequence_invalid";
       throw finalError;
     }
-    prepareCached(FACT_DELTA_NAMESPACE_INSERT_SQL).run(command.workspace_id, command.candidate_generation_id, command.fact_delta_id);
+    prepareCached(FACT_DELTA_NAMESPACE_INSERT_SQL).run(command.workspace_id, command.candidate_generation_id, command.fact_delta_id, command.producer_id ?? null, command.producer_version ?? null, command.owner_artifact_id ?? null, command.owner_artifact_version_id ?? null, command.analysis_digest ?? null, command.analysis_configuration_digest ?? null);
     const parentDelta = prepareCached(FACT_DELTA_KEY_SQL).get(command.workspace_id, command.candidate_generation_id, command.fact_delta_id);
     if (parentDelta === undefined) {
       const parentError = new Error("A staged FactDelta batch could not allocate its compact namespace.");
       parentError.code = "storage:fact_delta_batch_invalid";
       throw parentError;
+    }
+    for (const field of ["producer_id", "producer_version", "owner_artifact_id", "owner_artifact_version_id", "analysis_digest", "analysis_configuration_digest"]) {
+      if (command[field] !== undefined && parentDelta[field] !== command[field]) {
+        const provenanceError = new Error("FactDelta staging provenance conflicts with its immutable namespace.");
+        provenanceError.code = "storage:fact_delta_conflict";
+        throw provenanceError;
+      }
     }
     const factDeltaKey = Number(parentDelta.fact_delta_key);
     for (const sectionName of FACT_DELTA_SECTIONS) {
@@ -501,12 +523,59 @@ const SQLITE_WORKER_SOURCE = String.raw`
         appendTypedValues(values, section.ordinals, section.ordinal_row_offsets, row, 12, 4);
         appendTypedValues(values, section.enums, section.enum_row_offsets, row, 16, 4);
         appendTypedValues(values, section.presence, section.presence_row_offsets, row, 20, 8);
+        // Full canonical payloads belong to the records/dependencies lane.
+        // The secondary edge/identity lanes retain only their promoted index
+        // fields and proposal key, avoiding two extra copies of every record.
+        if (sectionName === "graph_edges") values[1] = null;
+        if (sectionName === "identities") values[2] = null;
         queue(batch.sequence * FACT_DELTA_ROW_STRIDE + row, values);
       }
       flush();
     }
     prepareCached(FACT_DELTA_INSERT_SQL).run(command.workspace_id, command.candidate_generation_id, command.fact_delta_id, batch.sequence, batch.byte_length, batch.final ? 1 : 0, command.accepted_at);
     return { status: "inserted" };
+  }
+
+  // Physical grouping amortises one BEGIN/COMMIT and one worker round trip
+  // across many logical owner streams. Each owner is still receipt-checked
+  // independently and the entire group rolls back if any identity conflicts.
+  function executeStagedFactDeltaGroup(command) {
+    const statuses = new Array(command.entries.length);
+    for (let entryIndex = 0; entryIndex < command.entries.length; entryIndex += 1) {
+      const entry = command.entries[entryIndex];
+      const accepted = prepareCached(FACT_DELTA_ACCEPTED_SQL).get(command.workspace_id, command.candidate_generation_id, entry.fact_delta_id);
+      if (accepted !== undefined) {
+        if (String(accepted.delta_digest) !== entry.delta_digest) {
+          const conflict = new Error("FactDelta identity conflicts with an already accepted digest.");
+          conflict.code = "storage:fact_delta_conflict";
+          throw conflict;
+        }
+        statuses[entryIndex] = "already_accepted";
+        continue;
+      }
+      for (const batch of entry.batches) executeStagedFactDeltaBatch({
+        workspace_id: command.workspace_id,
+        candidate_generation_id: command.candidate_generation_id,
+        fact_delta_id: entry.fact_delta_id,
+        accepted_at: command.accepted_at,
+        producer_id: entry.producer_id,
+        producer_version: entry.producer_version,
+        owner_artifact_id: entry.owner_artifact_id,
+        owner_artifact_version_id: entry.owner_artifact_version_id,
+        analysis_digest: entry.analysis_digest,
+        analysis_configuration_digest: entry.analysis_configuration_digest,
+        batch,
+      });
+      const latest = prepareCached(FACT_DELTA_LATEST_SQL).get(command.workspace_id, command.candidate_generation_id, entry.fact_delta_id);
+      if (latest === undefined || Number(latest.is_final) !== 1) {
+        const incomplete = new Error("A FactDelta group entry did not finish with a final batch.");
+        incomplete.code = "storage:fact_delta_sequence_invalid";
+        throw incomplete;
+      }
+      prepareCached(FACT_DELTA_ACCEPT_SQL).run(entry.fact_delta_id, command.workspace_id, command.candidate_generation_id, entry.delta_digest, command.accepted_at);
+      statuses[entryIndex] = "inserted";
+    }
+    return statuses;
   }
 
   function candidateStagedRowPlaceholders(columnCount = STAGED_TYPED_COLUMNS.length) {
@@ -521,9 +590,24 @@ const SQLITE_WORKER_SOURCE = String.raw`
   }
 
   function execute(command, sqls, discard) {
-    if (command.kind === "staged_fact_delta_batch") return discard ? null : executeStagedFactDeltaBatch(command);
+    if (command.kind === "staged_fact_delta_batch") {
+      const result = executeStagedFactDeltaBatch(command);
+      return discard ? null : result;
+    }
+    if (command.kind === "staged_fact_delta_group") return executeStagedFactDeltaGroup(command);
     if (command.kind === "exec") {
-      database.exec(resolveSql(command, sqls));
+      const sql = resolveSql(command, sqls);
+      // Changing journal mode while cached prepared statements still own
+      // schema handles can fail with SQLITE_LOCKED. Publication performs
+      // this only outside a transaction, so reopen the worker connection to
+      // finalize every statement deterministically before applying DELETE;
+      // openDatabase restores WAL on the reverse transition.
+      if (/PRAGMA\s+journal_mode\s*=\s*(?:DELETE|WAL)/iu.test(sql)) {
+        statementCache = new Map();
+        database.close();
+        database = openDatabase(workerData.filename);
+      }
+      database.exec(sql);
       return null;
     }
     if (command.kind === "backup") {

@@ -14,6 +14,7 @@ import { GenericSourceIndexer } from "./source-indexer.js";
 import { sourceProviderRequestDigest } from "./source-provider.js";
 import type { RegisteredWorkspace, WorkspaceRegistry } from "./workspaces.js";
 import type { WorkspaceScanPluginProvider } from "./workspace-indexing-session.js";
+import type { RustIndexingCoreGenerationPort } from "./rust-indexing-core-port.js";
 
 /**
  * Workspace fork (docs/decisions/12-workspace-fork.md): when a newly added
@@ -50,6 +51,8 @@ export interface WorkspaceForkOptions {
    * against each donor's stored registry digest as part of donor matching.
    */
   readonly plugin: WorkspaceScanPluginProvider;
+  /** The persistent Rust composition worker used for the target source layer. */
+  readonly indexing_core?: RustIndexingCoreGenerationPort;
   readonly inclusion_rules?: InclusionRules;
   readonly gitignore_rules?: GitIgnoreRules;
   readonly source_provider_binding_id?: string;
@@ -148,6 +151,10 @@ export interface ForkContext {
 }
 
 async function attemptWorkspaceForkInner(options: WorkspaceForkOptions): Promise<WorkspaceForkOutcome> {
+  /* c8 ignore next -- production daemon bypasses the compatibility copier; injected-core coverage belongs to the daemon integration gate. */
+  if (options.indexing_core !== undefined) {
+    return { status: "skipped", reason: "Rust indexing-core owns production structural publication; donor bulk-copy remains compatibility-only." };
+  }
   const context: ForkContext = {
     now: options.now ?? (() => new Date().toISOString()),
     gitObjects: options.git_objects ?? ISOMORPHIC_GIT_OBJECT_PORT,
@@ -339,7 +346,7 @@ async function commitSourceLayerAndPublish(options: WorkspaceForkOptions, contex
 
   const rollbackAndSkip = async (reason: string): Promise<WorkspaceForkOutcome> => {
     console.error(`[urdira] workspace fork for ${workspaceId} (donor ${donor.workspace_id}) failed after its source layer was durably committed; rolling back so the fallback full scan can publish a fresh generation instead of getting permanently stuck: ${reason}`);
-    await rollbackForkPublication(options.database, workspaceId, ids);
+    await rollbackForkPublication(options.database, workspaceId, ids, options.indexing_core);
     return { status: "skipped", reason };
   };
 
@@ -656,8 +663,31 @@ export async function commitForkSourceLayer(options: WorkspaceForkOptions, conte
     for (const batch of batches) yield batch;
   })();
 
-  const sourceIndexResult = await new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, ...(options.io_concurrency === undefined ? {} : { io_concurrency: options.io_concurrency }) });
+  // Rust owns the durable source-layer mutation in production. The generic
+  // indexer still performs deterministic observation planning and CAS
+  // capture, but defers its commit so the composition worker can apply the
+  // complete frontier in one immediate SQLite transaction. The direct
+  // `sourceIndex.commit` branch remains only for fork tests/oracles that do
+  // not inject a Rust writer.
+  const deferredSourceCommits: import("@urdira/storage").SourceIndexCommitInput[] = [];
+  const rustSourceCommit = options.indexing_core?.commit_source_index;
+  const sourceCaptureControl = rustSourceCommit === undefined ? {} : {
+    prepare_content_blobs: async ({ contents, content_streams }: { readonly contents: readonly import("@urdira/storage").SourceIndexContentInput[]; readonly content_streams: readonly import("@urdira/storage").SourceIndexContentStreamInput[] }) => await database.prepareSourceIndexContent({ contents, content_streams }),
+    defer_commit: async (commit: import("@urdira/storage").SourceIndexCommitInput): Promise<void> => { deferredSourceCommits.push(commit); },
+  };
+  const sourceIndexResult = await new GenericSourceIndexer(database).apply({ response: enumerateResponse, read: readObservation, read_stream: readStream, native_batches: nativeBatches, ...(options.io_concurrency === undefined ? {} : { io_concurrency: options.io_concurrency }), ...sourceCaptureControl });
   if (sourceIndexResult.status !== "published" && sourceIndexResult.status !== "equivalent") return undefined;
+
+  /* c8 ignore start -- exercised through the packaged Rust worker integration; unit forks intentionally use the oracle writer. */
+  if (rustSourceCommit !== undefined && deferredSourceCommits.length > 0) {
+    await rustSourceCommit({
+      operation_id: `source-index:${workspaceId}:${sourceIndexResult.observation_batch_id ?? enumeration.observationBatchId}`,
+      workspace_id: workspaceId,
+      database_path: database.database.filename,
+      commits: deferredSourceCommits,
+    });
+  }
+  /* c8 ignore stop */
 
   const occurrences = await database.sourceIndex.currentOccurrences(context.bindingId);
   if (occurrences.length === 0) return undefined;
@@ -1189,9 +1219,20 @@ async function copyDonorAndPublish(options: WorkspaceForkOptions, context: ForkC
  * rollback but no worse than skipping this cleanup step entirely, and must
  * never prevent the fallback full scan from being attempted.
  */
-export async function rollbackForkPublication(target: WorkspaceDatabase, workspaceId: string, ids: ForkPublicationIds): Promise<void> {
+export async function rollbackForkPublication(target: WorkspaceDatabase, workspaceId: string, ids: ForkPublicationIds, indexingCore?: RustIndexingCoreGenerationPort): Promise<void> {
   const { candidateId, materializationId, snapshotId, generationManifestId, generation } = ids;
+  let sourceRolledBackByRust = false;
   try {
+    /* c8 ignore start -- Rust recovery is exercised by the worker integration gate; fork unit tests use the compatibility oracle. */
+    if (indexingCore?.rollback_source_index !== undefined) {
+      try {
+        await indexingCore.rollback_source_index({ operation_id: `source-rollback:${workspaceId}:${generation}`, workspace_id: workspaceId, database_path: target.database.filename });
+        sourceRolledBackByRust = true;
+      } catch (error) {
+        console.error(`[urdira] Rust source rollback for ${workspaceId} failed; falling back to the guarded compatibility cleanup:`, error);
+      }
+    }
+    /* c8 ignore stop */
     await target.database.transaction([
       { kind: "run", sql: "DELETE FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ?", params: [workspaceId, generation] },
       { kind: "run", sql: "DELETE FROM identity_assignments WHERE workspace_id = ? AND valid_from_generation = ?", params: [workspaceId, generation] },
@@ -1217,12 +1258,15 @@ export async function rollbackForkPublication(target: WorkspaceDatabase, workspa
       // snapshot" hazard `attemptWorkspaceForkInner`'s enumerate-before-commit
       // ordering exists to avoid in the first place). Deleted child-tables
       // first to satisfy this schema's foreign keys.
-      { kind: "run", sql: "DELETE FROM artifact_tombstones WHERE workspace_id = ?", params: [workspaceId] },
-      { kind: "run", sql: "DELETE FROM artifact_versions WHERE workspace_id = ?", params: [workspaceId] },
-      { kind: "run", sql: "DELETE FROM source_observations WHERE workspace_id = ?", params: [workspaceId] },
-      { kind: "run", sql: "DELETE FROM source_observation_batches WHERE workspace_id = ?", params: [workspaceId] },
-      { kind: "run", sql: "DELETE FROM source_artifacts WHERE workspace_id = ?", params: [workspaceId] },
-      { kind: "run", sql: "DELETE FROM source_index_state WHERE workspace_id = ?", params: [workspaceId] },
+      /* c8 ignore next -- the compatibility cleanup is retained only for a Rust-worker recovery failure. */
+      ...(!sourceRolledBackByRust ? [
+        { kind: "run" as const, sql: "DELETE FROM artifact_tombstones WHERE workspace_id = ?", params: [workspaceId] },
+        { kind: "run" as const, sql: "DELETE FROM artifact_versions WHERE workspace_id = ?", params: [workspaceId] },
+        { kind: "run" as const, sql: "DELETE FROM source_observations WHERE workspace_id = ?", params: [workspaceId] },
+        { kind: "run" as const, sql: "DELETE FROM source_observation_batches WHERE workspace_id = ?", params: [workspaceId] },
+        { kind: "run" as const, sql: "DELETE FROM source_artifacts WHERE workspace_id = ?", params: [workspaceId] },
+        { kind: "run" as const, sql: "DELETE FROM source_index_state WHERE workspace_id = ?", params: [workspaceId] },
+      ] : []),
     ]);
   } catch (error) {
     console.error(`[urdira] workspace fork rollback for ${workspaceId} failed; the workspace database may retain an unverified generation ${generation}:`, error);

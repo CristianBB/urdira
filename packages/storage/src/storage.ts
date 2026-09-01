@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, readdir, rename, rm } from "node:fs/promises";
+import { access, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalBytes, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
@@ -6,13 +6,14 @@ import type { ModelPackInstallation, Workspace, WorkspaceCurrentState, Snapshot,
 import { BlobStore, CAS_LAYOUT_MARKER_FILENAME, CAS_LAYOUT_VERSION, ContentAddressedStore, writeCasLayoutMarker, type BlobReference } from "./cas.js";
 import { record, resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
-import { CATALOG_SCHEMA, WORKSPACE_SCHEMA, ensureCatalogSchemaCompatibility, ensureWorkspaceSchemaCompatibility, initializeSchema } from "./schema.js";
+import { CATALOG_SCHEMA, ensureCatalogSchemaCompatibility, ensureWorkspaceSchemaCompatibility, initializeSchema } from "./schema.js";
+import { WORKSPACE_V3_SCHEMA } from "./workspace-v3-sql.js";
 import { createWorkspaceRepositories, type WorkspaceRepositories } from "./repositories.js";
 import { openSqliteDatabase, type SqliteCommand, type SqliteDatabase, type SqliteValue } from "./sqlite.js";
 import { noFaults, type FaultBoundary, type FaultInjector } from "./faults.js";
 import { WorkspaceProjectionRepository } from "./projections.js";
 import { StorageMaintenance, WorkspaceLifecycleRepository } from "./lifecycle.js";
-import { WorkspaceSourceIndexRepository, type SourceIndexCommitInput } from "./source-index.js";
+import { WorkspaceSourceIndexRepository, type SourceIndexCommitInput, type SourceIndexContentInput, type SourceIndexContentStreamInput } from "./source-index.js";
 import { WorkspaceCandidateRepository, frozenCandidateBaseTupleDigest, normalizeObservationBatchIds, sameFrozenCandidateBaseTuple, type CandidatePublicationInput, type CandidatePublicationResult } from "./candidates.js";
 import { buildCandidatePublicationPlan, buildCompatibilityPublicationPlan, buildPublicationTransactionCommands, publicationTransactionCommands, type ProjectionSetDigestCorpusEntry, type RecordSetDigestCorpusEntry } from "./publication-authority.js";
 import { WorkspaceProjectionOccurrenceRepository } from "./projection-occurrences.js";
@@ -79,6 +80,8 @@ export class SerializedWriter {
   private readonly background: Array<{ readonly operation: () => Promise<unknown>; readonly resolve: (value: unknown) => void; readonly reject: (error: unknown) => void }> = [];
   private running = false;
 
+  constructor(private readonly lockPath?: string) {}
+
   /**
    * Serializes writes while giving foreground publication/manifest work strict
    * admission priority over background projections. A background transaction
@@ -87,7 +90,22 @@ export class SerializedWriter {
    */
   run<T>(operation: () => Promise<T>, lane: "foreground" | "background" = "foreground"): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const entry = { operation: operation as () => Promise<unknown>, resolve: resolve as (value: unknown) => void, reject };
+      const entry = {
+        operation: (async () => {
+          // Background reclamation is already ordered behind foreground
+          // publication by this writer; it must not add a filesystem-lock
+          // round-trip per cleanup batch or delay the caller's post-commit
+          // staging reclamation.
+          const lock = this.lockPath === undefined || lane === "background" ? undefined : await acquireWorkspaceMutationLock(this.lockPath);
+          try {
+            return await operation();
+          } finally {
+            if (lock !== undefined) await lock.release();
+          }
+        }) as () => Promise<unknown>,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+      };
       (lane === "background" ? this.background : this.foreground).push(entry);
       this.pump();
     });
@@ -102,6 +120,123 @@ export class SerializedWriter {
       this.running = false;
       this.pump();
     });
+  }
+}
+
+interface WorkspaceMutationLock {
+  release(): Promise<void>;
+}
+
+// How long a foreground SQLite mutation waits for the cross-process writer
+// lock before giving up. Detached Rust lexical maintenance
+// (`reconcile_lexical`, `crates/urdira-indexing-core/src/lib.rs`) now
+// releases and reacquires this same lease between bounded ~512-document
+// chunks instead of holding it for one multi-minute transaction (see that
+// function's doc comment), so the lock is never held longer than one
+// chunk's read+hash+FTS-insert work -- empirically a few seconds even for a
+// 14k-document cold corpus, not minutes. 20s keeps a wide safety margin over
+// that per-chunk hold time while still failing fast into a typed, retryable
+// error (`WORKSPACE_WRITER_BUSY_CODE` below) instead of hanging on the raw
+// filesystem `EEXIST`; `packages/daemon/src/runtime.ts` retries that error a
+// bounded number of times with a short delay (see its `WORKSPACE_WRITER_BUSY`
+// handling next to the `core:source_changed` retry).
+const WORKSPACE_WRITER_LOCK_WAIT_MS = 20_000;
+
+/**
+ * Stable error code for a foreground SQLite mutation that could not acquire
+ * the cross-process writer lock within `WORKSPACE_WRITER_LOCK_WAIT_MS`. This
+ * is deliberately NOT registered in `docs/protocol/core-operation-error-codes.md`:
+ * that registry is the closed, externally documented contract for the public
+ * query API's `OperationErrorCodeDefinition` values (see its "Registry
+ * contract" section), while this code never reaches a query client -- it is
+ * an internal daemon scan-scheduling signal consumed only by
+ * `scanFailureErrorCode`/the scan retry path in `packages/daemon/src/runtime.ts`.
+ * The `storage:` prefix and shape otherwise match every other internal code
+ * this module throws (e.g. `storage:schema_migration_failed` above).
+ */
+export const WORKSPACE_WRITER_BUSY_CODE = "storage:workspace_writer_busy";
+
+/**
+ * Cross-process companion to the Rust indexing-core writer lease. The lock is
+ * deliberately acquired only when a queued SQLite mutation starts, so reads
+ * and queue wait do not pay for filesystem coordination. Rust releases the
+ * same marker while the application persists candidate metadata and reacquires
+ * it for final structural publication.
+ */
+async function acquireWorkspaceMutationLock(lockPath: string): Promise<WorkspaceMutationLock> {
+  const deadline = Date.now() + WORKSPACE_WRITER_LOCK_WAIT_MS;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  while (handle === undefined) {
+    try {
+      handle = await open(lockPath, "wx");
+      try {
+        await handle.writeFile(`${process.pid}\n`, "utf8");
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        handle = undefined;
+        await rm(lockPath, { force: true });
+        throw error;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+      if (Date.now() >= deadline) {
+        // The lease is still held by another writer (most commonly detached
+        // lexical maintenance mid-chunk, see the constant doc comment
+        // above). This is a normal, expected race -- not corruption or a
+        // stuck process -- so surface a typed, retryable code instead of the
+        // raw `EEXIST`, and let the caller decide whether/how to retry
+        // rather than throwing an opaque filesystem error up the stack.
+        throw new StorageError(WORKSPACE_WRITER_BUSY_CODE, `Workspace writer lock at ${lockPath} is still held after ${WORKSPACE_WRITER_LOCK_WAIT_MS}ms; the current writer is expected to release it shortly.`, { lock_path: lockPath, waited_ms: Date.now() - (deadline - WORKSPACE_WRITER_LOCK_WAIT_MS) });
+      }
+      // A crashed Rust/Node worker can leave the marker behind. Recover only
+      // when its recorded owner PID is definitely gone; an empty or malformed
+      // marker is treated as live to avoid deleting a lock during creation.
+      const ownerAlive = await workspaceMutationOwnerAlive(lockPath);
+      if (ownerAlive === false) {
+        await rm(lockPath, { force: true });
+        continue;
+      }
+      await new Promise<void>((resolveWait) => setTimeout(resolveWait, 10));
+    }
+  }
+  return {
+    release: async () => {
+      await handle?.close();
+      await rm(lockPath, { force: true });
+    },
+  };
+}
+
+/** Acquire more than one workspace pathname in a stable order for moves. */
+async function acquireWorkspaceMutationLocks(lockPaths: readonly string[]): Promise<WorkspaceMutationLock> {
+  const locks: WorkspaceMutationLock[] = [];
+  let released = false;
+  try {
+    for (const lockPath of [...new Set(lockPaths.map((path) => resolve(path)))].sort()) locks.push(await acquireWorkspaceMutationLock(lockPath));
+  } catch (error) {
+    for (const lock of locks.reverse()) await lock.release().catch(() => undefined);
+    throw error;
+  }
+  return {
+    release: async () => {
+      if (released) return;
+      released = true;
+      for (const lock of [...locks].reverse()) await lock.release();
+    },
+  };
+}
+
+async function workspaceMutationOwnerAlive(lockPath: string): Promise<boolean | undefined> {
+  const ownerText = await readFile(lockPath, "utf8").catch(() => "");
+  const ownerPid = Number.parseInt(ownerText.trim(), 10);
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return undefined;
+  try {
+    process.kill(ownerPid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? false : true;
   }
 }
 
@@ -141,7 +276,7 @@ function workspaceWriter(filename: string): SerializedWriter {
   const key = resolve(filename);
   let writer = workspaceWriters.get(key);
   if (!writer) {
-    writer = new SerializedWriter();
+    writer = new SerializedWriter(`${resolve(filename)}.urdira-writer.lock`);
     workspaceWriters.set(key, writer);
   }
   return writer;
@@ -212,7 +347,10 @@ export class SerializedSqliteDatabase implements SqliteDatabase {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    await this.writer.run(() => this.inner.close());
+    // Closing a handle is not a database mutation and must not wait for a
+    // Rust writer marker held by a sibling worker thread during its final
+    // acknowledgement.
+    await this.writer.run(() => this.inner.close(), "background");
   }
 }
 
@@ -265,13 +403,18 @@ export class InstallationCatalog {
     const existing = await this.getWorkspaceRegistration(workspace.workspace_id);
     if (existing) return await this.resolveWorkspaceRegistration(workspace, absolutePath, existing);
     await mkdir(dirname(absolutePath), { recursive: true });
-    const workspaceDatabase = await openSqliteDatabase({ filename: absolutePath, busy_timeout_ms: this.busyTimeoutMs });
+    // Registration stamps and mutates the workspace database before the
+    // catalog row exists. Use the same marker as the Rust writer so a new
+    // composition generation cannot race schema/identity initialization.
+    const mutationLock = await acquireWorkspaceMutationLock(`${absolutePath}.urdira-writer.lock`);
+    let workspaceDatabase: SqliteDatabase | undefined;
     try {
-      await initializeSchema(workspaceDatabase, WORKSPACE_SCHEMA);
+      workspaceDatabase = await openSqliteDatabase({ filename: absolutePath, busy_timeout_ms: this.busyTimeoutMs });
+      await initializeSchema(workspaceDatabase, WORKSPACE_V3_SCHEMA);
       await ensureWorkspaceSchemaCompatibility(workspaceDatabase);
       await stampIdentityFormat(workspaceDatabase);
     } finally {
-      await workspaceDatabase.close();
+      try { await workspaceDatabase?.close(); } finally { await mutationLock.release(); }
     }
     const inserted = await this.database.run(
       `INSERT INTO installation_workspaces (workspace_id, canonical_root, display_root, status, source_provider_bindings, database_path, registered_at, removed_at)
@@ -410,6 +553,10 @@ export class InstallationCatalog {
     return await this.writer.run(async () => {
       const registration = await this.getWorkspaceRegistration(workspaceId);
       if (!registration) throw new StorageError("storage:workspace_not_found", `Workspace ${workspaceId} is not registered.`);
+      // Purging removes the workspace database and sidecars. Serialize that
+      // destructive mutation with Rust publication/reconciliation.
+      const mutationLock = await acquireWorkspaceMutationLock(`${resolve(registration.database_path)}.urdira-writer.lock`);
+      try {
       if (registration.removed_at === null) throw new StorageError("storage:workspace_lifecycle", `Workspace ${workspaceId} must be removed before it can be purged.`);
       const nowMs = Date.parse(now);
       const removedMs = Date.parse(registration.removed_at);
@@ -430,6 +577,9 @@ export class InstallationCatalog {
       ]);
       forgetWorkspaceDatabase(registration.database_path);
       return { workspace_id: workspaceId, purged: true as const, database_path: registration.database_path };
+      } finally {
+        await mutationLock.release();
+      }
     });
   }
 
@@ -446,6 +596,14 @@ export class InstallationCatalog {
         await this.pruneWorkspaceLeases(relocation.workspace_id);
         const registration = await this.getWorkspaceRegistration(relocation.workspace_id);
         if (!registration) throw new StorageError("storage:relocation_recovery_required", `Workspace ${relocation.workspace_id} relocation has no catalog registration.`);
+        // Recover against the currently catalogued path while holding the
+        // same marker used by Rust. This prevents a restart sweep from
+        // renaming or deleting a database during structural publication.
+        const mutationLock = await acquireWorkspaceMutationLocks([
+          `${resolve(relocation.from_path)}.urdira-writer.lock`,
+          `${resolve(relocation.to_path)}.urdira-writer.lock`,
+        ]);
+        try {
         const fromExists = await pathExists(relocation.from_path);
         const toExists = await pathExists(relocation.to_path);
         if (registration.database_path === relocation.to_path && toExists) {
@@ -469,6 +627,9 @@ export class InstallationCatalog {
           continue;
         }
         throw new StorageError("storage:relocation_recovery_required", `Workspace ${relocation.workspace_id} relocation requires administrator recovery.`);
+        } finally {
+          await mutationLock.release();
+        }
       }
     });
   }
@@ -530,13 +691,21 @@ export class InstallationCatalog {
   private async relocateWorkspaceSerialized(workspaceId: string, databasePath: string): Promise<void> {
     const workspace = await this.getWorkspace(workspaceId);
     if (!workspace) throw new StorageError("storage:workspace_not_found", `Workspace ${workspaceId} is not registered.`);
+    // Relocation changes the workspace database pathname and moves its
+    // SQLite files. Hold the shared writer marker for the old path for the
+    // entire move so Rust cannot publish while the file is being renamed.
+    const destination = resolve(databasePath);
+    await mkdir(dirname(destination), { recursive: true });
+    const mutationLock = await acquireWorkspaceMutationLocks([
+      `${resolve(workspace.database_path)}.urdira-writer.lock`,
+      `${destination}.urdira-writer.lock`,
+    ]);
+    try {
     if (workspaceHasOpenHandles(workspace.database_path)) throw new StorageError("storage:workspace_in_use", `Workspace ${workspaceId} has active database handles and cannot be relocated.`);
     const relocationOwnerId = `relocation:${randomUUID()}`;
     await this.beginWorkspaceRelocation(workspaceId, relocationOwnerId, process.pid);
     try {
-      const destination = resolve(databasePath);
       if (destination === resolve(workspace.database_path)) return;
-      await mkdir(dirname(destination), { recursive: true });
       try {
         await access(destination);
         throw new StorageError("storage:relocation_target_exists", `Workspace relocation target ${destination} already exists.`);
@@ -566,6 +735,9 @@ export class InstallationCatalog {
       }
     } finally {
       await this.endWorkspaceRelocation(workspaceId, relocationOwnerId);
+    }
+    } finally {
+      await mutationLock.release();
     }
   }
 
@@ -750,6 +922,8 @@ export class WorkspaceDatabase {
   readonly workspaceId: string;
   /** Absolute CAS root used by native analyzer workers to re-read immutable source bytes. */
   readonly casRoot: string;
+  /** CAS writer used by the Rust-owned source-ingestion bridge. */
+  readonly blobs: BlobStore;
   private readonly rawDatabase: SqliteDatabase;
   private readonly writer: SerializedWriter;
   private closed = false;
@@ -795,6 +969,7 @@ export class WorkspaceDatabase {
     const releaseLease = typeof rootDirOrReleaseLease === "function" ? rootDirOrReleaseLease : releaseLeaseMaybe ?? (async () => undefined);
     this.workspaceId = workspaceId;
     this.casRoot = join(rootDir, "cas");
+    this.blobs = blobs;
     this.rawDatabase = database;
     this.writer = workspaceWriter(database.filename);
     const serializedDatabase = new SerializedSqliteDatabase(database, this.writer);
@@ -813,6 +988,43 @@ export class WorkspaceDatabase {
 
   private readonly releaseLease: () => Promise<void>;
   private readonly faults: FaultInjector;
+
+  /**
+   * Capture source bytes into CAS without touching workspace SQLite. The
+   * resulting logical content ids are preserved so the Rust publication
+   * transaction can insert the source rows atomically with structural data.
+   */
+  async prepareSourceIndexContent(input: {
+    readonly contents: readonly SourceIndexContentInput[];
+    readonly content_streams: readonly SourceIndexContentStreamInput[];
+  }): Promise<readonly import("@urdira/contracts").ContentBlob[]> {
+    const references: import("@urdira/contracts").ContentBlob[] = [];
+    if (input.contents.length > 0) {
+      const written = await this.blobs.cas.putMany(input.contents.map((content) => ({ bytes: content.bytes, options: { media_type: content.media_type } })));
+      for (let index = 0; index < input.contents.length; index += 1) {
+        const requested = input.contents[index] as SourceIndexContentInput;
+        const actual = written[index] as import("@urdira/contracts").ContentBlob;
+        references.push({ content_blob_id: requested.content_blob_id, content_hash: actual.content_hash, byte_length: actual.byte_length, storage_reference: actual.storage_reference });
+      }
+    }
+    if (input.content_streams.length > 0) {
+      const written = await this.blobs.cas.putStreamsMany(input.content_streams.map((content) => ({
+        chunks: content.stream,
+        options: {
+          content_hash: content.content_hash,
+          byte_length: content.byte_length,
+          media_type: content.media_type,
+          ...(content.after_read === undefined ? {} : { after_read: content.after_read }),
+        },
+      })));
+      for (let index = 0; index < input.content_streams.length; index += 1) {
+        const requested = input.content_streams[index] as SourceIndexContentStreamInput;
+        const actual = written[index] as import("@urdira/contracts").ContentBlob;
+        references.push({ content_blob_id: requested.content_blob_id, content_hash: actual.content_hash, byte_length: actual.byte_length, storage_reference: actual.storage_reference });
+      }
+    }
+    return references;
+  }
 
   async publish(input: PublicationInput): Promise<void> {
     await this.executeSerializedPublicationBuilder(async () => await this.publishCompatibility(input));
@@ -883,6 +1095,27 @@ export class WorkspaceDatabase {
     const expected = input.frozen_base;
     if (expected.tuple_digest !== frozenCandidateBaseTupleDigest(expected)) throw new StorageError("storage:publication_conflict", "The frozen candidate base tuple digest is inconsistent.");
     if (!candidateAgreesWithFrozenBase(input.candidate, expected)) throw new StorageError("storage:publication_conflict", "Candidate identity does not agree with its frozen base tuple.");
+    // Rust may have completed the authoritative publication transaction
+    // before the application reaches this acknowledgement boundary. Handle
+    // that path before the ordinary `ready`/`publishing` state check: Rust
+    // atomically moves candidate_state to `published`, so asking the legacy
+    // TypeScript writer to validate or replay it would reject a valid commit.
+    if (input.rust_publication_completed === true) {
+      const journal = await this.database.get<{ snapshot_id: string; generation_manifest_id: string; generation: number; published_at: string }>(
+        "SELECT snapshot_id, generation_manifest_id, generation, published_at FROM candidate_publication_journal WHERE workspace_id = ? AND candidate_generation_id = ? AND status = 'published'",
+        [this.workspaceId, candidateId],
+      );
+      if (journal === undefined) throw new StorageError("storage:publication_invalid", "Rust reported publication completion without a durable publication journal.");
+      const currentAfterRust = await this.database.get<{ current_snapshot_id: string; current_generation: number }>("SELECT current_snapshot_id, current_generation FROM workspace_current_state WHERE workspace_id = ?", [this.workspaceId]);
+      if (currentAfterRust?.current_snapshot_id !== journal.snapshot_id || currentAfterRust.current_generation !== journal.generation) throw new StorageError("storage:publication_conflict", "Rust publication journal is not the visible workspace current state.");
+      this.scheduleCandidateStagingCleanup(candidateId);
+      return { candidate_generation_id: candidateId, snapshot_id: journal.snapshot_id, generation_manifest_id: journal.generation_manifest_id, generation: journal.generation, published_at: journal.published_at, status: "published" };
+    }
+    // Rust may have completed the authoritative publication transaction before
+    // the application reaches this acknowledgement boundary. Do not compare
+    // its durable journal against the TypeScript placeholder payload here:
+    // the Rust-owned branch below validates the visible current tuple and
+    // returns the journal as the single publication result.
     if (priorPublication) {
       await assertExistingPublicationJournal(this.database, this.workspaceId, input, priorPublication);
       return { ...priorPublication, status: "already_published" };
@@ -963,6 +1196,7 @@ export class WorkspaceDatabase {
       ...(current === undefined ? {} : { current }),
       workspaceId: this.workspaceId,
       database: this.database,
+      stagingDatabase: this.rawDatabase,
       faults: this.faults,
       generation,
       publishedAt,
@@ -1006,12 +1240,27 @@ export class WorkspaceDatabase {
       }
       return generate;
     });
+    const checkpointInitialPublicationWal = async (afterTransaction: boolean): Promise<void> => {
+      try {
+        await this.rawDatabase.get("PRAGMA wal_checkpoint(TRUNCATE)");
+      } catch (checkpointError) {
+        // Checkpointing is maintenance, not part of the authoritative commit.
+        // A lexical reader may pin the WAL, and a post-commit checkpoint must
+        // never turn an already-visible publication into a reported failure.
+        if (afterTransaction) return;
+        if (checkpointError instanceof StorageError && /locked|busy/iu.test(checkpointError.message)) return;
+        throw checkpointError;
+      }
+    };
     try {
+      if (current === undefined) await checkpointInitialPublicationWal(false);
       await timed("publish_sql_transaction", () => this.rawDatabase.transactionChunked(countedPublicationCommands(), undefined, { transfer_params: true, discard_results: true }));
     } catch (error) {
       if (error instanceof StorageError && error.code === "storage:transaction_assertion_failed") throw new StorageError("storage:publication_conflict", "The workspace current tuple changed or the publication generation is not gapless.");
       if (error instanceof StorageError && error.code === "ERR_SQLITE_ERROR" && /UNIQUE|constraint/i.test(error.message)) throw new StorageError("storage:publication_conflict", `An immutable publication uniqueness collision was detected: ${error.message}`);
       throw error;
+    } finally {
+      if (current === undefined) await checkpointInitialPublicationWal(true);
     }
     // `publish_post_commit`: everything after the transaction resolves --
     // commit-hook placement for the warm digest corpora
@@ -1061,15 +1310,39 @@ export class WorkspaceDatabase {
    */
   private scheduleCandidateStagingCleanup(candidateId: string): void {
     const cleanup = (async () => {
+      let publicationStagingCleaned = false;
       while (true) {
         const removed = await this.writer.run(async () => {
+          if (!publicationStagingCleaned) {
+            await this.rawDatabase.transaction([
+              ...[
+                "candidate_publication_record_facets",
+                "candidate_publication_record_closures",
+                "candidate_publication_identity_assignments",
+                "candidate_publication_record_occurrences",
+                "candidate_publication_descriptors",
+                "candidate_publication_projection_value_nodes",
+                "candidate_publication_projection_dependencies",
+                "candidate_publication_projection_occurrences",
+                "candidate_publication_projection_descriptors",
+              ].map((table) => ({ kind: "run" as const, sql: `DELETE FROM ${table} WHERE candidate_generation_id = ?`, params: [candidateId] })),
+            ]);
+            publicationStagingCleaned = true;
+            return true;
+          }
           const batches = await this.rawDatabase.all<{ fact_delta_id: string }>(
             "SELECT fact_delta_id FROM candidate_fact_delta_batches WHERE workspace_id = ? AND candidate_generation_id = ? ORDER BY sequence, fact_delta_id LIMIT 64",
             [this.workspaceId, candidateId],
           );
           if (batches.length === 0) {
             await this.rawDatabase.run("DELETE FROM candidate_fact_delta_namespaces WHERE workspace_id = ? AND candidate_generation_id = ?", [this.workspaceId, candidateId]);
-            return false;
+            const before = await this.rawDatabase.get<{ freelist_count: number }>("PRAGMA freelist_count");
+            if ((before?.freelist_count ?? 0) === 0) return false;
+            // Keep each reclaim slice small enough that a foreground
+            // FactDelta batch never waits behind a multi-second vacuum.
+            await this.rawDatabase.exec("PRAGMA incremental_vacuum(512)");
+            const after = await this.rawDatabase.get<{ freelist_count: number }>("PRAGMA freelist_count");
+            return (after?.freelist_count ?? 0) < (before?.freelist_count ?? 0);
           }
           const ids = batches.map((batch) => batch.fact_delta_id);
           const placeholders = ids.map(() => "?").join(", ");
@@ -1101,7 +1374,7 @@ export class WorkspaceDatabase {
     // survivor harmless -- see `workspaceDigestCorpora`'s comment.
     try {
       await Promise.allSettled([...this.stagingCleanups]);
-      await this.writer.run(() => this.rawDatabase.close());
+      await this.writer.run(() => this.rawDatabase.close(), "background");
     } finally {
       decrementWorkspaceHandle(this.rawDatabase.filename);
       await this.releaseLease();
@@ -1168,14 +1441,18 @@ export class DurableStorage {
     const workspaces = await this.catalog.database.all<{ workspace_id: string; database_path: string }>("SELECT workspace_id, database_path FROM installation_workspaces ORDER BY workspace_id");
     for (const workspace of workspaces) {
       try { await access(workspace.database_path); } catch { continue; }
-      const database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
+      const mutationLock = await acquireWorkspaceMutationLock(`${resolve(workspace.database_path)}.urdira-writer.lock`);
+      let database: SqliteDatabase | undefined;
       try {
-        await initializeSchema(database, WORKSPACE_SCHEMA);
+        database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
+        await initializeSchema(database, WORKSPACE_V3_SCHEMA);
         await ensureWorkspaceSchemaCompatibility(database, this.faults);
         const maintenance = new StorageMaintenance(database, this.cas, this.blobs, this.rootDir, workspace.workspace_id);
         const migrations = await database.all<{ migration_id: string }>("SELECT migration_id FROM storage_migrations WHERE workspace_id = ? AND state = 'running' ORDER BY started_at", [workspace.workspace_id]);
         for (const migration of migrations) await maintenance.reconcileMigration(migration.migration_id);
-      } finally { await database.close(); }
+      } finally {
+        try { await database?.close(); } finally { await mutationLock.release(); }
+      }
     }
   }
 
@@ -1184,21 +1461,32 @@ export class DurableStorage {
     const recoveredAt = new Date().toISOString();
     for (const workspace of workspaces) {
       try { await access(workspace.database_path); } catch { continue; }
-      const database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
+      const mutationLock = await acquireWorkspaceMutationLock(`${resolve(workspace.database_path)}.urdira-writer.lock`);
+      let database: SqliteDatabase | undefined;
       try {
-        await initializeSchema(database, WORKSPACE_SCHEMA);
+        database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
+        await initializeSchema(database, WORKSPACE_V3_SCHEMA);
         await ensureWorkspaceSchemaCompatibility(database);
         await database.run("UPDATE garbage_collection_epochs SET state = 'recovered', completed_at = COALESCE(completed_at, ?), failure_code = 'storage:gc_recovered_after_restart' WHERE workspace_id = ? AND state IN ('marking', 'sweeping')", [recoveredAt, workspace.workspace_id]);
-      } finally { await database.close(); }
+      } finally {
+        try { await database?.close(); } finally { await mutationLock.release(); }
+      }
     }
   }
 
   async openWorkspace(workspaceId: string): Promise<WorkspaceDatabase> {
     const workspace = await this.catalog.getWorkspace(workspaceId);
     if (!workspace) throw new StorageError("storage:workspace_not_found", `Workspace ${workspaceId} is not registered.`);
-    const database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
+    // Schema stamping, identity binding and the catalog lease all mutate the
+    // workspace before a SerializedWriter exists for the returned handle.
+    // Acquire the same marker used by Rust's IndexingCore before opening the
+    // connection so a legacy/compatibility TypeScript mutation can never race
+    // a Rust structural or lexical transaction during this bootstrap window.
+    const mutationLock = await acquireWorkspaceMutationLock(`${resolve(workspace.database_path)}.urdira-writer.lock`);
+    let database: SqliteDatabase | undefined;
     try {
-      await initializeSchema(database, WORKSPACE_SCHEMA);
+      database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
+      await initializeSchema(database, WORKSPACE_V3_SCHEMA);
       await ensureWorkspaceSchemaCompatibility(database, this.faults);
       await bindWorkspaceIdentity(database, workspaceId);
       await ensureIdentityFormat(database, workspaceId);
@@ -1208,8 +1496,10 @@ export class DurableStorage {
       return opened;
     } catch (error) {
       try { await this.catalog.releaseWorkspaceLease(workspaceId, this.ownerId); } catch { /* lease was not acquired */ }
-      await database.close();
+      await database?.close();
       throw error;
+    } finally {
+      await mutationLock.release();
     }
   }
 

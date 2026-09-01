@@ -1990,7 +1990,7 @@ export const authoritativeModelSourceFields = {
     {
       "name": "payload",
       "presence": "optional",
-      "logical_type": "JsonValue"
+      "logical_type": "SourceProviderPayload"
     },
     {
       "name": "error",
@@ -2102,7 +2102,7 @@ export const authoritativeModelSourceFields = {
     {
       "name": "content",
       "presence": "required",
-      "logical_type": "Bytes"
+      "logical_type": "Uint8Array"
     },
     {
       "name": "content_hash",
@@ -2953,6 +2953,11 @@ export const authoritativeModelSourceFields = {
       "name": "wait_timeout_ms",
       "presence": "required",
       "logical_type": "Count"
+    },
+    {
+      "name": "required_frontier",
+      "presence": "optional",
+      "logical_type": "source | syntax | structural | semantic"
     },
     {
       "name": "coverage_requirement",
@@ -6383,6 +6388,58 @@ export const authoritativeModelSourceFields = {
       "name": "effective_capabilities",
       "presence": "required",
       "logical_type": "Sequence<Text>"
+    },
+    {
+      "name": "runtime_executable_binding",
+      "presence": "optional",
+      "logical_type": "PluginRuntimeExecutableBinding"
+    }
+  ],
+  "PluginRuntimeExecutableBinding": [
+    {
+      "name": "plugin_id",
+      "presence": "required",
+      "logical_type": "Text"
+    },
+    {
+      "name": "plugin_version",
+      "presence": "required",
+      "logical_type": "Text"
+    },
+    {
+      "name": "runtime_target_id",
+      "presence": "required",
+      "logical_type": "Text"
+    },
+    {
+      "name": "runtime_contract_version",
+      "presence": "required",
+      "logical_type": "Count"
+    },
+    {
+      "name": "runtime_component_build_id",
+      "presence": "required",
+      "logical_type": "Text"
+    },
+    {
+      "name": "implementation_digest",
+      "presence": "required",
+      "logical_type": "Text"
+    },
+    {
+      "name": "package_digest",
+      "presence": "required",
+      "logical_type": "Text"
+    },
+    {
+      "name": "entrypoint_asset_digest",
+      "presence": "required",
+      "logical_type": "Text"
+    },
+    {
+      "name": "binding_digest",
+      "presence": "required",
+      "logical_type": "Text"
     }
   ],
   "RegistryCompatibilityAssessment": [
@@ -11600,6 +11657,11 @@ export const authoritativeModelSourceFields = {
       "name": "arguments",
       "presence": "required",
       "logical_type": "QueryStageArguments"
+    },
+    {
+      "name": "operation_version",
+      "presence": "optional",
+      "logical_type": "Count"
     }
   ],
   "StageOutputReference": [
@@ -11611,6 +11673,11 @@ export const authoritativeModelSourceFields = {
     {
       "name": "output",
       "presence": "required",
+      "logical_type": "Text"
+    },
+    {
+      "name": "name",
+      "presence": "optional",
       "logical_type": "Text"
     }
   ],
@@ -11912,6 +11979,11 @@ export const authoritativeModelSourceFields = {
       "name": "wait_timeout_ms",
       "presence": "required",
       "logical_type": "Count"
+    },
+    {
+      "name": "required_frontier",
+      "presence": "optional",
+      "logical_type": "source | syntax | structural | semantic"
     },
     {
       "name": "coverage_requirement",
@@ -13812,6 +13884,16 @@ export const authoritativeModelSourceFields = {
     },
     {
       "name": "source_ready",
+      "presence": "optional",
+      "logical_type": "Boolean"
+    },
+    {
+      "name": "syntax_ready",
+      "presence": "optional",
+      "logical_type": "Boolean"
+    },
+    {
+      "name": "structural_stage_1_ready",
       "presence": "optional",
       "logical_type": "Boolean"
     },

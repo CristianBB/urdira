@@ -351,7 +351,7 @@ export async function prepareRuntime(options: PrepareRuntimeOptions): Promise<Pr
       private: true,
       version: RUNTIME_VERSION,
       dependencies: { [RUNTIME_PACKAGE_NAME]: RUNTIME_VERSION },
-      overrides: { "adm-zip": "0.6.0", sharp: "0.35.3" },
+      overrides: { "adm-zip": "0.6.0", sharp: "0.35.3", protobufjs: "7.6.5" },
       allowScripts: RUNTIME_INSTALL_SCRIPT_APPROVALS,
     }, null, 2)}\n`, { mode: 0o600 });
 
@@ -440,7 +440,11 @@ export function bootstrapHelp(): string {
 
 async function executeRuntimeProcess(entrypoint: string, argv: readonly string[]): Promise<number> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(process.execPath, [entrypoint, ...argv], { stdio: "inherit", shell: false });
+    const child = spawn(process.execPath, [entrypoint, ...argv], {
+      env: { ...process.env, URDIRA_NATIVE_REQUIRED: "1" },
+      stdio: "inherit",
+      shell: false,
+    });
     child.once("error", reject);
     child.once("close", (code, signal) => {
       if (signal !== null) reject(new Error(`Urdira runtime terminated by ${signal}.`));

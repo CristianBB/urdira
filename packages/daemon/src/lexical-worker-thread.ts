@@ -57,6 +57,7 @@ port.on("message", (message: { readonly kind?: string }) => {
 
 void (async (): Promise<void> => {
   let storage: Awaited<ReturnType<typeof createDurableStorage>> | undefined;
+  let reply: WorkerReplyMessage | undefined;
   try {
     // `skip_startup_recovery: true` -- see `DurableStorageOptions`'s doc
     // comment (`packages/storage/src/storage.ts`) for the full rationale:
@@ -76,12 +77,15 @@ void (async (): Promise<void> => {
       ...(job.max_document_bytes === undefined ? {} : { max_document_bytes: job.max_document_bytes }),
       should_abort: () => abortRequested,
     });
-    port.postMessage({ kind: "result", result } satisfies WorkerReplyMessage);
+    reply = { kind: "result", result } satisfies WorkerReplyMessage;
   } catch (error) {
-    port.postMessage({ kind: "error", error: errorDetails(error) } satisfies WorkerReplyMessage);
+    reply = { kind: "error", error: errorDetails(error) } satisfies WorkerReplyMessage;
   } finally {
     // Closes every workspace this `DurableStorage` opened (just the one
     // above) plus the installation catalog -- see `DurableStorage.close()`.
     await storage?.close().catch(() => undefined);
   }
+  // Do not let the parent start a resumed writer until this worker has closed
+  // its SQLite handle and released the shared workspace mutation marker.
+  if (reply !== undefined) port.postMessage(reply);
 })();

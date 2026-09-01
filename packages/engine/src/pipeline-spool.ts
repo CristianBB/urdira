@@ -55,10 +55,11 @@ export class MemoryStageSpool implements StageSpool {
     const copy: QueryStreamItem[] = [];
     let bytes = 0;
     for await (const value of values) {
+      const nextBytes = itemBytes(value);
+      if (this.used + bytes + nextBytes > this.limits.hard_bytes) throw new Error(`Pipeline spool hard limit exceeded (${this.limits.hard_bytes} bytes).`);
       copy.push(value);
-      bytes += itemBytes(value);
+      bytes += nextBytes;
     }
-    if (this.used + bytes > this.limits.hard_bytes) throw new Error(`Pipeline spool hard limit exceeded (${this.limits.hard_bytes} bytes).`);
     this.rows.set(key, copy);
     this.used += bytes;
     const handle = stageSetHandle(executionId, stageId, output, copy);
@@ -84,8 +85,7 @@ export class SqliteStageSpool implements StageSpool {
       execution_id TEXT NOT NULL, stage_id TEXT NOT NULL, output TEXT NOT NULL,
       ordinal INTEGER NOT NULL, stable_sort_key TEXT NOT NULL, payload BLOB NOT NULL,
       PRIMARY KEY (execution_id, stage_id, output, ordinal)
-    ) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS pipeline_stage_rows_lookup
-      ON pipeline_stage_rows(execution_id, stage_id, output, ordinal);`);
+    ) WITHOUT ROWID;`);
   }
   static async memory(limits?: StageSpoolLimits): Promise<SqliteStageSpool> {
     return new SqliteStageSpool(await openSqliteDatabase({ filename: ":memory:" }), limits);
@@ -110,7 +110,14 @@ export class SqliteStageSpool implements StageSpool {
         yield { kind: "run", sql: "INSERT INTO pipeline_stage_rows (execution_id, stage_id, output, ordinal, stable_sort_key, payload) VALUES (?, ?, ?, ?, ?, ?)", params: [executionId, stageId, output, ordinal++, item.stable_sort_key, payload] };
       }
     })();
-    await this.database.transactionChunked(commands, 256, { transfer_params: true, discard_results: true });
+    try {
+      await this.database.transactionChunked(commands, 256, { transfer_params: true, discard_results: true });
+    } catch (error) {
+      // transactionChunked may already have committed an earlier bounded
+      // group. Remove this incomplete stage before exposing any handle.
+      try { await this.database.run("DELETE FROM pipeline_stage_rows WHERE execution_id = ? AND stage_id = ? AND output = ?", [executionId, stageId, output]); } catch { /* Preserve the original failure; execution cleanup retries by id. */ }
+      throw error;
+    }
     this.used += bytes;
     const database = this.database;
     const rowCount = ordinal;

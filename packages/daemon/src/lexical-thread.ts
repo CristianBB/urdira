@@ -11,6 +11,8 @@
 // existing per-run `openWorkspace`/`close` lifecycle in
 // `packages/daemon/src/runtime.ts`.
 import { Worker } from "node:worker_threads";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import type { ReconcileLexicalProjectionResult } from "@urdira/engine";
 
 export interface LexicalThreadJob {
@@ -52,7 +54,15 @@ type WorkerReplyMessage = WorkerResultMessage | WorkerErrorMessage;
 // out waiting for this worker's write lock -- the entire point of aborting
 // on a new scan in the first place (see `packages/daemon/src/runtime.ts`'s
 // `scheduleWorkspaceScan`).
-const ABORT_GRACE_MS = 2_000;
+// Give the worker enough time to finish the current SQLite transaction and
+// close its handle, releasing the cross-process workspace writer marker,
+// before the parent resorts to termination.
+const ABORT_GRACE_MS = 8_000;
+
+function defaultWorkspaceWriterMarker(job: LexicalThreadJob): string {
+  const safeId = job.workspace_id.replace(/[^A-Za-z0-9._-]/gu, "_");
+  return join(job.data_root, "workspaces", `${safeId}.sqlite.urdira-writer.lock`);
+}
 
 /**
  * Resolves the compiled worker-thread entry point the SAME way
@@ -91,12 +101,15 @@ export function runLexicalReconcileInThread(job: LexicalThreadJob): LexicalThrea
       clearAbortTimer();
       run();
     };
-    worker.on("message", (message: WorkerReplyMessage) => {
+    worker.on("message", async (message: WorkerReplyMessage) => {
+      if (abortRequested) await rm(defaultWorkspaceWriterMarker(job), { force: true }).catch(() => undefined);
       settle(() => { if (message.kind === "error") reject(threadError(message.error)); else resolve(message.result); });
       void worker.terminate();
     });
     worker.on("error", (error) => settle(() => reject(error instanceof Error ? error : new Error(String(error)))));
-    worker.on("exit", (code) => settle(() => {
+    worker.on("exit", async (code) => {
+      if (abortRequested) await rm(defaultWorkspaceWriterMarker(job), { force: true }).catch(() => undefined);
+      settle(() => {
       if (abortRequested) {
         // See `abort`'s doc comment: an unanswered abort followed by exit is
         // a successful cancellation, not a failure.
@@ -104,7 +117,8 @@ export function runLexicalReconcileInThread(job: LexicalThreadJob): LexicalThrea
         return;
       }
       reject(new Error(`Lexical maintenance worker thread exited with code ${code} before producing a result.`));
-    }));
+      });
+    });
   });
 
   return {
@@ -113,7 +127,9 @@ export function runLexicalReconcileInThread(job: LexicalThreadJob): LexicalThrea
       if (settled || abortRequested) return;
       abortRequested = true;
       worker.postMessage({ kind: "abort" });
-      abortTimer = setTimeout(() => { if (!settled) void worker.terminate(); }, ABORT_GRACE_MS);
+      abortTimer = setTimeout(() => {
+        if (!settled) void worker.terminate().finally(() => rm(defaultWorkspaceWriterMarker(job), { force: true }));
+      }, ABORT_GRACE_MS);
       abortTimer.unref?.();
     },
   };

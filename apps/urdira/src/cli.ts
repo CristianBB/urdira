@@ -6,12 +6,23 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseCliArgs, type CliResult } from "@urdira/cli";
 import type { DaemonStartupPhase } from "@urdira/daemon";
+import { loadNativeBinding, resolveNativeClosure } from "@urdira/native";
 import { migrateToV3 } from "@urdira/storage";
 import { runUrdira, runUrdiraMcp, runUrdiraWeb, URDIRA_VERSION, urdiraHelp } from "./index.js";
 
 const endpoint = process.env["URDIRA_ENDPOINT"];
 const argv = process.argv.slice(2);
 const INTERNAL_DAEMON_CHILD = "URDIRA_INTERNAL_DAEMON_CHILD";
+
+// Prepared npm runtimes and autonomous archives set this flag. Production
+// startup therefore fails closed before opening the daemon, MCP transport, or
+// workspace state when the exact native artifact cannot be loaded. Source-tree
+// development keeps the explicit opt-in so TypeScript contract tests do not
+// require a release artifact to have been staged first.
+if (process.env["URDIRA_NATIVE_REQUIRED"] === "1") {
+  const nativeClosure = resolveNativeClosure();
+  loadNativeBinding({ artifact_path: nativeClosure.addon_path });
+}
 
 // Diagnostic timings are intentionally opt-in and process-scoped. Set the
 // environment before any daemon/runtime is composed so worker threads inherit

@@ -10,8 +10,10 @@ import type {
   WorkspaceConfigurationRevision,
   WorkspaceCurrentState,
   WorkspaceFreshnessCheckpoint,
+  FactDeltaStreamBatch,
+  FactDeltaStreamHeader,
 } from "@urdira/contracts";
-import { validateFactDeltaBatch, type FactDeltaBatch } from "@urdira/contracts";
+import { validateFactDeltaBatch, validateFactDeltaStreamBatchValue, validateFactDeltaStreamHeaderValue, type FactDeltaBatch } from "@urdira/contracts";
 import type { BlobStore } from "./cas.js";
 import { resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
@@ -39,6 +41,14 @@ export interface CandidateTemplateSets {
   readonly artifact_dependencies: readonly unknown[];
   readonly lookup_dependencies: readonly unknown[];
   readonly lookup_revalidations: readonly unknown[];
+}
+
+interface CandidateStagedFactDeltaStreamGroupEntry {
+  readonly header: FactDeltaStreamHeader;
+  readonly batches: readonly {
+    readonly batch: FactDeltaStreamBatch;
+    readonly native_batch: FactDeltaBatch;
+  }[];
 }
 
 /** `set_kind` values for staged candidate template rows, in stable order. */
@@ -71,6 +81,10 @@ export interface CandidatePublicationInput {
   readonly publication_stage_ordinal?: number;
   readonly publication_stage_count?: number;
   readonly template_sets: CandidateTemplateSets;
+  /** Structural rows were promoted directly by the Rust indexing core. */
+  readonly rust_promoted_structural_rows?: boolean;
+  /** Rust completed the final v3 publication transaction for this candidate. */
+  readonly rust_publication_completed?: boolean;
   /**
    * (3c) Carries the seal-built record-open id/digest memo, keyed by object
    * identity of each `template_sets.record_opens` entry, straight into
@@ -474,7 +488,7 @@ export class WorkspaceCandidateRepository {
   }
 
   /** Accepts one transferred native batch idempotently before materialisation. */
-  async acceptNativeFactDeltaBatch(candidateGenerationId: string, factDeltaId: string, batch: FactDeltaBatch): Promise<"inserted" | "already_accepted"> {
+  async acceptNativeFactDeltaBatch(candidateGenerationId: string, factDeltaId: string, batch: FactDeltaBatch, provenance?: { readonly producer_id: string; readonly producer_version: string; readonly owner_artifact_id: string; readonly owner_artifact_version_id: string; readonly analysis_digest: string; readonly analysis_configuration_digest: string }): Promise<"inserted" | "already_accepted"> {
     validateFactDeltaBatch(batch);
     await this.requireCandidate(candidateGenerationId);
     const [result] = await this.database.transactionChunked([{
@@ -483,6 +497,7 @@ export class WorkspaceCandidateRepository {
       candidate_generation_id: candidateGenerationId,
       fact_delta_id: factDeltaId,
       accepted_at: now(),
+      ...provenance,
       batch,
     }], 1, { transfer_params: true });
     const status = (result as { readonly status?: unknown } | undefined)?.status;
@@ -503,6 +518,99 @@ export class WorkspaceCandidateRepository {
       accepted_at: now(),
       batch: entry.batch,
     })), 64, { transfer_params: true, discard_results: true });
+  }
+
+  /** Decision 25 stream staging port. The engine awaits this acknowledgement
+   * before requesting the next batch, so transferred buffers stay bounded. */
+  async stageFactDeltaStreamBatch(headerValue: FactDeltaStreamHeader, batchValue: FactDeltaStreamBatch, nativeBatch: FactDeltaBatch): Promise<"inserted" | "already_accepted"> {
+    const header = validateFactDeltaStreamHeaderValue(headerValue);
+    const batch = batchValue.records.length === batchValue.record_count && batchValue.dependencies.length === batchValue.dependency_count
+      ? validateFactDeltaStreamBatchValue(batchValue)
+      : batchValue;
+    assertWorkspace(this.workspaceId, header.workspace_id);
+    if (batch.fact_delta_id !== header.fact_delta_id
+      || batch.sequence !== nativeBatch.sequence
+      || batch.final !== nativeBatch.final
+      || batch.record_count !== nativeBatch.records.row_count
+      || batch.dependency_count !== nativeBatch.dependencies.row_count
+      || nativeBatch.graph_edges.row_count !== 0
+      || nativeBatch.identities.row_count !== 0) {
+      throw new StorageError("storage:fact_delta_batch_invalid", "FactDeltaStream batch does not match its transferred staging projection.");
+    }
+    return this.acceptNativeFactDeltaBatch(header.candidate_generation_id, header.fact_delta_id, nativeBatch, {
+      producer_id: header.plugin_id, producer_version: header.plugin_version,
+      owner_artifact_id: header.owner_artifact_id, owner_artifact_version_id: header.owner_artifact_version_id,
+      analysis_digest: header.analysis_digest, analysis_configuration_digest: header.analysis_configuration_digest,
+    });
+  }
+
+  /** Atomically stages and accepts a bounded group of independently validated streams. */
+  async commitFactDeltaStreamGroup(entries: readonly CandidateStagedFactDeltaStreamGroupEntry[]): Promise<readonly ("inserted" | "already_accepted")[]> {
+    if (entries.length === 0) return [];
+    if (entries.length > 64) throw new StorageError("storage:fact_delta_batch_invalid", "A FactDelta stream group cannot exceed 64 owners.");
+    const headers = entries.map((entry) => validateFactDeltaStreamHeaderValue(entry.header));
+    const candidateGenerationId = headers[0]!.candidate_generation_id;
+    await this.requireCandidate(candidateGenerationId);
+    let totalRows = 0;
+    let totalBytes = 0;
+    const workerEntries = entries.map((entry, entryIndex) => {
+      const header = headers[entryIndex]!;
+      assertWorkspace(this.workspaceId, header.workspace_id);
+      if (header.candidate_generation_id !== candidateGenerationId) throw new StorageError("storage:fact_delta_batch_invalid", "A FactDelta stream group cannot mix candidates.");
+      const batches = entry.batches.map(({ batch: batchValue, native_batch: nativeBatch }) => {
+        const batch = batchValue.records.length === batchValue.record_count && batchValue.dependencies.length === batchValue.dependency_count
+          ? validateFactDeltaStreamBatchValue(batchValue)
+          : batchValue;
+        validateFactDeltaBatch(nativeBatch);
+        if (batch.fact_delta_id !== header.fact_delta_id || batch.sequence !== nativeBatch.sequence || batch.final !== nativeBatch.final
+          || batch.record_count !== nativeBatch.records.row_count || batch.dependency_count !== nativeBatch.dependencies.row_count
+          || nativeBatch.graph_edges.row_count !== 0 || nativeBatch.identities.row_count !== 0) {
+          throw new StorageError("storage:fact_delta_batch_invalid", "FactDeltaStream group batch does not match its transferred staging projection.");
+        }
+        totalRows += nativeBatch.records.row_count + nativeBatch.graph_edges.row_count + nativeBatch.identities.row_count + nativeBatch.dependencies.row_count;
+        totalBytes += nativeBatch.byte_length;
+        return nativeBatch;
+      });
+      return Object.freeze({ fact_delta_id: header.fact_delta_id, delta_digest: header.delta_digest,
+        producer_id: header.plugin_id, producer_version: header.plugin_version,
+        owner_artifact_id: header.owner_artifact_id, owner_artifact_version_id: header.owner_artifact_version_id,
+        analysis_digest: header.analysis_digest, analysis_configuration_digest: header.analysis_configuration_digest,
+        batches: Object.freeze(batches) });
+    });
+    if (entries.length > 1 && (totalRows > 4096 || totalBytes > 16 * 1024 * 1024)) throw new StorageError("storage:fact_delta_batch_invalid", "A multi-owner FactDelta stream group exceeds its row or byte budget.");
+    const results = await this.database.transactionChunked([{
+      kind: "staged_fact_delta_group",
+      workspace_id: this.workspaceId,
+      candidate_generation_id: candidateGenerationId,
+      accepted_at: now(),
+      entries: workerEntries,
+    }], 1, { transfer_params: true });
+    const statuses = results[0];
+    if (!Array.isArray(statuses) || statuses.length !== entries.length || statuses.some((status) => status !== "inserted" && status !== "already_accepted")) {
+      throw new StorageError("storage:fact_delta_batch_invalid", "SQLite returned an invalid FactDelta stream-group acknowledgement.");
+    }
+    return Object.freeze(statuses as ("inserted" | "already_accepted")[]);
+  }
+
+  /** Promotes only a stream whose engine-side validator reached its final
+   * count and digest checks. Staged chunks alone are never accepted output. */
+  async completeFactDeltaStream(headerValue: FactDeltaStreamHeader): Promise<"inserted" | "already_accepted"> {
+    const header = validateFactDeltaStreamHeaderValue(headerValue);
+    const result = await this.acceptDelta({
+      fact_delta_id: header.fact_delta_id,
+      candidate_generation_id: header.candidate_generation_id,
+      workspace_id: header.workspace_id,
+      delta_digest: header.delta_digest,
+    });
+    return result.status;
+  }
+
+  async cancelFactDeltaStream(headerValue: FactDeltaStreamHeader): Promise<void> {
+    const header = validateFactDeltaStreamHeaderValue(headerValue);
+    assertWorkspace(this.workspaceId, header.workspace_id);
+    await this.requireCandidate(header.candidate_generation_id);
+    // Candidate-scoped staged chunks remain replayable/cleanable, but no
+    // candidate_fact_deltas row is created for an incomplete stream.
   }
 
   async saveMaterialization(candidateId: string, materialization: CandidateMaterialization, templateSets: CandidateTemplateSets = { source_transitions: [], record_opens: [], record_closures: [], identity_assignments: [], artifact_dependencies: [], lookup_dependencies: [], lookup_revalidations: [] }): Promise<CandidateInsertResult> {

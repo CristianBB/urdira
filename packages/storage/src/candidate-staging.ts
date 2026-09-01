@@ -43,6 +43,12 @@ export async function acceptStagedColumnBatch(database: SqliteDatabase, input: {
     const section = input.batch[sectionName];
     for (let row = 0; row < section.row_count; row += 1) {
       const values = rowValues(section, row);
+      // The complete canonical record/dependency body is authoritative in
+      // the primary records/dependencies lane. Edge and identity lanes are
+      // relational indexes over that row and must not persist the same large
+      // body again (text_1/text_2 respectively).
+      if (sectionName === "graph_edges") values[1] = null;
+      if (sectionName === "identities") values[2] = null;
       const table = SECTION_TABLES[sectionName]!;
       commands.push({ kind: "run", sql: `INSERT INTO ${table} (${STAGED_ROW_COLUMNS}) VALUES (${Array.from({ length: 30 }, () => "?").join(", ")})`, params: [delta.fact_delta_key, input.batch.sequence * 4_194_304 + row, ...values] });
     }
@@ -50,7 +56,7 @@ export async function acceptStagedColumnBatch(database: SqliteDatabase, input: {
   await database.transactionChunked(commands, 256, { discard_results: true });
 }
 
-function rowValues(section: FactDeltaColumnBatch, row: number): readonly (string | number | null)[] {
+function rowValues(section: FactDeltaColumnBatch, row: number): (string | number | null)[] {
   const values: (string | number | null)[] = new Array(TEXT_COLUMNS + REAL_COLUMNS + INTEGER_COLUMNS + ENUM_COLUMNS + PRESENCE_COLUMNS).fill(null);
   const textStart = section.strings.row_offsets[row]!;
   const textEnd = section.strings.row_offsets[row + 1]!;

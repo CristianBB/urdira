@@ -282,6 +282,34 @@ export const inlineSchemaSpecs: readonly InlineSchemaSpec[] = [
     ]
   },
   {
+    "id": "core:RuntimeComponentImplementationManifest@2",
+    "fields": [
+      { "name": "runtime_component_build_id", "optional": false, "type": "Identifier" },
+      { "name": "component_id", "optional": false, "type": "NamespacedIdentifier" },
+      { "name": "component_version", "optional": false, "type": "SemVer" },
+      { "name": "behavior_digest", "optional": false, "type": "Digest" },
+      { "name": "runtime_target_id", "optional": false, "type": "aarch64-apple-darwin | x86_64-apple-darwin | aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu | x86_64-pc-windows-msvc" },
+      { "name": "entrypoint_asset_digest", "optional": false, "type": "Digest" },
+      { "name": "executable_asset_digests", "optional": false, "type": "Set<Digest>" },
+      { "name": "native_asset_digests", "optional": false, "type": "Set<Digest>" },
+      { "name": "dependency_asset_digests", "optional": false, "type": "Set<Digest>" }
+    ]
+  },
+  {
+    "id": "core:PluginRuntimeExecutableBinding@1",
+    "fields": [
+      { "name": "plugin_id", "optional": false, "type": "NamespacedIdentifier" },
+      { "name": "plugin_version", "optional": false, "type": "SemVer" },
+      { "name": "runtime_target_id", "optional": false, "type": "aarch64-apple-darwin | x86_64-apple-darwin | aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu | x86_64-pc-windows-msvc" },
+      { "name": "runtime_contract_version", "optional": false, "type": "PositiveInteger" },
+      { "name": "runtime_component_build_id", "optional": false, "type": "Identifier" },
+      { "name": "implementation_digest", "optional": false, "type": "Digest" },
+      { "name": "package_digest", "optional": false, "type": "Digest" },
+      { "name": "entrypoint_asset_digest", "optional": false, "type": "Digest" },
+      { "name": "binding_digest", "optional": false, "type": "Digest" }
+    ]
+  },
+  {
     "id": "core:PluginPackageManifest@1",
     "fields": [
       {
@@ -702,6 +730,11 @@ export const inlineSchemaSpecs: readonly InlineSchemaSpec[] = [
         "name": "wait_timeout_ms",
         "optional": false,
         "type": "Count"
+      },
+      {
+        "name": "required_frontier",
+        "optional": true,
+        "type": "source | syntax | structural | semantic"
       },
       {
         "name": "coverage_requirement",

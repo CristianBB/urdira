@@ -12,20 +12,33 @@
  * Exists to attribute wall time spent inside `GenericSourceIndexer.apply`
  * (`packages/engine/src/source-indexer.ts`) that is NOT already inside one of
  * `@urdira/storage`'s own `commitInternal` buckets (CAS put loop, SQL,
- * metadata, directory fsync) -- specifically the provider read round-trip
- * per observation, per-batch digest verification, and per-fragment row/stream
- * assembly -- so a `URDIRA_STORAGE_DEBUG_TIMING=1` run's storage timing lines
- * and these engine timing lines can be summed against the `source_catalog`
- * stage total logged by `workspace-indexing-session.ts` to find any remaining
- * unattributed time.
+ * metadata, directory fsync) -- specifically the native-batch iterator wait,
+ * per-batch digest verification, the prior-frontier occurrence/absence
+ * queries, the aggregate per-batch read (`readAll`) and its per-observation
+ * provider round-trip, per-fragment row/stream assembly, and the Rust-owned
+ * capture's CAS write (`prepare_content_blobs`, which -- unlike the legacy
+ * `commitInternal` path -- never runs through `@urdira/storage`'s own timing)
+ * -- so a `URDIRA_STORAGE_DEBUG_TIMING=1` run's storage timing lines and
+ * these engine timing lines can be summed against the `source_catalog` stage
+ * total logged by `workspace-indexing-session.ts` to find any remaining
+ * unattributed time. `count()`/`snapshotCounters()` track the same run's
+ * observation/equivalent/CAS-blob/CAS-byte volumes so the aggregate log line
+ * carries both cost and volume.
  */
 
 interface Bucket {
   ms: number;
   count: number;
+  samples: number[];
 }
 
 const buckets = new Map<string, Bucket>();
+
+// Simple named counters (observation/blob/byte totals) alongside the timing
+// buckets above -- reported next to them in the same aggregate log line so a
+// `source_catalog` run's wall time and its volume can be read together
+// without a second instrumentation mechanism.
+const counters = new Map<string, number>();
 
 export function timingEnabled(): boolean {
   // Read the flag at call time, matching storage's debug-timing.ts: the
@@ -41,9 +54,11 @@ export async function timed<T>(bucket: string, action: () => Promise<T>): Promis
   try {
     return await action();
   } finally {
-    const entry = buckets.get(bucket) ?? { ms: 0, count: 0 };
-    entry.ms += performance.now() - startedAt;
+    const elapsed = performance.now() - startedAt;
+    const entry = buckets.get(bucket) ?? { ms: 0, count: 0, samples: [] };
+    entry.ms += elapsed;
     entry.count += 1;
+    entry.samples.push(elapsed);
     buckets.set(bucket, entry);
   }
 }
@@ -55,9 +70,11 @@ export function timedSync<T>(bucket: string, action: () => T): T {
   try {
     return action();
   } finally {
-    const entry = buckets.get(bucket) ?? { ms: 0, count: 0 };
-    entry.ms += performance.now() - startedAt;
+    const elapsed = performance.now() - startedAt;
+    const entry = buckets.get(bucket) ?? { ms: 0, count: 0, samples: [] };
+    entry.ms += elapsed;
     entry.count += 1;
+    entry.samples.push(elapsed);
     buckets.set(bucket, entry);
   }
 }
@@ -72,16 +89,40 @@ export function timedSync<T>(bucket: string, action: () => T): T {
  */
 export function record(bucket: string, ms: number): void {
   if (!timingEnabled()) return;
-  const entry = buckets.get(bucket) ?? { ms: 0, count: 0 };
+  const entry = buckets.get(bucket) ?? { ms: 0, count: 0, samples: [] };
   entry.ms += ms;
   entry.count += 1;
+  entry.samples.push(ms);
   buckets.set(bucket, entry);
 }
 
-export function snapshotTimings(): Record<string, { readonly ms: number; readonly count: number }> {
-  return Object.fromEntries([...buckets.entries()].map(([key, value]) => [key, { ms: Math.round(value.ms), count: value.count }]));
+/** Adds `amount` to a named counter when instrumentation is enabled; a no-op otherwise. */
+export function count(name: string, amount = 1): void {
+  if (!timingEnabled()) return;
+  counters.set(name, (counters.get(name) ?? 0) + amount);
+}
+
+export function snapshotCounters(): Record<string, number> {
+  return Object.fromEntries(counters.entries());
+}
+
+function percentile(samples: readonly number[], fraction: number): number {
+  if (samples.length === 0) return 0;
+  const ordered = [...samples].sort((left, right) => left - right);
+  return ordered[Math.max(0, Math.ceil(fraction * ordered.length) - 1)]!;
+}
+
+export function snapshotTimings(): Record<string, { readonly ms: number; readonly count: number; readonly p50_ms: number; readonly p95_ms: number; readonly p99_ms: number }> {
+  return Object.fromEntries([...buckets.entries()].map(([key, value]) => [key, {
+    ms: Math.round(value.ms),
+    count: value.count,
+    p50_ms: Math.round(percentile(value.samples, 0.50)),
+    p95_ms: Math.round(percentile(value.samples, 0.95)),
+    p99_ms: Math.round(percentile(value.samples, 0.99)),
+  }]));
 }
 
 export function resetTimings(): void {
   buckets.clear();
+  counters.clear();
 }

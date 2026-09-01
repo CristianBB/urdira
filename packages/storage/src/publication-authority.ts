@@ -323,6 +323,12 @@ export interface CandidatePublicationPlanInput {
   };
   readonly workspaceId: string;
   readonly database: SqliteDatabase;
+  /**
+   * Direct worker connection used only to build invisible typed staging while
+   * the caller owns the workspace publication lane. Passing the serialized
+   * facade here would enqueue behind that same lane and deadlock.
+   */
+  readonly stagingDatabase?: SqliteDatabase;
   readonly faults: FaultInjector;
   readonly generation: number;
   readonly publishedAt: string;
@@ -333,7 +339,7 @@ export interface CandidatePublicationPlanInput {
 }
 
 export async function buildCandidatePublicationPlan(planInput: CandidatePublicationPlanInput): Promise<PublicationCommandGroups> {
-  const { input, storedCandidate, current, workspaceId, database, faults, generation, publishedAt, recordSetDigestCorpus, projectionSetDigestCorpus } = planInput;
+  const { input, storedCandidate, current, workspaceId, database, stagingDatabase, faults, generation, publishedAt, recordSetDigestCorpus, projectionSetDigestCorpus } = planInput;
   const expected = input.frozen_base;
   const candidateId = input.candidate.candidate_generation_id;
   const snapshotId = `snapshot:${candidateId}`;
@@ -390,13 +396,25 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
     // verification in this function) still independently recomputes its own
     // digest from `recordOpens` regardless of this memo -- decision 13 stays
     // intact; only the redundant per-record parse/hash is skipped.
-    const trustedRecordOpenMemo = suppliedRecordOpenMemo(recordOpens, input.record_open_memo);
+    // A file-backed sequence and its memo are produced together by the
+    // engine's sealed accumulator. Each decoded open carries promoted
+    // id/digest hints, so an O(n) identity-coverage walk would only replay
+    // the entire spool once before the real consumers. The private marker
+    // cannot survive persistence/deserialization; recovery callers therefore
+    // still take the ordinary fail-closed coverage and re-hash path.
+    const trustedRecordOpenMemo = (isFileBackedTemplateSequence(recordOpens) || isPromotedRecordOpenMemo(input.record_open_memo))
+      && input.record_open_memo !== undefined
+      && input.record_open_memo.size === recordOpens.length
+      ? input.record_open_memo
+      : suppliedRecordOpenMemo(recordOpens, input.record_open_memo);
     const { memo: recordOpenMemo, parsedByEntry: recordOpenParsedByEntry } = await timed("publish_record_open_memo", async () => trustedRecordOpenMemo !== undefined
       ? { memo: trustedRecordOpenMemo, parsedByEntry: undefined }
       : useStreamingPublication
         ? { memo: await memoizeRecordOpens(recordOpens), parsedByEntry: undefined }
         : await parseRecordOpens(recordOpens));
-    const snapshotDigests = await timed("publish_snapshot_digest_fields", () => computeSnapshotDigestFields(database, workspaceId, current, generation, recordOpens, recordClosures, recordOpenMemo, recordSetDigestCorpus, artifactDependencies, projectionSetDigestCorpus));
+    const snapshotDigests = await timed("publish_snapshot_digest_fields", () => input.rust_promoted_structural_rows === true
+      ? computeRustPromotedSnapshotDigestFields(database, workspaceId, candidateId, current, generation, artifactDependencies, projectionSetDigestCorpus)
+      : computeSnapshotDigestFields(database, workspaceId, current, generation, recordOpens, recordClosures, recordOpenMemo, recordSetDigestCorpus, artifactDependencies, projectionSetDigestCorpus));
     const manifestDescriptors = timedSync("publish_manifest_descriptors", () => buildManifestDescriptors(sourceTransitions, recordOpens, recordClosures, identityAssignments, projectionOpens, projectionClosures, { sourceTransitions: sourceTransitionsDigest, recordOpens: recordOpensDigest, recordClosures: recordClosuresDigest, identityAssignments: identityAssignmentsDigest }));
     const sourceWatermarks = JSON.stringify({ watermarks: materialization.source_observation_watermarks, source_observation_batch_ids: normalizedExpectedObservations });
     const snapshot = {
@@ -420,7 +438,71 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
     };
     const completedSnapshot = { ...snapshot, snapshot_digest: snapshotDigest(snapshot) };
     const manifest = manifestRow(generationManifestId, workspaceId, candidateId, generation, snapshotId, input.frozen_base.snapshot_id, input.target_registry.registry_snapshot_id, input.publication_kind, publishedAt, manifestDescriptors);
-    await timed("publish_assert_immutable", () => assertPublicationImmutableRows(database, workspaceId, input, sourceTransitions, recordOpens, identityAssignments, projectionOpens, artifactDependencies, lookupDependencies, lookupRevalidations, materialization.capability_state_entries, generation, publishedAt, resolvedMaterializationSealedAt, manifest, completedSnapshot, recordOpenMemo));
+    const freshExternalTemplateSequence = storedCandidate.state === "ready"
+      && (isFileBackedTemplateSequence(recordOpens) && isFileBackedTemplateSequence(identityAssignments)
+        || isPromotedRecordOpenMemo(input.record_open_memo));
+    // A progressive initial successor can have a visible syntax predecessor
+    // while opening only identities from disjoint later-stage scopes. The
+    // engine marker proves that exact initial/progressive materializer route;
+    // the count query below separately proves every open has a native typed
+    // row. Replacements and ordinary incrementals remain on the full path.
+    const rustPromoted = input.rust_promoted_structural_rows === true || isPromotedRecordOpenMemo(input.record_open_memo);
+    const directFactDeltaCandidate = rustPromoted
+      && (recordOpens.length === identityAssignments.length || input.rust_promoted_structural_rows === true);
+    const directFactDeltaRows = directFactDeltaCandidate && stagingDatabase !== undefined
+      ? await stagingDatabase.get<{ count: number }>(`SELECT CASE
+          WHEN (SELECT COUNT(*) FROM candidate_publication_record_occurrences
+                WHERE workspace_id = ? AND candidate_generation_id = ?) > 0
+            OR ? = 0
+          THEN (SELECT COUNT(*) FROM candidate_publication_record_occurrences
+                WHERE workspace_id = ? AND candidate_generation_id = ?)
+          ELSE (SELECT COUNT(*) FROM candidate_staged_records s
+                JOIN candidate_fact_delta_namespaces n ON n.fact_delta_key = s.fact_delta_key
+                WHERE n.workspace_id = ? AND n.candidate_generation_id = ?
+                  AND s.text_6 <> '' AND s.text_7 <> ''
+                  AND n.owner_artifact_id IS NOT NULL AND n.owner_artifact_version_id IS NOT NULL)
+        END AS count`, [workspaceId, candidateId, recordOpens.length, workspaceId, candidateId, workspaceId, candidateId])
+      : undefined;
+    const directFactDeltaCanonicalStaging = directFactDeltaRows?.count === recordOpens.length;
+    // The Rust core may have already promoted its opaque kernel rows into the
+    // candidate publication relation. In that case reuse its descriptor and
+    // keep the publication path set-based even for a small candidate; falling
+    // back to the TypeScript staging builder would re-parse every owner.
+    const rustPublicationDescriptor = directFactDeltaCandidate && stagingDatabase !== undefined
+      ? await stagingDatabase.get<StagedCanonicalPublicationDescriptor & { readonly closure_count: number } & Record<string, unknown>>(
+        "SELECT record_count, facet_count, identity_count, canonical_byte_length, first_record_id, last_record_id, record_sequence_digest, identity_sequence_digest, (SELECT COUNT(*) FROM candidate_publication_record_closures c WHERE c.candidate_generation_id = candidate_publication_descriptors.candidate_generation_id AND c.workspace_id = candidate_publication_descriptors.workspace_id) AS closure_count FROM candidate_publication_descriptors WHERE candidate_generation_id = ? AND workspace_id = ?",
+        [candidateId, workspaceId],
+      )
+      : undefined;
+    const rustPreStaged = rustPromoted && rustPublicationDescriptor?.record_sequence_digest === "rust:pending"
+      && rustPublicationDescriptor.identity_sequence_digest === "rust:pending"
+      && (input.rust_promoted_structural_rows === true
+        || (rustPublicationDescriptor.record_count === recordOpens.length
+          && rustPublicationDescriptor.identity_count === identityAssignments.length));
+    const publicationUsesStreaming = useStreamingPublication || rustPreStaged;
+    const supportsSetBasedCanonicalStaging = typeof (stagingDatabase as unknown as { readonly transactionChunked?: unknown } | undefined)?.transactionChunked === "function";
+    const stagedTyped = rustPreStaged
+      ? {
+        canonical: rustPublicationDescriptor!,
+        projections: { projection_count: 0, dependency_count: 0, value_node_count: 0, first_projection_record_id: null, last_projection_record_id: null, projection_sequence_digest: digestCanonicalArray(projectionOpens) },
+        // Rust owns the opened-row staging, while the candidate materializer
+        // still supplies the exact close set for an incremental replacement.
+        // Keep that count in the descriptor so the set-based publication
+        // phase closes stale visible rows in the same transaction.
+        closure_count: rustPublicationDescriptor!.closure_count,
+      }
+      : publicationUsesStreaming && supportsSetBasedCanonicalStaging ? await timed("publish_stage_typed", () => stageCanonicalPublicationRows({
+      database: stagingDatabase!, candidate_id: candidateId, workspace_id: workspaceId, generation,
+      record_opens: recordOpens, record_closures: recordClosures, identity_assignments: identityAssignments, projection_opens: projectionOpens,
+      record_open_memo: recordOpenMemo,
+      record_sequence_digest: recordOpensDigest, identity_sequence_digest: identityAssignmentsDigest,
+      projection_sequence_digest: digestCanonicalArray(projectionOpens),
+      sealed_at: publishedAt,
+      direct_fact_delta_records: directFactDeltaCanonicalStaging,
+    })) : undefined;
+    const stagedCanonical = stagedTyped?.canonical;
+    const stagedProjections = stagedTyped?.projections;
+    await timed("publish_assert_immutable", () => assertPublicationImmutableRows(database, workspaceId, input, sourceTransitions, recordOpens, identityAssignments, projectionOpens, artifactDependencies, lookupDependencies, lookupRevalidations, materialization.capability_state_entries, generation, publishedAt, resolvedMaterializationSealedAt, manifest, completedSnapshot, recordOpenMemo, freshExternalTemplateSequence, stagedCanonical));
     const nextState = {
       workspace_id: workspaceId,
       current_snapshot_id: snapshotId,
@@ -448,17 +530,23 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
       ...faultCommand(faults, "candidate_publication.after_install_source"),
     ];
     const candidateMaterializationCommands: TransactionCommand[] = checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_materializations (candidate_materialization_id, workspace_id, candidate_generation_id, materialization_digest, sealed_at, materialization_contract_text) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO UPDATE SET candidate_materialization_id = excluded.candidate_materialization_id, workspace_id = excluded.workspace_id, candidate_generation_id = excluded.candidate_generation_id, materialization_digest = excluded.materialization_digest, sealed_at = excluded.sealed_at, materialization_contract_text = excluded.materialization_contract_text WHERE candidate_materializations.candidate_materialization_id = excluded.candidate_materialization_id AND candidate_materializations.workspace_id = excluded.workspace_id AND candidate_materializations.candidate_generation_id IS excluded.candidate_generation_id AND candidate_materializations.materialization_digest = excluded.materialization_digest AND candidate_materializations.sealed_at IS excluded.sealed_at AND candidate_materializations.materialization_contract_text = excluded.materialization_contract_text", params: [input.materialization.candidate_materialization_id, workspaceId, candidateId, input.materialization.materialization_digest, resolvedMaterializationSealedAt, JSON.stringify(input.materialization)] });
+    // Large publications have already completed the exact immutable-row
+    // comparison above while holding the serialized publication lane. Per-
+    // row checkpoint/assert triplets add no conflict information here and
+    // prevent equal-SQL rows from collapsing into bounded run_batch frames.
+    // Small publications keep the simpler defensive replay checks.
+    const requirePerRowReplayChecks = !publicationUsesStreaming;
     const dependencyCommands: TransactionCommand[] = timedSync("publish_dependency_commands", () => [
-      ...artifactDependencyCommands(artifactDependencies, workspaceId, generation),
-      ...lookupDependencyCommands(lookupDependencies, lookupRevalidations, workspaceId, candidateId, generation, publishedAt),
+      ...artifactDependencyCommands(artifactDependencies, workspaceId, generation, requirePerRowReplayChecks),
+      ...lookupDependencyCommands(lookupDependencies, lookupRevalidations, workspaceId, candidateId, generation, publishedAt, requirePerRowReplayChecks),
       ...capabilityStateCommands(materialization.capability_state_entries, workspaceId, candidateId, publishedAt),
     ]);
-    const recordClosureCommandList = useStreamingPublication ? [] : timedSync("publish_record_closure_commands", () => recordClosureCommands(recordClosures, workspaceId, generation));
-    const identityCommandList = useStreamingPublication ? [] : timedSync("publish_identity_commands", () => identityCommands(identityAssignments, workspaceId, generation));
+    const recordClosureCommandList = publicationUsesStreaming ? [] : timedSync("publish_record_closure_commands", () => recordClosureCommands(recordClosures, workspaceId, generation));
+    const identityCommandList = publicationUsesStreaming ? [] : timedSync("publish_identity_commands", () => identityCommands(identityAssignments, workspaceId, generation));
     const canonicalFaultCommands = faultCommand(faults, "candidate_publication.after_install_canonical");
-    const projectionClosureCommandList = useStreamingPublication ? [] : timedSync("publish_projection_commands", () => projectionClosureCommands(projectionClosures, workspaceId, generation));
+    const projectionClosureCommandList = publicationUsesStreaming ? [] : timedSync("publish_projection_commands", () => projectionClosureCommands(projectionClosures, workspaceId, generation));
     const projectionFaultCommands = faultCommand(faults, "candidate_publication.after_install_projections");
-    const canonicalCommands: TransactionCommand[] = useStreamingPublication ? [] : [
+    const canonicalCommands: TransactionCommand[] = publicationUsesStreaming ? [] : [
       ...candidateMaterializationCommands,
       ...dependencyCommands,
       ...timedSync("publish_record_open_commands", () => recordOpenCommands(recordOpens, workspaceId, generation, recordOpenMemo, recordOpenParsedByEntry)),
@@ -466,7 +554,7 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
       ...identityCommandList,
       ...canonicalFaultCommands,
     ];
-    const projectionCommandsForPublication: TransactionCommand[] = useStreamingPublication ? [] : [
+    const projectionCommandsForPublication: TransactionCommand[] = publicationUsesStreaming ? [] : [
       ...timedSync("publish_projection_commands", () => projectionCommands(projectionOpens, workspaceId, generation)),
       ...projectionClosureCommandList,
       ...projectionFaultCommands,
@@ -483,19 +571,109 @@ export async function buildCandidatePublicationPlan(planInput: CandidatePublicat
     // `recordOpenCommandStream`, the closure UPDATEs in
     // `recordClosureCommandStream`, and projection_occurrence_dependencies
     // inside `projectionCommandStream`, below).
-    const canonicalStream = useStreamingPublication ? (): Iterable<TransactionCommand> => coalesceAdjacentRuns((function* (): Generator<TransactionCommand> {
+    const canonicalStream = publicationUsesStreaming ? (): Iterable<TransactionCommand> => coalesceAdjacentRuns((function* (): Generator<TransactionCommand> {
       yield* candidateMaterializationCommands;
       yield* dependencyCommands;
       const rebuildInitialCanonicalIndexes = current === undefined && recordOpens.length >= STREAMING_PUBLICATION_RECORD_THRESHOLD;
       if (rebuildInitialCanonicalIndexes) yield { kind: "exec", sql: INITIAL_CANONICAL_INDEX_DROP_SQL };
-      yield* recordOpenCommandStream(recordOpens, workspaceId, generation, recordOpenMemo, recordOpenParsedByEntry);
-      yield* recordClosureCommandStream(recordClosures, workspaceId, generation);
-      yield* identityCommandStream(identityAssignments, workspaceId, generation);
+      if (stagedCanonical === undefined) {
+        yield* recordOpenCommandStream(recordOpens, workspaceId, generation, recordOpenMemo, recordOpenParsedByEntry);
+        yield* recordClosureCommandStream(recordClosures, workspaceId, generation);
+        yield* identityCommandStream(identityAssignments, workspaceId, generation);
+      } else {
+        if (rustPreStaged) {
+          // Stage-1 source recovery can advance the source-index counter ahead
+          // of the published tuple. Rebind the sealed candidate rows to the
+          // publication generation chosen by the storage CAS (a scalar update,
+          // never a per-record TypeScript rebuild).
+          yield {
+            kind: "run",
+            sql: "UPDATE candidate_publication_record_occurrences SET valid_from_generation = ? WHERE candidate_generation_id = ?",
+            params: [generation, candidateId],
+          };
+          yield {
+            kind: "run",
+            sql: "UPDATE candidate_publication_record_facets SET valid_from_generation = ? WHERE candidate_generation_id = ?",
+            params: [generation, candidateId],
+          };
+          yield {
+            kind: "run",
+            sql: "UPDATE candidate_publication_identity_assignments SET valid_from_generation = ? WHERE candidate_generation_id = ?",
+            params: [generation, candidateId],
+          };
+          yield {
+            kind: "run",
+            sql: "UPDATE candidate_publication_descriptors SET record_sequence_digest = ?, identity_sequence_digest = ?, sealed_at = ? WHERE candidate_generation_id = ? AND workspace_id = ? AND record_sequence_digest = 'rust:pending' AND identity_sequence_digest = 'rust:pending'",
+            params: [recordOpensDigest, identityAssignmentsDigest, publishedAt, candidateId, workspaceId],
+          };
+        }
+        const descriptorPredicate = "candidate_generation_id = ? AND workspace_id = ? AND record_count = ? AND facet_count = ? AND identity_count = ? AND canonical_byte_length = ? AND first_record_id IS ? AND last_record_id IS ? AND record_sequence_digest = ? AND identity_sequence_digest = ?";
+        const descriptorParams: SqliteValue[] = [candidateId, workspaceId, stagedCanonical.record_count, stagedCanonical.facet_count, stagedCanonical.identity_count, stagedCanonical.canonical_byte_length, stagedCanonical.first_record_id, stagedCanonical.last_record_id, stagedCanonical.record_sequence_digest, stagedCanonical.identity_sequence_digest];
+        yield { kind: "transaction_checkpoint" };
+        yield {
+          kind: "run",
+          sql: `INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) SELECT record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, NULL, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ? AND EXISTS (SELECT 1 FROM candidate_publication_descriptors WHERE ${descriptorPredicate}) ORDER BY row_ordinal ON CONFLICT(record_id) DO NOTHING`,
+          params: [candidateId, ...descriptorParams],
+        };
+        yield { kind: "assert_transaction_changes", expected: stagedCanonical.record_count };
+        yield { kind: "transaction_checkpoint" };
+        yield {
+          kind: "run",
+          sql: `INSERT INTO record_facets (workspace_id, record_id, valid_from_generation, facet_ordinal, facet) SELECT workspace_id, record_id, valid_from_generation, facet_ordinal, facet FROM candidate_publication_record_facets WHERE candidate_generation_id = ? AND EXISTS (SELECT 1 FROM candidate_publication_descriptors WHERE ${descriptorPredicate}) ORDER BY row_ordinal ON CONFLICT DO NOTHING`,
+          params: [candidateId, ...descriptorParams],
+        };
+        yield { kind: "assert_transaction_changes", expected: stagedCanonical.facet_count };
+        // `stagedCanonical` is derived exclusively from `stagedTyped.canonical`;
+        // reaching this branch therefore proves that the typed descriptor is
+        // present. Keep the invariant explicit instead of manufacturing an
+        // unreachable undefined/default branch in this critical path.
+        if (stagedTyped!.closure_count > 0) {
+          yield { kind: "transaction_checkpoint" };
+          yield {
+            kind: "run",
+            sql: `UPDATE record_occurrences SET valid_to_generation = ?
+              WHERE workspace_id = ? AND valid_to_generation IS NULL AND record_id IN (
+                SELECT record_id FROM candidate_publication_record_closures WHERE candidate_generation_id = ?
+              )`,
+            params: [generation, workspaceId, candidateId],
+          };
+          yield { kind: "assert_transaction_changes", expected: stagedTyped!.closure_count };
+        }
+        yield { kind: "transaction_checkpoint" };
+        yield {
+          kind: "run",
+          sql: `INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation) SELECT identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, NULL, NULL, valid_from_generation, NULL FROM candidate_publication_identity_assignments WHERE candidate_generation_id = ? AND EXISTS (SELECT 1 FROM candidate_publication_descriptors WHERE ${descriptorPredicate}) ORDER BY row_ordinal ON CONFLICT DO NOTHING`,
+          params: [candidateId, ...descriptorParams],
+        };
+        yield { kind: "assert_transaction_changes", expected: stagedCanonical.identity_count };
+      }
       if (rebuildInitialCanonicalIndexes) yield { kind: "exec", sql: INITIAL_CANONICAL_INDEX_BUILD_SQL };
       yield* canonicalFaultCommands;
     })()) : undefined;
-    const projectionsStream = useStreamingPublication ? (): Iterable<TransactionCommand> => coalesceAdjacentRuns((function* (): Generator<TransactionCommand> {
-      yield* projectionCommandStream(projectionOpens, workspaceId, generation);
+    const projectionsStream = publicationUsesStreaming ? (): Iterable<TransactionCommand> => coalesceAdjacentRuns((function* (): Generator<TransactionCommand> {
+      if (stagedProjections === undefined) {
+        yield* projectionCommandStream(projectionOpens, workspaceId, generation, true, requirePerRowReplayChecks);
+      } else {
+        const descriptorPredicate = "candidate_generation_id = ? AND workspace_id = ? AND projection_count = ? AND dependency_count = ? AND value_node_count = ? AND first_projection_record_id IS ? AND last_projection_record_id IS ? AND projection_sequence_digest = ?";
+        const descriptorParams: SqliteValue[] = [candidateId, workspaceId, stagedProjections.projection_count, stagedProjections.dependency_count, stagedProjections.value_node_count, stagedProjections.first_projection_record_id, stagedProjections.last_projection_record_id, stagedProjections.projection_sequence_digest];
+        yield { kind: "transaction_checkpoint" };
+        yield {
+          kind: "run",
+          sql: `INSERT INTO projection_occurrences (projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, valid_to_generation, content_digest) SELECT projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, NULL, content_digest FROM candidate_publication_projection_occurrences WHERE candidate_generation_id = ? AND EXISTS (SELECT 1 FROM candidate_publication_projection_descriptors WHERE ${descriptorPredicate}) ORDER BY row_ordinal ON CONFLICT(workspace_id, projection_record_id, valid_from_generation) DO UPDATE SET content_digest = excluded.content_digest WHERE projection_occurrences.workspace_id = excluded.workspace_id AND projection_occurrences.projection_kind = excluded.projection_kind AND projection_occurrences.projection_key = excluded.projection_key AND projection_occurrences.owner_artifact_id = excluded.owner_artifact_id AND projection_occurrences.owner_artifact_version_id = excluded.owner_artifact_version_id AND projection_occurrences.source_artifact_version_ids = excluded.source_artifact_version_ids AND projection_occurrences.source_record_ids = excluded.source_record_ids AND projection_occurrences.source_projection_record_ids = excluded.source_projection_record_ids AND projection_occurrences.generator = excluded.generator AND projection_occurrences.generator_version = excluded.generator_version AND projection_occurrences.generator_configuration_digest = excluded.generator_configuration_digest AND projection_occurrences.valid_from_generation = excluded.valid_from_generation AND projection_occurrences.valid_to_generation IS excluded.valid_to_generation`,
+          params: [candidateId, ...descriptorParams],
+        };
+        yield { kind: "assert_transaction_changes", expected: stagedProjections.projection_count };
+        yield {
+          kind: "run",
+          sql: `INSERT OR IGNORE INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id) SELECT workspace_id, projection_record_id, valid_from_generation, source_type, source_id FROM candidate_publication_projection_dependencies WHERE candidate_generation_id = ? AND EXISTS (SELECT 1 FROM candidate_publication_projection_descriptors WHERE ${descriptorPredicate}) ORDER BY row_ordinal`,
+          params: [candidateId, ...descriptorParams],
+        };
+        yield {
+          kind: "run",
+          sql: `INSERT INTO projection_value_nodes (workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value) SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM candidate_publication_projection_value_nodes WHERE candidate_generation_id = ? AND EXISTS (SELECT 1 FROM candidate_publication_projection_descriptors WHERE ${descriptorPredicate}) ORDER BY row_ordinal ON CONFLICT(workspace_id, record_id, valid_from_generation, value_path) DO UPDATE SET parent_path = excluded.parent_path, sequence_ordinal = excluded.sequence_ordinal, map_key = excluded.map_key, value_kind = excluded.value_kind, text_value = excluded.text_value, integer_value = excluded.integer_value, real_value = excluded.real_value, bool_value = excluded.bool_value, bytes_value = excluded.bytes_value`,
+          params: [candidateId, ...descriptorParams],
+        };
+      }
       yield* projectionClosureCommandStream(projectionClosures, workspaceId, generation);
       yield* projectionFaultCommands;
     })()) : undefined;
@@ -996,6 +1174,12 @@ function candidateTemplateValue(value: unknown): unknown {
   return value;
 }
 
+function firstIterableEntry<T>(entries: readonly T[]): T | undefined {
+  const iterator = entries[Symbol.iterator]();
+  try { return iterator.next().value as T | undefined; }
+  finally { iterator.return?.(); }
+}
+
 function digestCandidateTemplateArray(entries: readonly unknown[]): string {
   // LogicalDigestWriter has its own domain and therefore cannot provide the
   // byte-identical canonical-array digest. Use the ordinary canonical helper
@@ -1009,7 +1193,7 @@ function digestCandidateTemplateArray(entries: readonly unknown[]): string {
   // this holds for those too. Avoids a full `.some()` scan whose answer is
   // always false for every template set except identity assignments --
   // including a from-scratch scan's 1,000,000-entry record-open set.
-  if (entries.length === 0 || !isPackedCandidateTemplate(entries[0])) return digestCanonicalArray(entries);
+  if (entries.length === 0 || !isPackedCandidateTemplate(firstIterableEntry(entries))) return digestCanonicalArray(entries);
   return digestMappedCanonicalArray(entries, "urdira:candidate-template-logical-value:v2", candidateTemplateValue);
 }
 
@@ -1573,6 +1757,43 @@ export async function computeSnapshotDigestFields(database: SqliteDatabase, work
   return { canonical_record_set_digest: canonicalRecordSetDigest, projection_set_digests: JSON.stringify(projectionEntries), sortedVisible, record_set_digest_corpus_complete: recordSetDigestCorpusComplete, sortedProjectionsByKind };
 }
 
+/** Computes the visible record digest directly from Rust-promoted candidate
+ * rows. No TypeScript record-open graph is required on this path. */
+async function computeRustPromotedSnapshotDigestFields(
+  database: SqliteDatabase,
+  workspaceId: string,
+  candidateId: string,
+  current: CandidatePublicationPlanInput["current"],
+  generation: number,
+  artifactDependencies: readonly unknown[],
+  projectionCorpus?: ProjectionSetDigestCorpusEntry,
+): Promise<{ readonly canonical_record_set_digest: string; readonly projection_set_digests: string; readonly sortedVisible: readonly { readonly record_id: string; readonly record_digest: string }[]; readonly record_set_digest_corpus_complete: boolean; readonly sortedProjectionsByKind: Readonly<Record<ProjectionDigestKind, readonly ProjectionKindDigestRow[]>> }> {
+  const base = await computeSnapshotDigestFields(database, workspaceId, current, generation, [], [], undefined, undefined, artifactDependencies, projectionCorpus);
+  const oldGeneration = current?.current_generation;
+  const visible = new Map<string, string>();
+  if (oldGeneration !== undefined) {
+    const oldRows = await database.all<{ record_id: string; record_digest: string }>(
+      "SELECT record_id, record_digest FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)",
+      [workspaceId, oldGeneration, oldGeneration],
+    );
+    for (const row of oldRows) visible.set(row.record_id, row.record_digest);
+  }
+  const closed = await database.all<{ record_id: string }>(
+    "SELECT record_id FROM candidate_publication_record_closures WHERE candidate_generation_id = ? AND workspace_id = ?",
+    [candidateId, workspaceId],
+  );
+  for (const row of closed) visible.delete(row.record_id);
+  const promoted = await database.all<{ record_id: string; record_digest: string }>(
+    "SELECT record_id, record_digest FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ? AND workspace_id = ? ORDER BY record_id",
+    [candidateId, workspaceId],
+  );
+  for (const row of promoted) visible.set(row.record_id, row.record_digest);
+  const sortedVisible = [...visible.entries()]
+    .map(([record_id, record_digest]) => ({ record_id, record_digest }))
+    .sort((left, right) => left.record_id < right.record_id ? -1 : left.record_id > right.record_id ? 1 : 0);
+  return { ...base, canonical_record_set_digest: logicalRecordSetDigest(sortedVisible), sortedVisible, record_set_digest_corpus_complete: true };
+}
+
 /**
  * The "dependency" kind's opens for THIS publish, derived from the exact
  * same typed input (`CandidateTemplateSets.artifact_dependencies`) and
@@ -1673,7 +1894,69 @@ async function fetchExistingProjectionDependencies(database: SqliteDatabase, wor
   return found;
 }
 
-async function assertPublicationImmutableRows(database: SqliteDatabase, workspaceId: string, input: CandidatePublicationInput, sourceTransitions: readonly unknown[], recordOpens: readonly unknown[], identityAssignments: readonly unknown[], projectionOpens: readonly unknown[], artifactDependencies: readonly unknown[], lookupDependencies: readonly unknown[], lookupRevalidations: readonly unknown[], capabilityStates: readonly unknown[], generation: number, publishedAt: string, materializationSealedAt: string, manifest: GenerationManifestRow, completedSnapshot: SnapshotRow, recordOpenMemo: ReadonlyMap<unknown, RecordOpenMemoEntry>): Promise<void> {
+const FILE_BACKED_TEMPLATE_SEQUENCE = Symbol.for("urdira.file_backed_readonly_array");
+const PROMOTED_RECORD_OPEN_MEMO = Symbol.for("urdira.promoted_record_open_memo");
+
+function isFileBackedTemplateSequence(value: unknown): boolean {
+  return value !== null && typeof value === "object"
+    && (value as { readonly [FILE_BACKED_TEMPLATE_SEQUENCE]?: unknown })[FILE_BACKED_TEMPLATE_SEQUENCE] === true;
+}
+
+function isPromotedRecordOpenMemo(value: unknown): boolean {
+  return value !== null && typeof value === "object"
+    && (value as { readonly [PROMOTED_RECORD_OPEN_MEMO]?: unknown })[PROMOTED_RECORD_OPEN_MEMO] === true;
+}
+
+/** Replay comparison over the already sealed typed relation. This replaces
+ * corpus-sized JS id arrays and chunk queries with two bounded JOIN probes;
+ * SQL compares the authoritative columns using null-safe IS semantics. */
+async function assertStagedCanonicalReplayRows(database: SqliteDatabase, candidateId: string, workspaceId: string, generation: number): Promise<void> {
+  const record = await database.get<Record<string, unknown>>(`SELECT a.record_id, a.valid_from_generation, a.valid_to_generation
+    FROM candidate_publication_record_occurrences s
+    JOIN record_occurrences a ON a.record_id = s.record_id
+    WHERE s.candidate_generation_id = ? AND (
+      a.workspace_id IS NOT s.workspace_id OR a.category IS NOT s.category OR a.kind IS NOT s.kind OR
+      a.universal_kind IS NOT s.universal_kind OR a.schema_version IS NOT s.schema_version OR
+      a.producer_id IS NOT s.producer_id OR a.producer_version IS NOT s.producer_version OR
+      a.owner_artifact_id IS NOT s.owner_artifact_id OR a.owner_artifact_version_id IS NOT s.owner_artifact_version_id OR
+      a.primary_source_span_artifact_version_id IS NOT s.primary_source_span_artifact_version_id OR
+      a.primary_source_span_start_byte IS NOT s.primary_source_span_start_byte OR a.primary_source_span_end_byte IS NOT s.primary_source_span_end_byte OR
+      a.primary_source_span_start_line IS NOT s.primary_source_span_start_line OR a.primary_source_span_end_line IS NOT s.primary_source_span_end_line OR
+      a.valid_from_generation IS NOT s.valid_from_generation OR a.valid_to_generation IS NOT NULL OR
+      a.record_digest IS NOT s.record_digest OR a.body_digest IS NOT s.body_digest OR a.body_byte_length IS NOT s.body_byte_length OR
+      a.body_payload IS NOT s.body_payload OR a.analysis_digest IS NOT s.analysis_digest OR
+      a.analysis_configuration_digest IS NOT s.analysis_configuration_digest OR a.artifact_dependency_digest IS NOT s.artifact_dependency_digest
+    ) LIMIT 1`, [candidateId]);
+  if (record !== undefined) {
+    const id = String(record["record_id"] ?? "");
+    const closedAt = record["valid_to_generation"];
+    if (closedAt !== null && closedAt !== undefined && Number(record["valid_from_generation"]) < generation) {
+      throw new StorageError("storage:record_id_reuse", `Record occurrence ${id} re-mints the record_id of a closed historical row.`, { table: "record_occurrences", row_id: id, publishing_generation: generation });
+    }
+    throw new StorageError("storage:publication_conflict", `Authoritative record occurrence ${id} differs from the sealed publication payload.`, { table: "record_occurrences", row_id: id, comparison: "typed_staging_join" });
+  }
+  const identity = await database.get<{ identity_assignment_id: string }>(`SELECT a.identity_assignment_id
+    FROM candidate_publication_identity_assignments s
+    JOIN identity_assignments a ON a.workspace_id = s.workspace_id AND a.identity_assignment_id = s.identity_assignment_id AND a.valid_from_generation = s.valid_from_generation
+    WHERE s.candidate_generation_id = ? AND (
+      a.identity_type IS NOT s.identity_type OR a.identity_id IS NOT s.identity_id OR a.assignment_kind IS NOT s.assignment_kind OR
+      a.identity_key IS NOT s.identity_key OR a.identity_key_digest IS NOT s.identity_key_digest OR a.record_id IS NOT s.record_id OR
+      a.previous_record_id IS NOT s.previous_record_id OR a.owner_artifact_id IS NOT NULL OR a.owner_artifact_version_id IS NOT NULL OR a.valid_to_generation IS NOT NULL
+    ) LIMIT 1`, [candidateId]);
+  if (identity !== undefined) throw new StorageError("storage:publication_conflict", `Authoritative identity assignment ${identity.identity_assignment_id} differs from the sealed publication payload.`, { table: "identity_assignments", row_id: identity.identity_assignment_id, comparison: "typed_staging_join" });
+
+  // EXCEPT proves that every already-published row for this candidate's
+  // generation is represented by the sealed candidate relation; unlike a
+  // count comparison it also detects a same-count substitution.
+  const extraRecord = await database.get<{ record_id: string }>(`SELECT record_id FROM (
+      SELECT record_id FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation = ?
+      EXCEPT
+      SELECT record_id FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ?
+    ) LIMIT 1`, [workspaceId, generation, candidateId]);
+  if (extraRecord !== undefined) throw new StorageError("storage:publication_conflict", `Authoritative record occurrence ${extraRecord.record_id} is outside the sealed publication payload.`, { table: "record_occurrences", row_id: extraRecord.record_id, comparison: "typed_staging_except" });
+}
+
+async function assertPublicationImmutableRows(database: SqliteDatabase, workspaceId: string, input: CandidatePublicationInput, sourceTransitions: readonly unknown[], recordOpens: readonly unknown[], identityAssignments: readonly unknown[], projectionOpens: readonly unknown[], artifactDependencies: readonly unknown[], lookupDependencies: readonly unknown[], lookupRevalidations: readonly unknown[], capabilityStates: readonly unknown[], generation: number, publishedAt: string, materializationSealedAt: string, manifest: GenerationManifestRow, completedSnapshot: SnapshotRow, recordOpenMemo: ReadonlyMap<unknown, RecordOpenMemoEntry>, freshExternalTemplateSequence: boolean, stagedCanonical?: StagedCanonicalPublicationDescriptor): Promise<void> {
   const conflict = (kind: string, id: string, table: string, row: Record<string, unknown>, expected: Record<string, unknown>): never => { throw new StorageError("storage:publication_conflict", `Authoritative ${kind} ${id} differs from the sealed publication payload.`, { table, row_id: id, mismatched_fields: mismatchedFields(row, expected).join(",") }); };
   const registry = await database.get<Record<string, unknown>>("SELECT * FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [workspaceId, input.target_registry.registry_snapshot_id]);
   {
@@ -1778,8 +2061,9 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
       if (row && !rowMatches(row, expected)) conflict("artifact tombstone", tombstone["artifact_tombstone_id"], "artifact_tombstones", row, expected);
     }
   }
-  const recordCount = await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM record_occurrences WHERE workspace_id = ?", [workspaceId]);
-  if (recordCount?.count !== 0) {
+  if (!freshExternalTemplateSequence && stagedCanonical !== undefined) await assertStagedCanonicalReplayRows(database, input.candidate.candidate_generation_id, workspaceId, generation);
+  const recordCount = freshExternalTemplateSequence || stagedCanonical !== undefined ? undefined : await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM record_occurrences WHERE workspace_id = ?", [workspaceId]);
+  if (!freshExternalTemplateSequence && stagedCanonical === undefined && recordCount?.count !== 0) {
     // (3b) This branch only runs on a resumed/retried or otherwise non-fresh
     // publish (a real first publish takes the `recordCount?.count === 0`
     // fast path above and skips this whole block) -- but when it does run
@@ -1844,29 +2128,51 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
       }
     }
   }
-  const identityCount = await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM identity_assignments WHERE workspace_id = ? AND valid_from_generation = ?", [workspaceId, generation]);
-  if (identityCount?.count !== 0) {
+  // A fresh large publication has never committed any rows for this
+  // candidate. Its streamed INSERT windows are each followed by an exact
+  // `assert_transaction_changes`, so any collision with an earlier stage or
+  // historical generation still rolls the transaction back fail-closed. The
+  // expensive preflight is needed only for `publishing` replay, where already
+  // committed rows must be compared for idempotence. Restrict this shortcut
+  // to the engine's file-backed transport marker; ordinary and test arrays
+  // retain the fully diagnostic preflight path.
+  const identityCount = freshExternalTemplateSequence || stagedCanonical !== undefined ? undefined : await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM identity_assignments WHERE workspace_id = ? AND valid_from_generation = ?", [workspaceId, generation]);
+  if (!freshExternalTemplateSequence && stagedCanonical === undefined && identityCount?.count !== 0) {
     // Decode and query bounded chunks. The former flatMap retained every id
     // (and packed identities would then be decoded a second time), adding a
     // project-sized array at publication. A real first generation takes the
     // count=0 fast path; retries/conflict tests retain exact validation.
-    for (let offset = 0; offset < identityAssignments.length; offset += 4_096) {
-      const chunk: { readonly value: Record<string, any>; readonly id: string }[] = [];
-      for (const entry of identityAssignments.slice(offset, offset + 4_096)) {
-        const unpacked = candidateTemplateValue(entry);
-        if (!unpacked || typeof unpacked !== "object" || typeof (unpacked as Record<string, any>)["identity_assignment_id"] !== "string") continue;
-        const value = unpacked as Record<string, any>;
-        chunk.push({ value, id: String(value["identity_assignment_id"]) });
-      }
-      const existingIdentityAssignments = await fetchExistingRowsById(database, "identity_assignments", workspaceId, "identity_assignment_id", chunk.map((entry) => entry.id), { column: "valid_from_generation", value: generation });
-      for (const { value, id } of chunk) {
+    let chunk: { readonly value: Record<string, any>; readonly id: string }[] = [];
+    const validateIdentityChunk = async (): Promise<void> => {
+      if (chunk.length === 0) return;
+      const currentChunk = chunk;
+      chunk = [];
+      const existingIdentityAssignments = await fetchExistingRowsById(database, "identity_assignments", workspaceId, "identity_assignment_id", currentChunk.map((entry) => entry.id), { column: "valid_from_generation", value: generation });
+      for (const { value, id } of currentChunk) {
         const row = existingIdentityAssignments.get(id);
         if (!row) continue;
         const expected = { identity_assignment_id: id, workspace_id: workspaceId, identity_type: value["identity_type"] ?? "entity", identity_id: value["identity_id"] ?? "", assignment_kind: value["assignment_kind"] ?? "created", identity_key: value["identity_key"] ?? "", identity_key_digest: value["identity_key_digest"] ?? canonicalSha256(value["identity_key"] ?? ""), record_id: value["record_id"] ?? "", previous_record_id: value["previous_record_id"] ?? null, owner_artifact_id: null, owner_artifact_version_id: null, valid_from_generation: generation, valid_to_generation: null };
         if (!rowMatches(row, expected)) conflict("identity assignment", id, "identity_assignments", row, expected);
       }
+    };
+    for (const entry of identityAssignments) {
+        const unpacked = candidateTemplateValue(entry);
+        if (!unpacked || typeof unpacked !== "object" || typeof (unpacked as Record<string, any>)["identity_assignment_id"] !== "string") continue;
+        const value = unpacked as Record<string, any>;
+        chunk.push({ value, id: String(value["identity_assignment_id"]) });
+        if (chunk.length >= 4_096) await validateIdentityChunk();
     }
+    await validateIdentityChunk();
   }
+  // The same fresh, engine-owned file-backed publication that can skip the
+  // record/identity replay preflight above can also skip the projection and
+  // auxiliary-row replay probes below. None of these candidate-scoped rows
+  // can have been committed by an earlier attempt while the candidate is
+  // still `ready`; the set-based INSERT transaction asserts its exact change
+  // count and rolls back on any unexpected collision. A recovered
+  // `publishing` candidate and every external/in-memory template sequence
+  // retain the full diagnostic comparison path.
+  if (!freshExternalTemplateSequence) {
   const projectionIds = projectionOpens.flatMap((entry) => (entry && typeof entry === "object" && typeof (entry as Record<string, any>)["projection_record_id"] === "string" ? [String((entry as Record<string, any>)["projection_record_id"])] : []));
   const existingProjections = await fetchExistingRowsById(database, "projection_occurrences", workspaceId, "projection_record_id", projectionIds, { column: "valid_from_generation", value: generation });
   const existingProjectionDependencies = await fetchExistingProjectionDependencies(database, workspaceId, projectionIds, generation);
@@ -1939,6 +2245,7 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
     const expected = { state_key: key, workspace_id: workspaceId, state_kind: "capability_state", state_json: JSON.stringify(value), reference_workspace_id: workspaceId, reference_snapshot_id: null, reference_source_state_digest: null };
     if (row && !rowMatches(row, expected)) conflict("capability state", key, "control_plane_state", row, expected);
   }
+  }
   const candidateId = input.candidate.candidate_generation_id;
   const snapshotId = `snapshot:${candidateId}`;
   const generationManifestId = `generation-manifest:${candidateId}`;
@@ -1965,35 +2272,39 @@ async function assertPublicationImmutableRows(database: SqliteDatabase, workspac
 }
 
 
-function* artifactDependencyCommandStream(values: readonly unknown[], workspaceId: string, generation: number): Generator<TransactionCommand> {
+function replayCheckedCommand(command: TransactionCommand, required: boolean): readonly TransactionCommand[] {
+  return required ? checkedPublicationCommand(command) : [command];
+}
+
+function* artifactDependencyCommandStream(values: readonly unknown[], workspaceId: string, generation: number, requireReplayChecks = true): Generator<TransactionCommand> {
   for (const entry of values) {
     if (!entry || typeof entry !== "object") continue;
     const value = entry as Record<string, any>;
     const id = value["dependency_entry_id"];
     if (typeof id !== "string") continue;
     const contentDigest = digestLogicalValue(value, "urdira:artifact-dependency:v2");
-    yield* checkedPublicationCommand({ kind: "run", sql: "INSERT INTO artifact_dependencies (dependency_entry_id, workspace_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?) ON CONFLICT(workspace_id, dependency_entry_id, valid_from_generation) DO UPDATE SET content_digest = excluded.content_digest WHERE artifact_dependencies.workspace_id = excluded.workspace_id AND artifact_dependencies.record_id = excluded.record_id AND artifact_dependencies.owner_artifact_id = excluded.owner_artifact_id AND artifact_dependencies.owner_artifact_version_id = excluded.owner_artifact_version_id AND artifact_dependencies.dependency_artifact_id = excluded.dependency_artifact_id AND artifact_dependencies.dependency_artifact_version_id = excluded.dependency_artifact_version_id AND artifact_dependencies.dependency_role = excluded.dependency_role AND artifact_dependencies.producer_id = excluded.producer_id AND artifact_dependencies.producer_version = excluded.producer_version AND artifact_dependencies.valid_to_generation IS excluded.valid_to_generation", params: [id, workspaceId, String(value["record_id"] ?? ""), String(value["owner_artifact_id"] ?? ""), String(value["owner_artifact_version_id"] ?? ""), String(value["dependency_artifact_id"] ?? ""), String(value["dependency_artifact_version_id"] ?? ""), String(value["dependency_role"] ?? "reference"), String(value["producer_id"] ?? "candidate"), String(value["producer_version"] ?? "1"), generation, contentDigest] });
+    yield* replayCheckedCommand({ kind: "run", sql: "INSERT INTO artifact_dependencies (dependency_entry_id, workspace_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?) ON CONFLICT(workspace_id, dependency_entry_id, valid_from_generation) DO UPDATE SET content_digest = excluded.content_digest WHERE artifact_dependencies.workspace_id = excluded.workspace_id AND artifact_dependencies.record_id = excluded.record_id AND artifact_dependencies.owner_artifact_id = excluded.owner_artifact_id AND artifact_dependencies.owner_artifact_version_id = excluded.owner_artifact_version_id AND artifact_dependencies.dependency_artifact_id = excluded.dependency_artifact_id AND artifact_dependencies.dependency_artifact_version_id = excluded.dependency_artifact_version_id AND artifact_dependencies.dependency_role = excluded.dependency_role AND artifact_dependencies.producer_id = excluded.producer_id AND artifact_dependencies.producer_version = excluded.producer_version AND artifact_dependencies.valid_to_generation IS excluded.valid_to_generation", params: [id, workspaceId, String(value["record_id"] ?? ""), String(value["owner_artifact_id"] ?? ""), String(value["owner_artifact_version_id"] ?? ""), String(value["dependency_artifact_id"] ?? ""), String(value["dependency_artifact_version_id"] ?? ""), String(value["dependency_role"] ?? "reference"), String(value["producer_id"] ?? "candidate"), String(value["producer_version"] ?? "1"), generation, contentDigest] }, requireReplayChecks);
   }
 }
 
-function artifactDependencyCommands(values: readonly unknown[], workspaceId: string, generation: number): TransactionCommand[] {
-  return [...artifactDependencyCommandStream(values, workspaceId, generation)];
+function artifactDependencyCommands(values: readonly unknown[], workspaceId: string, generation: number, requireReplayChecks = true): TransactionCommand[] {
+  return [...artifactDependencyCommandStream(values, workspaceId, generation, requireReplayChecks)];
 }
 
-function lookupDependencyCommands(values: readonly unknown[], revalidations: readonly unknown[], workspaceId: string, candidateId: string, generation: number, publishedAt: string): TransactionCommand[] {
+function lookupDependencyCommands(values: readonly unknown[], revalidations: readonly unknown[], workspaceId: string, candidateId: string, generation: number, publishedAt: string, requireReplayChecks = true): TransactionCommand[] {
   const commands: TransactionCommand[] = [];
   for (const entry of values) {
     if (!entry || typeof entry !== "object") continue;
     const value = entry as Record<string, any>;
     const id = value["lookup_dependency_id"];
     if (typeof id !== "string") continue;
-    commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO candidate_lookup_dependencies (lookup_dependency_id, workspace_id, candidate_generation_id, consumer_type, consumer_id, owner_artifact_id, owner_artifact_version_id, operation, normalized_selector_or_address, selector_digest, previous_result_set_digest, invalidation_scope, valid_from_generation, valid_to_generation, dependency_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?) ON CONFLICT(lookup_dependency_id) DO UPDATE SET dependency_digest = excluded.dependency_digest WHERE candidate_lookup_dependencies.workspace_id = excluded.workspace_id AND candidate_lookup_dependencies.candidate_generation_id = excluded.candidate_generation_id AND candidate_lookup_dependencies.consumer_type = excluded.consumer_type AND candidate_lookup_dependencies.consumer_id = excluded.consumer_id AND candidate_lookup_dependencies.owner_artifact_id IS excluded.owner_artifact_id AND candidate_lookup_dependencies.owner_artifact_version_id IS excluded.owner_artifact_version_id AND candidate_lookup_dependencies.operation = excluded.operation AND candidate_lookup_dependencies.normalized_selector_or_address = excluded.normalized_selector_or_address AND candidate_lookup_dependencies.selector_digest = excluded.selector_digest AND candidate_lookup_dependencies.previous_result_set_digest = excluded.previous_result_set_digest AND candidate_lookup_dependencies.invalidation_scope = excluded.invalidation_scope AND candidate_lookup_dependencies.valid_from_generation = excluded.valid_from_generation AND candidate_lookup_dependencies.valid_to_generation IS excluded.valid_to_generation", params: [id, workspaceId, candidateId, String(value["consumer_type"] ?? "unknown"), String(value["consumer_id"] ?? ""), sqliteValue(value["owner_artifact_id"] ?? null), sqliteValue(value["owner_artifact_version_id"] ?? null), String(value["operation"] ?? "lookup"), String(value["normalized_selector_or_address"] ?? ""), String(value["selector_digest"] ?? canonicalSha256(value["normalized_selector_or_address"] ?? "")), String(value["previous_result_set_digest"] ?? ""), String(value["invalidation_scope"] ?? "candidate"), generation, String(value["dependency_digest"] ?? digestLogicalValue(value, "urdira:lookup-dependency:v2"))] }));
+    commands.push(...replayCheckedCommand({ kind: "run", sql: "INSERT INTO candidate_lookup_dependencies (lookup_dependency_id, workspace_id, candidate_generation_id, consumer_type, consumer_id, owner_artifact_id, owner_artifact_version_id, operation, normalized_selector_or_address, selector_digest, previous_result_set_digest, invalidation_scope, valid_from_generation, valid_to_generation, dependency_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?) ON CONFLICT(lookup_dependency_id) DO UPDATE SET dependency_digest = excluded.dependency_digest WHERE candidate_lookup_dependencies.workspace_id = excluded.workspace_id AND candidate_lookup_dependencies.candidate_generation_id = excluded.candidate_generation_id AND candidate_lookup_dependencies.consumer_type = excluded.consumer_type AND candidate_lookup_dependencies.consumer_id = excluded.consumer_id AND candidate_lookup_dependencies.owner_artifact_id IS excluded.owner_artifact_id AND candidate_lookup_dependencies.owner_artifact_version_id IS excluded.owner_artifact_version_id AND candidate_lookup_dependencies.operation = excluded.operation AND candidate_lookup_dependencies.normalized_selector_or_address = excluded.normalized_selector_or_address AND candidate_lookup_dependencies.selector_digest = excluded.selector_digest AND candidate_lookup_dependencies.previous_result_set_digest = excluded.previous_result_set_digest AND candidate_lookup_dependencies.invalidation_scope = excluded.invalidation_scope AND candidate_lookup_dependencies.valid_from_generation = excluded.valid_from_generation AND candidate_lookup_dependencies.valid_to_generation IS excluded.valid_to_generation", params: [id, workspaceId, candidateId, String(value["consumer_type"] ?? "unknown"), String(value["consumer_id"] ?? ""), sqliteValue(value["owner_artifact_id"] ?? null), sqliteValue(value["owner_artifact_version_id"] ?? null), String(value["operation"] ?? "lookup"), String(value["normalized_selector_or_address"] ?? ""), String(value["selector_digest"] ?? canonicalSha256(value["normalized_selector_or_address"] ?? "")), String(value["previous_result_set_digest"] ?? ""), String(value["invalidation_scope"] ?? "candidate"), generation, String(value["dependency_digest"] ?? digestLogicalValue(value, "urdira:lookup-dependency:v2"))] }, requireReplayChecks));
   }
   for (const entry of revalidations) {
     if (!entry || typeof entry !== "object") continue;
     const value = entry as Record<string, any>;
     const id = String(value["lookup_dependency_id"] ?? canonicalSha256(value));
-    commands.push(...checkedPublicationCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'lookup_revalidation', ?, ?, NULL, NULL, ?) ON CONFLICT(state_key) DO NOTHING", params: [`lookup_revalidation:${candidateId}:${id}`, workspaceId, JSON.stringify({ ...value, candidate_generation_id: candidateId, valid_from_generation: generation }), workspaceId, publishedAt] }));
+    commands.push(...replayCheckedCommand({ kind: "run", sql: "INSERT INTO control_plane_state (state_key, workspace_id, state_kind, state_json, reference_workspace_id, reference_snapshot_id, reference_source_state_digest, updated_at) VALUES (?, ?, 'lookup_revalidation', ?, ?, NULL, NULL, ?) ON CONFLICT(state_key) DO NOTHING", params: [`lookup_revalidation:${candidateId}:${id}`, workspaceId, JSON.stringify({ ...value, candidate_generation_id: candidateId, valid_from_generation: generation }), workspaceId, publishedAt] }, requireReplayChecks));
   }
   return commands;
 }
@@ -2058,12 +2369,14 @@ DROP INDEX IF EXISTS record_occurrences_visible_idx;
 DROP INDEX IF EXISTS record_occurrences_workspace_owner_idx;
 DROP INDEX IF EXISTS identity_assignments_lookup_idx;
 DROP INDEX IF EXISTS identity_assignments_key_idx;
+DROP INDEX IF EXISTS identity_assignments_owner_key_idx;
 DROP INDEX IF EXISTS identity_assignments_record_idx;`;
 const INITIAL_CANONICAL_INDEX_BUILD_SQL = `
 CREATE INDEX record_occurrences_visible_idx ON record_occurrences(workspace_id, valid_from_generation, valid_to_generation);
 CREATE INDEX record_occurrences_workspace_owner_idx ON record_occurrences(workspace_id, owner_artifact_id, valid_from_generation, valid_to_generation);
 CREATE INDEX identity_assignments_lookup_idx ON identity_assignments(workspace_id, identity_type, identity_id, valid_from_generation, valid_to_generation);
 CREATE INDEX identity_assignments_key_idx ON identity_assignments(workspace_id, identity_key_digest, valid_from_generation, identity_type, identity_key, record_id);
+CREATE INDEX identity_assignments_owner_key_idx ON identity_assignments(workspace_id, identity_type, identity_key, valid_from_generation, valid_to_generation, record_id);
 CREATE INDEX identity_assignments_record_idx ON identity_assignments(workspace_id, record_id, valid_from_generation, valid_to_generation);`;
 
 // Fixed-width occurrence rows are batched at the producer, before commands
@@ -2266,6 +2579,347 @@ function identityCommands(assignments: readonly unknown[], workspaceId: string, 
   return [...identityCommandStream(assignments, workspaceId, generation)];
 }
 
+interface StagedCanonicalPublicationDescriptor {
+  readonly record_count: number;
+  readonly facet_count: number;
+  readonly identity_count: number;
+  readonly canonical_byte_length: number;
+  readonly first_record_id: string | null;
+  readonly last_record_id: string | null;
+  readonly record_sequence_digest: string;
+  readonly identity_sequence_digest: string;
+}
+
+interface StagedProjectionPublicationDescriptor {
+  readonly projection_count: number;
+  readonly dependency_count: number;
+  readonly value_node_count: number;
+  readonly first_projection_record_id: string | null;
+  readonly last_projection_record_id: string | null;
+  readonly projection_sequence_digest: string;
+}
+
+interface StagedTypedPublicationDescriptor {
+  readonly canonical: StagedCanonicalPublicationDescriptor;
+  readonly projections: StagedProjectionPublicationDescriptor;
+  readonly closure_count: number;
+}
+
+const STAGED_RECORD_INSERT_SQL = `INSERT INTO candidate_publication_record_occurrences (
+  candidate_generation_id, row_ordinal, record_id, workspace_id, category, kind, universal_kind, schema_version,
+  producer_id, producer_version, owner_artifact_id, owner_artifact_version_id,
+  primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte,
+  primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, record_digest,
+  body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest
+) VALUES (${Array.from({ length: 25 }, () => "?").join(", ")})`;
+const STAGED_FACET_INSERT_SQL = "INSERT INTO candidate_publication_record_facets (candidate_generation_id, row_ordinal, workspace_id, record_id, valid_from_generation, facet_ordinal, facet) VALUES (?, ?, ?, ?, ?, ?, ?)";
+const STAGED_RECORD_CLOSURE_INSERT_SQL = "INSERT INTO candidate_publication_record_closures (candidate_generation_id, row_ordinal, workspace_id, record_id, valid_to_generation) VALUES (?, ?, ?, ?, ?)";
+const STAGED_IDENTITY_INSERT_SQL = "INSERT INTO candidate_publication_identity_assignments (candidate_generation_id, row_ordinal, identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, valid_from_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const STAGED_PROJECTION_INSERT_SQL = "INSERT INTO candidate_publication_projection_occurrences (candidate_generation_id, row_ordinal, projection_record_id, workspace_id, projection_kind, projection_key, owner_artifact_id, owner_artifact_version_id, source_artifact_version_ids, source_record_ids, source_projection_record_ids, generator, generator_version, generator_configuration_digest, valid_from_generation, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const STAGED_PROJECTION_DEPENDENCY_INSERT_SQL = "INSERT INTO candidate_publication_projection_dependencies (candidate_generation_id, row_ordinal, workspace_id, projection_record_id, valid_from_generation, source_type, source_id) VALUES (?, ?, ?, ?, ?, ?, ?)";
+const STAGED_PROJECTION_VALUE_INSERT_SQL = "INSERT INTO candidate_publication_projection_value_nodes (candidate_generation_id, row_ordinal, workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+/** Builds the invisible canonical publication relation once. The descriptor
+ * and every typed row commit atomically, so final publication can use a fixed
+ * number of INSERT ... SELECT statements and replay can discard an incomplete
+ * prior build without inspecting partially staged rows. */
+async function stageCanonicalPublicationRows(input: {
+  readonly database: SqliteDatabase;
+  readonly candidate_id: string;
+  readonly workspace_id: string;
+  readonly generation: number;
+  readonly record_opens: readonly unknown[];
+  readonly record_closures: readonly unknown[];
+  readonly identity_assignments: readonly unknown[];
+  readonly projection_opens: readonly unknown[];
+  readonly record_open_memo: ReadonlyMap<unknown, RecordOpenMemoEntry>;
+  readonly parsed_by_entry?: ReadonlyMap<unknown, Record<string, unknown>>;
+  readonly record_sequence_digest: string;
+  readonly identity_sequence_digest: string;
+  readonly projection_sequence_digest: string;
+  readonly sealed_at: string;
+  /** First-scan fast lane: Rust already sealed every canonical scalar in
+   * candidate_staged_records, so SQLite can promote it without a JS row loop. */
+  readonly direct_fact_delta_records?: boolean;
+}): Promise<StagedTypedPublicationDescriptor> {
+  let recordCount = 0;
+  let facetCount = 0;
+  let identityCount = 0;
+  let closureCount = 0;
+  let canonicalByteLength = 0;
+  let firstRecordId: string | null = null;
+  let lastRecordId: string | null = null;
+  let projectionCount = 0;
+  let projectionDependencyCount = 0;
+  let projectionValueNodeCount = 0;
+  let firstProjectionRecordId: string | null = null;
+  let lastProjectionRecordId: string | null = null;
+  const batchRows = 512;
+  const commands = function* (): Generator<TransactionCommand> {
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_descriptors WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_record_facets WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_record_closures WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_identity_assignments WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_projection_descriptors WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_projection_value_nodes WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_projection_dependencies WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    yield { kind: "run", sql: "DELETE FROM candidate_publication_projection_occurrences WHERE candidate_generation_id = ?", params: [input.candidate_id] };
+    if (input.direct_fact_delta_records === true) {
+      yield {
+        kind: "run",
+        sql: `INSERT INTO candidate_publication_record_occurrences (
+          candidate_generation_id, row_ordinal, record_id, workspace_id, category, kind, universal_kind, schema_version,
+          producer_id, producer_version, owner_artifact_id, owner_artifact_version_id,
+          primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte,
+          primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, record_digest,
+          body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest
+        )
+        SELECT ?, ROW_NUMBER() OVER (ORDER BY json_extract(s.text_6, '$.record_id')) - 1,
+          json_extract(s.text_6, '$.record_id'), ?, s.text_1, s.text_2, s.text_3,
+          CAST(json_extract(s.text_6, '$.schema_version') AS INTEGER), 'candidate', '1', n.owner_artifact_id, n.owner_artifact_version_id,
+          json_extract(s.text_6, '$.primary_source_span.artifact_version_id'), json_extract(s.text_6, '$.primary_source_span.start_byte'),
+          json_extract(s.text_6, '$.primary_source_span.end_byte'), json_extract(s.text_6, '$.primary_source_span.start_line'),
+          json_extract(s.text_6, '$.primary_source_span.end_line'), ?, json_extract(s.text_6, '$.record_digest'),
+          json_extract(s.text_6, '$.body_digest'), CAST(json_extract(s.text_6, '$.body_byte_length') AS INTEGER), unhex(s.text_7),
+          json_extract(s.text_6, '$.record_digest'), json_extract(s.text_6, '$.record_digest'), json_extract(s.text_6, '$.record_digest')
+        FROM candidate_staged_records s
+        JOIN candidate_fact_delta_namespaces n ON n.fact_delta_key = s.fact_delta_key
+        WHERE n.workspace_id = ? AND n.candidate_generation_id = ? AND s.text_6 <> '' AND s.text_7 <> ''
+          AND n.owner_artifact_id IS NOT NULL AND n.owner_artifact_version_id IS NOT NULL
+        ORDER BY json_extract(s.text_6, '$.record_id')`,
+        params: [input.candidate_id, input.workspace_id, input.generation, input.workspace_id, input.candidate_id],
+      };
+      yield {
+        kind: "run",
+        sql: `INSERT INTO candidate_publication_record_facets (candidate_generation_id, row_ordinal, workspace_id, record_id, valid_from_generation, facet_ordinal, facet)
+          SELECT ?, ROW_NUMBER() OVER (ORDER BY json_extract(s.text_6, '$.record_id'), CAST(f.key AS INTEGER)) - 1, ?,
+            json_extract(s.text_6, '$.record_id'), ?, CAST(f.key AS INTEGER), CAST(f.value AS TEXT)
+          FROM candidate_staged_records s
+          JOIN candidate_fact_delta_namespaces n ON n.fact_delta_key = s.fact_delta_key
+          JOIN json_each(json_extract(s.text_6, '$.facets')) f
+          WHERE n.workspace_id = ? AND n.candidate_generation_id = ? AND s.text_6 <> ''
+          ORDER BY json_extract(s.text_6, '$.record_id'), CAST(f.key AS INTEGER)`,
+        params: [input.candidate_id, input.workspace_id, input.generation, input.workspace_id, input.candidate_id],
+      };
+    }
+    let recordParams: SqliteValue[] = [];
+    let recordRows = 0;
+    let facetParams: SqliteValue[] = [];
+    let facetRows = 0;
+    for (const entry of input.direct_fact_delta_records === true ? [] : input.record_opens) {
+      if (entry === null || typeof entry !== "object") continue;
+      const wrapper = entry as Record<string, unknown>;
+      const raw = wrapper["record_without_validity"];
+      if (typeof raw !== "string") continue;
+      const opened = recordOpenMemoEntry(entry, input.record_open_memo);
+      if (opened === undefined) continue;
+      const record = input.parsed_by_entry?.get(entry) ?? (() => {
+        try { return unwrapRecordTemplate(JSON.parse(raw)); }
+        catch { throw new StorageError("storage:publication_invalid", "Record open template is not valid JSON."); }
+      })();
+      const params = recordOpenParams(wrapper, record, opened, input.workspace_id, input.generation);
+      recordParams.push(input.candidate_id, recordCount, ...params);
+      recordRows += 1;
+      firstRecordId ??= opened.recordId;
+      lastRecordId = opened.recordId;
+      const bodyLength = params[18];
+      if (typeof bodyLength !== "number" || !Number.isSafeInteger(bodyLength) || bodyLength < 0) throw new StorageError("storage:publication_invalid", "Staged record body length is invalid.");
+      canonicalByteLength += bodyLength;
+      const facets = Array.isArray(record["facets"]) ? record["facets"] : [];
+      for (let facetOrdinal = 0; facetOrdinal < facets.length; facetOrdinal += 1) {
+        const facet = facets[facetOrdinal];
+        if (typeof facet !== "string") continue;
+        facetParams.push(input.candidate_id, facetCount, input.workspace_id, opened.recordId, input.generation, facetOrdinal, facet);
+        facetRows += 1;
+        facetCount += 1;
+        if (facetRows >= batchRows) {
+          yield { kind: "run_batch", sql: STAGED_FACET_INSERT_SQL, rows: facetRows, params_flat: facetParams };
+          facetParams = [];
+          facetRows = 0;
+        }
+      }
+      recordCount += 1;
+      if (recordRows >= batchRows) {
+        yield { kind: "run_batch", sql: STAGED_RECORD_INSERT_SQL, rows: recordRows, params_flat: recordParams };
+        recordParams = [];
+        recordRows = 0;
+      }
+    }
+    if (recordRows > 0) yield { kind: "run_batch", sql: STAGED_RECORD_INSERT_SQL, rows: recordRows, params_flat: recordParams };
+    if (facetRows > 0) yield { kind: "run_batch", sql: STAGED_FACET_INSERT_SQL, rows: facetRows, params_flat: facetParams };
+    let closureParams: SqliteValue[] = [];
+    let closureRows = 0;
+    for (const entry of input.record_closures) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const recordId = (entry as Record<string, unknown>)["record_id"];
+      if (typeof recordId !== "string") continue;
+      closureParams.push(input.candidate_id, closureCount, input.workspace_id, recordId, input.generation);
+      closureRows += 1;
+      closureCount += 1;
+      if (closureRows >= batchRows) {
+        yield { kind: "run_batch", sql: STAGED_RECORD_CLOSURE_INSERT_SQL, rows: closureRows, params_flat: closureParams };
+        closureParams = [];
+        closureRows = 0;
+      }
+    }
+    if (closureRows > 0) yield { kind: "run_batch", sql: STAGED_RECORD_CLOSURE_INSERT_SQL, rows: closureRows, params_flat: closureParams };
+    if (input.direct_fact_delta_records === true) {
+      yield {
+        kind: "run",
+        sql: `INSERT INTO candidate_publication_identity_assignments (
+          candidate_generation_id, row_ordinal, identity_assignment_id, workspace_id, identity_type, identity_id,
+          assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, valid_from_generation
+        )
+        SELECT ?, ROW_NUMBER() OVER (ORDER BY json_extract(s.text_6, '$.identity_assignment_id')) - 1,
+          json_extract(s.text_6, '$.identity_assignment_id'), ?, json_extract(s.text_6, '$.identity_type'),
+          json_extract(s.text_6, '$.identity_id'), 'created', json_extract(s.text_6, '$.identity_key'),
+          json_extract(s.text_6, '$.identity_key_digest'), json_extract(s.text_6, '$.record_id'), NULL, ?
+        FROM candidate_staged_records s
+        JOIN candidate_fact_delta_namespaces n ON n.fact_delta_key = s.fact_delta_key
+        WHERE n.workspace_id = ? AND n.candidate_generation_id = ? AND s.text_6 <> '' AND s.text_7 <> ''
+        ORDER BY json_extract(s.text_6, '$.identity_assignment_id')`,
+        params: [input.candidate_id, input.workspace_id, input.generation, input.workspace_id, input.candidate_id],
+      };
+    }
+    let identityParams: SqliteValue[] = [];
+    let identityRows = 0;
+    for (const entry of input.direct_fact_delta_records === true ? [] : input.identity_assignments) {
+      const unpacked = candidateTemplateValue(entry);
+      if (unpacked === null || typeof unpacked !== "object") continue;
+      const value = unpacked as Record<string, any>;
+      if (typeof value["identity_assignment_id"] !== "string") continue;
+      identityParams.push(input.candidate_id, identityCount, ...identityAssignmentParams(value, input.workspace_id, input.generation));
+      identityRows += 1;
+      identityCount += 1;
+      if (identityRows >= batchRows) {
+        yield { kind: "run_batch", sql: STAGED_IDENTITY_INSERT_SQL, rows: identityRows, params_flat: identityParams };
+        identityParams = [];
+        identityRows = 0;
+      }
+    }
+    if (identityRows > 0) yield { kind: "run_batch", sql: STAGED_IDENTITY_INSERT_SQL, rows: identityRows, params_flat: identityParams };
+    let projectionParams: SqliteValue[] = [];
+    let projectionRows = 0;
+    let dependencyParams: SqliteValue[] = [];
+    let dependencyRows = 0;
+    let valueParams: SqliteValue[] = [];
+    let valueRows = 0;
+    for (const entry of input.projection_opens) {
+      if (entry === null || typeof entry !== "object") continue;
+      const projection = entry as Record<string, unknown>;
+      const projectionId = projection["projection_record_id"];
+      if (typeof projectionId !== "string") continue;
+      const artifacts = Array.isArray(projection["source_artifact_version_ids"]) ? projection["source_artifact_version_ids"] : [];
+      const records = Array.isArray(projection["source_record_ids"]) ? projection["source_record_ids"] : [];
+      const projections = Array.isArray(projection["source_projection_record_ids"]) ? projection["source_projection_record_ids"] : [];
+      const contentDigest = canonicalSha256(projectionContentDigestInput(projection));
+      projectionParams.push(input.candidate_id, projectionCount, ...projectionOpenParams(projection, projectionId, artifacts, records, projections, contentDigest, input.workspace_id, input.generation));
+      projectionRows += 1;
+      firstProjectionRecordId ??= projectionId;
+      lastProjectionRecordId = projectionId;
+      projectionCount += 1;
+      if (projectionRows >= batchRows) {
+        yield { kind: "run_batch", sql: STAGED_PROJECTION_INSERT_SQL, rows: projectionRows, params_flat: projectionParams };
+        projectionParams = [];
+        projectionRows = 0;
+      }
+      for (const [sourceType, values] of [["artifact_version", artifacts], ["record", records], ["projection", projections]] as const) {
+        for (const sourceId of values) {
+          dependencyParams.push(input.candidate_id, projectionDependencyCount, input.workspace_id, projectionId, input.generation, sourceType, String(sourceId));
+          dependencyRows += 1;
+          projectionDependencyCount += 1;
+          if (dependencyRows >= batchRows) {
+            yield { kind: "run_batch", sql: STAGED_PROJECTION_DEPENDENCY_INSERT_SQL, rows: dependencyRows, params_flat: dependencyParams };
+            dependencyParams = [];
+            dependencyRows = 0;
+          }
+        }
+      }
+      for (const valueRow of iterateRelationalValue(input.workspace_id, projectionId, input.generation, projection["payload"] ?? null)) {
+        valueParams.push(input.candidate_id, projectionValueNodeCount, valueRow.workspace_id, valueRow.record_id, valueRow.valid_from_generation, valueRow.value_path, valueRow.parent_path, valueRow.sequence_ordinal, valueRow.map_key, valueRow.value_kind, valueRow.text_value, valueRow.integer_value, valueRow.real_value, valueRow.bool_value, valueRow.bytes_value);
+        valueRows += 1;
+        projectionValueNodeCount += 1;
+        if (valueRows >= batchRows) {
+          yield { kind: "run_batch", sql: STAGED_PROJECTION_VALUE_INSERT_SQL, rows: valueRows, params_flat: valueParams };
+          valueParams = [];
+          valueRows = 0;
+        }
+      }
+    }
+    if (projectionRows > 0) yield { kind: "run_batch", sql: STAGED_PROJECTION_INSERT_SQL, rows: projectionRows, params_flat: projectionParams };
+    if (dependencyRows > 0) yield { kind: "run_batch", sql: STAGED_PROJECTION_DEPENDENCY_INSERT_SQL, rows: dependencyRows, params_flat: dependencyParams };
+    if (valueRows > 0) yield { kind: "run_batch", sql: STAGED_PROJECTION_VALUE_INSERT_SQL, rows: valueRows, params_flat: valueParams };
+    yield input.direct_fact_delta_records === true ? {
+      kind: "run",
+      sql: `INSERT INTO candidate_publication_descriptors (candidate_generation_id, workspace_id, record_count, facet_count, identity_count, canonical_byte_length, first_record_id, last_record_id, record_sequence_digest, identity_sequence_digest, sealed_at)
+        SELECT ?, ?,
+          (SELECT COUNT(*) FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ?),
+          (SELECT COUNT(*) FROM candidate_publication_record_facets WHERE candidate_generation_id = ?),
+          (SELECT COUNT(*) FROM candidate_publication_identity_assignments WHERE candidate_generation_id = ?),
+          COALESCE((SELECT SUM(body_byte_length) FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ?), 0),
+          (SELECT record_id FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ? ORDER BY row_ordinal LIMIT 1),
+          (SELECT record_id FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ? ORDER BY row_ordinal DESC LIMIT 1),
+          ?, ?, ?`,
+      params: [input.candidate_id, input.workspace_id, input.candidate_id, input.candidate_id, input.candidate_id, input.candidate_id, input.candidate_id, input.candidate_id, input.record_sequence_digest, input.identity_sequence_digest, input.sealed_at],
+    } : {
+      kind: "run",
+      sql: "INSERT INTO candidate_publication_descriptors (candidate_generation_id, workspace_id, record_count, facet_count, identity_count, canonical_byte_length, first_record_id, last_record_id, record_sequence_digest, identity_sequence_digest, sealed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      params: [input.candidate_id, input.workspace_id, recordCount, facetCount, identityCount, canonicalByteLength, firstRecordId, lastRecordId, input.record_sequence_digest, input.identity_sequence_digest, input.sealed_at],
+    };
+    yield {
+      kind: "run",
+      sql: "INSERT INTO candidate_publication_projection_descriptors (candidate_generation_id, workspace_id, projection_count, dependency_count, value_node_count, first_projection_record_id, last_projection_record_id, projection_sequence_digest, sealed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      params: [input.candidate_id, input.workspace_id, projectionCount, projectionDependencyCount, projectionValueNodeCount, firstProjectionRecordId, lastProjectionRecordId, input.projection_sequence_digest, input.sealed_at],
+    };
+  };
+  await input.database.transactionChunked(commands(), undefined, { transfer_params: true, discard_results: true });
+  const closureDescriptor = await input.database.get<{ count: number }>(
+    "SELECT COUNT(*) AS count FROM candidate_publication_record_closures WHERE candidate_generation_id = ?",
+    [input.candidate_id],
+  );
+  if (closureDescriptor?.count !== input.record_closures.length) {
+    throw new StorageError("storage:publication_invalid", "Typed record-closure staging is incomplete.");
+  }
+  closureCount = closureDescriptor.count;
+  if (input.direct_fact_delta_records === true) {
+    const descriptor = await input.database.get<{
+      record_count: number; facet_count: number; identity_count: number; canonical_byte_length: number;
+      first_record_id: string | null; last_record_id: string | null;
+    }>("SELECT record_count, facet_count, identity_count, canonical_byte_length, first_record_id, last_record_id FROM candidate_publication_descriptors WHERE candidate_generation_id = ?", [input.candidate_id]);
+    if (descriptor === undefined || descriptor.record_count !== input.record_opens.length || descriptor.identity_count !== input.identity_assignments.length) {
+      throw new StorageError("storage:publication_invalid", "Rust-sealed FactDelta publication staging is incomplete.");
+    }
+    recordCount = descriptor.record_count;
+    facetCount = descriptor.facet_count;
+    identityCount = descriptor.identity_count;
+    canonicalByteLength = descriptor.canonical_byte_length;
+    firstRecordId = descriptor.first_record_id;
+    lastRecordId = descriptor.last_record_id;
+  }
+  return Object.freeze({
+    canonical: Object.freeze({
+      record_count: recordCount,
+      facet_count: facetCount,
+      identity_count: identityCount,
+      canonical_byte_length: canonicalByteLength,
+      first_record_id: firstRecordId,
+      last_record_id: lastRecordId,
+      record_sequence_digest: input.record_sequence_digest,
+      identity_sequence_digest: input.identity_sequence_digest,
+    }),
+    projections: Object.freeze({
+      projection_count: projectionCount,
+      dependency_count: projectionDependencyCount,
+      value_node_count: projectionValueNodeCount,
+      first_projection_record_id: firstProjectionRecordId,
+      last_projection_record_id: lastProjectionRecordId,
+      projection_sequence_digest: input.projection_sequence_digest,
+    }),
+    closure_count: closureCount,
+  });
+}
+
 /**
  * The exact field set `candidate-materialization.ts`'s `projectionDigest`
  * digests (decision 11: excludes `workspace_id` -- the canonical layer's
@@ -2301,20 +2955,20 @@ function projectionOpenParams(projection: Record<string, unknown>, id: string, a
   return [id, workspaceId, sqliteValue(projection["projection_kind"] ?? "unknown"), sqliteValue(projection["projection_key"] ?? id), sqliteValue(projection["owner_artifact_id"] ?? ""), sqliteValue(projection["owner_artifact_version_id"] ?? ""), JSON.stringify(artifacts), JSON.stringify(records), JSON.stringify(projections), sqliteValue(projection["generator"] ?? ""), sqliteValue(projection["generator_version"] ?? ""), sqliteValue(projection["generator_configuration_digest"] ?? ""), generation, contentDigest];
 }
 
-function* flushProjectionOpenWindow(entries: readonly ProjectionOpenStreamEntry[], workspaceId: string, generation: number): Generator<TransactionCommand> {
+function* flushProjectionOpenWindow(entries: readonly ProjectionOpenStreamEntry[], workspaceId: string, generation: number, requireReplayChecks: boolean): Generator<TransactionCommand> {
   if (entries.length === 0) return;
   yield { kind: "transaction_checkpoint" };
   yield { kind: "run", sql: `${PROJECTION_OCCURRENCE_INSERT_SQL}${entries.map(() => PROJECTION_OCCURRENCE_PLACEHOLDER).join(", ")}${PROJECTION_OCCURRENCE_INSERT_SUFFIX}`, params: entries.flatMap((entry) => entry.params) };
   yield { kind: "assert_transaction_changes", expected: entries.length };
   const valueBatches = new RelationalValueBatchWriter("projection_value_nodes");
   for (const entry of entries) {
-    for (const [sourceType, sourceValues] of [["artifact_version", entry.artifacts], ["record", entry.records], ["projection", entry.projections]] as const) for (const sourceId of sourceValues) yield* checkedPublicationCommand({ kind: "run", sql: "INSERT OR IGNORE INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id) VALUES (?, ?, ?, ?, ?)", params: [workspaceId, entry.id, generation, sourceType, String(sourceId)] });
+    for (const [sourceType, sourceValues] of [["artifact_version", entry.artifacts], ["record", entry.records], ["projection", entry.projections]] as const) for (const sourceId of sourceValues) yield* replayCheckedCommand({ kind: "run", sql: "INSERT OR IGNORE INTO projection_occurrence_dependencies (workspace_id, projection_record_id, valid_from_generation, source_type, source_id) VALUES (?, ?, ?, ?, ?)", params: [workspaceId, entry.id, generation, sourceType, String(sourceId)] }, requireReplayChecks);
     yield* valueBatches.push(iterateRelationalValue(workspaceId, entry.id, generation, entry.projection["payload"] ?? null));
   }
   yield* valueBatches.finish();
 }
 
-function* projectionCommandStream(opens: readonly unknown[], workspaceId: string, generation: number, batch = true): Generator<TransactionCommand> {
+function* projectionCommandStream(opens: readonly unknown[], workspaceId: string, generation: number, batch = true, requireReplayChecks = true): Generator<TransactionCommand> {
   const window: ProjectionOpenStreamEntry[] = [];
   const unbatchedValueBatches = batch ? undefined : new RelationalValueBatchWriter("projection_value_nodes");
   for (const value of opens) {
@@ -2335,11 +2989,11 @@ function* projectionCommandStream(opens: readonly unknown[], workspaceId: string
     }
     window.push(streamEntry);
     if (window.length >= STREAMING_OCCURRENCE_BATCH_MAX_ROWS) {
-      yield* flushProjectionOpenWindow(window, workspaceId, generation);
+      yield* flushProjectionOpenWindow(window, workspaceId, generation, requireReplayChecks);
       window.length = 0;
     }
   }
-  if (batch) yield* flushProjectionOpenWindow(window, workspaceId, generation);
+  if (batch) yield* flushProjectionOpenWindow(window, workspaceId, generation, requireReplayChecks);
   else yield* unbatchedValueBatches!.finish();
 }
 

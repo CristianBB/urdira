@@ -1,5 +1,9 @@
 export { EngineError } from "./errors.js";
 export { mapWithConcurrency } from "./concurrency.js";
+// Canonical bytes/digests are a core-owned authority. Re-exporting the narrow
+// primitives keeps the composed application from importing the canonical
+// package directly while building private Rust-engine envelopes.
+export { canonicalBytes, digestBytes } from "@urdira/canonical";
 // Re-exported so a composing application (`apps/urdira`) can record its OWN
 // sub-buckets into the exact same `URDIRA_STORAGE_DEBUG_TIMING`-gated bucket
 // map `workspace-indexing-session.ts` snapshots/logs as "engine timings" --
@@ -19,6 +23,7 @@ export { RecordBodyInterner } from "./record-body-interner.js";
 export {
   classifyWorkspaceConfigurationImpact,
   detectWorkspaceTechnologies,
+  summarizeWorkspaceTechnologyProposal,
   WorkspaceConfigurationCoordinator,
   type WorkspaceConfigurationImpact,
   type WorkspaceConfigurationAttemptRecord,
@@ -29,12 +34,29 @@ export {
   type WorkspaceTechnologyKind,
   type WorkspaceTechnologyProposal,
   type WorkspaceTechnologyProposalItem,
+  type WorkspaceTechnologyProposalSummary,
+  type WorkspaceTechnologyProposalSummaryItem,
   type WorkspacePluginCatalogEntry,
   type WorkspaceConfigurationProposal,
 } from "./workspace-configuration.js";
 export { CursorCache, CursorCacheError, type CursorCacheOptions, type CursorDirection, type ManifestStreamReader, type ManifestStreamReadRequest, type ManifestStreamReadResult, type QueryCursorClaims, type ReadPageRequest, type ReadPageResult } from "./cursor-cache.js";
 export { evaluateOperation, expandRelations, findShortestPaths, type EvaluateOperationInput, type ExpandedRelation, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem, type RelationEdge, type RelationExpansionOptions, type ShortestPath, type ShortestPathOptions } from "./query-operators.js";
-export { DurableManifestStore, MemoryManifestStore, QueryEngine, type QueryContinuationRequest, type QueryExecutionOptions, type QueryExecutionPage, type QueryManifestStore, type QueryStreamPage } from "./query-execution.js";
+export {
+  DurableManifestStore,
+  MemoryManifestStore,
+  QueryEngine,
+  QueryOperationTelemetry,
+  type QueryContinuationRequest,
+  type QueryExecutionOptions,
+  type QueryExecutionPage,
+  type QueryManifestStore,
+  type QueryMetricDistribution,
+  type QueryOperationMetric,
+  type QueryOperationMetricProbe,
+  type QueryOperationResourceMeasurement,
+  type QueryOperationTelemetrySummary,
+  type QueryStreamPage,
+} from "./query-execution.js";
 export { buildQueryAdmissionPlan, normalizeQueryRequest, validatePipelineExpression, QueryPlanError, type NormalizedQueryPlan, type QueryAdmissionPlan, type QueryFrontier } from "./query-plan.js";
 export { stageSetHandle, type StageSetHandle } from "./stage-set-handle.js";
 export { MemoryStageSpool, SqliteStageSpool, DEFAULT_HARD_BYTES, DEFAULT_SPILL_BYTES, type StageSpool, type StageSpoolLimits } from "./pipeline-spool.js";
@@ -168,11 +190,13 @@ export {
 } from "./candidate-planning.js";
 export {
   FactDeltaAcceptanceService,
+  FactDeltaStreamAcceptanceService,
   CandidateDeltaError,
   validateFactDelta,
   type AcceptedDeltaStore,
   type AcceptedFactDelta,
   type MaterializationAcceptedFactDelta,
+  type MaterializationProposedRecord,
   compactAcceptedFactDelta,
   type CandidateTargetRegistry,
   type FactDeltaValidationInput,
@@ -226,6 +250,16 @@ export {
 } from "./candidate-materialization.js";
 export { MaterializationDigestOffload } from "./materialization-digest-offload.js";
 export {
+  configureNativeLogicalDigestPort,
+  digestNativeLogicalValueBatch,
+  verifyNativeLogicalValueBatch,
+  type NativeLogicalDigestPort,
+  type NativeLogicalDigestResult,
+  type NativeLogicalValueDigestInput,
+  type NativeLogicalValueVerificationInput,
+  type NativeLogicalVerificationResult,
+} from "./native-logical-digest.js";
+export {
   CandidateIndexer,
   createCandidateIssue,
   type CandidateCleanupResource,
@@ -242,6 +276,14 @@ export {
   type StagedSourceBatch,
 } from "./candidate-indexer.js";
 export { createWorkspaceCandidatePort } from "./workspace-indexing-port.js";
+export {
+  validateIndexGenerationRequest,
+  type IndexGenerationRequest,
+  type IndexingProgress,
+  type IndexingResult,
+  type RustIndexingCoreClient,
+  type RustIndexingCoreGenerationPort,
+} from "./rust-indexing-core-port.js";
 export {
   runFullWorkspaceScan,
   runProgressiveWorkspaceScan,
@@ -317,6 +359,14 @@ export {
   type SemanticRerankOptions,
   type SemanticSearchResult,
 } from "./semantic-retrieval.js";
+export {
+  configureNativeExactVectorTopKPort,
+  nativeExactVectorTopK,
+  nativeExactVectorTopKConfigured,
+  type NativeExactVectorTopKMatch,
+  type NativeExactVectorTopKPort,
+  type NativeExactVectorTopKRequest,
+} from "./native-exact-vector.js";
 export { selectBundledProfile, type BundledProfileCandidate, type FrozenEvaluationGate } from "./semantic-selection.js";
 export {
   createHttpEmbeddingProvider,

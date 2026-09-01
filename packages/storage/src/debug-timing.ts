@@ -18,6 +18,7 @@
 interface Bucket {
   ms: number;
   count: number;
+  samples: number[];
 }
 
 const buckets = new Map<string, Bucket>();
@@ -36,9 +37,11 @@ export async function timed<T>(bucket: string, action: () => Promise<T>): Promis
   try {
     return await action();
   } finally {
-    const entry = buckets.get(bucket) ?? { ms: 0, count: 0 };
-    entry.ms += performance.now() - startedAt;
+    const elapsed = performance.now() - startedAt;
+    const entry = buckets.get(bucket) ?? { ms: 0, count: 0, samples: [] };
+    entry.ms += elapsed;
     entry.count += 1;
+    entry.samples.push(elapsed);
     buckets.set(bucket, entry);
   }
 }
@@ -50,9 +53,11 @@ export function timedSync<T>(bucket: string, action: () => T): T {
   try {
     return action();
   } finally {
-    const entry = buckets.get(bucket) ?? { ms: 0, count: 0 };
-    entry.ms += performance.now() - startedAt;
+    const elapsed = performance.now() - startedAt;
+    const entry = buckets.get(bucket) ?? { ms: 0, count: 0, samples: [] };
+    entry.ms += elapsed;
     entry.count += 1;
+    entry.samples.push(elapsed);
     buckets.set(bucket, entry);
   }
 }
@@ -67,14 +72,27 @@ export function timedSync<T>(bucket: string, action: () => T): T {
  */
 export function record(bucket: string, ms: number): void {
   if (!timingEnabled()) return;
-  const entry = buckets.get(bucket) ?? { ms: 0, count: 0 };
+  const entry = buckets.get(bucket) ?? { ms: 0, count: 0, samples: [] };
   entry.ms += ms;
   entry.count += 1;
+  entry.samples.push(ms);
   buckets.set(bucket, entry);
 }
 
-export function snapshotTimings(): Record<string, { readonly ms: number; readonly count: number }> {
-  return Object.fromEntries([...buckets.entries()].map(([key, value]) => [key, { ms: Math.round(value.ms), count: value.count }]));
+function percentile(samples: readonly number[], fraction: number): number {
+  if (samples.length === 0) return 0;
+  const ordered = [...samples].sort((left, right) => left - right);
+  return ordered[Math.max(0, Math.ceil(fraction * ordered.length) - 1)]!;
+}
+
+export function snapshotTimings(): Record<string, { readonly ms: number; readonly count: number; readonly p50_ms: number; readonly p95_ms: number; readonly p99_ms: number }> {
+  return Object.fromEntries([...buckets.entries()].map(([key, value]) => [key, {
+    ms: Math.round(value.ms),
+    count: value.count,
+    p50_ms: Math.round(percentile(value.samples, 0.50)),
+    p95_ms: Math.round(percentile(value.samples, 0.95)),
+    p99_ms: Math.round(percentile(value.samples, 0.99)),
+  }]));
 }
 
 export function resetTimings(): void {

@@ -19,6 +19,12 @@
 // touching a pool instance directly.
 
 import type { WorkerTransport } from "@urdira/plugin-sdk";
+import type {
+  IndexingResourceAccountingPort,
+  ProcessTreeRssAdmissionRequest,
+  ProcessTreeRssReservation,
+  ProcessTreeRssTelemetry,
+} from "./process-tree-rss.js";
 
 export interface AnalysisWorkerPoolOptions<TDescriptor> {
   /** Builds a fresh worker for a cache miss (a new workspace, a descriptor-digest
@@ -36,6 +42,10 @@ export interface AnalysisWorkerPoolOptions<TDescriptor> {
   /** Idle time after `release()` before an unused entry is proactively
    * evicted. Default 300000 (5 minutes). */
   readonly idle_ttl_ms?: number;
+  /** Optional internal process-tree RSS admission. Callers must use
+   * `acquireWithResourceAdmission` when configured; the synchronous path is
+   * rejected so native child processes cannot bypass accounting. */
+  readonly resource_accounting?: IndexingResourceAccountingPort;
 }
 
 interface PoolEntry<TDescriptor> {
@@ -44,6 +54,7 @@ interface PoolEntry<TDescriptor> {
   readonly descriptor_digest: string;
   in_use: boolean;
   idle_timer: NodeJS.Timeout | undefined;
+  resource_reservation: ProcessTreeRssReservation | undefined;
 }
 
 function workerIsUnusable(worker: WorkerTransport): boolean {
@@ -80,6 +91,7 @@ export class AnalysisWorkerPool<TDescriptor> {
   private readonly maxEntries: number;
   private readonly maxActive: number;
   private readonly idleTtlMs: number;
+  private readonly resourceAccounting: IndexingResourceAccountingPort | undefined;
   private activeLeases = 0;
 
   constructor(options: AnalysisWorkerPoolOptions<TDescriptor>) {
@@ -88,12 +100,69 @@ export class AnalysisWorkerPool<TDescriptor> {
     this.maxActive = options.max_active ?? this.maxEntries;
     if (!Number.isInteger(this.maxActive) || this.maxActive < 1) throw new Error("Analysis worker pool max_active must be a positive integer.");
     this.idleTtlMs = options.idle_ttl_ms ?? 300_000;
+    this.resourceAccounting = options.resource_accounting;
   }
 
   /** Reuses a live worker for `key` when its descriptor digest matches, or
    * creates (and pools) a fresh one otherwise. Marks the entry on-loan --
    * it is never a target for idle-TTL or LRU eviction until `release(key)`. */
   acquire(key: string, descriptor: TDescriptor, descriptorDigest: string): WorkerTransport {
+    if (this.resourceAccounting !== undefined) throw new Error("Analysis worker process-tree RSS accounting requires acquireWithResourceAdmission().");
+    return this.acquireUnchecked(key, descriptor, descriptorDigest);
+  }
+
+  /** Performs conservative whole-process-tree RSS admission before leasing a
+   * worker. On ceiling pressure it terminates idle workers LRU-first, forcing
+   * a fresh sample after each victim; an incomplete sample never starts work. */
+  async acquireWithResourceAdmission(
+    key: string,
+    descriptor: TDescriptor,
+    descriptorDigest: string,
+    request: Omit<ProcessTreeRssAdmissionRequest, "fresh_sample">,
+  ): Promise<WorkerTransport> {
+    if (this.resourceAccounting === undefined) return this.acquireUnchecked(key, descriptor, descriptorDigest);
+    // Worker creation registers a new supervised process immediately after a
+    // successful admission. A cached process-table snapshot taken for the
+    // previous shard predates that registration and would therefore mark the
+    // new component as missing. Every lease boundary needs one fresh sample;
+    // host samplers still coalesce genuinely concurrent collection in-flight.
+    let decision = await this.resourceAccounting.admit({ ...request, fresh_sample: true });
+    while (!decision.admitted && decision.reason === "ceiling_exceeded" && await this.evictOldestIdleForResourcePressure()) {
+      decision = await this.resourceAccounting.admit({ ...request, fresh_sample: true });
+    }
+    if (!decision.admitted || decision.reservation === undefined) {
+      throw new Error(`Analysis worker RSS admission exhausted (${decision.reason}): tree=${decision.telemetry.process_tree_rss_bytes} reserved=${decision.telemetry.reserved_rss_bytes} requested=${decision.telemetry.requested_rss_bytes} ceiling=${decision.telemetry.ceiling_rss_bytes}.`);
+    }
+    try {
+      const worker = this.acquireUnchecked(key, descriptor, descriptorDigest);
+      const entry = this.entries.get(key);
+      if (entry === undefined) throw new Error("Analysis worker disappeared during RSS admission.");
+      entry.resource_reservation = decision.reservation;
+      return worker;
+    } catch (error) {
+      decision.reservation.release();
+      throw error;
+    }
+  }
+
+  /** Internal telemetry hook for daemon logging/benchmarks. */
+  sampleResourceTelemetry(options: { readonly fresh?: boolean } = {}): Promise<ProcessTreeRssTelemetry | undefined> {
+    return this.resourceAccounting?.sampleTelemetry(options) ?? Promise.resolve(undefined);
+  }
+
+  /** Reclaims idle workers until a fresh complete sample is at or below the
+   * ceiling. In-flight scans are never terminated; incomplete telemetry is
+   * returned unchanged so the next admission remains fail-closed. */
+  async enforceResourceCeiling(): Promise<ProcessTreeRssTelemetry | undefined> {
+    if (this.resourceAccounting === undefined) return undefined;
+    let telemetry = await this.resourceAccounting.sampleTelemetry({ fresh: true });
+    while (telemetry.complete && telemetry.projected_rss_bytes > telemetry.ceiling_rss_bytes && await this.evictOldestIdleForResourcePressure()) {
+      telemetry = await this.resourceAccounting.sampleTelemetry({ fresh: true });
+    }
+    return telemetry;
+  }
+
+  private acquireUnchecked(key: string, descriptor: TDescriptor, descriptorDigest: string): WorkerTransport {
     const existing = this.entries.get(key);
     if (existing !== undefined) {
       if (!workerIsUnusable(existing.worker) && existing.descriptor_digest === descriptorDigest) {
@@ -118,7 +187,7 @@ export class AnalysisWorkerPool<TDescriptor> {
     }
     if (this.activeLeases >= this.maxActive) throw new Error(`Analysis worker admission exhausted: ${this.activeLeases}/${this.maxActive} worker leases are active.`);
     const worker = this.create(descriptor);
-    this.entries.set(key, { worker, descriptor, descriptor_digest: descriptorDigest, in_use: true, idle_timer: undefined });
+    this.entries.set(key, { worker, descriptor, descriptor_digest: descriptorDigest, in_use: true, idle_timer: undefined, resource_reservation: undefined });
     this.activeLeases += 1;
     this.enforceCap();
     return worker;
@@ -135,6 +204,8 @@ export class AnalysisWorkerPool<TDescriptor> {
     if (!entry.in_use) return;
     entry.in_use = false;
     this.activeLeases -= 1;
+    entry.resource_reservation?.release();
+    entry.resource_reservation = undefined;
     this.scheduleIdleEviction(key, entry);
     this.enforceCap();
   }
@@ -149,6 +220,8 @@ export class AnalysisWorkerPool<TDescriptor> {
     this.entries.delete(key);
     this.clearIdleTimer(entry);
     if (entry.in_use) this.activeLeases -= 1;
+    entry.resource_reservation?.release();
+    entry.resource_reservation = undefined;
     await entry.worker.terminate().catch(() => undefined);
   }
 
@@ -199,5 +272,12 @@ export class AnalysisWorkerPool<TDescriptor> {
       if (victim === undefined) return;
       void this.evict(victim);
     }
+  }
+
+  private async evictOldestIdleForResourcePressure(): Promise<boolean> {
+    const victim = [...this.entries].find(([, entry]) => !entry.in_use)?.[0];
+    if (victim === undefined) return false;
+    await this.evict(victim);
+    return true;
   }
 }

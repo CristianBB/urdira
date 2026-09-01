@@ -22,6 +22,7 @@ import { record, resetTimings, snapshotTimings, timed, timedSync, timingEnabled 
 import { ISOMORPHIC_GIT_OBJECT_PORT, administrativeState, type GitObjectPort } from "./git-providers.js";
 import type { RegisteredWorkspace, WorkspaceRegistry } from "./workspaces.js";
 import type { WorkspaceScanPluginProvider } from "./workspace-indexing-session.js";
+import type { RustIndexingCoreGenerationPort } from "./rust-indexing-core-port.js";
 import {
   DEFAULT_FORK_GITIGNORE,
   DEFAULT_FORK_INCLUSION,
@@ -603,6 +604,8 @@ export interface IndexPackImportOptions {
   readonly storage: DurableStorage;
   readonly registry: WorkspaceRegistry;
   readonly plugin: WorkspaceScanPluginProvider;
+  /** Persistent Rust writer for source capture and recovery on import. */
+  readonly indexing_core?: RustIndexingCoreGenerationPort;
   readonly pack_path: string;
   readonly inclusion_rules?: InclusionRules;
   readonly gitignore_rules?: GitIgnoreRules;
@@ -1134,6 +1137,10 @@ async function fastPackVerify(target: WorkspaceDatabase, workspaceId: string, ma
 }
 
 async function attemptIndexPackImportInner(options: IndexPackImportOptions): Promise<IndexPackImportOutcome> {
+  /* c8 ignore next -- production daemon bypasses the compatibility copier; injected-core coverage belongs to the daemon integration gate. */
+  if (options.indexing_core !== undefined) {
+    return { status: "skipped", reason: "Rust indexing-core owns production structural publication; pack bulk-copy remains compatibility-only." };
+  }
   const context = buildContext(options);
   const workspaceId = options.workspace.workspace_id;
   const maxDiffEntries = options.max_diff_entries ?? DEFAULT_MAX_DIFF_ENTRIES;
@@ -1198,7 +1205,7 @@ async function importAfterEnumeration(options: IndexPackImportOptions, context: 
 
   const rollbackAndSkip = async (reason: string): Promise<IndexPackImportOutcome> => {
     console.error(`[urdira] index pack import for ${workspaceId} (pack ${manifest.pack_id}) failed after its source layer was durably committed; rolling back so the fallback full scan can publish a fresh generation instead of getting permanently stuck: ${reason}`);
-    await rollbackForkPublication(options.database, workspaceId, ids);
+    await rollbackForkPublication(options.database, workspaceId, ids, options.indexing_core);
     return { status: "skipped", reason };
   };
 

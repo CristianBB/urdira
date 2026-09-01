@@ -1,6 +1,8 @@
 import {
   canonicalSchemaRegistry,
   modelContractRegistry,
+  validatePluginRuntimeExecutableBindingValue,
+  validateRuntimeComponentImplementationManifestV2,
   type AnalysisConfiguration,
   type AnalyzerImplementationManifest,
   type PluginCompatibilityDeclaration,
@@ -9,6 +11,8 @@ import {
   type RuntimeComponentBuild,
   type RuntimeComponentBehaviorManifest,
   type RuntimeComponentImplementationManifest,
+  type RuntimeComponentImplementationManifestV2,
+  type PluginRuntimeExecutableBinding,
 } from "@urdira/contracts";
 import { canonicalJson, deepFreeze, hasExactKeys, sha256Bytes } from "./canonical.js";
 import type { PluginDigestAuthority } from "./digest-authority.js";
@@ -17,7 +21,7 @@ import { compareCanonicalJsonUtf8, compareUtf8Bytes } from "./ordering.js";
 import { materializePortResult, type PortMaterializationLimits } from "./port-boundary.js";
 import { parseSemVer, parseVersionRequirementText } from "./semver.js";
 
-export type { AnalysisConfiguration, AnalyzerImplementationManifest, PluginCompatibilityDeclaration, RuntimeComponentBehaviorManifest, RuntimeComponentBuild, RuntimeComponentImplementationManifest } from "@urdira/contracts";
+export type { AnalysisConfiguration, AnalyzerImplementationManifest, PluginCompatibilityDeclaration, PluginRuntimeExecutableBinding, RuntimeComponentBehaviorManifest, RuntimeComponentBuild, RuntimeComponentImplementationManifest, RuntimeComponentImplementationManifestV2 } from "@urdira/contracts";
 
 export interface InstalledPluginBundle {
   readonly package_locator: string;
@@ -29,6 +33,8 @@ export interface InstalledPluginBundle {
   readonly analysis_configuration: AnalysisConfiguration;
   readonly runtime_behavior_manifests: readonly RuntimeComponentBehaviorManifest[];
   readonly runtime_implementation_manifests: readonly RuntimeComponentImplementationManifest[];
+  readonly runtime_implementation_manifests_v2?: readonly RuntimeComponentImplementationManifestV2[];
+  readonly runtime_executable_binding?: PluginRuntimeExecutableBinding;
 }
 
 export interface DiscoveredPluginPackage extends Omit<InstalledPluginBundle, "package_locator"> {
@@ -69,6 +75,7 @@ export interface InstalledPackageFileRead { readonly bytes: Uint8Array; readonly
 export interface PluginDiscoveryPolicy { readonly max_file_bytes: number; }
 
 const BUNDLE_KEYS = ["package_locator", "manifest", "compatibility", "contribution", "runtime_builds", "analyzer_implementation_manifest", "analysis_configuration", "runtime_behavior_manifests", "runtime_implementation_manifests"] as const;
+const BUNDLE_OPTIONAL_KEYS = ["runtime_implementation_manifests_v2", "runtime_executable_binding"] as const;
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const NAMESPACED = /^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*$/u;
 const NAMESPACE = /^[a-z][a-z0-9_]*$/u;
@@ -177,8 +184,15 @@ function authoritativeDigest(operation: () => string): string {
 }
 
 function validateBundle(value: unknown, digests: PluginDigestAuthority, policy: PluginDiscoveryPolicy): { readonly bundle: InstalledPluginBundle; readonly analysis_configuration_digest: string } {
-  if (!hasExactKeys(value, BUNDLE_KEYS)) throw sdkError("plugin-sdk:package_declaration_invalid", "Plugin package bootstrap declarations must use their closed schema.");
+  if (!hasExactKeys(value, BUNDLE_KEYS, BUNDLE_OPTIONAL_KEYS)) throw sdkError("plugin-sdk:package_declaration_invalid", "Plugin package bootstrap declarations must use their closed schema.");
   const bundle = value as unknown as InstalledPluginBundle;
+  const manifestsV2 = bundle.runtime_implementation_manifests_v2 ?? [];
+  let validV2 = true;
+  try {
+    if (!Array.isArray(manifestsV2)) validV2 = false;
+    else for (const manifest of manifestsV2) validateRuntimeComponentImplementationManifestV2(manifest);
+    if (bundle.runtime_executable_binding !== undefined) validatePluginRuntimeExecutableBindingValue(bundle.runtime_executable_binding);
+  } catch { validV2 = false; }
   if (!validateAuthoritativeModel("PluginPackageManifest", bundle.manifest) ||
       !validateAuthoritativeModel("PluginCompatibilityDeclaration", bundle.compatibility) ||
       !validateAuthoritativeModel("PluginRegistryContribution", bundle.contribution) ||
@@ -187,7 +201,7 @@ function validateBundle(value: unknown, digests: PluginDigestAuthority, policy: 
       !validateAuthoritativeModel("AnalyzerImplementationManifest", bundle.analyzer_implementation_manifest) ||
       !validateAuthoritativeModel("AnalysisConfiguration", bundle.analysis_configuration) ||
       !Array.isArray(bundle.runtime_behavior_manifests) || !bundle.runtime_behavior_manifests.every((manifest) => validateAuthoritativeModel("RuntimeComponentBehaviorManifest", manifest)) ||
-      !Array.isArray(bundle.runtime_implementation_manifests) || !bundle.runtime_implementation_manifests.every((manifest) => validateAuthoritativeModel("RuntimeComponentImplementationManifest", manifest))) {
+      !Array.isArray(bundle.runtime_implementation_manifests) || !bundle.runtime_implementation_manifests.every((manifest) => validateAuthoritativeModel("RuntimeComponentImplementationManifest", manifest)) || !validV2) {
     throw sdkError("plugin-sdk:package_declaration_invalid", "Plugin package bootstrap declarations contain invalid authoritative values.");
   }
   if (typeof bundle.package_locator !== "string" || bundle.package_locator.length === 0 || bundle.manifest.package_format_id !== "core:plugin" || bundle.manifest.package_format_version !== 1 ||
@@ -235,27 +249,55 @@ function validateBundle(value: unknown, digests: PluginDigestAuthority, policy: 
     throw sdkError("plugin-sdk:package_declaration_invalid", "Plugin runtime behavior manifests must supply each built component release exactly once.");
   }
   if (!sameSet(behaviorKeys, requiredBehaviorKeys)) throw sdkError("plugin-sdk:package_coordinate_mismatch", "Plugin runtime behavior manifest coordinates must match built component releases.");
+  const manifestIds = new Set<string>();
   for (const build of bundle.runtime_builds) {
     if (buildIds.has(build.runtime_component_build_id) || build.runtime_component_build_id.length === 0 || !NAMESPACED.test(build.component_id) || build.schema_version !== 1) throw sdkError("plugin-sdk:package_declaration_invalid", "Plugin runtime build identities must be unique and authoritative.");
     buildIds.add(build.runtime_component_build_id);
     const definition = bundle.contribution.runtime_component_definitions.find((candidate) => candidate.component_id === build.component_id && candidate.component_version === build.component_version);
     const behavior = bundle.runtime_behavior_manifests.find((candidate) => candidate.component_id === build.component_id && candidate.component_version === build.component_version);
-    const implementation = bundle.runtime_implementation_manifests.find((candidate) => candidate.runtime_component_build_id === build.runtime_component_build_id);
+    const implementationV1 = bundle.runtime_implementation_manifests.find((candidate) => candidate.runtime_component_build_id === build.runtime_component_build_id);
+    const implementationV2 = manifestsV2.find((candidate) => candidate.runtime_component_build_id === build.runtime_component_build_id);
+    if (implementationV1 !== undefined && implementationV2 !== undefined) throw sdkError("plugin-sdk:package_declaration_invalid", "A runtime build cannot select both implementation manifest versions.");
+    const implementation = implementationV2 ?? implementationV1;
     if (!definition || !behavior || !implementation || implementation.component_id !== build.component_id || implementation.component_version !== build.component_version) {
       throw sdkError("plugin-sdk:package_coordinate_mismatch", "Plugin runtime build coordinates do not match their authoritative manifests.");
     }
     const implementationAssets = [...implementation.executable_asset_digests, ...implementation.native_asset_digests, ...implementation.dependency_asset_digests];
-    if (implementation.behavior_digest !== build.behavior_digest || authoritativeDigest(() => digests.runtime_behavior(behavior)) !== build.behavior_digest || authoritativeDigest(() => digests.runtime_implementation(implementation)) !== build.implementation_digest || definition.behavior_digest !== build.behavior_digest ||
+    const implementationDigest = implementationV2 === undefined
+      ? authoritativeDigest(() => digests.runtime_implementation(implementationV1!))
+      : authoritativeDigest(() => {
+          if (digests.runtime_implementation_v2 === undefined) throw new Error("missing v2 digest authority");
+          return digests.runtime_implementation_v2(implementationV2);
+        });
+    if (implementation.behavior_digest !== build.behavior_digest || authoritativeDigest(() => digests.runtime_behavior(behavior)) !== build.behavior_digest || implementationDigest !== build.implementation_digest || definition.behavior_digest !== build.behavior_digest ||
         canonicalJson([...behavior.contract_bindings].sort(compareCanonicalJsonUtf8)) !== canonicalJson([...definition.component_contracts].sort(compareCanonicalJsonUtf8)) ||
         !definition.component_contracts.some((binding) => binding.component_kind === behavior.component_kind) ||
         implementation.executable_asset_digests.length === 0 || !uniqueSubset(implementation.executable_asset_digests, executableAssetDigestSet) ||
         !uniqueSubset(implementationAssets, allAssetDigestSet)) {
       throw sdkError("plugin-sdk:package_digest_mismatch", "Plugin runtime build digests or executable closure do not match their canonical projections.");
     }
+    manifestIds.add(implementation.runtime_component_build_id);
   }
-  if (bundle.runtime_implementation_manifests.length !== buildIds.size || bundle.runtime_implementation_manifests.some((manifest) => !buildIds.has(manifest.runtime_component_build_id)) ||
+  if (manifestIds.size !== buildIds.size || bundle.runtime_implementation_manifests.some((manifest) => !buildIds.has(manifest.runtime_component_build_id)) || manifestsV2.some((manifest) => !buildIds.has(manifest.runtime_component_build_id)) ||
       bundle.runtime_behavior_manifests.some((manifest) => !bundle.contribution.runtime_component_definitions.some((definition) => definition.component_id === manifest.component_id && definition.component_version === manifest.component_version))) {
     throw sdkError("plugin-sdk:package_declaration_invalid", "Plugin runtime manifest identities must exactly match the declared builds.");
+  }
+  const binding = bundle.runtime_executable_binding;
+  if (binding === undefined) {
+    if (manifestsV2.length > 0) throw sdkError("plugin-sdk:package_declaration_invalid", "A v2 runtime implementation requires its exact executable binding.");
+  } else {
+    if (manifestsV2.length !== 1 || bundle.runtime_implementation_manifests.length !== 0 || digests.runtime_executable_binding === undefined) throw sdkError("plugin-sdk:package_declaration_invalid", "A native plugin package must supply exactly one v2 implementation and binding authority.");
+    const implementation = manifestsV2[0]!;
+    const build = bundle.runtime_builds.find((candidate) => candidate.runtime_component_build_id === binding.runtime_component_build_id);
+    const { binding_digest: _bindingDigest, ...bindingPayload } = binding;
+    const expectedBindingDigest = authoritativeDigest(() => digests.runtime_executable_binding!(bindingPayload));
+    if (binding.plugin_id !== bundle.manifest.plugin_id || binding.plugin_version !== bundle.manifest.plugin_version || binding.package_digest !== expectedPackageDigest ||
+        binding.runtime_contract_version <= 0 || !bundle.compatibility.supported_plugin_contract_versions.includes(binding.runtime_contract_version) ||
+        build === undefined || binding.implementation_digest !== build.implementation_digest || binding.runtime_component_build_id !== implementation.runtime_component_build_id ||
+        binding.runtime_target_id !== implementation.runtime_target_id || binding.entrypoint_asset_digest !== implementation.entrypoint_asset_digest ||
+        binding.binding_digest !== expectedBindingDigest) {
+      throw sdkError("plugin-sdk:package_digest_mismatch", "Plugin runtime executable binding does not match its exact package, build, target, or entrypoint.");
+    }
   }
   return { bundle, analysis_configuration_digest: analysisConfigurationDigest };
 }

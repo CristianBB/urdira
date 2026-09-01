@@ -33,6 +33,16 @@ export interface RecordColumnSelector {
   readonly kinds?: readonly string[];
 }
 
+export interface IndexedGraphEdge {
+  readonly edge_id: string;
+  readonly source_subject_id: string;
+  readonly target_subject_id: string;
+  readonly relation_record_id: string;
+  readonly relation_kind: string;
+  readonly role: string;
+  readonly evidence_class: string;
+}
+
 export interface CanonicalQuerySnapshotPort {
   /**
    * Query-only fallback for operations whose predicate is not yet expressible
@@ -93,6 +103,12 @@ export interface CanonicalQuerySnapshotPort {
    * Visibility-filtered like `records()`.
    */
   readonly records_by_selector?: (scope: QueryScope, selector: RecordColumnSelector, limit: number) => Promise<readonly CanonicalQueryRecord[]>;
+  /** Resolves container records through indexed artifact identity/path columns. */
+  readonly container_records_by_artifact_references?: (scope: QueryScope, references: readonly string[]) => Promise<readonly CanonicalQueryRecord[]>;
+  /** Reads the exact visible adjacency slice touching `subject_ids`. Returning
+   * `undefined` means this snapshot has no authoritative graph projection and
+   * requires the canonical-record fallback. */
+  readonly graph_edges_by_subject_ids?: (scope: QueryScope, subject_ids: readonly string[], direction: "inbound" | "outbound" | "both") => Promise<readonly IndexedGraphEdge[] | undefined>;
   /** Indexed relation join over subject record ids. This is the preferred
    * handle-native path; it reads graph edge columns only and never hydrates
    * the complete record corpus. */
@@ -458,6 +474,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
   private readonly recordsLoading = new Map<string, Promise<readonly CanonicalQueryRecord[]>>();
   private readonly capabilityCache = new Map<string, { readonly generation: number; readonly states: readonly SnapshotCapabilityStateEntry[] }>();
   private readonly textCache = new Map<string, string>();
+  private readonly graphAvailabilityCache = new Map<string, boolean>();
 
   /**
    * `interner` (optional -- omitted, this port behaves exactly as before
@@ -956,17 +973,75 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return rows.map((row) => this.decodeRow(row));
   }
 
+  async container_records_by_artifact_references(scope: QueryScope, references: readonly string[]): Promise<readonly CanonicalQueryRecord[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    const unique = [...new Set(references)];
+    if (unique.length === 0) return [];
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return [];
+    const found = new Map<string, CanonicalQueryRecord>();
+    for (const part of chunk(unique, DELTA_ID_CHUNK_SIZE)) {
+      const placeholders = part.map(() => "?").join(", ");
+      const condition = `records.universal_kind = 'core:container' AND (records.owner_artifact_version_id IN (${placeholders}) OR EXISTS (
+        SELECT 1 FROM source_artifacts AS artifacts
+         WHERE artifacts.workspace_id = records.workspace_id AND artifacts.artifact_id = records.owner_artifact_id
+           AND (artifacts.artifact_id IN (${placeholders}) OR artifacts.normalized_path IN (${placeholders}) OR artifacts.normalized_uri IN (${placeholders}))
+      ))`;
+      const rows = await this.queryRecordRows(scope.workspace_id, generation, condition, [...part, ...part, ...part, ...part]);
+      for (const row of rows) found.set(row.record_id, this.decodeRow(row));
+    }
+    return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
+  }
+
+  private async graphProjectionAvailable(workspaceId: string, generation: number): Promise<boolean> {
+    const key = `${workspaceId}\u0000${generation}`;
+    const cached = this.graphAvailabilityCache.get(key);
+    if (cached !== undefined) return cached;
+    const row = await this.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM graph_edges WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)", [workspaceId, generation, generation]);
+    const available = (row?.count ?? 0) > 0;
+    this.graphAvailabilityCache.set(key, available);
+    while (this.graphAvailabilityCache.size > 8) this.graphAvailabilityCache.delete(this.graphAvailabilityCache.keys().next().value as string);
+    return available;
+  }
+
+  async graph_edges_by_subject_ids(scope: QueryScope, subjectIds: readonly string[], direction: "inbound" | "outbound" | "both"): Promise<readonly IndexedGraphEdge[] | undefined> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return [];
+    if (!await this.graphProjectionAvailable(scope.workspace_id, generation)) return undefined;
+    const unique = [...new Set(subjectIds)];
+    if (unique.length === 0) return [];
+    const found = new Map<string, IndexedGraphEdge>();
+    const read = async (column: "source_subject_id" | "target_subject_id", ids: readonly string[]): Promise<void> => {
+      const placeholders = ids.map(() => "?").join(", ");
+      const rows = await this.database.all<IndexedGraphEdge & Record<string, unknown>>(
+        `SELECT edge_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class
+           FROM graph_edges
+          WHERE workspace_id = ? AND valid_from_generation <= ?
+            AND (valid_to_generation IS NULL OR valid_to_generation > ?)
+            AND ${column} IN (${placeholders})
+          ORDER BY relation_record_id, edge_id`,
+        [scope.workspace_id, generation, generation, ...ids],
+      );
+      for (const row of rows) found.set(row.edge_id, row);
+    };
+    for (const ids of chunk(unique, DELTA_ID_CHUNK_SIZE)) {
+      if (direction === "outbound" || direction === "both") await read("source_subject_id", ids);
+      if (direction === "inbound" || direction === "both") await read("target_subject_id", ids);
+    }
+    return [...found.values()].sort((left, right) => left.relation_record_id.localeCompare(right.relation_record_id) || left.edge_id.localeCompare(right.edge_id));
+  }
+
   async relation_pairs_by_subject_ids(scope: QueryScope, leftIds: readonly string[], rightIds: readonly string[], relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<ReadonlySet<string> | undefined> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
     if (leftIds.length === 0 || rightIds.length === 0) return new Set();
     const generation = await this.currentGeneration(scope);
     if (generation === undefined) return new Set();
-    const available = await this.database.get<{ count: number }>("SELECT COUNT(*) AS count FROM graph_edges WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)", [scope.workspace_id, generation, generation]);
     // Some providers publish canonical relation records without the optional
     // graph projection. Returning undefined keeps the complete record-based
     // fallback authoritative instead of treating an absent projection as an
     // empty relation set.
-    if ((available?.count ?? 0) === 0) return undefined;
+    if (!await this.graphProjectionAvailable(scope.workspace_id, generation)) return undefined;
     const right = new Set(rightIds);
     const selector = object(relationSelector);
     const kinds = new Set(strings(selector["universal_kinds"]));
@@ -2085,6 +2160,207 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
 
   constructor(private readonly snapshots: CanonicalQuerySnapshotPort, private readonly options: { readonly semantic?: ResolvedSemanticProvider } = {}) {}
 
+  private async resolveIndexedGraphSelectors(scope: QueryScope, selectorValues: unknown): Promise<readonly CanonicalQueryRecord[] | undefined> {
+    const selectors = Array.isArray(selectorValues) ? selectorValues : [];
+    const directIds = selectors.map(subjectIdentity).filter((value): value is string => value !== undefined);
+    const symbols = selectors.map(object).filter((selector) => selector["subject_type"] === "symbol");
+    const artifacts = selectors.map(object).filter((selector) => selector["subject_type"] === "artifact");
+    if (directIds.length > 0 && this.snapshots.records_by_ids === undefined) return undefined;
+    if (symbols.length > 0 && this.snapshots.records_by_name === undefined) return undefined;
+    if ((artifacts.length > 0 || symbols.some((selector) => typeof selector["context_artifact"] === "string")) && this.snapshots.container_records_by_artifact_references === undefined) return undefined;
+    if (symbols.some((selector) => String(selector["name"] ?? "").includes("."))) return undefined;
+    const rows: CanonicalQueryRecord[] = [];
+    if (directIds.length > 0) rows.push(...await this.snapshots.records_by_ids!(scope, directIds));
+    for (const name of [...new Set(symbols.map((selector) => String(selector["name"] ?? "")))]) rows.push(...await this.snapshots.records_by_name!(scope, name));
+    const artifactReferences = [...new Set([
+      ...artifacts.flatMap((selector) => [selector["artifact_id"], selector["artifact_version_id"], selector["path"]]),
+      ...symbols.map((selector) => selector["context_artifact"]),
+    ].filter((value): value is string => typeof value === "string"))];
+    if (artifactReferences.length > 0) rows.push(...await this.snapshots.container_records_by_artifact_references!(scope, artifactReferences));
+    const unique = [...new Map(rows.map((record) => [record.record_id, record])).values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
+    const maps = await identityMaps(unique);
+    return selectors.flatMap((selector) => resolveSelectorToRecords(selector, maps));
+  }
+
+  private async indexedGraphRecords(scope: QueryScope, traversalRoots: readonly CanonicalQueryRecord[], retainedRecords: readonly CanonicalQueryRecord[], direction: "inbound" | "outbound" | "both", maxDepth: number): Promise<readonly CanonicalQueryRecord[] | undefined> {
+    if (this.snapshots.graph_edges_by_subject_ids === undefined || this.snapshots.records_by_ids === undefined) return undefined;
+    const records = new Map<string, CanonicalQueryRecord>();
+    for (const record of [...traversalRoots, ...retainedRecords]) records.set(record.record_id, record);
+    const edgeRows = new Map<string, IndexedGraphEdge>();
+    const seen = new Set(traversalRoots.map((record) => record.record_id));
+    let frontier = [...traversalRoots];
+    const aliasMap = (): Map<string, CanonicalQueryRecord> => {
+      const aliases = new Map<string, CanonicalQueryRecord>();
+      for (const record of records.values()) for (const id of [record.record_id, record.identity_id, record.identity_key, record.body["entity_id"], record.body["relation_id"]]) if (typeof id === "string") aliases.set(id, record);
+      return aliases;
+    };
+    const hydrate = async (rows: readonly IndexedGraphEdge[]): Promise<void> => {
+      const ids = [...new Set(rows.flatMap((edge) => [edge.source_subject_id, edge.target_subject_id, edge.relation_record_id]))];
+      for (const record of await this.snapshots.records_by_ids!(scope, ids)) records.set(record.record_id, record);
+      for (const edge of rows) edgeRows.set(edge.edge_id, edge);
+    };
+    for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
+      const frontierAliases = new Set(frontier.flatMap((record) => [record.record_id, record.identity_id, record.identity_key].filter((value): value is string => value !== undefined)));
+      const rows = await this.snapshots.graph_edges_by_subject_ids(scope, [...frontierAliases], direction);
+      if (rows === undefined) return undefined;
+      await hydrate(rows);
+      const byAlias = aliasMap();
+      const next: CanonicalQueryRecord[] = [];
+      for (const edge of rows) {
+        const endpointIds: string[] = [];
+        if ((direction === "outbound" || direction === "both") && frontierAliases.has(edge.source_subject_id)) endpointIds.push(edge.target_subject_id);
+        if ((direction === "inbound" || direction === "both") && frontierAliases.has(edge.target_subject_id)) endpointIds.push(edge.source_subject_id);
+        for (const endpointId of endpointIds) {
+          const record = byAlias.get(endpointId);
+          if (record !== undefined && !seen.has(record.record_id)) { seen.add(record.record_id); next.push(record); }
+        }
+      }
+      frontier = next;
+    }
+    // The fallback's expansion relation stream includes every selected edge
+    // whose endpoints are both reachable, including cycle/back edges touching
+    // the final frontier. Fetch that closed adjacency without traversing it.
+    const allAliases = [...new Set([...records.values()].flatMap((record) => [record.record_id, record.identity_id, record.identity_key].filter((value): value is string => value !== undefined)))];
+    const closure = await this.snapshots.graph_edges_by_subject_ids(scope, allAliases, "both");
+    if (closure === undefined) return undefined;
+    await hydrate(closure);
+    return [...records.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
+  }
+
+  private evaluateGraphOperation(operation: OperationInvocation, records: readonly CanonicalQueryRecord[], maps: IdentityMaps, capabilityStates: readonly SnapshotCapabilityStateEntry[]): OperationEvaluation | undefined {
+    const args = object(operation.arguments);
+    const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => result(streams, capabilityStates);
+    if (operation.operation_id === "core:get_outline") {
+      const container = resolveSelectorsToRecords(args["container"] === undefined ? [] : [args["container"]], maps)[0];
+      if (container === undefined) throw new EngineErrorWithDetails("core:selector_not_found", "The get_outline container could not be resolved.", { selector_pointer: "/container" });
+      const depth = typeof args["depth"] === "number" ? args["depth"] : 1;
+      const contains = new Map<CanonicalQueryRecord, CanonicalQueryRecord[]>();
+      for (const relation of maps.relations) {
+        if (relation.universal_kind !== "core:contains") continue;
+        const endpoints = relationEndpoints(relation, maps.by_any_id);
+        if (endpoints.source === undefined || endpoints.target === undefined) continue;
+        const children = contains.get(endpoints.source) ?? [];
+        children.push(endpoints.target);
+        contains.set(endpoints.source, children);
+      }
+      const seen = new Set<string>([container.identity_key ?? container.record_id]);
+      let frontier = [container];
+      const members: CanonicalQueryRecord[] = [];
+      for (let level = 0; level < depth; level += 1) {
+        const next: CanonicalQueryRecord[] = [];
+        for (const parent of frontier) for (const child of contains.get(parent) ?? []) {
+          const key = child.identity_key ?? child.record_id;
+          if (!seen.has(key)) { seen.add(key); members.push(child); next.push(child); }
+        }
+        frontier = next;
+      }
+      return evaluated({ members: members.map((record) => item(record)) });
+    }
+    if (operation.operation_id === "core:find_references") {
+      const target = resolveSelectorsToRecords(args["target"] === undefined ? [] : [args["target"]], maps)[0];
+      const relations = target === undefined ? [] : maps.relations.filter((record) => relationEndpoints(record, maps.by_any_id).target === target);
+      const owners = relations.flatMap((record) => {
+        const source = relationEndpoints(record, maps.by_any_id).source;
+        return source === undefined ? [] : [source];
+      });
+      return evaluated({ references: relations.map((record) => item(record, relationClassification(record))), owners: [...new Map(owners.map((record) => [record.record_id, record])).values()].map((record) => item(record)) });
+    }
+    if (operation.operation_id === "core:expand_relations") {
+      const rootRecords = resolveSelectorsToRecords(args["subjects"], maps);
+      const idOf = (record: CanonicalQueryRecord): string => record.identity_key ?? record.record_id;
+      const rootIds = rootRecords.map(idOf);
+      const direction = args["direction"] === "inbound" ? "inbound" : args["direction"] === "both" ? "both" : "outbound";
+      const relationKinds = strings(object(args["relations"])["universal_kinds"]);
+      const minDepth = typeof args["min_depth"] === "number" ? args["min_depth"] : 1;
+      const maxDepth = typeof args["max_depth"] === "number" ? args["max_depth"] : 1;
+      const edges: RelationEdge[] = maps.relations.flatMap((record) => {
+        const endpoints = relationEndpoints(record, maps.by_any_id);
+        if (endpoints.source === undefined || endpoints.target === undefined) return [];
+        if (relationKinds.length > 0 && !relationKinds.includes(record.universal_kind)) return [];
+        return [{ source: idOf(endpoints.source), target: idOf(endpoints.target), relation_kind: record.universal_kind, classification: relationClassification(record), stable_sort_key: record.identity_key ?? record.record_id }];
+      });
+      const expanded = rootIds.length === 0 ? [] : expandRelations(edges, rootIds, { direction, min_depth: minDepth, max_depth: maxDepth, ...(relationKinds.length > 0 ? { relation_kinds: relationKinds } : {}) });
+      const discoveredIds = new Map<string, CanonicalQueryRecord>();
+      for (const entry of expanded) {
+        const record = maps.by_any_id.get(entry.subject);
+        if (record !== undefined && !discoveredIds.has(entry.subject)) discoveredIds.set(entry.subject, record);
+      }
+      const reachableIds = new Set([...rootIds, ...discoveredIds.keys()]);
+      const relationsUsed = maps.relations.filter((record) => {
+        if (relationKinds.length > 0 && !relationKinds.includes(record.universal_kind)) return false;
+        const endpoints = relationEndpoints(record, maps.by_any_id);
+        return endpoints.source !== undefined && endpoints.target !== undefined && reachableIds.has(idOf(endpoints.source)) && reachableIds.has(idOf(endpoints.target));
+      });
+      const paths = args["path_policy"] === undefined || discoveredIds.size === 0 || rootIds.length === 0
+        ? []
+        : findShortestPaths(edges, rootIds, [...discoveredIds.keys()], { direction, max_depth: maxDepth, all_shortest: false, ...(relationKinds.length > 0 ? { relation_kinds: relationKinds } : {}) }).map((path): QueryStreamItem => ({
+            value: { subjects: path.subjects.map((id) => maps.by_any_id.get(id)).filter((value): value is CanonicalQueryRecord => value !== undefined).map((record) => recordValue(record)), relation_kinds: path.relation_kinds, length: path.subjects.length - 1, classification: path.classification },
+            stable_sort_key: path.stable_sort_key,
+            result_classification: path.classification,
+          }));
+      return evaluated({ subjects: [...discoveredIds.values()].map((record) => item(record)), relations: relationsUsed.map((record) => item(record, relationClassification(record))), paths });
+    }
+    if (operation.operation_id === "core:find_paths") {
+      const sources = resolveSelectorsToRecords(args["sources"], maps);
+      const targets = new Set(resolveSelectorsToRecords(args["targets"], maps));
+      const direction = args["direction"] === "inbound" ? "inbound" : args["direction"] === "both" ? "both" : "outbound";
+      const relationKinds = strings(object(args["relations"])["universal_kinds"]);
+      const maxDepth = typeof args["max_depth"] === "number" ? args["max_depth"] : 4;
+      const adjacent = new Map<CanonicalQueryRecord, Array<{ readonly target: CanonicalQueryRecord; readonly relation: CanonicalQueryRecord }>>();
+      const add = (source: CanonicalQueryRecord, target: CanonicalQueryRecord, relation: CanonicalQueryRecord): void => {
+        const entries = adjacent.get(source) ?? [];
+        entries.push({ target, relation });
+        adjacent.set(source, entries);
+      };
+      for (const relation of maps.relations) {
+        if (relationKinds.length > 0 && !relationKinds.includes(relation.universal_kind)) continue;
+        const endpoints = relationEndpoints(relation, maps.by_any_id);
+        if (endpoints.source === undefined || endpoints.target === undefined) continue;
+        if (direction === "outbound" || direction === "both") add(endpoints.source, endpoints.target, relation);
+        if ((direction === "inbound" || direction === "both") && endpoints.source !== endpoints.target) add(endpoints.target, endpoints.source, relation);
+      }
+      const queue = sources.map((node) => ({ node, path: [] as CanonicalQueryRecord[] }));
+      let queueIndex = 0;
+      const found: CanonicalQueryRecord[] = [];
+      const seen = new Set(sources.map((record) => record.record_id));
+      while (queueIndex < queue.length) {
+        const current = queue[queueIndex++]!;
+        if (targets.has(current.node)) { found.push(...current.path); break; }
+        if (current.path.length >= maxDepth) continue;
+        for (const edge of adjacent.get(current.node) ?? []) {
+          if (seen.has(edge.target.record_id)) continue;
+          seen.add(edge.target.record_id);
+          queue.push({ node: edge.target, path: [...current.path, edge.relation] });
+        }
+      }
+      return evaluated({ paths: found.map((record) => item(record, relationClassification(record))) });
+    }
+    return undefined;
+  }
+
+  private async tryGraphPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
+    if (!["core:get_outline", "core:find_references", "core:expand_relations", "core:find_paths"].includes(operation.operation_id)) return undefined;
+    const args = object(operation.arguments);
+    const sourceSelectors = operation.operation_id === "core:get_outline" ? [args["container"]]
+      : operation.operation_id === "core:find_references" ? [args["target"]]
+      : operation.operation_id === "core:expand_relations" ? args["subjects"]
+      : args["sources"];
+    const roots = await this.resolveIndexedGraphSelectors(operation.scope, sourceSelectors);
+    if (roots === undefined) return undefined;
+    const retained = operation.operation_id === "core:find_paths" ? await this.resolveIndexedGraphSelectors(operation.scope, args["targets"]) : [];
+    if (retained === undefined) return undefined;
+    const direction = operation.operation_id === "core:get_outline" ? "outbound"
+      : operation.operation_id === "core:find_references" ? "inbound"
+      : args["direction"] === "inbound" ? "inbound" : args["direction"] === "both" ? "both" : "outbound";
+    const maxDepth = operation.operation_id === "core:get_outline" ? (typeof args["depth"] === "number" ? args["depth"] : 1)
+      : operation.operation_id === "core:find_references" ? 1
+      : typeof args["max_depth"] === "number" ? args["max_depth"] : operation.operation_id === "core:find_paths" ? 4 : 1;
+    const records = await this.indexedGraphRecords(operation.scope, roots, retained, direction, maxDepth);
+    if (records === undefined) return undefined;
+    const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+    return this.evaluateGraphOperation(operation, records, await identityMaps(records), capabilityStates);
+  }
+
   private async relationIndex(scope: QueryScope): Promise<{ readonly byAnyId: ReadonlyMap<string, string>; readonly pairs: ReadonlyMap<string, ReadonlySet<string>> }> {
     const scopeKey = relationScopeKey(scope);
     let index = this.relationIndexCache.get(scopeKey);
@@ -2330,6 +2606,8 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    */
   private async tryPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
     const args = object(operation.arguments);
+    const graph = await this.tryGraphPushdown(operation);
+    if (graph !== undefined) return graph;
     if (operation.operation_id === "core:resolve_symbol" && this.snapshots.records_by_name !== undefined) {
       const reference = String(args["reference"] ?? "");
       // A record's plain `name` never contains "." for any known producer,
@@ -2848,6 +3126,8 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => result(streams, capabilityStates);
     const maps = await cachedIdentityMaps(records);
     const args = object(boundOperation.arguments);
+    const graphEvaluation = this.evaluateGraphOperation(boundOperation, records, maps, capabilityStates);
+    if (graphEvaluation !== undefined) return graphEvaluation;
     if (boundOperation.operation_id === "core:find_records") {
       return evaluated({ records: records.filter((record) => selected(record, args["selector"])).map((record) => item(record)) });
     }
@@ -2881,109 +3161,6 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         }
       }
       return evaluated({ declarations: declarations.map((record) => item(record)), candidates: [] });
-    }
-    if (boundOperation.operation_id === "core:get_outline") {
-      const containers = resolveSelectorsToRecords(args["container"] === undefined ? [] : [args["container"]], maps);
-      const container = containers[0];
-      // Bug Group 3: an unresolvable container (including the artifact/path
-      // variants `subjectIdentity` alone never read) used to fall through
-      // to a silent `evaluated({members: []})` SUCCESS. A missing container
-      // is a selector error, not an empty-but-valid outline.
-      if (container === undefined) throw new EngineErrorWithDetails("core:selector_not_found", "The get_outline container could not be resolved.", { selector_pointer: "/container" });
-      const depth = typeof args["depth"] === "number" ? args["depth"] : 1;
-      const seen = new Set<string>([container.identity_key ?? container.record_id]);
-      let frontier = [container];
-      const members: CanonicalQueryRecord[] = [];
-      for (let level = 0; level < depth; level += 1) {
-        const next: CanonicalQueryRecord[] = [];
-        for (const parent of frontier) for (const relation of maps.relations.filter((entry) => entry.universal_kind === "core:contains")) {
-          const endpoints = relationEndpoints(relation, maps.by_any_id);
-          if (endpoints.source !== parent || endpoints.target === undefined) continue;
-          const key = endpoints.target.identity_key ?? endpoints.target.record_id;
-          if (!seen.has(key)) { seen.add(key); members.push(endpoints.target); next.push(endpoints.target); }
-        }
-        frontier = next;
-      }
-      return evaluated({ members: members.map((record) => item(record)) });
-    }
-    if (boundOperation.operation_id === "core:find_references") {
-      const targets = resolveSelectorsToRecords(args["target"] === undefined ? [] : [args["target"]], maps);
-      const target = targets[0];
-      const relations = target === undefined ? [] : maps.relations.filter((record) => relationEndpoints(record, maps.by_any_id).target === target);
-      const owners = relations.flatMap((record) => {
-        const source = relationEndpoints(record, maps.by_any_id).source;
-        return source === undefined ? [] : [source];
-      });
-      return evaluated({ references: relations.map((record) => item(record, relationClassification(record))), owners: [...new Map(owners.map((record) => [record.record_id, record])).values()].map((record) => item(record)) });
-    }
-    if (boundOperation.operation_id === "core:expand_relations") {
-      // Bug Group 4.2: real multi-hop BFS (adapted from `expandRelations`/
-      // `findShortestPaths` in `query-operators.ts`), honoring
-      // direction/min_depth/max_depth instead of the prior single-hop
-      // filter, and populating `paths` when `path_policy` is present
-      // instead of always returning `[]`. Also resolves `subjects` through
-      // `resolveSelectorsToRecords` so a `symbol` selector seed works too.
-      const rootRecords = resolveSelectorsToRecords(args["subjects"], maps);
-      const idOf = (record: CanonicalQueryRecord): string => record.identity_key ?? record.record_id;
-      const rootIds = rootRecords.map(idOf);
-      const direction = args["direction"] === "inbound" ? "inbound" : args["direction"] === "both" ? "both" : "outbound";
-      const relationKinds = strings(object(args["relations"])["universal_kinds"]);
-      const minDepth = typeof args["min_depth"] === "number" ? args["min_depth"] : 1;
-      const maxDepth = typeof args["max_depth"] === "number" ? args["max_depth"] : 1;
-      const edges: RelationEdge[] = maps.relations.flatMap((record) => {
-        const endpoints = relationEndpoints(record, maps.by_any_id);
-        if (endpoints.source === undefined || endpoints.target === undefined) return [];
-        if (relationKinds.length > 0 && !relationKinds.includes(record.universal_kind)) return [];
-        return [{ source: idOf(endpoints.source), target: idOf(endpoints.target), relation_kind: record.universal_kind, classification: relationClassification(record), stable_sort_key: record.identity_key ?? record.record_id }];
-      });
-      const expanded = rootIds.length === 0 ? [] : expandRelations(edges, rootIds, { direction, min_depth: minDepth, max_depth: maxDepth, ...(relationKinds.length > 0 ? { relation_kinds: relationKinds } : {}) });
-      const discoveredIds = new Map<string, CanonicalQueryRecord>();
-      for (const entry of expanded) {
-        const record = maps.by_any_id.get(entry.subject);
-        if (record !== undefined && !discoveredIds.has(entry.subject)) discoveredIds.set(entry.subject, record);
-      }
-      const reachableIds = new Set([...rootIds, ...discoveredIds.keys()]);
-      const relationsUsed = maps.relations.filter((record) => {
-        if (relationKinds.length > 0 && !relationKinds.includes(record.universal_kind)) return false;
-        const endpoints = relationEndpoints(record, maps.by_any_id);
-        return endpoints.source !== undefined && endpoints.target !== undefined && reachableIds.has(idOf(endpoints.source)) && reachableIds.has(idOf(endpoints.target));
-      });
-      const pathPolicy = args["path_policy"];
-      const paths = pathPolicy === undefined || discoveredIds.size === 0 || rootIds.length === 0
-        ? []
-        : findShortestPaths(edges, rootIds, [...discoveredIds.keys()], { direction, max_depth: maxDepth, all_shortest: false, ...(relationKinds.length > 0 ? { relation_kinds: relationKinds } : {}) }).map((path): QueryStreamItem => ({
-            value: {
-              subjects: path.subjects.map((id) => maps.by_any_id.get(id)).filter((value): value is CanonicalQueryRecord => value !== undefined).map((record) => recordValue(record)),
-              relation_kinds: path.relation_kinds,
-              length: path.subjects.length - 1,
-              classification: path.classification,
-            },
-            stable_sort_key: path.stable_sort_key,
-            result_classification: path.classification,
-          }));
-      return evaluated({ subjects: [...discoveredIds.values()].map((record) => item(record)), relations: relationsUsed.map((record) => item(record, relationClassification(record))), paths });
-    }
-    if (boundOperation.operation_id === "core:find_paths") {
-      const sourceIds = resolveSelectorsToRecords(args["sources"], maps).map((record) => record.record_id);
-      const targetRecords = new Set(resolveSelectorsToRecords(args["targets"], maps));
-      const relationKinds = strings(object(args["relations"])["universal_kinds"]);
-      const maxDepth = typeof args["max_depth"] === "number" ? args["max_depth"] : 4;
-      const queue = sourceIds.flatMap((id) => { const source = maps.by_any_id.get(id); return source === undefined ? [] : [{ node: source, path: [] as CanonicalQueryRecord[] }]; });
-      const found: CanonicalQueryRecord[] = [];
-      const seen = new Set(queue.map((entry) => entry.node.record_id));
-      while (queue.length > 0) {
-        const current = queue.shift()!;
-        if (targetRecords.has(current.node)) { found.push(...current.path); break; }
-        if (current.path.length >= maxDepth) continue;
-        for (const relation of maps.relations) {
-          if (relationKinds.length > 0 && !relationKinds.includes(relation.universal_kind)) continue;
-          const endpoints = relationEndpoints(relation, maps.by_any_id);
-          if (endpoints.source !== current.node || endpoints.target === undefined || seen.has(endpoints.target.record_id)) continue;
-          seen.add(endpoints.target.record_id);
-          queue.push({ node: endpoints.target, path: [...current.path, relation] });
-        }
-      }
-      return evaluated({ paths: found.map((record) => item(record, relationClassification(record))) });
     }
     if (boundOperation.operation_id === "core:get_source") {
       const selectors = Array.isArray(args["subjects"]) ? args["subjects"] : [];

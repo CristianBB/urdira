@@ -1,34 +1,42 @@
-import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { validateFactDeltaBatch, type ArtifactWorkItem, type FactDeltaBatch, type ReplacementScope, type SnapshotCapabilityStateEntry } from "@urdira/contracts";
+import { type ArtifactWorkItem, type ProposedRecord, type ProposedRecordDependency, type ReplacementScope, type SnapshotCapabilityStateEntry } from "@urdira/contracts";
 import { parseCliArgs, runCli, type CliCommand, type CliResult } from "@urdira/cli";
-import { createPersistentWorkspaceRegistry, DAEMON_PRIVATE_INTERFACE_VERSION, DaemonClient, DaemonError, DaemonRuntime, EndpointDescriptorStore, ProcessLock, daemonPaths, type DaemonRuntimeOptions, type DaemonStartupPhase, type IpcProgress, type SemanticProviderDescriptor } from "@urdira/daemon";
+import { createPersistentWorkspaceRegistry, DAEMON_PRIVATE_INTERFACE_VERSION, DaemonClient, DaemonError, DaemonRuntime, EndpointDescriptorStore, ProcessLock, daemonPaths, type DaemonErrorCode, type DaemonRuntimeOptions, type DaemonStartupPhase, type IpcProgress, type SemanticProviderDescriptor } from "@urdira/daemon";
 import {
   candidateTargetRegistryFromSnapshot,
-  compactAcceptedFactDelta,
+  configureNativeExactVectorTopKPort,
+  configureNativeLogicalDigestPort,
   createCanonicalPluginDigestAuthority,
+  EngineError,
   engineTimingEnabled,
-  FactDeltaAcceptanceService,
+  FactDeltaStreamAcceptanceService,
   readPersistedControlState,
   recordEngineTiming,
   type MaterializationAcceptedFactDelta,
+  type WorkspaceScanAnalysisOutcome,
   type WorkspaceScanPluginProvider,
   type WorkspaceScanSourceArtifact,
 } from "@urdira/engine";
 import { MCP_BENCHMARK_INSTRUCTIONS, buildBenchmarkInstructions, serveUrdiraStdio, type ServeUrdiraStdioOptions, type UrdiraMcpClient } from "@urdira/mcp";
 import { startUrdiraWeb, type UrdiraWebHandle } from "@urdira/web";
+import { createNativeExactVectorTopKPort, createNativeLogicalDigestPort, createNativeStructuralKernelPort, loadNativeBinding, resolveNativeClosure, type ResolvedNativeClosure } from "@urdira/native";
+import { WORKSPACE_V3_SCHEMA_DIGEST } from "@urdira/storage";
 export { MCP_BENCHMARK_INSTRUCTIONS, buildBenchmarkInstructions } from "@urdira/mcp";
-import type { PluginWorkerRequestEnvelope } from "@urdira/plugin-sdk";
+import { canonicalJson, configureStructuralKernelPort, type FactDeltaStream, type PluginWorkerRequestEnvelope, type WorkerTransport } from "@urdira/plugin-sdk";
 import {
   bundledPluginCatalogEntry,
+  buildJavascriptTypescriptNativeFactDeltaStream,
   createJavascriptTypescriptInstalledBundle,
-  createJavascriptTypescriptThreadTransport,
-  createJavascriptTypescriptWorker,
+  createJavascriptTypescriptProcessTransport,
+  createIndexingCoreProcessTransport,
+  createJavascriptTypescriptSemanticProcessTransport,
+  createRustSyntaxAnalyzeRequest,
   extractImportSpecifiers,
-  iterateNativeFactDeltaBatches,
   largeSyntaxManifestKey,
   languageForPath,
   resolveSyntaxDependencyGraph,
@@ -42,6 +50,14 @@ import {
   LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD,
   LARGE_SYNTAX_CORPUS_FILE_THRESHOLD,
   TYPESCRIPT_COMPILER_VERSION,
+  JSTS_RUST_SYNTAX_BUILD_IDENTITY,
+  JSTS_SEMANTIC_PROCESS_BUILD_IDENTITY,
+  type JavascriptTypescriptProcessTransport,
+  type IndexingCoreProcessTransport,
+  type JavascriptTypescriptSemanticProcessTransport,
+  type RustSyntaxAnalysisResult,
+  type RustSyntaxDirectImport,
+  type RustSyntaxFactCursor,
   type JavascriptTypescriptPackageAsset,
   type JavascriptTypescriptWorkerDescriptor,
 } from "@urdira/plugin-javascript-typescript";
@@ -53,12 +69,14 @@ import {
   PluginPackageDiscovery,
   PluginRegistryAssembler,
   PluginResolver,
+  sha256Bytes,
   type AssembledPluginRegistry,
   type AutomaticPluginInputAccessManifest,
   type DiscoveredPluginPackage,
   type SdkPluginResolutionLock,
 } from "@urdira/plugin-sdk";
 import { AnalysisWorkerPool } from "./analysis-worker-pool.js";
+import { WholeProcessTreeRssController, createHostProcessTableRssSampler } from "./process-tree-rss.js";
 
 export interface UrdiraRunOptions {
   readonly endpoint?: string;
@@ -68,6 +86,9 @@ export interface UrdiraRunOptions {
   readonly on_startup_progress?: (phase: DaemonStartupPhase) => void;
   /** Human-facing daemon attachment and long-running CLI operation progress. */
   readonly on_progress?: (progress: IpcProgress["progress"]) => void;
+  /** Internal foreground-controller override for administrative operations.
+   * Ordinary CLI calls retain the five-minute default. */
+  readonly admin_request_timeout_ms?: number;
 }
 
 export const URDIRA_VERSION = "0.3.3";
@@ -116,32 +137,99 @@ export interface UrdiraMcpRunOptions {
 //  - The installed bundle's executable "parser" asset is the *real*
 //    compiled `@urdira/plugin-javascript-typescript` analyzer
 //    (`dist/worker.js`, read directly off disk below).
-//  - The bundle's "dependency" provenance asset (standing in for
-//    `node_modules/typescript/package.json`) is a synthesized descriptor
-//    built from the real pinned `TYPESCRIPT_COMPILER_VERSION` constant, not
-//    the literal on-disk `typescript/package.json` bytes. Reading an
-//    arbitrary transitive dependency file would need a deep import path
-//    this package does not otherwise use; this is flagged as a known,
-//    documented limitation rather than treated as fully real provenance.
-//  - `analyze()` below calls the real `createJavascriptTypescriptWorker(...)`
-//    and its real `.invoke("analyze_artifact", ...)` — this is genuine
-//    TypeScript-checker analysis, not a stub.
+//  - The bundle's TypeScript dependency asset is a deterministic inventory
+//    of every regular file in the installed compiler package. The analyzer
+//    identity therefore commits the bytes actually loaded by the checker,
+//    not only the package's declared version string.
+//  - `analyze()` below calls the real semantic process transport and its real
+//    `.invoke("analyze_artifact", ...)` — this is genuine TypeScript-checker
+//    analysis in a supervised child process, not a stub.
 
-async function javascriptTypescriptWorkerAssetBytes(): Promise<Uint8Array> {
+async function javascriptTypescriptExecutableAssets(): Promise<readonly JavascriptTypescriptPackageAsset[]> {
   const indexUrl = import.meta.resolve("@urdira/plugin-javascript-typescript");
-  // `dist/worker.js` ships alongside `dist/index.js` in the published
-  // package (`package.json`'s `files: ["dist"]`), so a sibling URL
-  // resolution here needs no separate `exports` subpath entry.
-  const workerUrl = new URL("worker.js", indexUrl);
-  return new Uint8Array(await readFile(fileURLToPath(workerUrl)));
+  const distDirectory = fileURLToPath(new URL(".", indexUrl));
+  // Bind every shipped JavaScript module in the plugin package. The semantic
+  // process entrypoint imports worker.js and several sibling modules; binding
+  // only worker.js would leave executable production code outside the package
+  // and analyzer identities even though the process actually loads it.
+  const moduleNames = (await readdir(distDirectory, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+    .map((entry) => entry.name)
+    .sort();
+  for (const required of ["semantic-process-worker.js", "worker.js"]) {
+    if (!moduleNames.includes(required)) throw new Error(`The JavaScript/TypeScript runtime package is missing ${required}.`);
+  }
+  return await Promise.all(moduleNames.map(async (name) => ({
+    normalized_relative_path: `dist/${name}`,
+    bytes: new Uint8Array(await readFile(join(distDirectory, name))),
+    executable: true,
+    role: name === "semantic-process-worker.js" || name === "worker.js" ? "parser" as const : "dependency" as const,
+  })));
+}
+
+let typescriptPackageClosureDescriptorPromise: Promise<Uint8Array> | undefined;
+
+async function typescriptPackageClosureDescriptor(): Promise<Uint8Array> {
+  typescriptPackageClosureDescriptorPromise ??= (async () => {
+    const packageJsonPath = fileURLToPath(import.meta.resolve("typescript/package.json"));
+    const packageRoot = dirname(packageJsonPath);
+    const files: { readonly normalized_relative_path: string; readonly content_digest: string; readonly byte_length: number }[] = [];
+    const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
+      const entries = (await readdir(directory, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        const relativePath = relativeDirectory === "" ? entry.name : `${relativeDirectory}/${entry.name}`;
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) await walk(path, relativePath);
+        else if (entry.isFile()) {
+          const bytes = new Uint8Array(await readFile(path));
+          files.push({ normalized_relative_path: relativePath, content_digest: sha256Bytes(bytes), byte_length: bytes.byteLength });
+        } else throw new Error(`The installed TypeScript package contains an unsupported filesystem entry: ${relativePath}.`);
+      }
+    };
+    await walk(packageRoot, "");
+    const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as { readonly name?: unknown; readonly version?: unknown };
+    if (packageJson.name !== "typescript" || packageJson.version !== TYPESCRIPT_COMPILER_VERSION) throw new Error("The installed TypeScript package identity does not match the analyzer compiler version.");
+    return new TextEncoder().encode(JSON.stringify({ name: packageJson.name, version: packageJson.version, files }));
+  })();
+  return await typescriptPackageClosureDescriptorPromise;
+}
+
+function createProductionJavascriptTypescriptSemanticTransport(
+  descriptor: JavascriptTypescriptWorkerDescriptor,
+  processTreeRss?: WholeProcessTreeRssController,
+  structuralKernelAddonPath?: string,
+): JavascriptTypescriptSemanticProcessTransport {
+  if (descriptor.on_analysis_build !== undefined || descriptor.on_analysis_cache_load !== undefined || descriptor.on_analysis_incremental !== undefined) {
+    throw new Error("Test-only JavaScript/TypeScript analysis hooks cannot enter the production semantic process.");
+  }
+  const transport = createJavascriptTypescriptSemanticProcessTransport({
+    // Autonomous archives launch this application with their pinned private
+    // Node binary; prepared npm runtimes likewise retain the exact executable
+    // that passed runtime preparation. Never resolve `node` through PATH.
+    node_executable: process.execPath,
+    worker: descriptor,
+    ...(structuralKernelAddonPath === undefined ? {} : { structural_kernel_addon_path: structuralKernelAddonPath }),
+  });
+  if (processTreeRss === undefined) return transport;
+  const unregister = processTreeRss.registerComponent({
+    component_id: `typescript-checker:${transport.process_id}`,
+    kind: "typescript_checker",
+    pid: transport.process_id,
+  });
+  return {
+    ...transport,
+    async terminate(): Promise<void> {
+      try { await transport.terminate(); }
+      finally { unregister(); }
+    },
+  };
 }
 
 async function javascriptTypescriptBundleAssets(): Promise<readonly JavascriptTypescriptPackageAsset[]> {
-  const workerBytes = await javascriptTypescriptWorkerAssetBytes();
-  const typescriptDependencyDescriptor = new TextEncoder().encode(JSON.stringify({ name: "typescript", version: TYPESCRIPT_COMPILER_VERSION }));
+  const [executableAssets, typescriptDependencyDescriptor] = await Promise.all([javascriptTypescriptExecutableAssets(), typescriptPackageClosureDescriptor()]);
   return [
-    { normalized_relative_path: "dist/worker.js", bytes: workerBytes, executable: true, role: "parser" },
-    { normalized_relative_path: "node_modules/typescript/package.json", bytes: typescriptDependencyDescriptor, executable: false, role: "dependency" },
+    ...executableAssets,
+    { normalized_relative_path: "node_modules/typescript/package-closure.json", bytes: typescriptDependencyDescriptor, executable: false, role: "dependency" },
   ];
 }
 
@@ -149,6 +237,12 @@ interface PreparedJavascriptTypescriptRegistry {
   readonly registry: AssembledPluginRegistry;
   readonly lock: SdkPluginResolutionLock;
   readonly plugin: DiscoveredPluginPackage;
+}
+
+interface PreparedNativeRuntime {
+  readonly closure: ResolvedNativeClosure;
+  readonly addon_bytes: Uint8Array;
+  readonly worker_bytes: Uint8Array;
 }
 
 /** The second parameter `resolve_plugin_provider` (`@urdira/daemon`'s `DaemonRuntimeOptions`) is called with -- extracted as a type alias so this file can read a workspace's own database without adding a new cross-layer package dependency (`@urdira/storage` stays reached only through `@urdira/engine`, matching `architecture/manifest.json`'s allowed dependency edges for this app). */
@@ -201,7 +295,7 @@ type PluginResolverDatabase = Parameters<NonNullable<DaemonRuntimeOptions["resol
  * reuse the salted lock exactly rather than re-freezing a brand new one
  * with a fresh `created_at` that would again collide on republish.
  */
-function resolutionInputFingerprint(discoveredPackages: readonly DiscoveredPluginPackage[]): string {
+function resolutionInputFingerprint(discoveredPackages: readonly DiscoveredPluginPackage[], supportedRuntimeContractVersions: readonly number[]): string {
   const packages = [...discoveredPackages].sort((left, right) => (left.plugin_id < right.plugin_id ? -1 : left.plugin_id > right.plugin_id ? 1 : 0)).map((item) => ({
     plugin_id: item.plugin_id,
     plugin_version: item.plugin_version,
@@ -210,10 +304,11 @@ function resolutionInputFingerprint(discoveredPackages: readonly DiscoveredPlugi
     contribution_digest: item.contribution_digest,
     analysis_digest: item.compatibility.analysis_digest,
     analysis_configuration_digest: item.analysis_configuration_digest,
+    runtime_executable_binding: item.runtime_executable_binding ?? null,
   }));
   return canonicalSha256({
     resolver_version: JAVASCRIPT_TYPESCRIPT_VERSION,
-    supported_runtime_contract_versions: [1],
+    supported_runtime_contract_versions: supportedRuntimeContractVersions,
     supported_registry_contract_versions: [1],
     requirements: [{ plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, version_requirement: "*" }],
     pins: [],
@@ -221,11 +316,34 @@ function resolutionInputFingerprint(discoveredPackages: readonly DiscoveredPlugi
   });
 }
 
-async function prepareJavascriptTypescriptRegistry(workspaceId: string, now: string, database: PluginResolverDatabase): Promise<PreparedJavascriptTypescriptRegistry> {
+async function prepareJavascriptTypescriptRegistry(workspaceId: string, now: string, database: PluginResolverDatabase, nativeRuntime?: PreparedNativeRuntime): Promise<PreparedJavascriptTypescriptRegistry> {
   const digests = createCanonicalPluginDigestAuthority();
   const assets = await javascriptTypescriptBundleAssets();
-  const bundle = createJavascriptTypescriptInstalledBundle({ digests, package_locator: "bundled:jsts", target_triple: `${process.platform}-${process.arch}`, assets });
+  const nativeAddonPath = "native/urdira-native.node";
+  const nativeWorkerPath = nativeRuntime === undefined ? undefined : `native/${basename(nativeRuntime.closure.worker_path)}`;
+  const bundle = createJavascriptTypescriptInstalledBundle({
+    digests,
+    package_locator: "bundled:jsts",
+    assets,
+    ...(nativeRuntime === undefined
+      ? { target_triple: `${process.platform}-${process.arch}` }
+      : {
+          native_runtime: {
+            runtime_target_id: nativeRuntime.closure.runtime_target_id,
+            runtime_component_build_id: nativeRuntime.closure.runtime_component_build_id,
+            addon: { normalized_relative_path: nativeAddonPath, bytes: nativeRuntime.addon_bytes },
+            worker: { normalized_relative_path: nativeWorkerPath!, bytes: nativeRuntime.worker_bytes },
+          },
+        }),
+  });
   const bytesByPath = new Map(assets.map((asset) => [asset.normalized_relative_path, asset.bytes]));
+  if (nativeRuntime !== undefined) {
+    bytesByPath.set(nativeAddonPath, nativeRuntime.addon_bytes);
+    bytesByPath.set(nativeWorkerPath!, nativeRuntime.worker_bytes);
+  }
+  const packageByteLength = [...bytesByPath.values()].reduce((total, bytes) => total + bytes.byteLength, 0);
+  const maximumAssetByteLength = Math.max(8_000_000, ...[...bytesByPath.values()].map((bytes) => bytes.byteLength));
+  if (maximumAssetByteLength > 64 * 1024 * 1024 || packageByteLength > 128 * 1024 * 1024) throw new Error("The bundled JavaScript/TypeScript runtime closure exceeds its closed discovery budget.");
   const discovery = await new PluginPackageDiscovery({
     list: async () => [bundle],
     read_file: async (request) => {
@@ -233,8 +351,25 @@ async function prepareJavascriptTypescriptRegistry(workspaceId: string, now: str
       if (bytes === undefined) throw new Error(`Missing bundled JavaScript/TypeScript asset ${request.normalized_relative_path}.`);
       return { bytes, byte_length: bytes.byteLength };
     },
-  }, digests, { max_file_bytes: 8_000_000 }, { max_items: 100, max_depth: 20, max_nodes: 10_000, max_bytes: 8_000_000 }).discover(["bundled"]);
-  const fingerprint = resolutionInputFingerprint(discovery.packages);
+  }, digests, { max_file_bytes: maximumAssetByteLength }, { max_items: 100, max_depth: 20, max_nodes: 10_000, max_bytes: Math.max(8_000_000, packageByteLength) }).discover(["bundled"]);
+  const supportedRuntimeContractVersions = nativeRuntime === undefined ? [1] : [2];
+  if (discovery.packages.length !== 1) throw new Error("The bundled JavaScript/TypeScript plugin must resolve to exactly one package.");
+  const discoveredPlugin = discovery.packages[0]!;
+  if (nativeRuntime !== undefined) {
+    const binding = discoveredPlugin?.runtime_executable_binding;
+    const implementation = discoveredPlugin?.runtime_implementation_manifests_v2?.[0];
+    const semanticEntrypoint = discoveredPlugin.manifest.package_files.find((entry) => entry.normalized_relative_path === "dist/semantic-process-worker.js");
+    if (binding === undefined || implementation === undefined || discoveredPlugin.runtime_implementation_manifests_v2?.length !== 1 ||
+        semanticEntrypoint === undefined || !semanticEntrypoint.executable || !implementation.executable_asset_digests.includes(semanticEntrypoint.content_digest) ||
+        binding.runtime_target_id !== nativeRuntime.closure.runtime_target_id ||
+        binding.runtime_component_build_id !== nativeRuntime.closure.runtime_component_build_id ||
+        binding.entrypoint_asset_digest !== nativeRuntime.closure.worker_digest ||
+        implementation.entrypoint_asset_digest !== nativeRuntime.closure.worker_digest || !implementation.executable_asset_digests.includes(nativeRuntime.closure.worker_digest) ||
+        JSON.stringify(implementation.native_asset_digests) !== JSON.stringify([nativeRuntime.closure.addon_digest])) {
+      throw new Error("The bundled JavaScript/TypeScript plugin binding does not match the verified native closure.");
+    }
+  }
+  const fingerprint = resolutionInputFingerprint(discovery.packages, supportedRuntimeContractVersions);
   const resolutionLockId = `lock:${workspaceId}:${fingerprint.slice("sha256:".length, "sha256:".length + 16)}`;
   // Two-step existing-lock lookup (see the doc comment above): the
   // workspace's currently-published lock (legacy unsalted id or a
@@ -248,7 +383,7 @@ async function prepareJavascriptTypescriptRegistry(workspaceId: string, now: str
     packages: discovery.packages,
     requirements: [{ plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, version_requirement: parseVersionRequirementText("*") }],
     pins: [],
-    supported_runtime_contract_versions: [1],
+    supported_runtime_contract_versions: supportedRuntimeContractVersions,
     supported_registry_contract_versions: [1],
     workspace_id: workspaceId,
     resolver_version: JAVASCRIPT_TYPESCRIPT_VERSION,
@@ -307,7 +442,15 @@ function javascriptTypescriptAccessManifest(workItemId: string, analysisContextD
   };
 }
 
-function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTypescriptRegistry, workspaceId: string, registrySnapshotId: string, configurationRevisionId: string, now: string, casRoot: string, analysisCacheDir?: string, analysisWorkerPool?: AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>, analysisWorkerShardCount = 2, acceptNativeBatches?: (candidateGenerationId: string, batches: readonly { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[]) => Promise<void>): WorkspaceScanPluginProvider {
+interface RustSyntaxSession {
+  readonly transport: JavascriptTypescriptProcessTransport;
+  readonly runtime_executable_binding_digest: string;
+}
+
+function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTypescriptRegistry, workspaceId: string, registrySnapshotId: string, configurationRevisionId: string, now: string, casRoot: string, analysisCacheDir?: string, analysisWorkerPool?: AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>, analysisWorkerShardCount = 2, streamAcceptance?: FactDeltaStreamAcceptanceService, rustSyntax?: RustSyntaxSession, processTreeRss?: WholeProcessTreeRssController, structuralKernelAddonPath?: string, indexingCore?: IndexingCoreProcessTransport, databasePath?: string): WorkspaceScanPluginProvider {
+  if (indexingCore !== undefined && (streamAcceptance !== undefined || rustSyntax !== undefined)) {
+    throw new Error("Exclusive-work violation: the Rust indexing composition worker cannot be combined with a TypeScript structural writer or syntax session.");
+  }
   const configuration = {
     configuration_revision_id: configurationRevisionId,
     schema_version: 1,
@@ -352,11 +495,29 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
     registry_contribution_digest: prepared.plugin.contribution.contribution_digest,
     analysis_digest: prepared.plugin.compatibility.analysis_digest,
     analysis_configuration_digest: prepared.plugin.analysis_configuration_digest,
+    ...(prepared.plugin.runtime_executable_binding === undefined ? {} : { runtime_executable_binding_digest: prepared.plugin.runtime_executable_binding.binding_digest }),
     cas_root: casRoot,
     ...(analysisCacheDir === undefined ? {} : { analysis_cache_dir: analysisCacheDir }),
     native_batch_transport: "host",
   };
   const workerDescriptorDigest = canonicalSha256(workerDescriptor);
+  const rustSemanticWorkerEntrypoint = fileURLToPath(new URL("rust-semantic-worker.js", import.meta.resolve("@urdira/plugin-javascript-typescript")));
+  let activeRustOperationId: string | undefined;
+  const rustGenerationControl = indexingCore === undefined ? undefined : {
+    owns_candidate_lifecycle: true as const,
+    cancel: async (): Promise<void> => {
+      const operationId = activeRustOperationId;
+      if (operationId !== undefined) await indexingCore.cancel(operationId).catch(() => undefined);
+    },
+    commit_source_index: async (input: { readonly operation_id: string; readonly workspace_id: string; readonly database_path: string; readonly commits: readonly unknown[]; readonly finalize_state?: boolean }): Promise<void> => {
+      const result = await indexingCore.commitSourceIndex(input.operation_id, input.workspace_id, input.database_path, input.commits, input.finalize_state);
+      if (result.kind !== "source_index_committed") throw new Error("Rust indexing-core did not commit the generic source index.");
+    },
+    rollback_source_index: async (input: { readonly operation_id: string; readonly workspace_id: string; readonly database_path: string }): Promise<void> => {
+      const result = await indexingCore.rollbackSourceIndex(input.operation_id, input.workspace_id, input.database_path);
+      if (result.kind !== "source_index_rolled_back") throw new Error("Rust indexing-core did not roll back the generic source index.");
+    },
+  };
 
   // P3-3b: per-file raw import specifiers, collected via `on_source_text`
   // (below) as source cataloging hands off each file's full text -- NOT the
@@ -369,6 +530,13 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
   // this map can never leak a stale entry from a PRIOR scan into the current
   // one's pre-seed.
   const importSpecifiersByPath = new Map<string, readonly string[]>();
+  let nativeSemanticScope: {
+    readonly inputs_digest: string;
+    readonly configuration_digest: string;
+    readonly changed_paths: ReadonlySet<string>;
+    readonly affected_paths: ReadonlySet<string>;
+    readonly dependency_graph: ReadonlyMap<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>;
+  } | undefined;
   const onSourceText = (uri: string, text: string): void => {
     if (languageForPath(uri) === undefined) return;
     importSpecifiersByPath.set(uri, extractImportSpecifiers(text));
@@ -381,21 +549,62 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
   const graphPreseedEnabled = process.env["URDIRA_GRAPH_PRESEED"] !== "0";
 
   return {
-    supports_progressive_publication: true,
+    ...(rustGenerationControl === undefined ? {} : { indexing_core: rustGenerationControl }),
+    // A Rust generation is atomic across syntax and semantic stages. Keep
+    // progressive publications only for the portable compatibility route;
+    // splitting the Rust owner set would analyze and promote it twice.
+    supports_progressive_publication: indexingCore === undefined,
     supports_native_content_refs: true,
+    requires_complete_artifact_manifest: rustSyntax !== undefined || indexingCore !== undefined,
+    initial_publication_stage_groups: Object.freeze([{ stage_ids: Object.freeze(["jsts:structural_stage_2", "jsts:structural_stage_3"]) }]),
     registry_snapshot_id: registrySnapshotId,
     configuration_revision_id: configurationRevisionId,
     registry: prepared.registry,
     resolution_lock: prepared.lock,
     configuration,
     dependency_roles: [...JAVASCRIPT_TYPESCRIPT_DEPENDENCY_ROLES],
-    ...(graphPreseedEnabled ? { on_source_text: onSourceText } : {}),
-    analyze: async ({ workspace_id, candidate, artifacts, changed_artifact_ids, publication_stage_id, on_accepted_delta }) => {
+    ...(graphPreseedEnabled && rustSyntax === undefined && indexingCore === undefined ? { on_source_text: onSourceText } : {}),
+    analyze: async ({ workspace_id, candidate, frozen_base, source_state_digest, source_snapshot_id, candidate_work_manifest, artifacts, changed_artifact_ids, publication_stage_id, included_publication_stage_ids, on_accepted_delta, signal }) => {
       const stage = publication_stage_id === undefined
         ? undefined
         : JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES.find((entry) => entry.stage_id === publication_stage_id);
       if (publication_stage_id !== undefined && stage === undefined) throw new Error(`Unknown JavaScript/TypeScript structural stage: ${publication_stage_id}`);
-      const stageCapabilities = stage?.capabilities ?? JAVASCRIPT_TYPESCRIPT_CAPABILITIES.map((entry) => entry.capability);
+      const includedStages = included_publication_stage_ids === undefined
+        ? (stage === undefined ? [] : [stage])
+        : included_publication_stage_ids.map((stageId) => JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES.find((entry) => entry.stage_id === stageId));
+      if (includedStages.some((entry) => entry === undefined)
+        || (included_publication_stage_ids !== undefined && (includedStages.length < 2 || includedStages.at(-1)?.stage_id !== publication_stage_id))) {
+        throw new Error("The JavaScript/TypeScript accumulated publication stage group is invalid.");
+      }
+      // The Rust composition worker may execute syntax and semantic analysis
+      // in one generation; no progressive-stage requirement applies there.
+      const nativeStageOne = publication_stage_id === "jsts:structural_stage_1" && (rustSyntax !== undefined || indexingCore !== undefined);
+      // Once the composition worker is present it owns the complete structural
+      // generation for every progressive stage. Stage one and the semantic
+      // checker are both executed behind the Rust worker boundary; the app
+      // only supplies opaque generation/request envelopes and publication
+      // control metadata. Keeping this separate from `nativeStageOne` avoids
+      // selecting a second TypeScript staging/publication route for stages two
+      // and three.
+      const coreGenerationEnabled = indexingCore !== undefined;
+      // The engine always supplies this compact digest on the production
+      // route. Direct provider tests/oracle callers may invoke `analyze`
+      // without the coordinator, so retain a compatibility-only fallback
+      // there; it is unreachable for Rust-owned workspace scans.
+      const capturedSourceStateDigest = source_state_digest
+        ?? frozen_base?.source_state_digest
+        ?? canonicalSha256(artifacts.map((artifact) => ({ artifact_id: artifact.artifact_id, artifact_version_id: artifact.artifact_version_id, content_hash: artifact.content_hash })));
+      const exclusiveWork = new Map<string, string>();
+      const claimExclusiveWork = (owner: "rust" | "typescript", operations: readonly string[]): void => {
+        for (const operation of operations) {
+          const existing = exclusiveWork.get(operation);
+          if (existing !== undefined) throw new Error(`Exclusive-work violation: ${operation} is already owned by ${existing}, not ${owner}.`);
+          exclusiveWork.set(operation, owner);
+        }
+      };
+      const stageCapabilities = stage === undefined
+        ? JAVASCRIPT_TYPESCRIPT_CAPABILITIES.map((entry) => entry.capability)
+        : [...new Set((includedStages as (typeof JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES)[number][]).flatMap((entry) => entry.capabilities))];
       const completedCapabilities = stage === undefined
         ? stageCapabilities
         : JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES.filter((entry) => entry.ordinal <= stage.ordinal).flatMap((entry) => entry.capabilities);
@@ -403,11 +612,30 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // intentional: when source changes, stale stage-2/3 records must close
       // before the new declarations become visible. Later stages replace only
       // their own records and retain the preceding immutable stage.
-      const stageRecordKinds = stage === undefined || stage.ordinal === 1
-        ? [...JAVASCRIPT_TYPESCRIPT_RECORD_KINDS]
-        : stage.ordinal === 2
+      const recordKindsForStage = (stageId: string): readonly string[] => stageId === "jsts:structural_stage_1"
+        ? JAVASCRIPT_TYPESCRIPT_RECORD_KINDS
+        : stageId === "jsts:structural_stage_2"
           ? JAVASCRIPT_TYPESCRIPT_RECORD_KINDS.filter((kind) => ["jsts:relation_call", "jsts:relation_references", "jsts:relation_inherits", "jsts:relation_implements"].includes(kind))
-          : JAVASCRIPT_TYPESCRIPT_RECORD_KINDS.filter((kind) => kind === "jsts:diagnostic" || kind === "jsts:relation_covers" || kind.startsWith("jsts:entity_"));
+          : JAVASCRIPT_TYPESCRIPT_RECORD_KINDS.filter((kind) => ["jsts:entity_inferred_type", "jsts:relation_type_of", "jsts:diagnostic", "jsts:relation_covers"].includes(kind));
+      const stageRecordKinds = stage === undefined
+        ? [...JAVASCRIPT_TYPESCRIPT_RECORD_KINDS]
+        : [...new Set((includedStages as (typeof JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES)[number][]).flatMap((entry) => recordKindsForStage(entry.stage_id)))];
+      // In the Rust cutover a cold generation combines the syntax stage with
+      // the accumulated semantic stages in one transaction. Keep the
+      // semantic checker on the exact stage-2/3 vocabulary used by the former
+      // progressive final stage so the visible record set remains byte
+      // identical while avoiding a second generation.
+      const combinedRustGeneration = coreGenerationEnabled && publication_stage_id === undefined;
+      const semanticPublicationStageId = combinedRustGeneration ? "jsts:structural_stage_3" : publication_stage_id;
+      const semanticIncludedStageIds = combinedRustGeneration
+        ? ["jsts:structural_stage_2", "jsts:structural_stage_3"]
+        : included_publication_stage_ids;
+      const semanticStageCapabilities = combinedRustGeneration
+        ? JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES.filter((entry) => entry.ordinal >= 2).flatMap((entry) => entry.capabilities)
+        : stageCapabilities;
+      const semanticStageRecordKinds = combinedRustGeneration
+        ? [...new Set(JAVASCRIPT_TYPESCRIPT_STRUCTURAL_STAGES.filter((entry) => entry.ordinal >= 2).flatMap((entry) => recordKindsForStage(entry.stage_id)))]
+        : stageRecordKinds;
       const completeStageEntries = (status: SnapshotCapabilityStateEntry["status"] = "complete"): SnapshotCapabilityStateEntry[] => completedCapabilities.map((capability) => ({
         capability,
         capability_contract_version: "1.0.0",
@@ -419,18 +647,61 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         diagnostic_record_ids: [],
         ...(stage === undefined ? {} : { publication_stage_id: stage.stage_id, publication_stage_ordinal: stage.ordinal, publication_stage_count: stage.stage_count }),
       }));
-      const artifactVersions = artifacts.map((artifact) => ({ artifact_id: artifact.artifact_id, artifact_version_id: artifact.artifact_version_id, content_hash: artifact.content_hash }));
-      const targetRegistry = candidateTargetRegistryFromSnapshot({ registry: prepared.registry, artifact_versions: artifactVersions });
-      const acceptance = new FactDeltaAcceptanceService();
-      const native_batches: { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[] = [];
+      // The Rust composition worker seals and publishes the structural rows
+      // itself. Keep the application-side callback limited to the bounded
+      // publication envelope; returning it here lets the Rust route leave the
+      // owner planner, closure maps, FactDelta acceptance and TypeScript
+      // materializer completely untouched for this generation.
+      const rustExternalPublication = async (context: Parameters<NonNullable<WorkspaceScanAnalysisOutcome["external_publication"]>>[0]): Promise<import("@urdira/engine").CandidatePublicationResult> => {
+        if (indexingCore === undefined) throw new EngineError("engine:workspace_scan_external_publication_missing", "Rust indexing-core publication callback is missing.");
+        const result = await indexingCore.finalizeGeneration(`indexing-core:${workspace_id}:${candidate.candidate_generation_id}`, {
+          candidate: context.candidate,
+          frozen_base: context.frozen_base,
+          target_registry: prepared.registry,
+          target_resolution_lock: prepared.lock,
+          target_configuration: configuration,
+          freshness_checkpoint: context.freshness_checkpoint,
+          capability_state_entries: context.capability_state_entries,
+          publication_kind: context.publication_kind,
+          // Source commits already contain the complete version/tombstone
+          // authority. The Rust publisher derives the canonical transition
+          // templates inside its SQLite transaction, so do not serialize a
+          // second O(owners) transition graph through the application.
+          source_transitions: (context.source_index_commits?.length ?? 0) === 0 ? context.source_transitions : [],
+          // Source commits are sent to the Rust writer immediately after the
+          // capture frontier is sealed (`commitSourceIndex`). Re-sending the
+          // owner-sized commit payload here would both duplicate work and
+          // exceed the private 16 MiB transport budget on a full n8n cold
+          // scan. Rust derives the source transition set from its durable
+          // source tables during this final publication transaction.
+          source_index_commits: [],
+          lookup_bindings: [],
+          lookup_revalidations: [],
+          projection_closures: [],
+          lexical: { cas_root: casRoot, max_document_bytes: 2_000_000 },
+          source_snapshot_id: context.source_snapshot_id,
+          publication_stage_id: context.publication_stage_id,
+          publication_stage_ordinal: context.publication_stage_ordinal,
+          publication_stage_count: context.publication_stage_count,
+          published_at: new Date().toISOString(),
+        });
+        if (result.kind !== "completed") throw new Error("Rust indexing-core did not complete before publication.");
+        return {
+          candidate_generation_id: context.candidate.candidate_generation_id,
+          snapshot_id: `snapshot:${context.candidate.candidate_generation_id}`,
+          generation_manifest_id: `generation-manifest:${context.candidate.candidate_generation_id}`,
+          generation: result.generation,
+          published_at: new Date().toISOString(),
+          status: "published",
+        };
+      };
+      if (streamAcceptance === undefined && !coreGenerationEnabled) throw new Error("The built-in JavaScript/TypeScript plugin requires direct FactDeltaStream@2 acceptance.");
       // Real analysis: the compiled `@urdira/plugin-javascript-typescript`
-      // worker runs the pinned TypeScript checker over the scanned files.
-      // Default (`URDIRA_ANALYSIS_THREAD` unset or truthy): a real
-      // `node:worker_threads` worker, so the whole-project TypeScript
-      // program build + checking never blocks this (the daemon's) event
-      // loop. `URDIRA_ANALYSIS_THREAD=0` falls back to the in-process
-      // transport (same one direct `createJavascriptTypescriptWorker`
-      // callers/tests always use).
+      // worker runs the pinned TypeScript checker in a persistent, supervised
+      // child process launched by the exact Node executable running this
+      // prepared runtime. Production has no in-process or worker-thread
+      // fallback: a missing entrypoint, failed handshake, deadline, or crash
+      // rejects the scan and leaves the previously published snapshot intact.
       //
       // `analysis_cache_dir` (when `analysisCacheEnabled()` below is on) is
       // what lets THIS worker -- a fresh one, created and hard-terminated
@@ -455,10 +726,35 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // create/terminate; see `apps/urdira/src/analysis-worker-pool.ts`.
       // `URDIRA_ANALYSIS_POOL=0` restores today's exact per-scan behavior.
       const closureWorkerKey = `${workspace_id}:closure`;
-      const worker = analysisWorkerPool !== undefined
-        ? analysisWorkerPool.acquire(closureWorkerKey, workerDescriptor, workerDescriptorDigest)
-        : (analysisThreadEnabled() ? createJavascriptTypescriptThreadTransport(workerDescriptor) : createJavascriptTypescriptWorker(workerDescriptor));
       const sourceArtifacts = artifacts.filter((artifact) => languageForPath(artifact.path) !== undefined);
+      const estimatedWorkerRssBytes = analysisWorkerBaseReservationKib() * 1024
+        + sourceArtifacts.reduce((total, artifact) => total + artifact.byte_length, 0) * 2;
+      const acquirePooledWorker = async (key: string): Promise<JavascriptTypescriptSemanticProcessTransport | import("@urdira/plugin-sdk").WorkerTransport> => {
+        if (nativeStageOne) throw new Error("Exclusive-work violation: a TypeScript semantic process cannot be created during native structural stage 1.");
+        if (analysisWorkerPool === undefined) {
+          if (processTreeRss === undefined) return createProductionJavascriptTypescriptSemanticTransport(workerDescriptor, undefined, structuralKernelAddonPath);
+          const decision = await processTreeRss.admit({ reservation_id: `jsts-analysis:${key}`, estimated_additional_rss_bytes: estimatedWorkerRssBytes, fresh_sample: true });
+          if (!decision.admitted || decision.reservation === undefined) throw new Error(`Analysis worker RSS admission exhausted (${decision.reason}).`);
+          try {
+            const transport = createProductionJavascriptTypescriptSemanticTransport(workerDescriptor, processTreeRss, structuralKernelAddonPath);
+            return {
+              ...transport,
+              async terminate(): Promise<void> {
+                try { await transport.terminate(); }
+                finally { decision.reservation!.release(); }
+              },
+            };
+          } catch (error) {
+            decision.reservation.release();
+            throw error;
+          }
+        }
+        if (processTreeRss === undefined) return analysisWorkerPool.acquire(key, workerDescriptor, workerDescriptorDigest);
+        return analysisWorkerPool.acquireWithResourceAdmission(key, workerDescriptor, workerDescriptorDigest, {
+          reservation_id: `jsts-analysis:${key}`,
+          estimated_additional_rss_bytes: estimatedWorkerRssBytes,
+        });
+      };
       const accepted: MaterializationAcceptedFactDelta[] = [];
       const changedArtifactIds = changed_artifact_ids === undefined ? undefined : new Set(changed_artifact_ids);
       // The JavaScript/TypeScript provider owns only language-plugin source
@@ -470,34 +766,232 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // metadata, and documentation edits observed by the source index.
       // First scans keep the existing full analysis path because there is no
       // prior artifact set from which to prove that the plugin has no work.
-      if (changedArtifactIds !== undefined && !sourceArtifacts.some((artifact) => changedArtifactIds.has(artifact.artifact_id))) {
-        if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
-        else await worker.terminate();
+      if (!coreGenerationEnabled && changedArtifactIds !== undefined && !sourceArtifacts.some((artifact) => changedArtifactIds.has(artifact.artifact_id))) {
         if (debugTimingEnabled()) console.error(`[urdira] analyze timings ${workspace_id} owners=0 ms=${JSON.stringify({ closure: 0, worker_wait: 0, acceptance: 0, skipped: "no_plugin_artifact_changes" })}`);
         return {
           accepted_deltas: accepted,
           capability_state_entries: completeStageEntries(),
         };
       }
+      // Decision 25 native stage-one execution. The host supplies only explicit immutable
+      // CAS paths plus their authoritative digest/length; Rust reads and
+      // verifies those blobs without ambient checkout access. The retained
+      // content references. Rust is the sole parser, extractor, graph owner,
+      // affected-set authority, and structural-fact producer for this stage.
+      let nativeSyntaxResult: RustSyntaxAnalysisResult | undefined;
+      let nativeProjectKey: string | undefined;
+      let nativeAffectedPaths: ReadonlySet<string> | undefined;
+      const nativeDependencyGraph = new Map<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>();
+      if (coreGenerationEnabled) {
+        claimExclusiveWork("rust", ["sqlite_structural_ingest"]);
+        if (nativeStageOne) claimExclusiveWork("rust", ["source_decode", "syntax_parse", "declaration_extract", "import_extract", "direct_graph", "affected_set", "stage_one_fact_build"]);
+        if (databasePath === undefined) throw new Error("Rust indexing-core requires the workspace database path.");
+        const sourceStateDigest = capturedSourceStateDigest;
+      const sourceByteLength = sourceArtifacts.reduce((total, artifact) => total + artifact.byte_length, 0);
+      if (sourceByteLength > 0xffff_ffff || sourceArtifacts.length > 0xffff_ffff) throw new Error("JavaScript/TypeScript syntax input exceeds the closed Rust worker budget.");
+      const projectKey = canonicalSha256({ workspace_id, runtime_executable_binding_digest: prepared.plugin.runtime_executable_binding?.binding_digest ?? prepared.plugin.compatibility.analysis_digest });
+        const operationId = `indexing-core:${workspace_id}:${candidate.candidate_generation_id}`;
+        activeRustOperationId = operationId;
+        if (signal?.aborted) throw Object.assign(new Error("Rust indexing-core generation was cancelled."), { name: "AbortError" });
+        const cancelRustGeneration = (): void => {
+          // Keep cancellation on the private Rust control protocol. The
+          // worker checks the shared token at every syntax/group/checkpoint;
+          // a late abort is harmless because the operation is idempotent and
+          // the listener is removed immediately after the request returns.
+          void indexingCore!.cancel(operationId).catch(() => undefined);
+        };
+        signal?.addEventListener("abort", cancelRustGeneration, { once: true });
+        const generationEvent = await indexingCore!.indexGeneration({
+          operation_id: operationId,
+          workspace_id,
+          candidate_generation_id: candidate.candidate_generation_id,
+          database_path: databasePath,
+          cas_root: casRoot,
+          source_snapshot_id: source_snapshot_id ?? candidate.base_snapshot_id ?? `source-snapshot:${sourceStateDigest}`,
+          source_state_digest: sourceStateDigest,
+          base_generation: candidate.base_generation ?? 0,
+          candidate: candidate as unknown as Record<string, unknown>,
+          frozen_base: frozen_base as unknown as Record<string, unknown>,
+          ...(candidate_work_manifest === undefined ? {} : { work_manifest: candidate_work_manifest as unknown as Record<string, unknown> }),
+          registry_snapshot_id: registrySnapshotId,
+          configuration_revision_id: configurationRevisionId,
+          resolution_lock_id: prepared.lock.resolution_lock_id,
+          workspace_schema_digest: WORKSPACE_V3_SCHEMA_DIGEST,
+          // Every generation owned by the Rust composition worker uses the
+          // direct TEMP-to-v3 publication path.  Restricting this to the
+          // combined cold generation would reintroduce candidate body copies
+          // for progressive and incremental stages, defeating the single
+          // transaction cutover and making latency depend on stage shape.
+          ...(coreGenerationEnabled ? { direct_publication: true } : {}),
+          change_set: changedArtifactIds === undefined ? { kind: "full" } : { kind: "exact", changed_artifact_ids: [...changedArtifactIds] },
+          engine: { engine_id: "urdira:jsts", engine_version: JAVASCRIPT_TYPESCRIPT_VERSION, implementation_digest: prepared.plugin.compatibility.analysis_digest },
+          ...(!nativeStageOne && coreGenerationEnabled ? { semantic_engine: {
+            node_executable: process.execPath,
+            worker_entrypoint: rustSemanticWorkerEntrypoint,
+            build_identity: JSTS_SEMANTIC_PROCESS_BUILD_IDENTITY,
+            worker_descriptor: workerDescriptor,
+            ...(structuralKernelAddonPath === undefined ? {} : { structural_kernel_addon_path: structuralKernelAddonPath }),
+          } } : {}),
+          engine_input: {
+            project_key: projectKey,
+            configuration_digest: configuration.analysis_configuration_digest,
+            // Rust-owned generations intentionally omit the owner-sized source
+            // manifest from this envelope. The core resolves the current
+            // frontier from SQLite and applies these closed protocol limits
+            // after filtering it to the language engine's source extensions.
+            // Keep the exact capture-derived limits for the compatibility
+            // oracle, but never collapse an omitted manifest to a budget of 1.
+            budgets: {
+              max_output_bytes: 16 * 1024 * 1024,
+              max_files: Math.max(1, sourceArtifacts.length || 1_000_000),
+              max_source_bytes: Math.max(1, sourceByteLength || 0xffff_ffff),
+            },
+            ...(!nativeStageOne ? { semantic: {
+              inputs_digest: sourceStateDigest,
+              registry_digest: prepared.registry.registry_digest,
+              plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
+              plugin_version: JAVASCRIPT_TYPESCRIPT_VERSION,
+              analysis_digest: prepared.plugin.compatibility.analysis_digest,
+              analysis_configuration_digest: prepared.plugin.analysis_configuration_digest,
+              stage_capabilities: semanticStageCapabilities,
+              stage_record_kinds: semanticStageRecordKinds,
+              ...(semanticPublicationStageId === undefined ? {} : { publication_stage_id: semanticPublicationStageId }),
+              ...(semanticIncludedStageIds === undefined ? {} : { included_publication_stage_ids: semanticIncludedStageIds }),
+              ...(candidate.base_snapshot_id === undefined ? {} : { base_snapshot_id: candidate.base_snapshot_id }),
+              created_at: now,
+            } } : {}),
+          },
+          deadline_ms: Date.now() + 10 * 60_000,
+        }).finally(() => signal?.removeEventListener("abort", cancelRustGeneration));
+        const expectedPhase = nativeStageOne || coreGenerationEnabled ? "group_accepted" : "prepared";
+        if (generationEvent.kind !== "progress" || generationEvent.phase !== expectedPhase) throw new Error(`Rust indexing-core did not enter the ${nativeStageOne ? "engine-owned structural ingest" : "semantic staging"} state.`);
+        if (nativeStageOne) nativeAffectedPaths = new Set(generationEvent.affected_paths ?? sourceArtifacts.map((artifact) => artifact.path));
+        if (nativeStageOne && generationEvent.dependency_graph !== undefined) {
+          for (const [path, graph] of Object.entries(generationEvent.dependency_graph)) nativeDependencyGraph.set(path, graph);
+        }
+      } else if (nativeStageOne && sourceArtifacts.length > 0) {
+        if (rustSyntax === undefined) throw new Error("Native syntax worker is unavailable without the Rust indexing core.");
+        const syntax = rustSyntax;
+        claimExclusiveWork("rust", ["source_decode", "syntax_parse", "declaration_extract", "import_extract", "direct_graph", "affected_set", "stage_one_fact_build"]);
+        const sourceByteLength = sourceArtifacts.reduce((total, artifact) => total + artifact.byte_length, 0);
+        if (sourceByteLength > 0xffff_ffff || sourceArtifacts.length > 0xffff_ffff) throw new Error("JavaScript/TypeScript syntax input exceeds the closed Rust worker budget.");
+        const requestId = `rust-syntax:${workspace_id}:${candidate.candidate_generation_id}`;
+        const projectKey = canonicalSha256({ workspace_id, runtime_executable_binding_digest: syntax.runtime_executable_binding_digest });
+        nativeProjectKey = projectKey;
+        const analysisResult = await syntax.transport.analyze(createRustSyntaxAnalyzeRequest({
+          request_id: requestId,
+          cancellation_id: `cancel:${requestId}`,
+          project_key: projectKey,
+          configuration_digest: configuration.analysis_configuration_digest,
+          root_names: sourceArtifacts.map((artifact) => artifact.path),
+          ...(changedArtifactIds === undefined ? {} : { changed_artifact_ids: sourceArtifacts
+            .filter((artifact) => changedArtifactIds.has(artifact.artifact_id))
+            .map((artifact) => artifact.artifact_id) }),
+          files: sourceArtifacts.map((artifact) => {
+            const hex = artifact.content_hash.slice("sha256:".length);
+            return {
+              path: artifact.path,
+              artifact_id: artifact.artifact_id,
+              artifact_version_id: artifact.artifact_version_id,
+              content_digest: artifact.content_hash,
+              source_blob_path: join(casRoot, "sha256", hex.slice(0, 2), hex.slice(2)),
+              byte_length: artifact.byte_length,
+            };
+          }),
+          max_output_bytes: 16 * 1024 * 1024,
+          max_files: Math.max(1, sourceArtifacts.length),
+          max_source_bytes: Math.max(1, sourceByteLength),
+        }), { signal });
+        const coordinatedSemanticReset = analysisResult.build === "full"
+          && analysisResult.reset_reason !== undefined
+          && analysisResult.reset_reason !== "initial";
+        if (coordinatedSemanticReset) await analysisWorkerPool?.evictWorkspace(workspace_id);
+        const sourceByPath = new Map(sourceArtifacts.map((artifact) => [artifact.path, artifact]));
+        if (analysisResult.affected_files.some((path) => sourceByPath.get(path) === undefined)) throw new Error("The Rust syntax worker returned an affected path outside the current source manifest.");
+        nativeSyntaxResult = analysisResult;
+        nativeAffectedPaths = new Set(analysisResult.affected_files);
+      }
+      if (coreGenerationEnabled) {
+        return {
+          accepted_deltas: [],
+          capability_state_entries: completeStageEntries(),
+          native_batches: [],
+          rust_promoted_structural_rows: true,
+          external_publication: rustExternalPublication,
+        };
+      }
+      // The compatibility/oracle route still needs the complete artifact
+      // version manifest for its TypeScript semantic inputs. Keep this
+      // allocation behind the Rust early return so production composition
+      // never builds a second owner-sized digest input.
+      const artifactVersions = artifacts.map((artifact) => ({ artifact_id: artifact.artifact_id, artifact_version_id: artifact.artifact_version_id, content_hash: artifact.content_hash }));
+      const targetRegistry = candidateTargetRegistryFromSnapshot({ registry: prepared.registry, artifact_versions: artifactVersions });
       // Hoisted out of the per-owner loop: these aggregate over every scanned
       // artifact, so recomputing them per owner is quadratic in workspace size.
       const inputsDigest = canonicalSha256(artifactVersions);
+      if (nativeStageOne && nativeAffectedPaths !== undefined) {
+        const nativeChangedPaths = changedArtifactIds === undefined
+          ? new Set(sourceArtifacts.map((artifact) => artifact.path))
+          : new Set(sourceArtifacts.filter((artifact) => changedArtifactIds.has(artifact.artifact_id)).map((artifact) => artifact.path));
+        if ([...nativeChangedPaths].some((path) => !nativeAffectedPaths!.has(path))) throw new Error("The Rust affected set omitted a changed JavaScript/TypeScript source.");
+        nativeSemanticScope = {
+          inputs_digest: inputsDigest,
+          configuration_digest: configuration.analysis_configuration_digest,
+          changed_paths: nativeChangedPaths,
+          affected_paths: nativeAffectedPaths,
+          dependency_graph: nativeDependencyGraph,
+        };
+      }
+      const inheritedNativeScope = !nativeStageOne
+        && nativeSemanticScope?.inputs_digest === inputsDigest
+        && nativeSemanticScope.configuration_digest === configuration.analysis_configuration_digest
+        ? nativeSemanticScope
+        : undefined;
+      const rustSemanticScopeForPaths = (paths: readonly string[]): {
+        readonly authority: "urdira:jsts-syntax-worker";
+        readonly changed_paths: readonly string[];
+        readonly affected_paths: readonly string[];
+      } | undefined => {
+        if (inheritedNativeScope === undefined) return undefined;
+        const included = new Set(paths);
+        return {
+          authority: "urdira:jsts-syntax-worker",
+          changed_paths: [...inheritedNativeScope.changed_paths].filter((path) => included.has(path)).sort(),
+          affected_paths: [...inheritedNativeScope.affected_paths].filter((path) => included.has(path)).sort(),
+        };
+      };
+      const fullRustSemanticScope = rustSemanticScopeForPaths(sourceArtifacts.map((artifact) => artifact.path));
       const manifestEntries = javascriptTypescriptAccessManifestEntries(artifactVersions);
       const manifestEntriesDigest = canonicalSha256(manifestEntries);
       const rootNames = sourceArtifacts.map((artifact) => artifact.path);
       const artifactsByPath = new Map(artifacts.map((artifact) => [artifact.path, artifact]));
-      // 5.1: fetch every owner's import closure ONCE per scan, up front, via
-      // a dedicated `analyze_closure` call over the FULL corpus -- this is
-      // the same expensive whole-project analysis `analyze_artifact` would
-      // otherwise build lazily on the first owner's call, just moved earlier
-      // so every owner's access manifest (and `files` payload, below) can be
-      // narrowed to that owner's own closure instead. The worker's
-      // content-hash cache (`packages/plugin-javascript-typescript/src/worker.ts`)
-      // is keyed on (path, content_hash), not object identity, so this call
-      // warms the SAME cache every narrowed `analyze_artifact` call below
-      // then hits via subset-reuse -- one whole-project build per scan, not
-      // one per owner and not one per narrowed request either.
-      const needsSemanticClosure = true;
+      // Semantic stages fetch every owner's import closure once per scan. The
+      // native structural stage uses the Rust result directly and never enters
+      // this TypeScript path.
+      // 5.1: prepare dependency/semantic state ONCE per scan. The legacy route
+      // may still return TypeScript closures. With Rust authority this call
+      // only creates or updates the compiler project: it does not walk the
+      // corpus or materialize a whole-project JsTsAnalysisResult. Owner calls
+      // below use the Rust closure and walk exactly one owner through that
+      // prepared checker.
+      // A graph returned by the TypeScript closure call can safely narrow
+      // manifests, but it does not authorize the syntax-only fact builder.
+      // Only a faithful, non-reset Rust result does. Keeping these decisions
+      // separate is essential for JS/JSDoc files whose direct imports are
+      // representable by Oxc while their declarations still require the
+      // TypeScript checker.
+      // Rust already owns import extraction and the inverse affected closure.
+      // `analyze_closure` remains the closed fifth plugin call, but with a
+      // Rust-authoritative scope it only prepares/reuses the TypeScript
+      // program and checker-backed facts. It must not reconstruct stage-one
+      // facts, a dependency graph, or an affected closure.
+      const needsSemanticClosure = !nativeStageOne;
+      const worker = nativeStageOne || coreGenerationEnabled ? undefined : await acquirePooledWorker(closureWorkerKey);
+      if (worker !== undefined) claimExclusiveWork("typescript", ["semantic_program_build"]);
+      const semanticWorker = (): JavascriptTypescriptSemanticProcessTransport | import("@urdira/plugin-sdk").WorkerTransport => {
+        if (worker === undefined) throw new Error("Exclusive-work violation: native structural stage attempted to use the TypeScript semantic process.");
+        return worker;
+      };
       const closureRequestId = `request:closure:${workspace_id}:${candidate.candidate_generation_id}`;
       const closureStartedAt = performance.now();
       let closureResponse: {
@@ -505,6 +999,8 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
           readonly dependency_closures?: Readonly<Record<string, { readonly files: readonly string[]; readonly complete: boolean }>>;
           readonly dependency_graph?: Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>>;
           readonly impactful_changed_paths?: readonly string[];
+          readonly semantic_state_prepared?: boolean;
+          readonly dependency_authority?: "urdira:jsts-syntax-worker";
         };
       } | undefined;
       // P3-3b: pre-seed the worker's durable stage-1 dependency-graph cache
@@ -524,7 +1020,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // from-zero/full scan -- exactly the case the durable cache is for.
       // Never allowed to fail the scan: any error here is swallowed, and a
       // cache miss is always safe (the worker just builds the graph itself).
-      if (publication_stage_id === "jsts:structural_stage_1" && analysisCacheDir !== undefined && sourceArtifacts.length > 0) {
+      if (!nativeStageOne && publication_stage_id === "jsts:structural_stage_1" && analysisCacheDir !== undefined && sourceArtifacts.length > 0) {
         try {
           let totalBytes = 0;
           for (const artifact of sourceArtifacts) totalBytes += artifact.byte_length;
@@ -538,15 +1034,26 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         } catch { /* pre-seed is a pure speedup; a failure here must not fail indexing */ }
       }
       let closureWorkerRetained = false;
+      const buildSemanticClosureRequest = (): PluginWorkerRequestEnvelope => ({
+        protocol_version: "1.0.0", request_id: closureRequestId, request_digest: canonicalSha256({ request_id: closureRequestId, inputs_digest: inputsDigest, configuration_digest: configuration.analysis_configuration_digest, rust_semantic_scope: fullRustSemanticScope ?? null }), call: "analyze_closure", deadline: "2099-01-01T00:00:00.000Z", cancellation_id: `cancel:${closureRequestId}`,
+        payload: {
+          files: sourceArtifacts,
+          root_names: rootNames,
+          ...(publication_stage_id === undefined ? {} : { publication_stage_id }),
+          ...(fullRustSemanticScope === undefined ? {} : { rust_semantic_scope: fullRustSemanticScope }),
+        },
+      });
       try {
-        closureResponse = !needsSemanticClosure || sourceArtifacts.length === 0 ? undefined : await worker.invoke({
-        protocol_version: "1.0.0", request_id: closureRequestId, request_digest: canonicalSha256({ request_id: closureRequestId, inputs_digest: inputsDigest }), call: "analyze_closure", deadline: "2099-01-01T00:00:00.000Z", cancellation_id: `cancel:${closureRequestId}`,
-        // The language worker must never receive non-source workspace files.
-        // They are part of the source catalog, but cannot participate in the
-        // TypeScript program and would otherwise be decoded and retained in
-        // the worker's project graph for no semantic benefit.
-        payload: { files: sourceArtifacts, root_names: rootNames, ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
-      }) as {
+        if (!needsSemanticClosure || sourceArtifacts.length === 0) {
+          // Native stage one already supplied the authoritative affected set.
+        }
+        else if (coreGenerationEnabled) {
+          // The Rust composition worker now owns semantic preparation and
+          // owner request construction inside the generation transaction. The
+          // application does not invoke a second checker or materialise a
+          // closure response on this production route.
+        } else {
+          closureResponse = await semanticWorker().invoke(buildSemanticClosureRequest()) as {
         readonly payload: {
           readonly dependency_closures?: Readonly<Record<string, { readonly files: readonly string[]; readonly complete: boolean }>>;
           readonly dependency_graph?: Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>>;
@@ -563,15 +1070,22 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
            * is impactful".
            */
           readonly impactful_changed_paths?: readonly string[];
+          readonly semantic_state_prepared?: boolean;
+          readonly dependency_authority?: "urdira:jsts-syntax-worker";
         };
-      } | undefined;
+          } | undefined;
+        }
+      if (!coreGenerationEnabled && inheritedNativeScope !== undefined && (closureResponse?.payload.semantic_state_prepared !== true || closureResponse.payload.dependency_authority !== "urdira:jsts-syntax-worker"
+        || closureResponse.payload.dependency_graph !== undefined || closureResponse.payload.dependency_closures !== undefined)) {
+        throw new Error("The TypeScript semantic worker did not preserve exclusive Rust dependency authority.");
+      }
       } finally {
-        if (closureResponse === undefined && !closureWorkerRetained) {
+        if (worker !== undefined && closureResponse === undefined && !closureWorkerRetained) {
           if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
-          else await worker.terminate();
+          else await semanticWorker().terminate();
         }
       }
-      closureWorkerRetained = true;
+      closureWorkerRetained = worker !== undefined;
       const closureMs = needsSemanticClosure ? Math.round(performance.now() - closureStartedAt) : 0;
       const dependencyClosures = closureResponse?.payload.dependency_closures ?? {};
       const dependencyGraph = closureResponse?.payload.dependency_graph;
@@ -627,6 +1141,8 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         ? undefined
         : reverseReachable(impactfulChangedPaths ?? changedPaths);
       const isAffectedOwner = (owner: WorkspaceScanSourceArtifact): boolean => {
+        if (nativeStageOne) return nativeAffectedPaths?.has(owner.path) ?? false;
+        if (inheritedNativeScope !== undefined) return inheritedNativeScope.affected_paths.has(owner.path);
         if (changedPaths === undefined) return true;
         if (changedPaths.has(owner.path)) return true;
         if (dependencyGraph !== undefined) {
@@ -646,13 +1162,38 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // corpus; the requests remain bounded and correctness is unchanged.
       const sourceByteLength = sourceArtifacts.reduce((total, artifact) => total + artifact.byte_length, 0);
       const largeWorkspace = sourceArtifacts.length >= largeWorkspaceArtifactThreshold() || sourceByteLength >= 128 * 1024 * 1024;
+      const nativeClosureMemo = new Map<string, readonly string[] | undefined>();
+      const completeNativeClosure = (ownerPath: string): readonly string[] | undefined => {
+        if (inheritedNativeScope === undefined || inheritedNativeScope.dependency_graph.size !== sourceArtifacts.length) return undefined;
+        if (nativeClosureMemo.has(ownerPath)) return nativeClosureMemo.get(ownerPath);
+        const closure = new Set<string>();
+        const queue = [ownerPath];
+        for (let index = 0; index < queue.length; index += 1) {
+          const path = queue[index]!;
+          if (closure.has(path)) continue;
+          closure.add(path);
+          const node = inheritedNativeScope.dependency_graph.get(path);
+          if (node === undefined || !node.complete) {
+            nativeClosureMemo.set(ownerPath, undefined);
+            return undefined;
+          }
+          for (const dependency of node.direct_files) if (!closure.has(dependency)) queue.push(dependency);
+        }
+        const result = Object.freeze([...closure].sort());
+        nativeClosureMemo.set(ownerPath, result);
+        return result;
+      };
       type AnalysisPlan = {
         readonly planIndex: number;
+        readonly ownerPath: string;
+        readonly ownerArtifacts: readonly WorkspaceScanSourceArtifact[];
         readonly workItem: ArtifactWorkItem & { readonly candidate_generation_id: string; readonly base_snapshot_id?: string };
         readonly scope: ReplacementScope;
         readonly manifest: AutomaticPluginInputAccessManifest;
         readonly contextDigest: string;
-        readonly request: PluginWorkerRequestEnvelope;
+        readonly analysisInputDigest: string;
+        readonly cancellationId: string;
+        readonly request?: PluginWorkerRequestEnvelope;
       };
       const buildPlan = (owner: WorkspaceScanSourceArtifact, planIndex: number): AnalysisPlan => {
         const workItemId = `work:${owner.artifact_id}`;
@@ -690,9 +1231,12 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         // every cross-file relation TARGET's artifact version to be inside
         // this manifest, and the closure is built (in `analyzer.ts`'s
         // `relate`) to be a superset of exactly that.
-        const graphNode = dependencyGraph?.[owner.path];
+        const graphNode = nativeStageOne ? nativeDependencyGraph.get(owner.path) : dependencyGraph?.[owner.path];
         const closure = dependencyClosures[owner.path];
-        const narrowedPaths = graphNode !== undefined
+        const nativeSemanticClosure = completeNativeClosure(owner.path);
+        const narrowedPaths = nativeSemanticClosure !== undefined
+          ? nativeSemanticClosure
+          : graphNode !== undefined && graphNode.complete
           ? [...new Set([owner.path, ...graphNode.direct_files])].sort()
           : closure !== undefined && closure.complete ? closure.files : undefined;
         const narrowed = narrowedPaths !== undefined;
@@ -702,97 +1246,227 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         const ownerManifestEntries = narrowed ? javascriptTypescriptAccessManifestEntries(ownerArtifacts.map((artifact) => ({ artifact_id: artifact.artifact_id, artifact_version_id: artifact.artifact_version_id, content_hash: artifact.content_hash }))) : manifestEntries;
         const manifest = javascriptTypescriptAccessManifest(workItemId, contextDigest, ownerManifestEntries);
         const analysisInputDigest = canonicalSha256({ owner: owner.path, inputs_digest: narrowed ? canonicalSha256(ownerManifestEntries) : manifestEntriesDigest });
-        const request = {
+        const cancellationId = `cancel:${workItemId}`;
+        const ownerRustSemanticScope = rustSemanticScopeForPaths(narrowedPaths ?? rootNames);
+        const request = nativeStageOne ? undefined : {
           protocol_version: "1.0.0", request_id: manifest.request_id, request_digest: analysisInputDigest, call: "analyze_artifact" as const, deadline: "2099-01-01T00:00:00.000Z", cancellation_id: `cancel:${workItemId}`,
-          payload: { files: ownerArtifacts, root_names: narrowedPaths ?? rootNames, owner_path: owner.path, work_item: workItem, accepted_manifest: manifest, analysis_digest: prepared.plugin.compatibility.analysis_digest, analysis_configuration_digest: prepared.plugin.analysis_configuration_digest, analysis_input_digest: analysisInputDigest, created_at: now, ...(dependencyGraph === undefined ? {} : { bounded_syntax: true }), ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
+          payload: {
+            files: ownerArtifacts,
+            root_names: narrowedPaths ?? rootNames,
+            owner_path: owner.path,
+            work_item: workItem,
+            accepted_manifest: manifest,
+            analysis_digest: prepared.plugin.compatibility.analysis_digest,
+            analysis_configuration_digest: prepared.plugin.analysis_configuration_digest,
+            analysis_input_digest: analysisInputDigest,
+            created_at: now,
+            ...(publication_stage_id === undefined ? {} : { publication_stage_id }),
+            ...(included_publication_stage_ids === undefined ? {} : { included_publication_stage_ids }),
+            ...(ownerRustSemanticScope === undefined ? {} : { rust_semantic_scope: ownerRustSemanticScope }),
+          },
         };
-        return { workItem, scope, manifest, contextDigest, request, planIndex };
+        return { workItem, scope, manifest, contextDigest, analysisInputDigest, cancellationId, ownerPath: owner.path, ownerArtifacts, ...(request === undefined ? {} : { request }), planIndex };
       };
       // Ordinary workspaces keep the existing two-stage pipeline. Large
       // workspaces deliberately do not materialise 10k+ request envelopes and
       // closure-sized file arrays: one plan is built, consumed, and released
       // before the next owner is planned. This preserves order and bounded
       // worker backpressure without retaining a corpus-sized plan graph.
-      const plans: readonly AnalysisPlan[] | undefined = largeWorkspace ? undefined : affectedOwners.map(buildPlan);
+      // Rust-owned generations never materialise TypeScript owner plans. The
+      // composition worker constructs the semantic envelopes after capture;
+      // this map is reserved for the explicit oracle/fallback routes.
+      const plans: readonly AnalysisPlan[] | undefined = coreGenerationEnabled || nativeStageOne || largeWorkspace ? undefined : affectedOwners.map(buildPlan);
       const planCount = plans?.length ?? affectedOwners.length;
       // `URDIRA_ANALYSIS_LARGE_SHARDS` (default 1 -- today's exact behavior)
       // only widens the large-workspace stream when this scan is actually
-      // running bounded-syntax analysis (`dependencyGraph !== undefined`,
-      // the same condition `buildPlan` uses to set `bounded_syntax: true`
-      // above). Bounded syntax keeps no per-worker TypeScript checker/program
+      // running the test/development TypeScript bounded-syntax path. A native
+      // stage never reaches these semantic shards at all. Bounded syntax keeps
+      // no per-worker TypeScript checker/program
       // graph, only per-owner syntax state, so a few extra workers are
       // memory-safe the way duplicating a full checker never was (see the
       // `largeWorkspace` comment above). If a large workspace somehow still
       // falls back to full-checker analysis (`dependencyGraph === undefined`),
       // the multi-checker OOM risk that comment describes is back, so this
       // forces 1 regardless of the env var.
-      const effectiveLargeShardCount = largeWorkspace && dependencyGraph !== undefined ? analysisLargeWorkspaceShardCount() : 1;
-      const shardCount = Math.max(1, Math.min(largeWorkspace ? effectiveLargeShardCount : analysisWorkerShardCount, planCount || 1));
+      const effectiveLargeShardCount = largeWorkspace && !nativeStageOne && publication_stage_id === "jsts:structural_stage_1" ? analysisLargeWorkspaceShardCount() : 1;
+      // A Rust-authoritative production route keeps exactly one persistent
+      // checker project. Multiple semantic shards would duplicate the compiler
+      // project even though Rust has already narrowed the affected set. The
+      // worker releases each owner snapshot and source cache between requests.
+      // Test/development routes without native authority retain their
+      // configurable sharding behavior.
+      const shardCount = coreGenerationEnabled || nativeStageOne || inheritedNativeScope !== undefined
+        ? 1
+        : Math.max(1, Math.min(largeWorkspace ? effectiveLargeShardCount : analysisWorkerShardCount, planCount || 1));
       const shards = plans === undefined ? [] : Array.from({ length: shardCount }, (_, shard) => plans.filter((_, index) => index % shardCount === shard));
-      const acceptanceStartedAt = performance.now();
-      const pendingNativeBatches: { readonly fact_delta_id: string; readonly batch: FactDeltaBatch }[] = [];
-      const flushNativeBatches = async (force = false): Promise<void> => {
-        if (acceptNativeBatches === undefined || pendingNativeBatches.length === 0 || (!force && pendingNativeBatches.length < 64)) return;
-        const batch = pendingNativeBatches.splice(0, pendingNativeBatches.length);
-        // `accept_native_stage` (P3-3c): the SQLite worker-thread round trip
-        // that durably accepts native FactDelta batches
-        // (`WorkspaceCandidateRepository.acceptNativeFactDeltaBatches`,
-        // `packages/storage/src/candidates.ts`). This is the REAL native-batch
-        // cost on the `apps/urdira` path -- `workspace-indexing-session.ts`'s
-        // own `accept_native_stage_engine_loop` bucket is dead here, since
-        // every native batch this `analyze()` produces is diverted into
-        // `pendingNativeBatches` (below `acceptNativeBatches !== undefined`)
-        // and flushed here, INSIDE `analyze()`, before the engine ever sees
-        // it. Recorded into the engine's shared timing map (via the exported
-        // `recordEngineTiming`/`engineTimingEnabled`, not a local bucket map)
-        // so it lands in the same `[urdira] engine timings publish ...`
-        // snapshot as `plugin_analyze` and `execute_non_analyze` -- this cost
-        // is INSIDE `plugin_analyze`'s span, not `execute_non_analyze`'s.
-        const nativeAcceptStartedAt = engineTimingEnabled() ? performance.now() : 0;
-        await acceptNativeBatches(candidate.candidate_generation_id, batch);
-        if (engineTimingEnabled()) recordEngineTiming("accept_native_stage", performance.now() - nativeAcceptStartedAt);
+      let acceptanceMs = 0;
+      const invokeDirectStream = (transport: WorkerTransport, plan: AnalysisPlan): Promise<FactDeltaStream> => {
+        if (plan.request === undefined) throw new Error("Exclusive-work violation: native stage-one plan was routed to the TypeScript process.");
+        const direct = (transport as WorkerTransport & { readonly invokeFactDeltaStream?: (request: PluginWorkerRequestEnvelope) => Promise<FactDeltaStream> }).invokeFactDeltaStream;
+        if (direct === undefined) throw new Error("The production JavaScript/TypeScript semantic process does not support direct FactDeltaStream@2 emission.");
+        return direct.call(transport, plan.request);
       };
-      const consumePlanResponse = async (response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } }, plan: AnalysisPlan): Promise<MaterializationAcceptedFactDelta> => {
+      const invokeDirectGroup = async (transport: WorkerTransport, group: readonly AnalysisPlan[]): Promise<readonly FactDeltaStream[]> => {
+        if (signal?.aborted) throw Object.assign(new Error("Grouped semantic analysis was cancelled."), { name: "AbortError" });
+        const requests = group.map((plan) => {
+          if (plan.request === undefined) throw new Error("Exclusive-work violation: native stage-one plan was routed to the TypeScript semantic group.");
+          return plan.request;
+        });
+        const direct = (transport as WorkerTransport & { readonly invokeFactDeltaStreamGroup?: (requests: readonly PluginWorkerRequestEnvelope[]) => Promise<readonly FactDeltaStream[]> }).invokeFactDeltaStreamGroup;
+        if (direct === undefined) throw new Error("The production JavaScript/TypeScript semantic process does not support grouped FactDeltaStream@2 emission.");
+        const streams = await direct.call(transport, requests);
+        if (signal?.aborted) throw Object.assign(new Error("Grouped semantic analysis was cancelled."), { name: "AbortError" });
+        return streams;
+      };
+      const invokeDirectGroupBounded = async (transport: WorkerTransport, group: readonly AnalysisPlan[]): Promise<readonly FactDeltaStream[]> => {
+        try {
+          return await invokeDirectGroup(transport, group);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (group.length <= 1 || !/semantic (?:process )?group exceeds|semantic owner group exceeds/iu.test(message)) throw error;
+          const split = Math.ceil(group.length / 2);
+          const left = await invokeDirectGroupBounded(transport, group.slice(0, split));
+          const right = await invokeDirectGroupBounded(transport, group.slice(split));
+          return Object.freeze([...left, ...right]);
+        }
+      };
+      type NativeOwnerRows = {
+        readonly records: readonly ProposedRecord[];
+        readonly dependencies: readonly ProposedRecordDependency[];
+        readonly imports: readonly RustSyntaxDirectImport[];
+      };
+      const readNativeOwnerGroup = async (owners: readonly WorkspaceScanSourceArtifact[]): Promise<ReadonlyMap<string, NativeOwnerRows>> => {
+        if (!nativeStageOne || nativeProjectKey === undefined) throw new Error("Native fact pages require an active Rust stage-one analysis.");
+        const ownerByPath = new Map(owners.map((owner) => [owner.path, owner]));
+        const rowsByPath = new Map<string, { records: ProposedRecord[]; dependencies: ProposedRecordDependency[]; imports: RustSyntaxDirectImport[]; seen_cursors: Set<string> }>();
+        for (const owner of owners) rowsByPath.set(owner.path, { records: [], dependencies: [], imports: [], seen_cursors: new Set() });
+        let pending: { readonly path: string; readonly cursor?: RustSyntaxFactCursor }[] = owners.map((owner) => ({ path: owner.path }));
+        let requestSequence = 0;
+        while (pending.length > 0) {
+          const requestEntries = pending;
+          const transport = rustSyntax!.transport;
+          // Production handshakes require the grouped protocol. The scalar
+          // branch keeps injected/test transports and older in-process ports
+          // source-compatible without weakening the worker handshake.
+          const result = typeof transport.readFactsGroup === "function"
+            ? await transport.readFactsGroup({
+              project_key: nativeProjectKey,
+              entries: requestEntries,
+              max_output_bytes: 16 * 1024 * 1024,
+              max_rows: 4096,
+              cancellation_id: `cancel:facts-group:${candidate.candidate_generation_id}:${requestSequence}`,
+            }, { signal })
+            : {
+              pages: [await transport.readFacts({
+                project_key: nativeProjectKey,
+                path: requestEntries[0]!.path,
+                ...(requestEntries[0]!.cursor === undefined ? {} : { cursor: requestEntries[0]!.cursor }),
+                max_output_bytes: 16 * 1024 * 1024,
+                max_rows: 4096,
+                cancellation_id: `cancel:facts:${candidate.candidate_generation_id}:${requestSequence}`,
+              }, { signal })],
+              ...(requestEntries.length > 1 ? { next_request_index: 1 } : {}),
+            };
+          requestSequence += 1;
+          const next: { readonly path: string; readonly cursor?: RustSyntaxFactCursor }[] = [];
+          for (const page of result.pages) {
+            const owner = ownerByPath.get(page.path);
+            const rows = rowsByPath.get(page.path);
+            if (owner === undefined || rows === undefined || page.content_digest !== owner.content_hash || page.byte_length !== owner.byte_length || !page.parsed || page.diagnostics.length !== 0) {
+              throw new Error(`The Rust syntax worker could not produce a complete native stage-one page for ${page.path}; TypeScript fallback is forbidden.`);
+            }
+            rows.imports.push(...page.direct_imports);
+            rows.records.push(...page.records);
+            rows.dependencies.push(...page.dependencies);
+            if (page.next_cursor !== undefined) {
+              const key = `${page.next_cursor.imports_offset}:${page.next_cursor.records_offset}:${page.next_cursor.dependencies_offset}`;
+              if (rows.seen_cursors.has(key)) throw new Error(`Rust syntax fact pagination did not advance for ${page.path}.`);
+              rows.seen_cursors.add(key);
+              next.push({ path: page.path, cursor: page.next_cursor });
+            }
+          }
+          const nextRequestIndex = result.next_request_index ?? requestEntries.length;
+          if (nextRequestIndex < result.pages.length || nextRequestIndex > requestEntries.length) throw new Error("Rust syntax fact-group continuation did not advance.");
+          next.push(...requestEntries.slice(nextRequestIndex));
+          if (next.length === 0 && (result.next_request_index !== undefined || result.pages.some((page) => page.next_cursor !== undefined))) throw new Error("Rust syntax fact-group continuation was lost.");
+          pending = next;
+        }
+        const completed = new Map<string, NativeOwnerRows>();
+        for (const owner of owners) {
+          const rows = rowsByPath.get(owner.path)!;
+          if (new Set(rows.records.map((record) => record.proposal_record_key)).size !== rows.records.length) throw new Error(`Rust syntax fact pages repeated a record for ${owner.path}.`);
+          if (new Set(rows.dependencies.map((dependency) => dependency.proposed_dependency_id)).size !== rows.dependencies.length) throw new Error(`Rust syntax fact pages repeated a dependency for ${owner.path}.`);
+          const directFiles = [...new Set(rows.imports.flatMap((edge) => edge.target_path === undefined ? [] : [edge.target_path]))].sort();
+          nativeDependencyGraph.set(owner.path, {
+            direct_files: Object.freeze(directFiles),
+            complete: !rows.imports.some((edge) => edge.target_path === undefined && edge.specifier.startsWith(".")),
+          });
+          completed.set(owner.path, { records: Object.freeze(rows.records), dependencies: Object.freeze(rows.dependencies), imports: Object.freeze(rows.imports) });
+        }
+        return completed;
+      };
+      const invokeNativeStageOne = (plan: AnalysisPlan, rows: NativeOwnerRows): FactDeltaStream => buildJavascriptTypescriptNativeFactDeltaStream({
+        work_item: plan.workItem as unknown as Readonly<Record<string, unknown>>,
+        accepted_manifest: plan.manifest as unknown as Readonly<Record<string, unknown>>,
+        analysis_digest: prepared.plugin.compatibility.analysis_digest,
+        analysis_configuration_digest: prepared.plugin.analysis_configuration_digest,
+        analysis_input_digest: plan.analysisInputDigest,
+        created_at: now,
+        ...(publication_stage_id === undefined ? {} : { publication_stage_id }),
+        owner_path: plan.ownerPath,
+        files: plan.ownerArtifacts,
+        records: rows.records,
+        dependencies: rows.dependencies,
+        diagnostic_codes: [],
+      }, { cancellation_id: plan.cancellationId });
+      const validationInputForPlan = (plan: AnalysisPlan) => ({ candidate, work_item: plan.workItem, accepted_manifest: plan.manifest, expected_replacement_scopes: [plan.scope], target_registry: targetRegistry, base_records: [], base_record_dependencies: [], staged_records: [], analysis_context_digest: plan.contextDigest });
+      const consumePlanResponse = async (stream: FactDeltaStream, plan: AnalysisPlan): Promise<MaterializationAcceptedFactDelta> => {
         // `fact_delta_accept` (P3-3c): `acceptance.accept`'s own service
         // cost (validation + staging), also inside `plugin_analyze`'s span --
         // see `accept_native_stage`'s comment above for why this is recorded
         // here rather than relying on `execute_non_analyze`.
         const acceptStartedAt = engineTimingEnabled() ? performance.now() : 0;
-        const delta = await acceptance.accept({ candidate, work_item: plan.workItem, raw_delta: response.payload.validation_input.raw_delta, accepted_manifest: plan.manifest, expected_replacement_scopes: [plan.scope], target_registry: targetRegistry, base_records: [], base_record_dependencies: [], staged_records: [], analysis_context_digest: plan.contextDigest });
+        const acceptWallStartedAt = debugTimingEnabled() ? performance.now() : 0;
+        const delta = await streamAcceptance!.acceptValidated(stream, validationInputForPlan(plan));
         if (engineTimingEnabled()) recordEngineTiming("fact_delta_accept", performance.now() - acceptStartedAt);
-        const nativeBatches = response.payload.fact_delta_batches
-          ?? (response.payload.fact_delta_batch === undefined ? [] : [response.payload.fact_delta_batch]);
-        const batches = nativeBatches.length > 0 ? nativeBatches : iterateNativeFactDeltaBatches(delta.delta);
-        let batchIndex = 0;
-        let finalSeen = false;
-        for (const batch of batches) {
-          if (finalSeen) throw new Error("Plugin FactDelta batches cannot contain rows after a final batch.");
-          validateFactDeltaBatch(batch, batchIndex);
-          if (acceptNativeBatches !== undefined) pendingNativeBatches.push({ fact_delta_id: delta.delta.fact_delta_id, batch });
-          else native_batches.push({ fact_delta_id: delta.delta.fact_delta_id, batch });
-          finalSeen = batch.final;
-          batchIndex += 1;
-        }
-        if (batchIndex > 0 && !finalSeen) throw new Error("Plugin FactDelta batches must terminate with a final batch.");
-        await flushNativeBatches();
-        const compacted = compactAcceptedFactDelta(delta);
+        if (debugTimingEnabled()) acceptanceMs += performance.now() - acceptWallStartedAt;
         // (3a pipelined) Hand the compacted delta to the engine's streaming
         // consumer the moment it exists, so per-record digest work overlaps
-        // the rest of this analyze instead of running after it. The callback
-        // remains best-effort so a performance consumer can never change the
-        // provider's accepted-delta contract.
-        if (on_accepted_delta !== undefined) { try { await on_accepted_delta(compacted); } catch { /* streaming optimization failure is isolated */ } }
-        return compacted;
+        // the rest of this analyze instead of running after it. This callback
+        // is part of the first-publication materialization path: propagating a
+        // spool failure is required to prevent a partially accumulated
+        // candidate from being sealed as complete.
+        if (on_accepted_delta !== undefined) await on_accepted_delta(delta);
+        return delta;
+      };
+      const consumePlanGroup = async (entries: readonly { readonly plan: AnalysisPlan; readonly stream: () => Promise<FactDeltaStream> }[], maxStreams: number): Promise<readonly { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[]> => {
+        if (entries.length === 0) return [];
+        const acceptStartedAt = engineTimingEnabled() ? performance.now() : 0;
+        const acceptWallStartedAt = debugTimingEnabled() ? performance.now() : 0;
+        const deltas = await streamAcceptance!.acceptValidatedGroup((async function* () {
+          for (const entry of entries) {
+            if (signal?.aborted) throw Object.assign(new Error("Grouped FactDelta analysis was cancelled."), { name: "AbortError" });
+            yield { stream: await entry.stream(), input: validationInputForPlan(entry.plan) };
+          }
+        })(), { ...(signal === undefined ? {} : { signal }), max_streams: maxStreams, max_rows: 4096, max_bytes: 16 * 1024 * 1024 });
+        if (engineTimingEnabled()) recordEngineTiming("fact_delta_accept", performance.now() - acceptStartedAt);
+        if (debugTimingEnabled()) acceptanceMs += performance.now() - acceptWallStartedAt;
+        const results: { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[] = [];
+        for (let index = 0; index < deltas.length; index += 1) {
+          const delta = deltas[index]!;
+          const plan = entries[index]!.plan;
+          if (on_accepted_delta !== undefined) await on_accepted_delta(delta);
+          else results.push({ plan_index: plan.planIndex, delta });
+        }
+        return results;
       };
       const invokeShard = async (shard: readonly AnalysisPlan[], shardIndex: number): Promise<readonly { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[]> => {
         if (shard.length === 0) return [];
         const shardKey = `${workspace_id}:shard:${shardIndex}`;
         const ownsClosureWorker = shardIndex === 0;
         const shardWorker = ownsClosureWorker
-          ? worker
-          : analysisWorkerPool !== undefined
-            ? analysisWorkerPool.acquire(shardKey, workerDescriptor, workerDescriptorDigest)
-            : (analysisThreadEnabled() ? createJavascriptTypescriptThreadTransport(workerDescriptor) : createJavascriptTypescriptWorker(workerDescriptor));
+          ? semanticWorker()
+          : await acquirePooledWorker(shardKey);
         try {
           if (!ownsClosureWorker && sourceArtifacts.length > 0) {
             const shardClosureRequestId = `request:closure:${workspace_id}:${candidate.candidate_generation_id}:shard:${shardIndex}`;
@@ -803,14 +1477,19 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
               call: "analyze_closure",
               deadline: "2099-01-01T00:00:00.000Z",
               cancellation_id: `cancel:${shardClosureRequestId}`,
-              payload: { files: sourceArtifacts, root_names: rootNames, ...(publication_stage_id === undefined ? {} : { publication_stage_id }) },
+              payload: {
+                files: sourceArtifacts,
+                root_names: rootNames,
+                ...(publication_stage_id === undefined ? {} : { publication_stage_id }),
+                ...(fullRustSemanticScope === undefined ? {} : { rust_semantic_scope: fullRustSemanticScope }),
+              },
             });
           }
           const results: { readonly plan_index: number; readonly delta: MaterializationAcceptedFactDelta }[] = [];
-          let pending = shardWorker.invoke(shard[0]!.request);
+          let pending = invokeDirectStream(shardWorker, shard[0]!);
           pending.catch(() => undefined);
           for (let index = 0; index < shard.length; index += 1) {
-            const response = await pending as { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } };
+            const response = await pending;
             const plan = shard[index]!;
             // Accept each response before releasing it. Retaining every raw
             // FactDelta until all owners finish doubles the peak heap for a
@@ -819,7 +1498,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
             if (on_accepted_delta === undefined) results.push({ plan_index: plan.planIndex, delta });
             if ((index + 1) % 100 === 0 || index + 1 === shard.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=${shardIndex} completed=${index + 1}/${shard.length}`);
             if (index + 1 < shard.length) {
-              pending = shardWorker.invoke(shard[index + 1]!.request);
+              pending = invokeDirectStream(shardWorker, shard[index + 1]!);
               pending.catch(() => undefined);
             }
           }
@@ -840,7 +1519,45 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // materialized (ordinary-workspace) branch already reports its own
       // shard count via the pre-existing `shards` field.
       let largeStreamTelemetry: { readonly shards_used: number; readonly demotions: number; readonly per_shard_completed: readonly number[] } | undefined;
-      if (plans !== undefined) {
+      if (coreGenerationEnabled && nativeStageOne) {
+        // The composition worker already analyzed, validated, grouped and
+        // ingested every affected owner into SQLite. Do not construct owner
+        // plans or invoke either the Rust fact-page API or a TypeScript
+        // semantic process here: that would duplicate the dominant work and
+        // would violate the single Rust publication owner.
+        largeStreamTelemetry = { shards_used: 0, demotions: 0, per_shard_completed: [affectedOwners.length] };
+      } else if (nativeStageOne) {
+        const groupSize = 64;
+        for (let groupStart = 0; groupStart < affectedOwners.length; groupStart += groupSize) {
+          if (signal?.aborted) throw Object.assign(new Error("Native stage-one analysis was cancelled."), { name: "AbortError" });
+          const groupEnd = Math.min(affectedOwners.length, groupStart + groupSize);
+          const groupOwners = affectedOwners.slice(groupStart, groupEnd);
+          const rowsByPath = await readNativeOwnerGroup(groupOwners);
+          const group = Array.from({ length: groupEnd - groupStart }, (_, offset) => {
+            const planIndex = groupStart + offset;
+            const owner = affectedOwners[planIndex]!;
+            const plan = buildPlan(owner, planIndex);
+            return { plan, stream: async () => invokeNativeStageOne(plan, rowsByPath.get(owner.path)!) };
+          });
+          // This branch is the explicit Rust-syntax fallback only. The
+          // self-contained composition-worker path never enters it, so there
+          // is no second TypeScript->Rust acceptance loop for production
+          // structural generations.
+          const groupResults = await consumePlanGroup(group, groupSize);
+          for (const result of groupResults) accepted.push(result.delta);
+          if (groupEnd % 100 < groupSize || groupEnd === affectedOwners.length) console.error(`[urdira] native stage-one progress workspace=${workspace_id} completed=${groupEnd}/${affectedOwners.length}`);
+        }
+        if (nativeSyntaxResult !== undefined && nativeProjectKey !== undefined) {
+          await rustSyntax!.transport.commitAnalysis({ project_key: nativeProjectKey, analysis_token: nativeSyntaxResult.analysis_token }, { signal });
+        }
+        largeStreamTelemetry = { shards_used: 0, demotions: 0, per_shard_completed: [affectedOwners.length] };
+      } else if (coreGenerationEnabled && !nativeStageOne) {
+        // Rust has already run the checker, built semantic envelopes, and
+        // accepted canonical rows before returning from `indexGeneration`.
+        // Keep this branch as telemetry only; no owner plans or V8 callbacks
+        // are created on the production cutover route.
+        largeStreamTelemetry = { shards_used: 1, demotions: 0, per_shard_completed: [affectedOwners.length] };
+      } else if (plans !== undefined && shards.length > 1) {
         shardResults = (await Promise.all(shards.map((shard, shardIndex) => invokeShard(shard, shardIndex)))).flat().sort((left, right) => left.plan_index - right.plan_index);
       } else if (affectedOwners.length > 0 && shardCount <= 1) {
         // Large workspaces default to a single bounded owner stream. At most
@@ -848,24 +1565,54 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         // are live at each step; no corpus-sized `plans` or `shards` array
         // exists. (`shardCount > 1` -- `URDIRA_ANALYSIS_LARGE_SHARDS` -- takes
         // the K-shard stream branch below instead.)
-        let currentPlan = buildPlan(affectedOwners[0]!, 0);
-        let pending = worker.invoke(currentPlan.request);
-        pending.catch(() => undefined);
         try {
-          for (let index = 0; index < affectedOwners.length; index += 1) {
-            const response = await pending as { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } };
-            const delta = await consumePlanResponse(response, currentPlan);
-            if (on_accepted_delta === undefined) accepted.push(delta);
-            if ((index + 1) % 100 === 0 || index + 1 === affectedOwners.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=0 completed=${index + 1}/${affectedOwners.length}`);
-            if (index + 1 < affectedOwners.length) {
-              currentPlan = buildPlan(affectedOwners[index + 1]!, index + 1);
-              pending = worker.invoke(currentPlan.request);
-              pending.catch(() => undefined);
+          // Keep checker envelopes at the measured eight-owner RSS-safe bound,
+          // while letting the independent physical staging boundary collect
+          // up to 64 owners (and still stop at 4,096 rows or 16 MiB). Each
+          // lazy semantic chunk releases its returned stream array as soon as
+          // all eight owner-delimited streams have been consumed, so widening
+          // the SQLite amortisation window does not widen checker residency.
+          const semanticGroupSize = 8;
+          const physicalGroupSize = 64;
+          for (let groupStart = 0; groupStart < affectedOwners.length; groupStart += physicalGroupSize) {
+            if (signal?.aborted) throw Object.assign(new Error("Grouped semantic analysis was cancelled."), { name: "AbortError" });
+            const groupEnd = Math.min(affectedOwners.length, groupStart + physicalGroupSize);
+            const groupPlans = Array.from({ length: groupEnd - groupStart }, (_, offset) => {
+              const planIndex = groupStart + offset;
+              return buildPlan(affectedOwners[planIndex]!, planIndex);
+            });
+            const group: { readonly plan: AnalysisPlan; readonly stream: () => Promise<FactDeltaStream> }[] = [];
+            for (let semanticStart = 0; semanticStart < groupPlans.length; semanticStart += semanticGroupSize) {
+              const semanticPlans = groupPlans.slice(semanticStart, semanticStart + semanticGroupSize);
+              let streams: readonly FactDeltaStream[] | undefined;
+              let streamsPromise: Promise<readonly FactDeltaStream[]> | undefined;
+              let remaining = semanticPlans.length;
+              const load = async (): Promise<readonly FactDeltaStream[]> => {
+                if (streams !== undefined) return streams;
+                streamsPromise ??= invokeDirectGroupBounded(semanticWorker(), semanticPlans);
+                streams = await streamsPromise;
+                if (streams.length !== semanticPlans.length) throw new Error("The semantic owner group returned the wrong number of streams.");
+                return streams;
+              };
+              for (const [semanticIndex, plan] of semanticPlans.entries()) {
+                group.push({
+                  plan,
+                  stream: inheritedNativeScope === undefined ? () => invokeDirectStream(semanticWorker(), plan) : async () => {
+                    const result = (await load())[semanticIndex]!;
+                    remaining -= 1;
+                    if (remaining === 0) { streams = undefined; streamsPromise = undefined; }
+                    return result;
+                  },
+                });
+              }
             }
+            const groupResults = await consumePlanGroup(group, physicalGroupSize);
+            for (const result of groupResults) accepted.push(result.delta);
+            if (groupEnd % 100 < physicalGroupSize || groupEnd === affectedOwners.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=0 completed=${groupEnd}/${affectedOwners.length}`);
           }
         } finally {
           if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
-          else await worker.terminate();
+          else await semanticWorker().terminate();
           closureWorkerRetained = false;
         }
         largeStreamTelemetry = { shards_used: 1, demotions: 0, per_shard_completed: [affectedOwners.length] };
@@ -926,11 +1673,14 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         // beyond the mandatory first one. A shard rejected here never claims
         // anything and its `runLane` below returns before acquiring a worker.
         for (let candidateShard = 1; candidateShard < shardCount; candidateShard += 1) {
-          const rssKib = Math.round(process.memoryUsage().rss / 1024);
+          const resourceTelemetry = analysisWorkerPool === undefined
+            ? await processTreeRss?.sampleTelemetry({ fresh: true })
+            : await analysisWorkerPool.sampleResourceTelemetry({ fresh: true });
+          const rssKib = Math.round((resourceTelemetry?.process_tree_rss_bytes ?? process.memoryUsage().rss) / 1024);
           if (rssKib > rssBudgetKib) demote(candidateShard, rssKib);
         }
         // Reorder buffer: shards complete out of plan_index order, but
-        // `acceptance.accept`/the accumulator/`pendingNativeBatches` (fed
+        // `acceptance.accept`/the accumulator/stream staging (fed
         // inside `consumePlanResponse`) must see deltas in the same
         // plan_index order a single-shard scan would produce. Each shard
         // blocks on `acceptInOrder` until ITS OWN submitted index has
@@ -939,7 +1689,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         // completed-but-unaccepted response at any moment, bounding this
         // buffer to at most `activeShardCount - 1` entries (see the claim-
         // cursor comment above for why this can never deadlock).
-        const pendingResponses = new Map<number, { readonly response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } }; readonly plan: AnalysisPlan }>();
+        const pendingResponses = new Map<number, { readonly response: FactDeltaStream; readonly plan: AnalysisPlan }>();
         const acceptWaiters = new Map<number, () => void>();
         let nextAcceptIndex = 0;
         let draining = false;
@@ -968,7 +1718,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
             }
           })();
         };
-        const acceptInOrder = (planIndex: number, response: { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } }, plan: AnalysisPlan): Promise<void> => {
+        const acceptInOrder = (planIndex: number, response: FactDeltaStream, plan: AnalysisPlan): Promise<void> => {
           if (drainError !== undefined) return Promise.reject(drainError as Error);
           pendingResponses.set(planIndex, { response, plan });
           const wait = new Promise<void>((resolve) => { acceptWaiters.set(planIndex, resolve); });
@@ -979,24 +1729,33 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
           if (demotedShards.has(shardIndex)) return; // demoted before a worker was ever spawned
           const shardKey = `${workspace_id}:shard:${shardIndex}`;
           const ownsClosureWorker = shardIndex === 0;
-          const shardWorker = ownsClosureWorker
-            ? worker
-            : analysisWorkerPool !== undefined
-              ? analysisWorkerPool.acquire(shardKey, workerDescriptor, workerDescriptorDigest)
-              : (analysisThreadEnabled() ? createJavascriptTypescriptThreadTransport(workerDescriptor) : createJavascriptTypescriptWorker(workerDescriptor));
+          let shardWorker: import("@urdira/plugin-sdk").WorkerTransport;
+          if (ownsClosureWorker) shardWorker = semanticWorker();
+          else {
+            try { shardWorker = await acquirePooledWorker(shardKey); }
+            catch (error) {
+              if (processTreeRss === undefined || !(error instanceof Error) || !error.message.includes("RSS admission")) throw error;
+              const telemetry = await processTreeRss.sampleTelemetry({ fresh: true });
+              demote(shardIndex, Math.round((telemetry?.process_tree_rss_bytes ?? process.memoryUsage().rss) / 1024));
+              return;
+            }
+          }
           try {
             for (;;) {
               if (demotedShards.has(shardIndex)) break; // demoted mid-scan: finish nothing new
               const entry = claimNext();
               if (entry === undefined) break;
               const plan = buildPlan(entry.owner, entry.planIndex);
-              const response = await shardWorker.invoke(plan.request) as { readonly payload: { readonly validation_input: { readonly raw_delta: unknown }; readonly fact_delta_batch?: FactDeltaBatch; readonly fact_delta_batches?: readonly FactDeltaBatch[] } };
+              const response = await invokeDirectStream(shardWorker, plan);
               await acceptInOrder(entry.planIndex, response, plan);
               completedByShard[shardIndex] = (completedByShard[shardIndex] ?? 0) + 1;
               globalCompleted += 1;
               if (globalCompleted % 100 === 0 || globalCompleted === affectedOwners.length) console.error(`[urdira] analyze shard progress workspace=${workspace_id} stage=${publication_stage_id ?? "full"} shard=${shardIndex} completed=${globalCompleted}/${affectedOwners.length}`);
               if (globalCompleted % 64 === 0 && activeShardCount > 1) {
-                const rssKib = Math.round(process.memoryUsage().rss / 1024);
+                const resourceTelemetry = analysisWorkerPool === undefined
+                  ? await processTreeRss?.sampleTelemetry({ fresh: true })
+                  : await analysisWorkerPool.enforceResourceCeiling();
+                const rssKib = Math.round((resourceTelemetry?.process_tree_rss_bytes ?? process.memoryUsage().rss) / 1024);
                 if (rssKib > rssBudgetKib) demote(activeShardCount - 1, rssKib);
               }
             }
@@ -1014,7 +1773,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       }
       if ((plans === undefined ? affectedOwners.length : plans.length) === 0 && closureWorkerRetained) {
         if (analysisWorkerPool !== undefined) analysisWorkerPool.release(closureWorkerKey);
-        else await worker.terminate();
+        else await semanticWorker().terminate();
         closureWorkerRetained = false;
       }
       // Keep the accepted deltas as the durable candidate input, but avoid a
@@ -1022,8 +1781,10 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // deltas already retain the analyzer's structured facts and may occupy
       // gigabytes on a repository-sized first scan.
       for (const entry of shardResults) accepted.push(entry.delta);
-      await flushNativeBatches(true);
-      if (debugTimingEnabled()) console.error(`[urdira] analyze timings ${workspace_id} owners=${planCount} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(performance.now() - workerStartedAt), acceptance: Math.round(performance.now() - acceptanceStartedAt), shards: shardCount, plan_mode: largeWorkspace ? "stream" : "materialized", ...(largeStreamTelemetry === undefined ? {} : largeStreamTelemetry) })}`);
+      if (debugTimingEnabled()) {
+        const groupedWallMs = performance.now() - workerStartedAt;
+        console.error(`[urdira] analyze timings ${workspace_id} owners=${planCount} ms=${JSON.stringify({ closure: closureMs, worker_wait: Math.round(Math.max(0, groupedWallMs - acceptanceMs)), acceptance: Math.round(acceptanceMs), grouped_wall: Math.round(groupedWallMs), shards: shardCount, plan_mode: largeWorkspace ? "stream" : "materialized", ...(largeStreamTelemetry === undefined ? {} : largeStreamTelemetry) })}`);
+      }
       // Summarize claims in place. `flatMap` here used to briefly duplicate
       // every completeness claim while the accepted deltas were still live,
       // which was enough to push large TypeScript workspaces over V8's heap
@@ -1052,7 +1813,11 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
         diagnostic_record_ids: [],
         ...(stage === undefined ? {} : { publication_stage_id: stage.stage_id, publication_stage_ordinal: stage.ordinal, publication_stage_count: stage.stage_count }),
       }));
-      return { accepted_deltas: accepted, capability_state_entries, native_batches };
+      return {
+        accepted_deltas: accepted,
+        capability_state_entries,
+        native_batches: [],
+      };
     },
   };
 }
@@ -1101,20 +1866,87 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
  * with the immutable row the prior resolution already wrote. See
  * docs/decisions/14-plugin-upgrade-relock.md for the full design.
  */
-function createResolveJavascriptTypescriptPluginProvider(analysisCacheDir?: string, analysisWorkerPool?: AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>, analysisWorkerShardCount = 2): NonNullable<DaemonRuntimeOptions["resolve_plugin_provider"]> {
+function createResolveJavascriptTypescriptPluginProvider(analysisCacheDir?: string, analysisWorkerPool?: AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>, analysisWorkerShardCount = 2, rustSyntaxSessions?: Map<string, RustSyntaxSession>, nativeRuntime?: PreparedNativeRuntime, processTreeRss?: WholeProcessTreeRssController, indexingCoreSessions?: Map<string, IndexingCoreProcessTransport>, indexingCoreWorkerPath?: string): NonNullable<DaemonRuntimeOptions["resolve_plugin_provider"]> {
+  // The TypeScript acceptance/materialization path is retained only as a
+  // differential oracle for tests.  A missing composition worker must never
+  // silently turn a normal daemon (including development/packaged launches
+  // where NODE_ENV is unset) back into the duplicate owner loop that the Rust
+  // cutover removes.  The explicit switch is intentionally private and is
+  // never threaded by the shipped CLI/runtime bootstrap.
+  const oracleRoute = process.env["URDIRA_INDEXING_CORE_ORACLE"] === "1"
+    || process.env["NODE_ENV"] === "test";
   const prepared = new Map<string, Promise<{ readonly registry: PreparedJavascriptTypescriptRegistry; readonly now: string }>>();
   return async (workspace, database) => {
     if (!(workspace.selected_plugin_ids ?? []).includes(JAVASCRIPT_TYPESCRIPT_PLUGIN_ID)) return undefined;
     let entry = prepared.get(workspace.workspace_id);
     if (entry === undefined) {
       const now = new Date().toISOString();
-      entry = prepareJavascriptTypescriptRegistry(workspace.workspace_id, now, database).then((registry) => ({ registry, now }));
+      entry = prepareJavascriptTypescriptRegistry(workspace.workspace_id, now, database, nativeRuntime).then((registry) => ({ registry, now }));
       prepared.set(workspace.workspace_id, entry);
     }
     const { registry, now } = await entry;
     const registrySnapshotId = registry.registry.registry_snapshot_id;
     const configurationRevisionId = `configuration:${workspace.workspace_id}:${registry.lock.resolution_lock_id}`;
-    return buildJavascriptTypescriptPluginProvider(registry, workspace.workspace_id, registrySnapshotId, configurationRevisionId, now, database.casRoot, analysisCacheDir, analysisWorkerPool, analysisWorkerShardCount, async (candidateGenerationId, batches) => { await database.candidates.acceptNativeFactDeltaBatches(candidateGenerationId, batches); });
+    let indexingCore = indexingCoreSessions?.get(workspace.workspace_id);
+    const indexingCorePath = indexingCoreWorkerPath;
+    if (indexingCore === undefined && indexingCoreSessions !== undefined && indexingCorePath !== undefined) {
+      indexingCore = createIndexingCoreProcessTransport({ command: indexingCorePath, request_timeout_ms: indexingCoreRequestTimeoutMs() });
+      indexingCoreSessions.set(workspace.workspace_id, indexingCore);
+    }
+    // The composition worker is the sole production boundary for structural
+    // indexing. Keep this invariant at provider resolution as well as daemon
+    // startup: a long-lived daemon can retain a Rust-syntax session from an
+    // older configuration, and that session must never silently revive the
+    // TypeScript acceptance/writer route when the composition worker is
+    // absent. Development and test callers may still opt into the oracle by
+    // running outside production.
+    if (!oracleRoute && indexingCore === undefined) {
+      throw new Error("Production structural indexing requires urdira-indexing-worker; the TypeScript structural writer is not a production fallback.");
+    }
+    // The Rust composition worker owns validation/receipts/staging whenever
+    // it is available. Instantiate the TypeScript acceptance service only
+    // for the explicit development/oracle route, so production cannot
+    // accidentally perform the same SQLite ingestion twice.
+    const streamAcceptance = indexingCore === undefined ? new FactDeltaStreamAcceptanceService(database.candidates) : undefined;
+    let rustSyntax = indexingCore === undefined ? rustSyntaxSessions?.get(workspace.workspace_id) : undefined;
+    if (indexingCore !== undefined) {
+      const redundantSyntax = rustSyntaxSessions?.get(workspace.workspace_id);
+      if (redundantSyntax !== undefined) {
+        rustSyntaxSessions?.delete(workspace.workspace_id);
+        await redundantSyntax.transport.terminate();
+      }
+    }
+    const runtimeBindingDigest = registry.plugin.runtime_executable_binding?.binding_digest;
+    if (nativeRuntime !== undefined && runtimeBindingDigest === undefined) throw new Error("The required JavaScript/TypeScript native runtime has no executable binding.");
+    if (rustSyntax !== undefined && rustSyntax.runtime_executable_binding_digest !== runtimeBindingDigest) {
+      rustSyntaxSessions?.delete(workspace.workspace_id);
+      await rustSyntax.transport.terminate();
+      rustSyntax = undefined;
+    }
+    // Once the composition worker is part of a production daemon, the old
+    // Rust-syntax/TypeScript-writer route is test-only. Keeping it available
+    // in production would reintroduce the exact duplicate coordination that
+    // the cutover removes and would make performance depend on an accidental
+    // worker-path omission. Development and test harnesses may still exercise
+    // the compatibility oracle, but production startup fails closed instead.
+    if (rustSyntax === undefined && indexingCore === undefined && rustSyntaxSessions !== undefined && nativeRuntime !== undefined && runtimeBindingDigest !== undefined) {
+      const workerBytes = new Uint8Array(await readFile(nativeRuntime.closure.worker_path));
+      if (sha256Bytes(workerBytes) !== nativeRuntime.closure.worker_digest) throw new Error("The verified Urdira Rust syntax worker changed before launch.");
+      const transport = createJavascriptTypescriptProcessTransport({ command: nativeRuntime.closure.worker_path, expected_build_identity: JSTS_RUST_SYNTAX_BUILD_IDENTITY });
+      const unregister = processTreeRss?.registerComponent({ component_id: `rust-syntax:${transport.process_id}`, kind: "rust_syntax_worker", pid: transport.process_id });
+      rustSyntax = {
+        transport: unregister === undefined ? transport : {
+          ...transport,
+          async terminate(): Promise<void> {
+            try { await transport.terminate(); }
+            finally { unregister(); }
+          },
+        },
+        runtime_executable_binding_digest: runtimeBindingDigest,
+      };
+      rustSyntaxSessions.set(workspace.workspace_id, rustSyntax);
+    }
+    return buildJavascriptTypescriptPluginProvider(registry, workspace.workspace_id, registrySnapshotId, configurationRevisionId, now, database.casRoot, analysisCacheDir, analysisWorkerPool, analysisWorkerShardCount, streamAcceptance, rustSyntax, processTreeRss, nativeRuntime?.closure.addon_path, indexingCore, database.database.filename);
   };
 }
 
@@ -1123,6 +1955,17 @@ function positiveIntegerEnv(name: string): number | undefined {
   if (raw === undefined || raw === "") return undefined;
   const value = Number(raw);
   return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+// The composition worker owns the complete cold/incremental generation. Its
+// transport deadline must be at least as long as the generation deadline
+// carried in the Rust request; otherwise a large real workspace is killed by
+// the Node pipe while Rust is still making progress. The operation itself
+// remains bounded by `deadline_ms` (currently ten minutes), so this is not an
+// unbounded retry or a readiness relaxation. The value is overridable only
+// for diagnostic hosts and is capped by the private framed protocol.
+function indexingCoreRequestTimeoutMs(): number {
+  return Math.min(600_000, positiveIntegerEnv("URDIRA_INDEXING_CORE_TIMEOUT_MS") ?? 600_000);
 }
 
 // URDIRA_WARM_RECORDS_BUDGET_MB: LRU byte budget (megabytes) for warm
@@ -1243,8 +2086,8 @@ function resolveSemanticDescriptor(dataRoot: string): SemanticProviderDescriptor
 }
 
 // Default ON: a kill switch, not an opt-in. See `DaemonRuntimeOptions.lexical_thread`'s
-// doc comment (`packages/daemon/src/runtime.ts`) -- mirrors `URDIRA_ANALYSIS_THREAD`
-// below for the same reason: the lexical maintenance job (when
+// doc comment (`packages/daemon/src/runtime.ts`) -- paired with
+// `semanticThreadEnabled()` below for the same reason: the lexical maintenance job (when
 // `lexicalIndexEnabled()` above is also on) runs its per-document FTS5
 // computation in a dedicated `node:worker_threads` worker instead of on the
 // daemon's own event loop. `URDIRA_LEXICAL_THREAD=0` (or `false`/`off`/`no`)
@@ -1317,21 +2160,6 @@ function indexPackVerifyMode(): "fast" | "full" | undefined {
   return raw?.toLowerCase() === "full" ? "full" : undefined;
 }
 
-// Default ON: analysis (TypeScript program build + checking) runs in a real
-// `node:worker_threads` worker (see `createJavascriptTypescriptThreadTransport`,
-// `@urdira/plugin-javascript-typescript`) so it no longer blocks the daemon's
-// event loop for minutes on a large workspace. `URDIRA_ANALYSIS_THREAD=0`
-// (or `false`/`off`) forces the in-process transport instead -- e.g. to rule
-// out the worker thread when diagnosing an issue. Direct
-// `createJavascriptTypescriptWorker(...)` callers (tests, and this file's
-// own in-process fallback) are unaffected either way: only
-// `buildJavascriptTypescriptPluginProvider`'s choice of transport reads this.
-function analysisThreadEnabled(): boolean {
-  const raw = process.env["URDIRA_ANALYSIS_THREAD"];
-  if (raw === undefined || raw === "") return true;
-  return !["0", "false", "off", "no"].includes(raw.toLowerCase());
-}
-
 // Default ON: a kill switch, not an opt-in. Gates the durable (on-disk)
 // whole-project analysis cache (`analysis_cache_dir` on the JS/TS worker
 // descriptor, see `buildJavascriptTypescriptPluginProvider` above and
@@ -1398,6 +2226,13 @@ function analysisLargeShardRssBudgetKib(): number {
   return positiveIntegerEnv("URDIRA_ANALYSIS_RSS_BUDGET_KIB") ?? 4_300_000;
 }
 
+/** Conservative fixed cost reserved before each TypeScript checker process
+ * is admitted. Source bytes are charged separately at two times their
+ * encoded size by the caller. */
+function analysisWorkerBaseReservationKib(): number {
+  return positiveIntegerEnv("URDIRA_ANALYSIS_WORKER_RESERVATION_KIB") ?? 262_144;
+}
+
 /** Test-only seam: lets a small fixture workspace exercise the large-
  * workspace (bounded-syntax, streamed) analysis path without a 4096-file
  * fixture. `URDIRA_LARGE_WORKSPACE_ARTIFACT_THRESHOLD`, default 4096 --
@@ -1413,6 +2248,24 @@ function analysisPoolIdleTtlMs(): number {
 }
 
 export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_ROOT"] ?? join(homedir(), ".urdira")): Promise<DaemonRuntimeOptions> {
+  const nativeRequired = process.env["URDIRA_NATIVE_REQUIRED"] === "1";
+  // Resolve and checksum the addon plus syntax worker as one immutable target
+  // closure. The exact bytes feed the plugin package/analysis/binding digests,
+  // while the same verified paths are the only artifacts executed below.
+  // Production never silently downgrades when this closure is required.
+  let nativeRuntime: PreparedNativeRuntime | undefined;
+  if (nativeRequired) {
+    const closure = resolveNativeClosure();
+    const [addonBytes, workerBytes] = await Promise.all([readFile(closure.addon_path), readFile(closure.worker_path)]);
+    if (sha256Bytes(addonBytes) !== closure.addon_digest || sha256Bytes(workerBytes) !== closure.worker_digest) throw new Error("The Urdira native closure changed after verification.");
+    nativeRuntime = { closure, addon_bytes: new Uint8Array(addonBytes), worker_bytes: new Uint8Array(workerBytes) };
+  }
+  // Engine receives only a pure synchronous port after target/API validation
+  // succeeds; a selected binding is never downgraded to TypeScript on failure.
+  const nativeBinding = nativeRuntime === undefined ? undefined : loadNativeBinding({ artifact_path: nativeRuntime.closure.addon_path });
+  configureNativeLogicalDigestPort(nativeBinding === undefined ? undefined : createNativeLogicalDigestPort(nativeBinding));
+  configureNativeExactVectorTopKPort(nativeBinding === undefined ? undefined : createNativeExactVectorTopKPort(nativeBinding));
+  configureStructuralKernelPort(nativeBinding === undefined ? undefined : createNativeStructuralKernelPort(nativeBinding));
   const scanBudgetMs = positiveIntegerEnv("URDIRA_SCAN_BUDGET_MS");
   const scanMaxResponseBytes = positiveIntegerEnv("URDIRA_SCAN_MAX_RESPONSE_BYTES");
   const scanBudget = scanBudgetMs === undefined && scanMaxResponseBytes === undefined ? undefined : {
@@ -1454,6 +2307,11 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   // the same tree hit a donor workspace's entry instead of rebuilding.
   const analysisCacheDir = analysisCacheEnabled() ? join(dataRoot, "analysis-cache", "jsts") : undefined;
   const workerShards = analysisWorkerShardCount();
+  const processTreeRss = nativeRequired ? new WholeProcessTreeRssController({
+    root_pid: process.pid,
+    ceiling_rss_bytes: analysisLargeShardRssBudgetKib() * 1024,
+    sampler: createHostProcessTableRssSampler(),
+  }) : undefined;
   // One pool per daemon (mirrors `createResolveJavascriptTypescriptPluginProvider`'s
   // own single `prepared` cache below): keyed by workspace_id, so a workspace's
   // pooled worker survives across every scan of that workspace for this
@@ -1470,12 +2328,27 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   // demotion path.
   const analysisWorkerPool = analysisPoolEnabled()
     ? new AnalysisWorkerPool<JavascriptTypescriptWorkerDescriptor>({
-      create: (descriptor) => analysisThreadEnabled() ? createJavascriptTypescriptThreadTransport(descriptor) : createJavascriptTypescriptWorker(descriptor),
+      create: (descriptor) => createProductionJavascriptTypescriptSemanticTransport(descriptor, processTreeRss, nativeRuntime?.closure.addon_path),
       max_entries: analysisPoolMaxEntries(),
       max_active: Math.max(workerShards, analysisLargeWorkspaceShardCount()),
       idle_ttl_ms: analysisPoolIdleTtlMs(),
+      ...(processTreeRss === undefined ? {} : { resource_accounting: processTreeRss }),
     })
     : undefined;
+  const rustSyntaxSessions = nativeRuntime === undefined ? undefined : new Map<string, RustSyntaxSession>();
+  const packagedIndexingCorePath = nativeRuntime === undefined ? undefined : join(dirname(nativeRuntime.closure.worker_path), process.platform === "win32" ? "urdira-indexing-worker.exe" : "urdira-indexing-worker");
+  const indexingCoreWorkerPath = process.env["URDIRA_INDEXING_CORE_WORKER_PATH"] ?? (packagedIndexingCorePath !== undefined && existsSync(packagedIndexingCorePath) ? packagedIndexingCorePath : undefined);
+  // A verified production-native runtime must ship the composition worker. Do
+  // not silently demote it to the legacy TypeScript writer: that would put the
+  // dominant structural owner loop back on the application process and make a
+  // release appear healthy while missing the Rust cutover. Development/test
+  // runtimes may still exercise the compatibility oracle explicitly.
+  const oracleRoute = process.env["URDIRA_INDEXING_CORE_ORACLE"] === "1"
+    || process.env["NODE_ENV"] === "test";
+  if (!oracleRoute && indexingCoreWorkerPath === undefined) {
+    throw new Error("Production structural indexing requires urdira-indexing-worker; the TypeScript structural writer is not a production fallback.");
+  }
+  const indexingCoreSessions = indexingCoreWorkerPath === undefined ? undefined : new Map<string, IndexingCoreProcessTransport>();
   // Structural pool concurrency: how many "structural" jobs (workspace scans)
   // the daemon scheduler runs at once. Kept independently configurable from
   // `URDIRA_SCAN_IO_CONCURRENCY` (I/O within one scan) since raising this
@@ -1490,16 +2363,57 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
     engine_build_id: URDIRA_ENGINE_BUILD_ID,
     workspace_registry: createPersistentWorkspaceRegistry(dataRoot),
     plugin_catalog: [{ ...bundledPluginCatalogEntry, capability_declarations: JAVASCRIPT_TYPESCRIPT_CAPABILITIES }],
-    resolve_plugin_provider: createResolveJavascriptTypescriptPluginProvider(analysisCacheDir, analysisWorkerPool, workerShards),
+    resolve_plugin_provider: createResolveJavascriptTypescriptPluginProvider(analysisCacheDir, analysisWorkerPool, workerShards, rustSyntaxSessions, nativeRuntime, processTreeRss, indexingCoreSessions, indexingCoreWorkerPath),
+    // Generic source-only scans use the same persistent composition worker as
+    // language-backed scans. This keeps the no-plugin path from reopening a
+    // TypeScript SQLite writer and lets future language engines share the
+    // source-catalog commit protocol unchanged.
+    /* c8 ignore start -- exercised through daemon startup/runtime integration rather than the app unit harness. */
+    resolve_source_indexing_core: async (workspace: { readonly workspace_id: string }) => {
+      if (indexingCoreSessions === undefined || indexingCoreWorkerPath === undefined) return undefined;
+      let core = indexingCoreSessions.get(workspace.workspace_id);
+      if (core === undefined) {
+        core = createIndexingCoreProcessTransport({ command: indexingCoreWorkerPath, request_timeout_ms: indexingCoreRequestTimeoutMs() });
+        indexingCoreSessions.set(workspace.workspace_id, core);
+      }
+      return {
+        // Source-only scans have no active structural operation to cancel;
+        // cancellation is still observed by the outer scan before commit.
+        cancel: async (): Promise<void> => undefined,
+          commit_source_index: async (input: { readonly operation_id: string; readonly workspace_id: string; readonly database_path: string; readonly commits: readonly unknown[]; readonly finalize_state?: boolean }): Promise<void> => {
+            const result = await core!.commitSourceIndex(input.operation_id, input.workspace_id, input.database_path, input.commits, input.finalize_state);
+            if (result.kind !== "source_index_committed") throw new Error("Rust indexing-core did not commit the generic source index.");
+          },
+          rollback_source_index: async (input: { readonly operation_id: string; readonly workspace_id: string; readonly database_path: string }): Promise<void> => {
+            const result = await core!.rollbackSourceIndex(input.operation_id, input.workspace_id, input.database_path);
+            if (result.kind !== "source_index_rolled_back") throw new Error("Rust indexing-core did not roll back the generic source index.");
+          },
+      };
+    },
+    /* c8 ignore stop */
     // Wired straight through to `AnalysisWorkerPool.evict`/`closeAll` -- see
     // `analysis_worker_pool_evict`/`analysis_worker_pool_close_all`'s doc
     // comments (`packages/daemon/src/runtime.ts`) for why `@urdira/daemon`
     // itself only ever calls these plain closures, never touching a pool
     // instance directly. Both are `undefined` (byte-for-byte today's
     // behavior) when `URDIRA_ANALYSIS_POOL=0`.
-    ...(analysisWorkerPool === undefined ? {} : {
-      analysis_worker_pool_evict: (workspaceId: string) => analysisWorkerPool.evictWorkspace(workspaceId),
-      analysis_worker_pool_close_all: () => analysisWorkerPool.closeAll(),
+    ...(analysisWorkerPool === undefined && rustSyntaxSessions === undefined && indexingCoreSessions === undefined ? {} : {
+      analysis_worker_pool_evict: async (workspaceId: string) => {
+        await analysisWorkerPool?.evictWorkspace(workspaceId);
+        const rust = rustSyntaxSessions?.get(workspaceId);
+        if (rust !== undefined) { rustSyntaxSessions!.delete(workspaceId); await rust.transport.terminate(); }
+        const core = indexingCoreSessions?.get(workspaceId);
+        if (core !== undefined) { indexingCoreSessions!.delete(workspaceId); await core.terminate(); }
+      },
+      analysis_worker_pool_close_all: async () => {
+        await analysisWorkerPool?.closeAll();
+        const sessions = [...(rustSyntaxSessions?.values() ?? [])];
+        rustSyntaxSessions?.clear();
+        await Promise.all(sessions.map((session) => session.transport.terminate()));
+        const indexingCores = [...(indexingCoreSessions?.values() ?? [])];
+        indexingCoreSessions?.clear();
+        await Promise.all(indexingCores.map((session) => session.terminate()));
+      },
     }),
     ...(scanBudget === undefined ? {} : { scan_budget: scanBudget }),
     ...(scanIoConcurrency === undefined ? {} : { scan_io_concurrency: scanIoConcurrency }),
@@ -1509,6 +2423,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
     // switch fired, so an unset env var leaves this field omitted like every
     // other optional override here.
     ...(lexicalIndex ? {} : { lexical_index: false }),
+    ...(indexingCoreWorkerPath === undefined ? {} : { lexical_owned_by_rust: true }),
     ...(lexicalThread ? {} : { lexical_thread: false }),
     ...(workspaceFork ? {} : { workspace_fork: false }),
     ...(workspaceForkVerify === undefined ? {} : { workspace_fork_verify: workspaceForkVerify }),
@@ -1712,6 +2627,10 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
   // expensive composed runtime merely to discover a local CLI error, and a
   // stop request must not create the daemon it intends to stop.
   const command = parseCliArgs(argv);
+  const adminRequestTimeoutMs = options.admin_request_timeout_ms ?? CLI_ADMIN_REQUEST_TIMEOUT_MS;
+  if (!Number.isSafeInteger(adminRequestTimeoutMs) || adminRequestTimeoutMs < 1 || adminRequestTimeoutMs > 24 * 60 * 60 * 1_000) {
+    throw new TypeError("admin_request_timeout_ms must be a positive integer no greater than 24 hours.");
+  }
   if (command.options.debug_timing) {
     process.env["URDIRA_DEBUG_TIMING"] = "1";
     process.env["URDIRA_STORAGE_DEBUG_TIMING"] = "1";
@@ -1727,7 +2646,7 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
   } : undefined);
   const rawClient = daemon === undefined ? undefined : new DaemonClient(daemon.endpoint);
   const client = rawClient === undefined
-    ? { call: async () => ({ outcome: "success", payload: { state: "already_stopped" } }) }
+    ? { call: async () => ({ outcome: "success" as const, payload: { state: "already_stopped" } }) }
     : { call: async (call: string, payload: unknown) => {
       if (call === "core:workspace_preview") options.on_progress?.({ phase: "workspace_preview", completed: 0, message: "inspecting workspace technologies and compatible plugins" });
       if (call === "core:workspace_add") options.on_progress?.({ phase: "workspace_registration", completed: 0, message: "registering the workspace and starting observation" });
@@ -1735,16 +2654,27 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
       if (call === "core:daemon_restart") options.on_progress?.({ phase: "daemon_restart", completed: 0, message: "requesting graceful daemon replacement" });
       const longRunning = call === "core:workspace_preview" || call === "core:workspace_add" || call === "core:workspace_configure" || call === "core:configuration_set" || call === "core:reindex" || call === "core:daemon_stop" || call === "core:daemon_restart";
       return rawClient.call(call, payload, {
-        ...(longRunning ? { deadline_at: new Date(Date.now() + CLI_ADMIN_REQUEST_TIMEOUT_MS).toISOString() } : {}),
+        ...(longRunning ? { deadline_at: new Date(Date.now() + adminRequestTimeoutMs).toISOString() } : {}),
         ...(options.on_progress === undefined ? {} : { on_progress: options.on_progress }),
       });
     } };
   try {
     const result = await runCli(argv, {
       client,
-      preview_admin: async (command) => command.name === "workspace-add"
-        ? (await client.call("core:workspace_preview", { args: command.args, values: command.options.values })).payload
-        : { command: command.name, args: command.args, values: command.options.values },
+      preview_admin: async (command) => {
+        if (command.name !== "workspace-add") return { command: command.name, args: command.args, values: command.options.values };
+        const response = await client.call("core:workspace_preview", { args: command.args, values: command.options.values });
+        if (response.outcome === "error" && response.error !== undefined) {
+          throw new DaemonError(response.error.code as DaemonErrorCode, response.error.message, response.error.details ?? {});
+        }
+        if (response.outcome !== "success") {
+          throw new DaemonError("core:operation_cancelled", "Workspace preview was cancelled before a proposal was returned.");
+        }
+        if (!Object.hasOwn(response, "payload")) {
+          throw new DaemonError("core:ipc_frame_invalid", "Workspace preview succeeded without a response payload.");
+        }
+        return response.payload;
+      },
       ...(options.execute_admin === undefined ? {} : { execute_admin: options.execute_admin }),
       ...(prompt === undefined ? {} : { prompt }),
       read_stdin: async () => { const chunks: Buffer[] = []; for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk)); return Buffer.concat(chunks).toString("utf8"); },

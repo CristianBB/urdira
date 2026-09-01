@@ -8,7 +8,7 @@ import { StorageError } from "./errors.js";
 import { noFaults, type FaultInjector } from "./faults.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteValue } from "./sqlite.js";
 import { digestRelationalValue, hydrateRelationalValue, type RelationalValueRow } from "./relational-values.js";
-import { WORKSPACE_SCHEMA } from "./schema.js";
+import { WORKSPACE_V3_SCHEMA } from "./workspace-v3-sql.js";
 import { WorkspaceProjectionRepository } from "./projections.js";
 import { logicalRecordSetDigest } from "./publication-authority.js";
 
@@ -129,7 +129,7 @@ const MIGRATION_TABLE_NAMES = [
   "lexical_documents", "lexical_index_state", "semantic_index_state", "artifact_dependencies", "metric_projections", "vector_shards", "vector_projection_rows",
   "retention_leases", "retention_pins", "snapshot_expiration_markers", "query_executions", "query_manifest_segments", "backup_barriers", "lifecycle_cas_pins",
   "lifecycle_roots", "storage_migrations", "garbage_collection_epochs", "garbage_collection_candidates",
-  "candidate_state", "candidate_work_manifests", "candidate_fact_deltas", "candidate_fact_delta_namespaces", "candidate_fact_delta_batches", "candidate_staged_records", "candidate_staged_graph_edges", "candidate_staged_identities", "candidate_staged_dependencies", "candidate_materializations", "candidate_issues", "candidate_lookup_dependencies",
+  "candidate_state", "candidate_work_manifests", "candidate_fact_deltas", "candidate_fact_delta_namespaces", "candidate_fact_delta_batches", "candidate_staged_records", "candidate_staged_graph_edges", "candidate_staged_identities", "candidate_staged_dependencies", "candidate_publication_record_occurrences", "candidate_publication_record_facets", "candidate_publication_record_closures", "candidate_publication_identity_assignments", "candidate_publication_projection_occurrences", "candidate_publication_projection_dependencies", "candidate_publication_projection_value_nodes", "candidate_publication_projection_descriptors", "candidate_publication_descriptors", "candidate_materializations", "candidate_issues", "candidate_lookup_dependencies",
   "candidate_retention_leases", "candidate_roots", "candidate_cleanup_markers", "candidate_publication_journal", "generation_manifests",
   "projection_occurrences", "projection_occurrence_dependencies", "projection_value_nodes", "candidate_value_nodes", "identity_assignments",
 ] as const;
@@ -190,7 +190,7 @@ const MIGRATION_PAYLOAD_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   // `index_contract` is a one-byte marker rather than a canonical value. Keep
   // workspace metadata as typed SQLite BLOBs so the v2 shadow copy can move
   // both marker bytes and version values without invoking a legacy decoder.
-  workspace_meta: [], source_artifacts: [], source_observation_batches: [], artifact_versions: [], artifact_tombstones: [], source_observations: [], record_occurrences: [], registry_snapshots: [], snapshots: [], workspace_current_state: [], control_plane_state: [], graph_edges: [], lexical_documents: [], lexical_index_state: [], semantic_index_state: [], artifact_dependencies: [], metric_projections: [], vector_shards: [], vector_projection_rows: [], retention_leases: [], retention_pins: [], snapshot_expiration_markers: [], query_executions: [], query_manifest_segments: [], backup_barriers: [], lifecycle_roots: [], storage_migrations: [], garbage_collection_epochs: [], candidate_state: [], candidate_work_manifests: [], candidate_fact_deltas: [], candidate_fact_delta_namespaces: [], candidate_staged_records: [], candidate_staged_graph_edges: [], candidate_staged_identities: [], candidate_staged_dependencies: [], candidate_materializations: [], candidate_issues: [], candidate_lookup_dependencies: [], candidate_retention_leases: [], candidate_roots: [], candidate_cleanup_markers: [], candidate_publication_journal: [], generation_manifests: [], projection_occurrences: [], projection_occurrence_dependencies: [], identity_assignments: []
+  workspace_meta: [], source_artifacts: [], source_observation_batches: [], artifact_versions: [], artifact_tombstones: [], source_observations: [], record_occurrences: [], registry_snapshots: [], snapshots: [], workspace_current_state: [], control_plane_state: [], graph_edges: [], lexical_documents: [], lexical_index_state: [], semantic_index_state: [], artifact_dependencies: [], metric_projections: [], vector_shards: [], vector_projection_rows: [], retention_leases: [], retention_pins: [], snapshot_expiration_markers: [], query_executions: [], query_manifest_segments: [], backup_barriers: [], lifecycle_roots: [], storage_migrations: [], garbage_collection_epochs: [], candidate_state: [], candidate_work_manifests: [], candidate_fact_deltas: [], candidate_fact_delta_namespaces: [], candidate_staged_records: [], candidate_staged_graph_edges: [], candidate_staged_identities: [], candidate_staged_dependencies: [], candidate_publication_record_occurrences: [], candidate_publication_record_facets: [], candidate_publication_record_closures: [], candidate_publication_identity_assignments: [], candidate_publication_projection_occurrences: [], candidate_publication_projection_dependencies: [], candidate_publication_projection_value_nodes: [], candidate_publication_projection_descriptors: [], candidate_publication_descriptors: [], candidate_materializations: [], candidate_issues: [], candidate_lookup_dependencies: [], candidate_retention_leases: [], candidate_roots: [], candidate_cleanup_markers: [], candidate_publication_journal: [], generation_manifests: [], projection_occurrences: [], projection_occurrence_dependencies: [], identity_assignments: []
 };
 
 /** Every persisted table has a table-specific, versioned decoder and lossless row adapter. */
@@ -1251,7 +1251,7 @@ export class StorageMaintenance {
     await this.validateMigrationAdapters(this.database);
     const shadow = await openSqliteDatabase({ filename: shadowPath });
     try {
-      await shadow.exec(WORKSPACE_SCHEMA);
+      await shadow.exec(WORKSPACE_V3_SCHEMA);
       await shadow.exec("PRAGMA foreign_keys = OFF");
       const tables = await this.database.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'lexical_fts%' ORDER BY name");
       const logicalColumns: Record<string, readonly string[]> = {};

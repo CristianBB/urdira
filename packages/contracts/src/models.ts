@@ -655,6 +655,30 @@ export interface RuntimeComponentImplementationManifest {
   native_asset_digests: ReadonlyArray<string>;
   dependency_asset_digests: ReadonlyArray<string>;
 }
+/** Additive Decision 25 implementation manifest. The v1 interface above is
+ * retained unchanged for packages resolved under the original contract. */
+export interface RuntimeComponentImplementationManifestV2 {
+  runtime_component_build_id: string;
+  component_id: string;
+  component_version: string;
+  behavior_digest: string;
+  runtime_target_id: string;
+  entrypoint_asset_digest: string;
+  executable_asset_digests: ReadonlyArray<string>;
+  native_asset_digests: ReadonlyArray<string>;
+  dependency_asset_digests: ReadonlyArray<string>;
+}
+export interface PluginRuntimeExecutableBinding {
+  plugin_id: string;
+  plugin_version: string;
+  runtime_target_id: string;
+  runtime_contract_version: number;
+  runtime_component_build_id: string;
+  implementation_digest: string;
+  package_digest: string;
+  entrypoint_asset_digest: string;
+  binding_digest: string;
+}
 export interface PluginPackageManifest {
   package_format_id: string;
   package_format_version: number;
@@ -1500,6 +1524,9 @@ export interface ResolvedPlugin {
   registry_contract_version: string;
   resolved_dependency_plugin_ids: ReadonlyArray<string>;
   effective_capabilities: ReadonlyArray<string>;
+  /** Exact target-specific executable selected for this plugin. Absent only
+   * for preserved v1 plugin packages. */
+  runtime_executable_binding?: PluginRuntimeExecutableBinding;
 }
 export interface RegistryCompatibilityAssessment {
   assessment_id: string;
@@ -2233,6 +2260,66 @@ export interface FactDelta {
   completeness_claims: ReadonlyArray<CompletenessClaim>;
   created_at: string;
   delta_digest: string;
+}
+export interface FactDeltaStreamBackpressure {
+  acknowledgement_mode: "per_batch";
+  max_in_flight_batches: number;
+}
+/** Additive plugin output contract. FactDelta remains the v1 compatibility
+ * value and is not widened by this transport model. */
+export interface FactDeltaStreamHeader {
+  protocol_version: 2;
+  schema_id: "core:FactDeltaStream";
+  fact_delta_id: string;
+  candidate_generation_id: string;
+  workspace_id: string;
+  base_snapshot_id?: string;
+  work_item_id: string;
+  plugin_id: string;
+  plugin_version: string;
+  analysis_digest: string;
+  analysis_configuration_digest: string;
+  publication_stage_id?: string;
+  owner_artifact_id: string;
+  owner_artifact_version_id: string;
+  replacement_scopes: ReadonlyArray<ReplacementScope>;
+  replacement_scope_count: number;
+  replacement_scopes_digest: string;
+  input_artifact_version_ids: ReadonlyArray<string>;
+  input_artifact_version_count: number;
+  input_artifact_versions_digest: string;
+  input_record_ids: ReadonlyArray<string>;
+  input_record_count: number;
+  input_records_digest: string;
+  plugin_input_access_manifest_id: string;
+  plugin_input_access_manifest_digest: string;
+  analysis_input_digest: string;
+  completeness_claims: ReadonlyArray<CompletenessClaim>;
+  completeness_claim_count: number;
+  completeness_claims_digest: string;
+  proposed_record_count: number;
+  proposed_records_digest: string;
+  proposed_dependency_count: number;
+  proposed_dependencies_digest: string;
+  created_at: string;
+  delta_digest: string;
+  cancellation_id: string;
+  backpressure: FactDeltaStreamBackpressure;
+  stream_digest: string;
+}
+export interface FactDeltaStreamBatch {
+  protocol_version: 2;
+  schema_id: "core:FactDeltaStreamBatch";
+  fact_delta_id: string;
+  sequence: number;
+  final: boolean;
+  record_count: number;
+  dependency_count: number;
+  row_count: number;
+  byte_length: number;
+  records: ReadonlyArray<ProposedRecord>;
+  dependencies: ReadonlyArray<ProposedRecordDependency>;
+  chunk_digest: string;
 }
 export interface ReplacementScope {
   replacement_scope_id: string;

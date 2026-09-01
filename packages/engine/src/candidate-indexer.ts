@@ -93,6 +93,8 @@ export interface CandidatePublicationBuilderContext {
   readonly frozen_base: FrozenCandidateBaseTuple;
   readonly materialization: CandidateMaterialization;
   readonly template_sets: CandidateTemplateSets;
+  /** The fully sealed input that Rust uses for the final publication handoff. */
+  readonly publication?: CandidatePublicationInput;
 }
 
 export interface CandidateRunTrigger {
@@ -106,6 +108,29 @@ export interface CandidateRunTrigger {
   readonly execute?: (candidate: IndexCandidate, plan: CandidatePlan) => Promise<readonly AcceptedWorkResult[]>;
   readonly materializationInput?: Omit<CandidateMaterializationInput, "candidate" | "manifest" | "source_plan">;
   readonly seal?: (context: { readonly candidate: IndexCandidate; readonly plan: CandidatePlan; readonly accepted: readonly AcceptedWorkResult[] }) => Promise<SealedCandidateMaterialization> | SealedCandidateMaterialization;
+  /**
+   * Commits an external sealed producer after candidate materialization has
+   * been persisted, but before the workspace publication transaction starts.
+   * Rust indexing-core uses this boundary to promote its private staging
+   * relation without sending structural rows back through the application.
+   */
+  readonly before_publication?: (context: CandidatePublicationBuilderContext) => void | Promise<void>;
+  /**
+   * Private publication cutover used by a runtime that owns the complete
+   * candidate transaction. The callback runs after the candidate has reached
+   * `publishing`, but before TypeScript seals, persists, or builds any
+   * publication templates. Rust indexing-core uses this boundary to publish
+   * its staged rows directly and returns the durable publication result.
+   */
+  readonly external_publication?: (context: { readonly candidate: IndexCandidate; readonly frozen_base: FrozenCandidateBaseTuple; readonly plan: CandidatePlan; readonly accepted: readonly AcceptedWorkResult[] }) => Promise<CandidatePublicationResult>;
+  /**
+   * The Rust composition worker owns the candidate lifecycle for this run.
+   * The application still builds the pure work plan, but it must not insert,
+   * transition, lease or persist candidate metadata on the SQLite connection.
+   * The worker receives the candidate and manifest in the generation envelope
+   * and makes those writes on its own publication connection.
+   */
+  readonly rust_owned_lifecycle?: boolean;
   readonly publication: CandidatePublicationInput | ((context: CandidatePublicationBuilderContext) => CandidatePublicationInput | Promise<CandidatePublicationInput>);
   readonly cleanup_resources?: readonly CandidateCleanupResource[];
   readonly replan?: (candidate: IndexCandidate, reason: unknown) => CandidateRunTrigger | Promise<CandidateRunTrigger>;
@@ -268,6 +293,15 @@ export interface StageSourceBatchInput {
   readonly base: SourceCandidateBase;
   readonly trigger: Omit<CandidateRunTrigger, "source_plan">;
   /**
+   * Rust-owned callers may supply the compact control plan produced from the
+   * captured source commits. This avoids rebuilding the owner-sized
+   * transition array in TypeScript; the compatibility route leaves it unset
+   * and continues to use SourceCandidatePlanner as its test oracle.
+   */
+  readonly precomputed_plan?: SourceCandidatePlan;
+  /** Rust owns candidate lifecycle and freshness publication on this route. */
+  readonly rust_owned_lifecycle?: boolean;
+  /**
    * When `true`, skip the `plan.equivalent` early-return below even though
    * the planner found no transitions against `base`, and instead fall
    * through to the normal `status: "pending"` path so `publish()` runs the
@@ -285,15 +319,20 @@ export interface StageSourceBatchInput {
 }
 
 export class CandidateIndexer {
-  private readonly planner: CandidatePlanner;
-  private readonly executor: CandidateExecutor;
-  private readonly materializer: CandidateMaterializer;
+  private planner: CandidatePlanner | undefined;
+  private executor: CandidateExecutor | undefined;
+  private materializer: CandidateMaterializer | undefined;
   private readonly clock: () => string;
 
   constructor(private readonly options: CandidateIndexerOptions) {
-    this.planner = options.planner ?? new CandidatePlanner();
-    this.executor = options.executor ?? new CandidateExecutor();
-    this.materializer = options.materializer ?? new CandidateMaterializer();
+    // Rust-owned generations provide buildPlan/execute/seal/publication
+    // callbacks and never enter the compatibility planner, executor or
+    // materializer. Keep those objects lazy so the coordinator retains only
+    // a pure orchestration shell on the production cutover route; candidate
+    // lifecycle metadata is persisted by the Rust composition worker.
+    this.planner = options.planner;
+    this.executor = options.executor;
+    this.materializer = options.materializer;
     this.clock = options.clock ?? (() => new Date().toISOString());
   }
 
@@ -304,6 +343,7 @@ export class CandidateIndexer {
       return { candidate_generation_id: trigger.candidate.candidate_generation_id, snapshot_id: trigger.frozen_base.snapshot_id ?? "", generation_manifest_id: "", generation, published_at: now(this.clock), status: "already_published", state: "published" };
     }
     const candidate = { ...trigger.candidate, state: "queued" } as IndexCandidate;
+    const rustOwnedLifecycle = trigger.rust_owned_lifecycle === true;
     // `candidate_prepare`: everything from this run's own candidate-identity
     // write through the "analyzing" transition -- `insert`/`acquireBaseLease`
     // (below, outside the `try`) plus the "queued"->"planning" transition,
@@ -315,21 +355,34 @@ export class CandidateIndexer {
     // (which `timed`/`record`, `./debug-timing.js`, simply accumulate) so
     // wrapping it does not move the "queued"->"planning" transition outside
     // the `try` block below and change its exception handling.
-    await timedEngine("candidate_prepare", async () => {
+    if (!rustOwnedLifecycle) await timedEngine("candidate_prepare", async () => {
       await this.options.workspace.candidates.insert(candidate, trigger.frozen_base);
       if (trigger.frozen_base.generation !== undefined) await this.options.workspace.acquireBaseLease(candidate);
     });
     try {
       const plan = await timedEngine("candidate_prepare", async () => {
-        await this.transition(candidate, "queued", "planning");
+        if (!rustOwnedLifecycle) await this.transition(candidate, "queued", "planning");
         const builtPlan = await this.buildPlan(trigger, candidate);
-        await this.options.workspace.candidates.selectManifest(candidate.candidate_generation_id, builtPlan.manifest);
-        await this.transition(candidate, "planning", "analyzing", { analysis_started_at: now(this.clock) });
+        if (!rustOwnedLifecycle) {
+          await this.options.workspace.candidates.selectManifest(candidate.candidate_generation_id, builtPlan.manifest);
+          await this.transition(candidate, "planning", "analyzing", { analysis_started_at: now(this.clock) });
+        }
         return builtPlan;
       });
       const accepted = await this.execute(trigger, candidate, plan);
-      await this.transition(candidate, "analyzing", "validating");
-      await this.transition(candidate, "validating", "projecting");
+      if (!rustOwnedLifecycle) {
+        await this.transition(candidate, "analyzing", "validating");
+        await this.transition(candidate, "validating", "projecting");
+      }
+      if (trigger.external_publication !== undefined) {
+        if (!rustOwnedLifecycle) {
+          await this.transition(candidate, "projecting", "ready", { ready_at: now(this.clock) });
+          await this.transition(candidate, "ready", "publishing");
+        }
+        const publication = await timedEngine("publish", () => trigger.external_publication!({ candidate, frozen_base: trigger.frozen_base, plan, accepted }));
+        if (!rustOwnedLifecycle) await this.options.workspace.releaseBaseLease(candidate.candidate_generation_id);
+        return { ...publication, state: "published" };
+      }
       const sealed = await this.seal(trigger, candidate, plan, accepted);
       // `publish_handoff_post`: everything between the sealed materialization
       // coming back from `seal()` and `workspace.publishCandidate` actually
@@ -350,6 +403,15 @@ export class CandidateIndexer {
         await this.transition(candidate, "ready", "publishing");
         return await this.publicationInput(trigger, candidate, trigger.frozen_base, sealed, sets);
       });
+      if (trigger.before_publication !== undefined) {
+        await trigger.before_publication({
+          candidate,
+          frozen_base: trigger.frozen_base,
+          materialization: publicationInput.materialization,
+          template_sets: publicationInput.template_sets,
+          publication: publicationInput,
+        });
+      }
       const publication = await this.options.workspace.publishCandidate(publicationInput);
       await this.options.workspace.releaseBaseLease(candidate.candidate_generation_id);
       return { ...publication, state: "published" };
@@ -357,20 +419,50 @@ export class CandidateIndexer {
       if (isPublicationConflict(error)) {
         await this.options.workspace.issues.append(publicationConflictIssue(candidate, error, this.clock));
         await this.safeTransition(candidate, "publishing", "stale", { stale_against_snapshot_id: candidate.base_snapshot_id, failure_code: "core:publication_conflict" });
-        await this.options.workspace.releaseBaseLease(candidate.candidate_generation_id);
+        if (!rustOwnedLifecycle) await this.options.workspace.releaseBaseLease(candidate.candidate_generation_id);
         const replan = trigger.replan ?? this.options.replan;
         if (!replan) throw error;
         const replanned = await replan(candidate, error);
         const result = await this.run(replanned);
         return { ...result, replanned_from_candidate_id: candidate.candidate_generation_id };
       }
-      const current = await this.options.workspace.candidates.get(candidate.candidate_generation_id);
+      const current = rustOwnedLifecycle ? undefined : await this.options.workspace.candidates.get(candidate.candidate_generation_id);
       if (current && !["published", "stale", "cleaned"].includes(current.state)) await this.safeTransition(candidate, current.state, "failed", { failure_code: objectValue(error) && typeof error["code"] === "string" ? error["code"] : "core:atomic_publication_failed" });
-      try { await this.options.workspace.releaseBaseLease(candidate.candidate_generation_id); } catch (releaseError) {
+      try { if (!rustOwnedLifecycle) await this.options.workspace.releaseBaseLease(candidate.candidate_generation_id); } catch (releaseError) {
         await this.options.workspace.issues.append(cleanupIssue(candidate, { resource_type: "retention_lease", resource_id: candidate.retention_lease_id ?? `lease:${candidate.candidate_generation_id}` }, releaseError, this.clock));
       }
       throw error;
     }
+  }
+
+  /**
+   * Executes a generation whose complete candidate lifecycle is owned by an
+   * external runtime (the Rust composition worker).  This deliberately does
+   * not call the workspace candidate port, planner, materializer, seal or
+   * publication writer; the callback receives only the compact immutable plan
+   * needed to correlate the generation with the Rust transaction.
+   */
+  async runRustOwned(trigger: CandidateRunTrigger): Promise<CandidateRunResult> {
+    if (trigger.rust_owned_lifecycle !== true || trigger.external_publication === undefined) {
+      throw new TypeError("Rust-owned candidate execution requires the exclusive lifecycle and publication callback.");
+    }
+    if (trigger.equivalent) {
+      const generation = trigger.frozen_base.generation ?? 0;
+      return {
+        candidate_generation_id: trigger.candidate.candidate_generation_id,
+        snapshot_id: trigger.frozen_base.snapshot_id ?? "",
+        generation_manifest_id: "",
+        generation,
+        published_at: now(this.clock),
+        status: "already_published",
+        state: "published",
+      };
+    }
+    const candidate = { ...trigger.candidate, state: "queued" } as IndexCandidate;
+    const plan = await this.buildPlan(trigger, candidate);
+    const accepted = await this.execute(trigger, candidate, plan);
+    const publication = await trigger.external_publication({ candidate, frozen_base: trigger.frozen_base, plan, accepted });
+    return { ...publication, state: "published" };
   }
 
   async runBarrier(sequence: readonly CandidateRunTrigger[]): Promise<readonly CandidateRunResult[]> {
@@ -380,14 +472,20 @@ export class CandidateIndexer {
   }
 
   async stageSourceBatch(input: StageSourceBatchInput): Promise<StagedSourceBatch> {
-    const plan = new SourceCandidatePlanner().plan(input.observations, input.base);
+    const plan = input.precomputed_plan ?? new SourceCandidatePlanner().plan(input.observations, input.base);
     const coverageUsable = input.observations.coverage_completeness === "complete"
       || (input.allow_partial_coverage === true && input.observations.coverage_completeness === "partial");
     if (input.observations.outcome !== "success" || !input.observations.stable || !coverageUsable) {
       return { status: "degraded", plan, publish: async () => ({ status: "equivalent", generation: input.base.present.length + input.base.absent.length }) };
     }
-    if (plan.equivalent && !input.force_candidate) {
-      if (this.options.workspace.recordFreshness) await this.options.workspace.recordFreshness(plan.next_freshness_checkpoint);
+    // A stable directed reconciliation can have partial coverage while still
+    // proving that every observed source is byte-for-byte identical to the
+    // published base. Partial coverage cannot advance workspace-wide
+    // freshness, but zero transitions also means there is no new source state
+    // from which to build a candidate. This is the duplicate watcher-hint path
+    // and must stop before progressive publication is forced for later stages.
+    if (plan.transitions.length === 0 && !input.force_candidate) {
+      if (plan.equivalent && !input.rust_owned_lifecycle && this.options.workspace.recordFreshness) await this.options.workspace.recordFreshness(plan.next_freshness_checkpoint);
       return { status: "equivalent", plan, publish: async () => ({ status: "equivalent", generation: input.base.present.length + input.base.absent.length }) };
     }
     // `force_candidate` with an equivalent (transition-less) plan: freshness
@@ -396,7 +494,13 @@ export class CandidateIndexer {
     // `freshness_checkpoint` the caller's `publication` builder already
     // supplies to `CandidatePublicationInput` (see `runFullWorkspaceScan`'s
     // `staged.plan.next_freshness_checkpoint` usage).
-    return { status: "pending", plan, publish: async () => await this.run({ ...input.trigger, source_plan: plan }) };
+    return {
+      status: "pending",
+      plan,
+      publish: async () => await (input.rust_owned_lifecycle
+        ? this.runRustOwned({ ...input.trigger, source_plan: plan, rust_owned_lifecycle: true })
+        : this.run({ ...input.trigger, source_plan: plan })),
+    };
   }
 
   async recover(): Promise<readonly CandidateRunResult[]> {
@@ -492,19 +596,19 @@ export class CandidateIndexer {
   private async buildPlan(trigger: CandidateRunTrigger, candidate: IndexCandidate): Promise<CandidatePlan> {
     if (trigger.buildPlan) return await trigger.buildPlan(candidate, trigger.frozen_base);
     if (!trigger.planInput) throw new TypeError("Candidate run is missing planner input.");
-    return this.planner.plan({ ...trigger.planInput, candidate, frozen_base: trigger.frozen_base });
+    return (this.planner ??= new CandidatePlanner()).plan({ ...trigger.planInput, candidate, frozen_base: trigger.frozen_base });
   }
 
   private async execute(trigger: CandidateRunTrigger, candidate: IndexCandidate, plan: CandidatePlan): Promise<readonly AcceptedWorkResult[]> {
     if (trigger.execute) return await trigger.execute(candidate, plan);
     if (!trigger.executionInput) return [];
-    return await this.executor.execute({ ...trigger.executionInput, candidate, plan });
+    return await (this.executor ??= new CandidateExecutor()).execute({ ...trigger.executionInput, candidate, plan });
   }
 
   private async seal(trigger: CandidateRunTrigger, candidate: IndexCandidate, plan: CandidatePlan, accepted: readonly AcceptedWorkResult[]): Promise<SealedCandidateMaterialization> {
     if (trigger.seal) return await trigger.seal({ candidate, plan, accepted });
     if (!trigger.materializationInput || !trigger.source_plan) throw new TypeError("Candidate run is missing materialization input or source plan.");
-    return this.materializer.seal({ ...trigger.materializationInput, candidate, manifest: plan.manifest, source_plan: trigger.source_plan });
+    return (this.materializer ??= new CandidateMaterializer()).seal({ ...trigger.materializationInput, candidate, manifest: plan.manifest, source_plan: trigger.source_plan });
   }
 
   private async publicationInput(trigger: CandidateRunTrigger, candidate: IndexCandidate, frozenBase: FrozenCandidateBaseTuple, sealed: SealedCandidateMaterialization, templateSets: CandidateTemplateSets): Promise<CandidatePublicationInput> {
@@ -514,7 +618,7 @@ export class CandidateIndexer {
     // objects in `templateSets` (same array, no clone -- see
     // `templateSetsFromSealed`), so it stays valid all the way into
     // `buildCandidatePublicationPlan`'s own object-identity coverage check.
-    return { ...value, candidate: { ...value.candidate, state: "publishing" }, frozen_base: frozenBase, materialization, template_sets: templateSets, record_open_memo: sealed.record_open_memo };
+    return { ...value, candidate: { ...value.candidate, state: "publishing" }, frozen_base: frozenBase, materialization, template_sets: templateSets, record_open_memo: sealed.record_open_memo, ...(sealed.rust_promoted_structural_rows === true ? { rust_promoted_structural_rows: true } : {}) };
   }
 
   private async transition(candidate: IndexCandidate, expected: string, next: CandidateState, patch: Readonly<Record<string, unknown>> = {}): Promise<void> {

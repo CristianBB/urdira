@@ -4,6 +4,7 @@ import type { ArtifactWorkItem, CandidateProjectionTemplate, IndexCandidate, Pro
 import type { PluginAnalysisSession } from "@urdira/plugin-sdk";
 import type { AcceptedWorkResult, CandidatePlan, CandidatePlanningWorkItem } from "./candidate-planning.js";
 import type { FactDeltaAcceptanceService, ValidatedStagedRecord } from "./fact-delta.js";
+import { digestNativeLogicalValueBatch } from "./native-logical-digest.js";
 
 export interface CandidateAnalysisContextPort {
   open(workItem: ArtifactWorkItem, stagedEntries: readonly ValidatedStagedRecord[]): Promise<PluginAnalysisSession>;
@@ -65,7 +66,10 @@ export class CandidateExecutionError extends Error {
 }
 
 function digest(value: unknown): string { return canonicalSha256(value); }
-function logicalProjectionSetDigest(value: unknown): string { return new LogicalDigestWriter("urdira:projection-set:v3").value(value).digest(); }
+function logicalProjectionSetDigest(value: unknown): string {
+  return digestNativeLogicalValueBatch([{ domain: "urdira:projection-set:v3", value }])?.[0]?.digest
+    ?? new LogicalDigestWriter("urdira:projection-set:v3").value(value).digest();
+}
 
 function isProjection(item: CandidatePlanningWorkItem): item is ProjectionWorkItem & { readonly work_item_id: string } {
   return "projection_work_item_id" in item;
@@ -124,7 +128,15 @@ function projectionSuccess(
   const projections = set["projections"];
   const projectionSetDigest = set["projection_set_digest"];
   const canonicalDigest = Array.isArray(projections) ? digest(projections) : undefined;
-  const logicalDigest = Array.isArray(projections) ? logicalProjectionSetDigest(projections) : undefined;
+  let logicalDigest: string | undefined;
+  if (Array.isArray(projections)) {
+    try {
+      logicalDigest = logicalProjectionSetDigest(projections);
+    } catch (error) {
+      const nativeError = error instanceof Error ? error.message : String(error);
+      throw executionError(item, "core:projection_digest_mismatch", `Native logical digest batch failed: ${nativeError}`, { native_error: nativeError });
+    }
+  }
   if (!Array.isArray(projections) || typeof projectionSetDigest !== "string" || (projectionSetDigest !== canonicalDigest && projectionSetDigest !== logicalDigest)) throw executionError(item, "core:projection_digest_mismatch", "Projection set digest does not match its canonical or logical projections.", { expected_digest: logicalDigest ?? canonicalDigest, legacy_expected_digest: canonicalDigest, actual_digest: projectionSetDigest });
   const expectedFields = ["projection_record_id", "projection_kind", "projection_key", "workspace_id", "owner_artifact_id", "owner_artifact_version_id", "source_artifact_version_ids", "source_record_ids", "source_projection_record_ids", "generator", "generator_version", "generator_configuration_digest", "payload"].sort().join("\0");
   const artifactSources = new Set(context.base_artifact_version_ids);

@@ -1,12 +1,13 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { deserialize, serialize } from "node:v8";
 import { gunzip as gunzipCallback, gzip as gzipCallback } from "node:zlib";
 import { LogicalDigestWriter } from "@urdira/canonical";
-import { canonicalSha256, type PluginWorkerRequestEnvelope, type WorkerTransport } from "@urdira/plugin-sdk";
-import { analyzeBoundedSyntaxProject, analyzeSyntaxDependencyGraph, analyzeSyntaxProject, discoverProjects, isLargeSyntaxCorpus, JAVASCRIPT_TYPESCRIPT_CAPABILITIES, JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, JAVASCRIPT_TYPESCRIPT_VERSION, JsTsAnalysisSession, LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD, LARGE_SYNTAX_CORPUS_FILE_THRESHOLD, TYPESCRIPT_COMPILER_VERSION, type AnalyzerFile, type JsTsAnalysisResult, type JsTsDirectDependency } from "./analyzer.js";
-import { buildJavascriptTypescriptFactDelta } from "./fact-delta.js";
+import { FACT_DELTA_STREAM_MAX_BYTES, FACT_DELTA_STREAM_MAX_ROWS, canonicalSha256, factDeltaStreamCanonicalRow, factDeltaStreamSealedRows, prepareFactDeltaStreamStructuralGroup, projectStructuralObservationGroup, type FactDeltaStream, type PluginWorkerRequestEnvelope, type SealedStructuralProjectionOwner, type WorkerTransport } from "@urdira/plugin-sdk";
+import { analyzeBoundedSyntaxProject, analyzeSyntaxDependencyGraph, analyzeSyntaxProject, discoverProjects, isLargeSyntaxCorpus, JAVASCRIPT_TYPESCRIPT_CAPABILITIES, JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, JAVASCRIPT_TYPESCRIPT_VERSION, JsTsAnalysisSession, LARGE_SYNTAX_CORPUS_BYTE_THRESHOLD, LARGE_SYNTAX_CORPUS_FILE_THRESHOLD, TYPESCRIPT_COMPILER_VERSION, type AnalyzerFile, type JsTsAnalysisResult, type JsTsDirectDependency, type JsTsRustSemanticScope, type RustHybridPendingSite } from "./analyzer.js";
+import { buildJavascriptTypescriptFactDelta, buildJavascriptTypescriptFactDeltaStream, buildJavascriptTypescriptNativeFactDeltaHeader, JAVASCRIPT_TYPESCRIPT_NATIVE_PROJECTION_PROFILE, javascriptTypescriptNativeProjectionOwner, prepareJavascriptTypescriptFactDeltaStream, prepareJavascriptTypescriptProjectedFactDeltaStream, type JavascriptTypescriptFactDeltaInput, type JavascriptTypescriptNativeFactDeltaInput, type PreparedJavascriptTypescriptFactDeltaStream } from "./fact-delta.js";
 import { iterateNativeFactDeltaBatches } from "./native-batches.js";
 
 const gzip = promisify(gzipCallback);
@@ -72,7 +73,146 @@ async function filesFromPayload(payload: unknown, casRoot?: string, options: { r
   return result.sort((left, right) => left.path.localeCompare(right.path));
 }
 
+/**
+ * Reconstructs only immutable artifact metadata after a checker snapshot has
+ * already verified and analyzed the exact content hashes. Owner publication
+ * needs artifact/version bindings for dependencies, but it must not reread,
+ * hash, and UTF-8 decode the same CAS bytes once per owner or later stage.
+ * Any mismatch falls back to the full verified source-loading path.
+ */
+function filesFromPreparedPayload(payload: unknown, preparedFileHashes: ReadonlyMap<string, string>): AnalyzerFile[] | undefined {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const entries = (payload as Record<string, unknown>)["files"];
+  if (!Array.isArray(entries)) return undefined;
+  const files: AnalyzerFile[] = [];
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+    const source = entry as Record<string, unknown>;
+    const path = source["path"];
+    const contentHash = source["content_hash"];
+    if (typeof path !== "string" || path.length === 0 || path.startsWith("/") || path.includes("\\")
+      || path.split("/").some((part) => part === "" || part === "." || part === "..")
+      || source["text"] !== undefined || source["bytes"] !== undefined
+      || typeof contentHash !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(contentHash)
+      || preparedFileHashes.get(path) !== contentHash) return undefined;
+    const artifactId = source["artifact_id"];
+    const artifactVersionId = source["artifact_version_id"];
+    if ((artifactId !== undefined && (typeof artifactId !== "string" || artifactId.length === 0))
+      || (artifactVersionId !== undefined && (typeof artifactVersionId !== "string" || artifactVersionId.length === 0))) return undefined;
+    files.push({
+      path,
+      text: "",
+      content_hash: contentHash,
+      ...(typeof artifactId === "string" ? { artifact_id: artifactId } : {}),
+      ...(typeof artifactVersionId === "string" ? { artifact_version_id: artifactVersionId } : {}),
+    });
+  }
+  // Rust emits closure metadata in canonical path order. Keep that hot path
+  // allocation-free; retain the defensive sort for private callers/tests that
+  // construct an equivalent payload in an arbitrary order.
+  let ordered = true;
+  for (let index = 1; index < files.length; index += 1) {
+    if (files[index - 1]!.path.localeCompare(files[index]!.path) > 0) { ordered = false; break; }
+  }
+  return ordered ? files : files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
 type SyntaxDependencyGraph = Readonly<Record<string, JsTsDirectDependency>>;
+
+function rustSemanticScopeFromPayload(
+  payload: Readonly<Record<string, unknown>>,
+  rootNames: readonly string[],
+  preparedScope?: JsTsRustSemanticScope,
+): JsTsRustSemanticScope | undefined {
+  const value = payload["rust_semantic_scope"];
+  if (value === undefined) {
+    const reference = payload["rust_semantic_scope_ref"];
+    if (reference === undefined) return undefined;
+    if (typeof reference !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(reference) || preparedScope === undefined || canonicalSha256(preparedScope) !== reference) {
+      throw new Error("rust_semantic_scope_ref does not match the prepared Rust-authoritative scope.");
+    }
+    // Owner requests intentionally carry only their local root marker. The
+    // immutable closure scope was validated against the complete root set
+    // during preparation, so do not revalidate the full affected manifest
+    // against that one-owner marker on every hot request.
+    return preparedScope;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("rust_semantic_scope must be an object.");
+  const scope = value as Record<string, unknown>;
+  const keys = Object.keys(scope).sort();
+  if (keys.length !== 3 || keys[0] !== "affected_paths" || keys[1] !== "authority" || keys[2] !== "changed_paths"
+    || scope["authority"] !== "urdira:jsts-syntax-worker"
+    || !Array.isArray(scope["changed_paths"]) || !scope["changed_paths"].every((path) => typeof path === "string")
+    || !Array.isArray(scope["affected_paths"]) || !scope["affected_paths"].every((path) => typeof path === "string")) {
+    throw new Error("rust_semantic_scope is not a closed Rust-authoritative scope.");
+  }
+  const changedPaths = scope["changed_paths"] as string[];
+  const affectedPaths = scope["affected_paths"] as string[];
+  const roots = new Set(rootNames);
+  if (new Set(changedPaths).size !== changedPaths.length || new Set(affectedPaths).size !== affectedPaths.length
+    || changedPaths.some((path) => !roots.has(path)) || affectedPaths.some((path) => !roots.has(path))) {
+    throw new Error("rust_semantic_scope paths must be unique members of root_names.");
+  }
+  const affected = new Set(affectedPaths);
+  if (changedPaths.some((path) => !affected.has(path))) throw new Error("rust_semantic_scope affected_paths must contain changed_paths.");
+  const parsed = { authority: "urdira:jsts-syntax-worker", changed_paths: changedPaths, affected_paths: affectedPaths } as const;
+  const scopeId = payload["rust_semantic_scope_id"];
+  if (scopeId !== undefined && (typeof scopeId !== "string" || canonicalSha256(parsed) !== scopeId)) throw new Error("rust_semantic_scope_id does not match the closed Rust-authoritative scope.");
+  return parsed;
+}
+
+/**
+ * E1c cutover (design doc E1, step 3 of the handoff): reads one owner
+ * request's `rust_hybrid_pending_sites` -- present only when
+ * `URDIRA_JSTS_HYBRID=1` (`urdira-indexing-worker`'s `semantic_request`
+ * embeds it exactly then, never otherwise), so `undefined` here is exactly
+ * the flag-off signal that tells `analyzeRustSemanticOwner`/
+ * `beginRustSemanticOwnerGroup` to keep doing their own full `collectAll`
+ * walk unchanged. Malformed entries are dropped rather than thrown on: a
+ * dropped site only costs the checker doing slightly more work than
+ * strictly necessary (it is never wrong for the checker to look at a node
+ * Rust didn't ask about), so failing softly here is strictly safer than
+ * failing the whole owner over one bad wire entry.
+ */
+function pendingSitesFromPayload(payload: Readonly<Record<string, unknown>>): readonly RustHybridPendingSite[] | undefined {
+  const raw = payload["rust_hybrid_pending_sites"];
+  if (!Array.isArray(raw)) return undefined;
+  const sites: RustHybridPendingSite[] = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const start = record["start_utf16"];
+    const end = record["end_utf16"];
+    const kind = record["site_kind"];
+    if (typeof start === "number" && typeof end === "number"
+      && (kind === "identifier_ref" || kind === "call" || kind === "heritage" || kind === "typed_decl")) {
+      sites.push({ start_utf16: start, end_utf16: end, site_kind: kind });
+    }
+  }
+  return sites;
+}
+
+/** Builds the per-owner pending-site map `beginRustSemanticOwnerGroup`
+ * expects, straight from a bounded request group's own payloads -- there is
+ * no separate "group" wire shape, each owner's `rust_hybrid_pending_sites`
+ * simply rides its own `analyze_artifact` request (see `semantic_request`
+ * in urdira-indexing-worker/src/main.rs). `undefined` for an owner (rather
+ * than an omitted map entry) is impossible here: `pendingSitesFromPayload`
+ * only ever returns `undefined` when the whole flag is off, in which case
+ * every request in the group lacks the field and this returns an empty map
+ * -- `beginRustSemanticOwnerGroup` then falls back to `collectAll` for
+ * every owner, unchanged. */
+function pendingSitesByOwnerFromRequests(requests: readonly PluginWorkerRequestEnvelope[]): ReadonlyMap<string, readonly RustHybridPendingSite[]> {
+  const byOwner = new Map<string, readonly RustHybridPendingSite[]>();
+  for (const request of requests) {
+    const payload = request.payload as Record<string, unknown>;
+    const ownerPath = payload["owner_path"];
+    if (typeof ownerPath !== "string") continue;
+    const sites = pendingSitesFromPayload(payload);
+    if (sites !== undefined) byOwner.set(ownerPath, sites);
+  }
+  return byOwner;
+}
 
 export function largeSyntaxManifestKey(payload: unknown, rootNames: readonly string[], descriptor: JavascriptTypescriptWorkerDescriptor): string | undefined {
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
@@ -149,6 +289,8 @@ export interface JavascriptTypescriptWorkerDescriptor {
   readonly registry_contribution_digest?: string;
   readonly analysis_digest?: string;
   readonly analysis_configuration_digest?: string;
+  /** Exact Decision 25 executable binding selected in the resolution lock. */
+  readonly runtime_executable_binding_digest?: string;
   /** Immutable CAS root used for native source-reference hydration inside the worker. */
   readonly cas_root?: string;
   /** Maximum concurrent CAS reads for one analyzer request. */
@@ -207,6 +349,10 @@ export interface JavascriptTypescriptWorkerDescriptor {
    * `URDIRA_ANALYSIS_THREAD=0`) can observe it).
    */
   readonly on_analysis_incremental?: (rewalked: readonly string[]) => void;
+  /** Test-only count of checker owner walks; a stage-three spool hit does not fire it. */
+  readonly on_rust_semantic_owner_analyze?: (ownerPath: string) => void;
+  /** Test-only count of bounded checker lookup-group preparation passes. */
+  readonly on_rust_semantic_group_prepare?: (ownerPaths: readonly string[]) => void;
 }
 
 interface AnalysisCacheEntry {
@@ -340,7 +486,7 @@ function fileContentHash(file: AnalyzerFile, memo: FileHashMemo): string {
  * loaded and trusted as fresh. `canonicalSha256` returns `sha256:<hex>`; only the
  * hex half is used, so the cache filename stem is a plain hex string.
  */
-function durableAnalysisCacheKey(cacheKey: string, descriptor: JavascriptTypescriptWorkerDescriptor, stage = "monolithic"): string {
+export function durableAnalysisCacheKey(cacheKey: string, descriptor: JavascriptTypescriptWorkerDescriptor, stage = "monolithic"): string {
   const digest = canonicalSha256({
     format_version: stage === "monolithic" ? 1 : 3,
     stage,
@@ -349,6 +495,7 @@ function durableAnalysisCacheKey(cacheKey: string, descriptor: JavascriptTypescr
     plugin_version: JAVASCRIPT_TYPESCRIPT_VERSION,
     analysis_digest: descriptor.analysis_digest ?? null,
     analysis_configuration_digest: descriptor.analysis_configuration_digest ?? null,
+    runtime_executable_binding_digest: descriptor.runtime_executable_binding_digest ?? null,
   });
   return digest.startsWith("sha256:") ? digest.slice("sha256:".length) : digest;
 }
@@ -372,6 +519,66 @@ function isValidDurableAnalysis(value: unknown): value is JsTsAnalysisResult {
   return Array.isArray(candidate["entities"]) && Array.isArray(candidate["relations"]) && Array.isArray(candidate["diagnostics"])
     && candidate["dependency_closures"] !== null && typeof candidate["dependency_closures"] === "object" && !Array.isArray(candidate["dependency_closures"])
     && typeof candidate["language"] === "string" && typeof candidate["complete"] === "boolean";
+}
+
+/** Minimal checker projection consumed by structural stage 3. Stage 2 has
+ * already published references/calls/inheritance, so retaining those rows in
+ * the inter-stage spool would duplicate hundreds of megabytes of data that can
+ * never pass stage 3's closed record-kind filter. */
+function stageThreeSemanticProjection(analysis: JsTsAnalysisResult, ownerPath: string): JsTsAnalysisResult {
+  const relations = analysis.relations.filter((relation) => relation.path === ownerPath && relation.kind === "core:covers");
+  const targetIds = new Set(relations.flatMap((relation) => relation.target_id === undefined ? [] : [relation.target_id]));
+  const entities = analysis.entities.filter((entity) => (entity.path === ownerPath && entity.type !== undefined) || targetIds.has(entity.id));
+  const diagnostics = analysis.diagnostics.filter((diagnostic) => diagnostic.path === ownerPath);
+  return {
+    language: analysis.language,
+    entities,
+    relations,
+    diagnostics,
+    complete: diagnostics.length === 0,
+    dependency_closures: {},
+  };
+}
+
+/**
+ * Rust-authoritative owner analyses retain only the owner declaration surface
+ * plus entities referenced by that owner's checker relations. The projection
+ * needs artifact bindings only for those retained target paths; carrying the
+ * complete workspace file manifest through every owner request needlessly
+ * serializes the same 500+ entries hundreds of times.
+ */
+function filesForRustSemanticOwner(
+  files: readonly AnalyzerFile[],
+  analysis: JsTsAnalysisResult,
+  ownerPath: string,
+  preparedFiles?: ReadonlyMap<string, AnalyzerFile>,
+): readonly AnalyzerFile[] {
+  const paths = new Set<string>([ownerPath]);
+  for (const entity of analysis.entities) paths.add(entity.path);
+  for (const relation of analysis.relations) paths.add(relation.path);
+  for (const diagnostic of analysis.diagnostics) paths.add(diagnostic.path);
+  // The Rust request already carries the closure's metadata in canonical
+  // order. Selecting directly avoids constructing a new Map from every
+  // closure for every owner. Prepared metadata is consulted only for target
+  // declarations that the bounded owner request intentionally omitted.
+  const selected: AnalyzerFile[] = [];
+  const selectedPaths = new Set<string>();
+  for (const file of files) {
+    if (!paths.has(file.path)) continue;
+    selected.push(file);
+    selectedPaths.add(file.path);
+  }
+  if (preparedFiles !== undefined && selectedPaths.size !== paths.size) {
+    for (const path of paths) {
+      if (selectedPaths.has(path)) continue;
+      const prepared = preparedFiles.get(path);
+      if (prepared !== undefined) {
+        selected.push(prepared);
+        selectedPaths.add(path);
+      }
+    }
+  }
+  return selected;
 }
 
 /**
@@ -470,7 +677,7 @@ async function pruneDurableAnalysisCache(dir: string, maxEntries: number): Promi
  * durable-cache hit or a full build; an array, possibly empty, for a real
  * incremental build) -- see that field's doc comment in `analyzer.ts`.
  */
-async function loadOrBuildAnalysis(descriptor: JavascriptTypescriptWorkerDescriptor, session: JsTsAnalysisSession, files: readonly AnalyzerFile[], rootNames: readonly string[], compilerOptions: Readonly<Record<string, unknown>> | undefined, cacheKey: string): Promise<{ readonly analysis: JsTsAnalysisResult; readonly impactful_changed_paths?: readonly string[] }> {
+async function loadOrBuildAnalysis(descriptor: JavascriptTypescriptWorkerDescriptor, session: JsTsAnalysisSession, files: readonly AnalyzerFile[], rootNames: readonly string[], compilerOptions: Readonly<Record<string, unknown>> | undefined, cacheKey: string, rustScope?: JsTsRustSemanticScope): Promise<{ readonly analysis: JsTsAnalysisResult; readonly impactful_changed_paths?: readonly string[] }> {
   const cacheDir = descriptor.analysis_cache_dir;
   const durableKey = cacheDir === undefined ? undefined : durableAnalysisCacheKey(cacheKey, descriptor);
   if (cacheDir !== undefined && durableKey !== undefined) {
@@ -482,18 +689,184 @@ async function loadOrBuildAnalysis(descriptor: JavascriptTypescriptWorkerDescrip
     }
   }
   descriptor.on_analysis_build?.();
-  const sessionResult = session.analyze({ files, root_names: rootNames, ...(compilerOptions === undefined ? {} : { compiler_options: compilerOptions }) });
+  const sessionResult = session.analyze({ files, root_names: rootNames, ...(compilerOptions === undefined ? {} : { compiler_options: compilerOptions }), ...(rustScope === undefined ? {} : { rust_semantic_scope: rustScope }) });
   if (sessionResult.build === "incremental") descriptor.on_analysis_incremental?.(sessionResult.rewalked);
   const analysis = sessionResult.result;
   if (cacheDir !== undefined && durableKey !== undefined) await writeDurableAnalysisCache(cacheDir, durableKey, analysis, descriptor.analysis_cache_max_entries ?? 16);
   return { analysis, ...(sessionResult.impactful_changed_paths === undefined ? {} : { impactful_changed_paths: sessionResult.impactful_changed_paths }) };
 }
 
-export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescriptWorkerDescriptor = {}): WorkerTransport {
+export interface JavascriptTypescriptWorkerTransport extends WorkerTransport {
+  invokeFactDeltaStream(request: PluginWorkerRequestEnvelope): Promise<FactDeltaStream>;
+  invokeFactDeltaStreamGroup(requests: readonly PluginWorkerRequestEnvelope[]): Promise<readonly FactDeltaStream[]>;
+  invokeRustSemanticObservationGroup(requests: readonly PluginWorkerRequestEnvelope[]): Promise<readonly RustSemanticObservationOwner[]>;
+}
+
+// Each canonical owner batch retains the closed 4 MiB row envelope. The Rust
+// core's 16 MiB physical bound applies to the aggregate group, not an
+// individual canonical batch; keeping this limit also preserves the native
+// batch contract while groups remain bounded independently.
+const RUST_SEMANTIC_OBSERVATION_MAX_BYTES = FACT_DELTA_STREAM_MAX_BYTES;
+
+/** Compact owner observations used only by the Rust composition worker. The
+ * ordinary FactDeltaStream transport remains available as a test oracle and
+ * compatibility boundary, but structural rows are never framed into streams
+ * on this production path. */
+export interface RustSemanticObservationOwner {
+  readonly owner_artifact_id: string;
+  readonly owner_artifact_version_id: string;
+  readonly owner_path: string;
+  /** Diagnostic proposal keys are carried from the projected headers so Rust
+   * can reproduce the FactDelta commitment without reparsing canonical row
+   * JSON in its ingest path. */
+  readonly diagnostic_proposal_keys: readonly string[];
+  readonly batches: readonly {
+    readonly sequence: number;
+    readonly final_batch: boolean;
+    readonly canonical_records: readonly string[];
+    readonly canonical_dependencies: readonly string[];
+    readonly byte_length: 0;
+    readonly owner_digest: string;
+    readonly fact_delta_id: string;
+    readonly delta_digest: string;
+    readonly diagnostic_codes: readonly string[];
+  }[];
+  readonly next_cursor?: number;
+}
+
+/**
+ * Converts a prepared giant-owner stream to the compact observation shape
+ * without sealing it. Sealing would rebuild the legacy FactDelta header and
+ * whole-owner digest in TypeScript before Rust owns those values.
+ */
+/* c8 ignore start -- giant-owner fallback is exercised by the Rust preflight corpus. */
+function rustOwnedPreparedObservation(
+  prepared: PreparedJavascriptTypescriptFactDeltaStream,
+  input: JavascriptTypescriptFactDeltaInput,
+): RustSemanticObservationOwner {
+  const records = prepared.records.map(factDeltaStreamCanonicalRow);
+  const dependencies = prepared.dependencies.map(factDeltaStreamCanonicalRow);
+  const diagnosticCodes = input.analysis.diagnostics
+    .filter((diagnostic) => diagnostic.path === input.owner_path)
+    .map((diagnostic) => diagnostic.code);
+  const diagnosticProposalKeys = prepared.records
+    .filter((record) => record.category === "diagnostic")
+    .map((record) => record.proposal_record_key);
+  const batches: Array<RustSemanticObservationOwner["batches"][number]> = [];
+  let recordStart = 0;
+  let dependencyStart = 0;
+  let sequence = 0;
+  while (recordStart < records.length || dependencyStart < dependencies.length || sequence === 0) {
+    const batchRecords: string[] = [];
+    const batchDependencies: string[] = [];
+    let bytes = 0;
+    while (recordStart < records.length
+      && batchRecords.length + batchDependencies.length < FACT_DELTA_STREAM_MAX_ROWS
+      && bytes + records[recordStart]!.length <= RUST_SEMANTIC_OBSERVATION_MAX_BYTES) {
+      const row = records[recordStart++]!;
+      batchRecords.push(row);
+      bytes += row.length;
+    }
+    while (dependencyStart < dependencies.length
+      && batchRecords.length + batchDependencies.length < FACT_DELTA_STREAM_MAX_ROWS
+      && bytes + dependencies[dependencyStart]!.length <= RUST_SEMANTIC_OBSERVATION_MAX_BYTES) {
+      const row = dependencies[dependencyStart++]!;
+      batchDependencies.push(row);
+      bytes += row.length;
+    }
+    if (batchRecords.length === 0 && batchDependencies.length === 0 && sequence !== 0) {
+      const pending = Math.max(records[recordStart]?.length ?? 0, dependencies[dependencyStart]?.length ?? 0);
+      throw new Error(`Prepared Rust semantic observation row exceeds its physical batch budget (owner=${input.owner_path ?? "?"}, bytes=${pending}, limit=${RUST_SEMANTIC_OBSERVATION_MAX_BYTES}).`);
+    }
+    batches.push({
+      sequence,
+      final_batch: recordStart === records.length && dependencyStart === dependencies.length,
+      canonical_records: batchRecords,
+      canonical_dependencies: batchDependencies,
+      byte_length: 0,
+      owner_digest: "",
+      fact_delta_id: "",
+      delta_digest: "",
+      diagnostic_codes: diagnosticCodes,
+    });
+    sequence += 1;
+  }
+  return {
+    owner_artifact_id: String(input.work_item["artifact_id"]),
+    owner_artifact_version_id: String(input.work_item["target_artifact_version_id"]),
+    owner_path: input.owner_path!,
+    diagnostic_proposal_keys: diagnosticProposalKeys,
+    batches,
+  };
+}
+/* c8 ignore stop */
+
+export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescriptWorkerDescriptor = {}): JavascriptTypescriptWorkerTransport {
   let terminated = false;
   let analysisCache: AnalysisCacheEntry | undefined;
   let stage1AnalysisCache: AnalysisCacheEntry | undefined;
+  let rustSemanticPreparedFileHashes: ReadonlyMap<string, string> | undefined;
+  // Compact metadata for the one prepared Rust-authoritative project. Owner
+  // requests carry only the owner entry; reusing this map avoids serializing
+  // the full corpus once per owner group while still giving fact projection
+  // the artifact bindings for checker-discovered target entities.
+  let rustSemanticPreparedFiles: ReadonlyMap<string, AnalyzerFile> | undefined;
+  let rustSemanticPreparedScope: JsTsRustSemanticScope | undefined;
+  let rustSemanticSpoolHandle: FileHandle | undefined;
+  let rustSemanticSpoolPath: string | undefined;
+  let rustSemanticSpoolGeneration: string | undefined;
+  let rustSemanticSpoolBytes = 0;
+  const rustSemanticSpoolIndex = new Map<string, { readonly offset: number; readonly length: number }>();
   const fileHashMemo = new FileHashMemo();
+  const closeRustSemanticSpool = async (): Promise<void> => {
+    const handle = rustSemanticSpoolHandle;
+    const path = rustSemanticSpoolPath;
+    rustSemanticSpoolHandle = undefined;
+    rustSemanticSpoolPath = undefined;
+    rustSemanticSpoolGeneration = undefined;
+    rustSemanticSpoolBytes = 0;
+    rustSemanticSpoolIndex.clear();
+    await handle?.close().catch(() => undefined);
+    if (path !== undefined) await unlink(path).catch(() => undefined);
+  };
+  const prepareRustSemanticSpool = async (generation: string, create: boolean): Promise<void> => {
+    if (rustSemanticSpoolGeneration === generation && rustSemanticSpoolHandle !== undefined) return;
+    await closeRustSemanticSpool();
+    if (!create || descriptor.analysis_cache_dir === undefined) return;
+    await mkdir(descriptor.analysis_cache_dir, { recursive: true });
+    const path = join(descriptor.analysis_cache_dir, `rust-semantic-${process.pid}-${randomBytes(8).toString("hex")}.spool`);
+    rustSemanticSpoolHandle = await open(path, "w+");
+    rustSemanticSpoolPath = path;
+    rustSemanticSpoolGeneration = generation;
+  };
+  const rustSemanticSpoolKey = (ownerPath: string): string | undefined => rustSemanticSpoolGeneration === undefined ? undefined : `${rustSemanticSpoolGeneration}\0${ownerPath}`;
+  const hasRustSemanticSpoolEntry = (ownerPath: string): boolean => {
+    const key = rustSemanticSpoolKey(ownerPath);
+    return rustSemanticSpoolHandle !== undefined && key !== undefined && rustSemanticSpoolIndex.has(key);
+  };
+  const writeRustSemanticSpool = async (ownerPath: string, analysis: JsTsAnalysisResult): Promise<void> => {
+    const handle = rustSemanticSpoolHandle;
+    const key = rustSemanticSpoolKey(ownerPath);
+    if (handle === undefined || key === undefined) return;
+    const bytes = serialize({ format_version: 1, key, analysis });
+    const offset = rustSemanticSpoolBytes;
+    const result = await handle.write(bytes, 0, bytes.byteLength, offset);
+    if (result.bytesWritten !== bytes.byteLength) throw new Error("Rust-authoritative semantic spool write was incomplete.");
+    rustSemanticSpoolIndex.set(key, { offset, length: bytes.byteLength });
+    rustSemanticSpoolBytes += bytes.byteLength;
+  };
+  const readRustSemanticSpool = async (ownerPath: string): Promise<JsTsAnalysisResult | undefined> => {
+    const handle = rustSemanticSpoolHandle;
+    const key = rustSemanticSpoolKey(ownerPath);
+    const entry = key === undefined ? undefined : rustSemanticSpoolIndex.get(key);
+    if (handle === undefined || key === undefined || entry === undefined) return undefined;
+    const bytes = Buffer.allocUnsafe(entry.length);
+    const result = await handle.read(bytes, 0, entry.length, entry.offset);
+    if (result.bytesRead !== entry.length) throw new Error("Rust-authoritative semantic spool read was incomplete.");
+    const decoded = deserialize(bytes) as { readonly format_version?: unknown; readonly key?: unknown; readonly analysis?: unknown };
+    if (decoded.format_version !== 1 || decoded.key !== key || !isValidDurableAnalysis(decoded.analysis)) throw new Error("Rust-authoritative semantic spool entry failed validation.");
+    return decoded.analysis;
+  };
   // One incremental analysis session per worker instance: a per-scan worker
   // (today's default) only ever calls `session.analyze` at most once per
   // scan (see `loadOrBuildAnalysis`'s doc comment), so this session behaves
@@ -504,8 +877,7 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
   // edit between two scans re-walks only the affected files instead of the
   // whole project.
   const session = new JsTsAnalysisSession();
-  return {
-    async invoke(request: PluginWorkerRequestEnvelope): Promise<unknown> {
+  const invoke = async (request: PluginWorkerRequestEnvelope, directStream: boolean | "prepared" | "projection_input"): Promise<unknown> => {
       if (terminated) throw new Error("JavaScript/TypeScript worker is terminated.");
       if (request.call === "describe") return response(request, {
         plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
@@ -520,6 +892,16 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
       const preliminaryRootNames = Array.isArray(rawPayload["root_names"]) && rawPayload["root_names"].every((value) => typeof value === "string")
         ? rawPayload["root_names"] as string[] : [];
       const preliminaryStage = typeof rawPayload["publication_stage_id"] === "string" ? rawPayload["publication_stage_id"] : undefined;
+      const hasRustSemanticScope = rawPayload["rust_semantic_scope"] !== undefined || rawPayload["rust_semantic_scope_ref"] !== undefined;
+      if (preliminaryStage === "jsts:structural_stage_1" && descriptor.runtime_executable_binding_digest !== undefined) {
+        throw new Error("Exclusive-work violation: a native-bound JavaScript/TypeScript plugin cannot execute structural stage 1 in TypeScript.");
+      }
+      if (descriptor.runtime_executable_binding_digest !== undefined
+        && (preliminaryStage === "jsts:structural_stage_2" || preliminaryStage === "jsts:structural_stage_3")
+        && (request.call === "analyze_closure" || request.call === "analyze_artifact")
+        && !hasRustSemanticScope) {
+        throw new Error("Exclusive-work violation: native-bound TypeScript semantic work requires the Rust-authoritative affected scope.");
+      }
       // The large-corpus closure path only needs the direct import graph.  Its
       // cache key can be derived from immutable artifact digests before any
       // CAS bytes are decoded, so a repeated full reindex can skip both the
@@ -543,7 +925,14 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
           }
         }
       }
-      const files = await filesFromPayload(request.payload, descriptor.cas_root, {
+      const preparedFiles = descriptor.runtime_executable_binding_digest !== undefined
+        && (preliminaryStage === "jsts:structural_stage_2" || preliminaryStage === "jsts:structural_stage_3")
+        && (request.call === "analyze_closure" || request.call === "analyze_artifact")
+        && hasRustSemanticScope
+        && rustSemanticPreparedFileHashes !== undefined
+        ? filesFromPreparedPayload(request.payload, rustSemanticPreparedFileHashes)
+        : undefined;
+      const files = preparedFiles ?? await filesFromPayload(request.payload, descriptor.cas_root, {
         ...(descriptor.source_load_concurrency === undefined ? {} : { load_concurrency: descriptor.source_load_concurrency }),
         ...(descriptor.source_load_max_in_flight_bytes === undefined ? {} : { max_in_flight_bytes: descriptor.source_load_max_in_flight_bytes }),
       });
@@ -552,7 +941,41 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
         ? rawPayload["root_names"] as string[] : files.map((file) => file.path);
       const compilerOptions = rawPayload["compiler_options"] !== null && typeof rawPayload["compiler_options"] === "object" && !Array.isArray(rawPayload["compiler_options"])
         ? rawPayload["compiler_options"] as Record<string, unknown> : undefined;
+      const rustSemanticScope = rustSemanticScopeFromPayload(rawPayload, rootNames, rustSemanticPreparedScope);
       const publicationStageId = typeof rawPayload["publication_stage_id"] === "string" ? rawPayload["publication_stage_id"] : undefined;
+      if (request.call === "analyze_closure" && rustSemanticScope !== undefined) {
+        rustSemanticPreparedScope = rustSemanticScope;
+        const build = session.prepareRustSemanticState({
+          files,
+          root_names: rootNames,
+          ...(compilerOptions === undefined ? {} : { compiler_options: compilerOptions }),
+          rust_semantic_scope: rustSemanticScope,
+        });
+        rustSemanticPreparedFileHashes = new Map(files.map((file) => [file.path, file.content_hash ?? fileContentHash(file, fileHashMemo)]));
+        rustSemanticPreparedFiles = new Map(files.map((file) => [file.path, {
+          ...file,
+          // Source text is already owned by the prepared TypeScript snapshot;
+          // retain only bindings/hashes for later owner projections.
+          text: "",
+        }]));
+        const semanticGeneration = canonicalSha256({
+          files: [...rustSemanticPreparedFileHashes].sort(([left], [right]) => left.localeCompare(right)),
+          compiler_options: compilerOptions ?? null,
+          analyzer: JAVASCRIPT_TYPESCRIPT_VERSION,
+        });
+        if (publicationStageId === "jsts:structural_stage_2") await prepareRustSemanticSpool(semanticGeneration, true);
+        else if (publicationStageId === "jsts:structural_stage_3" && rustSemanticSpoolGeneration !== semanticGeneration) await closeRustSemanticSpool();
+        if (build === "full") descriptor.on_analysis_build?.();
+        else descriptor.on_analysis_incremental?.(rustSemanticScope.affected_paths);
+        // Rust already returned the exact dependency graph and affected set.
+        // This call owns only TypeScript program preparation and intentionally
+        // creates no JsTsAnalysisResult, structural facts, or closure arrays.
+        return response(request, {
+          plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID,
+          semantic_state_prepared: true,
+          dependency_authority: "urdira:jsts-syntax-worker",
+        });
+      }
       if (request.call === "analyze_closure" && publicationStageId === "jsts:structural_stage_1" && isLargeSyntaxCorpus({ files, root_names: rootNames })) {
         // A project-sized stage-1 analysis used to remain reachable through
         // `stage1AnalysisCache` for every owner request.  On VS Code that was
@@ -569,7 +992,7 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
         });
       }
       const compilerOptionsDigest = canonicalSha256(compilerOptions ?? null);
-      const cacheKey = analysisCacheKey(files, rootNames, compilerOptions, fileHashMemo);
+      const cacheKey = `${analysisCacheKey(files, rootNames, compilerOptions, fileHashMemo)}${rustSemanticScope === undefined ? "" : ":rust-semantic-v1"}`;
       let analysis: JsTsAnalysisResult;
       let impactfulChangedPaths: readonly string[] | undefined;
       // A pooled worker has already created the checker-backed TypeScript API
@@ -581,7 +1004,22 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
       // the checker-backed later stages.
       const boundedSyntax = rawPayload["bounded_syntax"] === true || (publicationStageId === "jsts:structural_stage_1" && stage1AnalysisCache !== undefined);
       if (publicationStageId !== "jsts:structural_stage_1") stage1AnalysisCache = undefined;
-      if (publicationStageId === "jsts:structural_stage_1") {
+      if (rustSemanticScope !== undefined) {
+        if (request.call !== "analyze_artifact") throw new Error("Rust-authoritative semantic state is limited to analyze_closure and analyze_artifact.");
+        const ownerPath = typeof rawPayload["owner_path"] === "string" ? rawPayload["owner_path"] : undefined;
+        if (ownerPath === undefined) throw new Error("Rust-authoritative semantic analysis requires owner_path.");
+        const spooled = publicationStageId === "jsts:structural_stage_3" ? await readRustSemanticSpool(ownerPath) : undefined;
+        if (spooled !== undefined) analysis = spooled;
+        else {
+          descriptor.on_rust_semantic_owner_analyze?.(ownerPath);
+          const stageRecordKinds = rawPayload["stage_record_kinds"];
+          const includeInferredTypes = preliminaryStage === "jsts:structural_stage_2"
+            || (Array.isArray(stageRecordKinds) && stageRecordKinds.includes("jsts:entity_inferred_type"));
+          const pendingSites = pendingSitesFromPayload(rawPayload);
+          analysis = session.analyzeRustSemanticOwner({ files, owner_path: ownerPath, include_inferred_types: includeInferredTypes, ...(pendingSites === undefined ? {} : { pending_sites: pendingSites }) });
+          if (publicationStageId === "jsts:structural_stage_2") await writeRustSemanticSpool(ownerPath, stageThreeSemanticProjection(analysis, ownerPath));
+        }
+      } else if (publicationStageId === "jsts:structural_stage_1") {
         const cachedSyntax = stage1AnalysisCache?.key === cacheKey
           ? stage1AnalysisCache
           : stage1AnalysisCache !== undefined && isSubsetOfCache(files, compilerOptionsDigest, stage1AnalysisCache, fileHashMemo)
@@ -624,7 +1062,7 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
         analysis = analysisCache.analysis;
         impactfulChangedPaths = analysisCache.impactful_changed_paths;
       } else {
-        const built = await loadOrBuildAnalysis(descriptor, session, files, rootNames, compilerOptions, cacheKey);
+        const built = await loadOrBuildAnalysis(descriptor, session, files, rootNames, compilerOptions, cacheKey, rustSemanticScope);
         analysis = built.analysis;
         impactfulChangedPaths = built.impactful_changed_paths;
         analysisCache = {
@@ -656,7 +1094,11 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
         const acceptedManifest = rawPayload["accepted_manifest"] !== null && typeof rawPayload["accepted_manifest"] === "object" && !Array.isArray(rawPayload["accepted_manifest"])
           ? rawPayload["accepted_manifest"] as Record<string, unknown> : undefined;
         if (acceptedManifest === undefined) throw new Error("Production analyze_artifact requests require the accepted plugin-input manifest.");
-        const factDelta = buildJavascriptTypescriptFactDelta({
+        const ownerPath = typeof rawPayload["owner_path"] === "string" ? rawPayload["owner_path"] : undefined;
+        const projectionFiles = rustSemanticScope === undefined || ownerPath === undefined
+          ? files
+          : filesForRustSemanticOwner(files, analysis, ownerPath, rustSemanticPreparedFiles);
+        const factDeltaInput = {
           analysis,
           work_item: workItem,
           accepted_manifest: acceptedManifest,
@@ -665,9 +1107,16 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
           analysis_input_digest: typeof rawPayload["analysis_input_digest"] === "string" ? rawPayload["analysis_input_digest"] : request.request_digest,
           created_at: typeof rawPayload["created_at"] === "string" ? rawPayload["created_at"] : "1970-01-01T00:00:00.000Z",
           ...(typeof rawPayload["publication_stage_id"] === "string" ? { publication_stage_id: rawPayload["publication_stage_id"] } : {}),
+          ...(Array.isArray(rawPayload["included_publication_stage_ids"]) && rawPayload["included_publication_stage_ids"].every((value) => typeof value === "string")
+            ? { included_publication_stage_ids: rawPayload["included_publication_stage_ids"] as string[] }
+            : {}),
           ...(typeof rawPayload["owner_path"] === "string" ? { owner_path: rawPayload["owner_path"] } : {}),
-          files,
-        });
+          files: projectionFiles,
+        };
+        if (directStream === "projection_input") return factDeltaInput;
+        if (directStream === "prepared") return prepareJavascriptTypescriptFactDeltaStream(factDeltaInput, { cancellation_id: request.cancellation_id });
+        if (directStream) return buildJavascriptTypescriptFactDeltaStream(factDeltaInput, { cancellation_id: request.cancellation_id });
+        const factDelta = buildJavascriptTypescriptFactDelta(factDeltaInput);
         return response(request, {
           outcome: "success",
           result_type: "fact_delta",
@@ -683,9 +1132,273 @@ export function createJavascriptTypescriptWorker(descriptor: JavascriptTypescrip
       // legacy canonical digest during the rolling wire migration.
       const projectionDigest = new LogicalDigestWriter("urdira:projection-set:v3").value(projections).digest();
       return response(request, { projection_set: { projections, projection_set_digest: projectionDigest }, plugin_id: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID });
+  };
+  return {
+    invoke: async (request): Promise<unknown> => invoke(request, false),
+    async invokeFactDeltaStream(request): Promise<FactDeltaStream> {
+      if (request.call !== "analyze_artifact") throw new Error("Direct FactDeltaStream emission is limited to analyze_artifact.");
+      return await invoke(request, true) as FactDeltaStream;
+    },
+    async invokeFactDeltaStreamGroup(requests): Promise<readonly FactDeltaStream[]> {
+      if (requests.length === 0 || requests.length > 32) throw new Error("A semantic owner group must contain between 1 and 32 requests.");
+      if (requests.some((request) => request.call !== "analyze_artifact"
+        || ((request.payload as Record<string, unknown>)["rust_semantic_scope"] === undefined
+          && (request.payload as Record<string, unknown>)["rust_semantic_scope_ref"] === undefined))) {
+        throw new Error("Grouped FactDeltaStream emission is limited to Rust-authoritative semantic analyze_artifact requests.");
+      }
+      const ownerPaths = requests.map((request) => (request.payload as Record<string, unknown>)["owner_path"]);
+      if (ownerPaths.some((path) => typeof path !== "string")) throw new Error("A semantic owner group request is missing owner_path.");
+      // Stage 2 already walked the checker and sealed the exact stage-3
+      // projection for every owner. Reopening a lookup group here used to
+      // repeat batched symbol/type/diagnostic queries before immediately
+      // reading those same results from the spool. Skip the checker only when
+      // every requested owner is an exact stage-3 spool hit; any miss retains
+      // the complete checker-backed fallback for the whole bounded group.
+      const spoolOnly = requests.every((request, index) => {
+        const payload = request.payload as Record<string, unknown>;
+        return payload["publication_stage_id"] === "jsts:structural_stage_3"
+          && hasRustSemanticSpoolEntry(ownerPaths[index] as string);
+      });
+      if (!spoolOnly) {
+        const includeInferredTypes = requests.some((request) => {
+          const kinds = (request.payload as Record<string, unknown>)["stage_record_kinds"];
+          const stage = (request.payload as Record<string, unknown>)["publication_stage_id"];
+          return stage === "jsts:structural_stage_2" || (Array.isArray(kinds) && kinds.includes("jsts:entity_inferred_type"));
+        });
+        session.beginRustSemanticOwnerGroup(ownerPaths as string[], includeInferredTypes, pendingSitesByOwnerFromRequests(requests));
+        descriptor.on_rust_semantic_group_prepare?.(ownerPaths as string[]);
+      }
+      try {
+        const debugTiming = process.env["URDIRA_DEBUG_TIMING"] === "1";
+        const inputStarted = debugTiming ? performance.now() : 0;
+        const inputs: JavascriptTypescriptFactDeltaInput[] = [];
+        for (const request of requests) inputs.push(await invoke(request, "projection_input") as JavascriptTypescriptFactDeltaInput);
+        const inputElapsed = debugTiming ? performance.now() - inputStarted : 0;
+        const prepared: PreparedJavascriptTypescriptFactDeltaStream[] = [];
+        // Bound before crossing N-API. The estimate deliberately counts every
+        // relation twice (row plus possible dependency); therefore any admitted
+        // group is within the core's exact 4,096-row bound. A giant owner keeps
+        // the portable paged path without weakening continuation semantics.
+        const estimatedRows = (input: JavascriptTypescriptFactDeltaInput): number => {
+          const path = input.owner_path;
+          if (path === undefined) return FACT_DELTA_STREAM_MAX_ROWS + 1;
+          return input.analysis.entities.filter((entry) => entry.path === path).reduce((count, entry) => count + (entry.type === undefined ? 1 : 3), 0)
+            + input.analysis.relations.filter((entry) => entry.path === path).length * 2
+            + input.analysis.diagnostics.filter((entry) => entry.path === path).length;
+        };
+        const projectionStarted = debugTiming ? performance.now() : 0;
+        let index = 0;
+        while (index < inputs.length) {
+          const firstRows = estimatedRows(inputs[index]!);
+          if (firstRows > FACT_DELTA_STREAM_MAX_ROWS) {
+            prepared.push(prepareJavascriptTypescriptFactDeltaStream(inputs[index]!, { cancellation_id: requests[index]!.cancellation_id }));
+            index += 1;
+            continue;
+          }
+          let end = index;
+          let rows = 0;
+          while (end < inputs.length) {
+            const next = estimatedRows(inputs[end]!);
+            if (next > FACT_DELTA_STREAM_MAX_ROWS || rows + next > FACT_DELTA_STREAM_MAX_ROWS) break;
+            rows += next;
+            end += 1;
+          }
+          const projected = projectStructuralObservationGroup(JAVASCRIPT_TYPESCRIPT_NATIVE_PROJECTION_PROFILE, {
+            owners: inputs.slice(index, end).map(javascriptTypescriptNativeProjectionOwner),
+          });
+          if (projected === undefined) {
+            for (let ownerIndex = index; ownerIndex < end; ownerIndex += 1) prepared.push(prepareJavascriptTypescriptFactDeltaStream(inputs[ownerIndex]!, { cancellation_id: requests[ownerIndex]!.cancellation_id }));
+          } else {
+            if (projected.length !== end - index) throw new Error("Native semantic observation projection returned the wrong owner count.");
+            projected.forEach((owner, projectedIndex) => {
+              const input = inputs[index + projectedIndex]!;
+              const { analysis: _analysis, ...projectedInput } = input;
+              prepared.push(prepareJavascriptTypescriptProjectedFactDeltaStream({
+                ...projectedInput,
+                owner_path: input.owner_path!,
+                projection: owner,
+              }, { cancellation_id: requests[index + projectedIndex]!.cancellation_id }));
+            });
+          }
+          index = end;
+        }
+        // The language oracle constructs observations; the generic core-owned
+        // kernel canonicalizes and derives publication scalars once for as
+        // many complete owners as fit the 4,096-row physical boundary. An
+        // oversized owner stays on its existing independently paged path.
+        let physical: PreparedJavascriptTypescriptFactDeltaStream[] = [];
+        let physicalRows = 0;
+        const flush = (): void => {
+          if (physical.length === 0) return;
+          // Native-projected rows are already attached to the exact kernel
+          // result. Portable fallback owners are prepared here as before.
+          prepareFactDeltaStreamStructuralGroup(physical);
+          physical = [];
+          physicalRows = 0;
+        };
+        for (const owner of prepared) {
+          const ownerRows = owner.records.length + owner.dependencies.length;
+          if (ownerRows > FACT_DELTA_STREAM_MAX_ROWS) { flush(); continue; }
+          if (physicalRows + ownerRows > FACT_DELTA_STREAM_MAX_ROWS) flush();
+          physical.push(owner);
+          physicalRows += ownerRows;
+        }
+        flush();
+        const projectionElapsed = debugTiming ? performance.now() - projectionStarted : 0;
+        if (debugTiming) console.error(`[urdira] semantic group internals owners=${requests.length} analyze_ms=${Math.round(inputElapsed)} project_prepare_ms=${Math.round(projectionElapsed)}`);
+        return Object.freeze(prepared.map((owner) => owner.seal()));
+      } finally {
+        if (!spoolOnly) session.endRustSemanticOwnerGroup();
+      }
+    },
+    async invokeRustSemanticObservationGroup(requests): Promise<readonly RustSemanticObservationOwner[]> {
+      if (requests.length === 0 || requests.length > 32) throw new Error("A semantic owner group must contain between 1 and 32 requests.");
+      if (requests.some((request) => request.call !== "analyze_artifact"
+        || ((request.payload as Record<string, unknown>)["rust_semantic_scope"] === undefined
+          && (request.payload as Record<string, unknown>)["rust_semantic_scope_ref"] === undefined))) {
+        throw new Error("Grouped Rust semantic observations are limited to Rust-authoritative analyze_artifact requests.");
+      }
+      const ownerPaths = requests.map((request) => (request.payload as Record<string, unknown>)["owner_path"]);
+      if (ownerPaths.some((path) => typeof path !== "string")) throw new Error("A semantic owner group request is missing owner_path.");
+      const spoolOnly = requests.every((request, index) => {
+        const payload = request.payload as Record<string, unknown>;
+        return payload["publication_stage_id"] === "jsts:structural_stage_3"
+          && hasRustSemanticSpoolEntry(ownerPaths[index] as string);
+      });
+      if (!spoolOnly) {
+        const includeInferredTypes = requests.some((request) => {
+          const payload = request.payload as Record<string, unknown>;
+          const kinds = payload["stage_record_kinds"];
+          return payload["publication_stage_id"] === "jsts:structural_stage_2"
+            || (Array.isArray(kinds) && kinds.includes("jsts:entity_inferred_type"));
+        });
+        session.beginRustSemanticOwnerGroup(ownerPaths as string[], includeInferredTypes, pendingSitesByOwnerFromRequests(requests));
+        descriptor.on_rust_semantic_group_prepare?.(ownerPaths as string[]);
+      }
+      try {
+        const inputs: JavascriptTypescriptFactDeltaInput[] = [];
+        for (const request of requests) inputs.push(await invoke(request, "projection_input") as JavascriptTypescriptFactDeltaInput);
+        const estimatedRows = (input: JavascriptTypescriptFactDeltaInput): number => {
+          const path = input.owner_path;
+          if (path === undefined) return FACT_DELTA_STREAM_MAX_ROWS + 1;
+          return input.analysis.entities.filter((entry) => entry.path === path).reduce((count, entry) => count + (entry.type === undefined ? 1 : 3), 0)
+            + input.analysis.relations.filter((entry) => entry.path === path).length * 2
+            + input.analysis.diagnostics.filter((entry) => entry.path === path).length;
+        };
+        const observations: RustSemanticObservationOwner[] = [];
+        let index = 0;
+        while (index < inputs.length) {
+          const first = estimatedRows(inputs[index]!);
+          /* c8 ignore start -- giant-owner fallback is exercised by the Rust preflight corpus. */
+          if (first > FACT_DELTA_STREAM_MAX_ROWS) {
+            const payload = requests[index]!.payload as Record<string, unknown>;
+            const rustOwnedDigests = payload["rust_owned_digests"] === true;
+            const stream = await invoke(requests[index]!, "prepared") as PreparedJavascriptTypescriptFactDeltaStream;
+            if (rustOwnedDigests) {
+              observations.push(rustOwnedPreparedObservation(stream, inputs[index]!));
+              index += 1;
+              continue;
+            }
+            const sealedStream = stream.seal();
+            const header = sealedStream.header;
+            const batches: Array<RustSemanticObservationOwner["batches"][number]> = [];
+            for await (const batch of sealedStream.batches) {
+              const sealed = factDeltaStreamSealedRows(batch);
+              batches.push({ sequence: batch.sequence, final_batch: batch.final, canonical_records: sealed?.canonical_records ?? batch.records.map(factDeltaStreamCanonicalRow), canonical_dependencies: sealed?.canonical_dependencies ?? batch.dependencies.map(factDeltaStreamCanonicalRow), byte_length: 0, owner_digest: "", fact_delta_id: `${header.fact_delta_id}:${batch.sequence}`, delta_digest: header.delta_digest, diagnostic_codes: [] });
+            }
+              observations.push({ owner_artifact_id: header.owner_artifact_id, owner_artifact_version_id: header.owner_artifact_version_id, owner_path: inputs[index]!.owner_path!, diagnostic_proposal_keys: [], batches });
+            index += 1;
+            continue;
+          }
+          let end = index;
+          let rows = 0;
+          while (end < inputs.length) {
+            const next = estimatedRows(inputs[end]!);
+            if (next > FACT_DELTA_STREAM_MAX_ROWS || rows + next > FACT_DELTA_STREAM_MAX_ROWS) break;
+            rows += next;
+            end += 1;
+          }
+          const projected = projectStructuralObservationGroup(JAVASCRIPT_TYPESCRIPT_NATIVE_PROJECTION_PROFILE, { owners: inputs.slice(index, end).map(javascriptTypescriptNativeProjectionOwner) });
+          if (projected === undefined) {
+            for (let ownerIndex = index; ownerIndex < end; ownerIndex += 1) {
+              const payload = requests[ownerIndex]!.payload as Record<string, unknown>;
+              const rustOwnedDigests = payload["rust_owned_digests"] === true;
+              const stream = await invoke(requests[ownerIndex]!, "prepared") as PreparedJavascriptTypescriptFactDeltaStream;
+              if (rustOwnedDigests) {
+                observations.push(rustOwnedPreparedObservation(stream, inputs[ownerIndex]!));
+                continue;
+              }
+              const sealedStream = stream.seal();
+              const batches: Array<RustSemanticObservationOwner["batches"][number]> = [];
+              for await (const batch of sealedStream.batches) {
+                const sealed = factDeltaStreamSealedRows(batch);
+                batches.push({ sequence: batch.sequence, final_batch: batch.final, canonical_records: sealed?.canonical_records ?? batch.records.map(factDeltaStreamCanonicalRow), canonical_dependencies: sealed?.canonical_dependencies ?? batch.dependencies.map(factDeltaStreamCanonicalRow), byte_length: 0, owner_digest: "", fact_delta_id: `${sealedStream.header.fact_delta_id}:${batch.sequence}`, delta_digest: sealedStream.header.delta_digest, diagnostic_codes: [] });
+              }
+              observations.push({ owner_artifact_id: sealedStream.header.owner_artifact_id, owner_artifact_version_id: sealedStream.header.owner_artifact_version_id, owner_path: inputs[ownerIndex]!.owner_path!, diagnostic_proposal_keys: [], batches });
+            }
+          } else {
+            if (projected.length !== end - index) throw new Error("Native semantic observation projection returned the wrong owner count.");
+            projected.forEach((owner, projectedIndex) => {
+              const input = inputs[index + projectedIndex]!;
+              const rustOwnedDigests = (requests[index + projectedIndex]!.payload as Record<string, unknown>)["rust_owned_digests"] === true;
+              const headerInput = {
+                ...input,
+                owner_path: input.owner_path!,
+                records: owner.record_headers as unknown as JavascriptTypescriptNativeFactDeltaInput["records"],
+                dependencies: owner.dependency_headers as unknown as JavascriptTypescriptNativeFactDeltaInput["dependencies"],
+                canonical_records: owner.canonical_records,
+                canonical_dependencies: owner.canonical_dependencies,
+                diagnostic_codes: owner.diagnostic_codes,
+              } satisfies JavascriptTypescriptNativeFactDeltaInput;
+              const diagnosticProposalKeys = owner.record_headers
+                .filter((record) => record.category === "diagnostic")
+                .map((record) => record.proposal_record_key);
+              const header = rustOwnedDigests ? undefined : buildJavascriptTypescriptNativeFactDeltaHeader(headerInput, { cancellation_id: requests[index + projectedIndex]!.cancellation_id });
+              const batches: Array<RustSemanticObservationOwner["batches"][number]> = [];
+              const records = owner.canonical_records;
+              const dependencies = owner.canonical_dependencies;
+              const maxRows = FACT_DELTA_STREAM_MAX_ROWS;
+              const maxBytes = RUST_SEMANTIC_OBSERVATION_MAX_BYTES;
+              let recordStart = 0;
+              let dependencyStart = 0;
+              let sequence = 0;
+              while (recordStart < records.length || dependencyStart < dependencies.length || sequence === 0) {
+                const batchRecords: string[] = [];
+                const batchDependencies: string[] = [];
+                let bytes = 0;
+                while (recordStart < records.length && batchRecords.length + batchDependencies.length < maxRows && bytes + records[recordStart]!.length <= maxBytes) { const row = records[recordStart++]!; batchRecords.push(row); bytes += row.length; }
+                while (dependencyStart < dependencies.length && batchRecords.length + batchDependencies.length < maxRows && bytes + dependencies[dependencyStart]!.length <= maxBytes) { const row = dependencies[dependencyStart++]!; batchDependencies.push(row); bytes += row.length; }
+                if (batchRecords.length === 0 && batchDependencies.length === 0 && sequence !== 0) {
+                  const pending = Math.max(records[recordStart]?.length ?? 0, dependencies[dependencyStart]?.length ?? 0);
+                  throw new Error(`Native semantic observation row exceeds its physical batch budget (owner=${input.owner_path ?? "?"}, bytes=${pending}, limit=${RUST_SEMANTIC_OBSERVATION_MAX_BYTES}).`);
+                }
+                const finalBatch = recordStart === records.length && dependencyStart === dependencies.length;
+                batches.push({ sequence, final_batch: finalBatch, canonical_records: batchRecords, canonical_dependencies: batchDependencies, byte_length: 0, owner_digest: "", fact_delta_id: header === undefined ? "" : `${header.fact_delta_id}:${sequence}`, delta_digest: header?.delta_digest ?? "", diagnostic_codes: owner.diagnostic_codes });
+                sequence += 1;
+              }
+              observations.push({ owner_artifact_id: header?.owner_artifact_id ?? String(input.work_item["artifact_id"]), owner_artifact_version_id: header?.owner_artifact_version_id ?? String(input.work_item["target_artifact_version_id"]), owner_path: input.owner_path!, diagnostic_proposal_keys: rustOwnedDigests ? diagnosticProposalKeys : [], batches });
+            });
+          }
+          /* c8 ignore stop */
+          index = end;
+        }
+        return Object.freeze(observations);
+      } finally {
+        if (!spoolOnly) session.endRustSemanticOwnerGroup();
+      }
     },
     async cancel(): Promise<void> { return; },
-    async reset(): Promise<unknown> { return { state_reset: true }; },
-    async terminate(): Promise<void> { terminated = true; analysisCache = undefined; stage1AnalysisCache = undefined; fileHashMemo.clear(); session.close(); },
+    async reset(): Promise<unknown> {
+      analysisCache = undefined;
+      stage1AnalysisCache = undefined;
+      rustSemanticPreparedFileHashes = undefined;
+      rustSemanticPreparedFiles = undefined;
+      rustSemanticPreparedScope = undefined;
+      await closeRustSemanticSpool();
+      fileHashMemo.clear();
+      session.close();
+      return { state_reset: true };
+    },
+    async terminate(): Promise<void> { terminated = true; analysisCache = undefined; stage1AnalysisCache = undefined; rustSemanticPreparedFileHashes = undefined; rustSemanticPreparedFiles = undefined; rustSemanticPreparedScope = undefined; await closeRustSemanticSpool(); fileHashMemo.clear(); session.close(); },
   };
 }

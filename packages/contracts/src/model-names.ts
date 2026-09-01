@@ -176,6 +176,7 @@ export const authoritativeModelNames = [
   "PluginCompatibilityDeclaration",
   "PluginResolutionLock",
   "ResolvedPlugin",
+  "PluginRuntimeExecutableBinding",
   "RegistryCompatibilityAssessment",
   "DefinitionChangeAssessment",
   "PluginAnalysisChange",

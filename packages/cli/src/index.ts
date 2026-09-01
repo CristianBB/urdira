@@ -169,7 +169,7 @@ function formatWorkspaceTechnologyProposal(preview: unknown): string {
       continue;
     }
     if (value === null || typeof value !== "object") continue;
-    const technology = value as { readonly technology_id?: unknown; readonly kind?: unknown; readonly confidence?: unknown; readonly compatible_plugin_ids?: unknown; readonly evidence?: unknown };
+    const technology = value as { readonly technology_id?: unknown; readonly kind?: unknown; readonly confidence?: unknown; readonly compatible_plugin_ids?: unknown; readonly evidence?: unknown; readonly evidence_count?: unknown; readonly evidence_complete?: unknown };
     const id = typeof technology.technology_id === "string" ? technology.technology_id : "unknown";
     const kind = typeof technology.kind === "string" ? `, ${technology.kind}` : "";
     const confidence = typeof technology.confidence === "number" ? `, confidence ${Math.round(technology.confidence * 100)}%` : "";
@@ -182,6 +182,16 @@ function formatWorkspaceTechnologyProposal(preview: unknown): string {
       const detail = item as { readonly path?: unknown; readonly rule?: unknown; readonly value?: unknown };
       if (typeof detail.path !== "string" || typeof detail.rule !== "string") continue;
       lines.push(`    detected from: ${detail.path} (${detail.rule}${typeof detail.value === "string" ? `: ${detail.value}` : ""})`);
+    }
+    const declaredEvidenceCount = technology.evidence_count;
+    const evidenceCount = typeof declaredEvidenceCount === "number" && Number.isSafeInteger(declaredEvidenceCount) && declaredEvidenceCount >= evidence.length
+      ? declaredEvidenceCount
+      : evidence.length;
+    const evidenceComplete = typeof technology.evidence_complete === "boolean"
+      ? technology.evidence_complete
+      : evidenceCount === evidence.length;
+    if (!evidenceComplete || evidenceCount > evidence.length) {
+      lines.push(`    showing ${evidence.length} of ${evidenceCount} deterministic evidence paths`);
     }
   }
   return lines.join("\n");

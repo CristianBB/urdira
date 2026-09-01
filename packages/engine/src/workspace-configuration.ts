@@ -50,6 +50,16 @@ export interface WorkspaceTechnologyProposal {
   readonly technologies: ReadonlyArray<WorkspaceTechnologyProposalItem>;
 }
 
+export interface WorkspaceTechnologyProposalSummaryItem extends Omit<WorkspaceTechnologyProposalItem, "evidence"> {
+  readonly evidence: ReadonlyArray<WorkspaceTechnologyEvidence>;
+  readonly evidence_count: number;
+  readonly evidence_complete: boolean;
+}
+
+export interface WorkspaceTechnologyProposalSummary extends Omit<WorkspaceTechnologyProposal, "technologies"> {
+  readonly technologies: ReadonlyArray<WorkspaceTechnologyProposalSummaryItem>;
+}
+
 export interface WorkspaceConfigurationProposal {
   readonly proposal_id: string;
   readonly workspace_root: string;
@@ -156,6 +166,24 @@ export function detectWorkspaceTechnologies(input: WorkspaceDetectionInput): Wor
   }));
   const identity = { provider_fingerprint: input.provider_fingerprint, git_state_fingerprint: input.git_state_fingerprint, plugin_catalog_fingerprint: input.plugin_catalog_fingerprint, technologies: ordered };
   return { ...identity, proposal_fingerprint: digest(identity) };
+}
+
+export function summarizeWorkspaceTechnologyProposal(
+  proposal: WorkspaceTechnologyProposal,
+  maxEvidencePerTechnology = 64,
+): WorkspaceTechnologyProposalSummary {
+  if (!Number.isSafeInteger(maxEvidencePerTechnology) || maxEvidencePerTechnology < 1 || maxEvidencePerTechnology > 4096) {
+    throw new RangeError("Workspace technology evidence limit must be a safe integer between 1 and 4096.");
+  }
+  return {
+    ...proposal,
+    technologies: proposal.technologies.map((technology) => ({
+      ...technology,
+      evidence: technology.evidence.slice(0, maxEvidencePerTechnology),
+      evidence_count: technology.evidence.length,
+      evidence_complete: technology.evidence.length <= maxEvidencePerTechnology,
+    })),
+  };
 }
 
 function normalized(value: unknown): string {

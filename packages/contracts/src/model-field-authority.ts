@@ -225,6 +225,7 @@ export const authoritativeModelOwners = {
   "PluginResolutionLock": "decisions/01-universal-data-model.md",
   "PluginResourceBudget": "decisions/02-language-plugin-contract.md",
   "PluginResourceExhausted": "decisions/02-language-plugin-contract.md",
+  "PluginRuntimeExecutableBinding": "decisions/25-rust-native-acceleration.md",
   "PluginUnsupported": "decisions/02-language-plugin-contract.md",
   "PluginUpgradePlan": "decisions/01-universal-data-model.md",
   "PluginWorkerRequestEnvelope": "decisions/02-language-plugin-contract.md",
@@ -2132,12 +2133,12 @@ export const authoritativeModelFieldMetadata = {
     "description": "exactly the corresponding `logical_input` or lowercase even-length `encoded_input_hex` is present",
     "source": "serialization/urdira-canonical-encoding.md"
   },
-  "CanonicalEncodingConformanceCase.expected_encoding_hex": {
+  "CanonicalEncodingConformanceCase.expected_digest_text": {
     "logical_type": "Text",
     "description": "Success requires `expected_encoding_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code",
     "source": "serialization/urdira-canonical-encoding.md"
   },
-  "CanonicalEncodingConformanceCase.expected_digest_text": {
+  "CanonicalEncodingConformanceCase.expected_encoding_hex": {
     "logical_type": "Text",
     "description": "Success requires `expected_encoding_hex`, requires `expected_digest_text` exactly when a recipe is selected, and omits `expected_error_code",
     "source": "serialization/urdira-canonical-encoding.md"
@@ -2689,7 +2690,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "Codebase.codebase_id": {
     "logical_type": "Identifier",
-    "description": "`Codebase.codebase_id` is the random stable identity of one optional grouping; `display_name` is mutable presentation metadata and `vcs_identity` is an optional matching hint, never identity authority.",
+    "description": "`Codebase.codebase_id` is the random stable identity of one project grouping; `display_name` is mutable presentation metadata and `vcs_identity` is an optional matching hint, never identity authority.",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "Codebase.created_at": {
@@ -6494,7 +6495,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "KindSelector.any_facets": {
     "logical_type": "Sequence<Text>",
-    "description": "Map kinds to `KindSelector.kinds`, facets to `KindSelector.any_facets`, and languages to `StructuralFilter.languages`; combine dimensions with AND and values within a dimension with OR.",
+    "description": "It maps every selected `record_kind` definition to `KindSelector.kinds`, every `facet` to `KindSelector.any_facets`, and every `language` to `StructuralFilter.languages`; values within one family combine by OR and the present families combine by AND.",
     "source": "decisions/01-universal-data-model.md"
   },
   "KindSelector.excluded_facets": {
@@ -6504,7 +6505,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "KindSelector.kinds": {
     "logical_type": "Sequence<Text>",
-    "description": "Map kinds to `KindSelector.kinds`, facets to `KindSelector.any_facets`, and languages to `StructuralFilter.languages`; combine dimensions with AND and values within a dimension with OR.",
+    "description": "It maps every selected `record_kind` definition to `KindSelector.kinds`, every `facet` to `KindSelector.any_facets`, and every `language` to `StructuralFilter.languages`; values within one family combine by OR and the present families combine by AND.",
     "source": "decisions/01-universal-data-model.md"
   },
   "KindSelector.universal_kinds": {
@@ -7157,6 +7158,11 @@ export const authoritativeModelFieldMetadata = {
     "description": "The ordered set of recipe version bindings under core:recipe_id_order@1.",
     "source": "serialization/core-canonical-schemas.md"
   },
+  "NormalizedQueryPlan.required_frontier": {
+    "logical_type": "source | syntax | structural | semantic",
+    "description": "The `required_frontier` field on `NormalizedQueryPlan` carries source | syntax | structural | semantic; it is optional and is defined by `serialization/core-canonical-schemas.md`.",
+    "source": "serialization/core-canonical-schemas.md"
+  },
   "NormalizedQueryPlan.response_budget": {
     "logical_type": "NormalizedResponseBudget",
     "description": "The `response_budget` field on `NormalizedQueryPlan` carries NormalizedResponseBudget; it is required and is defined by `serialization/core-canonical-schemas.md`.",
@@ -7229,7 +7235,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "OperationError.code": {
     "logical_type": "Text",
-    "description": "They are internal or administrative causes, not source `DiagnosticRecord` values and not public `OperationError.code` values.",
+    "description": "The `code` field on `OperationError` carries Text; it is required and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
   "OperationError.details": {
@@ -8394,22 +8400,22 @@ export const authoritativeModelFieldMetadata = {
   },
   "PluginResolutionLock.created_at": {
     "logical_type": "Text",
-    "description": "But `PluginResolutionLock.created_at` (`@urdira/plugin-sdk`'s",
+    "description": "The `created_at` field on `PluginResolutionLock` carries Text; it is required and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
   "PluginResolutionLock.lock_digest": {
     "logical_type": "Digest",
-    "description": "`{resolution_lock_id, workspace_id, resolver_version, resolved_plugins}`; `created_at` is absent by contract.",
+    "description": "`{resolution_lock_id, workspace_id, resolver_version, resolved_plugins}` including every present `runtime_executable_binding` in full; `created_at` is absent by contract.",
     "source": "decisions/01-universal-data-model.md"
   },
   "PluginResolutionLock.resolution_lock_id": {
     "logical_type": "Identifier",
-    "description": "resolution_lock_id`/ `registry_snapshot_id`/`configuration_revision_id` are pure functions of `workspace_id` alone (no content salt — `apps/urdira/src/index.ts`'s own `id_source`s), so they never change across repeated resolutions of the same workspace",
+    "description": "The `resolution_lock_id` field on `PluginResolutionLock` carries Text; it is required and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
   "PluginResolutionLock.resolved_plugins": {
     "logical_type": "Sequence<ResolvedPlugin>",
-    "description": "*resolved plugin set* (`PluginResolutionLock.resolved_plugins`: plugin",
+    "description": "The `resolved_plugins` field on `PluginResolutionLock` carries Sequence<ResolvedPlugin>; it is required and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
   "PluginResolutionLock.resolver_version": {
@@ -8419,7 +8425,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "PluginResolutionLock.workspace_id": {
     "logical_type": "Identifier",
-    "description": "This implementation does **not** compare that field literally: in the current `@urdira/plugin-sdk` registry model, `registry_digest` is workspace-salted (both `registry_snapshot_id` and every `namespace_binding.workspace_id` feed it), so it can never be equal across two genuinely distinct workspaces even when they resolve byte-identical plugin content — comparing it as specified would make this predicate permanently false and the fork feature inert",
+    "description": "The `workspace_id` field on `PluginResolutionLock` carries Text; it is required and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
   "PluginResourceBudget.deadline": {
@@ -8481,6 +8487,51 @@ export const authoritativeModelFieldMetadata = {
     "logical_type": "Text",
     "description": "The `retryability` field on `PluginResourceExhausted` carries Text; it is required and is defined by `decisions/02-language-plugin-contract.md`.",
     "source": "decisions/02-language-plugin-contract.md"
+  },
+  "PluginRuntimeExecutableBinding.binding_digest": {
+    "logical_type": "Digest",
+    "description": "`{plugin_id, plugin_version, runtime_target_id, runtime_contract_version, runtime_component_build_id, implementation_digest, package_digest, entrypoint_asset_digest}`. `binding_digest` itself is absent.",
+    "source": "decisions/25-rust-native-acceleration.md"
+  },
+  "PluginRuntimeExecutableBinding.entrypoint_asset_digest": {
+    "logical_type": "Digest",
+    "description": "The `entrypoint_asset_digest` field on `PluginRuntimeExecutableBinding` carries Text; it is required and is defined by `decisions/25-rust-native-acceleration.md`.",
+    "source": "decisions/25-rust-native-acceleration.md"
+  },
+  "PluginRuntimeExecutableBinding.implementation_digest": {
+    "logical_type": "Digest",
+    "description": "The `implementation_digest` field on `PluginRuntimeExecutableBinding` carries Text; it is required and is defined by `decisions/25-rust-native-acceleration.md`.",
+    "source": "decisions/25-rust-native-acceleration.md"
+  },
+  "PluginRuntimeExecutableBinding.package_digest": {
+    "logical_type": "Digest",
+    "description": "The `package_digest` field on `PluginRuntimeExecutableBinding` carries Text; it is required and is defined by `decisions/25-rust-native-acceleration.md`.",
+    "source": "decisions/25-rust-native-acceleration.md"
+  },
+  "PluginRuntimeExecutableBinding.plugin_id": {
+    "logical_type": "Identifier",
+    "description": "The `plugin_id` field on `PluginRuntimeExecutableBinding` carries Text; it is required and is defined by `decisions/25-rust-native-acceleration.md`.",
+    "source": "decisions/25-rust-native-acceleration.md"
+  },
+  "PluginRuntimeExecutableBinding.plugin_version": {
+    "logical_type": "SemVer",
+    "description": "The `plugin_version` field on `PluginRuntimeExecutableBinding` carries Text; it is required and is defined by `decisions/25-rust-native-acceleration.md`.",
+    "source": "decisions/25-rust-native-acceleration.md"
+  },
+  "PluginRuntimeExecutableBinding.runtime_component_build_id": {
+    "logical_type": "Identifier",
+    "description": "The `runtime_component_build_id` field on `PluginRuntimeExecutableBinding` carries Text; it is required and is defined by `decisions/25-rust-native-acceleration.md`.",
+    "source": "decisions/25-rust-native-acceleration.md"
+  },
+  "PluginRuntimeExecutableBinding.runtime_contract_version": {
+    "logical_type": "PositiveInteger",
+    "description": "The `runtime_contract_version` field on `PluginRuntimeExecutableBinding` carries Count; it is required and is defined by `decisions/25-rust-native-acceleration.md`.",
+    "source": "decisions/25-rust-native-acceleration.md"
+  },
+  "PluginRuntimeExecutableBinding.runtime_target_id": {
+    "logical_type": "Identifier",
+    "description": "The `runtime_target_id` field on `PluginRuntimeExecutableBinding` carries Text; it is required and is defined by `decisions/25-rust-native-acceleration.md`.",
+    "source": "decisions/25-rust-native-acceleration.md"
   },
   "PluginUnsupported.candidate_issue_code": {
     "logical_type": "Text",
@@ -9292,6 +9343,11 @@ export const authoritativeModelFieldMetadata = {
     "description": "evidence` is `EvidenceIncludeOptions`, `diagnostics` is `DiagnosticIncludeOptions`, `snippets` is `SourceIncludeOptions`, and `registry` is `RegistryIncludeOptions` defaulting to `{registry: used, include_payload_schemas: false}",
     "source": "protocol/public-query-contract.md"
   },
+  "QueryOptions.required_frontier": {
+    "logical_type": "source | syntax | structural | semantic",
+    "description": "The `required_frontier` field on `QueryOptions` carries source | syntax | structural | semantic; it is optional and is defined by `decisions/03-query-algebra-public-api.md`.",
+    "source": "protocol/public-query-contract.md"
+  },
   "QueryOptions.response_budget": {
     "logical_type": "ResponseBudget",
     "description": "response_budget` is mandatory after default normalization.",
@@ -9425,6 +9481,11 @@ export const authoritativeModelFieldMetadata = {
   "QueryStage.inputs": {
     "logical_type": "Sequence<StageOutputReference>",
     "description": "inputs` contains only outputs from earlier stages and is empty exactly for a legal source stage",
+    "source": "protocol/public-query-contract.md"
+  },
+  "QueryStage.operation_version": {
+    "logical_type": "PositiveInteger",
+    "description": "The `operation_version` field on `QueryStage` carries Count; it is optional and is defined by `decisions/03-query-algebra-public-api.md`.",
     "source": "protocol/public-query-contract.md"
   },
   "QueryStage.operator": {
@@ -10039,7 +10100,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "RegistryBundle.cursor": {
     "logical_type": "Text",
-    "description": "Its registry cursor claims repeat the same identity.",
+    "description": "The `cursor` field on `RegistryBundle` carries Text; it is optional and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
   "RegistryBundle.dependency_role_definitions": {
@@ -10104,7 +10165,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "RegistryBundle.registry_usage_set_id": {
     "logical_type": "Identifier",
-    "description": "`RegistryBundle.registry_usage_set_id` is required exactly for `used` and forbidden for `none` or `full`.",
+    "description": "The `registry_usage_set_id` field on `RegistryBundle` carries Text; it is optional and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
   "RegistryBundle.semantic_reason_definitions": {
@@ -10289,7 +10350,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "RegistrySnapshot.registry_snapshot_id": {
     "logical_type": "Identifier",
-    "description": "A snapshot's `registry_snapshot_id` retains the complete immutable set needed to interpret every reachable record, including historical domain, comparator, verifier, runtime-component, recipe, and schema versions",
+    "description": "The `registry_snapshot_id` field on `RegistrySnapshot` carries Text; it is required and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
   "RegistrySnapshot.resolution_lock_id": {
@@ -10339,7 +10400,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "RegistryUsageSet.registry_usage_set_id": {
     "logical_type": "Identifier",
-    "description": "Add `RegistryUsageSet.registry_usage_set_id`, parent-slice identity/digest bindings, complete required-definition coordinates, and cursor repetition so a used-registry continuation remains meaningful without rehydrating its parent result slice.",
+    "description": "The `registry_usage_set_id` field on `RegistryUsageSet` carries Text; it is required and is defined by `decisions/03-query-algebra-public-api.md`.",
     "source": "decisions/03-query-algebra-public-api.md"
   },
   "RegistryUsageSet.usage_set_digest": {
@@ -10807,6 +10868,11 @@ export const authoritativeModelFieldMetadata = {
     "description": "The `resolved_dependency_plugin_ids` field on `ResolvedPlugin` carries Sequence<Text>; it is required and is defined by `decisions/01-universal-data-model.md`.",
     "source": "decisions/01-universal-data-model.md"
   },
+  "ResolvedPlugin.runtime_executable_binding": {
+    "logical_type": "PluginRuntimeExecutableBinding",
+    "description": "The `runtime_executable_binding` field on `ResolvedPlugin` carries PluginRuntimeExecutableBinding; it is optional and is defined by `decisions/01-universal-data-model.md`.",
+    "source": "decisions/01-universal-data-model.md"
+  },
   "ResponseBudget.max_characters": {
     "logical_type": "Count",
     "description": "ResponseBudget.max_items` and `max_characters` are positive server-bounded limits",
@@ -11144,7 +11210,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "RuntimeComponentBuild.implementation_digest": {
     "logical_type": "Digest",
-    "description": "Scalar `input(core:RuntimeComponentImplementationManifest@1)` captured from the exact local build. Build ID, component coordinates, and behavior digest must equal the target build record.",
+    "description": "Scalar `input(core:RuntimeComponentImplementationManifest@1)` under recipe version 1, or `input(core:RuntimeComponentImplementationManifest@2)` under recipe version 2. Build ID, component coordinates, behavior digest, and selected schema version must equal the target build record.",
     "source": "decisions/10-daemon-mcp-packaging.md"
   },
   "RuntimeComponentBuild.removed_at": {
@@ -11489,7 +11555,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "SemanticCoverageView.materialization_state": {
     "logical_type": "Text",
-    "description": "- **Coverage and evaluation state.** `SemanticCoverageView.materialization_state` is `\"complete\"`/`\"degraded\"` when the marker is current (depending on whether every eligible artifact is covered), `\"updating\"` when the marker is stale or missing but the index is otherwise supported, and `\"unavailable\"` when it is not supported at all (no provider, unsupported port, or hybrid's fully-unindexed case).",
+    "description": "The `materialization_state` field on `SemanticCoverageView` carries Text; it is required and is defined by `decisions/06-semantic-search-ranking.md`.",
     "source": "protocol/public-query-contract.md"
   },
   "SemanticCoverageView.pending_artifact_count": {
@@ -12623,13 +12689,13 @@ export const authoritativeModelFieldMetadata = {
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "SourceProviderReadResult.content": {
-    "logical_type": "Bytes",
-    "description": "The `content` field on `SourceProviderReadResult` carries source bytes as a Uint8Array; it is required and is defined by `decisions/04-workspace-snapshot-incremental-indexing.md`.",
+    "logical_type": "Uint8Array",
+    "description": "The `content` field on `SourceProviderReadResult` carries Uint8Array; it is required and is defined by `decisions/04-workspace-snapshot-incremental-indexing.md`.",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "SourceProviderReadResult.content_hash": {
     "logical_type": "Digest",
-    "description": "Exact source bytes returned by the stable successful read; the core recomputes the digest before acceptance.",
+    "description": "Exact `content` bytes returned by the stable successful read; the core recomputes it before acceptance.",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "SourceProviderReadResult.metadata_digest": {
@@ -12783,8 +12849,8 @@ export const authoritativeModelFieldMetadata = {
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "SourceProviderResponseEnvelope.payload": {
-    "logical_type": "JsonValue",
-    "description": "The `payload` field on `SourceProviderResponseEnvelope` carries JsonValue; it is optional and is defined by `decisions/04-workspace-snapshot-incremental-indexing.md`.",
+    "logical_type": "SourceProviderPayload",
+    "description": "The `payload` field on `SourceProviderResponseEnvelope` carries SourceProviderPayload; it is optional and is defined by `decisions/04-workspace-snapshot-incremental-indexing.md`.",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "SourceProviderResponseEnvelope.protocol_version": {
@@ -13046,6 +13112,11 @@ export const authoritativeModelFieldMetadata = {
     "logical_type": "Text",
     "description": "The `view_type` field on `StagedPluginRecordView` carries Text; it is required and is defined by `decisions/02-language-plugin-contract.md`.",
     "source": "decisions/02-language-plugin-contract.md"
+  },
+  "StageOutputReference.name": {
+    "logical_type": "Text",
+    "description": "The `name` field on `StageOutputReference` carries Text; it is optional and is defined by `decisions/03-query-algebra-public-api.md`.",
+    "source": "protocol/public-query-contract.md"
   },
   "StageOutputReference.output": {
     "logical_type": "Text",
@@ -13369,7 +13440,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "VcsState.dirty": {
     "logical_type": "Text",
-    "description": "dirty` reports provider-observed deviation from the resolved revision and is false for immutable virtual references",
+    "description": "dirty` is the closed `clean` or `dirty` observation",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "VcsState.head_revision": {
@@ -13524,12 +13595,12 @@ export const authoritativeModelFieldMetadata = {
   },
   "Workspace.canonical_root": {
     "logical_type": "Text",
-    "description": "canonical_root` is the provider-normalized duplicate-detection root or canonical virtual URI",
+    "description": "canonical_root` is the provider-normalized duplicate-detection root or canonical virtual URI, while `display_root` is the normalized user-facing location and never remains `.` for a physical root",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "Workspace.codebase_id": {
     "logical_type": "Identifier",
-    "description": "codebase_id` is optional grouping membership",
+    "description": "Every active workspace has a `codebase_id` and `project_name",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "Workspace.current_snapshot_id": {
@@ -13539,7 +13610,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "Workspace.display_root": {
     "logical_type": "Text",
-    "description": "display_root` is the user-facing location",
+    "description": "canonical_root` is the provider-normalized duplicate-detection root or canonical virtual URI, while `display_root` is the normalized user-facing location and never remains `.` for a physical root",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "Workspace.registered_at": {
@@ -13579,7 +13650,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "Workspace.workspace_id": {
     "logical_type": "Identifier",
-    "description": "`Workspace.workspace_id` is the random stable identity of one registration.",
+    "description": "`Workspace.workspace_id` is the stable identity of one registration.",
     "source": "decisions/04-workspace-snapshot-incremental-indexing.md"
   },
   "WorkspaceCandidateIssueScope.scope_type": {
@@ -13684,7 +13755,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "WorkspaceConfigurationRevision.created_at": {
     "logical_type": "Text",
-    "description": "codebase's own `WorkspaceConfigurationRevision.created_at` construction",
+    "description": "The `created_at` field on `WorkspaceConfigurationRevision` carries Text; it is required and is defined by `decisions/09-configuration-security-lifecycle.md`.",
     "source": "decisions/09-configuration-security-lifecycle.md"
   },
   "WorkspaceConfigurationRevision.effective_configuration": {
@@ -14057,6 +14128,16 @@ export const authoritativeModelFieldMetadata = {
     "description": "The `structural_source_snapshot_id` field on `WorkspaceIndexStatusView` carries Text; it is optional and is defined by `decisions/03-query-algebra-public-api.md`.",
     "source": "decisions/03-query-algebra-public-api.md"
   },
+  "WorkspaceIndexStatusView.structural_stage_1_ready": {
+    "logical_type": "Boolean",
+    "description": "The `structural_stage_1_ready` field on `WorkspaceIndexStatusView` carries Boolean; it is optional and is defined by `decisions/03-query-algebra-public-api.md`.",
+    "source": "decisions/03-query-algebra-public-api.md"
+  },
+  "WorkspaceIndexStatusView.syntax_ready": {
+    "logical_type": "Boolean",
+    "description": "The `syntax_ready` field on `WorkspaceIndexStatusView` carries Boolean; it is optional and is defined by `decisions/03-query-algebra-public-api.md`.",
+    "source": "decisions/03-query-algebra-public-api.md"
+  },
   "WorkspaceIndexStatusView.workspace_id": {
     "logical_type": "Identifier",
     "description": "The `workspace_id` field on `WorkspaceIndexStatusView` carries Text; it is required and is defined by `decisions/03-query-algebra-public-api.md`.",
@@ -14069,7 +14150,7 @@ export const authoritativeModelFieldMetadata = {
   },
   "WorkspacePluginStatusView.activation_status": {
     "logical_type": "Text",
-    "description": "`WorkspacePluginStatusView.activation_status` is `active`, `quarantined`, or `unavailable`; its declarations are the exact active `PluginCapabilityDeclaration` projections.",
+    "description": "The `activation_status` field on `WorkspacePluginStatusView` carries Text; it is required and is defined by `decisions/03-query-algebra-public-api.md`.",
     "source": "decisions/03-query-algebra-public-api.md"
   },
   "WorkspacePluginStatusView.capability_declarations": {

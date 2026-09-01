@@ -9,6 +9,8 @@ import type {
   ResolvedPlugin,
   RuntimeComponentBehaviorManifest,
   RuntimeComponentImplementationManifest,
+  RuntimeComponentImplementationManifestV2,
+  PluginRuntimeExecutableBinding,
 } from "@urdira/contracts";
 
 export interface PluginResolutionLockDigestInput {
@@ -35,6 +37,10 @@ export interface PluginDigestAuthority {
   analysis_configuration(value: AnalysisConfiguration): string;
   runtime_behavior(value: RuntimeComponentBehaviorManifest): string;
   runtime_implementation(value: RuntimeComponentImplementationManifest): string;
+  /** Additive Decision 25 authorities. Optional only so v1-only injected test
+   * authorities remain source compatible; v2 package validation requires both. */
+  runtime_implementation_v2?(value: RuntimeComponentImplementationManifestV2): string;
+  runtime_executable_binding?(value: Omit<PluginRuntimeExecutableBinding, "binding_digest">): string;
   language_definition(value: LanguageDefinition): string;
   resolution_lock(value: PluginResolutionLockDigestInput): string;
   registry_snapshot(value: RegistrySnapshotDigestInput): string;

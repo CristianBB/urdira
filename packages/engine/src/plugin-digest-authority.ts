@@ -1,4 +1,12 @@
 import {
+  decision25DigestRecipeRegistry,
+  decision25DigestDomainRegistry,
+  validatePluginRuntimeExecutableBindingValue,
+  validateRuntimeComponentImplementationManifestV2,
+  type PluginRuntimeExecutableBinding,
+  type RuntimeComponentImplementationManifestV2,
+} from "@urdira/contracts";
+import {
   computeDigest,
   digestDomainRegistry,
   digestRecipeDefinitions,
@@ -21,6 +29,12 @@ function registeredDigest(recipeId: string, value: unknown): string {
     Number(recipe.payload_schema_version),
     payload,
   );
+}
+
+function decision25Digest(recipeId: string, recipeVersion: number, value: unknown): string {
+  const recipe = decision25DigestRecipeRegistry.find((candidate) => candidate.digest_recipe_id === recipeId && candidate.recipe_version === recipeVersion);
+  if (recipe === undefined) throw new TypeError(`The Decision 25 digest recipe ${recipeId}@${String(recipeVersion)} is unavailable.`);
+  return computeDigest(recipe.digest_domain, recipe.digest_recipe_id, recipe.recipe_version, recipe.payload_schema_id, recipe.payload_schema_version, value);
 }
 
 /**
@@ -53,6 +67,12 @@ export function createCanonicalPluginDigestAuthority(): PluginDigestAuthority {
       })),
     }),
     runtime_implementation: (value) => registeredDigest("core:runtime_component_implementation_digest", value),
+    runtime_implementation_v2: (value: RuntimeComponentImplementationManifestV2) => decision25Digest("core:runtime_component_implementation_digest", 2, validateRuntimeComponentImplementationManifestV2(value)),
+    runtime_executable_binding: (value: Omit<PluginRuntimeExecutableBinding, "binding_digest">) => {
+      const placeholder = { ...value, binding_digest: `sha256:${"0".repeat(64)}` };
+      validatePluginRuntimeExecutableBindingValue(placeholder);
+      return decision25Digest("core:plugin_runtime_executable_binding_digest", 1, value);
+    },
     language_definition: (value) => registeredDigest("core:language_definition_digest", value),
     resolution_lock: (value) => registeredDigest("core:plugin_resolution_lock_digest", value),
     registry_snapshot: (value) => registeredDigest("core:registry_snapshot_digest", {
@@ -63,8 +83,9 @@ export function createCanonicalPluginDigestAuthority(): PluginDigestAuthority {
         ...(binding.emission_valid_to_generation === undefined ? {} : { emission_valid_to_generation: Number(binding.emission_valid_to_generation) }),
       })),
     }),
-    has_core_digest_domain: (value) => digestDomainRegistry.some((entry) => entry.digest_domain === value),
-    has_core_digest_recipe: (id, version) => digestRecipeDefinitions.some((entry) => entry.digest_recipe_id === id && entry.recipe_version === version),
+    has_core_digest_domain: (value) => digestDomainRegistry.some((entry) => entry.digest_domain === value) || decision25DigestDomainRegistry.includes(value),
+    has_core_digest_recipe: (id, version) => digestRecipeDefinitions.some((entry) => entry.digest_recipe_id === id && entry.recipe_version === version)
+      || decision25DigestRecipeRegistry.some((entry) => entry.digest_recipe_id === id && String(entry.recipe_version) === version),
     has_core_external_verifier: (id, version) => externalVerificationContractDefinitions.some((entry) => entry.external_verification_contract_id === id && entry.contract_version === version),
   } satisfies PluginDigestAuthority);
 }

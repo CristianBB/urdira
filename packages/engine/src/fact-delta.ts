@@ -1,6 +1,9 @@
-import { canonicalJson, canonicalSha256 } from "@urdira/plugin-sdk";
-import type { ArtifactWorkItem, CandidateIssueScope, ClosedPayloadSchema, FactDelta, IndexCandidate, PluginInputAccessManifest, ProposedRecord, RecordArtifactDependency, ReplacementScope } from "@urdira/contracts";
-import { pluginInputAccessManifestDigest, pluginInputAccessManifestId, type AutomaticPluginInputAccessManifest } from "@urdira/plugin-sdk";
+import { createHash } from "node:crypto";
+import { canonicalBytes, digestBytes } from "@urdira/canonical";
+import { acceptSealedFactDeltaStreamBatch, canonicalJson, canonicalSha256, factDeltaStreamAttestedFacets, factDeltaStreamBodyPayloadHex, factDeltaStreamCanonicalRow, factDeltaStreamNativeBatch, factDeltaStreamPublicationRow, factDeltaStreamRecordDigest, FactDeltaStreamValidator } from "@urdira/plugin-sdk";
+import type { ArtifactWorkItem, CandidateIssueScope, ClosedPayloadSchema, FactDelta, FactDeltaBatch, FactDeltaStreamBatch, FactDeltaStreamHeader, IndexCandidate, PluginInputAccessManifest, ProposedRecord, ProposedRecordDependency, RecordArtifactDependency, ReplacementScope } from "@urdira/contracts";
+import { isFinalizedPluginInputAccessManifest, pluginInputAccessManifestDigest, pluginInputAccessManifestId, type AutomaticPluginInputAccessManifest, type FactDeltaStream, type FactDeltaStreamValidationSummary } from "@urdira/plugin-sdk";
+import { record as recordTiming, timed, timedSync, timingEnabled } from "./debug-timing.js";
 
 export interface FactDeltaValidationInput {
   readonly candidate: IndexCandidate;
@@ -118,6 +121,11 @@ export interface MaterializationProposedRecord {
   readonly owner_artifact_id: string;
   readonly owner_artifact_version_id: string;
   readonly canonical_record: string;
+  readonly record_digest: string;
+  /** Private native publication scalar row. Absent on the portable fallback. */
+  readonly publication_record?: Readonly<Record<string, unknown>>;
+  /** Exact UCE body bytes encoded as lowercase hex for SQLite unhex(). */
+  readonly body_payload_hex?: string;
 }
 
 export interface MaterializationReplacementSet extends Omit<ValidatedReplacementSet, "records"> {
@@ -135,16 +143,20 @@ export function compactAcceptedFactDelta(value: AcceptedFactDelta): Materializat
   const { fact_delta_id, delta_digest, plugin_id, plugin_version, proposed_dependencies, completeness_claims } = value.delta;
   const replacement_sets = value.replacement_sets.map((set) => Object.freeze({
     ...set,
-    records: Object.freeze(set.records.map((record) => Object.freeze({
-      proposal_record_key: record.proposal_record_key,
-      category: record.category,
-      kind: record.kind,
-      universal_kind: record.universal_kind,
-      identity_key: record.identity_key,
-      owner_artifact_id: set.scope.owner_artifact_id,
-      owner_artifact_version_id: set.scope.owner_artifact_version_id,
-      canonical_record: canonicalJson(record),
-    }))),
+    records: Object.freeze(set.records.map((record) => {
+      const canonicalRecord = canonicalJson(record);
+      return Object.freeze({
+        proposal_record_key: record.proposal_record_key,
+        category: record.category,
+        kind: record.kind,
+        universal_kind: record.universal_kind,
+        identity_key: record.identity_key,
+        owner_artifact_id: set.scope.owner_artifact_id,
+        owner_artifact_version_id: set.scope.owner_artifact_version_id,
+        canonical_record: canonicalRecord,
+        record_digest: digestBytes(canonicalBytes(record)),
+      });
+    })),
   }));
   return Object.freeze({
     ...value,
@@ -284,7 +296,7 @@ function validateManifest(input: FactDeltaValidationInput, delta: FactDelta): vo
   if (manifest.plugin_input_access_manifest_id !== pluginInputAccessManifestId(manifest.request_id, manifest.analysis_view_digest)) {
     fail(input, "core:analysis_context_unavailable", "The accepted access manifest identity does not match its request and view.");
   }
-  if (manifest.manifest_digest !== pluginInputAccessManifestDigest(manifestInput as never)) {
+  if (!isFinalizedPluginInputAccessManifest(input.accepted_manifest) && manifest.manifest_digest !== pluginInputAccessManifestDigest(manifestInput as never)) {
     fail(input, "core:candidate_digest_mismatch", "The accepted access manifest digest is invalid.");
   }
   if (delta.plugin_input_access_manifest_id !== manifest.plugin_input_access_manifest_id || delta.plugin_input_access_manifest_digest !== manifest.manifest_digest) {
@@ -394,39 +406,61 @@ function validateRecords(input: FactDeltaValidationInput, delta: FactDelta): voi
   }
   const extraStaged = input.staged_records.filter((entry) => !stagedManifestIds.has(entry.staged_record_id));
   if (extraStaged.length > 0) fail(input, "core:undeclared_input", "FactDelta carries staged producer entries absent from the accepted manifest.", { input_type: "staged_record", undeclared_ids: extraStaged.map((entry) => entry.staged_record_id) });
-  for (const record of delta.proposed_records) {
-    const definition = input.target_registry.record_kinds.get(record.kind);
-    if (definition === undefined) {
-      fail(input, "core:unregistered_identifier", "A proposed record kind is not registered in the target schema.", { proposal_record_key: record.proposal_record_key, identifier: record.kind });
-    }
-    if (definition.category !== record.category || definition.universal_kind !== record.universal_kind || definition.schema_version !== record.schema_version) {
-      fail(input, "core:record_schema_invalid", "A proposed record is not valid for its registered target schema.", { proposal_record_key: record.proposal_record_key });
-    }
-    try {
-      const facets = parseLogicalJson(record.facets);
-      if (!Array.isArray(facets) || facets.some((facet) => typeof facet !== "string") || new Set(facets).size !== facets.length || facets.some((facet) => !definition.allowed_facets.includes(facet)) || (definition.required_facets ?? []).some((facet) => !facets.includes(facet))) throw new TypeError("facet set is not registered");
-      if (definition.body_schema !== undefined && !matchesPayloadSchema(record.body, definition.body_schema)) throw new TypeError("body does not match registered schema");
+  for (const record of delta.proposed_records) validateProposedRecord(input, record);
+}
+
+function validateProposedRecord(input: FactDeltaValidationInput, record: ProposedRecord): void {
+  const definition = input.target_registry.record_kinds.get(record.kind);
+  if (definition === undefined) {
+    fail(input, "core:unregistered_identifier", "A proposed record kind is not registered in the target schema.", { proposal_record_key: record.proposal_record_key, identifier: record.kind });
+  }
+  if (definition.category !== record.category || definition.universal_kind !== record.universal_kind || definition.schema_version !== record.schema_version) {
+    fail(input, "core:record_schema_invalid", "A proposed record is not valid for its registered target schema.", { proposal_record_key: record.proposal_record_key });
+  }
+  try {
+    const attestedFacets = factDeltaStreamAttestedFacets(record);
+    const facets = attestedFacets ?? parseLogicalJson(record.facets);
+    if (!Array.isArray(facets) || facets.some((facet) => typeof facet !== "string") || new Set(facets).size !== facets.length || facets.some((facet) => !definition.allowed_facets.includes(facet)) || (definition.required_facets ?? []).some((facet) => !facets.includes(facet))) throw new TypeError("facet set is not registered");
+    if (definition.body_schema !== undefined && !matchesPayloadSchema(record.body, definition.body_schema)) throw new TypeError("body does not match registered schema");
+    if (attestedFacets === undefined) {
       canonicalJson(record.body);
       if (record.source_span.length > 0) parseLogicalJson(record.source_span);
       parseLogicalJson(record.evidence_references);
-    } catch {
-      fail(input, "core:record_schema_invalid", "A proposed record contains invalid registered facets, body schema, or UCE fields.", { proposal_record_key: record.proposal_record_key });
     }
-    // ProposedRecord no longer declares its own workspace/owner (decision 05);
-    // the work-item owner scope is already enforced by `validateScopes`'s
-    // category/kind membership test against `expected_replacement_scopes`,
-    // which are themselves pinned to `input.work_item` before this validator runs.
+  } catch {
+    fail(input, "core:record_schema_invalid", "A proposed record contains invalid registered facets, body schema, or UCE fields.", { proposal_record_key: record.proposal_record_key });
   }
+  // ProposedRecord no longer declares its own workspace/owner (decision 05);
+  // the work-item owner scope is already enforced by `validateScopes`'s
+  // category/kind membership test against `expected_replacement_scopes`,
+  // which are themselves pinned to `input.work_item` before this validator runs.
 }
 
-function validateDependencies(input: FactDeltaValidationInput, delta: FactDelta): void {
-  const keys = new Set(delta.proposed_records.map((record) => record.proposal_record_key));
-  const dependencyIds = new Set<string>();
+type DependencyValidationContext = {
+  readonly declaredByVersion: ReadonlyMap<string, Readonly<Record<string, unknown>>>;
+  readonly declaredVersions: ReadonlySet<string>;
+  readonly inputRecordIds: ReadonlySet<string>;
+  readonly stagedRecordIds: ReadonlySet<string>;
+};
+
+function dependencyValidationContext(input: FactDeltaValidationInput, inputRecordIds: readonly string[]): DependencyValidationContext {
   const declaredEntries = input.accepted_manifest.artifact_version_entries.filter((entry) => isObject(entry) && typeof entry["artifact_version_id"] === "string");
   const declaredVersions = new Set<string>([
     ...declaredEntries.map((entry) => (entry as unknown as Record<string, unknown>)["artifact_version_id"] as string),
     ...input.accepted_manifest.transitive_artifact_version_ids,
   ]);
+  return {
+    declaredByVersion: new Map(declaredEntries.map((entry) => {
+      const record = entry as unknown as Readonly<Record<string, unknown>>;
+      return [record["artifact_version_id"] as string, record] as const;
+    })),
+    declaredVersions,
+    inputRecordIds: new Set(inputRecordIds),
+    stagedRecordIds: new Set(input.staged_records.map((entry) => entry.staged_record_id)),
+  };
+}
+
+function validateProposedDependency(input: FactDeltaValidationInput, dependency: ProposedRecordDependency, keys: ReadonlySet<string>, dependencyIds: Set<string>, context: DependencyValidationContext): void {
   const digestFromReference = (reference: unknown): string | undefined => {
     if (!isObject(reference)) return undefined;
     for (const key of ["dependency_digest", "content_hash", "digest"]) if (typeof reference[key] === "string") return reference[key] as string;
@@ -444,30 +478,35 @@ function validateDependencies(input: FactDeltaValidationInput, delta: FactDelta)
     if (referenceType === "staged_record" && stagedId === undefined) fail(input, "core:dependency_validation_failed", "Staged dependency source reference is missing its staged identity.", { dependency_failure_kind: "source_reference_id_missing" });
     if ((referenceType === "local_proposal" || referenceType === "proposal") && proposalKey === undefined) fail(input, "core:dependency_validation_failed", "Proposal dependency source reference is missing its proposal identity.", { dependency_failure_kind: "source_reference_id_missing" });
     if (proposalKey !== undefined && !keys.has(proposalKey)) fail(input, "core:undeclared_input", "Dependency source refers to an unknown local proposal.", { source_reference: reference });
-    if (recordId !== undefined && !delta.input_record_ids.includes(recordId)) fail(input, "core:undeclared_input", "Dependency source refers to an undeclared base record.", { source_reference: reference });
-    if (stagedId !== undefined && !input.staged_records.some((entry) => entry.staged_record_id === stagedId)) fail(input, "core:undeclared_input", "Dependency source refers to an undeclared staged record.", { source_reference: reference });
+    if (recordId !== undefined && !context.inputRecordIds.has(recordId)) fail(input, "core:undeclared_input", "Dependency source refers to an undeclared base record.", { source_reference: reference });
+    if (stagedId !== undefined && !context.stagedRecordIds.has(stagedId)) fail(input, "core:undeclared_input", "Dependency source refers to an undeclared staged record.", { source_reference: reference });
     if (dependencyBasis === "base" && referenceType !== undefined && referenceType !== "base_record") fail(input, "core:dependency_validation_failed", "Base dependency source has the wrong reference type.", { source_reference: reference });
   };
-  for (const dependency of delta.proposed_dependencies) {
-    if (dependencyIds.has(dependency.proposed_dependency_id) || !keys.has(dependency.proposal_record_key)) fail(input, "core:dependency_validation_failed", "A proposed dependency is not locally resolvable.");
-    dependencyIds.add(dependency.proposed_dependency_id);
-    if (!input.target_registry.dependency_roles.has(dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "A proposed dependency role is not registered.", { dependency_role: dependency.dependency_role });
-    if (!declaredVersions.has(dependency.dependency_artifact_version_id)) fail(input, "core:dependency_validation_failed", "A proposed dependency version is outside the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id });
-    const registered = input.target_registry.artifact_versions?.get(dependency.dependency_artifact_version_id);
-    if (registered?.closed === true || input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id)?.closed === true) fail(input, "core:dependency_validation_failed", "A proposed dependency refers to a closing artifact version.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id });
-    if (registered !== undefined && registered.artifact_id !== dependency.dependency_artifact_id) fail(input, "core:dependency_validation_failed", "A proposed dependency artifact/version identity is inconsistent.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id });
-    validateSourceReference(dependency.source_reference, dependency.dependency_basis);
-    const closure = input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id);
-    const declared = declaredEntries.find((entry) => (entry as unknown as Record<string, unknown>)["artifact_version_id"] === dependency.dependency_artifact_version_id) as unknown as Record<string, unknown> | undefined;
-    const expectedDigest = closure?.digest ?? registered?.content_hash ?? (typeof declared?.["content_hash"] === "string" ? declared["content_hash"] as string : undefined);
-    if (expectedDigest !== undefined && digestFromReference(dependency.source_reference) !== expectedDigest) fail(input, "core:dependency_validation_failed", "Dependency content digest does not match the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "digest_mismatch" });
-    if (closure !== undefined && (closure.dependency_artifact_id !== dependency.dependency_artifact_id || closure.dependency_role !== dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "Dependency role or artifact identity does not match the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closure_mismatch" });
-  }
+  if (dependencyIds.has(dependency.proposed_dependency_id) || !keys.has(dependency.proposal_record_key)) fail(input, "core:dependency_validation_failed", "A proposed dependency is not locally resolvable.");
+  dependencyIds.add(dependency.proposed_dependency_id);
+  if (!input.target_registry.dependency_roles.has(dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "A proposed dependency role is not registered.", { dependency_role: dependency.dependency_role });
+  if (!context.declaredVersions.has(dependency.dependency_artifact_version_id)) fail(input, "core:dependency_validation_failed", "A proposed dependency version is outside the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id });
+  const registered = input.target_registry.artifact_versions?.get(dependency.dependency_artifact_version_id);
+  if (registered?.closed === true || input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id)?.closed === true) fail(input, "core:dependency_validation_failed", "A proposed dependency refers to a closing artifact version.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id });
+  if (registered !== undefined && registered.artifact_id !== dependency.dependency_artifact_id) fail(input, "core:dependency_validation_failed", "A proposed dependency artifact/version identity is inconsistent.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id });
+  validateSourceReference(dependency.source_reference, dependency.dependency_basis);
+  const closure = input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id);
+  const declared = context.declaredByVersion.get(dependency.dependency_artifact_version_id);
+  const expectedDigest = closure?.digest ?? registered?.content_hash ?? (typeof declared?.["content_hash"] === "string" ? declared["content_hash"] as string : undefined);
+  if (expectedDigest !== undefined && digestFromReference(dependency.source_reference) !== expectedDigest) fail(input, "core:dependency_validation_failed", "Dependency content digest does not match the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "digest_mismatch" });
+  if (closure !== undefined && (closure.dependency_artifact_id !== dependency.dependency_artifact_id || closure.dependency_role !== dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "Dependency role or artifact identity does not match the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closure_mismatch" });
+}
+
+function validateDependencies(input: FactDeltaValidationInput, delta: FactDelta): void {
+  const keys = new Set(delta.proposed_records.map((record) => record.proposal_record_key));
+  const dependencyIds = new Set<string>();
+  const context = dependencyValidationContext(input, delta.input_record_ids);
+  for (const dependency of delta.proposed_dependencies) validateProposedDependency(input, dependency, keys, dependencyIds, context);
   for (const dependency of input.base_record_dependencies) {
     if (!keys.has(dependency.record_id) && !delta.input_record_ids.includes(dependency.record_id)) fail(input, "core:undeclared_input", "A base dependency is not declared by the accepted manifest.", { input_type: "base_record", undeclared_ids: [dependency.record_id] });
     if (!input.target_registry.dependency_roles.has(dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "A base dependency role is not registered.", { dependency_role: dependency.dependency_role });
     if (dependency.valid_to_generation !== undefined || input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id)?.closed === true) fail(input, "core:dependency_validation_failed", "A base dependency is closing.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closing_dependency" });
-    if (!declaredVersions.has(dependency.dependency_artifact_version_id)) fail(input, "core:dependency_validation_failed", "A base dependency version is outside the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "undeclared_version" });
+    if (!context.declaredVersions.has(dependency.dependency_artifact_version_id)) fail(input, "core:dependency_validation_failed", "A base dependency version is outside the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "undeclared_version" });
     const registered = input.target_registry.artifact_versions?.get(dependency.dependency_artifact_version_id);
     if (registered !== undefined && (registered.artifact_id !== dependency.dependency_artifact_id || registered.closed === true)) fail(input, "core:dependency_validation_failed", "A base dependency artifact/version is not live.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "artifact_version_mismatch" });
     const closure = input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id);
@@ -583,5 +622,285 @@ export class FactDeltaAcceptanceService {
 
   async discard(factDeltaId: string): Promise<void> {
     await this.#store.remove(factDeltaId);
+  }
+}
+
+export interface FactDeltaStreamStagingPort {
+  stageFactDeltaStreamBatch(header: FactDeltaStreamHeader, batch: FactDeltaStreamBatch, nativeBatch: FactDeltaBatch): Promise<"inserted" | "already_accepted">;
+  completeFactDeltaStream(header: FactDeltaStreamHeader): Promise<"inserted" | "already_accepted">;
+  /**
+   * Commits several completely validated logical streams in one durable
+   * storage transaction. The physical group is only an amortisation boundary:
+   * every entry keeps its own header, sequence receipts and immutable delta
+   * identity.
+   */
+  commitFactDeltaStreamGroup?(entries: readonly StagedFactDeltaStreamGroupEntry[]): Promise<readonly ("inserted" | "already_accepted")[]>;
+  cancelFactDeltaStream?(header: FactDeltaStreamHeader): Promise<void>;
+}
+
+export interface StagedFactDeltaStreamGroupEntry {
+  readonly header: FactDeltaStreamHeader;
+  readonly batches: readonly {
+    readonly batch: FactDeltaStreamBatch;
+    readonly native_batch: FactDeltaBatch;
+  }[];
+}
+
+export interface FactDeltaStreamAcceptanceOptions {
+  readonly signal?: AbortSignal;
+}
+
+export interface FactDeltaStreamGroupAcceptanceOptions extends FactDeltaStreamAcceptanceOptions {
+  readonly max_streams?: number;
+  readonly max_rows?: number;
+  readonly max_bytes?: number;
+}
+
+export interface FactDeltaStreamGroupValidationEntry {
+  readonly stream: FactDeltaStream;
+  readonly input: FactDeltaStreamValidationInput;
+}
+
+export type FactDeltaStreamValidationInput = Omit<FactDeltaValidationInput, "raw_delta">;
+
+export interface AcceptedFactDeltaStream extends FactDeltaStreamValidationSummary {
+  readonly header: FactDeltaStreamHeader;
+  readonly acceptance: "inserted" | "already_accepted";
+}
+
+function throwIfFactDeltaStreamAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const error = new Error("FactDeltaStream acceptance was cancelled.");
+  error.name = "AbortError";
+  throw error;
+}
+
+/** Validates and durably stages exactly one bounded batch at a time. Only a
+ * completely validated final stream is promoted to an accepted FactDelta. */
+export class FactDeltaStreamAcceptanceService {
+  readonly #staging: FactDeltaStreamStagingPort;
+
+  constructor(staging: FactDeltaStreamStagingPort) {
+    this.#staging = staging;
+  }
+
+  async accept(stream: FactDeltaStream, options: FactDeltaStreamAcceptanceOptions = {}): Promise<AcceptedFactDeltaStream> {
+    const validator = new FactDeltaStreamValidator(stream.header);
+    try {
+      throwIfFactDeltaStreamAborted(options.signal);
+      for await (const rawBatch of stream.batches) {
+        throwIfFactDeltaStreamAborted(options.signal);
+        const batch = validator.accept_batch(rawBatch);
+        const nativeBatch = factDeltaStreamNativeBatch(batch);
+        await this.#staging.stageFactDeltaStreamBatch(validator.header, batch, nativeBatch);
+        throwIfFactDeltaStreamAborted(options.signal);
+      }
+      const summary = validator.finish();
+      throwIfFactDeltaStreamAborted(options.signal);
+      const acceptance = await this.#staging.completeFactDeltaStream(validator.header);
+      return Object.freeze({ header: validator.header, acceptance, ...summary });
+    } catch (error) {
+      if (options.signal?.aborted && this.#staging.cancelFactDeltaStream !== undefined) await this.#staging.cancelFactDeltaStream(validator.header);
+      throw error;
+    }
+  }
+
+  /** Built-in direct-stream path. Header authority and every row are checked
+   * before the final receipt is promoted; only compact materialization rows,
+   * proposal identities, and dependencies survive beyond each staged batch. */
+  async acceptValidated(stream: FactDeltaStream, input: FactDeltaStreamValidationInput, options: FactDeltaStreamAcceptanceOptions = {}): Promise<MaterializationAcceptedFactDelta> {
+    const validator = timedSync("fact_delta_stream_header_protocol", () => new FactDeltaStreamValidator(stream.header));
+    const header = validator.header;
+    const preflightStartedAt = timingEnabled() ? performance.now() : 0;
+    const validationInput = { ...input, raw_delta: header } satisfies FactDeltaValidationInput;
+    const shell = {
+      fact_delta_id: header.fact_delta_id, candidate_generation_id: header.candidate_generation_id, workspace_id: header.workspace_id,
+      ...(header.base_snapshot_id === undefined ? {} : { base_snapshot_id: header.base_snapshot_id }), work_item_id: header.work_item_id,
+      plugin_id: header.plugin_id, plugin_version: header.plugin_version, analysis_digest: header.analysis_digest,
+      analysis_configuration_digest: header.analysis_configuration_digest, ...(header.publication_stage_id === undefined ? {} : { publication_stage_id: header.publication_stage_id }),
+      owner_artifact_id: header.owner_artifact_id, owner_artifact_version_id: header.owner_artifact_version_id,
+      replacement_scopes: header.replacement_scopes, input_artifact_version_ids: header.input_artifact_version_ids, input_record_ids: header.input_record_ids,
+      plugin_input_access_manifest_id: header.plugin_input_access_manifest_id, plugin_input_access_manifest_digest: header.plugin_input_access_manifest_digest,
+      analysis_input_digest: header.analysis_input_digest, proposed_records: [], proposed_dependencies: [], completeness_claims: header.completeness_claims,
+      created_at: header.created_at, delta_digest: header.delta_digest,
+    } satisfies FactDelta;
+    validateIdentity(validationInput, shell);
+    validateManifest(validationInput, shell);
+    const directArtifactIds = orderedUnique(input.accepted_manifest.artifact_version_entries.filter((entry) => isObject(entry) && typeof entry["artifact_version_id"] === "string").map((entry) => entry["artifact_version_id"] as string));
+    if (canonicalJson(header.input_artifact_version_ids) !== canonicalJson(directArtifactIds)) fail(validationInput, "core:delta_scope_mismatch", "FactDeltaStream direct artifact inputs do not match the accepted manifest.");
+    const expectedScopeIds = input.expected_replacement_scopes.map((scope) => scope.replacement_scope_id);
+    if (header.replacement_scopes.length !== input.expected_replacement_scopes.length || header.replacement_scopes.some((scope, index) => scope.replacement_scope_id !== expectedScopeIds[index] || !sameScope(scope, input.expected_replacement_scopes[index]!))) {
+      fail(validationInput, "core:delta_scope_mismatch", "FactDeltaStream replacement scopes do not match the frozen work item.");
+    }
+    for (const scope of header.replacement_scopes) {
+      const base = input.base_records.filter((record) => record.owner_artifact_id === scope.owner_artifact_id && record.owner_artifact_version_id === scope.owner_artifact_version_id && scope.record_categories.includes(record.category) && scope.record_kinds.includes(record.kind));
+      if (baseSetDigest(base) !== scope.base_record_set_digest) fail(validationInput, "core:delta_base_mismatch", "Replacement scope base record-set digest does not match the frozen base records.", { replacement_scope_id: scope.replacement_scope_id });
+    }
+    validateRecords(validationInput, shell);
+    validateDependencies(validationInput, shell);
+    if (preflightStartedAt !== 0) recordTiming("fact_delta_stream_preflight_validation", performance.now() - preflightStartedAt);
+
+    const proposalKeys = new Set<string>();
+    const dependencyIds = new Set<string>();
+    const dependencyContext = dependencyValidationContext(validationInput, header.input_record_ids);
+    const diagnosticKeys = new Set<string>();
+    const dependencies: ProposedRecordDependency[] = [];
+    const replacement = header.replacement_scopes.map((scope) => ({ scope, records: [] as MaterializationProposedRecord[], hash: createHash("sha256"), count: 0 }));
+    for (const entry of replacement) entry.hash.update("[", "utf8");
+    try {
+      throwIfFactDeltaStreamAborted(options.signal);
+      for await (const rawBatch of stream.batches) {
+        throwIfFactDeltaStreamAborted(options.signal);
+        const batch = timedSync("fact_delta_stream_protocol", () => validator.accept_batch(rawBatch));
+        const sealed = timedSync("fact_delta_stream_rust_acceptance", () => acceptSealedFactDeltaStreamBatch(batch, [...input.target_registry.record_kinds.values()].map((definition) => ({
+          kind: definition.kind,
+          category: definition.category,
+          universal_kind: definition.universal_kind,
+          schema_version: definition.schema_version,
+          allowed_facets: definition.allowed_facets,
+          required_facets: definition.required_facets ?? [],
+          ...(definition.body_schema === undefined ? {} : { body_schema: definition.body_schema }),
+        }))));
+        timedSync("fact_delta_stream_record_validation", () => {
+          const records = sealed?.records ?? batch.records;
+          for (const [recordIndex, record] of records.entries()) {
+            if (proposalKeys.has(record.proposal_record_key)) fail(validationInput, "core:record_schema_invalid", "FactDeltaStream proposal record keys must be unique.", { proposal_record_key: record.proposal_record_key });
+            proposalKeys.add(record.proposal_record_key);
+            if (sealed === undefined) validateProposedRecord(validationInput, record as ProposedRecord);
+            else {
+              const definition = input.target_registry.record_kinds.get(record.kind);
+              if (definition === undefined) fail(validationInput, "core:unregistered_identifier", "A proposed record kind is not registered in the target schema.", { proposal_record_key: record.proposal_record_key, identifier: record.kind });
+              if (sealed.record_schema_attestations[recordIndex] !== true) fail(validationInput, "core:record_schema_invalid", "A proposed record contains invalid registered facets, body schema, or UCE fields.", { proposal_record_key: record.proposal_record_key });
+            }
+            const matching = replacement.filter((entry) => entry.scope.record_categories.includes(record.category) && entry.scope.record_kinds.includes(record.kind));
+            if (matching.length === 0) fail(validationInput, "core:delta_scope_mismatch", "A streamed proposed record is outside every replacement scope.", { proposal_record_key: record.proposal_record_key });
+            const canonicalRecord = sealed?.kernel.canonical_records[recordIndex] ?? factDeltaStreamCanonicalRow(record as ProposedRecord);
+            if (record.category === "diagnostic") diagnosticKeys.add(record.proposal_record_key);
+            for (const entry of matching) {
+              if (entry.count > 0) entry.hash.update(",", "utf8");
+              entry.hash.update(canonicalRecord, "utf8");
+              entry.count += 1;
+              const publicationRecord = sealed?.kernel.publication_records[recordIndex] ?? factDeltaStreamPublicationRow(record as ProposedRecord);
+              const bodyPayloadHex = sealed?.kernel.record_body_payload_hexes[recordIndex] ?? factDeltaStreamBodyPayloadHex(record as ProposedRecord);
+              const recordDigest = sealed?.kernel.record_digests[recordIndex] ?? factDeltaStreamRecordDigest(record as ProposedRecord) ?? digestBytes(canonicalBytes(record as ProposedRecord));
+              entry.records.push(Object.freeze({ proposal_record_key: record.proposal_record_key, category: record.category, kind: record.kind, universal_kind: record.universal_kind, identity_key: record.identity_key, owner_artifact_id: entry.scope.owner_artifact_id, owner_artifact_version_id: entry.scope.owner_artifact_version_id, canonical_record: canonicalRecord, record_digest: recordDigest, ...(publicationRecord === undefined ? {} : { publication_record: publicationRecord }), ...(bodyPayloadHex === undefined ? {} : { body_payload_hex: bodyPayloadHex }) }));
+            }
+          }
+        });
+        timedSync("fact_delta_stream_dependency_validation", () => {
+          for (const dependency of sealed?.dependencies ?? batch.dependencies) {
+            validateProposedDependency(validationInput, dependency, proposalKeys, dependencyIds, dependencyContext);
+            dependencies.push(Object.freeze(dependency));
+          }
+        });
+        const nativeBatch = timedSync("fact_delta_stream_native_batch", () => factDeltaStreamNativeBatch(batch));
+        await timed("fact_delta_stream_stage", () => this.#staging.stageFactDeltaStreamBatch(header, batch, nativeBatch));
+        throwIfFactDeltaStreamAborted(options.signal);
+      }
+      timedSync("fact_delta_stream_finish", () => validator.finish());
+      const diagnosticRecords = [...diagnosticKeys].map((proposal_record_key) => ({ proposal_record_key, category: "diagnostic" }) as ProposedRecord);
+      validateCompleteness(validationInput, { ...shell, proposed_records: diagnosticRecords });
+      const acceptance = await timed("fact_delta_stream_complete", () => this.#staging.completeFactDeltaStream(header));
+      const transitive = orderedUnique([...directArtifactIds, ...input.accepted_manifest.transitive_artifact_version_ids.filter((entry): entry is string => typeof entry === "string")]);
+      const staged = Object.freeze([...input.staged_records].map((entry) => Object.freeze({ ...entry, transitive_artifact_version_ids: Object.freeze([...entry.transitive_artifact_version_ids]) })));
+      return Object.freeze({
+        acceptance: acceptance === "already_accepted" ? "already_present" : "inserted",
+        delta: Object.freeze({ fact_delta_id: header.fact_delta_id, delta_digest: header.delta_digest, plugin_id: header.plugin_id, plugin_version: header.plugin_version, proposed_dependencies: Object.freeze(dependencies), completeness_claims: Object.freeze([...header.completeness_claims]) }),
+        replacement_sets: Object.freeze(replacement.map((entry) => {
+          entry.hash.update("]", "utf8");
+          return Object.freeze({ scope: entry.scope, records: Object.freeze(entry.records), record_set_digest: `sha256:${entry.hash.digest("hex")}` });
+        })),
+        input_artifact_version_ids: Object.freeze(directArtifactIds), input_record_ids: Object.freeze([...header.input_record_ids]),
+        transitive_artifact_version_ids: Object.freeze(transitive), validated_staged_records: staged,
+      });
+    } catch (error) {
+      if (options.signal?.aborted && this.#staging.cancelFactDeltaStream !== undefined) await this.#staging.cancelFactDeltaStream(header);
+      throw error;
+    }
+  }
+
+  /**
+   * Validates logical streams independently, then commits bounded physical
+   * groups. This removes the owner-per-transaction bottleneck without making
+   * a partially validated owner durable or changing the per-owner result.
+   */
+  async acceptValidatedGroup(
+    entries: Iterable<FactDeltaStreamGroupValidationEntry> | AsyncIterable<FactDeltaStreamGroupValidationEntry>,
+    options: FactDeltaStreamGroupAcceptanceOptions = {},
+  ): Promise<readonly MaterializationAcceptedFactDelta[]> {
+    const maxStreams = options.max_streams ?? 64;
+    const maxRows = options.max_rows ?? 4096;
+    const maxBytes = options.max_bytes ?? 16 * 1024 * 1024;
+    for (const [field, value] of [["max_streams", maxStreams], ["max_rows", maxRows], ["max_bytes", maxBytes]] as const) {
+      if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${field} must be a positive safe integer.`);
+    }
+
+    type Buffered = {
+      readonly staged: StagedFactDeltaStreamGroupEntry;
+      readonly delta: MaterializationAcceptedFactDelta;
+      readonly rows: number;
+      readonly bytes: number;
+    };
+    const accepted: MaterializationAcceptedFactDelta[] = [];
+    let buffered: Buffered[] = [];
+    let bufferedRows = 0;
+    let bufferedBytes = 0;
+
+    const commit = async (): Promise<void> => {
+      if (buffered.length === 0) return;
+      throwIfFactDeltaStreamAborted(options.signal);
+      const staged = buffered.map((entry) => entry.staged);
+      const statuses = await timed("fact_delta_stream_group_commit", () => this.#staging.commitFactDeltaStreamGroup !== undefined
+        ? this.#staging.commitFactDeltaStreamGroup(staged)
+        : Promise.all(staged.map(async (entry) => {
+          for (const batch of entry.batches) await this.#staging.stageFactDeltaStreamBatch(entry.header, batch.batch, batch.native_batch);
+          return this.#staging.completeFactDeltaStream(entry.header);
+        })));
+      if (statuses.length !== buffered.length) throw new Error("FactDeltaStream group staging returned the wrong acknowledgement count.");
+      for (let index = 0; index < buffered.length; index += 1) {
+        const status = statuses[index];
+        if (status !== "inserted" && status !== "already_accepted") throw new Error("FactDeltaStream group staging returned an invalid acknowledgement.");
+        accepted.push(Object.freeze({ ...buffered[index]!.delta, acceptance: status === "already_accepted" ? "already_present" : "inserted" }));
+      }
+      buffered = [];
+      bufferedRows = 0;
+      bufferedBytes = 0;
+    };
+
+    try {
+      for await (const entry of entries) {
+        throwIfFactDeltaStreamAborted(options.signal);
+        const stagedBatches: { batch: FactDeltaStreamBatch; native_batch: FactDeltaBatch }[] = [];
+        let streamRows = 0;
+        let streamBytes = 0;
+        let completedHeader: FactDeltaStreamHeader | undefined;
+        const bufferingPort: FactDeltaStreamStagingPort = {
+          stageFactDeltaStreamBatch: async (header, batch, nativeBatch) => {
+            completedHeader = header;
+            stagedBatches.push({ batch, native_batch: nativeBatch });
+            streamRows += nativeBatch.records.row_count + nativeBatch.graph_edges.row_count + nativeBatch.identities.row_count + nativeBatch.dependencies.row_count;
+            streamBytes += nativeBatch.byte_length;
+            return "inserted";
+          },
+          completeFactDeltaStream: async (header) => { completedHeader = header; return "inserted"; },
+        };
+        const delta = await new FactDeltaStreamAcceptanceService(bufferingPort).acceptValidated(entry.stream, entry.input, options);
+        if (completedHeader === undefined) throw new Error("FactDeltaStream validation completed without a header.");
+        if (buffered.length > 0 && (buffered.length + 1 > maxStreams || bufferedRows + streamRows > maxRows || bufferedBytes + streamBytes > maxBytes)) await commit();
+        buffered.push({ staged: Object.freeze({ header: completedHeader, batches: Object.freeze(stagedBatches) }), delta, rows: streamRows, bytes: streamBytes });
+        bufferedRows += streamRows;
+        bufferedBytes += streamBytes;
+        // A single oversized owner is legal and remains isolated in its own
+        // transaction; it must never force unrelated owners over the budget.
+        if (buffered.length >= maxStreams || bufferedRows >= maxRows || bufferedBytes >= maxBytes) await commit();
+      }
+      await commit();
+      return Object.freeze(accepted);
+    } catch (error) {
+      if (this.#staging.cancelFactDeltaStream !== undefined) {
+        await Promise.allSettled(buffered.map((entry) => this.#staging.cancelFactDeltaStream!(entry.staged.header)));
+      }
+      throw error;
+    }
   }
 }

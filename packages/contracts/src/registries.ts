@@ -75,6 +75,8 @@ export const canonicalSchemaRegistry = [
   entry("core:AnalyzerImplementationManifest@1", "Approved core canonical schema coordinate core:AnalyzerImplementationManifest@1."),
   entry("core:RuntimeComponentBehaviorManifest@1", "Approved core canonical schema coordinate core:RuntimeComponentBehaviorManifest@1."),
   entry("core:RuntimeComponentImplementationManifest@1", "Approved core canonical schema coordinate core:RuntimeComponentImplementationManifest@1."),
+  entry("core:RuntimeComponentImplementationManifest@2", "Decision 25 exact target-specific runtime implementation manifest."),
+  entry("core:PluginRuntimeExecutableBinding@1", "Decision 25 exact resolved plugin runtime executable binding."),
   entry("core:PluginPackageManifest@1", "Approved core canonical schema coordinate core:PluginPackageManifest@1."),
   entry("core:CoreRegistryManifest@1", "Approved core canonical schema coordinate core:CoreRegistryManifest@1."),
   entry("core:CoreRegistryDefinition@1", "Approved core canonical schema coordinate core:CoreRegistryDefinition@1."),
@@ -112,6 +114,27 @@ export const canonicalSchemaRegistry = [
   entry("core:ModelPackRuntimeConfiguration@1", "Approved core canonical schema coordinate core:ModelPackRuntimeConfiguration@1."),
   entry("core:TokenizerAssetManifest@1", "Approved core canonical schema coordinate core:TokenizerAssetManifest@1.")
 ];
+
+export interface VersionedDigestRecipeCoordinate {
+  readonly digest_recipe_id: string;
+  readonly recipe_version: number;
+  readonly digest_domain: string;
+  readonly payload_schema_id: string;
+  readonly payload_schema_version: number;
+  readonly payload_binding: "verified_input";
+}
+
+/** Additive Decision 25 authority. Version 1 remains valid for legacy
+ * implementation manifests; version 2 is selected only for the v2 schema. */
+export const decision25DigestRecipeRegistry: readonly VersionedDigestRecipeCoordinate[] = Object.freeze([
+  { digest_recipe_id: "core:runtime_component_implementation_digest", recipe_version: 1, digest_domain: "core:runtime_component_implementation", payload_schema_id: "core:RuntimeComponentImplementationManifest", payload_schema_version: 1, payload_binding: "verified_input" },
+  { digest_recipe_id: "core:runtime_component_implementation_digest", recipe_version: 2, digest_domain: "core:runtime_component_implementation", payload_schema_id: "core:RuntimeComponentImplementationManifest", payload_schema_version: 2, payload_binding: "verified_input" },
+  { digest_recipe_id: "core:plugin_runtime_executable_binding_digest", recipe_version: 1, digest_domain: "core:plugin_runtime_executable_binding", payload_schema_id: "core:PluginRuntimeExecutableBinding", payload_schema_version: 1, payload_binding: "verified_input" },
+]);
+export const decision25DigestDomainRegistry: readonly string[] = Object.freeze([
+  "core:runtime_component_implementation",
+  "core:plugin_runtime_executable_binding",
+]);
 
 const comparatorRegistryEntries = [
   entry("core:record_artifact_dependency_order@1", "Approved core canonical comparator core:record_artifact_dependency_order@1."),

@@ -94,12 +94,19 @@ export interface RelationExpansionOptions {
   readonly relation_kinds?: readonly string[];
 }
 
-function outgoing(edges: readonly RelationEdge[], subject: string, direction: RelationExpansionOptions["direction"], relationKinds: ReadonlySet<string>): RelationEdge[] {
-  return edges.filter((edge) => relationKinds.size === 0 || relationKinds.has(edge.relation_kind)).flatMap((edge) => {
-    if ((direction === "outbound" || direction === "both") && edge.source === subject) return [{ ...edge, source: edge.source, target: edge.target }];
-    if ((direction === "inbound" || direction === "both") && edge.target === subject) return [{ ...edge, source: edge.target, target: edge.source }];
-    return [];
-  });
+function adjacency(edges: readonly RelationEdge[], direction: RelationExpansionOptions["direction"], relationKinds: ReadonlySet<string>): ReadonlyMap<string, readonly RelationEdge[]> {
+  const bySubject = new Map<string, RelationEdge[]>();
+  const add = (subject: string, edge: RelationEdge): void => {
+    const current = bySubject.get(subject);
+    if (current === undefined) bySubject.set(subject, [edge]);
+    else current.push(edge);
+  };
+  for (const edge of edges) {
+    if (relationKinds.size > 0 && !relationKinds.has(edge.relation_kind)) continue;
+    if (direction === "outbound" || direction === "both") add(edge.source, edge);
+    if ((direction === "inbound" || direction === "both") && edge.target !== edge.source) add(edge.target, { ...edge, source: edge.target, target: edge.source });
+  }
+  return bySubject;
 }
 
 export function expandRelations(edges: readonly RelationEdge[], roots: readonly string[], options: RelationExpansionOptions): readonly ExpandedRelation[] {
@@ -107,13 +114,15 @@ export function expandRelations(edges: readonly RelationEdge[], roots: readonly 
   const maxDepth = options.max_depth ?? minDepth;
   if (!Number.isSafeInteger(minDepth) || minDepth < 0 || !Number.isSafeInteger(maxDepth) || maxDepth < minDepth) throw new EngineError("core:budget_invalid", "Relation depth bounds are invalid.");
   const relationKinds = new Set(options.relation_kinds ?? []);
+  const bySubject = adjacency(edges, options.direction, relationKinds);
   const queue = roots.map((subject) => ({ subject, depth: 0 }));
+  let queueIndex = 0;
   const seen = new Set(roots);
   const result: ExpandedRelation[] = [];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
+  while (queueIndex < queue.length) {
+    const current = queue[queueIndex++]!;
     if (current.depth >= maxDepth) continue;
-    for (const edge of outgoing(edges, current.subject, options.direction, relationKinds)) {
+    for (const edge of bySubject.get(current.subject) ?? []) {
       const depth = current.depth + 1;
       if (seen.has(edge.target)) continue;
       seen.add(edge.target);
@@ -137,11 +146,13 @@ export function findShortestPaths(edges: readonly RelationEdge[], sources: reado
   if (!Number.isSafeInteger(options.max_depth) || options.max_depth < 0) throw new EngineError("core:budget_invalid", "Maximum path depth must be a non-negative safe integer.");
   const targetSet = new Set(targets);
   const relationKinds = new Set(options.relation_kinds ?? []);
+  const bySubject = adjacency(edges, options.direction, relationKinds);
   const queue = sources.map((subject) => ({ subjects: [subject], relations: [] as string[], classifications: [] as RelationEdge["classification"][] }));
+  let queueIndex = 0;
   const results: ShortestPath[] = [];
   let shortest: number | undefined;
-  while (queue.length > 0) {
-    const current = queue.shift()!;
+  while (queueIndex < queue.length) {
+    const current = queue[queueIndex++]!;
     const depth = current.subjects.length - 1;
     if (shortest !== undefined && depth > shortest) continue;
     const subject = current.subjects[current.subjects.length - 1]!;
@@ -153,7 +164,7 @@ export function findShortestPaths(edges: readonly RelationEdge[], sources: reado
       continue;
     }
     if (depth >= options.max_depth) continue;
-    for (const edge of outgoing(edges, subject, options.direction, relationKinds)) {
+    for (const edge of bySubject.get(subject) ?? []) {
       if (current.subjects.includes(edge.target)) continue;
       queue.push({ subjects: [...current.subjects, edge.target], relations: [...current.relations, edge.relation_kind], classifications: [...current.classifications, edge.classification] });
     }

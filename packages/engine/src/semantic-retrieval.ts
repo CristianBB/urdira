@@ -1,4 +1,5 @@
 import { canonicalVectorBytes } from "./semantic-runtime.js";
+import { nativeExactVectorTopK, nativeExactVectorTopKConfigured } from "./native-exact-vector.js";
 
 export type SemanticMetadata = Readonly<Record<string, string | number | boolean | readonly string[]>>;
 
@@ -46,6 +47,19 @@ function matchesFilter(metadata: SemanticMetadata | undefined, filter: SemanticM
   });
 }
 
+const textEncoder = new TextEncoder();
+
+function utf8Compare(left: string, right: string): number {
+  const leftBytes = textEncoder.encode(left.normalize("NFC"));
+  const rightBytes = textEncoder.encode(right.normalize("NFC"));
+  const length = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (leftBytes[index] ?? 0) - (rightBytes[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return leftBytes.length - rightBytes.length;
+}
+
 function distance(left: readonly number[], right: readonly number[], metric: ExactVectorScanOptions["distance_metric"]): number {
   if (metric === "squared_l2") return left.reduce((sum, value, index) => sum + ((value - (right[index] ?? 0)) ** 2), 0);
   const leftNorm = Math.sqrt(left.reduce((sum, value) => sum + value * value, 0));
@@ -58,11 +72,33 @@ export function exactVectorScan(candidates: readonly ExactVectorCandidate[], que
   if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit <= 0)) throw new Error("Exact semantic scan limit must be positive.");
   const elementType = options.element_type ?? "float32";
   const configuration = { dimensions: options.dimensions, element_type: elementType, normalization: options.normalization ?? "none" } as const;
-  const queryValues = values(canonicalVectorBytes(query, configuration), options.dimensions, elementType);
-  const ranked = candidates
-    .filter((candidate) => candidate.profile_id === options.profile_id && candidate.executable_binding_id === options.executable_binding_id && matchesFilter(candidate.metadata, options.filter))
-    .map((candidate) => ({ id: candidate.projection_record_id, distance: distance(values(canonicalVectorBytes(candidate.vector, configuration), options.dimensions, elementType), queryValues, options.distance_metric) }))
-    .sort((left, right) => left.distance - right.distance || left.id.localeCompare(right.id));
+  const queryBytes = canonicalVectorBytes(query, configuration);
+  const queryValues = values(queryBytes, options.dimensions, elementType);
+  const eligible = candidates.filter((candidate) => candidate.profile_id === options.profile_id && candidate.executable_binding_id === options.executable_binding_id && matchesFilter(candidate.metadata, options.filter));
+  if (eligible.length === 0) return [];
+  const identifiers = eligible.map((candidate) => candidate.projection_record_id);
+  if (new Set(identifiers).size !== identifiers.length) throw new Error("Exact semantic scan candidate identifiers must be unique.");
+  const limit = Math.min(options.limit ?? eligible.length, eligible.length);
+  if (nativeExactVectorTopKConfigured()) {
+    const width = options.dimensions * (elementType === "float32" ? 4 : 8);
+    const packedCandidates = new Uint8Array(eligible.length * width);
+    eligible.forEach((candidate, index) => packedCandidates.set(canonicalVectorBytes(candidate.vector, configuration), index * width));
+    const native = nativeExactVectorTopK({
+      query: queryBytes,
+      candidates: packedCandidates,
+      projectionRecordIds: identifiers,
+      dimensions: options.dimensions,
+      elementType: elementType === "float32" ? "float32_le" : "float64_le",
+      k: limit,
+      metric: options.distance_metric,
+    });
+    if (native === undefined) throw new Error("Native exact vector top-k configuration changed during the query.");
+    return native;
+  }
+  const vectors = eligible.map((candidate) => canonicalVectorBytes(candidate.vector, configuration));
+  const ranked = eligible
+    .map((candidate, index) => ({ id: candidate.projection_record_id, distance: distance(values(vectors[index]!, options.dimensions, elementType), queryValues, options.distance_metric) }))
+    .sort((left, right) => left.distance - right.distance || utf8Compare(left.id, right.id));
   const limited = options.limit === undefined ? ranked : ranked.slice(0, options.limit);
   return limited.map((candidate, index) => ({ projection_record_id: candidate.id, rank: index + 1 }));
 }

@@ -60,6 +60,15 @@ export interface AutomaticPluginInputAccessManifest {
 
 export type PluginInputAccessManifestDigestInput = Omit<AutomaticPluginInputAccessManifest, "plugin_input_access_manifest_id" | "manifest_digest">;
 
+const FINALIZED_ACCESS_MANIFESTS = new WeakSet<object>();
+
+/** True only for a frozen manifest whose digest was computed by this capture
+ * authority in the current process. Deserialized or plugin-supplied values
+ * are never trusted by this shortcut. */
+export function isFinalizedPluginInputAccessManifest(value: AutomaticPluginInputAccessManifest): boolean {
+  return FINALIZED_ACCESS_MANIFESTS.has(value as object);
+}
+
 export function pluginInputAccessManifestId(requestId: string, analysisViewDigest: string): string {
   return canonicalSha256({ request_id: requestId, analysis_view_digest: analysisViewDigest });
 }
@@ -327,6 +336,7 @@ export class PluginAccessManifestCapture {
       ...manifestDigestInput,
       manifest_digest: pluginInputAccessManifestDigest(manifestDigestInput),
     });
+    FINALIZED_ACCESS_MANIFESTS.add(manifest as object);
     const inputArtifactVersionIds = orderedUnique([...this.#directArtifactVersionIds, ...transitiveArtifacts]);
     const inputRecordIds = orderedUnique(recordEntries.filter((entry): entry is PluginCapturedBaseRecordEntry => entry.input_type === "base_record").map((entry) => entry.record_id));
     const analysisInputDigest = canonicalSha256({
