@@ -20,7 +20,15 @@ The first analyzer is one plugin, `urdira:javascript_typescript`, owning namespa
 
 The contribution supplies the byte-identical shared `javascript` and `typescript` `LanguageDefinition` values from the core taxonomy. JavaScript artifacts, including JSX-enabled source, store `javascript`; TypeScript artifacts, including TSX-enabled source, store `typescript`. `js`, `jsx`, `mjs`, `cjs`, `ts`, `tsx`, `mts`, and `cts` are discovery/file-hint aliases only and never persisted as language IDs.
 
-The TypeScript compiler API is authoritative for parsing, binding, module resolution, symbols, types, overloads, and compiler-compatible control-flow facts. Incremental `Program` or builder APIs may accelerate a worker request, but worker state is disposable and never authoritative. The interactive TypeScript language service is not required for correctness and is used only if its answer is proven equivalent to the frozen compiler-program inputs.
+The TypeScript compiler API is authoritative for binding, module resolution,
+symbols, types, overloads, and compiler-compatible control-flow facts. The
+approved Rust syntax worker is the exclusive production authority for the
+stage-one parse, declarations, containment, syntactic imports and exports,
+direct dependency graph, and reverse affected set. Incremental `Program` or
+builder APIs may accelerate a later semantic worker request, but worker state
+is disposable and never authoritative. The interactive TypeScript language
+service is not required for correctness and is used only if its answer is
+proven equivalent to the frozen compiler-program inputs.
 
 Structural publication uses three fixed reusable passes: (1) declarations,
 containment, syntactic imports, and exports; (2) resolved symbols, references,
@@ -29,23 +37,46 @@ control/data flow, effects, test relationships, and semantic preparation. The
 worker may reuse one immutable program/session; stage three must match a fresh
 monolithic analysis in visible records and canonical/projection digests.
 
-Stage 1 is a memory-bounded syntax frontier. It uses `analyzeSyntaxProject` and
-must not construct a project-wide TypeScript `Program` or `Checker`; those
-objects retain the complete source graph and are reserved for later semantic
-stages. A syntax result may be reused for a compatible narrowed closure, but
-the worker retains at most one such result and a bounded source-hash memo (512
-entries or 16 MiB of UTF-8 text). Any checker-backed stage releases the
-syntax-only result before retaining its semantic analysis. This restriction
-changes no published capability: typed, resolved, diagnostic, flow, and
+Stage 1 is a memory-bounded native syntax frontier. It must not create or
+invoke a TypeScript process, construct a project-wide TypeScript `Program` or
+`Checker`, decode source again in Node, or run the legacy TypeScript syntax
+analyzer. The persistent Rust worker retains content-keyed syntax facts and a
+bounded dependency graph. It emits already constructed stage-one record and
+dependency rows through per-owner cursor pages; Node validates and stages
+those rows without reconstructing them from native entities or retaining
+another workspace-sized syntax graph. Typed, resolved, diagnostic, flow, and
 semantic-preparation facts remain unavailable until their owning later stage.
 
-No second parser defines canonical identity. A lightweight scanner may preclassify files or compute local invalidation candidates, but every published syntax or semantic fact is validated against the exact TypeScript syntax tree and program selected by the work item.
+Exactly one engine owns each production capability. Rust exclusively performs
+stage-one source decoding, parsing, declaration and import extraction, graph
+maintenance, affected-set calculation, and stage-one fact construction.
+TypeScript may parse internally only as an inseparable prerequisite of the
+checker-backed stages two and three; those stages cannot publish or reconstruct
+stage-one records. Shadow comparison is test and qualification machinery only
+and is absent from the activated production path. Unsupported or malformed
+native syntax fails the candidate closed instead of falling back to the legacy
+TypeScript syntax implementation. Process, state, reset, and build-identity
+rules are defined by [Rust native acceleration](25-rust-native-acceleration.md).
+
+Checker-rendered types do not replace the declaration entities emitted by
+Rust. Stage three publishes a distinct `jsts:entity_inferred_type` plus a
+`jsts:relation_type_of` edge to the stable stage-one declaration identity.
+This preserves exact type information while preventing TypeScript from
+serializing a second copy of any stage-one declaration, containment, import,
+or export record.
+
+The Rust-authoritative affected scope is mandatory on the checker preparation
+call and every owner publication call. It is narrowed to the owner's verified
+closure without changing authority or selecting a second analysis key. The
+production route retains one checker process and reuses its verified content
+hashes for stages two and three, so per-owner publication does not reread or
+decode source blobs already consumed while preparing the program.
 
 ## Language and artifact scope
 
 The MVP accepts `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.d.ts`, `.d.mts`, and `.d.cts`, plus JSON files consumed by supported module resolution or project configuration. JavaScript uses the project's `allowJs`, `checkJs`, JSDoc, and module-detection rules; when no project config exists, Urdira creates a documented inferred project with conservative defaults derived only from file extensions and nearest package metadata.
 
-Supported syntax is exactly the syntax accepted by the pinned compiler release, including JSX/TSX, decorators under the selected compiler mode, namespaces, enums, private fields, top-level await, imports, exports, and JSDoc types. A file requiring a newer syntax version is retained with the exact unsupported-syntax diagnostic and incomplete capability state rather than partially parsed by another engine.
+Supported syntax must be accepted by both the pinned Oxc stage-one parser and the pinned compiler release, including JSX/TSX, decorators under the selected compiler mode, namespaces, enums, private fields, top-level await, imports, exports, and JSDoc types. Malformed input or syntax outside that intersection fails the candidate closed with a bounded native-worker error. It is never partially parsed or reprocessed by the TypeScript stage-one implementation.
 
 JSON, Markdown, CSS, templates, and other assets remain source artifacts and participate in lexical and generic semantic search. They receive JavaScript/TypeScript canonical semantics only when a registered plugin or later framework enricher contributes them.
 

@@ -80,6 +80,9 @@ importers:
       '@urdira/mcp':
         specifier: workspace:*
         version: link:../../packages/mcp
+      '@urdira/native':
+        specifier: workspace:*
+        version: link:../../packages/native
       '@urdira/plugin-javascript-typescript':
         specifier: workspace:*
         version: link:../../packages/plugin-javascript-typescript
@@ -184,6 +187,8 @@ importers:
       '@urdira/engine':
         specifier: workspace:*
         version: link:../engine
+
+  packages/native: {}
 
   packages/plugin-javascript-typescript:
     dependencies:

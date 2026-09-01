@@ -200,6 +200,7 @@ Status meanings in this table:
 | `PluginCompatibilityDeclaration` | Plugin registry | Approved concept | This specification |
 | `PluginResolutionLock` | Control | Approved concept | This specification |
 | `ResolvedPlugin` | Control | Approved concept | This specification |
+| `PluginRuntimeExecutableBinding` | Control value | Approved model | [Rust native acceleration](25-rust-native-acceleration.md) |
 | `RegistryCompatibilityAssessment` | Control | Approved concept | This specification |
 | `DefinitionChangeAssessment` | Control | Approved concept | This specification |
 | `PluginAnalysisChange` | Control | Approved concept | This specification |
@@ -2357,6 +2358,7 @@ ResolvedPlugin
   registry_contract_version
   resolved_dependency_plugin_ids[]
   effective_capabilities[]
+  runtime_executable_binding?
 ```
 
 `PluginCompatibilityDeclaration` fields:
@@ -2399,6 +2401,7 @@ The default configuration resolver evaluates recommendations only while construc
 - `registry_contract_version` is the exact positive integer registry contract selected for this contribution.
 - `resolved_dependency_plugin_ids` is the deduplicated set of dependency owners selected in the same lock. The complete dependency graph must be acyclic.
 - `effective_capabilities` is the complete set of negotiated `PluginCapabilityDeclaration` values available under the selected package, contracts, dependencies, platform, and workspace configuration.
+- `runtime_executable_binding` is absent only for a preserved version-1 package. When present, it is the complete validated `PluginRuntimeExecutableBinding@1`; its target, runtime contract, build, implementation, package, entrypoint, and binding digest are copied into the lock and cannot be reselected during a request.
 
 Resolution considers only locally installed packages or packages made available by explicit local configuration. It never downloads a plugin implicitly. Explicit workspace pins take priority; otherwise Urdira selects the highest stable versions satisfying the complete dependency graph. Prereleases participate only when their requirement permits them. Installing a newer package does not mutate an existing lock.
 

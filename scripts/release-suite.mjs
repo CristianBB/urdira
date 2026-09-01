@@ -75,22 +75,30 @@ async function runConformanceProbes(rootDir) {
   return { semantic: "passed", sqlite: "passed", sandbox: "passed" };
 }
 
-async function packageInspection(rootDir, outputDir) {
+async function packageInspection(rootDir, outputDir, nativeRequired, targets) {
   const conformance = await runConformanceProbes(rootDir);
-  const result = await buildRelease({ rootDir, outputDir, targets: undefined, clean: true, build: true });
+  const result = await buildRelease({ rootDir, outputDir, ...(targets === undefined ? {} : { targets }), clean: true, build: true, nativeRequired });
   const config = await readReleaseConfig();
-  const required = ["package.json", "platform.json", "release.json", "checksums.sha256", "schemas/registry.json", "README.md", "LICENSE", "dist/index.js", "node_modules/@urdira/engine/dist/index.js", "node_modules/@urdira/mcp/dist/index.js", "node_modules/@urdira/daemon/dist/index.js", "node_modules/@urdira/daemon/dist/semantic-maintenance-process.js", "node_modules/@urdira/daemon/dist/semantic-neural-process.js"];
+  const required = ["package.json", "platform.json", "release.json", "checksums.sha256", "schemas/registry.json", "README.md", "LICENSE", "dist/index.js", "app/dist/index.js", "app/dist/cli.js", "node_modules/@urdira/engine/dist/index.js", "node_modules/@urdira/mcp/dist/index.js", "node_modules/@urdira/daemon/dist/index.js", "node_modules/@urdira/daemon/dist/semantic-maintenance-process.js", "node_modules/@urdira/daemon/dist/semantic-neural-process.js"];
   const checks = {};
   for (const archive of result.archives) {
     const inspection = await inspectReleaseArchive(archive.path);
     const platform = inspection.platform ?? {};
     const targetConfig = config.targets.find((target) => target.id === archive.target);
+    const windows = archive.target === "win32-x64";
+    const targetRequired = [...required, ...(nativeRequired ? [
+      windows ? "bin/urdira.exe" : "bin/urdira",
+      windows ? "runtime/node.exe" : "runtime/node",
+      "native/manifest.json",
+      "native/urdira-native.node",
+      windows ? "native/urdira-jsts-syntax-worker.exe" : "native/urdira-jsts-syntax-worker",
+    ] : [])];
     checks[archive.target] = {
       forbidden: inspection.forbidden.length,
       symlinks: inspection.symlinks.length,
       archive_errors: inspection.errors.length,
       checksum_failures: inspection.checksum_failures.length,
-      required: required.every((path) => inspection.files.includes(path)),
+      required: targetRequired.every((path) => inspection.files.includes(path)),
       conformance: platform.target === archive.target
         && platform.runtime?.sqlite === "node:sqlite"
         && platform.runtime?.semantic_runtime === "@huggingface/transformers@4.2.0"
@@ -112,14 +120,14 @@ export async function writeReleaseReport(report, path) {
   return reportWithDigest;
 }
 
-export async function runReleaseSuite({ rootDir = ROOT, outputDir = join(rootDir, "release/artifacts"), reportPath = join(rootDir, "release/reports/phase-14-release.json"), skipInstall = false } = {}) {
+export async function runReleaseSuite({ rootDir = ROOT, outputDir = join(rootDir, "release/artifacts"), reportPath = join(rootDir, "release/reports/phase-14-release.json"), skipInstall = false, nativeRequired = true, targets } = {}) {
   const started = new Date().toISOString();
   const gates = {};
   if (!skipInstall) gates.install = await runCommand(["install", "--frozen-lockfile"], rootDir);
   for (const gate of RELEASE_GATES) {
     try {
       if (gate === "benchmark") gates[gate] = await runBenchmark(rootDir);
-      else if (gate === "package_inspection") gates[gate] = await packageInspection(rootDir, outputDir);
+      else if (gate === "package_inspection") gates[gate] = await packageInspection(rootDir, outputDir, nativeRequired, targets);
       else gates[gate] = await runCommand(commands[gate], rootDir);
     } catch (error) {
       gates[gate] = { status: "failed", output: String(error instanceof Error ? error.stack ?? error.message : error) };
@@ -145,6 +153,11 @@ export async function runReleaseSuite({ rootDir = ROOT, outputDir = join(rootDir
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
-  const report = await runReleaseSuite({ rootDir: ROOT, skipInstall: process.env.URDIRA_SKIP_INSTALL === "1" });
+  const selectedTarget = process.env.URDIRA_RELEASE_TARGET;
+  const report = await runReleaseSuite({
+    rootDir: ROOT,
+    skipInstall: process.env.URDIRA_SKIP_INSTALL === "1",
+    ...(selectedTarget === undefined ? {} : { targets: [selectedTarget] }),
+  });
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }

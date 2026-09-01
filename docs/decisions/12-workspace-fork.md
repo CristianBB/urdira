@@ -34,13 +34,16 @@ records or computing a full Git status.
 
 1. Enumerate and hash the target source without publishing it.
 2. Select and verify a donor and its plugin resolution.
-3. Commit the target source layer through `GenericSourceIndexer`, including
-   normal byte reads, CAS writes, lengths, and content-digest verification.
+3. Capture and validate the target source layer through `GenericSourceIndexer`,
+   including normal byte reads, CAS writes, lengths, and content-digest
+   verification; defer its typed rows to the persistent Rust indexing core for
+   the single SQLite commit (the direct TypeScript commit is test/oracle-only).
 4. Copy the donor's visible canonical rows into the target database while
    rewriting target-local ownership and dependency references.
 5. Build and atomically publish a fresh target generation and snapshot.
 6. Verify the published target. Any failure rolls back every fork-owned source,
-   canonical, projection, control, and publication row.
+   canonical, projection, control, and publication row; source recovery uses
+   the Rust `source_index_rollback` command on the production route.
 
 If a precondition is absent or a check fails, the daemon runs the ordinary
 progressive scan. A skipped or failed fork must never leave state that changes
@@ -112,3 +115,14 @@ mints a new lock/configuration identity and forces complete reanalysis.
   workspaces.
 - Disabling the optimization changes performance only; the progressive scan
   remains authoritative.
+
+## Rust cutover amendment (2026-08-31)
+
+The donor-row bulk copier described above remains a compatibility/oracle
+implementation because it writes target structural rows through the
+TypeScript storage adapter. When a persistent `urdira-indexing-worker` is
+available, the daemon does not enter this copier (and the engine rejects an
+injected Rust writer at its boundary); it falls through to the ordinary Rust
+generation. This keeps one production structural SQLite writer. A future
+Rust-native donor-copy command may re-enable the optimization without
+changing the fork's byte or publication contracts.

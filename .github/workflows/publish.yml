@@ -13,7 +13,63 @@ permissions:
   id-token: write
 
 jobs:
+  native-targets:
+    name: Build native publish closure (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+          - target: darwin-x64
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+          - target: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+          - target: linux-x64-gnu
+            runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+          - target: win32-x64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 11.20.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.rust_target }}
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build exact native closure
+        run: pnpm build:native
+        env:
+          URDIRA_RELEASE_TARGET: ${{ matrix.target }}
+      - name: Upload native closure
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.target }}
+          path: release/native/${{ matrix.target }}/
+          if-no-files-found: error
+
   publish:
+    needs: native-targets
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: npm-production
@@ -36,12 +92,31 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
           registry-url: https://registry.npmjs.org
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Install Rust audit tools
+        run: cargo install cargo-audit --version 0.22.2 --locked && cargo install cargo-deny --version 0.20.2 --locked
       - name: Verify release source
-        run: pnpm verify && pnpm audit --prod
+        run: pnpm audit:native && pnpm verify && pnpm audit --prod
+      - uses: actions/download-artifact@v8
+        with: { name: native-darwin-arm64, path: release/native/darwin-arm64 }
+      - uses: actions/download-artifact@v8
+        with: { name: native-darwin-x64, path: release/native/darwin-x64 }
+      - uses: actions/download-artifact@v8
+        with: { name: native-linux-arm64-gnu, path: release/native/linux-arm64-gnu }
+      - uses: actions/download-artifact@v8
+        with: { name: native-linux-x64-gnu, path: release/native/linux-x64-gnu }
+      - uses: actions/download-artifact@v8
+        with: { name: native-win32-x64, path: release/native/win32-x64 }
       - name: Build and smoke-test npm packages
         run: pnpm package:npm:smoke
+        env:
+          URDIRA_REQUIRE_ALL_NATIVE_TARGETS: "1"
       - name: Publish in dependency order with provenance
         shell: bash
         run: |

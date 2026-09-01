@@ -38,6 +38,22 @@ The authoritative model shapes and field semantics are defined under **Namespace
 
 ## Approved decisions
 
+The optimized structural route is a core protocol, not a JavaScript/TypeScript
+exception. Every language adapter uses the roles and limits in the
+[structural indexing fast path](../protocol/structural-indexing-fast-path.md):
+language-owned syntax and semantic authority ends at owner-delimited
+`FactDeltaStream@2`; the core-owned Rust kernel, typed candidate staging,
+receipts and set-based SQLite publication are shared. Cold indexing is the
+empty-base case and incremental indexing uses the same route with typed
+closures. A new language cannot require a language identifier or branch in
+engine, native-core or storage code.
+
+The private oracle handshake may place that same core-owned kernel inside the
+supervised language process after exact path/API verification. Adapters then
+construct each owner observation set once and reuse the Rust seal for header,
+framing and staging. This placement is generic and cannot give the core a
+language namespace, compiler rule or plugin-owned semantic decision.
+
 - Plugin registration is one atomic closed contribution covering every typed identifier the plugin may emit.
 - Candidate execution output uses `FactDelta`; invalid output creates `CandidateIssue` control-plane state and never canonical diagnostics.
 - Runtime, registry, package, capability, analyzer, and public API versions remain independent compatibility axes.
@@ -71,7 +87,18 @@ Every declared language resolves to an active canonical `LanguageDefinition` in 
 
 ## Extraction protocol
 
-The negotiated runtime exposes four core-owned calls: `describe`, `discover_partitions`, `analyze_artifact`, and `generate_projection`. `describe` returns the already installed compatibility declaration and contribution digests for verification; it cannot vary by workspace. `discover_partitions` implements the pure discovery contract above. `analyze_artifact` consumes one frozen `ArtifactWorkItem` and produces exactly one `FactDelta`. `generate_projection` consumes one frozen `ProjectionWorkItem` and produces one complete projection replacement set.
+The negotiated runtime exposes five core-owned calls: `describe`,
+`discover_partitions`, `analyze_artifact`, `analyze_closure`, and
+`generate_projection`. `describe` returns the already installed compatibility
+declaration and contribution digests for verification; it cannot vary by
+workspace. `discover_partitions` implements the pure discovery contract above.
+`analyze_artifact` consumes one frozen `ArtifactWorkItem` and produces exactly
+one `FactDelta` or bounded `FactDeltaStream`. `analyze_closure` is the bounded
+project or partition form used when exact cross-file semantics cannot be
+expressed as independent artifact calls; it retains the same frozen-view,
+access-manifest, budget, replacement, and failure rules. `generate_projection`
+consumes one frozen `ProjectionWorkItem` and produces one complete projection
+replacement set.
 
 ```text
 PluginWorkerRequestEnvelope
@@ -288,7 +315,21 @@ PluginFailed
   details
 ```
 
-Request `call` is exactly `describe`, `discover_partitions`, `analyze_artifact`, or `generate_projection`, and selects its one payload type. Response `outcome` is `success`, `inputs_incomplete`, `unsupported`, `cancelled`, `resource_exhausted`, or `failed` and selects one closed result variant. Unknown fields or variants reject the response. Every non-success value contains `candidate_issue_code`, `retryability`, a bounded safe `message`, and closed code-specific `details`; it never contains a stack trace, absolute host path, environment value, arbitrary log, or secret.
+Request `call` is exactly `describe`, `discover_partitions`,
+`analyze_artifact`, `analyze_closure`, or `generate_projection`, and selects its
+one payload type. Response `outcome` is `success`, `inputs_incomplete`,
+`unsupported`, `cancelled`, `resource_exhausted`, or `failed` and selects one
+closed result variant. Unknown fields or variants reject the response. Every
+non-success value contains `candidate_issue_code`, `retryability`, a bounded
+safe `message`, and closed code-specific `details`; it never contains a stack
+trace, absolute host path, environment value, arbitrary log, or secret.
+
+Production plugin calls use the supervised process boundary above. A worker
+thread or in-process adapter is permitted only by conformance tests and cannot
+be selected as a production fallback. The built-in JavaScript/TypeScript
+plugin's Rust syntax process and TypeScript checker process are separately
+verified components of one analyzer implementation binding as specified by
+[Rust native acceleration](25-rust-native-acceleration.md).
 
 `PluginAnalysisView` is the exact base snapshot plus validated candidate source overlay and only validated staged outputs of prerequisite DAG work. It excludes base records scheduled for closure or replacement and excludes unvalidated, failed, concurrent non-prerequisite, and downstream staged output. The same digest yields the same visible bytes and records regardless of scheduling. `content_access` is `readable` or `metadata_only` under policy.
 

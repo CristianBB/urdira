@@ -80,6 +80,11 @@ current generation:
 5. The ordinary immutable-row, generation, publication, and current-pointer
    checks succeed in the same transaction used by workspace-fork publication.
 
+Target source catalog capture is deferred to the persistent Rust indexing core
+and committed through its closed source-index protocol. Pack import therefore
+shares the production writer and recovery boundary with ordinary scans; the
+TypeScript source commit remains an explicit test/oracle route only.
+
 Per-record body verification normally runs in one or two bounded workers while
 the scratch donor is being streamed and the target source layer is being
 cataloged. Corruption is rejected before bulk copy or publication. The
@@ -146,3 +151,14 @@ gate. Current non-normative performance and live corruption evidence is in
 [`../evidence/2026-08-24-index-pack-codec-performance.md`](../evidence/2026-08-24-index-pack-codec-performance.md)
 and
 [`../evidence/2026-08-24-readiness-queue-implementation.md`](../evidence/2026-08-24-readiness-queue-implementation.md).
+
+## Rust cutover amendment (2026-08-31)
+
+Pack bulk-copy and its target publication transaction remain a
+compatibility/oracle implementation. A daemon with the persistent Rust
+composition worker consumes the pending pack request and deliberately falls
+through to the normal Rust generation; the engine also rejects an injected
+Rust writer at the legacy import boundary. Thus no production pack attempt
+can open a second TypeScript structural writer. A Rust-native pack-copy
+command can restore this optimization later while retaining the same
+verification and publication contracts.

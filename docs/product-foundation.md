@@ -44,11 +44,18 @@ current architecture.
 | 22 | v3 bounded pipelines, incremental digests, and destructive data-root boundary | Approved and implemented | [v3 optimization](decisions/22-v3-optimization.md) |
 | 23 | Cross-machine index pack bootstrap | Approved and implemented | [Index pack](decisions/23-index-pack.md) |
 | 24 | Local web interface | Approved and implemented | [Local web interface](decisions/24-local-web-interface.md) |
+| 25 | Rust native acceleration | Approved | [Rust native acceleration](decisions/25-rust-native-acceleration.md) |
+
+The 2026-08-29 Rust indexing-core cutover is governed by the amendments in
+Decisions 21, 22 and 25 and the [structural indexing fast path](protocol/structural-indexing-fast-path.md).
+The accompanying handoff is evidence only and cannot override these current
+specifications.
 
 The order expresses dependency between current specifications. Decisions 21
 and 22 define the v3 native pipeline, relational authority, logical digests,
 and data-root boundary. Decision 23 defines optional verified index-pack
-bootstrap. The [current architecture](architecture.md) maps these contracts to
+bootstrap. Decision 25 defines mandatory bounded Rust library and worker
+boundaries without changing SQLite or public-query authority. The [current architecture](architecture.md) maps these contracts to
 the production composition roots.
 
 `decisions/01-universal-data-model.md` is the complete inventory and source of truth for shared logical model names and shapes. Operation-specific public argument schemas are linked from that inventory to the single authoritative [Public query contract](protocol/public-query-contract.md); no document may define a parallel or legacy variant.
@@ -592,8 +599,8 @@ Relational persistence, native worker transfer, and incremental logical digest c
 
 ## Contract maintenance
 
-The 23 linked specifications collectively define the current implemented
-architecture. Exact compiler/runtime versions, supported release targets, and
+The 25 linked specifications collectively define the current implemented and
+approved architecture. Exact compiler/runtime versions, supported release targets, and
 benchmark corpus commits are recorded in release manifests and evidence.
 
 A change to identity, ownership, exactness, evidence, completeness, plugin

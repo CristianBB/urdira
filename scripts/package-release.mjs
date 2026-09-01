@@ -15,6 +15,7 @@ import {
   sha256,
   validateReleaseConfig,
 } from "./release-contract.mjs";
+import { stageNativeArtifacts } from "./native-release.mjs";
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -178,7 +179,17 @@ async function listFiles(root, current = root) {
   for (const entry of (await readdir(current, { withFileTypes: true })).sort((left, right) => compareNames(left.name, right.name))) {
     const path = join(current, entry.name);
     if (entry.isDirectory()) output.push(...await listFiles(root, path));
-    else output.push({ path, relative_path: unix(relative(root, path)), mode: unix(relative(root, path)) === "bin/urdira.mjs" ? 0o755 : 0o644 });
+    else {
+      const relativePath = unix(relative(root, path));
+      const executable = relativePath === "bin/urdira.mjs"
+        || relativePath === "bin/urdira"
+        || relativePath === "bin/urdira.exe"
+        || relativePath === "runtime/node"
+        || relativePath === "runtime/node.exe"
+        || relativePath === "native/urdira-jsts-syntax-worker"
+        || relativePath === "native/urdira-jsts-syntax-worker.exe";
+      output.push({ path, relative_path: relativePath, mode: executable ? 0o755 : 0o644 });
+    }
   }
   return output;
 }
@@ -294,7 +305,7 @@ export async function writeDeterministicArchive(root, destination) {
   return { path: destination, digest: sha256(archive), byte_length: archive.byteLength };
 }
 
-export async function stageProductionTree({ rootDir = SCRIPT_ROOT, stageRoot, targetId, metadata }) {
+export async function stageProductionTree({ rootDir = SCRIPT_ROOT, stageRoot, targetId, metadata, nativeArtifactRoot, nativeRequired = true }) {
   const config = await readReleaseConfig();
   const target = targetRecord(config, targetId);
   await mkdir(stageRoot, { recursive: true });
@@ -302,6 +313,7 @@ export async function stageProductionTree({ rootDir = SCRIPT_ROOT, stageRoot, ta
   for (const name of PRODUCTION_PACKAGE_NAMES) await stageProductionPackage(name, rootDir, stageRoot, copied, target.watcher, target);
   const appSource = join(rootDir, "apps", "urdira", "dist");
   await copyBuildPayload(appSource, join(stageRoot, "dist"));
+  await copyBuildPayload(appSource, join(stageRoot, "app", "dist"));
   const productionVersions = new Map(await Promise.all(PRODUCTION_PACKAGE_NAMES.map(async (name) => [name, (await readJson(join(rootDir, packagePath(name), "package.json"))).version])));
   await writeJson(join(stageRoot, "package.json"), { name: "urdira", version: productionVersions.get("@urdira/runtime"), type: "module", license: "MIT", engines: { node: ">=24.18.1" }, main: "./dist/index.js", bin: { urdira: "./bin/urdira.mjs" }, dependencies: Object.fromEntries(PRODUCTION_PACKAGE_NAMES.filter((name) => name !== "urdira" && name !== "@urdira/runtime").map((name) => [name, productionVersions.get(name)])) });
   await cp(join(rootDir, "README.md"), join(stageRoot, "README.md"));
@@ -309,6 +321,10 @@ export async function stageProductionTree({ rootDir = SCRIPT_ROOT, stageRoot, ta
   await mkdir(join(stageRoot, "bin"), { recursive: true });
   await writeFile(join(stageRoot, "bin/urdira.mjs"), "#!/usr/bin/env node\nconst { runUrdira, runUrdiraMcp } = await import('../dist/index.js');\nconst argv = process.argv.slice(2);\nconst endpoint = process.env.URDIRA_ENDPOINT;\nif (argv[0] === 'mcp') {\n  const handle = await runUrdiraMcp({ ...(endpoint === undefined ? {} : { endpoint }) });\n  process.stdin.resume();\n  await new Promise((resolve) => process.stdin.once('end', resolve));\n  await handle.close();\n} else {\n  const result = await runUrdira(argv, { ...(endpoint === undefined ? {} : { endpoint }) });\n  process.stdout.write(result.stdout);\n}\n");
   await chmod(join(stageRoot, "bin/urdira.mjs"), 0o755);
+  if (nativeRequired) {
+    const root = nativeArtifactRoot ?? join(rootDir, "release", "native", target.id);
+    await stageNativeArtifacts({ artifactRoot: root, stageRoot, target: target.id });
+  }
   await writeJson(join(stageRoot, "platform.json"), { target: target.id, os: target.os, architecture: target.architecture, ...(target.libc === undefined ? {} : { libc: target.libc, minimum_libc: target.minimum_libc }), ...(target.minimum_os === undefined ? {} : { minimum_os: target.minimum_os }), runtime: config.runtime, watcher: target.watcher_package });
   const contracts = await import("@urdira/contracts");
   await writeJson(join(stageRoot, "schemas", "registry.json"), {
@@ -316,7 +332,7 @@ export async function stageProductionTree({ rootDir = SCRIPT_ROOT, stageRoot, ta
     operation_registry: contracts.operationRegistry.map((operation) => ({ operation_id: operation.operation_id, operation_version: operation.operation_version })).sort((left, right) => compareNames(left.operation_id, right.operation_id)),
     recipe_registry: contracts.recipeRegistry.map((recipe) => ({ recipe_id: recipe.recipe_id, recipe_version: recipe.recipe_version })).sort((left, right) => compareNames(left.recipe_id, right.recipe_id)),
   });
-  await writeJson(join(stageRoot, "release.json"), metadata);
+  await writeJson(join(stageRoot, "release.json"), { ...metadata, target: target.id, rust_target: target.rust_target });
   const inspection = await inspectProductionTree(stageRoot);
   if (inspection.symlinks.length > 0) throw new Error(`Production tree contains symlinks: ${inspection.symlinks.join(", ")}`);
   if (inspection.forbidden.length > 0) throw new Error(`Production tree contains forbidden members: ${inspection.forbidden.map((entry) => entry.relative_path).join(", ")}`);
@@ -326,7 +342,7 @@ export async function stageProductionTree({ rootDir = SCRIPT_ROOT, stageRoot, ta
   return { target, inspection: await inspectProductionTree(stageRoot), checksums };
 }
 
-export async function buildRelease({ rootDir = SCRIPT_ROOT, outputDir = join(rootDir, "release", "artifacts"), targets = SUPPORTED_TARGETS, clean = true, build = true } = {}) {
+export async function buildRelease({ rootDir = SCRIPT_ROOT, outputDir = join(rootDir, "release", "artifacts"), targets = SUPPORTED_TARGETS, clean = true, build = true, nativeArtifactRoot, nativeRequired = true } = {}) {
   const config = await readReleaseConfig();
   const configErrors = validateReleaseConfig(config);
   if (configErrors.length > 0) throw new Error(`Invalid release configuration: ${configErrors.join("; ")}`);
@@ -343,7 +359,7 @@ export async function buildRelease({ rootDir = SCRIPT_ROOT, outputDir = join(roo
   const inspections = {};
   for (const targetId of targets) {
     const stageRoot = join(outputDir, "staging", targetId);
-    const staged = await stageProductionTree({ rootDir, stageRoot, targetId, metadata });
+    const staged = await stageProductionTree({ rootDir, stageRoot, targetId, metadata, nativeArtifactRoot: nativeArtifactRoot === undefined ? undefined : join(nativeArtifactRoot, targetId), nativeRequired });
     const archive = await writeDeterministicArchive(stageRoot, join(outputDir, `urdira-${targetId}-${metadata.engine_version}.tar.gz`));
     archives.push({ target: targetId, ...archive });
     inspections[targetId] = staged.inspection;

@@ -138,7 +138,7 @@ The dependency-free bootstrap additionally provides `runtime prepare/status`. Ru
 
 Neither layer offers general shell execution, build/test execution, source editing, patching, Git checkout, hook invocation, arbitrary package-manager execution, or arbitrary plugin methods. `query` uses the same public API and exact schemas as MCP. Destructive commands resolve exact targets, print the dry-run plan, and require the lifecycle confirmation contract; idempotent daemon start/stop are the explicit lifecycle intent and run directly.
 
-CLI syntax and local lifecycle admission are validated before daemon resolution. `daemon start` and `daemon stop` are direct idempotent commands and do not require `--dry-run` or `--confirm`: start attaches to an existing compatible daemon or launches a detached one, while stop never starts a missing daemon and otherwise returns `already_stopped`. A human start renders the normative `locking`, `catalog_verification`, `workspace_recovery`, `provider_reconciliation`, and `ready` phases immediately on stderr while preserving machine-readable stdout. `workspace add` prints its detected technology, confidence, evidence, and compatible-plugin proposal before asking two explicit interactive confirmations; `workspace configure` instead identifies its exact workspace target and configuration because it does not perform technology detection. `--dry-run` remains an optional preview, while destructive administrative operations retain explicit `--confirm`.
+CLI syntax and local lifecycle admission are validated before daemon resolution. `daemon start` and `daemon stop` are direct idempotent commands and do not require `--dry-run` or `--confirm`: start attaches to an existing compatible daemon or launches a detached one, while stop never starts a missing daemon and otherwise returns `already_stopped`. A human start renders the normative `locking`, `catalog_verification`, `workspace_recovery`, `provider_reconciliation`, and `ready` phases immediately on stderr while preserving machine-readable stdout. `workspace add` prints its detected technology, confidence, compatible-plugin proposal, and a bounded deterministic evidence sample before asking two explicit interactive confirmations. An incomplete sample declares both its total evidence count and incompleteness while the proposal fingerprint continues to commit to the complete detection result; `workspace configure` instead identifies its exact workspace target and configuration because it does not perform technology detection. `--dry-run` remains an optional preview, while destructive administrative operations retain explicit `--confirm`.
 
 The composed runtime also accepts the opt-in `--debug-timing` diagnostic flag on
 runtime commands. It propagates `URDIRA_DEBUG_TIMING` and
@@ -153,7 +153,17 @@ The first public entry package is the dependency-free `urdira` npm bootstrap, su
 
 `urdira --version`, `urdira --help`, and `urdira runtime status` work before runtime preparation. Any command requiring the composed application first enforces the declared minimum Node version before resolving or executing the private runtime, and presents the same runtime-preparation dry-run on an interactive terminal when preparation is needed; it never prepares implicitly on a non-interactive CLI or MCP invocation. `urdira runtime prepare --confirm` is the explicit scriptable path and the only authority for the destructive pre-v3 reset defined by decision 22. Preparation discloses the exact reset target, minimum Node version, the minimum npm version required for strict install-script enforcement, that ONNX Runtime, Sharp, Parcel Watcher, and protobuf execute their exact reviewed installation scripts, and that the current Transformers.js closure contains the known deprecated `boolean@3.2.0` package. The bootstrap captures npm output, records that acknowledged notice, rejects any other warning, validates the installed closure before any reset, and atomically activates the versioned runtime. Subsequent commands execute the exact private runtime entry point without package-manager access.
 
-Neither npm package bundles Node.js. During confirmed runtime preparation, platform-native dependencies are selected by npm for the installation host and must pass the supported-platform CI and package smoke tests. Deterministic per-platform archives remain a secondary offline distribution and bypass npm runtime preparation: they contain the daemon, CLI, MCP adapter, schema registry, and required runtime dependency closure, but no model weights. Both delivery forms expose the same application and protocol contracts.
+The npm bootstrap does not bundle Node.js. During confirmed runtime
+preparation, platform-native dependencies are selected for the installation
+host and must pass the supported-platform CI and package smoke tests. The
+prepared runtime includes the exact verified Rust addon and worker builds;
+their absence or mismatch aborts atomic activation. Deterministic per-platform
+archives remain an offline distribution and bypass npm runtime preparation:
+they contain a private pinned Node runtime, the daemon, CLI, MCP adapter,
+schema registry, and exactly one target's required native dependency closure,
+but no model weights. Both delivery forms expose the same application and
+protocol contracts. No destination toolchain or installation script compiles
+Rust code.
 
 Publication is staged from the production allowlist rather than from the workspace manifests directly. The runtime package and complete dependency closure publish before the bootstrap, whose embedded runtime coordinate must match exactly. The staging gate rejects bootstrap dependencies, `workspace:*` ranges, private or test-only dependencies, missing license/readme files, source/test payloads, and version drift. Official npm publication uses npm trusted publishing with provenance after the package namespace and workflow are configured; the initial namespace bootstrap may require a one-time interactive publish by an organization owner.
 
@@ -216,3 +226,14 @@ Windows grace preserves the child's committed-progress counters across slower
 process IPC and shutdown. Query-host crashes reject in-flight work and are
 restarted lazily, with a three-crashes-per-sixty-seconds circuit breaker and a
 sixty-second cooldown. Shutdown drains or terminates every semantic child.
+
+## Structural indexing-core packaging amendment (2026-08-29)
+
+The target-native closure also includes the persistent Rust composition worker,
+`urdira-indexing-core`, and the JavaScript/TypeScript indexing engine. The
+daemon starts one worker per registered workspace and exposes only the closed
+generation/progress/status/cancel/shutdown boundary to the TypeScript shell.
+The worker owns the workspace writer connection; structural rows and
+per-owner callbacks never cross the application Node-API boundary. Archives
+must checksum these binaries alongside the existing addon, syntax worker and
+launcher, and startup fails closed on a missing or mismatched worker digest.

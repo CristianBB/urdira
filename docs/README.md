@@ -14,9 +14,16 @@ implementation or release.
    diagnostic registry, indexing registry, semantic registry, or compatibility
    contract.
    For Urdira's native indexing/storage lineage and destructive v3 boundary,
-   also read [native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md), [v3 optimization](decisions/22-v3-optimization.md), [index pack](decisions/23-index-pack.md), and [local web interface](decisions/24-local-web-interface.md).
+   also read [native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md), [v3 optimization](decisions/22-v3-optimization.md), [index pack](decisions/23-index-pack.md), [local web interface](decisions/24-local-web-interface.md), and [Rust native acceleration](decisions/25-rust-native-acceleration.md).
+   The private language-neutral cold/incremental route is defined by the
+   [structural indexing fast path](protocol/structural-indexing-fast-path.md).
 5. Use [audits](audits/), [evidence](evidence/), and public benchmark reports
    only as verification. They cannot introduce product behavior.
+   The current Rust-core indexing transition is summarized in the
+   [evidence-backed fresh-session handoff](evidence/2026-08-29-rust-core-indexing-handoff.md);
+   it remains non-normative evidence. The implemented cutover contract is
+   defined by the amendments in Decisions 21, 22, 25 and the structural fast
+   path protocol.
 6. Use the [release process](release.md) for qualification and publication.
 
 Contributors and coding agents must also read [AGENTS.md](../AGENTS.md),

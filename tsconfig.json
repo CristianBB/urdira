@@ -25,6 +25,7 @@
   "references": [
     { "path": "packages/contracts" },
     { "path": "packages/canonical" },
+    { "path": "packages/native" },
     { "path": "packages/security" },
     { "path": "packages/storage" },
     { "path": "packages/plugin-sdk" },

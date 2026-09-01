@@ -4,6 +4,10 @@ dist/
 coverage/
 .turbo/
 .cache/
+target/
+/fuzz/artifacts/
+/packages/native/prebuilds/
+/release/native/
 *.log
 .env
 .env.*
@@ -19,6 +23,7 @@ release/artifacts/
 release/artifacts-test/
 release/npm/
 release/reports/*.json
+!release/reports/exact-vector-top-k-darwin-arm64-2026-08-28.json
 release/benchmarks/results/
 .DS_Store
 tsconfig.tsbuildinfo

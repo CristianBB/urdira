@@ -1,5 +1,8 @@
 export const SUPPORTED_TARGETS: readonly string[];
+export const NATIVE_NPM_PACKAGES: Readonly<Record<string, string>>;
+export const NATIVE_NPM_PACKAGE_NAMES: readonly string[];
 export const PRODUCTION_PACKAGE_NAMES: readonly string[];
+export const NPM_PUBLIC_PACKAGE_NAMES: readonly string[];
 export const FORBIDDEN_PRODUCTION_PATTERNS: readonly RegExp[];
 export const RELEASE_GATES: readonly string[];
 export function readReleaseConfig(configPath?: string): Promise<Record<string, unknown>>;

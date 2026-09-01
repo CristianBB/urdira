@@ -16,6 +16,13 @@
       "responsibilities": ["canonical-encoding", "digests", "comparators"]
     },
     {
+      "name": "@urdira/native",
+      "path": "packages/native",
+      "layer": 1,
+      "dependencies": [],
+      "responsibilities": ["native-loader", "logical-digest-kernels", "packed-vector-kernels", "structural-observation-profile-dispatch"]
+    },
+    {
       "name": "@urdira/security",
       "path": "packages/security",
       "layer": 2,
@@ -69,7 +76,7 @@
       "path": "packages/plugin-javascript-typescript",
       "layer": 2,
       "dependencies": ["@urdira/canonical", "@urdira/contracts", "@urdira/plugin-sdk"],
-      "responsibilities": ["javascript-typescript-analysis", "typescript-project-discovery", "language-plugin-runtime"]
+      "responsibilities": ["javascript-typescript-analysis", "typescript-project-discovery", "language-plugin-runtime", "javascript-typescript-native-observation-projection"]
     },
     {
       "name": "@urdira/embedding-local",
@@ -132,7 +139,7 @@
       "name": "@urdira/runtime",
       "path": "apps/urdira",
       "layer": 8,
-      "dependencies": ["@urdira/cli", "@urdira/contracts", "@urdira/daemon", "@urdira/embedding-local", "@urdira/engine", "@urdira/mcp", "@urdira/plugin-javascript-typescript", "@urdira/plugin-sdk", "@urdira/storage", "@urdira/web"],
+      "dependencies": ["@urdira/cli", "@urdira/contracts", "@urdira/daemon", "@urdira/embedding-local", "@urdira/engine", "@urdira/mcp", "@urdira/native", "@urdira/plugin-javascript-typescript", "@urdira/plugin-sdk", "@urdira/storage", "@urdira/web"],
       "responsibilities": ["composed-production-entry-point"]
     },
     {
@@ -143,9 +150,33 @@
       "responsibilities": ["dependency-free-distribution-bootstrap", "confirmed-runtime-preparation"]
     }
   ],
+  "native_components": [
+    {
+      "name": "urdira-indexing-core",
+      "path": "crates/urdira-indexing-core",
+      "layer": 2,
+      "dependencies": ["urdira-native-core", "urdira-worker-protocol"],
+      "responsibilities": ["generation-validation", "canonical-sealing", "sqlite-staging", "set-based-publication", "receipts", "recovery", "cancellation", "metrics"]
+    },
+    {
+      "name": "urdira-jsts-indexing-engine",
+      "path": "crates/urdira-jsts-indexing-engine",
+      "layer": 2,
+      "dependencies": ["urdira-indexing-core", "urdira-jsts-syntax-worker", "urdira-jsts-native-projection"],
+      "responsibilities": ["javascript-typescript-language-engine", "bounded-checker-groups", "incremental-engine-state"]
+    },
+    {
+      "name": "urdira-indexing-worker",
+      "path": "crates/urdira-indexing-worker",
+      "layer": 3,
+      "dependencies": ["urdira-indexing-core", "urdira-jsts-indexing-engine", "urdira-jsts-syntax-worker", "urdira-worker-protocol"],
+      "responsibilities": ["persistent-composition-worker", "workspace-operation-boundary", "progress-and-cancellation"]
+    }
+  ],
   "coverage": [
     { "area": "contracts", "owner": "@urdira/contracts" },
     { "area": "canonical-encoding", "owner": "@urdira/canonical" },
+    { "area": "native-acceleration", "owner": "@urdira/native" },
     { "area": "configuration-security", "owner": "@urdira/security" },
     { "area": "durable-storage", "owner": "@urdira/storage" },
     { "area": "core-engine", "owner": "@urdira/engine" },

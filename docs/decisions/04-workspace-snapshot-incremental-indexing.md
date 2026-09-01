@@ -83,7 +83,7 @@ The Git-reference provider resolves a branch or tag to an exact commit before en
 
 Watcher events are low-latency hints. The default scheduler begins a workspace batch after 50 ms without another related event and forces a capture after 250 ms of continuous activity. These defaults are configurable within safety bounds and do not affect logical output. Deletion, exclusion, provider reset, and explicit freshness barriers bypass ordinary debounce.
 
-Coalescing may collapse repeated modify hints for the same path before stable capture. For a concrete existing file, the directory provider may perform a stable targeted capture containing only that file; the source index applies it as partial coverage, without deletion authority, and the candidate planner diffs it against the existing catalog. A registered physical delete event bypasses source enumeration and enters the generic watch path for that artifact only. A same-batch delete/create is split into two ordered publications so a rename does not reopen a closed lifecycle in one generation. It may not erase an authoritative absence barrier, reorder provider watermarks, or merge events across different provider bindings. Overflow, provider reset, root transition, branch/admin changes, lost ordering, or an unknown delete target fall back to complete reconciliation. The stable reconciliation result, not watcher event shape, determines content updates.
+Coalescing may collapse repeated modify hints for the same path before stable capture. For a concrete existing file, the directory provider may perform a stable targeted capture containing only that file; the source index applies it as partial coverage, without deletion authority, and the candidate planner diffs it against the existing catalog. An accepted targeted content transition advances the source generation used by the following candidate, while a targeted capture with zero transitions stops before candidate creation and cannot advance workspace-wide freshness. A registered physical delete event bypasses source enumeration and enters the generic watch path for that artifact only. A same-batch delete/create is split into two ordered publications so a rename does not reopen a closed lifecycle in one generation. It may not erase an authoritative absence barrier, reorder provider watermarks, or merge events across different provider bindings. Overflow, provider reset, root transition, branch/admin changes, lost ordering, or an unknown delete target fall back to complete reconciliation. The stable reconciliation result, not watcher event shape, determines content updates.
 
 A physical watcher backend error invalidates that underlying subscription and emits one provider-reset barrier. Urdira closes the failed subscription and serially installs one replacement after bounded exponential backoff. Repeated callbacks from the invalidated subscription are stale and cannot consume additional retry attempts or start concurrent replacements. A successful event resets the consecutive-failure count; bounded exhaustion leaves the periodic authoritative reconciliation as the recovery backstop. On macOS, Urdira selects the native `kqueue` backend explicitly for workspace watchers instead of FSEvents: indexing can keep the Node callback busy long enough for the FSEvents client queue to drop events, while kqueue has no such client queue. The normal inclusion exclusions remain applied to both backends.
 
@@ -110,12 +110,34 @@ The stable target state publishes atomically as one generation even when thousan
 
 Mass-change analysis is chunked internally but its candidate manifest is frozen as one logical publication. Resource pressure delays publication or returns degraded status; it never exposes a mixture of old and new branch state.
 
+Physical work may be grouped without changing logical ownership. Source capture,
+plugin analysis, validation, staging, and publication may carry bounded ordered
+groups of owners when every `FactDelta`, artifact occurrence, scope, digest,
+receipt, and failure remains independently attributable to exactly one owner.
+The group is an internal scheduling and transaction boundary only; it cannot
+coalesce owner identity, weaken per-owner validation, or make partial staging
+visible. An oversized owner continues through its own idempotent cursor and is
+sealed only after its final validated page.
+
+Cold and incremental structural indexing use the same language-neutral route
+defined by the [structural indexing fast path](../protocol/structural-indexing-fast-path.md).
+Cold indexing supplies an empty base; incremental indexing supplies the exact
+changed/affected owner set plus typed open and closure relations. A language
+adapter may retain compiler or dependency state, but it cannot introduce a
+second publication implementation or bypass the core-owned Rust kernel,
+candidate receipts, sealed staging, or atomic SQLite publication.
+
 When a plugin declares ordered structural stages, each stage is its own atomic
 candidate generation referencing the same immutable source snapshot. Completed
 capabilities are queryable with `partial` completeness; blocked capabilities
 return retryable errors. `structural_ready` becomes true only after the final
 stage for the current source commits. A crash exposes the prior complete stage,
 never a half-published candidate.
+
+Vector materialization is a separate capability frontier. A generation may be
+structurally ready while that frontier is `pending` or `materializing`; semantic
+queries continue to enforce their declared complete-coverage requirement and
+must not reinterpret structural readiness as vector completeness.
 
 ## Freshness barriers
 

@@ -100,6 +100,28 @@ core:RuntimeComponentImplementationManifest@1
   native_asset_digests : Set<Digest>
   dependency_asset_digests : Set<Digest>
 
+core:RuntimeComponentImplementationManifest@2
+  runtime_component_build_id : Identifier
+  component_id : NamespacedIdentifier
+  component_version : SemVer
+  behavior_digest : Digest
+  runtime_target_id : aarch64-apple-darwin | x86_64-apple-darwin | aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu | x86_64-pc-windows-msvc
+  entrypoint_asset_digest : Digest
+  executable_asset_digests : Set<Digest>
+  native_asset_digests : Set<Digest>
+  dependency_asset_digests : Set<Digest>
+
+core:PluginRuntimeExecutableBinding@1
+  plugin_id : NamespacedIdentifier
+  plugin_version : SemVer
+  runtime_target_id : aarch64-apple-darwin | x86_64-apple-darwin | aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu | x86_64-pc-windows-msvc
+  runtime_contract_version : PositiveInteger
+  runtime_component_build_id : Identifier
+  implementation_digest : Digest
+  package_digest : Digest
+  entrypoint_asset_digest : Digest
+  binding_digest : Digest
+
 core:PluginPackageManifest@1
   package_format_id : NamespacedIdentifier
   package_format_version : PositiveInteger
@@ -115,6 +137,12 @@ PackageFileEntry
 ```
 
 Asset sets are complete transitive closures for the named role. A digest appearing in several roles remains present in each semantic set. `package_files` covers every package file after the package format's explicitly registered integrity exclusions; paths obey canonical relative-path rules and are unique.
+
+`RuntimeComponentImplementationManifest@1` remains valid for legacy packages.
+Version 2 selects exactly one registered native target and one entrypoint from
+its non-empty executable asset set. `PluginRuntimeExecutableBinding@1` copies
+the same target, build, implementation digest, package digest, and entrypoint;
+all coordinates must match one verified package candidate exactly.
 
 ## Registry and compatibility input schemas
 

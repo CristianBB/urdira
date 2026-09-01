@@ -7,14 +7,55 @@
     "sqlite": "node:sqlite",
     "watcher": "@parcel/watcher@2.6.0",
     "semantic_runtime": "@huggingface/transformers@4.2.0",
-    "sandbox_contract": "plugin-sdk:restricted-node@1"
+    "sandbox_contract": "plugin-sdk:restricted-node@1",
+    "rust_toolchain": "1.98.0",
+    "node_api": 10,
+    "worker_protocol": "urdira.ipc.v2",
+    "jsts_parser": "oxc"
   },
   "targets": [
-    { "id": "darwin-arm64", "os": "darwin", "architecture": "arm64", "minimum_os": "13.0", "watcher_package": "@parcel/watcher-darwin-arm64@2.6.0" },
-    { "id": "darwin-x64", "os": "darwin", "architecture": "x64", "minimum_os": "13.0", "watcher_package": "@parcel/watcher-darwin-x64@2.6.0" },
-    { "id": "linux-arm64-gnu", "os": "linux", "architecture": "arm64", "libc": "glibc", "minimum_libc": "2.31", "watcher_package": "@parcel/watcher-linux-arm64-glibc@2.6.0" },
-    { "id": "linux-x64-gnu", "os": "linux", "architecture": "x64", "libc": "glibc", "minimum_libc": "2.31", "watcher_package": "@parcel/watcher-linux-x64-glibc@2.6.0" },
-    { "id": "win32-x64", "os": "win32", "architecture": "x64", "minimum_os": "10.0.19041", "watcher_package": "@parcel/watcher-win32-x64@2.6.0" }
+    {
+      "id": "darwin-arm64",
+      "os": "darwin",
+      "architecture": "arm64",
+      "minimum_os": "13.0",
+      "watcher_package": "@parcel/watcher-darwin-arm64@2.6.0",
+      "rust_target": "aarch64-apple-darwin"
+    },
+    {
+      "id": "darwin-x64",
+      "os": "darwin",
+      "architecture": "x64",
+      "minimum_os": "13.0",
+      "watcher_package": "@parcel/watcher-darwin-x64@2.6.0",
+      "rust_target": "x86_64-apple-darwin"
+    },
+    {
+      "id": "linux-arm64-gnu",
+      "os": "linux",
+      "architecture": "arm64",
+      "libc": "glibc",
+      "minimum_libc": "2.31",
+      "watcher_package": "@parcel/watcher-linux-arm64-glibc@2.6.0",
+      "rust_target": "aarch64-unknown-linux-gnu"
+    },
+    {
+      "id": "linux-x64-gnu",
+      "os": "linux",
+      "architecture": "x64",
+      "libc": "glibc",
+      "minimum_libc": "2.31",
+      "watcher_package": "@parcel/watcher-linux-x64-glibc@2.6.0",
+      "rust_target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "id": "win32-x64",
+      "os": "win32",
+      "architecture": "x64",
+      "minimum_os": "10.0.19041",
+      "watcher_package": "@parcel/watcher-win32-x64@2.6.0",
+      "rust_target": "x86_64-pc-windows-msvc"
+    }
   ],
   "production_packages": [
     "urdira",
@@ -29,6 +70,7 @@
     "@urdira/security",
     "@urdira/plugin-sdk",
     "@urdira/plugin-javascript-typescript",
+    "@urdira/native",
     "@urdira/canonical",
     "@urdira/contracts"
   ],
@@ -54,5 +96,23 @@
     "acquisition": "configure_time_download",
     "bundled_assets": false
   },
-  "gates": ["unit", "contract", "integration", "e2e", "crash", "corruption", "security", "watcher", "benchmark", "package_inspection"]
+  "gates": [
+    "unit",
+    "contract",
+    "integration",
+    "e2e",
+    "crash",
+    "corruption",
+    "security",
+    "watcher",
+    "benchmark",
+    "package_inspection"
+  ],
+  "native_npm_packages": {
+    "darwin-arm64": "@urdira/native-darwin-arm64",
+    "darwin-x64": "@urdira/native-darwin-x64",
+    "linux-arm64-gnu": "@urdira/native-linux-arm64-gnu",
+    "linux-x64-gnu": "@urdira/native-linux-x64-gnu",
+    "win32-x64": "@urdira/native-win32-x64"
+  }
 }

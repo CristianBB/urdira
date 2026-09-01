@@ -102,8 +102,9 @@ Preview registration before changing local Urdira state:
 urdira workspace add /absolute/path/to/project
 ```
 
-The CLI prints every detected technology, confidence, evidence path, and
-compatible plugin before asking for confirmation. A workspace path is required;
+The CLI prints every detected technology, confidence, compatible plugin, and a
+bounded deterministic evidence sample before asking for confirmation. When the
+sample is incomplete, it also prints the total evidence count. A workspace path is required;
 use `.` for the current directory. To inspect the proposal without applying it, use:
 
 ```bash
@@ -484,12 +485,73 @@ qualification additionally requires the correctness, crash, corruption,
 security, stress, deterministic replay, and three-run P95 gates in the
 [release policy](docs/decisions/08-performance-reliability-evaluation.md).
 
-Urdira v3's indexing hot path uses native `Uint8Array` streams, transferable
-worker buffers, and typed relational SQLite projections. Schema IR generates
+Urdira v3's indexing hot path uses native `Uint8Array` streams, supervised Rust
+syntax workers, bounded Node-API logical-digest batches, and typed relational
+SQLite projections. The verified Rust worker exclusively owns JavaScript and
+TypeScript structural stage-one decoding, parsing, declarations, imports,
+dependency invalidation, and structural facts; that stage neither starts nor
+invokes the TypeScript process. Rust-built records cross the private boundary
+in deterministic groups of at most 64 owners, 4,096 rows, or 16 MiB, with
+per-owner cursors for larger owners. Validation remains owner-scoped, while a
+normal group and all of its receipts commit in one SQLite transaction. The
+typed semantic checker similarly uses groups of at most 32 owners while
+retaining one compiler `Program` for the generation. Node does not reconstruct
+or retain the workspace syntax corpus. Its closed protocol 1.9 handshake also
+receives the exact verified core addon, so each owner is projected once and
+Rust-sealed canonical bytes are reused for the stream header, final framing and
+typed publication instead of rebuilding the same FactDelta rows in TypeScript.
+One bounded continuation drains several owner-delimited streams instead of
+performing one synchronous process round trip per owner. Those continuations
+carry Rust-sealed canonical record and dependency rows, not nested JavaScript
+object graphs or producer-owned staging columns. The host keeps those rows
+opaque: native API v16 reparses their exact canonical text, checks the target
+record definitions and emits compact accepted fields plus typed staging rows.
+Only the core-owned result can enter candidate staging; producer preseal is
+never acceptance authority.
+The rule is shared by cold and incremental generations. Directory capture hashes each native
+source once, validates its filesystem boundary before and after the read, and
+hands a canonical prefix of up to 64 MiB of those exact bytes to CAS without
+reopening the source; remaining reads use eager registration and eight I/O
+lanes. For every Rust-owned structural generation, native API v16 also seals the exact
+typed record-publication scalars and UCE body bytes carried by those streams.
+SQLite promotes them into invisible candidate staging with fixed set-based SQL
+and publishes atomically. Progressive initial successors can use the same
+typed lane; incremental closures are staged and applied set-wise, while
+replacement-salted opens, unsupported body shapes, or oversized typed physical
+batches retain the exact canonical fallback. This is the shared
+[structural indexing fast path](docs/protocol/structural-indexing-fast-path.md):
+future language adapters replace only their syntax and semantic authorities,
+not the core Rust kernel, staging, receipts, or publication route. SQLite remains the
+authoritative format and public query behavior is unchanged. Semantic exact-vector top-K also uses the verified Rust addon
+in production, while core retains filtering, canonical vector encoding,
+limits, ordering validation, and ranking integration. The pinned TypeScript
+compiler remains authoritative for JavaScript/TypeScript resolution and typed
+semantics in later stages. It consumes Rust's exact changed/affected scope,
+prepares one reusable compiler program, and does not return another import
+graph or affected closure. Typed results use separate inferred-type and
+`type_of` records, so later stages do not replace Rust declaration records.
+
+The operation-level cutover is implemented by the `urdira-indexing-core` crate
+and its persistent `urdira-indexing-worker`: a generation request, bounded
+progress events, and a final sealed receipt are the only structural boundary
+visible to the TypeScript application. The worker owns the workspace SQLite
+writer and schedules lexical reconciliation after publication; the TypeScript
+owner loop remains a differential-test oracle only and is never a production
+fallback. Normal daemon startup fails closed when the composition worker is
+missing; the private `URDIRA_INDEXING_CORE_ORACLE=1` switch is reserved for
+the isolated baseline/oracle harness. See the [Rust indexing-core boundary](docs/protocol/structural-indexing-fast-path.md#rust-indexing-core-operation-boundary).
+Schema IR generates
 the relational table metadata. Cross-process providers, plugins, daemon/CLI,
 and explicit portable import/export use bounded Protobuf-ES chunks; JSON is
 limited to configuration and MCP text/opaque references. Boundary telemetry
 records bytes read, transferred, copied, decoded, and retained.
+
+Mandatory native cutover requires the closed qualification campaign: exactly
+three counterbalanced runs on both `darwin-arm64` and `linux-x64-gnu`, with
+full/incremental digest equivalence, checksummed process-tree RSS evidence, all
+absolute tier-L limits, and the 25/40/25 improvement gates. The reproducible
+procedure and report contract are documented in the [release
+guide](docs/release.md#native-acceleration-campaign).
 
 ## Current limitations
 
@@ -501,9 +563,10 @@ records bytes read, transferred, copied, decoded, and retained.
   sync, and SQLite WAL behavior.
 - Semantic search depends on the configured local model being present and
   healthy. Structural and textual capabilities remain available if it is not.
-- The npm distribution supplies JavaScript and host-selected native
-  dependencies; it does not bundle Node.js. Deterministic platform archives
-  are a separate offline distribution.
+- The npm bootstrap requires Node.js to perform confirmed preparation. The
+  prepared runtime supplies exact host-selected Rust and other native
+  dependencies. Deterministic platform archives are a separate offline
+  distribution and include a private pinned Node runtime.
 
 ## Development
 
@@ -517,8 +580,8 @@ pnpm preflight:windows
 pnpm verify
 pnpm audit --prod
 pnpm package:npm:smoke
-pnpm package:release
-pnpm release:acceptance
+URDIRA_RELEASE_TARGET=<host-target> pnpm package:release
+URDIRA_RELEASE_TARGET=<host-target> URDIRA_SKIP_INSTALL=1 pnpm release:acceptance
 ```
 
 `pnpm verify` checks architecture boundaries, lint, the complete test suite,
@@ -530,6 +593,39 @@ hygiene. Release steps and external prerequisites are documented in
 `pnpm preflight:windows` is the focused cross-platform gate for portable
 filenames, a real staged-file round trip, Windows path and IPC adapters,
 CRLF-sensitive Git fixtures, storage path decoding, and publication hygiene.
+
+The workspace-v3 and fixed publication SQL authorities live under
+`packages/storage/sql/`. After changing either authority, run
+`pnpm generate:workspace-sql`; the generated TypeScript wrappers and Rust
+constants are checked by the digest tests.
+
+The current bounded n8n qualification remains open. The post-cutover 8/32/128
+owner runs are exact and reconcile within five percent. Production structural
+indexing uses one Rust composition-worker generation for the syntax frontier
+and accumulated semantic stages: Rust owns grouping, validation,
+canonicalization, SQLite staging, receipts, publication, recovery, and
+post-publication lexical work. TypeScript no longer plans or accumulates
+structural rows and is never a production fallback; the private oracle switch
+is restricted to the differential baseline harness. Legacy donor bulk-copy
+paths (workspace fork and index-pack) are also bypassed, so they cannot open a
+second structural SQLite writer; the normal Rust generation is authoritative.
+The latest
+512-owner Rust run passed the 45-second admission gate
+at 30.707 seconds wall time (29.991 seconds observed readiness) and 1.80 GiB peak
+process-tree RSS with an exact visible-set digest (`retained benchmark`). This is a retained single preflight, not a P95 result; later rebuilt-runtime samples remain in the evidence log. Gate 5 remains intentionally
+gated while the <=30-second product target is validated across repeated runs. For this admission decision, the 2 GiB RSS figure is advisory: an exact run that exceeds it remains admissible when its agreed time gate passes, with the measured overage retained as optimization evidence. This is optimization evidence, not a 30-second
+SLA claim; see the [Rust cutover evidence](docs/evidence/2026-08-29-rust-core-indexing-handoff.md)
+and [indexing performance findings](docs/evidence/2026-08-29-indexing-performance-findings.md).
+The Rust sink keeps body payloads as a single typed staging BLOB; the direct
+production finalizer reads that relation in-place, so legacy candidate tables
+carry metadata/closures only and no duplicate structural body copy.
+The previous staged 512-owner measurements (104.990 and 90.817 seconds) are
+retained for comparison. An experimental single-generation variant is retained
+as rejected differential evidence because it changed the visible-set digest;
+it is not the production route. The checker and final Rust publication remain
+the dominant spans. The 20-cold/60-incremental campaign still requires explicit
+authorization. The set-based promotion evidence is retained in the [Rust
+cutover evidence](docs/evidence/2026-08-29-rust-core-indexing-handoff.md).
 
 The production package graph is the dependency-free `urdira` bootstrap,
 `@urdira/runtime`, and its public `@urdira/*` dependency closure.

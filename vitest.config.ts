@@ -6,6 +6,7 @@ const isWindowsCi = isCi && process.platform === "win32";
 export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
+    globalSetup: ["./tests/global-setup.ts"],
     passWithNoTests: false,
     exclude: ["tests/phase14-release-suite.test.ts"],
     maxWorkers: isCi ? 2 : undefined,

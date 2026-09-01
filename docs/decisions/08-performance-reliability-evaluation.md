@@ -1,7 +1,7 @@
 # Performance, Reliability, and Evaluation
 
 Status: **Approved**  
-Last updated: 2026-08-19
+Last updated: 2026-08-31
 Depends on: Query, indexing, storage, and JavaScript/TypeScript MVP specifications
 
 ## Decision objective
@@ -46,6 +46,30 @@ Cold full indexing to a structurally queryable snapshot, excluding asynchronous 
 | L | 20 min | 50 min |
 
 The generic semantic materialization must reach complete coverage within an additional 2, 15, and 90 minutes at P95 for S, M, and L respectively on the CPU baseline. Structural publication is never delayed for embeddings. Scan telemetry records source-ready, TypeScript program/checker, candidate/seal, canonical encoding, SQLite plan/transaction, structural-ready, and semantic-ready timings separately.
+
+The retained n8n qualification corpus is an additional named structural gate.
+On the published macOS arm64 reference host, the exact corpus with digest
+`sha256:1dd28be497b20c5f1b3585dd7438e69060ef5a2fbe5660a5e7f5d728a492d2ed`
+must reach complete non-vector structural readiness at or below 30 seconds P95
+over 20 cold roots. A content-only mutation must reach the equivalent complete
+structural snapshot at or below 2 seconds P95. The complete process tree records
+RSS against a 2 GiB advisory budget and temporary bytes against 1.5 times the
+final database size. For an individual preflight or campaign sample, exceeding
+the RSS budget does not reject an otherwise exact result when its agreed time
+gate passes; the overage remains visible telemetry and an optimization input.
+An operating-system OOM, failed publication, digest mismatch, or time-gate
+failure remains a rejection. Qualification uses nearest-rank percentiles and
+requires exact record, relationship, diagnostic, order, and registered-digest
+equality.
+
+Before a full qualification campaign, deterministic 512-owner and 1,000-owner
+preflights use the retained corpus order and digests. Their non-overlapping
+subspans must reconcile with wall time within five percent and report owner,
+row, byte, IPC-frame, transaction, statement, WAL, spool-pass,
+checker-rotation, process-tree RSS, and P50/P95/P99 counters. A single isolated
+cold run is admitted only when those preflights project no more than 45 seconds
+and show a material improvement. The P95 campaign requires explicit operator
+authorization after that cold result is presented.
 
 For a one-file edit after watcher receipt, P95 time to a snapshot containing updated local syntax is 500 ms for S/M and 1 s for L. P95 time to complete cross-file structural invalidation and publication is 2 s for S, 5 s for M, and 15 s for L. New embeddings for the changed scope reach a projection-only generation within 5 s, 15 s, and 45 s respectively. Deletion must make obsolete structural and semantic results invisible in the same structural publication; no latency target permits stale visibility afterward.
 
@@ -153,6 +177,12 @@ A release candidate passes only when:
 - no P95 latency or peak-resource metric regresses more than 10% from the previous release without an approved benchmark-baseline revision;
 - full/incremental equivalence and cursor replay are 100%; and
 - benchmark inputs, runner version, raw measurements, environment, and report digest are published with the release.
+
+The mandatory Rust cutover additionally requires the paired native-acceleration
+campaign in Decision 25: at least 25 percent lower cold P50/P95, 40 percent
+lower complete incremental P95, and 25 percent lower peak process-tree RSS on
+the frozen large corpus, without weakening any absolute target in this file
+other than the named n8n preflight RSS exception stated above.
 
 Flaky runs are failures until their cause is identified; rerunning until success is not acceptance. A waived performance regression may ship only as an explicit known limitation, but correctness, evidence, completeness, snapshot isolation, and data-safety invariants cannot be waived.
 
