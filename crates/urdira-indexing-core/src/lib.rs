@@ -923,6 +923,132 @@ fn is_lease_contended(error: &CoreError) -> bool {
         .contains("workspace structural writer is already active")
 }
 
+/// Filename suffix for the scan-priority sidecar written by the daemon
+/// (`packages/daemon/src/runtime.ts`'s `markScanPending`/`scanPendingSidecarPath`)
+/// when a real foreground edit is queued for a workspace. Mirrors the
+/// `<database_path>.urdira-writer.lock` convention `workspace_lease` above
+/// already uses for the cross-process writer marker, and the private
+/// `cancellation_path` sidecar convention on `GenerationRequest`. See
+/// `scan_priority_pending` below for what observing it means.
+const SCAN_PENDING_SIDECAR_SUFFIX: &str = ".urdira-scan-pending";
+
+/// A scan-priority marker older than this is treated as though it were
+/// absent. The daemon removes the marker in its own `finally` on every path
+/// (success, failure, or a database that never opened) as soon as this
+/// workspace's database handle closes, so a marker surviving this long can
+/// only mean the daemon crashed before that cleanup ran. The threshold is
+/// far larger than the marker's normal lifetime (the window between a scan
+/// job's admission and that same job closing its database handle -- well
+/// under the whole scan, but not vanishingly short either), so it never
+/// misfires against a genuinely in-flight edit while still recovering
+/// detached maintenance from an orphaned marker instead of slowing it down
+/// forever.
+const SCAN_PENDING_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// How long a single lease re-acquire turn
+/// (`yield_mutation_lease`/`schedule_secondary_index_rebuild` in
+/// `urdira-indexing-worker`) waits for a pending scan-priority marker to
+/// clear before giving up on THIS turn and reacquiring the lease anyway.
+/// Bounding this per turn -- rather than waiting for the marker to clear
+/// unconditionally -- is what keeps a continuous stream of foreground edits
+/// from starving maintenance outright: maintenance still gets a turn to run
+/// at least once every `SCAN_PRIORITY_WAIT_BUDGET`, even if the daemon keeps
+/// re-arming the marker for the next queued edit within that same window.
+const SCAN_PRIORITY_WAIT_BUDGET: Duration = Duration::from_secs(5);
+
+/// Poll interval used while waiting out a scan-priority marker. Cheap
+/// relative to the marker's expected lifetime, so this does not need the
+/// exponential backoff `open_with_lease_wait`/`yield_mutation_lease` use for
+/// actual lease contention.
+const SCAN_PRIORITY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Path to the private scan-priority sidecar for a workspace database,
+/// mirroring `packages/daemon/src/runtime.ts`'s `scanPendingSidecarPath`.
+fn scan_pending_sidecar_path(workspace_path: &str) -> PathBuf {
+    PathBuf::from(format!("{workspace_path}{SCAN_PENDING_SIDECAR_SUFFIX}"))
+}
+
+/// True when the daemon has a real foreground edit queued for this
+/// workspace (see the sidecar's own doc comment above). Detached
+/// maintenance consults this before re-acquiring the workspace writer
+/// lease so a foreground scan can win that race instead of losing it
+/// chunk after chunk. Exposed from the crate root because both
+/// `yield_mutation_lease` below (inside `IndexingCore`) and
+/// `schedule_secondary_index_rebuild` (`urdira-indexing-worker`, which
+/// re-opens a fresh `IndexingCore` per attempt rather than holding one
+/// across its retry loop) need it.
+pub fn scan_priority_pending(workspace_path: &str) -> bool {
+    match std::fs::metadata(scan_pending_sidecar_path(workspace_path)) {
+        Ok(metadata) => metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_none_or(|age| age < SCAN_PENDING_STALE_AFTER),
+        Err(_) => false,
+    }
+}
+
+/// Bounded wait: if a scan-priority marker is currently set for
+/// `workspace_path`, wait up to `SCAN_PRIORITY_WAIT_BUDGET` for it to clear
+/// before returning, honoring `cancellation`/`deadline_ms` exactly like
+/// `IndexingCore::check_cancelled` so a cancelled or deadline-exceeded
+/// generation is never held up by this wait either. Always returns `Ok(())`
+/// once the marker clears OR the wait budget elapses -- deliberately does
+/// NOT keep waiting past the budget even if the marker is still set, so the
+/// caller's next lease re-acquire always eventually happens regardless (see
+/// `SCAN_PRIORITY_WAIT_BUDGET`'s own doc comment for why that bounds
+/// starvation instead of trading one indefinite wait for another).
+///
+/// Public so `schedule_secondary_index_rebuild` in `urdira-indexing-worker`
+/// can call it too: that loop re-opens a fresh `IndexingCore` on every
+/// attempt instead of holding one across the wait the way
+/// `yield_mutation_lease` does, so it has no `&self` to hang this off of.
+/// It has no `CancellationToken`/deadline of its own either -- pass
+/// `CancellationToken::default()` and `None` in that case; the loop's own
+/// bounded attempt/requeue counters already cap total wait time.
+pub fn wait_out_scan_priority(
+    workspace_path: &str,
+    cancellation: &CancellationToken,
+    deadline_ms: Option<u64>,
+) -> Result<(), CoreError> {
+    if !scan_priority_pending(workspace_path) {
+        return Ok(());
+    }
+    let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
+    let wait_started = Instant::now();
+    if debug_timing {
+        eprintln!(
+            "[urdira-indexing-core] scan-priority marker present; deferring lease reacquire for up to {}ms",
+            SCAN_PRIORITY_WAIT_BUDGET.as_millis()
+        );
+    }
+    let wait_until = wait_started + SCAN_PRIORITY_WAIT_BUDGET;
+    while scan_priority_pending(workspace_path) && Instant::now() < wait_until {
+        if cancellation.is_cancelled() {
+            return Err(CoreError("indexing operation cancelled".into()));
+        }
+        if deadline_ms.is_some_and(|deadline| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(u64::MAX, |value| {
+                    value.as_millis().min(u128::from(u64::MAX)) as u64
+                });
+            now >= deadline
+        }) {
+            return Err(CoreError("indexing operation deadline exceeded".into()));
+        }
+        std::thread::sleep(SCAN_PRIORITY_POLL_INTERVAL);
+    }
+    if debug_timing {
+        eprintln!(
+            "[urdira-indexing-core] scan-priority wait done cleared={} elapsed_ms={}",
+            !scan_priority_pending(workspace_path),
+            wait_started.elapsed().as_millis()
+        );
+    }
+    Ok(())
+}
+
 impl IndexingCore {
     pub fn open(path: &str, request: &GenerationRequest) -> Result<Self, CoreError> {
         validate_identifier(&request.operation_id, "operation_id")?;
@@ -1830,8 +1956,31 @@ impl IndexingCore {
     /// elsewhere, which propagates out of the caller (`reconcile_lexical`)
     /// and is retried as a whole by `schedule_lexical_reconcile`'s own
     /// independent (and longer) 10-minute retry budget.
+    ///
+    /// Before trying to reacquire, this gives priority to a foreground scan
+    /// if one is queued: `wait_out_scan_priority` (above) waits up to
+    /// `SCAN_PRIORITY_WAIT_BUDGET` for the daemon's scan-priority marker
+    /// (`scan_priority_pending`) to clear. Releasing here and then racing a
+    /// bare `ensure_mutation_lease()` immediately after used to let this
+    /// same in-process maintenance thread win that race almost every time --
+    /// it reacquires within microseconds of releasing, while a foreground
+    /// scan's `open_with_lease_wait` (often in a different process) only
+    /// polls every 100-500ms -- so a queued edit could lose every chunk
+    /// boundary in a row and wait out the whole detached pass (measured:
+    /// 12.5s of `stage_plan`, docs/evidence/2026-09-02-edit-latency.md).
+    /// This does not change who is allowed to hold the lease, only who gets
+    /// first crack at an empty one: once the wait ends (marker cleared, or
+    /// the bounded budget elapsed), this falls through to the exact same
+    /// unconditional reacquire loop as before, so the single-writer
+    /// invariant and this method's own deadline/cancellation contract are
+    /// unchanged. Skipped entirely (`self.workspace_path == ":memory:"`)
+    /// for in-memory generations, which have no sidecar path and no
+    /// cross-process contention to arbitrate.
     fn yield_mutation_lease(&mut self) -> Result<(), CoreError> {
         self.release_mutation_lease();
+        if self.workspace_path != ":memory:" {
+            wait_out_scan_priority(&self.workspace_path, &self.cancellation, self.deadline_ms)?;
+        }
         loop {
             match self.ensure_mutation_lease() {
                 Ok(()) => return Ok(()),
@@ -3574,5 +3723,189 @@ mod tests {
         drop(holder);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.urdira-writer.lock", path.display()));
+    }
+
+    /// (b) Gate: with no scan-priority marker present, `wait_out_scan_priority`
+    /// must return immediately -- a foreground scan's absence must not add
+    /// any latency to detached maintenance's normal chunk-boundary
+    /// reacquire.
+    #[test]
+    fn wait_out_scan_priority_returns_immediately_without_a_marker() {
+        let path = std::env::temp_dir().join(format!(
+            "urdira-indexing-core-scan-priority-absent-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = remove_file(scan_pending_sidecar_path(path.to_str().expect("path")));
+        let started = Instant::now();
+        wait_out_scan_priority(
+            path.to_str().expect("path"),
+            &CancellationToken::default(),
+            None,
+        )
+        .expect("no marker means no wait");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "must not wait at all when no scan-priority marker is set"
+        );
+    }
+
+    /// (a) Gate: with a scan-priority marker present, `wait_out_scan_priority`
+    /// must defer -- not return instantly -- and then resume promptly once
+    /// the marker clears, instead of always waiting out its full bounded
+    /// budget. This is the mechanism `yield_mutation_lease` uses to stop
+    /// detached maintenance from winning its own immediate lease re-acquire
+    /// race against a foreground scan's slower, cross-process
+    /// `open_with_lease_wait` poll (docs/evidence/2026-09-02-edit-latency.md).
+    #[test]
+    fn wait_out_scan_priority_defers_then_resumes_once_the_marker_clears() {
+        let path = std::env::temp_dir().join(format!(
+            "urdira-indexing-core-scan-priority-present-{}.sqlite",
+            std::process::id()
+        ));
+        let marker_path = scan_pending_sidecar_path(path.to_str().expect("path"));
+        let _ = remove_file(&marker_path);
+        File::create(&marker_path).expect("scan-priority marker");
+        let marker_for_clear = marker_path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = remove_file(&marker_for_clear);
+        });
+        let started = Instant::now();
+        wait_out_scan_priority(
+            path.to_str().expect("path"),
+            &CancellationToken::default(),
+            None,
+        )
+        .expect("must resume once the marker clears");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "must actually wait for the pending marker instead of racing straight through, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < SCAN_PRIORITY_WAIT_BUDGET,
+            "must resume promptly once the marker clears rather than waiting out the whole budget, elapsed={elapsed:?}"
+        );
+        let _ = remove_file(&marker_path);
+    }
+
+    /// Bounds starvation: a marker that never clears (a busy foreground edit
+    /// storm keeps re-arming it) must still let maintenance make progress --
+    /// `wait_out_scan_priority` gives up on THIS turn once its bounded
+    /// budget elapses rather than waiting indefinitely.
+    #[test]
+    fn wait_out_scan_priority_gives_up_after_its_budget_even_if_the_marker_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "urdira-indexing-core-scan-priority-persistent-{}.sqlite",
+            std::process::id()
+        ));
+        let marker_path = scan_pending_sidecar_path(path.to_str().expect("path"));
+        let _ = remove_file(&marker_path);
+        File::create(&marker_path).expect("scan-priority marker");
+        let started = Instant::now();
+        wait_out_scan_priority(
+            path.to_str().expect("path"),
+            &CancellationToken::default(),
+            None,
+        )
+        .expect("must still return Ok once the wait budget elapses");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= SCAN_PRIORITY_WAIT_BUDGET,
+            "must wait out the full budget before giving maintenance its turn, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < SCAN_PRIORITY_WAIT_BUDGET + Duration::from_secs(2),
+            "must not wait meaningfully longer than its bounded budget, elapsed={elapsed:?}"
+        );
+        let _ = remove_file(&marker_path);
+    }
+
+    /// (c) Gate: a marker left behind by a daemon that crashed before its
+    /// own `finally`-based cleanup ran (`clearScanPending`,
+    /// `packages/daemon/src/runtime.ts`) must not permanently stall
+    /// maintenance. `scan_priority_pending` treats a marker older than
+    /// `SCAN_PENDING_STALE_AFTER` as absent, so this must resolve near-
+    /// instantly instead of waiting out `SCAN_PRIORITY_WAIT_BUDGET`.
+    #[test]
+    fn wait_out_scan_priority_ignores_a_stale_marker_left_behind_by_a_crash() {
+        let path = std::env::temp_dir().join(format!(
+            "urdira-indexing-core-scan-priority-stale-{}.sqlite",
+            std::process::id()
+        ));
+        let marker_path = scan_pending_sidecar_path(path.to_str().expect("path"));
+        let _ = remove_file(&marker_path);
+        let marker = File::create(&marker_path).expect("scan-priority marker");
+        let stale_time = SystemTime::now() - (SCAN_PENDING_STALE_AFTER + Duration::from_secs(5));
+        marker
+            .set_modified(stale_time)
+            .expect("backdate the marker to simulate a crash-orphaned file");
+        drop(marker);
+        assert!(
+            !scan_priority_pending(path.to_str().expect("path")),
+            "a marker older than SCAN_PENDING_STALE_AFTER must be treated as absent"
+        );
+        let started = Instant::now();
+        wait_out_scan_priority(
+            path.to_str().expect("path"),
+            &CancellationToken::default(),
+            None,
+        )
+        .expect("a stale marker must not block maintenance");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "a stale (crash-orphaned) marker must not cost a real wait"
+        );
+        let _ = remove_file(&marker_path);
+    }
+
+    /// End-to-end through the real call site: `yield_mutation_lease` itself
+    /// must defer its reacquire while a scan-priority marker is set, giving
+    /// a competing opener (standing in for a foreground scan's
+    /// `open_with_lease_wait`) the freed lease first, then still complete
+    /// once that competitor releases it.
+    #[test]
+    fn yield_mutation_lease_lets_a_pending_scan_win_the_freed_lease() {
+        let request = request();
+        let path = std::env::temp_dir().join(format!(
+            "urdira-indexing-core-yield-scan-priority-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.urdira-writer.lock", path.display()));
+        let marker_path = scan_pending_sidecar_path(path.to_str().expect("path"));
+        let _ = remove_file(&marker_path);
+        let mut core =
+            IndexingCore::open(path.to_str().expect("path"), &request).expect("maintenance core");
+        File::create(&marker_path).expect("scan-priority marker");
+
+        let scan_path = path.clone();
+        let scan_request = request.clone();
+        let scan_marker = marker_path.clone();
+        let scan_won = Arc::new(AtomicBool::new(false));
+        let scan_won_writer = scan_won.clone();
+        let scan_thread = std::thread::spawn(move || {
+            // Give `yield_mutation_lease` a moment to release and start
+            // deferring before the "foreground scan" tries to open.
+            std::thread::sleep(Duration::from_millis(100));
+            let scan_core = IndexingCore::open(scan_path.to_str().expect("path"), &scan_request)
+                .expect("the foreground scan must win the freed lease first");
+            scan_won_writer.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = remove_file(&scan_marker);
+            drop(scan_core);
+        });
+
+        core.yield_mutation_lease()
+            .expect("maintenance must still reacquire once the scan releases");
+        assert!(
+            scan_won.load(Ordering::Acquire),
+            "the foreground scan must have acquired the lease before maintenance reacquired it"
+        );
+        scan_thread.join().expect("scan thread");
+        drop(core);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.urdira-writer.lock", path.display()));
+        let _ = remove_file(&marker_path);
     }
 }

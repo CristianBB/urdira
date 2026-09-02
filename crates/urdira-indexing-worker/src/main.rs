@@ -17,6 +17,7 @@ use urdira_indexing_core::{
     COLD_DIRECT_ANALYZE_SQL, CORE_PROTOCOL_VERSION, CancellationToken, CandidatePublicationSink,
     CanonicalPhysicalGroup, CoreError, GenerationDescriptor, GenerationRequest, IndexingCore,
     LanguageEngine, PhysicalGroup, PublicationSink, StructuralKernelResult, prepare_engine_group,
+    wait_out_scan_priority,
 };
 use urdira_jsts_indexing_engine::JavascriptTypescriptEngine;
 use urdira_jsts_syntax_worker::{
@@ -392,6 +393,24 @@ fn schedule_secondary_index_rebuild(
                     std::thread::sleep(Duration::from_millis(PREEMPTION_REQUEUE_DELAY_MS));
                     scheduled_epoch = SECONDARY_MAINTENANCE_EPOCH.load(Ordering::Acquire);
                     continue 'requeue;
+                }
+                // Give a queued foreground scan first crack at the lease
+                // this pass just released/is about to try for, exactly like
+                // `IndexingCore::yield_mutation_lease` -- see
+                // `wait_out_scan_priority`'s doc comment
+                // (`crates/urdira-indexing-core/src/lib.rs`) for why a bare
+                // immediate reopen here used to win that race against a
+                // scan's own `open_with_lease_wait` almost every time. This
+                // loop has no `CancellationToken`/deadline of its own to
+                // thread through the wait; its existing bounded
+                // attempt/requeue counters already cap how long that costs.
+                if let Err(error) =
+                    wait_out_scan_priority(&database_path, &CancellationToken::default(), None)
+                {
+                    eprintln!(
+                        "[urdira-indexing-worker] secondary index scan-priority wait failed: {error}"
+                    );
+                    return;
                 }
                 let result = IndexingCore::open(&database_path, &request).and_then(|mut core| {
                     core.with_transaction(|transaction| {

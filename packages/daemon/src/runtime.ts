@@ -1,4 +1,4 @@
-import { chmod, readdir, readFile, stat, unlink } from "node:fs/promises";
+import { chmod, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, resolve } from "node:path";
@@ -1821,6 +1821,48 @@ export class DaemonRuntime {
       // usage below and its success-path resets).
       const workspaceWriterBusyRetries = new Map<string, number>();
       const WORKSPACE_WRITER_BUSY_MAX_RETRIES = 8;
+      // Scan-priority sidecar (docs/evidence/2026-09-02-edit-latency.md's
+      // "primera edicion" residual): a real edit-triggered scan and detached
+      // Rust maintenance (`reconcile_lexical`'s `yield_mutation_lease` and
+      // `schedule_secondary_index_rebuild`'s per-attempt loop, both in
+      // `crates/urdira-indexing-worker`/`-core`) both want the same
+      // process-local `workspace_lease`. Maintenance already releases that
+      // lease between bounded chunks (B1/B5), but nothing told it to let a
+      // *specific* incoming edit win the immediate re-acquire race, so a cold
+      // corpus's first foreground edit could still lose every such race in a
+      // row and wait out the whole detached pass (measured: 12.5s of
+      // `stage_plan`). This marker file -- `<database_path>.urdira-scan-pending`,
+      // the same private-sidecar convention as `GenerationRequest.cancellation_path`
+      // (`crates/urdira-indexing-core/src/lib.rs`) -- is this daemon's side of
+      // that priority signal: its mere existence tells the Rust maintenance
+      // loops "a real edit is queued, give it the next turn". It is created
+      // by `markScanPending` once this scan's actual on-disk database path is
+      // known (right after `durableStorage.openWorkspace` below, in `run`) --
+      // deliberately before plugin resolution, workspace-fork/index-pack
+      // attempts, source enumeration, and the Rust structural generation
+      // itself, so maintenance sees it as early as possible. It is removed by
+      // `clearScanPending` in this job's own outer `finally` below regardless
+      // of outcome (success, failure, or a database that never opened), which
+      // is the simpler "(o al completar)" half of the design contract --
+      // precisely tracking the moment the Rust generation itself acquires the
+      // lease would need a new event threaded back from the Rust worker,
+      // which is unnecessary: the Rust side already bounds how long it honors
+      // a still-present marker (a short wait per chunk boundary, not an
+      // unbounded wait), so this file living for this job's whole duration
+      // only ever costs maintenance a few bounded chunks of delay, never a
+      // hang. Only set for a genuine edit ("indexing" activity), not a
+      // passive "checking_for_updates" freshness sweep -- the latter must not
+      // pause maintenance for no real edit. Best-effort throughout: a failure
+      // to write or remove this advisory file must never affect scan success
+      // -- worst case, maintenance simply does not see the priority hint for
+      // this one job.
+      const scanPendingSidecarPath = (databasePath: string): string => `${databasePath}.urdira-scan-pending`;
+      const markScanPending = (databasePath: string): void => {
+        void writeFile(scanPendingSidecarPath(databasePath), `${process.pid}\n`, "utf8").catch(() => undefined);
+      };
+      const clearScanPending = (databasePath: string): void => {
+        void unlink(scanPendingSidecarPath(databasePath)).catch(() => undefined);
+      };
       const pendingScans = new Map<string, {
         full: boolean;
         uris: Set<string>;
@@ -1916,6 +1958,11 @@ export class DaemonRuntime {
                     registered_at: workspace.registered_at,
                   });
                   database = await durableStorage.openWorkspace(workspaceId);
+                  // Priority signal for detached Rust maintenance (see
+                  // `markScanPending`'s doc comment above): only a genuine
+                  // edit needs to pre-empt maintenance, not a passive
+                  // freshness sweep.
+                  if (activity === "indexing") markScanPending(database.database.filename);
                   const plugin = await resolvePluginProvider(workspace, database);
                 if (!plugin) {
                     // Generic source discovery is useful without a language
@@ -2147,7 +2194,10 @@ export class DaemonRuntime {
                   }
                   notifyReadinessChanged(workspaceId);
                 } finally {
-                  if (database) await database.close().catch(() => undefined);
+                  if (database) {
+                    clearScanPending(database.database.filename);
+                    await database.close().catch(() => undefined);
+                  }
                 }
                 return undefined;
               } finally {
