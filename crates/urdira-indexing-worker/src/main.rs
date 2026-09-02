@@ -17,7 +17,6 @@ use urdira_indexing_core::{
     COLD_DIRECT_ANALYZE_SQL, CORE_PROTOCOL_VERSION, CancellationToken, CandidatePublicationSink,
     CanonicalPhysicalGroup, CoreError, GenerationDescriptor, GenerationRequest, IndexingCore,
     LanguageEngine, PhysicalGroup, PublicationSink, StructuralKernelResult, prepare_engine_group,
-    wait_out_scan_priority,
 };
 use urdira_jsts_indexing_engine::JavascriptTypescriptEngine;
 use urdira_jsts_syntax_worker::{
@@ -38,37 +37,71 @@ const RUST_SEMANTIC_PROTOCOL: &str = "urdira:jsts-rust-semantic.v1";
 // corpus-sized structural payload through the application process.
 const RUST_SEMANTIC_MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
 
-// Every structural generation invalidates queued derived-index maintenance.
-// This lets a new source edit pre-empt the detached accelerator rebuild
-// instead of waiting behind a multi-second CREATE INDEX transaction.
+// Every structural generation invalidates queued lexical maintenance for an
+// older generation. `schedule_lexical_reconcile` snapshots this epoch when it
+// is scheduled and re-checks it both before taking the writer lease (quiet
+// period) and on every retry inside its bounded wait loop; a change means a
+// newer structural generation has since been accepted, and the stale pass
+// steps aside instead of contending for the lease against it. Lexical
+// maintenance is chunked and yields its lease every few seconds, so unlike
+// the old detached secondary-index rebuild (removed; see
+// docs/evidence/2026-09-02, T2) it reliably completes rather than starving.
 static SECONDARY_MAINTENANCE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-// The derived accelerator indexes owned by the detached secondary-index
-// rebuild pass (`schedule_secondary_index_rebuild`). Kept as (name, DDL)
-// pairs at module scope, rather than as a local const inside that function,
-// so both pre-emption sites (`schedule_lexical_reconcile`'s own quiet-period
-// check and `schedule_secondary_index_rebuild`'s per-attempt check) can
-// report the same pending-index names without duplicating the list.
+// The five derived accelerator indexes that a cold-direct publication used to
+// leave to a *detached* post-publication rebuild pass. That pass raced every
+// subsequent structural generation for the workspace writer lease using a
+// single-attempt `open` (never `open_with_lease_wait`) and ceded to
+// scan-priority on every retry, so on a busy corpus it could requeue
+// indefinitely and never complete -- "secondary indexes ready" would simply
+// never print. These indexes are derived accelerators, not part of the v3
+// byte contract, and none of them participate in the cold-direct INSERT's own
+// conflict resolution (see the `cold_direct` comment above the
+// `record_occurrences`/`identity_assignments`/`artifact_dependencies` DROP
+// INDEX statements), so building them inline, in the same transaction, right
+// after the promotion inserts and before commit, is safe and removes the
+// starvation risk entirely. Kept as (name, DDL) pairs at module scope so
+// `publish()`'s inline `cold_direct` block and the accelerator-completeness
+// test below share one source of truth for the DDL text.
 //
-// `record_occurrences_digest_order_idx` is deliberately absent here: a
-// cold-direct publication recreates it inline, inside the publish
-// transaction, right before the visible_record_digest scan that depends on
-// it (see the publish() zone of the same name). `record_occurrences_visible_idx`
-// and `identity_assignments_owner_key_idx` are recreated inline there too,
-// but are still listed here as well (a harmless repeat `IF NOT EXISTS`
-// check) because unlike the digest-order index they are read by more than
-// just the cold-direct scan. `record_occurrences_workspace_owner_idx` and
-// `record_occurrences_workspace_owner_version_idx` are also recreated
-// inline at the cold commit (the first incremental publish's
-// `DIRECT_PUBLICATION_CLOSURES_SQL` needs
-// `record_occurrences_workspace_owner_idx` immediately -- see
-// docs/evidence/2026-09-01-f5-e3-cierre-tanda.md, A1) and are excluded here
-// entirely, same as the digest-order index, to avoid creating them twice.
-const SECONDARY_INDEXES: &[(&str, &str)] = &[
+// The other five accelerators recreated at the cold commit are kept in their
+// own two arrays right below, rather than folded into the one above, because
+// they are built at two different points inside the same transaction:
+// `COLD_DIRECT_DIGEST_ORDER_ACCEL_INDEX` right before the
+// `visible_record_digest` scan that depends on it, and
+// `COLD_DIRECT_A1_ACCEL_INDEXES` later, alongside the five above, because the
+// very next incremental publish's `DIRECT_PUBLICATION_CLOSURES_SQL` needs
+// `record_occurrences_workspace_owner_idx` immediately (see
+// docs/evidence/2026-09-01-f5-e3-cierre-tanda.md, A1). All three arrays
+// together are the complete set of ten derived accelerators a cold-direct
+// commit must leave built; see
+// `cold_direct_commit_builds_every_accelerator_index` below, which is the
+// regression guard for that completeness.
+const COLD_DIRECT_DIGEST_ORDER_ACCEL_INDEX: (&str, &str) = (
+    "record_occurrences_digest_order_idx",
+    "CREATE INDEX IF NOT EXISTS record_occurrences_digest_order_idx ON record_occurrences(workspace_id, record_id, valid_from_generation, valid_to_generation, record_digest)",
+);
+
+const COLD_DIRECT_A1_ACCEL_INDEXES: &[(&str, &str)] = &[
     (
         "record_occurrences_visible_idx",
         "CREATE INDEX IF NOT EXISTS record_occurrences_visible_idx ON record_occurrences(workspace_id, valid_from_generation, valid_to_generation)",
     ),
+    (
+        "identity_assignments_owner_key_idx",
+        "CREATE INDEX IF NOT EXISTS identity_assignments_owner_key_idx ON identity_assignments(workspace_id, identity_type, identity_key, valid_from_generation, valid_to_generation, record_id)",
+    ),
+    (
+        "record_occurrences_workspace_owner_idx",
+        "CREATE INDEX IF NOT EXISTS record_occurrences_workspace_owner_idx ON record_occurrences(workspace_id, owner_artifact_id, valid_from_generation, valid_to_generation)",
+    ),
+    (
+        "record_occurrences_workspace_owner_version_idx",
+        "CREATE INDEX IF NOT EXISTS record_occurrences_workspace_owner_version_idx ON record_occurrences(workspace_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, record_id)",
+    ),
+];
+
+const COLD_DIRECT_NET_ACCEL_INDEXES: &[(&str, &str)] = &[
     (
         "identity_assignments_lookup_idx",
         "CREATE INDEX IF NOT EXISTS identity_assignments_lookup_idx ON identity_assignments(workspace_id, identity_type, identity_id, valid_from_generation, valid_to_generation)",
@@ -76,10 +109,6 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
     (
         "identity_assignments_key_idx",
         "CREATE INDEX IF NOT EXISTS identity_assignments_key_idx ON identity_assignments(workspace_id, identity_key_digest, valid_from_generation, identity_type, identity_key, record_id)",
-    ),
-    (
-        "identity_assignments_owner_key_idx",
-        "CREATE INDEX IF NOT EXISTS identity_assignments_owner_key_idx ON identity_assignments(workspace_id, identity_type, identity_key, valid_from_generation, valid_to_generation, record_id)",
     ),
     (
         "identity_assignments_record_idx",
@@ -94,15 +123,6 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
         "CREATE INDEX IF NOT EXISTS artifact_dependencies_direct_idx ON artifact_dependencies(workspace_id, record_id, valid_from_generation, valid_to_generation, dependency_artifact_id, dependency_artifact_version_id, dependency_role)",
     ),
 ];
-
-/// Comma-joined names of `SECONDARY_INDEXES`, for pre-emption diagnostics.
-fn secondary_index_pending_names() -> String {
-    SECONDARY_INDEXES
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
 
 mod publication_v3_sql;
 
@@ -143,7 +163,6 @@ struct LexicalMaintenance {
     cas_root: String,
     generation: i64,
     max_document_bytes: usize,
-    rebuild_secondary_indexes: bool,
 }
 
 fn post_publication_deadline_ms() -> u64 {
@@ -173,7 +192,6 @@ fn schedule_lexical_reconcile(
     cas_root: String,
     generation: i64,
     max_document_bytes: usize,
-    rebuild_secondary_indexes: bool,
 ) {
     let scheduled_epoch = SECONDARY_MAINTENANCE_EPOCH.load(Ordering::Acquire);
     std::thread::spawn(move || {
@@ -185,13 +203,12 @@ fn schedule_lexical_reconcile(
         // start racing the very first foreground mutation (the harness's or
         // an editor's first save) for the lease before that edit ever got a
         // chance to run (docs/evidence/2026-09-01-f1-resultado.md). The cold
-        // case uses the same order of magnitude as the secondary-index
-        // rebuild's cold quiet period below (`quiet_period_ms`) rather than
-        // the shorter edit-to-edit interval, since a cold generation is
-        // reliably followed by more foreground activity than a routine
-        // incremental edit is. If another generation arrives during the
-        // quiet period, this pass is superseded; the newer pass sees the
-        // latest visible source frontier and will reconcile it instead.
+        // case uses a longer quiet period than the shorter edit-to-edit
+        // interval, since a cold generation is reliably followed by more
+        // foreground activity than a routine incremental edit is. If another
+        // generation arrives during the quiet period, this pass is
+        // superseded; the newer pass sees the latest visible source frontier
+        // and will reconcile it instead.
         const COLD_LEXICAL_QUIET_PERIOD_MS: u64 = 15_000;
         const EDIT_LEXICAL_QUIET_PERIOD_MS: u64 = 5_000;
         let quiet_period_ms = if request.base_generation > 0 {
@@ -255,58 +272,17 @@ fn schedule_lexical_reconcile(
                     eprintln!(
                         "[urdira-indexing-worker] lexical reconcile complete generation={generation} closed={closed} inserted={inserted} oversized={oversized} wal_busy={busy} wal_frames={frames} wal_checkpointed={checkpointed}"
                     );
-                    if rebuild_secondary_indexes {
-                        // Let the next watcher turn settle before taking the
-                        // writer lease for derived indexes. Structural source
-                        // commits always win this maintenance race.
-                        // Cold publication is followed immediately by the
-                        // harness (and commonly by the first editor save).
-                        // Give that first structural generation priority over
-                        // derived-index maintenance; later generations can
-                        // use the shorter quiet period.
-                        let quiet_period_ms = if request.base_generation == 0 {
-                            15_000
-                        } else {
-                            2_000
-                        };
-                        std::thread::sleep(Duration::from_millis(quiet_period_ms));
-                        let current_epoch = SECONDARY_MAINTENANCE_EPOCH.load(Ordering::Acquire);
-                        if current_epoch == scheduled_epoch {
-                            schedule_secondary_index_rebuild(
-                                database_path.clone(),
-                                request.clone(),
-                                scheduled_epoch,
-                            );
-                        } else {
-                            // B5: a newer structural generation already began
-                            // during this quiet period. Dropping the rebuild
-                            // here used to leave every derived accelerator
-                            // index (including
-                            // record_occurrences_workspace_owner_idx, whose
-                            // absence turns the incremental publish closure
-                            // into a full 3.19M-row scan) missing until some
-                            // later generation's own quiet period happened to
-                            // go completely uninterrupted -- rare during a
-                            // busy editing session
-                            // (docs/evidence/2026-09-01-f5-e3-cierre-tanda.md).
-                            // Adopt the fresher epoch and let the rebuild's
-                            // own bounded pre-emption requeue loop
-                            // (schedule_secondary_index_rebuild) wait the new
-                            // generation out instead of abandoning the pass
-                            // entirely.
-                            if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
-                                eprintln!(
-                                    "[urdira-indexing-worker] secondary index maintenance pre-empted during quiet period; rescheduling under epoch={current_epoch}, pending indexes: {}",
-                                    secondary_index_pending_names()
-                                );
-                            }
-                            schedule_secondary_index_rebuild(
-                                database_path.clone(),
-                                request.clone(),
-                                current_epoch,
-                            );
-                        }
-                    }
+                    // Derived accelerator indexes used to be rebuilt here, by
+                    // a detached pass scheduled after this lexical reconcile
+                    // completed. That pass raced every subsequent structural
+                    // generation for the writer lease with a single-attempt
+                    // `open` and ceded to scan-priority on every retry, so on
+                    // a busy corpus it could requeue indefinitely and never
+                    // complete. All ten accelerator indexes are now built
+                    // inline, inside the cold-direct publish transaction
+                    // itself (see `COLD_DIRECT_NET_ACCEL_INDEXES` and the
+                    // `cold_direct` block in `publish()`), so there is
+                    // nothing left for this pass to hand off.
                     return;
                 }
                 Err(error) if Instant::now() < retry_deadline => {
@@ -341,114 +317,6 @@ fn schedule_wal_checkpoint(database_path: String, request: GenerationRequest) {
                 "[urdira-indexing-worker] wal checkpoint complete busy={busy} frames={frames} checkpointed={checkpointed}"
             ),
             Err(error) => eprintln!("[urdira-indexing-worker] wal checkpoint deferred: {error}"),
-        }
-    });
-}
-
-/// Rebuild secondary query indexes after a cold structural commit is already
-/// visible. Indexes are derived accelerators, not part of the v3 byte
-/// contract; keeping this bounded maintenance pass outside the readiness
-/// transaction removes several seconds of cold sort/write amplification while
-/// preserving correctness (SQLite can scan until the indexes exist).
-fn schedule_secondary_index_rebuild(
-    database_path: String,
-    request: GenerationRequest,
-    scheduled_epoch: u64,
-) {
-    std::thread::spawn(move || {
-        // B5: pre-emption used to abort this pass outright (`return`) the
-        // instant a newer structural generation began, with nothing left to
-        // re-arm it -- incremental generations schedule lexical maintenance,
-        // not this rebuild directly, so a busy editing session (each edit's
-        // own detached rebuild pre-empted by the very next edit before it
-        // ever acquired the lease) could leave every accelerator index in
-        // `SECONDARY_INDEXES` missing indefinitely
-        // (docs/evidence/2026-09-01-f5-e3-cierre-tanda.md). Requeue for the
-        // fresher epoch instead of discarding, bounded so a genuine
-        // non-stop edit storm still lets this thread exit rather than spin
-        // forever; the storm's eventual last edit re-arms this same
-        // maintenance through its own `schedule_lexical_reconcile` call once
-        // activity settles.
-        const MAX_PREEMPTION_REQUEUES: u32 = 12;
-        const PREEMPTION_REQUEUE_DELAY_MS: u64 = 2_000;
-        let mut scheduled_epoch = scheduled_epoch;
-        let mut requeues = 0_u32;
-        'requeue: loop {
-            for attempt in 0..20_u32 {
-                if SECONDARY_MAINTENANCE_EPOCH.load(Ordering::Acquire) != scheduled_epoch {
-                    if requeues >= MAX_PREEMPTION_REQUEUES {
-                        eprintln!(
-                            "[urdira-indexing-worker] secondary index maintenance abandoned after {requeues} pre-emption requeues; pending indexes: {}",
-                            secondary_index_pending_names()
-                        );
-                        return;
-                    }
-                    requeues += 1;
-                    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
-                        eprintln!(
-                            "[urdira-indexing-worker] secondary index maintenance pre-empted by structural generation; requeue={requeues} pending indexes: {}",
-                            secondary_index_pending_names()
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(PREEMPTION_REQUEUE_DELAY_MS));
-                    scheduled_epoch = SECONDARY_MAINTENANCE_EPOCH.load(Ordering::Acquire);
-                    continue 'requeue;
-                }
-                // Give a queued foreground scan first crack at the lease
-                // this pass just released/is about to try for, exactly like
-                // `IndexingCore::yield_mutation_lease` -- see
-                // `wait_out_scan_priority`'s doc comment
-                // (`crates/urdira-indexing-core/src/lib.rs`) for why a bare
-                // immediate reopen here used to win that race against a
-                // scan's own `open_with_lease_wait` almost every time. This
-                // loop has no `CancellationToken`/deadline of its own to
-                // thread through the wait; its existing bounded
-                // attempt/requeue counters already cap how long that costs.
-                if let Err(error) =
-                    wait_out_scan_priority(&database_path, &CancellationToken::default(), None)
-                {
-                    eprintln!(
-                        "[urdira-indexing-worker] secondary index scan-priority wait failed: {error}"
-                    );
-                    return;
-                }
-                let result = IndexingCore::open(&database_path, &request).and_then(|mut core| {
-                    core.with_transaction(|transaction| {
-                        for (_, sql) in SECONDARY_INDEXES {
-                            transaction.execute(sql, []).map_err(sql_error)?;
-                        }
-                        Ok(())
-                    })?;
-                    core.checkpoint_wal()
-                });
-                match result {
-                    Ok((busy, frames, checkpointed)) => {
-                        eprintln!(
-                            "[urdira-indexing-worker] secondary indexes ready busy={busy} frames={frames} checkpointed={checkpointed}"
-                        );
-                        return;
-                    }
-                    Err(error) if attempt < 20 => {
-                        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
-                            eprintln!(
-                                "[urdira-indexing-worker] secondary index retry attempt={} error={error}",
-                                attempt + 1
-                            );
-                        }
-                        std::thread::sleep(Duration::from_millis(25 + u64::from(attempt) * 25));
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "[urdira-indexing-worker] secondary index rebuild deferred after bounded retries: {error}"
-                        );
-                        return;
-                    }
-                }
-            }
-            // The bounded per-attempt loop exhausted without success and
-            // without a pre-emption; give up quietly, exactly as before this
-            // requeue loop existed.
-            return;
         }
     });
 }
@@ -2249,7 +2117,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         cas_root: cas_root.to_owned(),
                                         generation: published_generation,
                                         max_document_bytes,
-                                        rebuild_secondary_indexes: request.direct_publication,
                                     })
                                 } else {
                                     core.release_mutation_lease();
@@ -2327,7 +2194,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         maintenance.cas_root,
                                         maintenance.generation,
                                         maintenance.max_document_bytes,
-                                        maintenance.rebuild_secondary_indexes,
                                     );
                                 }
                                 PostPublicationMaintenance::WalCheckpoint {
@@ -5735,6 +5601,23 @@ fn finalize_workspace_publication(
     // write amplification. Drop only the rebuildable secondary indexes inside
     // the same transaction and recreate them before commit; readers never
     // observe the intermediate schema and rollback restores the prior state.
+    //
+    // Safety invariant: SQLite indexes are scoped to the whole table they
+    // index, not to a single workspace's rows within it, but each workspace
+    // owns its own SQLite *file* -- `DurableStorage.registerWorkspace`
+    // resolves every workspace to its own path via `defaultWorkspacePath`
+    // (packages/storage/src/storage.ts:377) and a fork copies its donor into
+    // its own separate file over an `ATTACH DATABASE ... AS fork_donor_db`
+    // (packages/engine/src/workspace-fork.ts:750), never sharing a file with
+    // the donor. A single connection/transaction, and therefore a single
+    // DROP/CREATE INDEX pair, is consequently already scoped to exactly one
+    // workspace's tables, so dropping and recreating an accelerator index
+    // during this workspace's cold commit can never observe or affect
+    // another workspace's rows. If a future change ever puts more than one
+    // workspace's rows in the same SQLite file (shared-table
+    // multi-tenancy), this DROP/CREATE dance would need to move to a
+    // per-workspace-filtered rebuild instead -- it is only sound today
+    // because "one file per workspace" holds.
     let cold_direct = request.direct_publication && !records_exist;
     if cold_direct {
         transaction
@@ -5911,14 +5794,14 @@ fn finalize_workspace_publication(
     // (which only serves the incremental owner-history join/anti-join and is
     // unused by a cold-direct publication), turns both the COUNT and the
     // ordered SELECT below into index-only scans. Recreate it inline, inside
-    // this same transaction, before the scan runs; it is therefore no longer
-    // part of the detached secondary-index rebuild list below.
+    // this same transaction, before the scan runs -- it therefore has its own
+    // `COLD_DIRECT_DIGEST_ORDER_ACCEL_INDEX` constant rather than sharing the
+    // `COLD_DIRECT_A1_ACCEL_INDEXES`/`COLD_DIRECT_NET_ACCEL_INDEXES` lists
+    // built later in this same transaction.
     if cold_direct {
         let digest_index_started = Instant::now();
         transaction
-            .execute_batch(
-                "CREATE INDEX IF NOT EXISTS record_occurrences_digest_order_idx ON record_occurrences(workspace_id, record_id, valid_from_generation, valid_to_generation, record_digest)",
-            )
+            .execute(COLD_DIRECT_DIGEST_ORDER_ACCEL_INDEX.1, [])
             .map_err(sql_error)?;
         if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
             eprintln!(
@@ -6153,21 +6036,37 @@ fn finalize_workspace_publication(
     // `SEARCH r USING INDEX record_occurrences_workspace_owner_idx` plan)
     // has no choice but a full scan of every visible row -- measured
     // at +14s on a 3.19M-row corpus for a single-file edit
-    // (docs/evidence/2026-09-01-f5-e3-cierre-tanda.md, A1). The remaining
-    // derived accelerators are rebuilt by the detached maintenance pass,
-    // which is pre-empted as soon as a new structural generation arrives
-    // (and now requeues instead of giving up outright, see
-    // `schedule_secondary_index_rebuild` in `urdira-indexing-worker`) --
-    // acceptable there because none of those other indexes gate the very
-    // next incremental publish's own closure query the way this one does.
+    // (docs/evidence/2026-09-01-f5-e3-cierre-tanda.md, A1).
+    //
+    // The remaining five accelerators (`COLD_DIRECT_NET_ACCEL_INDEXES`) used
+    // to be left to a *detached* post-publication rebuild pass. That pass
+    // raced every subsequent structural generation for the workspace writer
+    // lease with a single-attempt `open` and ceded to scan-priority on every
+    // retry, so on a busy corpus it could requeue indefinitely and never
+    // complete -- "secondary indexes ready" would simply never print. None
+    // of the five participate in the cold-direct INSERTs' own conflict
+    // resolution (see the safety-invariant comment above the DROP INDEX
+    // statements earlier in this function), so building them here, inline,
+    // in the same transaction and measured under the same
+    // `cold_index_rebuild_ms` total as the four above, is safe and removes
+    // the starvation risk entirely.
     if cold_direct {
         let cold_index_rebuild_started = Instant::now();
-        transaction
-            .execute_batch(
-                "CREATE INDEX IF NOT EXISTS record_occurrences_visible_idx ON record_occurrences(workspace_id, valid_from_generation, valid_to_generation); CREATE INDEX IF NOT EXISTS identity_assignments_owner_key_idx ON identity_assignments(workspace_id, identity_type, identity_key, valid_from_generation, valid_to_generation, record_id); CREATE INDEX IF NOT EXISTS record_occurrences_workspace_owner_idx ON record_occurrences(workspace_id, owner_artifact_id, valid_from_generation, valid_to_generation); CREATE INDEX IF NOT EXISTS record_occurrences_workspace_owner_version_idx ON record_occurrences(workspace_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, record_id);",
-            )
-            .map_err(sql_error)?;
-        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
+        for (name, sql) in COLD_DIRECT_A1_ACCEL_INDEXES
+            .iter()
+            .chain(COLD_DIRECT_NET_ACCEL_INDEXES)
+        {
+            let per_index_started = Instant::now();
+            transaction.execute(sql, []).map_err(sql_error)?;
+            if debug_timing {
+                eprintln!(
+                    "[urdira-indexing-worker] publish cold_index_rebuild index={name} elapsed_ms={}",
+                    per_index_started.elapsed().as_millis()
+                );
+            }
+        }
+        if debug_timing {
             eprintln!(
                 "[urdira-indexing-worker] publish cold_index_rebuild_ms={}",
                 cold_index_rebuild_started.elapsed().as_millis()
@@ -6293,110 +6192,76 @@ mod tests {
         }
     }
 
-    /// A1: `record_occurrences_workspace_owner_idx` and
-    /// `record_occurrences_workspace_owner_version_idx` are recreated
-    /// inline, inside the cold-direct commit itself (see the `cold_direct`
-    /// block in `publish()`), because the very next incremental publish's
-    /// `DIRECT_PUBLICATION_CLOSURES_SQL` needs the first of the two
-    /// immediately (docs/evidence/2026-09-01-f5-e3-cierre-tanda.md). The
-    /// detached `SECONDARY_INDEXES` rebuild list must not recreate them too
-    /// -- this test pins that split so the two lists cannot silently drift
-    /// back into overlapping (redundant, if harmless) index creation.
+    /// T3 (docs/evidence/2026-09-02): a cold-direct publication used to
+    /// leave five derived accelerator indexes to a *detached*
+    /// post-publication rebuild pass that raced every subsequent structural
+    /// generation for the workspace writer lease with a single-attempt
+    /// `open`, ceding to scan-priority on every retry -- on a busy corpus it
+    /// could requeue indefinitely and never complete, so those five indexes
+    /// could stay missing forever. All ten derived accelerators
+    /// (`COLD_DIRECT_DIGEST_ORDER_ACCEL_INDEX`, `COLD_DIRECT_A1_ACCEL_INDEXES`,
+    /// `COLD_DIRECT_NET_ACCEL_INDEXES`) are now built inline, synchronously,
+    /// by the cold-direct commit itself. This test exercises exactly the SQL
+    /// those three module-scope lists carry -- the same source the real
+    /// `cold_direct` block in `finalize_workspace_publication` reads from --
+    /// against a minimal stand-in schema covering only the columns those
+    /// indexes reference, then asserts every one of the ten index names
+    /// exists in `sqlite_schema` afterward. It is the guard against a future
+    /// change silently dropping one of the ten, or reintroducing a detached
+    /// rebuild that can starve.
     #[test]
-    fn secondary_index_rebuild_list_excludes_indexes_recreated_inline_at_the_cold_commit() {
-        let names: Vec<&str> = SECONDARY_INDEXES.iter().map(|(name, _)| *name).collect();
-        for excluded in [
-            "record_occurrences_workspace_owner_idx",
-            "record_occurrences_workspace_owner_version_idx",
-        ] {
-            assert!(
-                !names.contains(&excluded),
-                "{excluded} must stay out of the detached SECONDARY_INDEXES list; it is recreated inline at the cold commit"
-            );
-        }
-        // record_occurrences_visible_idx and identity_assignments_owner_key_idx
-        // stay listed in both places deliberately (a harmless repeat
-        // `IF NOT EXISTS`); pin that they are still present here.
-        for still_present in [
-            "record_occurrences_visible_idx",
-            "identity_assignments_owner_key_idx",
-        ] {
-            assert!(
-                names.contains(&still_present),
-                "{still_present} must remain in SECONDARY_INDEXES"
-            );
-        }
-    }
-
-    /// B5: a pre-emption used to make `schedule_secondary_index_rebuild`
-    /// abandon the rebuild outright (`return`), leaving every accelerator
-    /// index missing until some later generation's own quiet period
-    /// happened to go completely uninterrupted. Schedule this pass under a
-    /// deliberately stale epoch so it hits the pre-emption branch
-    /// deterministically on its very first check, then assert it requeues
-    /// under the current epoch and the indexes end up existing instead of
-    /// the pass giving up.
-    #[test]
-    fn schedule_secondary_index_rebuild_requeues_after_preemption_until_indexes_exist() {
+    fn cold_direct_commit_builds_every_accelerator_index() {
         let db_path = std::env::temp_dir().join(format!(
-            "urdira-indexing-worker-preemption-requeue-{}.sqlite",
-            std::process::id()
+            "urdira-indexing-worker-cold-direct-accel-indexes-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{}.urdira-writer.lock", db_path.display()));
-        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
-        let request = test_request();
-        {
-            let mut core = IndexingCore::open(db_path.to_str().expect("db path"), &request)
-                .expect("core open for schema setup");
-            core.with_transaction(|transaction| {
-                transaction
-                    .execute_batch(
-                        "CREATE TABLE record_occurrences (record_id TEXT NOT NULL, workspace_id TEXT NOT NULL, owner_artifact_id TEXT NOT NULL, owner_artifact_version_id TEXT NOT NULL, valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER, record_digest TEXT); \
-                         CREATE TABLE identity_assignments (record_id TEXT NOT NULL, workspace_id TEXT NOT NULL, identity_type TEXT NOT NULL, identity_id TEXT, identity_key TEXT, identity_key_digest TEXT, valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER); \
-                         CREATE TABLE artifact_dependencies (record_id TEXT NOT NULL, workspace_id TEXT NOT NULL, dependency_artifact_id TEXT, dependency_artifact_version_id TEXT, dependency_entry_id TEXT, dependency_role TEXT, valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER);",
-                    )
-                    .map_err(sql_error)
-            })
+        let connection = rusqlite::Connection::open(&db_path).expect("open connection");
+        connection
+            .execute_batch(
+                "CREATE TABLE record_occurrences (record_id TEXT NOT NULL, workspace_id TEXT NOT NULL, owner_artifact_id TEXT NOT NULL, owner_artifact_version_id TEXT NOT NULL, valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER, record_digest TEXT); \
+                 CREATE TABLE identity_assignments (record_id TEXT NOT NULL, workspace_id TEXT NOT NULL, identity_type TEXT NOT NULL, identity_id TEXT, identity_key TEXT, identity_key_digest TEXT, valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER); \
+                 CREATE TABLE artifact_dependencies (record_id TEXT NOT NULL, workspace_id TEXT NOT NULL, dependency_artifact_id TEXT, dependency_artifact_version_id TEXT, dependency_entry_id TEXT, dependency_role TEXT, valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER);",
+            )
             .expect("schema");
-            // `core` drops here, releasing the workspace writer lease before
-            // the maintenance pass under test tries to acquire it.
+        // Mirror the two-phase order the real cold-direct commit uses: the
+        // digest-order index is built first (it gates the visible_record_digest
+        // scan), the other nine later.
+        connection
+            .execute(COLD_DIRECT_DIGEST_ORDER_ACCEL_INDEX.1, [])
+            .expect("digest order index");
+        for (_, sql) in COLD_DIRECT_A1_ACCEL_INDEXES
+            .iter()
+            .chain(COLD_DIRECT_NET_ACCEL_INDEXES)
+        {
+            connection.execute(sql, []).expect("accelerator index");
         }
-        let stale_epoch = SECONDARY_MAINTENANCE_EPOCH
-            .load(Ordering::Acquire)
-            .wrapping_sub(1);
-        schedule_secondary_index_rebuild(
-            db_path.to_str().expect("db path").to_owned(),
-            request,
-            stale_epoch,
+        let expected_names: Vec<&str> = std::iter::once(&COLD_DIRECT_DIGEST_ORDER_ACCEL_INDEX)
+            .chain(COLD_DIRECT_A1_ACCEL_INDEXES.iter())
+            .chain(COLD_DIRECT_NET_ACCEL_INDEXES.iter())
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            expected_names.len(),
+            10,
+            "the cold commit builds ten total derived accelerator indexes: one digest-order + four A1 + five net-new"
         );
-        let verify_connection = rusqlite::Connection::open(db_path.to_str().expect("db path"))
-            .expect("verify connection");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let present: i64 = verify_connection
+        for name in &expected_names {
+            let present: i64 = connection
                 .query_row(
-                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name IN ('record_occurrences_visible_idx', 'identity_assignments_lookup_idx', 'identity_assignments_key_idx', 'identity_assignments_owner_key_idx', 'identity_assignments_record_idx', 'artifact_dependencies_reverse_idx', 'artifact_dependencies_direct_idx')",
-                    [],
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+                    [name],
                     |row| row.get(0),
                 )
-                .expect("count indexes");
-            if present == SECONDARY_INDEXES.len() as i64 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "secondary indexes were not rebuilt after a pre-emption requeue within the deadline; present={present}/{}",
-                SECONDARY_INDEXES.len()
+                .expect("count index");
+            assert_eq!(
+                present, 1,
+                "{name} must exist after the cold-direct commit builds every accelerator index inline"
             );
-            std::thread::sleep(Duration::from_millis(100));
         }
-        drop(verify_connection);
+        drop(connection);
         let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{}.urdira-writer.lock", db_path.display()));
-        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
     }
 
     /// A synthetic multi-group corpus for the facts pipeline tests below.

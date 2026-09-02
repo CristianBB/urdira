@@ -945,10 +945,9 @@ const SCAN_PENDING_SIDECAR_SUFFIX: &str = ".urdira-scan-pending";
 /// forever.
 const SCAN_PENDING_STALE_AFTER: Duration = Duration::from_secs(30);
 
-/// How long a single lease re-acquire turn
-/// (`yield_mutation_lease`/`schedule_secondary_index_rebuild` in
-/// `urdira-indexing-worker`) waits for a pending scan-priority marker to
-/// clear before giving up on THIS turn and reacquiring the lease anyway.
+/// How long a single lease re-acquire turn (`yield_mutation_lease`) waits
+/// for a pending scan-priority marker to clear before giving up on THIS turn
+/// and reacquiring the lease anyway.
 /// Bounding this per turn -- rather than waiting for the marker to clear
 /// unconditionally -- is what keeps a continuous stream of foreground edits
 /// from starving maintenance outright: maintenance still gets a turn to run
@@ -969,14 +968,12 @@ fn scan_pending_sidecar_path(workspace_path: &str) -> PathBuf {
 }
 
 /// True when the daemon has a real foreground edit queued for this
-/// workspace (see the sidecar's own doc comment above). Detached
-/// maintenance consults this before re-acquiring the workspace writer
-/// lease so a foreground scan can win that race instead of losing it
-/// chunk after chunk. Exposed from the crate root because both
-/// `yield_mutation_lease` below (inside `IndexingCore`) and
-/// `schedule_secondary_index_rebuild` (`urdira-indexing-worker`, which
-/// re-opens a fresh `IndexingCore` per attempt rather than holding one
-/// across its retry loop) need it.
+/// workspace (see the sidecar's own doc comment above). Detached lexical
+/// maintenance consults this before re-acquiring the workspace writer lease
+/// so a foreground scan can win that race instead of losing it chunk after
+/// chunk. Exposed from the crate root (rather than a private helper) for
+/// `yield_mutation_lease` below (inside `IndexingCore`); `wait_out_scan_priority`
+/// stays `pub` for the same reason described on its own doc comment below.
 pub fn scan_priority_pending(workspace_path: &str) -> bool {
     match std::fs::metadata(scan_pending_sidecar_path(workspace_path)) {
         Ok(metadata) => metadata
@@ -999,13 +996,17 @@ pub fn scan_priority_pending(workspace_path: &str) -> bool {
 /// `SCAN_PRIORITY_WAIT_BUDGET`'s own doc comment for why that bounds
 /// starvation instead of trading one indefinite wait for another).
 ///
-/// Public so `schedule_secondary_index_rebuild` in `urdira-indexing-worker`
-/// can call it too: that loop re-opens a fresh `IndexingCore` on every
-/// attempt instead of holding one across the wait the way
-/// `yield_mutation_lease` does, so it has no `&self` to hang this off of.
-/// It has no `CancellationToken`/deadline of its own either -- pass
-/// `CancellationToken::default()` and `None` in that case; the loop's own
-/// bounded attempt/requeue counters already cap total wait time.
+/// Kept `pub` at the crate root rather than a private method on
+/// `IndexingCore`: it used to also be called directly by
+/// `urdira-indexing-worker`'s detached secondary-index rebuild pass (removed
+/// -- see docs/evidence/2026-09-02, T2 -- it raced every subsequent
+/// structural generation for the writer lease and could starve
+/// indefinitely, so those indexes are now built inline in the cold-direct
+/// commit instead). Its only caller today is `yield_mutation_lease` below,
+/// but the free function stays exported in case a future detached,
+/// per-attempt maintenance pass (which, unlike `yield_mutation_lease`,
+/// cannot hold `&self` across a retry loop that re-opens a fresh
+/// `IndexingCore` on every attempt) needs it again.
 pub fn wait_out_scan_priority(
     workspace_path: &str,
     cancellation: &CancellationToken,

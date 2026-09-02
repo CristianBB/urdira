@@ -1823,11 +1823,14 @@ export class DaemonRuntime {
       const WORKSPACE_WRITER_BUSY_MAX_RETRIES = 8;
       // Scan-priority sidecar (docs/evidence/2026-09-02-edit-latency.md's
       // "primera edicion" residual): a real edit-triggered scan and detached
-      // Rust maintenance (`reconcile_lexical`'s `yield_mutation_lease` and
-      // `schedule_secondary_index_rebuild`'s per-attempt loop, both in
-      // `crates/urdira-indexing-worker`/`-core`) both want the same
-      // process-local `workspace_lease`. Maintenance already releases that
-      // lease between bounded chunks (B1/B5), but nothing told it to let a
+      // Rust lexical maintenance (`reconcile_lexical`'s `yield_mutation_lease`
+      // in `crates/urdira-indexing-core`) both want the same process-local
+      // `workspace_lease`. (A second detached rebuild pass used to contend
+      // for the same lease to build derived accelerator indexes after a
+      // cold-direct commit; it was removed -- those indexes are now built
+      // inline, synchronously, inside the cold-direct commit itself -- see
+      // docs/evidence/2026-09-02, T2.) Maintenance already releases that
+      // lease between bounded chunks (B1), but nothing told it to let a
       // *specific* incoming edit win the immediate re-acquire race, so a cold
       // corpus's first foreground edit could still lose every such race in a
       // row and wait out the whole detached pass (measured: 12.5s of
