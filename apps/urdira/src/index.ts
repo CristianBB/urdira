@@ -861,7 +861,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
               created_at: now,
             } } : {}),
           },
-          deadline_ms: Date.now() + 10 * 60_000,
+          deadline_ms: indexingCoreDeadlineMs(),
         }).finally(() => signal?.removeEventListener("abort", cancelRustGeneration));
         const expectedPhase = nativeStageOne || coreGenerationEnabled ? "group_accepted" : "prepared";
         if (generationEvent.kind !== "progress" || generationEvent.phase !== expectedPhase) throw new Error(`Rust indexing-core did not enter the ${nativeStageOne ? "engine-owned structural ingest" : "semantic staging"} state.`);
@@ -1961,11 +1961,51 @@ function positiveIntegerEnv(name: string): number | undefined {
 // transport deadline must be at least as long as the generation deadline
 // carried in the Rust request; otherwise a large real workspace is killed by
 // the Node pipe while Rust is still making progress. The operation itself
-// remains bounded by `deadline_ms` (currently ten minutes), so this is not an
-// unbounded retry or a readiness relaxation. The value is overridable only
-// for diagnostic hosts and is capped by the private framed protocol.
+// remains bounded by `deadline_ms` (see `indexingCoreDeadlineMs` below), so
+// this is not an unbounded retry or a readiness relaxation.
+//
+// T3 (docs/evidence/2026-09-02-file-creation-diagnosis.md, "el timeout"): the
+// wire protocol between this process and the Rust indexing-core worker is
+// strictly request/response -- a `progress`-kind event IS the terminal
+// response to `index_generation`/`accept_group` (see
+// `IndexingCommand::AcceptGroup`'s handling in
+// `crates/urdira-indexing-worker/src/main.rs`), never a mid-flight "still
+// working" notification a still-pending call's own timer could reset
+// against. Building a real intra-request heartbeat channel would need wire
+// protocol surgery (a non-terminal frame kind Rust interleaves into a
+// long-running command, plus a Node-side decoder change to reset rather than
+// resolve on it) that is out of scope here. T1 already removes the actual
+// O(corpus) syntax-analysis cost that made a single file create/delete's
+// `index_generation` request exceed the OLD fixed 600_000ms ceiling; this
+// higher, configurable ceiling is the safety net for whatever legitimately
+// large full build still takes the conservative fallback path (a
+// `compiler_options`/config change, or any case the incremental root
+// add/remove path could not certify).
+const INDEXING_CORE_DEFAULT_TIMEOUT_MS = 600_000;
+/** Generous explicit upper bound on `URDIRA_INDEXING_CORE_TIMEOUT_MS` --
+ * still finite (an operator who needs longer should raise this constant
+ * deliberately, not discover an unbounded hang), but six times the previous
+ * hardcoded ceiling. */
+const INDEXING_CORE_MAX_TIMEOUT_MS = 3_600_000;
+/** Kept strictly below the transport's own request timer so a graceful
+ * Rust-side `"indexing operation deadline exceeded"` error always wins over
+ * Node abruptly killing the child process pipe. */
+const INDEXING_CORE_DEADLINE_GRACE_MS = 30_000;
+
 function indexingCoreRequestTimeoutMs(): number {
-  return Math.min(600_000, positiveIntegerEnv("URDIRA_INDEXING_CORE_TIMEOUT_MS") ?? 600_000);
+  return Math.min(INDEXING_CORE_MAX_TIMEOUT_MS, positiveIntegerEnv("URDIRA_INDEXING_CORE_TIMEOUT_MS") ?? INDEXING_CORE_DEFAULT_TIMEOUT_MS);
+}
+
+/** Absolute epoch-ms deadline for one Rust generation request --
+ * `urdira-indexing-core`'s own `check_cancelled`/`wait_out_scan_priority`
+ * checkpoints enforce this and fail with a graceful "deadline exceeded"
+ * error instead of running forever. Always `indexingCoreRequestTimeoutMs()`
+ * minus `INDEXING_CORE_DEADLINE_GRACE_MS`, so raising
+ * `URDIRA_INDEXING_CORE_TIMEOUT_MS` actually extends how long Rust itself is
+ * willing to keep working, not just how long Node is willing to wait for a
+ * response Rust would have abandoned long before. */
+function indexingCoreDeadlineMs(): number {
+  return Date.now() + Math.max(1_000, indexingCoreRequestTimeoutMs() - INDEXING_CORE_DEADLINE_GRACE_MS);
 }
 
 // URDIRA_WARM_RECORDS_BUDGET_MB: LRU byte budget (megabytes) for warm

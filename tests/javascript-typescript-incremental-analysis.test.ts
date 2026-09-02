@@ -685,10 +685,18 @@ export const sharedWidget: DerivedWidget = DerivedWidget.create(9);
       // list (Rust proved nothing is left for the checker) must short-circuit
       // to no entities/relations without touching the checker at all.
       const filesWithEmpty: AnalyzerFile[] = [...files, { path: "src/empty-owner.ts", text: "// nothing pending here\n" }];
+      // T2 (docs/evidence/2026-09-02-file-creation-diagnosis.md): adding
+      // "src/empty-owner.ts" as a new root, with `compiler_options`
+      // unchanged and the existing root's own text unchanged, now takes the
+      // incremental add-root path (`fileChanges.created` + a cheap
+      // `openProjects` reconfigure of the already-open session config)
+      // instead of tearing down and rebuilding the whole API. The
+      // assertions below (identical relations/entities to the full build)
+      // are exactly what proves that path is equivalent, not just faster.
       expect(session.prepareRustSemanticState({
         files: filesWithEmpty, root_names: [...rootNames, "src/empty-owner.ts"],
         rust_semantic_scope: { authority: "urdira:jsts-syntax-worker", changed_paths: filesWithEmpty.map((file) => file.path), affected_paths: filesWithEmpty.map((file) => file.path) },
-      })).toBe("full");
+      })).toBe("incremental");
       session.beginRustSemanticOwnerGroup(
         ["src/widgets.ts", "src/empty-owner.ts"],
         true,

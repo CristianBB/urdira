@@ -71,9 +71,23 @@ type Request = { readonly request_id: string; readonly kind: string; readonly [k
 type Pending = { readonly resolve: (event: IndexingEvent) => void; readonly reject: (error: Error) => void; readonly timer: NodeJS.Timeout };
 
 function asError(value: unknown): Error { return value instanceof Error ? value : new Error(String(value)); }
+// T3 (docs/evidence/2026-09-02-file-creation-diagnosis.md): this per-request
+// timer is the only liveness signal this transport has for a still-pending
+// `index_generation`/`accept_group`/... call -- the wire protocol is
+// strictly request/response, so a `progress`-kind event IS the terminal
+// response to whichever command sent it, never a mid-flight notification a
+// pending call's timer could reset against. `MAX_REQUEST_TIMEOUT_MS` is a
+// generous but still-finite safety-net ceiling (six times the previous
+// hardcoded 600_000ms), configurable end-to-end via
+// `URDIRA_INDEXING_CORE_TIMEOUT_MS` (see `indexingCoreRequestTimeoutMs` /
+// `indexingCoreDeadlineMs` in `apps/urdira/src/index.ts`, which also raises
+// the `deadline_ms` budget Rust's own internal checkpoints enforce, so
+// raising this ceiling actually extends how long Rust keeps working, not
+// just how long Node waits for a response Rust already abandoned).
+const MAX_REQUEST_TIMEOUT_MS = 3_600_000;
 function timeout(value: number | undefined): number {
   const result = value ?? 120_000;
-  if (!Number.isSafeInteger(result) || result <= 0 || result > 600_000) throw new Error("indexing-core request_timeout_ms is invalid.");
+  if (!Number.isSafeInteger(result) || result <= 0 || result > MAX_REQUEST_TIMEOUT_MS) throw new Error("indexing-core request_timeout_ms is invalid.");
   return result;
 }
 function validateEvent(value: unknown): IndexingEvent {

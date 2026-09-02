@@ -899,6 +899,46 @@ impl SyntaxWorkerState {
             Some(_) if prior_paths.as_ref() != Some(&paths) => Some(ResetReason::FileSetChanged),
             Some(_) => None,
         };
+        // T1 (docs/evidence/2026-09-02-file-creation-diagnosis.md): a
+        // root/file-set change that is a PURE path-membership change --
+        // every path present both before and now kept byte-identical
+        // content, and the resolver configuration did not change -- never
+        // needs the O(corpus) reparse the generic reset below performs.
+        // Only the added/removed paths themselves, plus whichever OTHER
+        // files' import/export resolution the new path set actually
+        // changes (computed exactly by `reresolve_file`, never guessed
+        // at), are re-derived. Any case this cannot certify -- a content
+        // edit mixed into the same request, or a configuration change --
+        // is deliberately excluded here and falls through to the existing
+        // conservative full reset.
+        let path_membership_incremental = matches!(
+            reset_reason,
+            Some(ResetReason::RootSetChanged) | Some(ResetReason::FileSetChanged)
+        ) && prior.as_ref().is_some_and(|state| {
+            state.configuration_digest == configuration_digest
+                && state
+                    .source_metadata
+                    .iter()
+                    .filter(|(path, _)| paths.contains(path.as_str()))
+                    .all(|(path, metadata)| source_metadata.get(path) == Some(metadata))
+        });
+        let added: BTreeSet<String> = if path_membership_incremental {
+            prior_paths.as_ref().map_or_else(
+                || paths.clone(),
+                |prior_paths| paths.difference(prior_paths).cloned().collect(),
+            )
+        } else {
+            BTreeSet::new()
+        };
+        let removed: BTreeSet<String> = if path_membership_incremental {
+            prior_paths
+                .as_ref()
+                .map_or_else(BTreeSet::new, |prior_paths| {
+                    prior_paths.difference(&paths).cloned().collect()
+                })
+        } else {
+            BTreeSet::new()
+        };
         let pending_replay = reset_reason.is_none()
             && prior
                 .as_ref()
@@ -925,6 +965,8 @@ impl SyntaxWorkerState {
         )?;
         let changed = if pending_replay {
             BTreeSet::new()
+        } else if path_membership_incremental {
+            added.clone()
         } else if reset_reason.is_some() || matches!(&change_set, AuthoritativeChangeSet::Full) {
             paths.clone()
         } else {
@@ -962,7 +1004,15 @@ impl SyntaxWorkerState {
             });
         }
         let available = paths.clone();
-        let mut next_files = if reset_reason.is_some() {
+        let mut next_files = if path_membership_incremental {
+            let mut files = prior
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| state.files.clone());
+            for path in &removed {
+                files.remove(path);
+            }
+            files
+        } else if reset_reason.is_some() {
             BTreeMap::new()
         } else {
             prior
@@ -1042,7 +1092,47 @@ impl SyntaxWorkerState {
                 Err(error) => return Err(error),
             }
         }
-        let affected = if reset_reason.is_some() {
+        // T1: a path add/remove can change the resolved `target_path` of an
+        // OTHER, byte-identical file's relative/bare import specifier --
+        // both when a specifier that used to be unresolved now finds the
+        // added path, and when a higher-resolution-priority path shadows
+        // (add) or stops shadowing (remove) a specifier's previous target
+        // (see `resolve_relative`/`probe_extensions`'s fixed extension
+        // order). Re-resolving is cheap (no re-parse; a handful of
+        // `BTreeSet` probes per existing import) so every retained file is
+        // checked exactly, never guessed at from specifier text alone.
+        let mut reresolved: BTreeSet<String> = BTreeSet::new();
+        if path_membership_incremental {
+            let stale_paths: Vec<String> = next_files
+                .keys()
+                .filter(|path| !changed.contains(path.as_str()))
+                .cloned()
+                .collect();
+            for path in stale_paths {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(WorkerMessage::Cancelled {
+                        request_id,
+                        cancellation_id,
+                    });
+                }
+                let updated = next_files
+                    .get(&path)
+                    .and_then(|existing| reresolve_file(existing, available, resolver));
+                if let Some(updated) = updated {
+                    next_files.insert(path.clone(), updated);
+                    reresolved.insert(path);
+                }
+            }
+        }
+        let affected = if path_membership_incremental {
+            let closure_changed: BTreeSet<String> =
+                added.iter().chain(reresolved.iter()).cloned().collect();
+            reverse_affected_closure(
+                prior.as_ref().map(|state| &state.files),
+                &next_files,
+                &closure_changed,
+            )
+        } else if reset_reason.is_some() {
             paths
         } else {
             reverse_affected_closure(
@@ -1061,18 +1151,25 @@ impl SyntaxWorkerState {
         let analysis_token = next_analysis_token(&project_key, self.next_analysis_sequence);
         self.next_analysis_sequence = self.next_analysis_sequence.saturating_add(1);
         let affected_files = affected.into_iter().collect::<Vec<_>>();
+        let reported_changed_files: Vec<String> = if path_membership_incremental {
+            added.union(&reresolved).cloned().collect()
+        } else {
+            changed.into_iter().collect()
+        };
         let response = WorkerMessage::AnalysisResult {
             request_id,
             cancellation_id,
             project_key: project_key.clone(),
             analysis_token: analysis_token.clone(),
-            build: if reset_reason.is_some() {
+            build: if path_membership_incremental {
+                BuildKind::Incremental
+            } else if reset_reason.is_some() {
                 BuildKind::Full
             } else {
                 BuildKind::Incremental
             },
             reset_reason,
-            changed_files: changed.into_iter().collect(),
+            changed_files: reported_changed_files,
             affected_files: affected_files.clone(),
             metrics,
         };
@@ -2305,6 +2402,105 @@ fn stable_entity_id(kind: EntityKind, path: &str, start: u32, name: &str) -> Str
     format!("jsts:{}:{path}:{start}:{name}", kind.identity_name())
 }
 
+/// Re-derive only the import/export target-path resolution (and the
+/// corresponding `core:import`/`core:export` relations) of an already-parsed
+/// file against a NEW `available` path set, without re-parsing its source.
+/// `file`'s own byte content never changes here -- only which other path (if
+/// any) each of its relative/bare specifiers now resolves to, which is
+/// exactly what changes when a sibling path is added to or removed from the
+/// corpus (T1, `docs/evidence/2026-09-02-file-creation-diagnosis.md`).
+/// Returns `None` when nothing about this file's resolution actually
+/// changed, so the caller can skip touching it -- keeping the incremental
+/// add/remove-root path's rewrite proportional to what genuinely changed,
+/// not to the corpus size.
+fn reresolve_file(
+    file: &SyntaxFileResult,
+    available: &BTreeSet<String>,
+    resolver: &WorkspaceResolver,
+) -> Option<SyntaxFileResult> {
+    let mut direct_imports = file.direct_imports.clone();
+    let mut resolution_changed = false;
+    for import in &mut direct_imports {
+        let resolved = resolver.resolve(&file.path, &import.specifier, available);
+        if resolved != import.target_path {
+            resolution_changed = true;
+        }
+        import.target_path = resolved;
+    }
+    let mut export_bindings = file.export_bindings.clone();
+    for binding in &mut export_bindings {
+        if let Some(specifier) = &binding.source_specifier {
+            let resolved = resolver.resolve(&file.path, specifier, available);
+            if resolved != binding.source_target_path {
+                resolution_changed = true;
+            }
+            binding.source_target_path = resolved;
+        }
+    }
+    if !resolution_changed {
+        return None;
+    }
+    let module_id = stable_entity_id(EntityKind::Module, &file.path, 0, &file.path);
+    let mut relations: Vec<SyntaxRelation> = file
+        .relations
+        .iter()
+        .filter(|relation| {
+            !(matches!(relation.kind, RelationKind::Import | RelationKind::Export)
+                && relation.source_id == module_id)
+        })
+        .cloned()
+        .collect();
+    for import in &direct_imports {
+        let kind = match import.kind {
+            ImportKind::Import => RelationKind::Import,
+            ImportKind::Export => RelationKind::Export,
+            ImportKind::DynamicImport | ImportKind::Require => continue,
+        };
+        let target_id = import
+            .target_path
+            .as_ref()
+            .map(|path| stable_entity_id(EntityKind::Module, path, 0, path));
+        let classification = if target_id.is_some() {
+            RelationClassification::Confirmed
+        } else {
+            RelationClassification::Possible
+        };
+        let id = format!(
+            "jsts:{}:{}:{}:{}:{}:{}",
+            kind.identity_name(),
+            file.path,
+            import.start,
+            import.end,
+            module_id,
+            target_id.as_deref().unwrap_or("unresolved")
+        );
+        relations.push(SyntaxRelation {
+            id,
+            kind,
+            source_id: module_id.clone(),
+            target_id,
+            path: file.path.clone(),
+            start: import.start,
+            end: import.end,
+            classification,
+        });
+    }
+    relations.sort_by(|left, right| left.id.cmp(&right.id));
+    Some(SyntaxFileResult {
+        path: file.path.clone(),
+        content_digest: file.content_digest.clone(),
+        language: file.language,
+        script_kind: file.script_kind,
+        byte_length: file.byte_length,
+        parsed: file.parsed,
+        direct_imports,
+        entities: file.entities.clone(),
+        relations,
+        diagnostics: file.diagnostics.clone(),
+        export_bindings,
+    })
+}
+
 fn reverse_affected_closure(
     prior: Option<&BTreeMap<String, SyntaxFileResult>>,
     next: &BTreeMap<String, SyntaxFileResult>,
@@ -2958,12 +3154,257 @@ declare module 'markdown-it-task-lists' {
         else {
             panic!("expected result")
         };
-        assert_eq!(build, BuildKind::Full);
+        // T1: deleting the last source is a pure path-membership change (no
+        // retained path's content changed, no configuration change), so it
+        // now takes the narrow incremental add/remove-root path instead of
+        // the O(corpus) reset -- `reset_reason` still reports the root-set
+        // transition, but `build` is `Incremental`. The resulting state
+        // (empty manifest, empty changed/affected sets) is identical either
+        // way.
+        assert_eq!(build, BuildKind::Incremental);
         assert_eq!(reset_reason, Some(ResetReason::RootSetChanged));
         assert!(changed_files.is_empty());
         assert!(affected_files.is_empty());
         assert!(state.projects["project:one"].files.is_empty());
         assert!(state.projects["project:one"].source_metadata.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // T1 equivalence gate (docs/evidence/2026-09-02-file-creation-diagnosis.md):
+    // the incremental add/remove-root path must produce the EXACT same
+    // retained `SyntaxFileResult` state as a fresh full build of the same
+    // target corpus, scale-independent -- the same property the Merkle
+    // equivalence tests establish elsewhere. Each test below builds the
+    // target corpus two ways (incrementally, from a smaller prior state;
+    // and directly, as a single full build) and asserts the two runs'
+    // retained project state is byte-for-byte identical.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn incremental_root_add_matches_full_rebuild_for_a_new_file_without_importers() {
+        let mut incremental_state = SyntaxWorkerState::default();
+        analyze(
+            &mut incremental_state,
+            vec![
+                source("a.ts", "export const a = 1;"),
+                source("b.ts", "export const b = 2;"),
+            ],
+            &["a.ts", "b.ts"],
+            '1',
+        );
+        let WorkerMessage::AnalysisResult { build, .. } = analyze_exact(
+            &mut incremental_state,
+            vec![
+                source("a.ts", "export const a = 1;"),
+                source("b.ts", "export const b = 2;"),
+                source("c.ts", "export const c = 3;"),
+            ],
+            &["a.ts", "b.ts", "c.ts"],
+            '1',
+            &["artifact:c.ts"],
+        ) else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Incremental);
+
+        let mut full_state = SyntaxWorkerState::default();
+        analyze(
+            &mut full_state,
+            vec![
+                source("a.ts", "export const a = 1;"),
+                source("b.ts", "export const b = 2;"),
+                source("c.ts", "export const c = 3;"),
+            ],
+            &["a.ts", "b.ts", "c.ts"],
+            '1',
+        );
+
+        assert_eq!(
+            incremental_state.projects["project:one"].files,
+            full_state.projects["project:one"].files
+        );
+    }
+
+    #[test]
+    fn incremental_root_add_matches_full_rebuild_when_the_new_file_satisfies_a_previously_unresolved_import()
+     {
+        let mut incremental_state = SyntaxWorkerState::default();
+        analyze(
+            &mut incremental_state,
+            vec![source(
+                "a.ts",
+                "import { b } from './b'; export const a = 1;",
+            )],
+            &["a.ts"],
+            '1',
+        );
+        let unresolved = &incremental_state.projects["project:one"].files["a.ts"].direct_imports[0];
+        assert_eq!(unresolved.target_path, None);
+
+        let WorkerMessage::AnalysisResult {
+            build,
+            affected_files,
+            ..
+        } = analyze_exact(
+            &mut incremental_state,
+            vec![
+                source("a.ts", "import { b } from './b'; export const a = 1;"),
+                source("b.ts", "export const b = 2;"),
+            ],
+            &["a.ts", "b.ts"],
+            '1',
+            &["artifact:b.ts"],
+        )
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Incremental);
+        // `a.ts` is affected too: its own import target flipped from
+        // unresolved to `b.ts`, even though `a.ts`'s byte content never
+        // changed -- this is exactly the case the diagnosis doc calls out
+        // as the delicate one.
+        assert_eq!(affected_files, vec!["a.ts".to_owned(), "b.ts".to_owned()]);
+
+        let mut full_state = SyntaxWorkerState::default();
+        analyze(
+            &mut full_state,
+            vec![
+                source("a.ts", "import { b } from './b'; export const a = 1;"),
+                source("b.ts", "export const b = 2;"),
+            ],
+            &["a.ts", "b.ts"],
+            '1',
+        );
+
+        assert_eq!(
+            incremental_state.projects["project:one"].files,
+            full_state.projects["project:one"].files
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["a.ts"].direct_imports[0]
+                .target_path
+                .as_deref(),
+            Some("b.ts")
+        );
+    }
+
+    #[test]
+    fn incremental_root_removal_matches_full_rebuild_when_deleting_an_imported_file() {
+        let mut incremental_state = SyntaxWorkerState::default();
+        analyze(
+            &mut incremental_state,
+            vec![
+                source("a.ts", "import { b } from './b'; export const a = 1;"),
+                source("b.ts", "export const b = 2;"),
+            ],
+            &["a.ts", "b.ts"],
+            '1',
+        );
+        let WorkerMessage::AnalysisResult {
+            build,
+            affected_files,
+            ..
+        } = analyze_exact(
+            &mut incremental_state,
+            vec![source(
+                "a.ts",
+                "import { b } from './b'; export const a = 1;",
+            )],
+            &["a.ts"],
+            '1',
+            &["artifact:b.ts"],
+        )
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Incremental);
+        // `a.ts` is affected: its import target regresses to unresolved
+        // now that `b.ts` is gone.
+        assert_eq!(affected_files, vec!["a.ts".to_owned()]);
+
+        let mut full_state = SyntaxWorkerState::default();
+        analyze(
+            &mut full_state,
+            vec![source(
+                "a.ts",
+                "import { b } from './b'; export const a = 1;",
+            )],
+            &["a.ts"],
+            '1',
+        );
+
+        assert_eq!(
+            incremental_state.projects["project:one"].files,
+            full_state.projects["project:one"].files
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["a.ts"].direct_imports[0].target_path,
+            None
+        );
+    }
+
+    #[test]
+    fn incremental_root_add_reresolves_a_higher_priority_extension_shadow() {
+        // `./util` currently resolves to `util.ts` (the only match). Adding
+        // `util.js` -- which `RESOLUTION_EXTENSIONS`'s fixed `.js`-before-
+        // `.ts` priority order prefers -- must flip `a.ts`'s import target
+        // even though `a.ts`'s own byte content is unchanged: this is the
+        // shadowing half of "the new path set changes an unchanged file's
+        // resolution", not just the previously-unresolved half.
+        let mut incremental_state = SyntaxWorkerState::default();
+        analyze(
+            &mut incremental_state,
+            vec![
+                source("a.ts", "import { u } from './util'; export const a = 1;"),
+                source("util.ts", "export const u = 1;"),
+            ],
+            &["a.ts", "util.ts"],
+            '1',
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["a.ts"].direct_imports[0]
+                .target_path
+                .as_deref(),
+            Some("util.ts")
+        );
+
+        let WorkerMessage::AnalysisResult { build, .. } = analyze_exact(
+            &mut incremental_state,
+            vec![
+                source("a.ts", "import { u } from './util'; export const a = 1;"),
+                source("util.ts", "export const u = 1;"),
+                source("util.js", "export const u = 1;"),
+            ],
+            &["a.ts", "util.ts", "util.js"],
+            '1',
+            &["artifact:util.js"],
+        ) else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Incremental);
+
+        let mut full_state = SyntaxWorkerState::default();
+        analyze(
+            &mut full_state,
+            vec![
+                source("a.ts", "import { u } from './util'; export const a = 1;"),
+                source("util.ts", "export const u = 1;"),
+                source("util.js", "export const u = 1;"),
+            ],
+            &["a.ts", "util.ts", "util.js"],
+            '1',
+        );
+
+        assert_eq!(
+            incremental_state.projects["project:one"].files,
+            full_state.projects["project:one"].files
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["a.ts"].direct_imports[0]
+                .target_path
+                .as_deref(),
+            Some("util.js")
+        );
     }
 
     #[test]

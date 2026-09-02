@@ -985,28 +985,69 @@ function entityProjection(entities: readonly JsTsEntity[]): string {
   return entities.map((entity) => `${entity.id}\0${entity.kind}\0${entity.path}\0${entity.start}`).join("\n");
 }
 
-/** A mutable, in-memory `FileSystem` for the TS 7 API backed directly by a
- * `Map<virtual path, text>` -- unlike `createVirtualFileSystem` (immutable,
- * snapshotted once at construction), later `map.set(...)` calls are visible
- * to the API on its NEXT `updateSnapshot({fileChanges:...})`, which is what
- * lets a session apply a content-only edit without rebuilding the API or
- * its underlying Go-server project state. Directory listings are computed
- * once from the map's INITIAL keys: a session never adds or removes map
- * entries after construction (root-set changes always rebuild via a brand
- * new map instead), so a static listing stays correct for this map's whole
- * lifetime. */
-function createMutableFileSystem(map: Map<string, string>): FileSystem {
-  const directories = new Set<string>();
-  for (const path of map.keys()) {
+/**
+ * Backing store for `createMutableFileSystem`, holding both the virtual
+ * `path -> text` map and a live, reference-counted directory index.
+ *
+ * T2 (docs/evidence/2026-09-02-file-creation-diagnosis.md): earlier this was
+ * a bare `Map<string, string>` whose directory listing was computed ONCE
+ * from its initial keys, on the documented assumption that "a session never
+ * adds or removes map entries after construction (root-set changes always
+ * rebuild via a brand new map instead)". `prepareRustSemanticState`'s
+ * incremental add/remove-root path breaks that assumption on purpose (a
+ * created/deleted file's path genuinely enters or leaves this store without
+ * a full rebuild), so the directory index now has to stay live across
+ * `set`/`delete` calls instead of being frozen at construction. `set`/`get`/
+ * `has`/`keys`/`size` keep the plain `Map` shape every existing call site
+ * already used.
+ */
+class MutableVirtualFileSystemStore {
+  private readonly files = new Map<string, string>();
+  private readonly directoryRefCounts = new Map<string, number>();
+
+  constructor(initial?: Iterable<readonly [string, string]>) {
+    if (initial !== undefined) for (const [path, text] of initial) this.set(path, text);
+  }
+
+  private eachAncestorDirectory(path: string, visit: (directory: string) => void): void {
     let directory = path;
     while (directory.includes("/")) {
       directory = directory.slice(0, directory.lastIndexOf("/"));
-      if (directory.length > 0) directories.add(directory);
+      if (directory.length > 0) visit(directory);
     }
   }
+
+  set(path: string, text: string): void {
+    if (!this.files.has(path)) this.eachAncestorDirectory(path, (directory) => this.directoryRefCounts.set(directory, (this.directoryRefCounts.get(directory) ?? 0) + 1));
+    this.files.set(path, text);
+  }
+
+  delete(path: string): void {
+    if (!this.files.delete(path)) return;
+    this.eachAncestorDirectory(path, (directory) => {
+      const count = this.directoryRefCounts.get(directory) ?? 0;
+      if (count <= 1) this.directoryRefCounts.delete(directory); else this.directoryRefCounts.set(directory, count - 1);
+    });
+  }
+
+  has(path: string): boolean { return this.files.has(path); }
+  get(path: string): string | undefined { return this.files.get(path); }
+  get size(): number { return this.files.size; }
+  keys(): IterableIterator<string> { return this.files.keys(); }
+  directoryExists(directoryName: string): boolean { return this.directoryRefCounts.has(directoryName); }
+}
+
+/** A mutable, in-memory `FileSystem` for the TS 7 API backed by a
+ * `MutableVirtualFileSystemStore` -- unlike `createVirtualFileSystem`
+ * (immutable, snapshotted once at construction), later `store.set(...)`/
+ * `store.delete(...)` calls are visible to the API on its NEXT
+ * `updateSnapshot({fileChanges:...})`, which is what lets a session apply a
+ * content-only edit -- or, since T2, a root add/remove -- without rebuilding
+ * the API or its underlying Go-server project state. */
+function createMutableFileSystem(store: MutableVirtualFileSystemStore): FileSystem {
   return {
-    fileExists: (fileName) => map.has(fileName),
-    directoryExists: (directoryName) => directories.has(directoryName),
+    fileExists: (fileName) => store.has(fileName),
+    directoryExists: (directoryName) => store.directoryExists(directoryName),
     // `undefined` (NOT `null`) for a path this map doesn't track: per
     // `FileSystem.readFile`'s doc comment (`typescript/unstable/fs`),
     // `null` means "does not exist, never fall back to the real
@@ -1018,17 +1059,17 @@ function createMutableFileSystem(map: Map<string, string>): FileSystem {
     // returning `null` instead silently broke every ambient/global type
     // (e.g. `Error`) for every session build until this was caught by the
     // differential correctness tests.
-    readFile: (fileName) => map.get(fileName),
+    readFile: (fileName) => store.get(fileName),
     realpath: (path) => path,
     getAccessibleEntries: (directoryName) => {
       // `undefined` (not an empty listing) for a directory outside this
       // map's own tree -- matches `createVirtualFileSystem`'s behavior,
       // letting the real filesystem's own directory listing take over for
       // anything this virtual workspace doesn't itself contain.
-      if (!directories.has(directoryName)) return undefined;
+      if (!store.directoryExists(directoryName)) return undefined;
       const files: string[] = [];
       const subdirectories = new Set<string>();
-      for (const path of map.keys()) {
+      for (const path of store.keys()) {
         if (!path.startsWith(`${directoryName}/`)) continue;
         const rest = path.slice(directoryName.length + 1);
         const slash = rest.indexOf("/");
@@ -2032,7 +2073,7 @@ function assembleAnalysis(
  */
 export class JsTsAnalysisSession {
   private api: API | undefined;
-  private fileMap: Map<string, string> | undefined;
+  private fileMap: MutableVirtualFileSystemStore | undefined;
   private rustSemanticSnapshot: TypescriptSnapshot | undefined;
   private rustSemanticProject: TypescriptProject | undefined;
   private rustSemanticOwnerGroupActive = false;
@@ -2166,31 +2207,66 @@ export class JsTsAnalysisSession {
     if ([...changedPaths, ...affectedPaths].some((path) => !roots.has(path))) throw new TypeError("Rust semantic scope contains a path outside root_names.");
     if ([...changedPaths].some((path) => !affectedPaths.has(path))) throw new TypeError("Rust semantic scope must include every changed path in affected_paths.");
 
+    // T2 (docs/evidence/2026-09-02-file-creation-diagnosis.md): a root-set
+    // change on its own no longer disqualifies the live API/project from
+    // being updated in place -- only losing the API/fileMap/scope entirely,
+    // or an actual `compiler_options` change, does. Root additions and
+    // removals are instead reconciled below (mirrored into the live
+    // `MutableVirtualFileSystemStore` and the session config's own `files`
+    // list), the same way a content edit already was. Rust's own incremental
+    // add/remove-root path (T1) is what hands this method that shape:
+    // `rust_semantic_scope.changed_paths` always includes every added root
+    // (it needs fresh text) and `root_names` reflects every removal, so
+    // nothing here has to re-derive which paths are new from scratch.
     const canUpdate = this.api !== undefined && this.fileMap !== undefined && this.rustAuthoritativeScope
-      && sameStringArray(this.rootNames, rootNames)
       && stableOptionsJson(this.compilerOptionsSnapshot) === stableOptionsJson(compilerOptions);
     const virtualRoot = SESSION_VIRTUAL_ROOT;
     const configPath = `${virtualRoot}/${SESSION_CONFIG_FILE}`;
     const actuallyChangedPaths = new Set<string>();
+    const createdPaths = new Set<string>();
+    const deletedPaths = new Set<string>();
+    let rootMembershipChanged = false;
     if (!canUpdate) {
       this.rustSemanticSnapshot?.dispose();
       this.rustSemanticSnapshot = undefined;
       this.rustSemanticProject = undefined;
       this.resetRustSemanticResolutionCaches();
       this.api?.close();
-      const map = new Map<string, string>(sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text]));
-      map.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
-      this.fileMap = map;
-      this.api = new API({ fs: createMutableFileSystem(map), ...(process.env["URDIRA_DEBUG_TIMING"] === "1" ? { collectTiming: true } : {}) });
+      const store = new MutableVirtualFileSystemStore(sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text] as const));
+      store.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
+      this.fileMap = store;
+      this.api = new API({ fs: createMutableFileSystem(store), ...(process.env["URDIRA_DEBUG_TIMING"] === "1" ? { collectTiming: true } : {}) });
     } else {
       const filesByPath = new Map(sourceFiles.map((file) => [file.path, file]));
+      const priorRoots = new Set(this.rootNames);
+      // Removed roots first: drop their text from the live store so a
+      // later re-creation of the same path is correctly seen as `created`
+      // (fresh text, not a no-op `changed` against stale leftovers) rather
+      // than silently resurrecting whatever this store still held for it.
+      for (const path of this.rootNames) {
+        if (roots.has(path)) continue;
+        this.fileMap!.delete(`${virtualRoot}/${path}`);
+        deletedPaths.add(path);
+        rootMembershipChanged = true;
+      }
       for (const path of changedPaths) {
         const file = filesByPath.get(path);
-        if (file !== undefined && this.fileMap!.get(`${virtualRoot}/${path}`) !== file.text) {
-          this.fileMap!.set(`${virtualRoot}/${path}`, file.text);
-          actuallyChangedPaths.add(path);
+        if (file === undefined) continue;
+        const virtualPath = `${virtualRoot}/${path}`;
+        const isNewRoot = !priorRoots.has(path);
+        if (isNewRoot) rootMembershipChanged = true;
+        if (this.fileMap!.get(virtualPath) !== file.text) {
+          this.fileMap!.set(virtualPath, file.text);
+          if (isNewRoot) createdPaths.add(path); else actuallyChangedPaths.add(path);
+        } else if (isNewRoot) {
+          // Text already present in the store (defensive: Rust always lists
+          // an added root in `changed_paths`, so this should not happen) --
+          // still needs to count as `created` so the project reopen below
+          // actually picks the path up as a root.
+          createdPaths.add(path);
         }
       }
+      if (rootMembershipChanged) this.fileMap!.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
     }
     const api = this.api!;
     this.rustSemanticConfigPath = configPath;
@@ -2202,11 +2278,26 @@ export class JsTsAnalysisSession {
       // in each bounded root window immediately before its checker walk.
       this.fileMap!.set(configPath, JSON.stringify({ compilerOptions, files: [] }));
     }
-    if (!canUpdate || actuallyChangedPaths.size > 0 || this.rustSemanticSnapshot === undefined || this.rustSemanticProject === undefined) {
+    if (!canUpdate || actuallyChangedPaths.size > 0 || rootMembershipChanged || this.rustSemanticSnapshot === undefined || this.rustSemanticProject === undefined) {
       this.rustSemanticSnapshot?.dispose();
       const snapshot = api.updateSnapshot(!canUpdate
         ? { openProjects: [configPath] }
-        : { fileChanges: { changed: [...actuallyChangedPaths].map((path) => `${virtualRoot}/${path}`) } });
+        : rootMembershipChanged
+          // A root add/remove reopens `configPath` (already ref-counted
+          // open, so this is a cheap reconfigure, not the full API/Program
+          // teardown the `!canUpdate` branch above performs) -- the same
+          // `openProjects` + `fileChanges.changed:[configPath]` pairing
+          // `activateRustSemanticWindow` already relies on to pick up a
+          // changed root list without a full rebuild. `created`/`deleted`
+          // are included for the source paths themselves, on top of
+          // whatever OTHER retained path's content also changed in this
+          // same call.
+          ? { openProjects: [configPath], fileChanges: {
+              changed: [...actuallyChangedPaths].map((path) => `${virtualRoot}/${path}`).concat(configPath),
+              ...(createdPaths.size > 0 ? { created: [...createdPaths].map((path) => `${virtualRoot}/${path}`) } : {}),
+              ...(deletedPaths.size > 0 ? { deleted: [...deletedPaths].map((path) => `${virtualRoot}/${path}`) } : {}),
+            } }
+          : { fileChanges: { changed: [...actuallyChangedPaths].map((path) => `${virtualRoot}/${path}`) } });
       const project = snapshot.getProjects().find((candidate) => candidate.configFileName === configPath);
       if (project === undefined) {
         snapshot.dispose();
@@ -2625,7 +2716,7 @@ export class JsTsAnalysisSession {
     this.fileMap = undefined;
     const virtualRoot = SESSION_VIRTUAL_ROOT;
     const configPath = `${virtualRoot}/${SESSION_CONFIG_FILE}`;
-    const map = new Map<string, string>(sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text]));
+    const map = new MutableVirtualFileSystemStore(sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text] as const));
     map.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
     const api = new API({ fs: createMutableFileSystem(map) });
     let project: TypescriptProject | undefined;
@@ -2720,7 +2811,7 @@ export class JsTsAnalysisSession {
     const filesByPath = new Map(sourceFiles.map((file) => [file.path, file]));
     let freshApi = false;
     if (this.api === undefined || this.fileMap === undefined) {
-      const map = new Map<string, string>(sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text]));
+      const map = new MutableVirtualFileSystemStore(sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text] as const));
       map.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
       this.fileMap = map;
       this.api = new API({ fs: createMutableFileSystem(map) });
