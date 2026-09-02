@@ -73,11 +73,10 @@ async function run(options) {
         else if (change.kind === "delete") await unlink(join(selectedDigestRoot, ...change.path.split("/")));
         else await rename(join(selectedDigestRoot, ...change.from_path.split("/")), join(selectedDigestRoot, ...change.to_path.split("/")));
       }
+      // Digests must be cumulative: the controller applies each mutation on
+      // top of the prior state, so resulting_corpus_digest[i] is the digest
+      // after mutations 0..i applied in order (do not reset to pristine).
       selectedDigests.push(await computeNativeAccelerationCorpusDigest(selectedDigestRoot, []));
-      if (selectedMutations.length > 1) {
-        await rm(selectedDigestRoot, { recursive: true, force: true });
-        await cp(corpus, selectedDigestRoot, { recursive: true });
-      }
     }
     await rm(selectedDigestRoot, { recursive: true, force: true });
     const trace = { ...generatedTrace, mutations: [...selectedMutations.map((mutation, index) => ({ ...mutation, mutation_index: index, resulting_corpus_digest: selectedDigests[index] })), ...remainingMutations].map((mutation, index) => ({ ...mutation, mutation_index: index })) };
