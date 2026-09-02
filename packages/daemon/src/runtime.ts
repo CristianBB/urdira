@@ -121,6 +121,44 @@ export interface DaemonRuntimeOptions {
    */
   readonly reconciliation_sweep_interval_ms?: number;
   /**
+   * Burst-aggregation window (in ms) for watcher-triggered edit scans (see
+   * `scheduleWorkspaceScan`'s `scanAggregationBuffers`/`flushScanAggregation`
+   * below, `packages/daemon/src/runtime.ts`). Measured problem: when no scan
+   * is currently in flight for a workspace, the FIRST watcher event of a
+   * burst of N almost-simultaneous edits (an agent's multi-file write, or one
+   * disk edit reported as several path events by the OS watcher) used to
+   * start a scan immediately, so events 2..N -- arriving microseconds to a
+   * few hundred ms later -- always missed that scan's `changed_uris` and had
+   * to be coalesced into a SECOND, separate follow-up scan
+   * (`pendingScans`) once the first one settled: one burst, two scans, ~2x
+   * the scan floor. With this window set, the first genuine edit event
+   * (`activity === "indexing"`, and only from the real filesystem watcher --
+   * see `scheduleWorkspaceScan`'s `aggregatable` parameter) instead buffers
+   * for up to this many ms, DEBOUNCED (reset) by every further event that
+   * arrives inside the window, before the single resulting scan actually
+   * starts with the union of every buffered URI/delete. Defaults to `200`
+   * when omitted; `0` disables aggregation entirely (byte-for-byte today's
+   * immediate-start behavior). Never applied to a passive
+   * `checking_for_updates` sweep, to `core:workspace_add`/`core:reindex`'s
+   * own first scan, to the post-scan `pendingScans` follow-up, or to any
+   * other non-watcher call site -- none of those are watcher edit bursts, and
+   * none of them should gain latency they do not have today. See
+   * `scan_aggregation_max_ms` for the debounce's hard cap, and `core:query`'s
+   * handler (`flushScanAggregation`) for the one thing that can force an
+   * early flush.
+   */
+  readonly scan_aggregation_window_ms?: number;
+  /**
+   * Hard cap (in ms), measured from the FIRST buffered event, on how long
+   * `scan_aggregation_window_ms`'s debounce can keep resetting before the
+   * buffered scan is forced to start regardless. Without this cap, an agent
+   * that edits in a near-continuous stream (each edit landing just inside the
+   * rolling window) could postpone indexing indefinitely. Defaults to
+   * `1_000` when omitted; only consulted while `scan_aggregation_window_ms`
+   * is non-zero.
+   */
+  readonly scan_aggregation_max_ms?: number;
+  /**
    * Whether an enabled lexical maintenance job (see `lexical_index` above)
    * runs `reconcileLexicalProjection` inside a dedicated `node:worker_threads`
    * worker (`runLexicalReconcileInThread`, `./lexical-thread.js`) instead of
@@ -1047,6 +1085,52 @@ function projectNameForGitRoot(root: string, administration: Awaited<ReturnType<
 }
 
 type WorkspaceIndexingActivity = "checking_for_updates" | "indexing";
+/** Alias for the watcher-hint type `scheduleWorkspaceScan`'s pending/aggregation
+ * buffers key authoritative deletes by, matching the inline `import(...)`
+ * spelling already used at those call sites. */
+type ScanWatcherHint = import("@urdira/engine").WatcherHint;
+/**
+ * Accumulator shape shared by `pendingScans` (events coalesced while a scan
+ * is already in flight -- unchanged behavior) and `scanAggregationBuffers`
+ * (events buffered BEFORE a watcher-triggered scan starts -- see
+ * `DaemonRuntimeOptions.scan_aggregation_window_ms`'s doc comment). Both are
+ * populated by the same `mergeScanRequestIntoBuffer` merge rules.
+ */
+interface ScanRequestBuffer {
+  full: boolean;
+  readonly uris: Set<string>;
+  readonly authoritativeDeletes: Map<string, ScanWatcherHint>;
+  readonly presencesAfterDeletes: Set<string>;
+  activity: WorkspaceIndexingActivity;
+}
+function createScanRequestBuffer(activity: WorkspaceIndexingActivity): ScanRequestBuffer {
+  return { full: false, uris: new Set(), authoritativeDeletes: new Map(), presencesAfterDeletes: new Set(), activity };
+}
+/**
+ * Merges one incoming scan request (a watcher event, an explicit reindex, a
+ * retry, ...) into an accumulator buffer, exactly matching the coalescing
+ * rules `scheduleWorkspaceScan` has always applied while a scan is in
+ * flight: an unsafe/lost-coverage request (`changedUris === undefined`)
+ * supersedes and clears any narrower work already buffered; while an
+ * authoritative-delete phase is active (buffered, in progress, or carried by
+ * this very request), incoming URIs are treated as post-delete presences
+ * (kept for a second, later generation) rather than folded into the same
+ * scan as the deletes.
+ */
+function mergeScanRequestIntoBuffer(buffer: ScanRequestBuffer, changedUris: readonly string[] | undefined, authoritativeDeletes: readonly ScanWatcherHint[], activity: WorkspaceIndexingActivity, deletePhaseActive: boolean): void {
+  if (activity === "indexing") buffer.activity = "indexing";
+  if (changedUris === undefined) {
+    buffer.full = true;
+    buffer.uris.clear();
+    buffer.authoritativeDeletes.clear();
+    buffer.presencesAfterDeletes.clear();
+  } else if (buffer.authoritativeDeletes.size > 0 || authoritativeDeletes.length > 0 || deletePhaseActive) {
+    for (const uri of changedUris) buffer.presencesAfterDeletes.add(uri);
+  } else {
+    for (const uri of changedUris) buffer.uris.add(uri);
+  }
+  for (const event of authoritativeDeletes) buffer.authoritativeDeletes.set(event.normalized_uri, event);
+}
 
 function workspaceAdministrativeView(registry: WorkspaceRegistry, workspace: RegisteredWorkspace, indexingActivity?: WorkspaceIndexingActivity): Readonly<Record<string, unknown>> {
   const vcs = normalizedVcsState(workspace.vcs_state);
@@ -1476,7 +1560,7 @@ export class DaemonRuntime {
   readonly recovered_cursor_ids: ReadonlyArray<string>;
   private readonly knownCursorIds: Set<string>;
   private state: DaemonStatus["state"] = "starting";
-  private constructor(private readonly options: DaemonRuntimeOptions, paths: DaemonPaths, private readonly lock: ProcessLock, private readonly descriptor: EndpointDescriptorStore, private readonly checkpoint: LastKnownGoodStore, private readonly server: LocalIpcServer, scheduler: DaemonScheduler, recoveredCheckpoint: import("./ownership.js").LastKnownGood | undefined, recovery: PersistentCursorRecovery, recoveredCursorIds: ReadonlyArray<string>, private readonly pendingWarms: ReadonlySet<Promise<void>>, private readonly watcherManager?: WorkspaceWatcherManager, private readonly indexingStorage?: DurableStorage, private readonly queryEnginesForTest?: ReadonlyMap<string, CachedWorkspaceQueryEngine>, private readonly reconciliationSweepTimer?: NodeJS.Timeout, private readonly semanticHost?: NeuralSemanticProviderHost) {
+  private constructor(private readonly options: DaemonRuntimeOptions, paths: DaemonPaths, private readonly lock: ProcessLock, private readonly descriptor: EndpointDescriptorStore, private readonly checkpoint: LastKnownGoodStore, private readonly server: LocalIpcServer, scheduler: DaemonScheduler, recoveredCheckpoint: import("./ownership.js").LastKnownGood | undefined, recovery: PersistentCursorRecovery, recoveredCursorIds: ReadonlyArray<string>, private readonly pendingWarms: ReadonlySet<Promise<void>>, private readonly watcherManager?: WorkspaceWatcherManager, private readonly indexingStorage?: DurableStorage, private readonly queryEnginesForTest?: ReadonlyMap<string, CachedWorkspaceQueryEngine>, private readonly reconciliationSweepTimer?: NodeJS.Timeout, private readonly semanticHost?: NeuralSemanticProviderHost, private readonly clearScanAggregationTimers?: () => void) {
     this.paths = paths; this.endpoint = paths.endpoint; this.scheduler = scheduler; this.recovery = recovery; this.recovered_checkpoint = recoveredCheckpoint; this.recovered_cursor_ids = recoveredCursorIds; this.knownCursorIds = new Set([...recoveredCursorIds, ...(options.known_cursors ?? [])]);
   }
   static async start(options: DaemonRuntimeOptions): Promise<DaemonRuntime> {
@@ -1866,14 +1950,35 @@ export class DaemonRuntime {
       const clearScanPending = (databasePath: string): void => {
         void unlink(scanPendingSidecarPath(databasePath)).catch(() => undefined);
       };
-      const pendingScans = new Map<string, {
-        full: boolean;
-        uris: Set<string>;
-        authoritativeDeletes: Map<string, import("@urdira/engine").WatcherHint>;
-        presencesAfterDeletes: Set<string>;
-        activity: WorkspaceIndexingActivity;
-      }>();
-      const scheduleWorkspaceScan = (workspaceId: string, changedUris?: readonly string[], authoritativeDeletes: readonly import("@urdira/engine").WatcherHint[] = [], activity: WorkspaceIndexingActivity = "indexing"): void => {
+      const pendingScans = new Map<string, ScanRequestBuffer>();
+      // Burst-aggregation state (see `DaemonRuntimeOptions.scan_aggregation_window_ms`'s
+      // doc comment): `scanAggregationBuffers` holds the union of every
+      // watcher edit event buffered so far for a workspace that has NO scan
+      // in flight yet; `scanAggregationTimers` holds that buffer's pending
+      // debounce/flush timer; `scanAggregationStartedAt` records when the
+      // FIRST event of the current buffer arrived, so the debounce can be
+      // capped at `scan_aggregation_max_ms` instead of resetting forever.
+      // All three are always mutated together (see `flushScanAggregation`
+      // below, the only place that clears them, and the aggregation branch
+      // of `scheduleWorkspaceScan`, the only place that populates them).
+      const scanAggregationBuffers = new Map<string, ScanRequestBuffer>();
+      const scanAggregationTimers = new Map<string, NodeJS.Timeout>();
+      const scanAggregationStartedAt = new Map<string, number>();
+      const scanAggregationWindowMs = Math.max(0, options.scan_aggregation_window_ms ?? 200);
+      const scanAggregationMaxMs = Math.max(scanAggregationWindowMs, options.scan_aggregation_max_ms ?? 1_000);
+      // `aggregatable` is `true` ONLY at the one call site that represents a
+      // real filesystem watcher event (`WorkspaceWatcherManagerOptions.on_reconcile`
+      // below). Every other call site -- `core:workspace_add`'s first scan,
+      // `core:reindex`, the periodic reconciliation sweep, the
+      // workspace-writer-busy retry, and this same function's own
+      // `pendingScans`/aggregation follow-up recursion -- omits it and so
+      // defaults to `false`, keeping their scan start exactly as immediate as
+      // it is today. This is deliberately narrower than gating on
+      // `activity === "indexing"` alone: several of those other call sites
+      // also pass `"indexing"`, but none of them are a burst of near-
+      // simultaneous edits, and per `scan_aggregation_window_ms`'s contract
+      // none of them may gain latency they do not already have.
+      const scheduleWorkspaceScan = (workspaceId: string, changedUris?: readonly string[], authoritativeDeletes: readonly ScanWatcherHint[] = [], activity: WorkspaceIndexingActivity = "indexing", aggregatable = false): void => {
         const registry = options.workspace_registry;
         const resolvePluginProvider = options.resolve_plugin_provider;
         const durableStorage = indexingStorage;
@@ -1883,27 +1988,8 @@ export class DaemonRuntime {
         // never downgrade visible real indexing to a passive check.
         scanActivities.set(workspaceId, scanActivities.get(workspaceId) === "indexing" || activity === "indexing" ? "indexing" : "checking_for_updates");
         if (scanInFlight.has(workspaceId)) {
-          const pending = pendingScans.get(workspaceId) ?? {
-            full: false,
-            uris: new Set<string>(),
-            authoritativeDeletes: new Map<string, import("@urdira/engine").WatcherHint>(),
-            presencesAfterDeletes: new Set<string>(),
-            activity,
-          };
-          if (activity === "indexing") pending.activity = "indexing";
-          if (changedUris === undefined) {
-            // Unsafe/lost coverage supersedes narrower work and does not
-            // carry a delete hint into the full reconciliation.
-            pending.full = true;
-            pending.uris.clear();
-            pending.authoritativeDeletes.clear();
-            pending.presencesAfterDeletes.clear();
-          } else if (pending.authoritativeDeletes.size > 0 || authoritativeDeletes.length > 0 || activeAuthoritativeDeletePhases.has(workspaceId)) {
-            for (const uri of changedUris) pending.presencesAfterDeletes.add(uri);
-          } else {
-            for (const uri of changedUris) pending.uris.add(uri);
-          }
-          for (const event of authoritativeDeletes) pending.authoritativeDeletes.set(event.normalized_uri, event);
+          const pending = pendingScans.get(workspaceId) ?? createScanRequestBuffer(activity);
+          mergeScanRequestIntoBuffer(pending, changedUris, authoritativeDeletes, activity, activeAuthoritativeDeletePhases.has(workspaceId));
           pendingScans.set(workspaceId, pending);
           // All pending changes are coalesced into a follow-up scan. The
           // active scan is never aborted: kqueue can report one edit as
@@ -1915,6 +2001,32 @@ export class DaemonRuntime {
           // produce `spawn EBADF` plus SQLite generation-check failures.
           // The pending request is already coalesced above and will run once
           // after this scan settles.
+          return;
+        }
+        if (aggregatable && activity === "indexing" && scanAggregationWindowMs > 0) {
+          // No scan is in flight yet: this is the FIRST (or a subsequent,
+          // still-within-window) event of a potential burst. Buffer it and
+          // (re)start the debounce timer instead of starting a scan
+          // immediately -- see `scan_aggregation_window_ms`'s doc comment for
+          // the full rationale and `flushScanAggregation` below for what
+          // actually starts the scan once the window elapses.
+          const now = Date.now();
+          const buffer = scanAggregationBuffers.get(workspaceId) ?? createScanRequestBuffer(activity);
+          const isFirstEventOfBurst = !scanAggregationBuffers.has(workspaceId);
+          scanAggregationBuffers.set(workspaceId, buffer);
+          mergeScanRequestIntoBuffer(buffer, changedUris, authoritativeDeletes, activity, activeAuthoritativeDeletePhases.has(workspaceId));
+          if (isFirstEventOfBurst) scanAggregationStartedAt.set(workspaceId, now);
+          const startedAt = scanAggregationStartedAt.get(workspaceId) ?? now;
+          const existingTimer = scanAggregationTimers.get(workspaceId);
+          if (existingTimer !== undefined) clearTimeout(existingTimer);
+          // Debounce (reset) on every event, but never past the hard cap
+          // measured from the burst's first event -- a continuous stream of
+          // edits, each landing just inside the rolling window, must still
+          // flush eventually instead of postponing the scan forever.
+          const delayMs = Math.min(scanAggregationWindowMs, Math.max(0, scanAggregationMaxMs - (now - startedAt)));
+          const timer = setTimeout(() => flushScanAggregation(workspaceId), delayMs);
+          timer.unref?.();
+          scanAggregationTimers.set(workspaceId, timer);
           return;
         }
         scanInFlight.add(workspaceId);
@@ -2256,6 +2368,58 @@ export class DaemonRuntime {
           scanActivities.delete(workspaceId);
         }
       };
+      // Fires when a burst's aggregation window elapses (or is force-flushed
+      // early -- see `core:query`/`core:query_continue`'s handler below,
+      // "flush-on-query"), or is a no-op if the buffer was already flushed by
+      // one of those. Replays the exact same `full`/`authoritativeDeletes`/
+      // `presencesAfterDeletes`/`uris` branching `scheduleWorkspaceScan`'s
+      // own post-scan `pendingScans` follow-up uses (see its `finally`
+      // block, below) so a burst that happened to include a rename/recreate
+      // still publishes the delete generation before the replacement, and
+      // reuses `scheduleWorkspaceScan` itself (non-aggregatable, so this
+      // never re-enters the buffering branch) to actually start the scan --
+      // by then `scanAggregationBuffers` no longer holds an entry for this
+      // workspace, so a concurrent watcher event arriving during that call
+      // starts a brand-new burst rather than being folded into this one.
+      const flushScanAggregation = (workspaceId: string): void => {
+        const timer = scanAggregationTimers.get(workspaceId);
+        if (timer !== undefined) clearTimeout(timer);
+        scanAggregationTimers.delete(workspaceId);
+        scanAggregationStartedAt.delete(workspaceId);
+        const buffer = scanAggregationBuffers.get(workspaceId);
+        scanAggregationBuffers.delete(workspaceId);
+        if (buffer === undefined) return;
+        if (buffer.full) {
+          scheduleWorkspaceScan(workspaceId, undefined, [], buffer.activity);
+        } else if (buffer.authoritativeDeletes.size > 0) {
+          // Preserve a second generation for rename/recreate batches, same
+          // rationale as the post-scan `pendingScans` follow-up below: the
+          // tombstone generation for the deletes publishes first, and any
+          // post-delete presences buffered alongside them are queued as a
+          // normal follow-up request (by now `scanInFlight` already holds
+          // this workspace, so this second call coalesces into `pendingScans`
+          // instead of starting a second immediate scan).
+          scheduleWorkspaceScan(workspaceId, [], [...buffer.authoritativeDeletes.values()], buffer.activity);
+          if (buffer.presencesAfterDeletes.size > 0) scheduleWorkspaceScan(workspaceId, [...buffer.presencesAfterDeletes], [], buffer.activity);
+        } else {
+          scheduleWorkspaceScan(workspaceId, [...buffer.uris], [], buffer.activity);
+        }
+      };
+      // Shutdown cleanup for the aggregation state above: cancels every still
+      // -pending debounce/flush timer (a burst mid-window when `stop()` is
+      // called) instead of leaving it to fire later against an already-
+      // stopped scheduler. `scheduleWorkspaceScan`'s own scheduler-admission
+      // `catch` already tolerates a submit call after the daemon starts
+      // stopping, but an uncleared `setTimeout` would otherwise sit in the
+      // event loop doing nothing useful, or fire the moment `.unref()` is not
+      // honored on a platform. Wired into `DaemonRuntime.stop()` below via
+      // the constructor.
+      const clearScanAggregationTimers = (): void => {
+        for (const timer of scanAggregationTimers.values()) clearTimeout(timer);
+        scanAggregationTimers.clear();
+        scanAggregationBuffers.clear();
+        scanAggregationStartedAt.clear();
+      };
       // D5: post-ready lexical maintenance (`reconcileLexicalProjection`,
       // `@urdira/engine`'s `lexical-reconciler.ts`), submitted after every
       // successful scan (see `scheduleWorkspaceScan`'s `run`, above). Per-
@@ -2505,8 +2669,13 @@ export class DaemonRuntime {
         for (const workspaceId of warmableWorkspaceIds) submitSemanticMaintenance(workspaceId);
       }
       const watcherManager = options.workspace_registry ? new WorkspaceWatcherManager({
+        // `aggregatable: true` -- this is the ONE call site a real
+        // filesystem watcher event reaches (see `scheduleWorkspaceScan`'s
+        // `aggregatable` doc comment above): eligible to buffer for up to
+        // `scan_aggregation_window_ms` before its scan actually starts,
+        // instead of starting immediately.
         on_reconcile: async (workspaceId, changedUris, _reason, authoritativeDeletes = []) => {
-          try { options.workspace_registry?.beginReconciliation(workspaceId); scheduleWorkspaceScan(workspaceId, changedUris, authoritativeDeletes); } catch { /* removed workspaces are ignored */ }
+          try { options.workspace_registry?.beginReconciliation(workspaceId); scheduleWorkspaceScan(workspaceId, changedUris, authoritativeDeletes, "indexing", true); } catch { /* removed workspaces are ignored */ }
         },
       }) : undefined;
       server = new LocalIpcServer({ endpoint: paths.endpoint, ...(options.max_frame_bytes === undefined ? {} : { max_frame_bytes: options.max_frame_bytes }), handler: async (request, context) => {
@@ -2537,6 +2706,16 @@ export class DaemonRuntime {
           const cache = cursorCache;
           const workspaceId = singleWorkspaceScopeId(request.payload);
           if (workspaceId === undefined) throw new DaemonError("core:ipc_request_invalid", `${request.call} requires an explicit single_workspace scope.`);
+          // Flush-on-query: a query naming this workspace must not be made to
+          // wait out an in-progress aggregation window (see
+          // `DaemonRuntimeOptions.scan_aggregation_window_ms`'s doc comment)
+          // for edits that already arrived -- force whatever is buffered to
+          // start scanning right now. Best-effort and synchronous (never
+          // awaited): a no-op when nothing is buffered for this workspace,
+          // and even a genuine flush only submits the scan job here, it does
+          // not block this request on the scan itself (freshness/frontier
+          // waits below already handle that).
+          flushScanAggregation(workspaceId);
           // Admission is deliberately completed before scheduler submission,
           // readiness waits, engine acquisition, or any query IPC fan-out.
           // The normalized plan is then the only source of frontier/stage
@@ -3060,7 +3239,7 @@ export class DaemonRuntime {
         }, reconciliationSweepIntervalMs);
         reconciliationSweepTimer.unref?.();
       }
-      const runtime = new DaemonRuntime(options, paths, lock, descriptor, checkpoint, server!, scheduler, recoveredCheckpoint, recovery, recoveredCursorIds, pendingWarms, watcherManager, indexingStorage, queryEngines, reconciliationSweepTimer, semanticHost);
+      const runtime = new DaemonRuntime(options, paths, lock, descriptor, checkpoint, server!, scheduler, recoveredCheckpoint, recovery, recoveredCursorIds, pendingWarms, watcherManager, indexingStorage, queryEngines, reconciliationSweepTimer, semanticHost, clearScanAggregationTimers);
       runtime.state = "ready";
       runtimeHandle = runtime;
       options.on_startup_progress?.("ready");
@@ -3084,6 +3263,12 @@ export class DaemonRuntime {
     if (this.state === "stopping") return;
     this.state = "stopping";
     clearInterval(this.reconciliationSweepTimer);
+    // Cancel any burst-aggregation window still open when the daemon stops
+    // (see `scan_aggregation_window_ms`'s doc comment and
+    // `clearScanAggregationTimers`'s own doc comment above): otherwise a
+    // buffered burst's debounce timer would keep sitting in the event loop
+    // for up to `scan_aggregation_max_ms` after shutdown began.
+    this.clearScanAggregationTimers?.();
     await this.server.close();
     await this.watcherManager?.stopAll();
     await this.scheduler.stop(options);

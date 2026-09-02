@@ -679,6 +679,84 @@ describe("Daemon periodic reconciliation sweep (Bug B backstop)", () => {
   }, 120_000);
 });
 
+// Scan-aggregation window (`DaemonRuntimeOptions.scan_aggregation_window_ms`,
+// `packages/daemon/src/runtime.ts`): the periodic reconciliation sweep above
+// drives `scheduleWorkspaceScan` with `activity: "checking_for_updates"` and
+// no `aggregatable` flag (see that call site, and the sweep test right
+// above), so it must keep re-triggering on its own short interval even when
+// the aggregation window is configured deliberately much longer -- proving
+// the window only ever applies to the one call site that IS a real watcher
+// edit event, never to this passive path. (The complementary "a burst of
+// real edits collapses into one scan" and "an isolated edit still lands
+// after the window, and a continuous stream is force-flushed at the cap"
+// coverage lives in `tests/phase-daemon-scan-aggregation.test.ts`, which
+// uses a much lighter no-plugin harness -- this file's real JS/TS plugin
+// bootstrap is reused here only because the sweep needs a genuinely
+// `"ready"` workspace, which the no-plugin scan path never reaches.)
+describe("Daemon scan-aggregation window does not delay the passive reconciliation sweep", () => {
+  it("keeps sweeping on its own interval even with a much larger aggregation window configured", async () => {
+    // Short prefixes: the daemon's IPC socket path is derived from `dataRoot`
+    // and macOS enforces a ~104-byte `AF_UNIX` path limit -- a longer prefix
+    // here reliably overflows it (`listen EINVAL`) once combined with the
+    // system temp dir's own path length.
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-sva-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-sva-ws-"));
+    let runtime: DaemonRuntime | undefined;
+    try {
+      await mkdir(workspaceRoot, { recursive: true });
+      for (const file of ["task.ts", "errors.ts"]) {
+        await writeFile(join(workspaceRoot, file), await readFile(join(fixtureRoot, file), "utf8"), "utf8");
+      }
+
+      const resolveCalls: string[] = [];
+      const countingResolvePluginProvider: NonNullable<DaemonRuntimeOptions["resolve_plugin_provider"]> = async (workspace, database) => {
+        resolveCalls.push(workspace.workspace_id);
+        return resolvePluginProvider(workspace, database);
+      };
+
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-daemon-sweep-vs-aggregation",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        plugin_catalog: [{ ...bundledPluginCatalogEntry, capability_declarations: JAVASCRIPT_TYPESCRIPT_CAPABILITIES }],
+        resolve_plugin_provider: countingResolvePluginProvider,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+        reconciliation_sweep_interval_ms: 150,
+        // Deliberately much larger than the sweep interval above: if the
+        // sweep's own scans were (incorrectly) subject to this window, the
+        // second sweep-triggered scan below could not land until ~5s in,
+        // instead of within a couple of 150ms sweep ticks.
+        scan_aggregation_window_ms: 5_000,
+        scan_aggregation_max_ms: 10_000,
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+
+      const added = await client.call("core:workspace_add", {
+        args: [workspaceRoot],
+        confirmed: true,
+        selected_technology_ids: ["typescript"],
+        selected_plugin_ids: [JAVASCRIPT_TYPESCRIPT_PLUGIN_ID],
+      });
+      expect(added.outcome).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+      const settled = await pollUntilReady(client, workspaceId);
+      expect(settled.workspace_status).toBe("ready");
+      const callsAtReady = resolveCalls.length;
+
+      // At least one more sweep-triggered scan must land well within a
+      // handful of 150ms sweep ticks -- nowhere near the 5s aggregation
+      // window this run is deliberately configured with.
+      await pollUntil(() => resolveCalls.length > callsAtReady, 3_000);
+      const final = await pollUntilReady(client, workspaceId);
+      expect(final.workspace_status).toBe("ready");
+    } finally {
+      if (runtime) await runtime.stop();
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
+
 // D5: post-ready lexical maintenance wiring (`packages/daemon/src/runtime.ts`'s
 // `submitLexicalMaintenance`, submitted right after `registry.markReady` on
 // scan success) and D6: `core:search_text` pushdown activating once it
