@@ -400,6 +400,36 @@ impl PublicationSink for CandidatePublicationSink {
     }
 }
 
+/// Statistics `DIRECT_PUBLICATION_CLOSURES_SQL` needs SQLite to pick
+/// `record_occurrences_workspace_owner_idx` (selective: workspace + owner)
+/// over `record_occurrences_digest_order_idx` (workspace-only, so on a
+/// populated workspace SQLite's cost estimator otherwise treats it as an
+/// effective full scan) for the `stale` CTE's join. A cold-direct commit's
+/// durable tables have zero `sqlite_stat1` rows -- production never ran
+/// `ANALYZE` anywhere before this constant was introduced -- so without it
+/// the very first incremental publish after cold inherits the bad plan.
+/// Measured on a 3.19M-row n8n-scale fixture
+/// (`direct_publication_closures_scale_bench` below): unanalyzed, the
+/// closures query took 946,035-970,595ms; running this once, inline, right
+/// after the cold commit (re)creates `record_occurrences_workspace_owner_idx`
+/// (see the `cold_direct` block in `urdira-indexing-worker`'s
+/// `finalize_workspace_publication`) costs ~22.2s and drops the same query
+/// to 152-165ms. Two cheaper bounded alternatives were measured and
+/// rejected: `PRAGMA analysis_limit=400; PRAGMA optimize;` never flips the
+/// plan at all (still 546,912-552,668ms -- 400 sampled rows isn't enough for
+/// SQLite to see `owner_artifact_id`'s selectivity at this row count);
+/// `PRAGMA analysis_limit=1000; ANALYZE;` does flip the `record_occurrences`
+/// access to the right index (1,016-1,333ms) but only partially samples the
+/// `identity_assignments_owner_key_idx` chain, leaving it ~7-8x slower than
+/// this targeted full `ANALYZE` for barely less cost (14.8s vs 22.2s).
+/// Targeted at just these two tables (not a blanket `ANALYZE;`) so it only
+/// pays for the tables this closures query actually reads, not every table
+/// in the schema. DIGEST-NEUTRAL: `ANALYZE` only ever writes the internal
+/// `sqlite_stat1`/`sqlite_stat4` bookkeeping tables it reads back itself; it
+/// never touches a durable row or any digest.
+pub const COLD_DIRECT_ANALYZE_SQL: &str =
+    "ANALYZE record_occurrences; ANALYZE identity_assignments;";
+
 /// Closes stale durable records and identity predecessors for a direct
 /// publication generation. Exposed as a module constant (rather than an
 /// inline literal inside `promote_direct_publication_metadata`) so the
@@ -2726,6 +2756,580 @@ mod tests {
              here means the comparison lost sargability and degraded back into an \
              O(stale_rows * staged_rows) rescan:\n{plan}"
         );
+    }
+
+    /// Regression guard for `COLD_DIRECT_ANALYZE_SQL`: on a durable schema
+    /// that also carries `record_occurrences_digest_order_idx` (the
+    /// workspace-only index the closures query's cost estimator prefers when
+    /// `sqlite_stat1` has no rows) alongside the selective
+    /// `record_occurrences_workspace_owner_idx`, and with no stats at all,
+    /// the planner picks the WRONG (digest-order) index for the `stale` CTE.
+    /// After running `COLD_DIRECT_ANALYZE_SQL` -- exactly the statement the
+    /// cold-direct commit in `urdira-indexing-worker` runs inline, right
+    /// after (re)creating that index -- `sqlite_stat1` has rows for both
+    /// `record_occurrences` and `identity_assignments`, and the plan flips
+    /// to the owner index. Doesn't assert timing (that's the scale bench
+    /// below); asserts only the plan and the stats table, which is what the
+    /// production fix actually depends on.
+    #[test]
+    fn cold_direct_analyze_leaves_planner_stats_for_the_closures_owner_index() {
+        let request = request();
+        let core = IndexingCore::open(":memory:", &request).expect("core");
+        core.connection
+            .execute_batch(
+                "CREATE TABLE candidate_publication_record_closures (candidate_generation_id TEXT NOT NULL, row_ordinal INTEGER NOT NULL, workspace_id TEXT NOT NULL, record_id TEXT NOT NULL, valid_to_generation INTEGER NOT NULL, PRIMARY KEY (candidate_generation_id, row_ordinal)); \
+                 CREATE TABLE record_occurrences (record_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, owner_artifact_id TEXT NOT NULL, valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER, record_digest TEXT); \
+                 CREATE INDEX record_occurrences_digest_order_idx ON record_occurrences(workspace_id, record_id, valid_from_generation, valid_to_generation, record_digest); \
+                 CREATE INDEX record_occurrences_workspace_owner_idx ON record_occurrences(workspace_id, owner_artifact_id, valid_from_generation, valid_to_generation); \
+                 CREATE TABLE identity_assignments (identity_assignment_id TEXT NOT NULL, workspace_id TEXT NOT NULL, identity_type TEXT NOT NULL, identity_key TEXT NOT NULL, record_id TEXT NOT NULL, valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER, PRIMARY KEY (workspace_id, identity_assignment_id, valid_from_generation)); \
+                 CREATE INDEX identity_assignments_owner_key_idx ON identity_assignments(workspace_id, identity_type, identity_key, valid_from_generation, valid_to_generation, record_id); \
+                 INSERT INTO urdira_core_owner_stage (operation_id, candidate_generation_id, group_sequence, owner_artifact_id, owner_artifact_version_id, owner_path, observation_lane, sequence, final_batch, row_count, byte_length, owner_digest, fact_delta_id, delta_digest) VALUES ('operation:test', 'candidate:test', 0, 'artifact:mutated', 'version:mutated', 'mutated.ts', 'structural', 0, 1, 50, 1600, 'sha256:owner', NULL, NULL); \
+                 WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < 4999) \
+                 INSERT INTO record_occurrences SELECT 'record:noise' || x, 'workspace:test', 'artifact:other' || (x % 500), 1, NULL, 'sha256:noise' || x FROM seq; \
+                 WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < 49) \
+                 INSERT INTO record_occurrences SELECT 'record:old' || x, 'workspace:test', 'artifact:mutated', 1, NULL, 'sha256:old' || x FROM seq; \
+                 WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < 49) \
+                 INSERT INTO identity_assignments SELECT 'sha256:assign' || x, 'workspace:test', 'entity', 'identity:mutated:old:' || x, 'record:old' || x, 1, NULL FROM seq; \
+                 WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < 49) \
+                 INSERT INTO urdira_core_owner_rows (owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, row_ordinal, lane, proposal_key, publication_record_id, body_payload_hex, record_category, record_kind, record_universal_kind, record_schema_version, record_digest, body_digest, body_byte_length, identity_type, identity_key, identity_id, identity_assignment_id, identity_key_digest) SELECT 'artifact:mutated', 'version:mutated', 'structural', 0, x, 'records', 'proposal:mutated:' || x, randomblob(32), randomblob(16), 'entity', 'jsts:entity_variable', 'core:variable', 1, randomblob(32), randomblob(32), 10, 'entity', 'identity:mutated:new:' || x, randomblob(32), randomblob(32), randomblob(32) FROM seq; \
+                 CREATE INDEX IF NOT EXISTS urdira_core_owner_rows_record_id ON urdira_core_owner_rows (lane, publication_record_id);",
+            )
+            .expect("scratch schema and rows");
+
+        let capture_plan = |core: &IndexingCore| -> String {
+            let mut statement = core
+                .connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {DIRECT_PUBLICATION_CLOSURES_SQL}"
+                ))
+                .expect("prepare plan");
+            let lines: Vec<String> = statement
+                .query_map(
+                    params![
+                        &request.operation_id,
+                        &request.candidate_generation_id,
+                        &request.workspace_id,
+                        request.base_generation,
+                        descriptor_generation(&request)
+                    ],
+                    |row| row.get::<_, String>(3),
+                )
+                .expect("query plan")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan rows");
+            lines.join("\n")
+        };
+
+        let stat1_row_count = |core: &IndexingCore, table: &str| -> i64 {
+            core.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0)
+        };
+
+        // Before ANALYZE: no sqlite_stat1 rows at all, and the planner falls
+        // back to the workspace-only digest-order index -- the exact
+        // degraded plan this fix targets.
+        assert_eq!(
+            stat1_row_count(&core, "record_occurrences"),
+            0,
+            "sqlite_stat1 must be empty before COLD_DIRECT_ANALYZE_SQL runs"
+        );
+        let plan_before = capture_plan(&core);
+        assert!(
+            plan_before.contains("SEARCH r USING INDEX record_occurrences_digest_order_idx"),
+            "expected the degraded pre-ANALYZE plan to pick the workspace-only \
+             digest-order index over the selective owner index:\n{plan_before}"
+        );
+
+        core.connection
+            .execute_batch(COLD_DIRECT_ANALYZE_SQL)
+            .expect("cold direct analyze");
+
+        assert!(
+            stat1_row_count(&core, "record_occurrences") > 0,
+            "sqlite_stat1 must have rows for record_occurrences after COLD_DIRECT_ANALYZE_SQL"
+        );
+        assert!(
+            stat1_row_count(&core, "identity_assignments") > 0,
+            "sqlite_stat1 must have rows for identity_assignments after COLD_DIRECT_ANALYZE_SQL"
+        );
+        let plan_after = capture_plan(&core);
+        assert!(
+            !plan_after.contains("record_occurrences_digest_order_idx"),
+            "the digest-order index must no longer be chosen once stats exist:\n{plan_after}"
+        );
+        assert!(
+            plan_after.contains("SEARCH r USING")
+                && (plan_after.contains("record_occurrences_workspace_owner_idx")
+                    || plan_after.contains("record_occurrences_workspace_owner_version_idx")),
+            "expected the analyzed plan to pick the selective owner index:\n{plan_after}"
+        );
+    }
+
+    /// Ad-hoc scale bench for `DIRECT_PUBLICATION_CLOSURES_SQL`. Added to
+    /// discriminate cold-disk I/O from query-plan degradation on a
+    /// production-shaped n8n-scale fixture: ~3.19M `record_occurrences` rows
+    /// across ~14,000 owners (real production indexes, no `ANALYZE` unless a
+    /// phase explicitly runs it -- production never runs `ANALYZE` either,
+    /// see `debug_log_missing_incremental_indexes` above and the absence of
+    /// any `ANALYZE`/`sqlite_stat` call anywhere in this crate or
+    /// `urdira-indexing-worker` outside this test file), plus one mutated
+    /// owner with 588 rows of prior state (matching the n8n incident this
+    /// bench was written to investigate) and a fresh 600-row stage for that
+    /// owner (588 continuing identities with changed content + 12 new).
+    ///
+    /// Not part of the default `cargo test` run -- building the fixture
+    /// takes a couple of minutes. Run explicitly with:
+    ///   cargo test -p urdira-indexing-core --lib -- \
+    ///     --ignored --nocapture direct_publication_closures_scale_bench
+    ///
+    /// Measurement only: asserts nothing about timing, only that the
+    /// anti-join rewrite explored in phase 4 below produces the exact same
+    /// closure row set as the production SQL. Changes nothing outside this
+    /// test's own temp directory.
+    #[test]
+    #[ignore]
+    fn direct_publication_closures_scale_bench() {
+        const NUM_NOISE_OWNERS: i64 = 13_999;
+        const ROWS_PER_NOISE_OWNER: i64 = 228;
+        const NOISE_TOTAL: i64 = NUM_NOISE_OWNERS * ROWS_PER_NOISE_OWNER;
+        const MUTATED_PRIOR: i64 = 588;
+        const SEED_TOTAL: i64 = NOISE_TOTAL + MUTATED_PRIOR;
+        const STAGE_CONTINUING: i64 = 588;
+        const STAGE_NEW: i64 = 12;
+
+        let mut request = request();
+        // previous_generation/previous need base_generation >= the durable
+        // rows' valid_from_generation (1 below) to actually match anything;
+        // the shared request() helper defaults base_generation to 0, which
+        // would silently make the predecessor path a no-op.
+        request.base_generation = 1;
+        let generation = descriptor_generation(&request);
+
+        let dir = std::env::temp_dir().join(format!(
+            "urdira-closures-bench-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("bench dir");
+        let db_path = dir.join("workspace.sqlite");
+        let db_path_str = db_path.to_str().expect("db path utf8").to_string();
+        eprintln!("[bench] db path: {db_path_str}");
+
+        // ---- Phase 0: build the durable fixture once (real production
+        // indexes from packages/storage/sql/workspace-v3.sql; FOREIGN KEY
+        // clauses dropped since the parent tables aren't needed to measure
+        // this SQL and would only slow down the bulk load). ----
+        {
+            let core = IndexingCore::open(&db_path_str, &request).expect("open (build)");
+            let build_started = Instant::now();
+            core.connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;\
+                     CREATE TABLE record_occurrences (\
+                       record_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, \
+                       category TEXT NOT NULL, kind TEXT NOT NULL, universal_kind TEXT NOT NULL, \
+                       schema_version INTEGER NOT NULL, producer_id TEXT NOT NULL, producer_version TEXT NOT NULL, \
+                       owner_artifact_id TEXT NOT NULL, owner_artifact_version_id TEXT NOT NULL, \
+                       valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER, \
+                       record_digest TEXT NOT NULL, body_digest TEXT NOT NULL, body_byte_length INTEGER NOT NULL, \
+                       analysis_digest TEXT NOT NULL, analysis_configuration_digest TEXT NOT NULL, \
+                       artifact_dependency_digest TEXT NOT NULL\
+                     ) STRICT;\
+                     CREATE TABLE identity_assignments (\
+                       identity_assignment_id TEXT NOT NULL, workspace_id TEXT NOT NULL, \
+                       identity_type TEXT NOT NULL, identity_id TEXT NOT NULL, assignment_kind TEXT NOT NULL, \
+                       identity_key TEXT NOT NULL, identity_key_digest TEXT NOT NULL, record_id TEXT NOT NULL, \
+                       previous_record_id TEXT, owner_artifact_id TEXT, owner_artifact_version_id TEXT, \
+                       valid_from_generation INTEGER NOT NULL, valid_to_generation INTEGER, \
+                       PRIMARY KEY (workspace_id, identity_assignment_id, valid_from_generation)\
+                     ) STRICT;\
+                     CREATE TABLE candidate_publication_record_closures (\
+                       candidate_generation_id TEXT NOT NULL, row_ordinal INTEGER NOT NULL, \
+                       workspace_id TEXT NOT NULL, record_id TEXT NOT NULL, valid_to_generation INTEGER NOT NULL, \
+                       PRIMARY KEY (candidate_generation_id, row_ordinal), \
+                       UNIQUE (candidate_generation_id, record_id)\
+                     ) STRICT, WITHOUT ROWID;\
+                     CREATE TABLE bench_seed (x INTEGER PRIMARY KEY, digest BLOB NOT NULL, owner_artifact_id TEXT NOT NULL, identity_key TEXT NOT NULL);",
+                )
+                .expect("durable schema");
+
+            core.connection
+                .execute_batch(&format!(
+                    "WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < {last}) \
+                     INSERT INTO bench_seed SELECT x, randomblob(32), \
+                       CASE WHEN x < {noise_total} THEN 'artifact:owner' || printf('%05d', x % {num_noise_owners}) ELSE 'artifact:mutated' END, \
+                       CASE WHEN x < {noise_total} THEN 'identity:owner' || printf('%05d', x % {num_noise_owners}) || ':' || (x / {num_noise_owners}) ELSE 'identity:mutated:' || (x - {noise_total}) END \
+                     FROM seq;",
+                    last = SEED_TOTAL - 1,
+                    noise_total = NOISE_TOTAL,
+                    num_noise_owners = NUM_NOISE_OWNERS,
+                ))
+                .expect("seed rows");
+            eprintln!(
+                "[bench] seed rows ({SEED_TOTAL}) built in {:?}",
+                build_started.elapsed()
+            );
+
+            let load_started = Instant::now();
+            core.connection
+                .execute(
+                    "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) \
+                     SELECT 'record:' || lower(hex(digest)), 'workspace:test', 'entity', 'jsts:entity_variable', 'core:variable', 1, 'candidate', '1', owner_artifact_id, owner_artifact_id || ':v1', 1, NULL, lower(hex(digest)), lower(hex(digest)), 10, 'sha256:a', 'sha256:a', 'sha256:a' FROM bench_seed",
+                    (),
+                )
+                .expect("load record_occurrences");
+            core.connection
+                .execute(
+                    "INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, valid_from_generation, valid_to_generation) \
+                     SELECT 'sha256:' || lower(hex(digest)), 'workspace:test', 'entity', 'entity:' || lower(hex(digest)), 'created', identity_key, 'sha256:' || lower(hex(digest)), 'record:' || lower(hex(digest)), 1, NULL FROM bench_seed",
+                    (),
+                )
+                .expect("load identity_assignments");
+            core.connection
+                .execute_batch("DROP TABLE bench_seed;")
+                .expect("drop seed");
+            eprintln!(
+                "[bench] durable rows loaded in {:?}",
+                load_started.elapsed()
+            );
+
+            let index_started = Instant::now();
+            core.connection
+                .execute_batch(
+                    "CREATE INDEX record_occurrences_visible_idx ON record_occurrences(workspace_id, valid_from_generation, valid_to_generation);\
+                     CREATE INDEX record_occurrences_workspace_owner_idx ON record_occurrences(workspace_id, owner_artifact_id, valid_from_generation, valid_to_generation);\
+                     CREATE INDEX record_occurrences_workspace_owner_version_idx ON record_occurrences(workspace_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, record_id);\
+                     CREATE INDEX record_occurrences_digest_order_idx ON record_occurrences(workspace_id, record_id, valid_from_generation, valid_to_generation, record_digest);\
+                     CREATE INDEX identity_assignments_lookup_idx ON identity_assignments(workspace_id, identity_type, identity_id, valid_from_generation, valid_to_generation);\
+                     CREATE INDEX identity_assignments_key_idx ON identity_assignments(workspace_id, identity_key_digest, valid_from_generation, identity_type, identity_key, record_id);\
+                     CREATE INDEX identity_assignments_owner_key_idx ON identity_assignments(workspace_id, identity_type, identity_key, valid_from_generation, valid_to_generation, record_id);\
+                     CREATE INDEX identity_assignments_record_idx ON identity_assignments(workspace_id, record_id, valid_from_generation, valid_to_generation);",
+                )
+                .expect("indexes");
+            eprintln!("[bench] indexes built in {:?}", index_started.elapsed());
+
+            let checkpoint: (i64, i64, i64) = core
+                .connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("checkpoint");
+            eprintln!(
+                "[bench] checkpoint {checkpoint:?}, total build {:?}",
+                build_started.elapsed()
+            );
+        }
+        // `core` (and its process-local write lease) drops here, so the
+        // next `IndexingCore::open` on the same path gets a genuinely fresh
+        // connection with an empty SQLite page cache.
+
+        let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("[bench] db file size: {} MiB", db_size / (1024 * 1024));
+
+        let stage_mutated_owner = |core: &IndexingCore| {
+            core.connection
+                .execute(
+                    "INSERT INTO urdira_core_owner_stage (operation_id, candidate_generation_id, group_sequence, owner_artifact_id, owner_artifact_version_id, owner_path, observation_lane, sequence, final_batch, row_count, byte_length, owner_digest, fact_delta_id, delta_digest) VALUES (?1, ?2, 0, 'artifact:mutated', 'artifact:mutated:v2', 'mutated.ts', 'structural', 0, 1, ?3, 20000, 'sha256:owner', NULL, NULL)",
+                    params![
+                        &request.operation_id,
+                        &request.candidate_generation_id,
+                        STAGE_CONTINUING + STAGE_NEW
+                    ],
+                )
+                .expect("stage receipt");
+            core.connection
+                .execute_batch(&format!(
+                    "WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < {continuing_last}) \
+                     INSERT INTO urdira_core_owner_rows (owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, row_ordinal, lane, proposal_key, publication_record_id, body_payload_hex, record_category, record_kind, record_universal_kind, record_schema_version, record_digest, body_digest, body_byte_length, identity_type, identity_key, identity_id, identity_assignment_id, identity_key_digest) \
+                     SELECT 'artifact:mutated', 'artifact:mutated:v2', 'structural', 0, x, 'records', 'proposal:mutated:' || x, randomblob(32), randomblob(16), 'entity', 'jsts:entity_variable', 'core:variable', 1, randomblob(32), randomblob(32), 10, 'entity', 'identity:mutated:' || x, randomblob(32), randomblob(32), randomblob(32) FROM seq; \
+                     WITH RECURSIVE seq2(x) AS (SELECT {continuing_total} UNION ALL SELECT x + 1 FROM seq2 WHERE x < {new_last}) \
+                     INSERT INTO urdira_core_owner_rows (owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, row_ordinal, lane, proposal_key, publication_record_id, body_payload_hex, record_category, record_kind, record_universal_kind, record_schema_version, record_digest, body_digest, body_byte_length, identity_type, identity_key, identity_id, identity_assignment_id, identity_key_digest) \
+                     SELECT 'artifact:mutated', 'artifact:mutated:v2', 'structural', 0, x, 'records', 'proposal:mutated:' || x, randomblob(32), randomblob(16), 'entity', 'jsts:entity_variable', 'core:variable', 1, randomblob(32), randomblob(32), 10, 'entity', 'identity:mutated:new:' || x, randomblob(32), randomblob(32), randomblob(32) FROM seq2;",
+                    continuing_last = STAGE_CONTINUING - 1,
+                    continuing_total = STAGE_CONTINUING,
+                    new_last = STAGE_CONTINUING + STAGE_NEW - 1,
+                ))
+                .expect("stage owner rows");
+        };
+
+        let capture_plan = |core: &IndexingCore, sql: &str| -> Vec<String> {
+            let mut statement = core
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare plan");
+            statement
+                .query_map(
+                    params![
+                        &request.operation_id,
+                        &request.candidate_generation_id,
+                        &request.workspace_id,
+                        request.base_generation,
+                        generation
+                    ],
+                    |row| row.get::<_, String>(3),
+                )
+                .expect("query plan")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan rows")
+        };
+
+        let run_closures = |core: &IndexingCore,
+                            sql: &str,
+                            label: &str|
+         -> (u128, u64, Vec<String>) {
+            core.connection
+                .execute(
+                    "DELETE FROM candidate_publication_record_closures WHERE candidate_generation_id = ?1",
+                    [&request.candidate_generation_id],
+                )
+                .expect("reset closures");
+            let started = Instant::now();
+            core.connection
+                .execute(
+                    sql,
+                    params![
+                        &request.operation_id,
+                        &request.candidate_generation_id,
+                        &request.workspace_id,
+                        request.base_generation,
+                        generation
+                    ],
+                )
+                .expect("run closures");
+            let elapsed_ms = started.elapsed().as_millis();
+            let changed = core.connection.changes();
+            let mut statement = core
+                .connection
+                .prepare("SELECT record_id FROM candidate_publication_record_closures WHERE candidate_generation_id = ?1 ORDER BY record_id")
+                .expect("prepare select");
+            let ids: Vec<String> = statement
+                .query_map([&request.candidate_generation_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .expect("select ids")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect ids");
+            eprintln!(
+                "[bench] {label}: {elapsed_ms}ms, changes={changed}, closure_rows={}",
+                ids.len()
+            );
+            (elapsed_ms, changed, ids)
+        };
+
+        // Anti-join rewrite of the two correlated `NOT EXISTS` subqueries
+        // (see task 3): same predicate, expressed as a `LEFT JOIN ... WHERE
+        // x IS NULL` instead of a per-row correlated subquery. Built by
+        // substring replacement of the exact production text so it cannot
+        // silently drift from `DIRECT_PUBLICATION_CLOSURES_SQL`.
+        let antijoin_sql = DIRECT_PUBLICATION_CLOSURES_SQL
+            .replace(
+                "JOIN record_occurrences r ON r.workspace_id = ?3 AND r.owner_artifact_id = s.owner_artifact_id WHERE s.operation_id = ?1 AND s.candidate_generation_id = ?2 AND r.valid_from_generation <= ?5 AND (r.valid_to_generation IS NULL OR r.valid_to_generation > ?5) AND NOT EXISTS (SELECT 1 FROM urdira_core_owner_rows p WHERE p.lane = 'records' AND p.publication_record_id = unhex(substr(r.record_id, 8)))",
+                "JOIN record_occurrences r ON r.workspace_id = ?3 AND r.owner_artifact_id = s.owner_artifact_id LEFT JOIN urdira_core_owner_rows p ON p.lane = 'records' AND p.publication_record_id = unhex(substr(r.record_id, 8)) WHERE s.operation_id = ?1 AND s.candidate_generation_id = ?2 AND r.valid_from_generation <= ?5 AND (r.valid_to_generation IS NULL OR r.valid_to_generation > ?5) AND p.publication_record_id IS NULL",
+            )
+            .replace(
+                "JOIN previous ON previous.identity_type = o.identity_type AND previous.identity_key = o.identity_key WHERE o.lane = 'records' AND previous.record_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM urdira_core_owner_rows p WHERE p.lane = 'records' AND p.publication_record_id = unhex(substr(previous.record_id, 8)))",
+                "JOIN previous ON previous.identity_type = o.identity_type AND previous.identity_key = o.identity_key LEFT JOIN urdira_core_owner_rows p ON p.lane = 'records' AND p.publication_record_id = unhex(substr(previous.record_id, 8)) WHERE o.lane = 'records' AND previous.record_id IS NOT NULL AND p.publication_record_id IS NULL",
+            );
+        assert_ne!(
+            antijoin_sql, DIRECT_PUBLICATION_CLOSURES_SQL,
+            "antijoin substring replace must actually match the production text"
+        );
+        assert_eq!(
+            antijoin_sql
+                .matches("LEFT JOIN urdira_core_owner_rows p")
+                .count(),
+            2,
+            "both NOT EXISTS subqueries must have been rewritten"
+        );
+
+        // ---- Phase 1+2: fresh connection, no ANALYZE. ----
+        {
+            let core = IndexingCore::open(&db_path_str, &request).expect("open phase 1");
+            stage_mutated_owner(&core);
+            let plan = capture_plan(&core, DIRECT_PUBLICATION_CLOSURES_SQL);
+            eprintln!(
+                "[bench] === phase 1: no ANALYZE, fresh connection ===\n{}",
+                plan.join("\n")
+            );
+            run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase1 cold (no ANALYZE)",
+            );
+            run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase1 warm (no ANALYZE)",
+            );
+
+            let analyze_started = Instant::now();
+            core.connection.execute_batch("ANALYZE;").expect("analyze");
+            eprintln!(
+                "[bench] ANALYZE (same connection) took {:?}",
+                analyze_started.elapsed()
+            );
+            let plan_after = capture_plan(&core, DIRECT_PUBLICATION_CLOSURES_SQL);
+            eprintln!(
+                "[bench] === phase 2: after ANALYZE, same (now-warm) connection ===\n{}",
+                plan_after.join("\n")
+            );
+            run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase2 warm (after ANALYZE, same conn)",
+            );
+            core.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
+                .expect("checkpoint after analyze");
+        }
+
+        // ---- Phase 3: fresh connection, stats already persisted. ----
+        let (ids_original, plan3) = {
+            let core = IndexingCore::open(&db_path_str, &request).expect("open phase 3");
+            stage_mutated_owner(&core);
+            let plan = capture_plan(&core, DIRECT_PUBLICATION_CLOSURES_SQL);
+            eprintln!(
+                "[bench] === phase 3: fresh connection, ANALYZE stats persisted ===\n{}",
+                plan.join("\n")
+            );
+            let (_, _, ids_cold) = run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase3 cold (analyzed)",
+            );
+            let (_, _, ids_warm) = run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase3 warm (analyzed)",
+            );
+            assert_eq!(
+                ids_cold, ids_warm,
+                "same SQL must produce the same closure set cold vs warm"
+            );
+
+            // ---- Phase 4: anti-join rewrite, same (now-warm) connection. ----
+            let antijoin_plan = capture_plan(&core, &antijoin_sql);
+            eprintln!(
+                "[bench] === phase 4: anti-join rewrite, warm connection ===\n{}",
+                antijoin_plan.join("\n")
+            );
+            let (_, _, ids_antijoin) =
+                run_closures(&core, &antijoin_sql, "phase4 antijoin (warm, analyzed)");
+            run_closures(&core, &antijoin_sql, "phase4 antijoin (warm again)");
+
+            assert_eq!(
+                ids_cold.len(),
+                ids_antijoin.len(),
+                "anti-join rewrite must close the same NUMBER of records"
+            );
+            assert_eq!(
+                ids_cold, ids_antijoin,
+                "anti-join rewrite must close the exact same SET of record_ids"
+            );
+            eprintln!(
+                "[bench] anti-join rewrite verified byte-for-byte equivalent: {} rows",
+                ids_cold.len()
+            );
+            (ids_cold, plan)
+        };
+        eprintln!(
+            "[bench] final closure set size: {} (phase3 plan retained: {} lines)",
+            ids_original.len(),
+            plan3.len()
+        );
+
+        // ---- Phase 5+6: cheaper alternatives to a targeted full ANALYZE.
+        // The fixture above already ran a full `ANALYZE;` (phases 2/3), so
+        // reset `sqlite_stat1` back to empty (matching a never-analyzed
+        // production database) before measuring each cheaper variant from a
+        // clean slate on a fresh connection (empty page cache, like a real
+        // cold worker process). ----
+        let reset_stats = || {
+            let core = IndexingCore::open(&db_path_str, &request).expect("open (reset stats)");
+            core.connection
+                .execute_batch("DELETE FROM sqlite_stat1; ANALYZE sqlite_master;")
+                .expect("reset stats");
+            core.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
+                .expect("checkpoint after stats reset");
+        };
+
+        // Phase 5: variant (b), the SQLite-recommended bounded pattern --
+        // `PRAGMA analysis_limit=400; PRAGMA optimize;` run on the exact
+        // fresh connection a cold worker process would have.
+        reset_stats();
+        {
+            let core = IndexingCore::open(&db_path_str, &request).expect("open phase 5");
+            stage_mutated_owner(&core);
+            let variant_started = Instant::now();
+            core.connection
+                .execute_batch("PRAGMA analysis_limit=400; PRAGMA optimize;")
+                .expect("variant b: bounded optimize");
+            let variant_ms = variant_started.elapsed().as_millis();
+            eprintln!("[bench] variant (b) analysis_limit=400; PRAGMA optimize: {variant_ms}ms");
+            let plan = capture_plan(&core, DIRECT_PUBLICATION_CLOSURES_SQL);
+            eprintln!(
+                "[bench] === phase 5: after variant (b), fresh connection ===\n{}",
+                plan.join("\n")
+            );
+            let (_, _, ids_b) = run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase5 cold (variant b)",
+            );
+            run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase5 warm (variant b)",
+            );
+            assert_eq!(
+                ids_original, ids_b,
+                "variant (b) must close the exact same record set as the baseline"
+            );
+        }
+
+        // Phase 6: variant (c), a bounded targeted `ANALYZE` --
+        // `PRAGMA analysis_limit=1000; ANALYZE;`
+        reset_stats();
+        {
+            let core = IndexingCore::open(&db_path_str, &request).expect("open phase 6");
+            stage_mutated_owner(&core);
+            let variant_started = Instant::now();
+            core.connection
+                .execute_batch("PRAGMA analysis_limit=1000; ANALYZE;")
+                .expect("variant c: bounded analyze");
+            let variant_ms = variant_started.elapsed().as_millis();
+            eprintln!("[bench] variant (c) analysis_limit=1000; ANALYZE: {variant_ms}ms");
+            let plan = capture_plan(&core, DIRECT_PUBLICATION_CLOSURES_SQL);
+            eprintln!(
+                "[bench] === phase 6: after variant (c), fresh connection ===\n{}",
+                plan.join("\n")
+            );
+            let (_, _, ids_c) = run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase6 cold (variant c)",
+            );
+            run_closures(
+                &core,
+                DIRECT_PUBLICATION_CLOSURES_SQL,
+                "phase6 warm (variant c)",
+            );
+            assert_eq!(
+                ids_original, ids_c,
+                "variant (c) must close the exact same record set as the baseline"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

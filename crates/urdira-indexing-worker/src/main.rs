@@ -14,9 +14,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use urdira_indexing_core::{
-    CORE_PROTOCOL_VERSION, CancellationToken, CandidatePublicationSink, CanonicalPhysicalGroup,
-    CoreError, GenerationDescriptor, GenerationRequest, IndexingCore, LanguageEngine,
-    PhysicalGroup, PublicationSink, StructuralKernelResult, prepare_engine_group,
+    COLD_DIRECT_ANALYZE_SQL, CORE_PROTOCOL_VERSION, CancellationToken, CandidatePublicationSink,
+    CanonicalPhysicalGroup, CoreError, GenerationDescriptor, GenerationRequest, IndexingCore,
+    LanguageEngine, PhysicalGroup, PublicationSink, StructuralKernelResult, prepare_engine_group,
 };
 use urdira_jsts_indexing_engine::JavascriptTypescriptEngine;
 use urdira_jsts_syntax_worker::{
@@ -6155,7 +6155,39 @@ fn finalize_workspace_publication(
             );
         }
         debug_publish_phase(publish_started, "cold_index_rebuild");
+
+        // Give the query planner real statistics for the two durable tables
+        // `DIRECT_PUBLICATION_CLOSURES_SQL` reads, right alongside the
+        // indexes just (re)created above -- see `COLD_DIRECT_ANALYZE_SQL`'s
+        // doc comment (urdira-indexing-core) for the full measured
+        // before/after and the two cheaper variants that were rejected.
+        // Runs once, inline, in the cold-direct commit -- not on any edit's
+        // critical path.
+        let analyze_stats_started = Instant::now();
+        transaction
+            .execute_batch(COLD_DIRECT_ANALYZE_SQL)
+            .map_err(sql_error)?;
+        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "[urdira-indexing-worker] publish analyze_stats_ms={}",
+                analyze_stats_started.elapsed().as_millis()
+            );
+        }
+        debug_publish_phase(publish_started, "analyze_stats");
     }
+
+    // A per-publish `PRAGMA optimize;` (to keep stats fresh as a workspace
+    // grows) was tried and measured live on the n8n-corpus gate (2,000
+    // owners, one single-file mutation): `optimize_stats_ms=802` against a
+    // ~1,323ms total incremental `rust core publish ms` -- SQLite's "only
+    // re-analyzes when it judges a table has changed enough" heuristic did
+    // NOT fall through to a no-op on this small, ordinary edit the way the
+    // cold-commit case did (`optimize_stats_ms=53`, immediately after the
+    // explicit `ANALYZE` above). That is squarely on the edit critical path
+    // and not despreciable, so it was dropped rather than shipped; only the
+    // one-time, inline, cold-commit `ANALYZE` above (never on an edit's
+    // critical path) is kept. See docs/evidence for the full before/after.
+
     let current = transaction.query_row("SELECT current_snapshot_id, current_generation, state_revision FROM workspace_current_state WHERE workspace_id = ?1", [&request.workspace_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?))).optional().map_err(sql_error)?;
     if let Some((old_snapshot, old_generation, revision)) = current {
         let changed = transaction.execute("UPDATE workspace_current_state SET current_snapshot_id = ?1, current_generation = ?2, current_registry_snapshot_id = ?3, current_resolution_lock_id = ?4, current_configuration_revision_id = ?5, current_freshness_checkpoint_id = ?6, state_revision = ?7, updated_at = ?8 WHERE workspace_id = ?9 AND current_snapshot_id = ?10 AND current_generation = ?11 AND state_revision = ?12", params![&snapshot_id,generation,&request.registry_snapshot_id,&request.resolution_lock_id,&request.configuration_revision_id,&freshness_id,revision+1,&published_at,&request.workspace_id,old_snapshot,old_generation,revision]).map_err(sql_error)?;
