@@ -95,6 +95,201 @@ pub fn verify_xxh3(bytes: &[u8], label: &str) -> Result<()> {
     Ok(())
 }
 
+/// A2 (2026-09-05): combines the 16 per-nibble-partition xxh3 hashes of one
+/// hot `records.*` file into that file's header `body_xxh3` -- `xxh3` of
+/// the 16 hashes' little-endian bytes, concatenated in nibble order. An
+/// EMPTY partition's slot is `xxh::hash(&[])` (the exact value hashing
+/// that partition's own empty byte range would produce) and is NEVER
+/// skipped -- required for a store with fewer than 16 populated nibbles
+/// (every store under ~16 rows, including most unit-test fixtures) to
+/// combine deterministically and identically regardless of which writer
+/// path produced it. See `identity_codec`-adjacent module docs: this is
+/// the "hash each partition once, while its buffer is still in hand"
+/// replacement for re-`mmap`-ing a just-written file to hash it whole
+/// (measured 300-455 MB/s on the real pipeline vs 4.85-9.2 GB/s for the
+/// same xxh3 run in isolation -- `docs/evidence/2026-09-02-v4-p2-2b-cold-
+/// pipeline.md` §18.4).
+pub fn hash_of_partition_hashes(parts: &[u64; N_NIBBLES]) -> u64 {
+    let mut buf = [0u8; N_NIBBLES * 8];
+    for (i, h) in parts.iter().enumerate() {
+        buf[i * 8..i * 8 + 8].copy_from_slice(&h.to_le_bytes());
+    }
+    xxh::hash(&buf)
+}
+
+/// A2: derives the 16 nibble ROW-INDEX boundaries (`[b0=0, b1, ..., b15,
+/// bN=n]`) from `records.keys`' own DATA bytes (post-header) -- sorted by
+/// `record_id`, hence by nibble (`record_id[0] >> 4`), by construction
+/// (every writer in this crate sorts hot rows this way). Used by [`verify_
+/// xxh3_partitioned_stride`]/[`nibble_byte_boundaries`] to re-derive
+/// exactly the boundaries the writer used, straight from what's actually
+/// on disk -- self-verifying: a corrupted `records.keys` fails its OWN
+/// partitioned verify using these same boundaries, so trusting them here
+/// is not a soft spot.
+pub fn nibble_row_boundaries(keys_data: &[u8]) -> [usize; N_NIBBLES + 1] {
+    let n = keys_data.len() / KEYS_STRIDE;
+    let mut b = [0usize; N_NIBBLES + 1];
+    for (nib, slot) in b.iter_mut().enumerate().take(N_NIBBLES) {
+        *slot = lower_bound(n, |i| {
+            let byte0 = keys_data[i * KEYS_STRIDE];
+            ((byte0 >> 4) as usize).cmp(&nib)
+        });
+    }
+    b[N_NIBBLES] = n;
+    b
+}
+
+/// A2: verifies a FIXED-STRIDE hot section (`records.keys`/`records.meta`/
+/// `records.digests`) against its header's `body_xxh3`, using the SAME
+/// `hash_of_partition_hashes` formula the writer computes it with.
+/// `row_boundaries` (from [`nibble_row_boundaries`]) gives the 16 nibbles'
+/// row-index ranges; `stride` turns each into a byte range.
+pub fn verify_xxh3_partitioned_stride(
+    bytes: &[u8],
+    row_boundaries: &[usize; N_NIBBLES + 1],
+    stride: usize,
+    label: &str,
+) -> Result<()> {
+    let (header, data) = header_and_data(bytes)?;
+    let mut parts = [0u64; N_NIBBLES];
+    for nib in 0..N_NIBBLES {
+        let start = row_boundaries[nib] * stride;
+        let end = row_boundaries[nib + 1] * stride;
+        parts[nib] = xxh::hash(&data[start..end]);
+    }
+    let actual = hash_of_partition_hashes(&parts);
+    if actual != header.body_xxh3 {
+        return Err(store_err!(
+            "xxh3 mismatch in {}: header {:016x} != computed {:016x}",
+            label,
+            header.body_xxh3,
+            actual
+        ));
+    }
+    Ok(())
+}
+
+/// A2: derives the 16 nibbles' BYTE boundaries for a variable-length hot
+/// section (`records.body`/`records.ident`) from `records.meta`'s own
+/// `off_field` (`meta::BODY_OFF` or `meta::IDENT_OFF`) at each nibble's
+/// first row. A nibble whose row index is `>=` the row count (every
+/// remaining nibble is empty, past the last real row) resolves to `total`
+/// -- there is no row left to read an offset from, and `total` is exactly
+/// the byte offset one past the last row's own data, the correct boundary
+/// for an empty trailing gap.
+pub fn nibble_byte_boundaries(
+    meta_data: &[u8],
+    row_boundaries: &[usize; N_NIBBLES + 1],
+    off_field: usize,
+    total: u64,
+) -> [u64; N_NIBBLES + 1] {
+    let n_rows = meta_data.len() / META_STRIDE;
+    let mut b = [0u64; N_NIBBLES + 1];
+    for (nib, slot) in b.iter_mut().enumerate().take(N_NIBBLES) {
+        let row = row_boundaries[nib];
+        *slot = if row < n_rows {
+            let m = &meta_data[row * META_STRIDE..(row + 1) * META_STRIDE];
+            u64le(m, off_field)
+        } else {
+            total
+        };
+    }
+    b[N_NIBBLES] = total;
+    b
+}
+
+/// A2: verifies a VARIABLE-LENGTH hot section (`records.body`/`records.
+/// ident`) against its header's `body_xxh3`, using the SAME `hash_of_
+/// partition_hashes` formula the writer computes it with. `byte_
+/// boundaries` (from [`nibble_byte_boundaries`]) gives the 16 nibbles'
+/// byte ranges directly.
+pub fn verify_xxh3_partitioned_bytes(
+    bytes: &[u8],
+    byte_boundaries: &[u64; N_NIBBLES + 1],
+    label: &str,
+) -> Result<()> {
+    let (header, data) = header_and_data(bytes)?;
+    let mut parts = [0u64; N_NIBBLES];
+    for nib in 0..N_NIBBLES {
+        let start = byte_boundaries[nib] as usize;
+        let end = byte_boundaries[nib + 1] as usize;
+        parts[nib] = xxh::hash(&data[start..end]);
+    }
+    let actual = hash_of_partition_hashes(&parts);
+    if actual != header.body_xxh3 {
+        return Err(store_err!(
+            "xxh3 mismatch in {}: header {:016x} != computed {:016x}",
+            label,
+            header.body_xxh3,
+            actual
+        ));
+    }
+    Ok(())
+}
+
+/// A2: verifies all five hot `records.*` sections of one segment in one
+/// call -- derives `row_boundaries` from `keys` once, reuses it for
+/// `meta`/`digests` (fixed stride) and (via `nibble_byte_boundaries`) for
+/// `body`/`ident` (variable length). `keys`/`meta` must be the section's
+/// FULL bytes (header + data), matching every other `verify_xxh3*`
+/// function's own convention.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_records_hot_partitioned(
+    keys: &[u8],
+    meta: &[u8],
+    digests: &[u8],
+    body: &[u8],
+    ident: &[u8],
+    label_prefix: &str,
+) -> Result<()> {
+    let (_, keys_data) = header_and_data(keys)?;
+    let (_, meta_data) = header_and_data(meta)?;
+    let row_boundaries = nibble_row_boundaries(keys_data);
+    verify_xxh3_partitioned_stride(
+        keys,
+        &row_boundaries,
+        KEYS_STRIDE,
+        &format!("{label_prefix}/records.keys"),
+    )?;
+    verify_xxh3_partitioned_stride(
+        meta,
+        &row_boundaries,
+        META_STRIDE,
+        &format!("{label_prefix}/records.meta"),
+    )?;
+    verify_xxh3_partitioned_stride(
+        digests,
+        &row_boundaries,
+        DIGESTS_STRIDE,
+        &format!("{label_prefix}/records.digests"),
+    )?;
+    let (_, body_data) = header_and_data(body)?;
+    let (_, ident_data) = header_and_data(ident)?;
+    let body_boundaries = nibble_byte_boundaries(
+        meta_data,
+        &row_boundaries,
+        meta::BODY_OFF,
+        body_data.len() as u64,
+    );
+    let ident_boundaries = nibble_byte_boundaries(
+        meta_data,
+        &row_boundaries,
+        meta::IDENT_OFF,
+        ident_data.len() as u64,
+    );
+    verify_xxh3_partitioned_bytes(
+        body,
+        &body_boundaries,
+        &format!("{label_prefix}/records.body"),
+    )?;
+    verify_xxh3_partitioned_bytes(
+        ident,
+        &ident_boundaries,
+        &format!("{label_prefix}/records.ident"),
+    )?;
+    Ok(())
+}
+
 fn create_sized(path: &Path, len: u64) -> std::io::Result<File> {
     let f = OpenOptions::new()
         .read(true)
@@ -184,6 +379,38 @@ pub fn encode_framed(
     body: &[u8],
 ) -> (Vec<u8>, u64) {
     let hash = xxh::hash(body);
+    let header = FileHeader {
+        table_id: table_id as u16,
+        row_count,
+        generation,
+        body_xxh3: hash,
+    }
+    .encode();
+    let mut blob = Vec::with_capacity(HEADER_LEN + body.len());
+    blob.extend_from_slice(&header);
+    blob.extend_from_slice(body);
+    (blob, hash)
+}
+
+/// A2: partitioned sibling of [`encode_framed`] for the five hot delta
+/// sections (`writer::build_delta_sections`) -- `body_xxh3` is `hash_of_
+/// partition_hashes` over `boundaries` (nibble BYTE ranges within `body`,
+/// `[N_NIBBLES + 1]` entries) instead of one plain xxh3 of the whole
+/// `body`, matching `write_base`/`write_base_partitioned`'s own hot-file
+/// header formula so a compaction (base <- delta) and a fresh cold write
+/// of the same logical rows produce identical headers.
+pub fn encode_framed_partitioned(
+    table_id: TableId,
+    generation: u64,
+    row_count: u64,
+    body: &[u8],
+    boundaries: &[usize; N_NIBBLES + 1],
+) -> (Vec<u8>, u64) {
+    let mut parts = [0u64; N_NIBBLES];
+    for nib in 0..N_NIBBLES {
+        parts[nib] = xxh::hash(&body[boundaries[nib]..boundaries[nib + 1]]);
+    }
+    let hash = hash_of_partition_hashes(&parts);
     let header = FileHeader {
         table_id: table_id as u16,
         row_count,
@@ -289,10 +516,19 @@ pub fn write_hot_and_secondary_files(
     // runs twice for the same row.
     let batch_index = BatchIndex::from_rows(rows);
     let resolve_identity = |id: &[u8; 32]| batch_index.get(id);
+    // A3a-fix: `dicts.entity_kinds` is already complete (the caller
+    // extended it with this batch's new words before calling this
+    // function -- see `SegmentWriter::write_base_with_pending`'s own doc
+    // comment) -- built once here, shared by the loop below.
+    let entity_kinds = identity_codec::EntityKindIndex::from_dicts(dicts);
     let mut layouts = vec![IDENTITY_LAYOUT_RAW; n];
-    for (k, layout) in layouts.iter_mut().enumerate() {
+    let mut entity_kind_bytes = vec![identity_codec::ENTITY_KIND_NONE; n];
+    for k in 0..n {
         let row = &rows[order[k] as usize];
-        *layout = identity_codec::classify_identity_layout(row, dicts, &resolve_identity);
+        let (layout, entity_kind_byte) =
+            identity_codec::classify_identity_layout(row, dicts, &resolve_identity, &entity_kinds);
+        layouts[k] = layout;
+        entity_kind_bytes[k] = entity_kind_byte;
     }
 
     let mut body_off = vec![0u64; n];
@@ -357,6 +593,7 @@ pub fn write_hot_and_secondary_files(
             let body_off = &body_off;
             let ident_off = &ident_off;
             let layouts = &layouts;
+            let entity_kind_bytes = &entity_kind_bytes;
             let nibble_start = nibble_start;
 
             handles.push(scope.spawn(move || -> Result<Work> {
@@ -413,6 +650,7 @@ pub fn write_hot_and_secondary_files(
                         put_u64le(m, meta::IDENT_OFF, ident_off[k]);
                         let layout = layouts[k];
                         m[meta::IDENTITY_LAYOUT] = layout;
+                        m[meta::ENTITY_KIND] = entity_kind_bytes[k];
                         let ident_len = if layout == IDENTITY_LAYOUT_RAW {
                             row.identity_key.len() as u32
                         } else {
@@ -656,8 +894,20 @@ pub fn write_hot_and_secondary_files(
             .map(|(slot, (name, file, data_len))| {
                 let ordered = &ordered;
                 scope.spawn(move || -> Result<(&'static str, u64, u64)> {
-                    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                    // A2: per-nibble hash, combined via `hash_of_partition_
+                    // hashes` -- the SAME formula `write_hot_and_secondary_
+                    // files_partitioned` uses, so both writers produce
+                    // identical headers for the same logical rows
+                    // (`write_base_partitioned_test.rs`'s byte-for-byte
+                    // oracle). An absent nibble (no entry in `ordered`,
+                    // i.e. an empty partition -- `nibble_buffers` only ever
+                    // gets an entry for a nibble with `start != end`) is
+                    // NEVER skipped: its slot stays `xxh::hash(&[])`,
+                    // exactly what hashing its own (empty) buffer would
+                    // have produced.
+                    let mut parts = [xxh::hash(&[]); N_NIBBLES];
                     for entry in ordered {
+                        let nib = entry.0;
                         let buf: &Vec<u8> = match slot {
                             0 => &entry.1,
                             1 => &entry.2,
@@ -665,9 +915,9 @@ pub fn write_hot_and_secondary_files(
                             3 => &entry.4,
                             _ => &entry.5,
                         };
-                        hasher.update(buf);
+                        parts[nib] = xxh::hash(buf);
                     }
-                    let hash = hasher.digest();
+                    let hash = hash_of_partition_hashes(&parts);
                     let header = FileHeader {
                         table_id: TableId::Records as u16,
                         row_count: n as u64,
@@ -762,18 +1012,31 @@ pub fn write_hot_and_secondary_files_partitioned(
     // `par_iter` below (never rebuilt per partition).
     let batch_index = BatchIndex::from_partitions(partitions);
     let resolve_identity = |id: &[u8; 32]| batch_index.get(id);
-    // `layouts[nib][local]` mirrors `partitions[nib][local]`, classified
-    // once here (single pass, still cheap relative to the I/O this
-    // function does) and reused by both this prefix-sum loop and the
-    // per-partition write loop below -- never re-classified per row.
-    let layouts: Vec<Vec<u8>> = partitions
+    // A3a-fix: `dicts.entity_kinds` is already complete (the caller
+    // extended it with this batch's new words before calling this
+    // function, over EVERY partition -- see `SegmentWriter::write_base_
+    // partitioned_with_pending`'s own doc comment).
+    let entity_kinds = identity_codec::EntityKindIndex::from_dicts(dicts);
+    // `layouts[nib][local]`/`entity_kind_bytes[nib][local]` mirror
+    // `partitions[nib][local]`, classified once here (single pass, still
+    // cheap relative to the I/O this function does) and reused by both
+    // this prefix-sum loop and the per-partition write loop below -- never
+    // re-classified per row.
+    let (layouts, entity_kind_bytes): (Vec<Vec<u8>>, Vec<Vec<u8>>) = partitions
         .iter()
         .map(|part| {
             part.iter()
-                .map(|row| identity_codec::classify_identity_layout(row, dicts, &resolve_identity))
-                .collect()
+                .map(|row| {
+                    identity_codec::classify_identity_layout(
+                        row,
+                        dicts,
+                        &resolve_identity,
+                        &entity_kinds,
+                    )
+                })
+                .unzip()
         })
-        .collect();
+        .unzip();
 
     let mut row_base = [0usize; N_NIBBLES + 1];
     let mut body_base = [0u64; N_NIBBLES + 1];
@@ -822,19 +1085,29 @@ pub fn write_hot_and_secondary_files_partitioned(
     // meaningful share of this task's own measured RSS at n8n scale, see
     // the evidence doc), each partition's buffers here are written to disk
     // and then DROPPED immediately (end of this closure's scope) -- never
-    // returned, never kept alive past their own `write_at` calls. The
-    // whole-file xxh3 hash is computed afterward straight off the just-
-    // written FILE via `mmap_file` (`write_and_hash_hot_files`, below,
-    // called after this closure and `secondary_work` both finish) instead
-    // of a second in-memory copy: `write_at`'s pages are already resident
-    // in this process's page cache, so the mmap read is not a real disk
-    // read, just a different view onto memory this process already holds
-    // ONE copy of instead of two.
-    let hot_files_work = || -> Result<()> {
+    // returned, never kept alive past their own `write_at` calls.
+    //
+    // A2 (2026-09-05): the per-file whole-data xxh3 used to be computed
+    // AFTER this closure returned, by re-`mmap_file`-ing each just-written
+    // file and hashing it whole (measured 300-455 MB/s on the real
+    // pipeline vs 4.85-9.2 GB/s for the same xxh3 run in isolation --
+    // `docs/evidence/2026-09-02-v4-p2-2b-cold-pipeline.md` §18.4 -- the gap
+    // being the re-read: the five files' worth of data crossing the
+    // mmap/page-cache boundary a second time, competing for bandwidth
+    // across 5 concurrent rayon tasks). Now each partition hashes its OWN
+    // five buffers right here, immediately after (never before) writing
+    // them, while they're still in hand -- no re-read of anything. Returns
+    // `[u64; 5]` per partition (keys/meta/digests/body/ident, same order
+    // `header_jobs` below indexes); the caller combines each file's 16
+    // partition hashes via `hash_of_partition_hashes` into that file's
+    // header `body_xxh3` -- the SAME formula the non-partitioned `write_
+    // hot_and_secondary_files` above now also uses, so both writers
+    // produce byte-identical headers for the same logical rows.
+    let hot_files_work = || -> Result<Vec<[u64; 5]>> {
         partitions
             .par_iter()
             .enumerate()
-            .map(|(nib, part)| -> Result<()> {
+            .map(|(nib, part)| -> Result<[u64; 5]> {
                 let count = part.len();
                 let mut keys_buf = vec![0u8; count * KEYS_STRIDE];
                 let mut meta_buf = vec![0u8; count * META_STRIDE];
@@ -888,6 +1161,7 @@ pub fn write_hot_and_secondary_files_partitioned(
                     put_u32le(m, meta::BODY_LEN, row.body.len() as u32);
                     put_u64le(m, meta::IDENT_OFF, ident_base[nib] + local_ident_off);
                     m[meta::IDENTITY_LAYOUT] = layout;
+                    m[meta::ENTITY_KIND] = entity_kind_bytes[nib][local];
                     let ident_len = if layout == IDENTITY_LAYOUT_RAW {
                         row.identity_key.len() as u32
                     } else {
@@ -930,10 +1204,19 @@ pub fn write_hot_and_secondary_files_partitioned(
                 body_file.write_all_at(&body_buf, HEADER_LEN as u64 + body_base[nib])?;
                 ident_file.write_all_at(&ident_buf, HEADER_LEN as u64 + ident_base[nib])?;
 
-                // `keys_buf`/`meta_buf`/`digests_buf`/`body_buf`/`ident_buf`
-                // drop here, at the end of this partition's own closure
-                // call -- never propagated out.
-                Ok(())
+                // A2: hash each buffer HERE, while still owned by this
+                // partition's own stack frame -- immediately before
+                // `keys_buf`/`meta_buf`/`digests_buf`/`body_buf`/
+                // `ident_buf` drop at the end of this closure call (never
+                // propagated out, never re-read from disk).
+                let part_hashes = [
+                    xxh::hash(&keys_buf),
+                    xxh::hash(&meta_buf),
+                    xxh::hash(&digests_buf),
+                    xxh::hash(&body_buf),
+                    xxh::hash(&ident_buf),
+                ];
+                Ok(part_hashes)
             })
             .collect()
     };
@@ -1118,55 +1401,39 @@ pub fn write_hot_and_secondary_files_partitioned(
     let hot_and_secondary_started = std::time::Instant::now();
     let (hot_result, secondary_result) = rayon::join(hot_files_work, secondary_work);
     let hot_and_secondary_elapsed = hot_and_secondary_started.elapsed();
-    hot_result?;
+    let per_partition_hashes = hot_result?;
     let secondary = secondary_result?;
+    debug_assert_eq!(per_partition_hashes.len(), N_NIBBLES);
 
-    // P2-2j item 4 (RSS): hash each hot file's DATA region straight off an
-    // mmap of the file this function itself just wrote (`write_hot_and_
-    // secondary_files`'s own header-hash pass keeps every nibble's encoded
-    // buffer alive in a `Vec` for exactly this purpose -- see this
-    // function's own module-level doc comment for the measured RSS cost).
-    // The pages are already resident in this process's page cache (they
-    // were just written via `write_at`, not fsynced -- no real disk I/O
-    // happens here), so this is a second VIEW onto memory already held,
-    // not a second in-memory COPY. One `rayon` task per file (five total).
-    let header_jobs: Vec<(&'static str, &Path, &Arc<File>, u64)> = vec![
-        (
-            "records.keys",
-            &keys_path,
-            &keys_file,
-            (n * KEYS_STRIDE) as u64,
-        ),
-        (
-            "records.meta",
-            &meta_path,
-            &meta_file,
-            (n * META_STRIDE) as u64,
-        ),
+    // A2: combine each file's 16 per-partition hashes (computed inline,
+    // above, right after that partition wrote its own buffers -- never a
+    // re-read of the file) into that file's header `body_xxh3`, via
+    // `hash_of_partition_hashes` -- no `mmap_file`/re-read of anything
+    // here at all, closing the gap `hot_files_work`'s own doc comment
+    // describes. One `rayon` task per file (five total) purely to write
+    // the five headers concurrently; the hash itself is already computed.
+    let header_hash_started = std::time::Instant::now();
+    let header_jobs: Vec<(&'static str, &Arc<File>, u64, usize)> = vec![
+        ("records.keys", &keys_file, (n * KEYS_STRIDE) as u64, 0),
+        ("records.meta", &meta_file, (n * META_STRIDE) as u64, 1),
         (
             "records.digests",
-            &digests_path,
             &digests_file,
             (n * DIGESTS_STRIDE) as u64,
+            2,
         ),
-        ("records.body", &body_path, &body_file, total_body),
-        ("records.ident", &ident_path, &ident_file, total_ident),
+        ("records.body", &body_file, total_body, 3),
+        ("records.ident", &ident_file, total_ident, 4),
     ];
-    let header_hash_started = std::time::Instant::now();
-    let mut per_file_hash_ms: Vec<(&'static str, f64)> = Vec::new();
-    let results: Vec<Result<(&'static str, u64, u64, f64)>> = header_jobs
+    let results: Vec<Result<(&'static str, u64, u64)>> = header_jobs
         .into_par_iter()
         .map(
-            |(name, path, file, data_len)| -> Result<(&'static str, u64, u64, f64)> {
-                let file_started = std::time::Instant::now();
-                let hash = if data_len == 0 {
-                    xxh::hash(&[])
-                } else {
-                    let mapped = mmap_file(path)?;
-                    let data_start = HEADER_LEN;
-                    let data_end = data_start + data_len as usize;
-                    xxh::hash(&mapped[data_start..data_end])
-                };
+            |(name, file, data_len, slot)| -> Result<(&'static str, u64, u64)> {
+                let mut parts = [0u64; N_NIBBLES];
+                for (nib, part_hashes) in per_partition_hashes.iter().enumerate() {
+                    parts[nib] = part_hashes[slot];
+                }
+                let hash = hash_of_partition_hashes(&parts);
                 let header = FileHeader {
                     table_id: TableId::Records as u16,
                     row_count: n as u64,
@@ -1175,12 +1442,7 @@ pub fn write_hot_and_secondary_files_partitioned(
                 }
                 .encode();
                 file.write_all_at(&header, 0)?;
-                Ok((
-                    name,
-                    HEADER_LEN as u64 + data_len,
-                    hash,
-                    file_started.elapsed().as_secs_f64() * 1_000.0,
-                ))
+                Ok((name, HEADER_LEN as u64 + data_len, hash))
             },
         )
         .collect();
@@ -1189,20 +1451,14 @@ pub fn write_hot_and_secondary_files_partitioned(
     let mut bytes = std::collections::BTreeMap::new();
     let mut xxh3s = std::collections::BTreeMap::new();
     for r in results {
-        let (name, total, hash, hash_ms) = r?;
+        let (name, total, hash) = r?;
         bytes.insert(name, total);
         xxh3s.insert(name, hash);
-        per_file_hash_ms.push((name, hash_ms));
     }
 
     if debug_timing {
-        let per_file: String = per_file_hash_ms
-            .iter()
-            .map(|(name, ms)| format!("{name}={ms:.1}ms"))
-            .collect::<Vec<_>>()
-            .join(" ");
         eprintln!(
-            "[urdira-structural-store] write_hot_and_secondary_files_partitioned: hot_and_secondary(parallel)={:.3}s header_hash(parallel)={:.3}s [{per_file}] n={n} total_body_bytes={total_body} total_ident_bytes={total_ident}",
+            "[urdira-structural-store] write_hot_and_secondary_files_partitioned: hot_and_secondary(parallel)={:.3}s header_hash(parallel, no re-read)={:.3}s n={n} total_body_bytes={total_body} total_ident_bytes={total_ident}",
             hot_and_secondary_elapsed.as_secs_f64(),
             header_hash_elapsed.as_secs_f64(),
         );

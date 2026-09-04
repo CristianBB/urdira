@@ -108,6 +108,43 @@ pub struct Dictionaries {
     /// napi port's `subject_text_for` already uses for a v3-converted
     /// store's sidecar).
     pub subject_text: Vec<String>,
+    /// A3a-fix: the REAL owner path text, aligned 1:1 BY ORDINAL with
+    /// `artifacts` (`artifact_paths[i]` is `artifacts[i]`'s owner's actual
+    /// `owner_path`, e.g. `"src/a.ts"` -- never the `(artifact_id,
+    /// artifact_version_id)` digest pair `artifacts[i]` itself carries, and
+    /// never derived from it: only the caller that minted the artifact
+    /// (`urdira-indexing-worker`'s materialize pass) knows the real path).
+    /// Populated by that caller alongside `artifacts` itself; this crate
+    /// only stores/reads it back. May be SHORTER than `artifacts` for a
+    /// store whose earlier generations predate this field (or a
+    /// v3-converted store, which never populates it at all) -- a reader's
+    /// `.get(ord)` returning `None` for such an ordinal is the intended
+    /// "can't reconstruct, fall back to Raw" signal (`identity_codec::
+    /// artifact_path`), never a bug.
+    pub artifact_paths: Vec<String>,
+    /// A3a-fix: the FINE per-declaration entity-kind word (`"function"`/
+    /// `"class"`/`"method"`/`"getter"`/... -- `EntityKind::identity_name()`
+    /// in `urdira-jsts-syntax-worker`) an entity row's identity string's
+    /// `{kind}` segment actually uses, interned by ordinal. Unlike every
+    /// other dictionary here, this one is populated ENTIRELY INSIDE this
+    /// crate (`identity_codec::collect_new_entity_kinds`, called from
+    /// `writer.rs`/`segment_io.rs` at write time) by parsing the fine word
+    /// straight out of each entity row's OWN `identity_key` bytes -- no
+    /// caller needs to (or can: `RecordRow`/`Dictionaries` carry no fine-
+    /// grained kind field at all, only the coarse `UniversalKind`-bucketed
+    /// `kind_id`) populate this field itself. New words are assigned
+    /// ordinals in SORTED order among only the words new to this batch
+    /// (never row-iteration order), so `write_base` and `write_base_
+    /// partitioned` -- which see the same logical rows bucketed
+    /// differently -- always assign identical ordinals to a given word
+    /// (`write_base_partitioned_test.rs`'s byte-for-byte oracle depends on
+    /// this). `records.meta`'s `ENTITY_KIND` byte (u8, 255 == none) indexes
+    /// into this list; an ordinal that would not fit in a `u8` (>254,
+    /// meaning >255 distinct fine words have ever been seen -- never
+    /// happens in practice, the real vocabulary is under 20 words) simply
+    /// is not tagged (`IDENTITY_LAYOUT_RAW`), same never-lose-correctness
+    /// discipline every other classify-time guard in `identity_codec` uses.
+    pub entity_kinds: Vec<String>,
 }
 
 pub const PENDING_SITE_KIND_CALL: u8 = 1;
@@ -185,6 +222,11 @@ impl Dictionaries {
                 .to_vec(),
             subject_text: self.subject_text[base.subject_text.len().min(self.subject_text.len())..]
                 .to_vec(),
+            artifact_paths: self.artifact_paths
+                [base.artifact_paths.len().min(self.artifact_paths.len())..]
+                .to_vec(),
+            entity_kinds: self.entity_kinds[base.entity_kinds.len().min(self.entity_kinds.len())..]
+                .to_vec(),
         }
     }
 
@@ -201,6 +243,10 @@ impl Dictionaries {
             .extend(additions.facet_names.iter().cloned());
         self.subject_text
             .extend(additions.subject_text.iter().cloned());
+        self.artifact_paths
+            .extend(additions.artifact_paths.iter().cloned());
+        self.entity_kinds
+            .extend(additions.entity_kinds.iter().cloned());
     }
 
     pub fn is_empty(&self) -> bool {
@@ -212,5 +258,7 @@ impl Dictionaries {
             && self.artifacts.is_empty()
             && self.facet_names.is_empty()
             && self.subject_text.is_empty()
+            && self.artifact_paths.is_empty()
+            && self.entity_kinds.is_empty()
     }
 }

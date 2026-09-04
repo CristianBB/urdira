@@ -520,6 +520,17 @@ impl NativeStoreBuilder {
             // leaving them empty here is deliberate, not an omission.
             facet_names: Vec::new(),
             subject_text: Vec::new(),
+            // A3a-fix: this v3-conversion path has no real owner path to
+            // offer (`artifacts` here is a v3 artifact id/version pair, not
+            // guaranteed to follow the `"artifact:{path}"` convention the
+            // real v4 pipeline uses regardless) -- every row from this
+            // builder falls back to `IDENTITY_LAYOUT_RAW`, exactly the
+            // pre-A3a behavior, which is correct for this path.
+            // `entity_kinds` is populated entirely inside `structural-store`
+            // itself at write time (see `identity_codec`'s module doc), not
+            // by any caller.
+            artifact_paths: Vec::new(),
+            entity_kinds: Vec::new(),
         };
         let writer = urdira_structural_store::SegmentWriter::new();
         let summary = writer
@@ -1502,7 +1513,8 @@ fn pending_site_rows_for_owner(
 #[cfg(test)]
 mod pending_sites_by_owner_tests {
     use super::{
-        Dictionaries, NONE_U16, NativeOutputPendingSiteRow, RecordRow, pending_site_rows_for_owner,
+        Dictionaries, NONE_U16, NONE_U32, NativeOutputPendingSiteRow, RecordRow,
+        pending_site_rows_for_owner,
     };
     use sha2::{Digest, Sha256};
     use urdira_structural_store::{
@@ -1557,6 +1569,8 @@ mod pending_sites_by_owner_tests {
             ],
             facet_names: Vec::new(),
             subject_text: Vec::new(),
+            artifact_paths: Vec::new(),
+            entity_kinds: Vec::new(),
         };
 
         let source_row = RecordRow {
@@ -1572,8 +1586,12 @@ mod pending_sites_by_owner_tests {
             span_artifact_version: 0,
             span_start_byte: 0,
             span_end_byte: 0,
-            span_start_line: 0,
-            span_end_line: 0,
+            // A4 (line numbers task): this synthetic test row carries no
+            // real span, so "no line known" (`NONE_U32`) is the correct
+            // sentinel -- matches what napi's `opt_u32_text` treats as
+            // `None` (see that function's own doc comment).
+            span_start_line: NONE_U32,
+            span_end_line: NONE_U32,
             identity_type: 0,
             assignment_kind: 0,
             name_id: 0,

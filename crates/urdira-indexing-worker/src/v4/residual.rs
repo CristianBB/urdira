@@ -96,7 +96,7 @@ use sha2::{Digest, Sha256};
 use urdira_native_core::StructuralKernelRecordRef;
 use urdira_source_frontier::Frontier;
 use urdira_structural_store::row::{
-    CATEGORY_DIAGNOSTIC, CATEGORY_ENTITY, CATEGORY_RELATION, Dictionaries, RecordRow,
+    CATEGORY_DIAGNOSTIC, CATEGORY_ENTITY, CATEGORY_RELATION, Dictionaries, NONE_U32, RecordRow,
 };
 use urdira_structural_store::{PendingSiteKey, SetKind, StoreReader, merkle};
 use urdira_tsgo_client::binary;
@@ -536,6 +536,11 @@ fn run_once_with_quiet_period(
     // (e.g. `this.repository.save(...)`) produce exactly one new entity
     // record, not 1,000 duplicates.
     let mut synthesized_member_entities: HashMap<(String, i32), [u8; 32]> = HashMap::new();
+    // A4 (line numbers task, 2026-09-05): one `LineIndex` per owner path,
+    // built lazily on first use and shared by every row this run
+    // synthesizes -- see `owner_line_index`'s own doc comment.
+    let mut line_index_cache: HashMap<String, urdira_jsts_syntax_worker::LineIndex> =
+        HashMap::new();
     // A2 (pending.sites migration): closures for the `pending.sites` side
     // table -- one entry per site this pass actually upgrades (see the
     // `SiteOutcome::WorkspaceTarget` arm below). `External`/`Unresolved`
@@ -634,6 +639,7 @@ fn run_once_with_quiet_period(
                         publish_generation,
                         new_generation_u32,
                         &mut synthesized_member_entities,
+                        &mut line_index_cache,
                         &mut opened_records,
                         &mut kinds_dict,
                         &mut universal_kinds_dict,
@@ -674,6 +680,9 @@ fn run_once_with_quiet_period(
                     &store,
                     publish_generation,
                     new_generation_u32,
+                    &file_map,
+                    &workspace_root,
+                    &mut line_index_cache,
                     &mut kinds_dict,
                     &mut universal_kinds_dict,
                     &mut relation_kinds_dict,
@@ -820,6 +829,7 @@ fn run_once_with_quiet_period(
                         publish_generation,
                         new_generation_u32,
                         &mut synthesized_member_entities,
+                        &mut line_index_cache,
                         &mut opened_records,
                         &mut kinds_dict,
                         &mut universal_kinds_dict,
@@ -843,6 +853,9 @@ fn run_once_with_quiet_period(
                     &store,
                     publish_generation,
                     new_generation_u32,
+                    &file_map,
+                    &workspace_root,
+                    &mut line_index_cache,
                     &mut kinds_dict,
                     &mut universal_kinds_dict,
                     &mut relation_kinds_dict,
@@ -883,6 +896,9 @@ fn run_once_with_quiet_period(
                     &store,
                     publish_generation,
                     new_generation_u32,
+                    &file_map,
+                    &workspace_root,
+                    &mut line_index_cache,
                     &mut kinds_dict,
                     &mut universal_kinds_dict,
                     &mut names_dict,
@@ -1503,6 +1519,7 @@ fn try_synthesize_member_entity(
     generation: u64,
     new_generation: u32,
     cache: &mut HashMap<(String, i32), [u8; 32]>,
+    line_index_cache: &mut HashMap<String, urdira_jsts_syntax_worker::LineIndex>,
     opened_records: &mut Vec<RecordRow>,
     kinds_dict: &mut OrdinalDict<String>,
     universal_kinds_dict: &mut OrdinalDict<String>,
@@ -1632,6 +1649,28 @@ fn try_synthesize_member_entity(
         u16::try_from(universal_kinds_dict.intern(&universal_kind)).unwrap_or(u16::MAX);
     let name_id = names_dict.intern(&name);
 
+    // A4 (line numbers task): `decl_start`/`decl_end` are UTF-16 offsets on
+    // `real_path` (same convention `identifier_text_at_path` above already
+    // relies on for this exact file/offset pair).
+    let (raw_start_line, raw_end_line) = span_lines_for(
+        line_index_cache,
+        file_map,
+        workspace_root,
+        &real_path,
+        decl_start,
+        decl_end,
+    );
+    let span_start_line = if raw_start_line == 0 {
+        NONE_U32
+    } else {
+        raw_start_line
+    };
+    let span_end_line = if raw_end_line == 0 {
+        NONE_U32
+    } else {
+        raw_end_line
+    };
+
     opened_records.push(RecordRow {
         record_id,
         owner_artifact,
@@ -1645,8 +1684,8 @@ fn try_synthesize_member_entity(
         span_artifact_version: owner_artifact,
         span_start_byte: kernel_row.span_start,
         span_end_byte: kernel_row.span_end,
-        span_start_line: 0,
-        span_end_line: 0,
+        span_start_line,
+        span_end_line,
         identity_type: 1,
         assignment_kind: 0,
         name_id,
@@ -1683,6 +1722,57 @@ fn identifier_text_at_path(
     urdira_tsgo_client::node::identifier_text_at(&units, name_start_utf16)
 }
 
+/// A4 (line numbers task, 2026-09-05): `real_path`'s own UTF-16 line index
+/// (`urdira_jsts_syntax_worker::LineIndex`), built once per owner path and
+/// cached in `cache` for the rest of this residual run -- every row this
+/// module synthesizes for the SAME owner (a synthesized member entity, a
+/// newly-confirmed relation, an inferred-type entity/relation pair, a
+/// diagnostic row) reuses it rather than re-scanning the owner's text per
+/// record. Same `file_map`/`workspace_root` virtual-path convention
+/// `identifier_text_at_path` above already uses. `None` when `real_path`'s
+/// text is not in `file_map` (should not happen for a live frontier entry
+/// this pass is actually touching, but never guessed at -- the caller falls
+/// back to "no line known", `0`, the same sentinel a synthetic `ProposedRecord`
+/// with no real span uses).
+fn owner_line_index<'a>(
+    cache: &'a mut HashMap<String, urdira_jsts_syntax_worker::LineIndex>,
+    file_map: &BTreeMap<String, String>,
+    workspace_root: &str,
+    real_path: &str,
+) -> Option<&'a urdira_jsts_syntax_worker::LineIndex> {
+    if !cache.contains_key(real_path) {
+        let virtual_path = format!("{workspace_root}/{real_path}");
+        let text = file_map.get(&virtual_path)?;
+        cache.insert(
+            real_path.to_owned(),
+            urdira_jsts_syntax_worker::LineIndex::from_text(text),
+        );
+    }
+    cache.get(real_path)
+}
+
+/// 1-based `(start_line, end_line)` for a `(start, end)` UTF-16 offset pair
+/// on `real_path`, via [`owner_line_index`]'s cache -- `(0, 0)` ("no line
+/// known") when the owner's text is unavailable or an offset is negative
+/// (defensive; every real `tsgo` offset this module reads is non-negative,
+/// but `i32` is the wire type -- see `ResidualPass`'s own doc comment).
+fn span_lines_for(
+    cache: &mut HashMap<String, urdira_jsts_syntax_worker::LineIndex>,
+    file_map: &BTreeMap<String, String>,
+    workspace_root: &str,
+    real_path: &str,
+    start: i32,
+    end: i32,
+) -> (u32, u32) {
+    let (Ok(start), Ok(end)) = (u32::try_from(start), u32::try_from(end)) else {
+        return (0, 0);
+    };
+    match owner_line_index(cache, file_map, workspace_root, real_path) {
+        Some(index) => (index.line_of(start), index.line_of(end)),
+        None => (0, 0),
+    }
+}
+
 /// Builds one confirmed `core:call`/`core:inherits`/`core:implements`
 /// `RecordRow`, byte-for-byte matching `semantic_sites.rs`'s
 /// `call_proposed_record`/`heritage_proposed_record` identity/body recipe.
@@ -1712,6 +1802,9 @@ fn build_confirmed_row(
     store: &StoreReader,
     generation: u64,
     new_generation: u32,
+    file_map: &BTreeMap<String, String>,
+    workspace_root: &str,
+    line_index_cache: &mut HashMap<String, urdira_jsts_syntax_worker::LineIndex>,
     kinds_dict: &mut OrdinalDict<String>,
     universal_kinds_dict: &mut OrdinalDict<String>,
     relation_kinds_dict: &mut OrdinalDict<String>,
@@ -1817,6 +1910,22 @@ fn build_confirmed_row(
     let name_id = names_dict.intern(&materialize::identity_key_name(&identity_key).to_owned());
     let target_subject = Some(subjects_dict.intern(target_record_id));
 
+    // A4 (line numbers task): `path`/`start`/`end` are this relation's own
+    // owner file and UTF-16 span (the pending site's own coordinates,
+    // unchanged by confirmation).
+    let (raw_start_line, raw_end_line) =
+        span_lines_for(line_index_cache, file_map, workspace_root, path, start, end);
+    let span_start_line = if raw_start_line == 0 {
+        NONE_U32
+    } else {
+        raw_start_line
+    };
+    let span_end_line = if raw_end_line == 0 {
+        NONE_U32
+    } else {
+        raw_end_line
+    };
+
     Ok(Some(RecordRow {
         record_id,
         owner_artifact,
@@ -1830,8 +1939,8 @@ fn build_confirmed_row(
         span_artifact_version: owner_artifact,
         span_start_byte: kernel_row.span_start,
         span_end_byte: kernel_row.span_end,
-        span_start_line: 0,
-        span_end_line: 0,
+        span_start_line,
+        span_end_line,
         identity_type: 1,
         assignment_kind: 0,
         name_id,
@@ -1903,6 +2012,15 @@ fn finalize_kernel_row(
     name_id: u32,
     source_subject: Option<u32>,
     target_subject: Option<u32>,
+    // A4 (line numbers task): precomputed by the caller (`build_inferred_
+    // type_rows`/`build_diagnostic_row`, which each already know their own
+    // `path`/`start`/`end`) rather than re-resolved here -- this function
+    // has no `file_map`/`workspace_root` of its own, and both callers reuse
+    // the SAME span for more than one `finalize_kernel_row` call (entity +
+    // relation), so resolving once per caller invocation is strictly
+    // better than once per row. Already `NONE_U32`-mapped by the caller.
+    span_start_line: u32,
+    span_end_line: u32,
 ) -> ([u8; 32], Option<RecordRow>) {
     let identity_key_digest = identity_key_digest_bytes(identity_key);
     if let Some(last) = store.by_identity_last(&identity_key_digest)
@@ -1935,8 +2053,8 @@ fn finalize_kernel_row(
         span_artifact_version: owner_artifact,
         span_start_byte: kernel_row.span_start,
         span_end_byte: kernel_row.span_end,
-        span_start_line: 0,
-        span_end_line: 0,
+        span_start_line,
+        span_end_line,
         identity_type: 1,
         assignment_kind: 0,
         name_id,
@@ -1988,6 +2106,9 @@ fn build_inferred_type_rows(
     store: &StoreReader,
     generation: u64,
     new_generation: u32,
+    file_map: &BTreeMap<String, String>,
+    workspace_root: &str,
+    line_index_cache: &mut HashMap<String, urdira_jsts_syntax_worker::LineIndex>,
     kinds_dict: &mut OrdinalDict<String>,
     universal_kinds_dict: &mut OrdinalDict<String>,
     relation_kinds_dict: &mut OrdinalDict<String>,
@@ -2068,6 +2189,23 @@ fn build_inferred_type_rows(
         return Ok(None);
     };
 
+    // A4 (line numbers task): the entity/relation pair this function builds
+    // always shares `span` (both `StructuralKernelRecordRef::source_span`
+    // above are the SAME `canonical_span(path, start, end)`), so this is
+    // resolved once and reused for both `finalize_kernel_row` calls below.
+    let (raw_start_line, raw_end_line) =
+        span_lines_for(line_index_cache, file_map, workspace_root, path, start, end);
+    let span_start_line = if raw_start_line == 0 {
+        NONE_U32
+    } else {
+        raw_start_line
+    };
+    let span_end_line = if raw_end_line == 0 {
+        NONE_U32
+    } else {
+        raw_end_line
+    };
+
     let entity_kind = "jsts:entity_inferred_type".to_string();
     let entity_universal_kind = "core:type".to_string();
     let entity_kind_id = u16::try_from(kinds_dict.intern(&entity_kind)).unwrap_or(u16::MAX);
@@ -2090,6 +2228,8 @@ fn build_inferred_type_rows(
         entity_name_id,
         None,
         None,
+        span_start_line,
+        span_end_line,
     );
 
     let target_subject = Some(subjects_dict.intern(&entity_record_id_final));
@@ -2119,6 +2259,8 @@ fn build_inferred_type_rows(
         relation_name_id,
         source_subject,
         target_subject,
+        span_start_line,
+        span_end_line,
     );
 
     Ok(Some(InferredTypeRowsResult {
@@ -2155,6 +2297,9 @@ fn build_diagnostic_row(
     store: &StoreReader,
     generation: u64,
     new_generation: u32,
+    file_map: &BTreeMap<String, String>,
+    workspace_root: &str,
+    line_index_cache: &mut HashMap<String, urdira_jsts_syntax_worker::LineIndex>,
     kinds_dict: &mut OrdinalDict<String>,
     universal_kinds_dict: &mut OrdinalDict<String>,
     names_dict: &mut OrdinalDict<String>,
@@ -2198,6 +2343,21 @@ fn build_diagnostic_row(
         u16::try_from(universal_kinds_dict.intern(&universal_kind)).unwrap_or(u16::MAX);
     let name_id = names_dict.intern(&materialize::identity_key_name(&identity_key).to_owned());
 
+    // A4 (line numbers task): `path`/`start`/`end` are this diagnostic's own
+    // owner file and UTF-16 span.
+    let (raw_start_line, raw_end_line) =
+        span_lines_for(line_index_cache, file_map, workspace_root, path, start, end);
+    let span_start_line = if raw_start_line == 0 {
+        NONE_U32
+    } else {
+        raw_start_line
+    };
+    let span_end_line = if raw_end_line == 0 {
+        NONE_U32
+    } else {
+        raw_end_line
+    };
+
     let (_record_id, row) = finalize_kernel_row(
         kernel_row,
         &identity_key,
@@ -2213,6 +2373,8 @@ fn build_diagnostic_row(
         name_id,
         None,
         None,
+        span_start_line,
+        span_end_line,
     );
     Ok(Some((identity_key, row)))
 }

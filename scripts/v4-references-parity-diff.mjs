@@ -58,7 +58,8 @@
 //     against the v3 target id's raw kind token (`method`, `property`,
 //     `function`, `variable`, `parameter`, `class`, ... i.e. the segment
 //     right after `jsts:`, NOT the coarser `targetKindBucket` groups
-//     above), plus a uniform-random 5-sample reservoir per `(reason,
+//     above), plus a uniform-random `--samples`-sized (default 30)
+//     reservoir per `(reason,
 //     workspace)` cell (path:start + the v3 target id) so a reader can spot
 //     what shape of workspace target each reason is actually losing.
 //
@@ -209,10 +210,16 @@ function rawTargetKind(targetId) {
   return parsed?.kind ?? "other";
 }
 
-// Uniform-random reservoir sampling (5 per cell) over an unbounded stream --
-// avoids holding all 167,843 `v4_missing` candidates in memory just to
-// sample from them at the end.
-function reservoirPush(reservoirState, item, cap = 5) {
+// Uniform-random reservoir sampling (`--samples` per cell, default 30) over
+// an unbounded stream -- avoids holding all 167,843 `v4_missing` candidates
+// in memory just to sample from them at the end. A5b (2026-09-05): the
+// default was a hardcoded 5 until this task needed >=50 `import_binding/
+// export:ambiguous` workspace samples to measure v3's overload-resolution
+// rule against the oracle (see that reason's own doc trail); widened to
+// share `SAMPLE_CAP` with every other `--samples`-driven reservoir in this
+// script (`forwardBuckets`'s own use just below already does), so `--samples
+// 60` now actually yields up to 60 per reason here too, not a silent 5.
+function reservoirPush(reservoirState, item, cap = SAMPLE_CAP) {
   reservoirState.seen++;
   if (reservoirState.items.length < cap) {
     reservoirState.items.push(item);
@@ -441,7 +448,8 @@ for (const [key, v3site] of v3ByKey) {
 // 6b. `--classify-targets`: for every `v4_missing` site, bucket v3's
 //    target_id path (workspace/lib/node_modules/other), cross-tab against
 //    `reason`, and -- workspace only -- against the raw v3 target kind
-//    token, plus a 5-sample reservoir per (reason, workspace) cell.
+//    token, plus a `--samples`-sized (default 30) reservoir per (reason,
+//    workspace) cell.
 // ---------------------------------------------------------------------------
 const targetClassHistogram = new Map(); // targetClass -> count
 const reasonByTargetClassHistogram = new Map(); // "reason|targetClass" -> count
@@ -555,7 +563,7 @@ if (CLASSIFY_TARGETS_ENABLED) {
     console.log(`  ${reason.padEnd(32)} ${kind.padEnd(16)} ${String(count).padStart(8)}`);
   }
   console.log("");
-  console.log("-- v4_missing workspace-only samples: 5 random per reason --");
+  console.log(`-- v4_missing workspace-only samples: ${SAMPLE_CAP} random per reason --`);
   for (const [reason, reservoirState] of [...reasonWorkspaceSamples.entries()].sort((a, b) => b[1].seen - a[1].seen)) {
     console.log(`  reason=${reason} (${reservoirState.seen} workspace sites, ${reservoirState.items.length} shown)`);
     for (const item of reservoirState.items) {

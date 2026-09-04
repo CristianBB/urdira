@@ -78,17 +78,34 @@ pub mod meta {
     pub const BODY_LEN: usize = 73;
     pub const IDENT_OFF: usize = 77;
     pub const IDENT_LEN: usize = 85;
-    /// A3a: one byte, `IDENTITY_LAYOUT_{RAW,ENTITY,RELATION}` below --
-    /// whether `records.ident`'s `IDENT_OFF..IDENT_OFF+IDENT_LEN` bytes are
-    /// this row's real identity key (`RAW`, `IDENT_LEN` > 0, the pre-A3a
-    /// behavior and the default for a zero-initialized row) or the
-    /// candidate string reconstructed from this row's OWN typed fields was
-    /// found to be byte-for-byte identical to the producer's original
-    /// identity key, so the store elides storing it at all (`ENTITY`/
-    /// `RELATION`, `IDENT_LEN` == 0). See `crate::identity_codec`.
+    /// A3a: one byte, `IDENTITY_LAYOUT_{RAW,ENTITY,RELATION,
+    /// RELATION_NO_SPAN}` below -- whether `records.ident`'s `IDENT_OFF..
+    /// IDENT_OFF+IDENT_LEN` bytes are this row's real identity key (`RAW`,
+    /// `IDENT_LEN` > 0, the pre-A3a behavior and the default for a zero-
+    /// initialized row) or the candidate string reconstructed from this
+    /// row's OWN typed fields was found to be byte-for-byte identical to
+    /// the producer's original identity key, so the store elides storing
+    /// it at all (`ENTITY`/`RELATION`/`RELATION_NO_SPAN`, `IDENT_LEN` ==
+    /// 0). See `crate::identity_codec`.
     pub const IDENTITY_LAYOUT: usize = 89;
+    /// A3a-fix: one byte, ordinal into `dicts.entity_kinds` (the row's own
+    /// FINE per-declaration kind word, e.g. `"function"`/`"method"`), 255
+    /// (`ENTITY_KIND_NONE`) meaning "not applicable" -- only meaningful
+    /// when `meta[IDENTITY_LAYOUT] == IDENTITY_LAYOUT_ENTITY`. See
+    /// `crate::identity_codec`'s module doc for why this exists (a real
+    /// entity row's `kind_id` dictionary text is only ever one of five
+    /// COARSE `UniversalKind`-bucketed words, never the fine word the
+    /// identity string's `{kind}` segment uses, so the fine word has to be
+    /// carried separately to reconstruct/tag an entity's identity key at
+    /// all).
+    pub const ENTITY_KIND: usize = 90;
     #[allow(dead_code)] // documents the byte budget vs the 96B stride
-    pub const USED: usize = 90;
+    pub const USED: usize = 91;
+
+    /// `meta[ENTITY_KIND]` sentinel: "no entity-kind ordinal recorded for
+    /// this row" (every non-`IDENTITY_LAYOUT_ENTITY` row, and a zero-
+    /// initialized `records.meta` byte from a pre-A3a-fix store).
+    pub const ENTITY_KIND_NONE: u8 = 255;
 
     /// This row's `identity_key()` bytes are stored verbatim in
     /// `records.ident` at `IDENT_OFF..IDENT_OFF+IDENT_LEN` -- either
@@ -100,7 +117,7 @@ pub mod meta {
     /// the pre-A3a "always store the real bytes" behavior exactly).
     pub const IDENTITY_LAYOUT_RAW: u8 = 0;
     /// This row is a `CATEGORY_ENTITY` row whose identity key is exactly
-    /// `jsts:{kind}:{path}:{start}:{name}` reconstructed from `kind_id`/
+    /// `jsts:{kind}:{path}:{start}:{name}` reconstructed from `ENTITY_KIND`/
     /// `owner_artifact`/`span_start_byte`/`name_id` -- `IDENT_LEN` is 0,
     /// nothing is stored in `records.ident` for this row.
     pub const IDENTITY_LAYOUT_ENTITY: u8 = 1;
@@ -113,6 +130,13 @@ pub mod meta {
     /// ()`) -- `IDENT_LEN` is 0, nothing is stored in `records.ident` for
     /// this row.
     pub const IDENTITY_LAYOUT_RELATION: u8 = 2;
+    /// A3a-fix: this row is a `CATEGORY_RELATION` row whose identity key
+    /// carries no span at all -- exactly `jsts:{rel}:{source_identity_key}:
+    /// {target_identity_key}` (no `{path}:{start}:{end}` segment, e.g.
+    /// `jsts:contains:{source_key}:{target_key}`) -- reconstructed from
+    /// `kind_id`/`source_subject`/`target_subject` only. `IDENT_LEN` is 0,
+    /// nothing is stored in `records.ident` for this row.
+    pub const IDENTITY_LAYOUT_RELATION_NO_SPAN: u8 = 3;
 }
 
 pub mod digests {

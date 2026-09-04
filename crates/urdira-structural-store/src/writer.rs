@@ -90,6 +90,20 @@ impl SegmentWriter {
 
         let order = compute_order(rows);
 
+        // A3a-fix: intern every NEW fine entity-kind word this batch needs
+        // (`dicts.entity_kinds` is entirely internal to this crate, unlike
+        // every other dictionary here -- see `identity_codec`'s module
+        // doc). Must happen ONCE, up front, sequentially -- never inside
+        // `write_hot_and_secondary_files`' per-nibble parallel loop -- so
+        // every row's classify call sees the SAME complete `entity_kinds`
+        // list and a shared ordinal lookup, and so `dict.bin` carries every
+        // new word exactly once.
+        let mut dicts_owned = dicts.clone();
+        let new_entity_kinds =
+            identity_codec::collect_new_entity_kinds(rows, &dicts_owned.entity_kinds);
+        dicts_owned.entity_kinds.extend(new_entity_kinds);
+        let dicts = &dicts_owned;
+
         // Hot files (records.keys/meta/digests/body/ident, partitioned by
         // top nibble across `self.n_threads` threads) and the six
         // secondary sorted-index arrays (by_owner/by_name/by_kind/
@@ -223,6 +237,20 @@ impl SegmentWriter {
         std::fs::create_dir_all(&base_dir)?;
 
         let mut files: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+
+        // A3a-fix: same up-front, sequential entity-kind interning
+        // `write_base_with_pending` does, over EVERY partition's rows
+        // (never inside the `rayon::join`/per-partition `par_iter` below --
+        // `collect_new_entity_kinds`'s own doc comment is what guarantees
+        // this produces the SAME ordinals `write_base_with_pending` would
+        // for the same logical rows, regardless of nibble bucketing).
+        let mut dicts_owned = dicts.clone();
+        let new_entity_kinds = identity_codec::collect_new_entity_kinds(
+            partitions.iter().flatten(),
+            &dicts_owned.entity_kinds,
+        );
+        dicts_owned.entity_kinds.extend(new_entity_kinds);
+        let dicts = &dicts_owned;
 
         let hot_and_entries_started = Instant::now();
         let (hs, (record_entries, dep_entries)) = rayon::join(
@@ -497,6 +525,27 @@ impl SegmentWriter {
         // merge the reader itself performs across segments.
         let mut full_dicts = current_reader.dictionaries();
         full_dicts.append(dict_additions);
+
+        // A3a-fix: entity-kind interning is entirely internal to this
+        // crate (see `identity_codec`'s module doc) -- `dict_additions`
+        // (the CALLER's own new-entries computation, `urdira-indexing-
+        // worker`'s materialize pass) never populates `entity_kinds`
+        // itself, so it's computed here, from `opened_rows` against the
+        // dictionary state BEFORE this generation's own additions (`full_
+        // dicts.entity_kinds` at this point is exactly the live store's
+        // base+prior-deltas value), then folded into BOTH `full_dicts`
+        // (for this function's own classify calls below) and a locally
+        // owned, augmented `dict_additions` (shadowing the parameter, so
+        // every downstream use in `build_delta_sections` -- the `Dict`
+        // section body, `total_dict_entries` -- picks it up unchanged).
+        let new_entity_kinds =
+            identity_codec::collect_new_entity_kinds(opened_rows, &full_dicts.entity_kinds);
+        full_dicts
+            .entity_kinds
+            .extend(new_entity_kinds.iter().cloned());
+        let mut dict_additions_owned = dict_additions.clone();
+        dict_additions_owned.entity_kinds = new_entity_kinds;
+        let dict_additions = &dict_additions_owned;
 
         // Builds every logical section's blob (header + data, byte-
         // identical to what the pre-P3-6 standalone file would have held)
@@ -947,24 +996,56 @@ fn build_delta_sections(
             .get(id)
             .map(|v| v.identity_key().into_owned())
     };
+    // A3a-fix: `full_dicts.entity_kinds` is already complete by the time
+    // this function runs (extended by this generation's own new words in
+    // `write_delta_with_reader_and_pending`, just above its call to this
+    // function) -- built once here, shared by the loop below.
+    let entity_kinds = identity_codec::EntityKindIndex::from_dicts(full_dicts);
 
     // -- records.keys/meta/digests/body/ident --
     let order = compute_order(opened_rows);
     let n = order.len();
+    // A2: nibble ROW-INDEX boundaries within `order` -- `order` is sorted
+    // by full `record_id` (`compute_order`), so it is ALSO sorted by
+    // nibble (`record_id[0] >> 4`), by construction; this is the same
+    // "walk `order` once, note where the nibble changes" recipe `write_
+    // hot_and_secondary_files`'s own `nibble_start` uses.
+    let mut row_boundaries = [n; N_NIBBLES + 1];
+    {
+        let mut cur = 0usize;
+        for (nib, slot) in row_boundaries.iter_mut().enumerate().take(N_NIBBLES) {
+            *slot = cur;
+            while cur < n && nibble_of(&opened_rows[order[cur] as usize].record_id) == nib {
+                cur += 1;
+            }
+        }
+        row_boundaries[N_NIBBLES] = n;
+    }
     let mut keys_body = Vec::with_capacity(n * KEYS_STRIDE);
     let mut meta_body = vec![0u8; n * META_STRIDE];
     let mut digests_body = vec![0u8; n * DIGESTS_STRIDE];
     let mut body_body: Vec<u8> = Vec::new();
     let mut ident_body: Vec<u8> = Vec::new();
+    // A2: this generation's own per-row body/ident byte offsets, captured
+    // as they're computed below -- reused after the loop to turn `row_
+    // boundaries` into BYTE boundaries for the two variable-length
+    // sections (`nibble_byte_boundaries`'s in-memory-blob equivalent; this
+    // function builds one `Vec<u8>` blob rather than a file, so it reuses
+    // its own already-computed offsets instead of re-deriving them from
+    // `records.meta` the way the cold writer's on-disk verify does).
+    let mut body_offsets: Vec<u64> = Vec::with_capacity(n);
+    let mut ident_offsets: Vec<u64> = Vec::with_capacity(n);
     for (k, &i) in order.iter().enumerate() {
         let row = &opened_rows[i as usize];
         keys_body.extend_from_slice(&row.record_id);
 
-        let (layout, ident_bytes) =
-            identity_codec::classify_identity(row, full_dicts, &resolve_identity);
+        let (layout, entity_kind_byte, ident_bytes) =
+            identity_codec::classify_identity(row, full_dicts, &resolve_identity, &entity_kinds);
 
         let body_off = body_body.len() as u64;
         let ident_off = ident_body.len() as u64;
+        body_offsets.push(body_off);
+        ident_offsets.push(ident_off);
         let m = &mut meta_body[k * META_STRIDE..(k + 1) * META_STRIDE];
         put_u32le(m, meta::OWNER_ARTIFACT, row.owner_artifact);
         put_u32le(m, meta::OWNER_VERSION, row.owner_version);
@@ -997,6 +1078,7 @@ fn build_delta_sections(
         put_u32le(m, meta::BODY_LEN, row.body.len() as u32);
         put_u64le(m, meta::IDENT_OFF, ident_off);
         m[meta::IDENTITY_LAYOUT] = layout;
+        m[meta::ENTITY_KIND] = entity_kind_byte;
         put_u32le(m, meta::IDENT_LEN, ident_bytes.len() as u32);
 
         let d = &mut digests_body[k * DIGESTS_STRIDE..(k + 1) * DIGESTS_STRIDE];
@@ -1011,25 +1093,93 @@ fn build_delta_sections(
         body_body.extend_from_slice(&row.body);
         ident_body.extend_from_slice(&ident_bytes);
     }
+    // A2: byte boundaries for the 5 hot sections, from `row_boundaries` --
+    // keys/meta/digests are fixed-stride (byte = row * stride); body/ident
+    // are variable-length, resolved via each nibble's FIRST row's own
+    // already-captured offset (or the section's total, for a nibble past
+    // the last real row).
+    let total_body = body_body.len() as u64;
+    let total_ident = ident_body.len() as u64;
+    let keys_boundaries: [usize; N_NIBBLES + 1] = row_boundaries.map(|r| r * KEYS_STRIDE);
+    let meta_boundaries: [usize; N_NIBBLES + 1] = row_boundaries.map(|r| r * META_STRIDE);
+    let digests_boundaries: [usize; N_NIBBLES + 1] = row_boundaries.map(|r| r * DIGESTS_STRIDE);
+    let mut body_boundaries = [0usize; N_NIBBLES + 1];
+    let mut ident_boundaries = [0usize; N_NIBBLES + 1];
+    for (nib, (body_slot, ident_slot)) in body_boundaries
+        .iter_mut()
+        .zip(ident_boundaries.iter_mut())
+        .enumerate()
+        .take(N_NIBBLES)
+    {
+        let row = row_boundaries[nib];
+        *body_slot = if row < n {
+            body_offsets[row] as usize
+        } else {
+            total_body as usize
+        };
+        *ident_slot = if row < n {
+            ident_offsets[row] as usize
+        } else {
+            total_ident as usize
+        };
+    }
+    body_boundaries[N_NIBBLES] = total_body as usize;
+    ident_boundaries[N_NIBBLES] = total_ident as usize;
+
     sections.push((
         SectionId::RecordsKeys,
-        encode_framed(TableId::Records, generation, n as u64, &keys_body).0,
+        encode_framed_partitioned(
+            TableId::Records,
+            generation,
+            n as u64,
+            &keys_body,
+            &keys_boundaries,
+        )
+        .0,
     ));
     sections.push((
         SectionId::RecordsMeta,
-        encode_framed(TableId::Records, generation, n as u64, &meta_body).0,
+        encode_framed_partitioned(
+            TableId::Records,
+            generation,
+            n as u64,
+            &meta_body,
+            &meta_boundaries,
+        )
+        .0,
     ));
     sections.push((
         SectionId::RecordsDigests,
-        encode_framed(TableId::Records, generation, n as u64, &digests_body).0,
+        encode_framed_partitioned(
+            TableId::Records,
+            generation,
+            n as u64,
+            &digests_body,
+            &digests_boundaries,
+        )
+        .0,
     ));
     sections.push((
         SectionId::RecordsBody,
-        encode_framed(TableId::Records, generation, n as u64, &body_body).0,
+        encode_framed_partitioned(
+            TableId::Records,
+            generation,
+            n as u64,
+            &body_body,
+            &body_boundaries,
+        )
+        .0,
     ));
     sections.push((
         SectionId::RecordsIdent,
-        encode_framed(TableId::Records, generation, n as u64, &ident_body).0,
+        encode_framed_partitioned(
+            TableId::Records,
+            generation,
+            n as u64,
+            &ident_body,
+            &ident_boundaries,
+        )
+        .0,
     ));
 
     // -- secondary sorted-index arrays --
@@ -1227,7 +1377,9 @@ fn build_delta_sections(
         + dict_additions.names.len()
         + dict_additions.artifacts.len()
         + dict_additions.facet_names.len()
-        + dict_additions.subject_text.len();
+        + dict_additions.subject_text.len()
+        + dict_additions.artifact_paths.len()
+        + dict_additions.entity_kinds.len();
     if total_dict_entries > 0 {
         let mut dict_body = Vec::new();
         // `write_dict_body` cannot fail against a `Vec<u8>` sink.
@@ -1406,7 +1558,9 @@ fn write_dict_files(
         + dicts.names.len()
         + dicts.artifacts.len()
         + dicts.facet_names.len()
-        + dicts.subject_text.len();
+        + dicts.subject_text.len()
+        + dicts.artifact_paths.len()
+        + dicts.entity_kinds.len();
     if total_entries > 0 {
         let mut dict_body = Vec::new();
         dict::write_dict_body(&mut dict_body, dicts)?;

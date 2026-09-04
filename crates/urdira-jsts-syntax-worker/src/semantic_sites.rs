@@ -33,7 +33,7 @@
 
 use crate::resolver::{self, WorkspaceResolver};
 use crate::{
-    AnalysisError, ErrorCode, ProposedRecord, SyntaxFileResult, bounded_sha256_identity,
+    AnalysisError, ErrorCode, LineIndex, ProposedRecord, SyntaxFileResult, bounded_sha256_identity,
     canonical_evidence, canonical_json, canonical_span, facets_list_from_value,
     proposal_record_key,
 };
@@ -1515,6 +1515,23 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// guess, matching every other degrade-to-`false`/`Pending` rule in this
     /// module.
     is_test_source: bool,
+    /// A4 (line numbers task, 2026-09-05): THIS owner file's own UTF-16
+    /// line index, built by the caller (`analyze_owner_semantics_with_
+    /// context`) from the SAME `source_text` this walk's spans are already
+    /// UTF-16-converted against -- built locally here rather than looked up
+    /// through `ctx.files.get(path)` so every `ProposedRecord` this walker
+    /// proposes gets real line numbers even when `ctx.files` has no entry
+    /// for `path` itself (every existing test above only ever populates
+    /// `ctx.files` with *target* files an import resolves to, never the
+    /// owner's own entry -- see `test_container_owner_file`'s doc comment --
+    /// and a brand-new incrementally-analyzed owner is not guaranteed to be
+    /// in the caller's `project_files` snapshot yet either). Every relation/
+    /// entity this walker proposes with a REAL span (i.e. `path` itself,
+    /// never a synthetic `external:{specifier}` entity) is on this file, by
+    /// construction (see the individual `*_proposed_record` producers'
+    /// callers in `finish` below), so this single index is always the right
+    /// one -- no per-record path comparison needed.
+    line_index: LineIndex,
 }
 
 impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
@@ -1525,6 +1542,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         jsdoc_typed_file: bool,
         ctx: &'r HybridResolutionContext<'r>,
         member_qualified_names: BTreeMap<String, String>,
+        line_index: LineIndex,
     ) -> Self {
         let module_id = format!("jsts:module:{path}:0:{path}");
         let is_test_source = ctx
@@ -1579,6 +1597,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             namespace_import_specifiers: HashMap::new(),
             namespace_reexport_targets: HashMap::new(),
             is_test_source,
+            line_index,
         }
     }
 
@@ -3562,7 +3581,9 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             self.reference_rows
                 .iter()
                 .filter(|row| row.cross_file)
-                .map(|row| covers_proposed_record(&self.path, &self.module_id, row))
+                .map(|row| {
+                    covers_proposed_record(&self.path, &self.module_id, row, &self.line_index)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -3570,27 +3591,27 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         let reference_rows = self
             .reference_rows
             .iter()
-            .map(|row| reference_proposed_record(&self.path, row))
+            .map(|row| reference_proposed_record(&self.path, row, &self.line_index))
             .collect();
         let call_rows = self
             .call_rows
             .iter()
-            .map(|row| call_proposed_record(&self.path, row))
+            .map(|row| call_proposed_record(&self.path, row, &self.line_index))
             .collect();
         let heritage_rows = self
             .heritage_rows
             .iter()
-            .map(|row| heritage_proposed_record(&self.path, row))
+            .map(|row| heritage_proposed_record(&self.path, row, &self.line_index))
             .collect();
         let typeflow_call_rows = self
             .typeflow_call_rows
             .iter()
-            .map(|row| call_proposed_record(&self.path, row))
+            .map(|row| call_proposed_record(&self.path, row, &self.line_index))
             .collect();
         let typeflow_heritage_rows = self
             .typeflow_heritage_rows
             .iter()
-            .map(|row| heritage_proposed_record(&self.path, row))
+            .map(|row| heritage_proposed_record(&self.path, row, &self.line_index))
             .collect();
         // A2 (pending.sites migration): one `PendingSiteProposal` per
         // `PendingCallSite` (reason as-is) then per `PendingHeritageSite`
@@ -3629,7 +3650,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         let candidate_call_rows = self
             .candidate_call_rows
             .iter()
-            .map(|row| candidate_call_record(&self.path, row))
+            .map(|row| candidate_call_record(&self.path, row, &self.line_index))
             .collect();
         // Parameter entities, "referenced-only" variant: `referenced_
         // parameter_targets` is already sorted (a `BTreeSet`, keyed by the
@@ -3664,14 +3685,24 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .iter()
             .filter_map(|target_id| {
                 let fact = self.parameter_declarations.get(target_id)?;
-                Some(parameter_entity_record(&self.path, language, fact))
+                Some(parameter_entity_record(
+                    &self.path,
+                    language,
+                    fact,
+                    &self.line_index,
+                ))
             })
             .chain(
                 self.referenced_catch_targets
                     .iter()
                     .filter_map(|target_id| {
                         let fact = self.catch_declarations.get(target_id)?;
-                        Some(catch_variable_entity_record(&self.path, language, fact))
+                        Some(catch_variable_entity_record(
+                            &self.path,
+                            language,
+                            fact,
+                            &self.line_index,
+                        ))
                     }),
             )
             .collect();
@@ -3680,14 +3711,22 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .iter()
             .filter_map(|target_id| {
                 let fact = self.parameter_declarations.get(target_id)?;
-                Some(parameter_contains_record(&self.path, fact))
+                Some(parameter_contains_record(
+                    &self.path,
+                    fact,
+                    &self.line_index,
+                ))
             })
             .chain(
                 self.referenced_catch_targets
                     .iter()
                     .filter_map(|target_id| {
                         let fact = self.catch_declarations.get(target_id)?;
-                        Some(catch_variable_contains_record(&self.path, fact))
+                        Some(catch_variable_contains_record(
+                            &self.path,
+                            fact,
+                            &self.line_index,
+                        ))
                     }),
             )
             .collect();
@@ -3706,12 +3745,25 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         for use_ in &self.external_uses {
             let module_entity = crate::external_module_entity(&use_.specifier);
             if external_ids_seen.insert(module_entity.id.clone()) {
-                external_entity_rows.push(crate::proposal_entity_record(&module_entity, language));
+                // A4: `module_entity`/`symbol_entity` are synthetic --
+                // `path: "external:{specifier}"`, `start`/`end` both `0`,
+                // never this owner file's own text -- so no line index
+                // applies (`None`, matching `ProposedRecord::span_start_
+                // line`'s own "no line known" case).
+                external_entity_rows.push(crate::proposal_entity_record(
+                    &module_entity,
+                    language,
+                    None,
+                ));
             }
             let symbol_entity =
                 crate::external_symbol_entity(&use_.specifier, &use_.name, use_.is_type);
             if external_ids_seen.insert(symbol_entity.id.clone()) {
-                external_entity_rows.push(crate::proposal_entity_record(&symbol_entity, language));
+                external_entity_rows.push(crate::proposal_entity_record(
+                    &symbol_entity,
+                    language,
+                    None,
+                ));
             }
             let contains = crate::external_contains_relation(
                 &use_.specifier,
@@ -3720,7 +3772,14 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 use_.start,
                 use_.end,
             );
-            external_contains_rows.push(crate::proposal_relation_record(&contains));
+            // Unlike the two entity rows above, `contains` is a REAL
+            // occurrence on THIS owner file (`path: owner_path`, a real
+            // `start`/`end` -- see `external_contains_relation`'s own doc
+            // comment), so it does get a real line number.
+            external_contains_rows.push(crate::proposal_relation_record(
+                &contains,
+                Some(&self.line_index),
+            ));
         }
         // Measurement-only (2026-09-04 n8n before/after report), gated
         // behind an env var an operator must deliberately set -- never on by
@@ -3793,7 +3852,11 @@ fn compute_sites_digest(sites: &[SemanticSite]) -> String {
     )
 }
 
-fn reference_proposed_record(path: &str, row: &ReferenceRow) -> ProposedRecord {
+fn reference_proposed_record(
+    path: &str,
+    row: &ReferenceRow,
+    line_index: &LineIndex,
+) -> ProposedRecord {
     let identity_key = format!(
         "jsts:references:{path}:{}:{}:{}:{}",
         row.start, row.end, row.source_id, row.target_id
@@ -3824,6 +3887,8 @@ fn reference_proposed_record(path: &str, row: &ReferenceRow) -> ProposedRecord {
         facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
+        span_start_line: line_index.line_of(row.start),
+        span_end_line: line_index.line_of(row.end),
         identity_key,
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(path, row.start, row.end),
@@ -3848,6 +3913,7 @@ fn covers_proposed_record(
     path: &str,
     test_container_id: &str,
     row: &ReferenceRow,
+    line_index: &LineIndex,
 ) -> ProposedRecord {
     let identity_key = format!(
         "jsts:covers:{path}:{}:{}:{}:{}",
@@ -3879,6 +3945,8 @@ fn covers_proposed_record(
         facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
+        span_start_line: line_index.line_of(row.start),
+        span_end_line: line_index.line_of(row.end),
         identity_key,
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(path, row.start, row.end),
@@ -3899,7 +3967,7 @@ fn covers_proposed_record(
 /// (`expr.span` in `visit_call_expression`), matching `node.getStart()`/
 /// `getEnd()` on the checker side (`node` there is the call expression
 /// itself, not just its callee).
-fn call_proposed_record(path: &str, row: &CallRow) -> ProposedRecord {
+fn call_proposed_record(path: &str, row: &CallRow, line_index: &LineIndex) -> ProposedRecord {
     let identity_key = format!(
         "jsts:call:{path}:{}:{}:{}:{}",
         row.start, row.end, row.source_id, row.target_id
@@ -3930,6 +3998,8 @@ fn call_proposed_record(path: &str, row: &CallRow) -> ProposedRecord {
         facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
+        span_start_line: line_index.line_of(row.start),
+        span_end_line: line_index.line_of(row.end),
         identity_key,
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(path, row.start, row.end),
@@ -3947,7 +4017,11 @@ fn call_proposed_record(path: &str, row: &CallRow) -> ProposedRecord {
 /// interface_declaration`), matching the checker's per-type-entry
 /// `ExpressionWithTypeArguments` span when it carries no type arguments
 /// either.
-fn heritage_proposed_record(path: &str, row: &HeritageRow) -> ProposedRecord {
+fn heritage_proposed_record(
+    path: &str,
+    row: &HeritageRow,
+    line_index: &LineIndex,
+) -> ProposedRecord {
     let identity_key = format!(
         "jsts:{}:{path}:{}:{}:{}:{}",
         row.relation_kind, row.start, row.end, row.source_id, row.target_id
@@ -3978,6 +4052,8 @@ fn heritage_proposed_record(path: &str, row: &HeritageRow) -> ProposedRecord {
         facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
+        span_start_line: line_index.line_of(row.start),
+        span_end_line: line_index.line_of(row.end),
         identity_key,
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(path, row.start, row.end),
@@ -4001,7 +4077,11 @@ fn heritage_proposed_record(path: &str, row: &HeritageRow) -> ProposedRecord {
 /// residual`'s `dump_call_bodies`/`collect` doc comments for how the
 /// store-level `target_subject().is_some() && !core:indirect` confirmed
 /// test stays correct with this row shape live).
-fn candidate_call_record(path: &str, row: &CandidateCallRow) -> ProposedRecord {
+fn candidate_call_record(
+    path: &str,
+    row: &CandidateCallRow,
+    line_index: &LineIndex,
+) -> ProposedRecord {
     let identity_key = format!(
         "jsts:call:{path}:{}:{}:{}:{}",
         row.start, row.end, row.source_id, row.target_id
@@ -4036,6 +4116,8 @@ fn candidate_call_record(path: &str, row: &CandidateCallRow) -> ProposedRecord {
         facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
+        span_start_line: line_index.line_of(row.start),
+        span_end_line: line_index.line_of(row.end),
         identity_key,
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(path, row.start, row.end),
@@ -4071,6 +4153,7 @@ fn parameter_entity_record(
     path: &str,
     language: crate::Language,
     fact: &ParameterDeclarationFact,
+    line_index: &LineIndex,
 ) -> ProposedRecord {
     let entity = crate::SyntaxEntity {
         id: fact.entity_id.clone(),
@@ -4084,7 +4167,7 @@ fn parameter_entity_record(
         qualified_name: Some(fact.qualified_name.clone()),
         is_test: None,
     };
-    crate::proposal_entity_record(&entity, language)
+    crate::proposal_entity_record(&entity, language, Some(line_index))
 }
 
 /// Parameter entities, "referenced-only" variant: the `core:contains`
@@ -4094,7 +4177,11 @@ fn parameter_entity_record(
 /// `contains` row is indistinguishable, by shape, from one `push_member_
 /// entities` (lib.rs) would have produced had it been the one materializing
 /// this row.
-fn parameter_contains_record(path: &str, fact: &ParameterDeclarationFact) -> ProposedRecord {
+fn parameter_contains_record(
+    path: &str,
+    fact: &ParameterDeclarationFact,
+    line_index: &LineIndex,
+) -> ProposedRecord {
     let id = format!(
         "jsts:contains:{path}:{}:{}:{}:{}",
         fact.start, fact.end, fact.parent_id, fact.entity_id
@@ -4109,7 +4196,7 @@ fn parameter_contains_record(path: &str, fact: &ParameterDeclarationFact) -> Pro
         end: fact.end,
         classification: crate::RelationClassification::Confirmed,
     };
-    crate::proposal_relation_record(&relation)
+    crate::proposal_relation_record(&relation, Some(line_index))
 }
 
 /// 2026-09-04 references-parity task, bucket 1: the `core:value` (`jsts:
@@ -4125,6 +4212,7 @@ fn catch_variable_entity_record(
     path: &str,
     language: crate::Language,
     fact: &ParameterDeclarationFact,
+    line_index: &LineIndex,
 ) -> ProposedRecord {
     let entity = crate::SyntaxEntity {
         id: fact.entity_id.clone(),
@@ -4138,13 +4226,17 @@ fn catch_variable_entity_record(
         qualified_name: Some(fact.qualified_name.clone()),
         is_test: None,
     };
-    crate::proposal_entity_record(&entity, language)
+    crate::proposal_entity_record(&entity, language, Some(line_index))
 }
 
 /// 2026-09-04 references-parity task, bucket 1: the `core:contains`
 /// `ProposedRecord` for one catch-clause binding fact's parent -> variable
 /// edge -- byte-identical shape to `parameter_contains_record`.
-fn catch_variable_contains_record(path: &str, fact: &ParameterDeclarationFact) -> ProposedRecord {
+fn catch_variable_contains_record(
+    path: &str,
+    fact: &ParameterDeclarationFact,
+    line_index: &LineIndex,
+) -> ProposedRecord {
     let id = format!(
         "jsts:contains:{path}:{}:{}:{}:{}",
         fact.start, fact.end, fact.parent_id, fact.entity_id
@@ -4159,7 +4251,7 @@ fn catch_variable_contains_record(path: &str, fact: &ParameterDeclarationFact) -
         end: fact.end,
         classification: crate::RelationClassification::Confirmed,
     };
-    crate::proposal_relation_record(&relation)
+    crate::proposal_relation_record(&relation, Some(line_index))
 }
 
 impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
@@ -5786,6 +5878,11 @@ pub fn analyze_owner_semantics_with_context(
                 (declaration.entity_id, qualified_name)
             })
             .collect();
+    // A4 (line numbers task): built from the SAME `source_text` whose spans
+    // `Utf8ToUtf16::convert_program` already converted to UTF-16 above --
+    // see `SemanticWalker::line_index`'s own doc comment for why this is
+    // built locally rather than looked up through `ctx.files`.
+    let line_index = LineIndex::from_text(source_text);
     let mut walker = SemanticWalker::new(
         path,
         semantic.scoping(),
@@ -5793,6 +5890,7 @@ pub fn analyze_owner_semantics_with_context(
         jsdoc_typed_file,
         ctx,
         member_qualified_names,
+        line_index,
     );
     walker.visit_program(&parsed.program);
     Ok(walker.finish())
@@ -5868,6 +5966,36 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.2 == function_id && row.3 == doubled_id)
+        );
+    }
+
+    #[test]
+    fn reference_record_carries_the_real_editor_line_past_a_multibyte_comment() {
+        // A4 (line numbers task, 2026-09-05): line 1 is a comment containing
+        // "café" (5 UTF-8 bytes, 4 UTF-16 code units -- the exact byte-vs-
+        // UTF-16-unit split this task's `LineIndex` has to get right). Line
+        // 2 is empty. `greet`'s declaration is on line 3. The reference to
+        // it (`useIt`'s initializer) is on line 5.
+        let source = "// café\n\nfunction greet() {}\n\nconst useIt = greet;\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let function_id = "jsts:function:a.ts:18:greet";
+        let reference = semantics
+            .reference_rows
+            .iter()
+            .find(|record| record.body["target_id"] == function_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a reference row targeting {function_id}: {:?}",
+                    semantics.reference_rows
+                )
+            });
+        assert_eq!(
+            reference.span_start_line, 5,
+            "reference record: {reference:?}"
+        );
+        assert_eq!(
+            reference.span_end_line, 5,
+            "reference record: {reference:?}"
         );
     }
 
@@ -7197,6 +7325,7 @@ mod tests {
             export_bindings,
             export_star_specifiers: Vec::new(),
             ambient_modules: Vec::new(),
+            line_index: crate::LineIndex::from_text(""),
         }
     }
 
@@ -10165,5 +10294,51 @@ mod tests {
             symbol_a, symbol_b,
             "symbol entity must be byte-identical across owners"
         );
+    }
+
+    // A5b (2026-09-05 references-parity task, bucket 1 --
+    // `import_binding/export:unresolved`, 1,340 workspace sites in the n8n
+    // corpus): a consumer importing a name through a barrel that re-exports
+    // an IMPORTED binding with no `from` on the `export` itself
+    // (`SyntaxCollector::visit_export_specifier`'s new `imported_locals`
+    // lookup, lib.rs) must resolve all the way to the real declaration, not
+    // stay pending. `index.ts`'s own `export_bindings` entry here is exactly
+    // the shape that visitor now emits, POST the generic `source_specifier
+    // -> source_target_path` resolution pass (`parse_source`) -- a re-export
+    // binding (`source_specifier`/`source_target_path` both set), never the
+    // pre-fix same-file declaration-lookup shape.
+    #[test]
+    fn resolves_through_a_barrels_sourceless_reexport_of_an_imported_binding() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            target_file(
+                "a.ts",
+                vec![target_entity(crate::EntityKind::Function, "a.ts", 16, "A")],
+                vec![export_binding("A", "A")],
+            ),
+        );
+        files.insert(
+            "index.ts".to_owned(),
+            target_file(
+                "index.ts",
+                vec![],
+                vec![reexport_binding("A", "A", "./a", "a.ts")],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import { A } from \"./index\";\nA();\n";
+        let semantics = analyze_owner_semantics_with_context("consumer.ts", source, &ctx)
+            .expect("analysis succeeds");
+        let target_id = "jsts:function:a.ts:16:A";
+        let rows = resolved(&semantics);
+        assert!(rows.iter().any(|row| row.3 == target_id), "rows: {rows:?}");
+        assert_eq!(
+            semantics.call_rows.len(),
+            1,
+            "the call itself must resolve too: {:?}",
+            semantics.call_rows
+        );
+        assert_eq!(semantics.call_rows[0].body["target_id"], target_id);
     }
 }

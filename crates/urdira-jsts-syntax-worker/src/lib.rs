@@ -5,9 +5,9 @@ use oxc_ast::ast::{
     BindingIdentifier, BindingPattern, CallExpression, Class, ClassType, Declaration,
     ExportAllDeclaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
     ExportNamedDeclaration, ExportSpecifier, Expression, Function, FunctionType, ImportDeclaration,
-    ImportExpression, ModuleExportName, Statement, TSEnumDeclaration, TSInterfaceDeclaration,
-    TSModuleDeclaration, TSModuleDeclarationBody, TSModuleDeclarationName, TSTypeAliasDeclaration,
-    VariableDeclaration,
+    ImportDeclarationSpecifier, ImportExpression, ModuleExportName, Statement, TSEnumDeclaration,
+    TSInterfaceDeclaration, TSModuleDeclaration, TSModuleDeclarationBody, TSModuleDeclarationName,
+    TSTypeAliasDeclaration, VariableDeclaration,
 };
 use oxc_ast_visit::{
     Visit,
@@ -34,8 +34,10 @@ use urdira_worker_protocol::{
     PROTOCOL_VERSION,
 };
 
+mod line_index;
 mod resolver;
 mod semantic_sites;
+pub use line_index::LineIndex;
 pub use resolver::{
     AmbientModuleIndex, ConfigAsset, ExportResolution, WorkspaceResolver, resolve_named_export,
 };
@@ -296,6 +298,25 @@ pub struct ProposedRecord {
     pub facets: String,
     pub schema_version: u8,
     pub source_span: String,
+    /// A4 (line numbers task, 2026-09-05): 1-based line numbers for the SAME
+    /// offsets `source_span` already encodes -- deliberately NOT folded into
+    /// `source_span` itself (a plain, additive field here instead), because
+    /// `source_span`'s canonical-JSON text enters the record digest
+    /// (`urdira-native-core::structural_record_digest_hash`) and a line
+    /// number must never perturb an existing record's identity/digest.
+    /// `0` means "no line known" -- either this record's span is synthetic
+    /// (e.g. an external-package entity's `start`/`end` are both `0` with no
+    /// real file backing them) or the producing file's own [`LineIndex`]
+    /// was not available at the call site. Every real producer fills these
+    /// from `LineIndex::line_of` on the SAME UTF-16 offsets `source_span`
+    /// was built from -- see [`SyntaxFileResult::line_index`]'s own doc
+    /// comment for why that index is always for the OWNER file, never the
+    /// span's own `path` when those two differ (a cross-file relation's span
+    /// is always on the owning file, so they never differ for a relation;
+    /// only a synthetic external entity ever has a `path` unequal to any
+    /// real owner, and that case is exactly the `0` one above).
+    pub span_start_line: u32,
+    pub span_end_line: u32,
     pub identity_key: String,
     pub body: serde_json::Value,
     pub evidence_references: String,
@@ -392,6 +413,22 @@ pub struct SyntaxFileResult {
     /// resolving externally where v3 resolved to a declaration inside one
     /// of these).
     pub ambient_modules: Vec<AmbientModuleDeclaration>,
+    /// A4 (line numbers task, 2026-09-05): this file's own UTF-16-code-unit
+    /// line index, built ONCE per parse (`LineIndex::from_text`, over the
+    /// SAME original UTF-8 `text` `Utf8ToUtf16::convert_program` already
+    /// converts spans against) and carried here so every `ProposedRecord`
+    /// producer that owns a span on THIS file -- every one of `entities`/
+    /// `relations` except a synthetic external-package entity, whose `path`
+    /// is `external:{specifier}`, never this file's own path -- can turn its
+    /// `start`/`end` into 1-based `span_start_line`/`span_end_line` without
+    /// re-scanning the file. `reresolve_file`/`reresolve_ambient_relations`
+    /// (T1 incremental re-resolution) never touch this file's own byte
+    /// content, only import/export target-path resolution, so both simply
+    /// carry the ORIGINAL parse's `line_index` forward unchanged rather than
+    /// rebuilding it. n8n-scale cost: ~2M lines workspace-wide, 4 bytes per
+    /// line entry, ~8 MB resident total -- accepted (owner-approved design,
+    /// `~/.claude/plans/happy-noodling-nygaard.md` §A4).
+    pub line_index: LineIndex,
 }
 
 /// One `declare module "specifier" { ... }` / `declare module "specifier";`
@@ -2337,25 +2374,40 @@ fn proposed_records(file: &SyntaxFileResult, start: usize, end: usize) -> Vec<Pr
     let mut records = Vec::with_capacity(end.saturating_sub(start));
     if start < file.entities.len() {
         let entity_end = end.min(file.entities.len());
-        records.extend(
-            file.entities[start..entity_end]
-                .iter()
-                .map(|entity| proposal_entity_record(entity, file.language)),
-        );
+        records.extend(file.entities[start..entity_end].iter().map(|entity| {
+            // A4 (line numbers task): `file.entities` can hold a synthetic
+            // external-package/symbol entity (`external_module_entity`/
+            // `external_symbol_entity`, `path: "external:{specifier}"`,
+            // `start`/`end` both `0`) alongside this file's own real
+            // entities -- `file.line_index` is only valid for `file.path`
+            // itself, so only use it when the entity's own `path` actually
+            // matches (never a guess for the synthetic case).
+            let line_index = (entity.path == file.path).then_some(&file.line_index);
+            proposal_entity_record(entity, file.language, line_index)
+        }));
     }
     let relation_start = start.saturating_sub(file.entities.len());
     let relation_end = end.saturating_sub(file.entities.len());
     if relation_start < file.relations.len() && relation_start < relation_end {
+        // Every `SyntaxRelation` this crate ever builds carries `path: self.
+        // path.clone()` (`push_relation`/`build_import_export_facts`), i.e.
+        // always `file.path` itself -- unlike an entity, a relation never
+        // has a synthetic cross-file `path`, so `file.line_index` always
+        // applies here, unconditionally.
         records.extend(
             file.relations[relation_start..relation_end.min(file.relations.len())]
                 .iter()
-                .map(proposal_relation_record),
+                .map(|relation| proposal_relation_record(relation, Some(&file.line_index))),
         );
     }
     records
 }
 
-fn proposal_entity_record(entity: &SyntaxEntity, language: Language) -> ProposedRecord {
+fn proposal_entity_record(
+    entity: &SyntaxEntity,
+    language: Language,
+    line_index: Option<&LineIndex>,
+) -> ProposedRecord {
     let kind = match entity.universal_kind {
         UniversalKind::Type => "jsts:entity_type",
         UniversalKind::Callable => "jsts:entity_callable",
@@ -2446,6 +2498,10 @@ fn proposal_entity_record(entity: &SyntaxEntity, language: Language) -> Proposed
         serde_json::json!(["core:declaration", "core:definition", "core:member"])
     };
     let facets_list = facets_list_from_value(&facets);
+    let (span_start_line, span_end_line) = match line_index {
+        Some(index) => (index.line_of(entity.start), index.line_of(entity.end)),
+        None => (0, 0),
+    };
     ProposedRecord {
         proposal_record_key: proposal_record_key(&entity.id),
         category: "entity",
@@ -2454,6 +2510,8 @@ fn proposal_entity_record(entity: &SyntaxEntity, language: Language) -> Proposed
         facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(&entity.path, entity.start, entity.end),
+        span_start_line,
+        span_end_line,
         identity_key: entity.id.clone(),
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(&entity.path, entity.start, entity.end),
@@ -2461,7 +2519,10 @@ fn proposal_entity_record(entity: &SyntaxEntity, language: Language) -> Proposed
     }
 }
 
-fn proposal_relation_record(relation: &SyntaxRelation) -> ProposedRecord {
+fn proposal_relation_record(
+    relation: &SyntaxRelation,
+    line_index: Option<&LineIndex>,
+) -> ProposedRecord {
     let mut body = serde_json::Map::new();
     body.insert(
         "source_id".into(),
@@ -2491,6 +2552,10 @@ fn proposal_relation_record(relation: &SyntaxRelation) -> ProposedRecord {
         serde_json::json!(["core:reference_relation"])
     };
     let facets_list = facets_list_from_value(&facets);
+    let (span_start_line, span_end_line) = match line_index {
+        Some(index) => (index.line_of(relation.start), index.line_of(relation.end)),
+        None => (0, 0),
+    };
     ProposedRecord {
         proposal_record_key: proposal_record_key(&relation.id),
         category: "relation",
@@ -2499,6 +2564,8 @@ fn proposal_relation_record(relation: &SyntaxRelation) -> ProposedRecord {
         facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(&relation.path, relation.start, relation.end),
+        span_start_line,
+        span_end_line,
         identity_key: relation.id.clone(),
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(&relation.path, relation.start, relation.end),
@@ -3094,7 +3161,22 @@ fn parse_source(
         export_bindings: collector.export_bindings,
         export_star_specifiers: collector.export_star_specifiers,
         ambient_modules: collector.ambient_modules,
+        line_index: LineIndex::from_text(text),
     })
+}
+
+/// A5b (2026-09-05 references-parity task, bucket 1): what an imported LOCAL
+/// binding names in its OWN source module, per `SyntaxCollector::
+/// imported_locals`'s own doc comment -- `Named` carries the imported name
+/// (`import { a as b }` -> local `b` maps to `Named("a")`; `import { a }`
+/// maps to `Named("a")` too, same name either side), `Default` an
+/// `import local from "spec"`, `Namespace` an `import * as local from
+/// "spec"`.
+#[derive(Debug, Clone)]
+enum ImportedName {
+    Named(String),
+    Default,
+    Namespace,
 }
 
 struct SyntaxCollector {
@@ -3110,6 +3192,19 @@ struct SyntaxCollector {
     /// `declare module "specifier" { ... }` this file declares -- see
     /// `SyntaxFileResult::ambient_modules`'s own doc comment.
     ambient_modules: Vec<AmbientModuleDeclaration>,
+    /// A5b (2026-09-05 references-parity task, bucket 1 --
+    /// `import_binding/export:unresolved`, 1,340 workspace sites): every
+    /// local binding this file's own `import` statements introduce, keyed by
+    /// that LOCAL name -- populated in `visit_import_declaration`, consulted
+    /// in `visit_export_specifier` so a barrel doing `import { X } from
+    /// './x'; export { X };` (a re-export with NO `from` clause on the
+    /// `export` itself) is recognized as a re-export of the IMPORTED `X`,
+    /// not a local declaration named `X` (there is none -- the previous
+    /// behavior treated `local_name: "X"` as a same-file declaration name for
+    /// `resolver::resolve_direct_export` to look up, which never finds one
+    /// for a purely re-exported import, and stayed `Unresolved` forever).
+    /// Never cleared/consulted across files (one `SyntaxCollector` per file).
+    imported_locals: HashMap<String, (String, ImportedName)>,
 }
 
 impl SyntaxCollector {
@@ -3136,6 +3231,7 @@ impl SyntaxCollector {
             export_bindings: Vec::new(),
             export_star_specifiers: Vec::new(),
             ambient_modules: Vec::new(),
+            imported_locals: HashMap::new(),
         }
     }
 
@@ -3703,6 +3799,42 @@ impl<'a> Visit<'a> for SyntaxCollector {
             declaration.span.start,
             declaration.source.span.end,
         );
+        // A5b (2026-09-05 references-parity task, bucket 1): record every
+        // local binding this declaration introduces into `imported_locals`
+        // -- see that field's own doc comment -- so a LATER sourceless
+        // re-export of the same local name (`visit_export_specifier` below)
+        // can recognize it as a re-export of an IMPORTED binding rather than
+        // a local declaration. Covers all three specifier shapes
+        // (`import { a }`/`import { a as b }`, `import def`, `import * as
+        // ns`) uniformly, including `import type`/`import { type a }` --
+        // resolution downstream never distinguishes value vs. type imports
+        // either.
+        if let Some(specifiers) = &declaration.specifiers {
+            let specifier_text = declaration.source.value.as_str().to_owned();
+            for specifier in specifiers {
+                match specifier {
+                    ImportDeclarationSpecifier::ImportSpecifier(named) => {
+                        let imported_name = module_export_name_text(&named.imported);
+                        self.imported_locals.insert(
+                            named.local.name.as_str().to_owned(),
+                            (specifier_text.clone(), ImportedName::Named(imported_name)),
+                        );
+                    }
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(default) => {
+                        self.imported_locals.insert(
+                            default.local.name.as_str().to_owned(),
+                            (specifier_text.clone(), ImportedName::Default),
+                        );
+                    }
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace) => {
+                        self.imported_locals.insert(
+                            namespace.local.name.as_str().to_owned(),
+                            (specifier_text.clone(), ImportedName::Namespace),
+                        );
+                    }
+                }
+            }
+        }
         walk_import_declaration(self, declaration);
     }
 
@@ -3751,15 +3883,73 @@ impl<'a> Visit<'a> for SyntaxCollector {
     /// belongs to a `from`-bearing declaration is already handled in
     /// `visit_export_named_declaration` and skipped here to avoid a
     /// duplicate/incorrect (non-re-export) binding.
+    ///
+    /// A5b (2026-09-05 references-parity task, bucket 1): when `local` is
+    /// itself one of THIS file's own `imported_locals` (a barrel doing
+    /// `import { X } from './x'; export { X };` / `export type { T };`,
+    /// with no `from` on the `export` itself), this is genuinely a
+    /// RE-EXPORT of the imported binding, not a local declaration named
+    /// `local` -- there usually is none (`resolver::resolve_direct_export`
+    /// would search this file's own `entities` for a same-named
+    /// declaration and never find one, staying `Unresolved` forever; see
+    /// `docs/evidence/...` for the 1,340-site regression this closes).
+    /// Emitted as a re-export binding carrying the ORIGINAL import's own
+    /// specifier text (`source_specifier`) so the SAME generic
+    /// `source_specifier -> source_target_path` resolution pass every other
+    /// re-export binding goes through (`parse_source`, this file's own
+    /// caller) resolves it identically, and `resolver::resolve_named_export`
+    /// then chases it exactly like an ordinary `export { a } from "./x"` --
+    /// including transitively, through further re-export hops. The three
+    /// `ImportedName` shapes each map to the form `resolve_named_export`
+    /// already knows how to chase: `Named(orig)` -> an ordinary re-export of
+    /// `orig`; `Namespace` -> the `NAMESPACE_REEXPORT_LOCAL_NAME` sentinel
+    /// (same shape `export * as X from "spec"` uses, see that constant's own
+    /// doc comment); `Default` -> `local_name: "default"`, the SAME local
+    /// name a with-source `export { default as X } from "./y"` gives this
+    /// exact field (oxc parses that form's own `local` as the literal
+    /// `IdentifierName` text `"default"` -- verified against `visit_export_
+    /// named_declaration`'s own with-source loop just above, which stores
+    /// `local.name.as_str()` verbatim with no special-casing), so both forms
+    /// resolve through `resolve_direct_export`'s existing `name == "default"`
+    /// lookup (itself populated by `visit_export_default_declaration`)
+    /// without any further change there.
     fn visit_export_specifier(&mut self, specifier: &ExportSpecifier<'a>) {
         if let ModuleExportName::IdentifierReference(local) = &specifier.local {
             let exported_name = module_export_name_text(&specifier.exported);
-            self.export_bindings.push(SyntaxExportBinding {
-                exported_name,
-                local_name: local.name.as_str().to_owned(),
-                source_specifier: None,
-                source_target_path: None,
-            });
+            match self.imported_locals.get(local.name.as_str()) {
+                Some((source_specifier, ImportedName::Named(orig))) => {
+                    self.export_bindings.push(SyntaxExportBinding {
+                        exported_name,
+                        local_name: orig.clone(),
+                        source_specifier: Some(source_specifier.clone()),
+                        source_target_path: None,
+                    });
+                }
+                Some((source_specifier, ImportedName::Namespace)) => {
+                    self.export_bindings.push(SyntaxExportBinding {
+                        exported_name,
+                        local_name: NAMESPACE_REEXPORT_LOCAL_NAME.to_owned(),
+                        source_specifier: Some(source_specifier.clone()),
+                        source_target_path: None,
+                    });
+                }
+                Some((source_specifier, ImportedName::Default)) => {
+                    self.export_bindings.push(SyntaxExportBinding {
+                        exported_name,
+                        local_name: "default".to_owned(),
+                        source_specifier: Some(source_specifier.clone()),
+                        source_target_path: None,
+                    });
+                }
+                None => {
+                    self.export_bindings.push(SyntaxExportBinding {
+                        exported_name,
+                        local_name: local.name.as_str().to_owned(),
+                        source_specifier: None,
+                        source_target_path: None,
+                    });
+                }
+            }
         }
         walk_export_specifier(self, specifier);
     }
@@ -4090,6 +4280,11 @@ fn reresolve_file(
         export_bindings,
         export_star_specifiers,
         ambient_modules: file.ambient_modules.clone(),
+        // A4: `file`'s own byte content is untouched here (only import/
+        // export target-path resolution changed), so its line index is
+        // still valid unchanged -- see `SyntaxFileResult::line_index`'s own
+        // doc comment.
+        line_index: file.line_index.clone(),
     })
 }
 
@@ -4151,6 +4346,9 @@ fn reresolve_ambient_relations(
         export_bindings: file.export_bindings.clone(),
         export_star_specifiers: file.export_star_specifiers.clone(),
         ambient_modules: file.ambient_modules.clone(),
+        // A4: same reasoning as `reresolve_file` above -- this rebuild never
+        // touches `file`'s own byte content either.
+        line_index: file.line_index.clone(),
     })
 }
 
@@ -4688,6 +4886,48 @@ mod tests {
                 .filter(|record| record.category == "entity")
                 .count(),
             1
+        );
+    }
+
+    // -- A4 (line numbers task, 2026-09-05) --------------------------------
+
+    #[test]
+    fn entity_record_carries_the_real_editor_line_past_a_multibyte_comment() {
+        // Line 1 is a comment containing "café" -- 5 UTF-8 bytes ('é' is a
+        // 2-byte UTF-8 sequence) but only 4 UTF-16 code units -- so a byte-
+        // counting (rather than UTF-16-code-unit-counting) line index would
+        // still land on the right line here (multibyte content stays BEFORE
+        // the newline either way), but a naive per-BYTE offset->line lookup
+        // fed a UTF-16 offset (the bug this whole task exists to avoid)
+        // would drift onto the wrong line for any file where this shows up
+        // more than once -- this fixture at least exercises the conversion
+        // path end to end. Line 2 is empty. The function declaration is on
+        // line 3.
+        let source_text = "// café\n\nexport function greet(): void {}\n";
+        let mut state = SyntaxWorkerState::default();
+        let files = vec![source("a.ts", source_text)];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let entity = records
+            .iter()
+            .find(|record| record.kind == "jsts:entity_callable" && record.body["name"] == "greet")
+            .expect("expected the `greet` function entity");
+        assert_eq!(
+            entity.span_start_line, 3,
+            "entity record: {entity:?}, source: {source_text:?}"
+        );
+        assert_eq!(
+            entity.span_end_line, 3,
+            "entity record: {entity:?}, source: {source_text:?}"
         );
     }
 
@@ -6476,5 +6716,147 @@ declare module 'markdown-it-task-lists' {
         );
         assert_eq!(collector.export_bindings.len(), 1);
         assert_eq!(collector.export_bindings[0].exported_name, "eval-utils");
+    }
+
+    // A5b (2026-09-05 references-parity task, bucket 1 --
+    // `import_binding/export:unresolved`): a barrel doing `import { X } from
+    // './x'; export { X };` (no `from` on the `export` itself) must be
+    // recognized as a re-export of the IMPORTED `X`, not a same-file
+    // declaration lookup -- see `SyntaxCollector::imported_locals`'s own doc
+    // comment.
+
+    #[test]
+    fn sourceless_reexport_of_a_named_import_binds_through_the_import_specifier() {
+        let collector = collect("index.ts", "import { A } from './a';\nexport { A };\n");
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "A");
+        assert_eq!(binding.local_name, "A");
+        assert_eq!(binding.source_specifier.as_deref(), Some("./a"));
+        // Filled in by `parse_source`'s own generic per-binding resolution
+        // pass, not here.
+        assert_eq!(binding.source_target_path, None);
+    }
+
+    #[test]
+    fn sourceless_reexport_of_a_renamed_named_import_tracks_the_original_name() {
+        // `import { B as C } from './b'` binds local `C` to `B` in './b';
+        // `export { C as D }` must re-export `./b`'s own `B`, under the
+        // NEW public name `D` -- never `C` (a local binding that does not
+        // exist in `./b`) and never `B` as the exported name (the barrel's
+        // own consumers see `D`).
+        let collector = collect(
+            "index.ts",
+            "import { B as C } from './b';\nexport { C as D };\n",
+        );
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "D");
+        assert_eq!(binding.local_name, "B");
+        assert_eq!(binding.source_specifier.as_deref(), Some("./b"));
+    }
+
+    #[test]
+    fn sourceless_reexport_of_a_type_only_named_import() {
+        // `export type { T }` of a `type`-only import -- value/type-only
+        // status is never distinguished by this mechanism (mirrors every
+        // other `SyntaxExportBinding` producer here).
+        let collector = collect(
+            "index.ts",
+            "import type { T } from './t';\nexport type { T };\n",
+        );
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "T");
+        assert_eq!(binding.local_name, "T");
+        assert_eq!(binding.source_specifier.as_deref(), Some("./t"));
+    }
+
+    #[test]
+    fn sourceless_reexport_of_a_namespace_import_synthesizes_a_namespace_binding() {
+        // `import * as ns from './n'; export { ns };` re-exports the WHOLE
+        // namespace under `ns` -- same `NAMESPACE_REEXPORT_LOCAL_NAME`
+        // sentinel shape `export * as X from "spec"` already uses (see that
+        // constant's own doc comment), reached through the sourceless form
+        // this time.
+        let collector = collect("index.ts", "import * as ns from './n';\nexport { ns };\n");
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "ns");
+        assert_eq!(binding.local_name, NAMESPACE_REEXPORT_LOCAL_NAME);
+        assert_eq!(binding.source_specifier.as_deref(), Some("./n"));
+    }
+
+    #[test]
+    fn sourceless_reexport_of_a_default_import_binds_to_the_default_local_name() {
+        // `import Def from './d'; export { Def };` -- `local_name:
+        // "default"`, the SAME local name a with-source `export { default
+        // as X } from "./d"` already gives this field (see `visit_export_
+        // specifier`'s own doc comment for why this is deliberate, not a
+        // coincidence).
+        let collector = collect("index.ts", "import Def from './d';\nexport { Def };\n");
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "Def");
+        assert_eq!(binding.local_name, "default");
+        assert_eq!(binding.source_specifier.as_deref(), Some("./d"));
+    }
+
+    #[test]
+    fn sourceless_reexport_of_a_non_imported_local_is_unchanged() {
+        // Negative case: `local` is NOT one of this file's own
+        // `imported_locals` (here, a genuine same-file function
+        // declaration) -- old behavior (a same-file declaration lookup,
+        // `source_specifier: None`) must be completely unaffected.
+        let collector = collect(
+            "index.ts",
+            "function locallyDeclared() {}\nexport { locallyDeclared };\n",
+        );
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "locallyDeclared");
+        assert_eq!(binding.local_name, "locallyDeclared");
+        assert_eq!(binding.source_specifier, None);
+    }
+
+    #[test]
+    fn sourceless_reexport_of_a_name_with_neither_an_import_nor_a_declaration_stays_unresolved() {
+        // Negative case, end to end: `local` is neither imported nor
+        // declared anywhere in this file -- the binding shape is unchanged
+        // (a same-file declaration lookup, exactly like the non-imported
+        // case above), and `resolver::resolve_direct_export` must stay
+        // `Unresolved` for it -- never guessed.
+        let source_text = "export { neverDeclared };\n";
+        let collector = collect("index.ts", source_text);
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "neverDeclared");
+        assert_eq!(binding.local_name, "neverDeclared");
+        assert_eq!(binding.source_specifier, None);
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "index.ts".to_owned(),
+            SyntaxFileResult {
+                path: "index.ts".to_owned(),
+                content_digest: "sha256:0".to_owned(),
+                language: Language::Typescript,
+                script_kind: ScriptKind::Ts,
+                byte_length: 0,
+                parsed: true,
+                direct_imports: Vec::new(),
+                entities: collector.entities.clone(),
+                relations: Vec::new(),
+                diagnostics: Vec::new(),
+                export_bindings: collector.export_bindings.clone(),
+                export_star_specifiers: Vec::new(),
+                ambient_modules: Vec::new(),
+                line_index: LineIndex::from_text(source_text),
+            },
+        );
+        assert_eq!(
+            resolver::resolve_named_export(&files, "index.ts", "neverDeclared"),
+            resolver::ExportResolution::Unresolved
+        );
     }
 }

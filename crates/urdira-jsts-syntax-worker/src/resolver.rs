@@ -46,7 +46,7 @@
 //! out of scope here too -- see the design doc's own E2b note.
 
 use crate::{
-    AmbientModuleDeclaration, AmbientModuleMember, EntityKind, SyntaxExportBinding,
+    AmbientModuleDeclaration, AmbientModuleMember, EntityKind, SyntaxEntity, SyntaxExportBinding,
     SyntaxFileResult,
 };
 use serde_json::Value;
@@ -1154,17 +1154,71 @@ fn resolve_via_export_star(
     }
 }
 
+/// A5b (2026-09-05 references-parity task, overload sub-bucket) measured a
+/// candidate widening here -- NOT shipped, see this doc comment's tail for
+/// why -- against the v3 oracle (n8n corpus): TS function overloads
+/// (`function f(...): T; function f(...): T; function f(...) { ... }`) each
+/// get their OWN `SyntaxEntity` (one per `visit_function` call, since every
+/// overload SIGNATURE, a bodyless `TSDeclareFunction`, and the trailing
+/// IMPLEMENTATION are separate AST nodes), while `export_bindings`' own
+/// post-collection `sort()`/`dedup()` (lib.rs's `parse_source`) collapses the
+/// identical `export function f` binding they each independently push down
+/// to ONE -- so a genuinely overloaded exported function reaches here as a
+/// SINGLE `binding` against MULTIPLE same-named entities, and this function
+/// degrades that to `Ambiguous` today (the `_ => Ambiguous` arm below).
+/// Sampled every `import_binding/export:ambiguous` site (600
+/// reservoir-sampled, `--samples 600` on `scripts/v4-references-parity-
+/// diff.mjs`) down to its unique `(declaring file, name)` cluster (16 unique
+/// clusters) and checked, for the 11 clusters that actually had >1 same-file
+/// same-name `EntityKind::Function` entity (`createFilesystem`, `Service`,
+/// `mockSpawn`, `isCanvasGroupNode`, `validateFieldType`,
+/// `sanitizeCredentials`, `clean`, `attempt`, `randomInt`, `randomString`,
+/// `continueInstanceAiTraceContext` -- 2-3 overloads each), which declaration
+/// v3's checker resolved a plain (non-call) reference to: the FIRST
+/// declaration in source order (lowest `start`) -- 11/11, unanimous, NEVER
+/// the implementation (highest `start`, the intuitive guess this task
+/// started from).
+///
+/// NOT implemented despite the unanimous sample: `resolve_direct_export` is
+/// the SAME function `resolve_named_export` uses for every caller, and in
+/// `semantic_sites.rs` its result is cached ONCE per imported symbol
+/// (`HybridResolutionContext::import_bindings`, keyed by `SymbolId`) and
+/// consumed identically by a plain identifier reference
+/// (`resolve_identifier_reference`) AND a call's callee
+/// (`resolve_identifier_to_kind`, `resolve_call_target`'s own doc comment
+/// explicitly documents today's `resolve_direct_export`-is-`Ambiguous`
+/// behavior as why an overloaded callee stays `REASON_CALL_TARGET_UNCERTAIN`
+/// rather than a guessed target). Prototyping the first-declaration rule
+/// here made `semantic_sites::tests::ambiguous_multiple_declarations_in_
+/// target_stays_pending` (a PLAIN REFERENCE assertion, same shape as this
+/// task's own oracle sample) and `semantic_sites::tests::cross_file_call_
+/// target_ambiguous_in_the_target_module_stays_pending` both fail: the call
+/// site now resolved to a specific overload signature chosen purely by
+/// SOURCE ORDER, never validated against v3's ACTUAL call-site overload
+/// resolution (which picks a signature by ARGUMENT-TYPE matching, not
+/// declaration order, and could legitimately differ per call site) -- a
+/// real risk of introducing new WRONG `core:call` targets this task never
+/// measured. This producer has no way to give the reference and call
+/// consumers different answers without threading a caller-intent flag
+/// through `semantic_sites.rs`'s own cache population
+/// (`resolve_named_binding_via_specifier`) -- out of this task's file scope
+/// (semantic_sites.rs production code) and its own two pre-existing tests
+/// above are frozen (this task's scope: append-only there). Left
+/// unimplemented per this task's own explicit rule for a non-unanimous
+/// finding -- unanimous for the PLAIN-REFERENCE shape in isolation, but not
+/// safely implementable without also (unvalidated) changing CALL-target
+/// resolution, so treated as "do not implement, document" rather than
+/// shipped.
 fn resolve_direct_export(
     file: &SyntaxFileResult,
     direct: &[&SyntaxExportBinding],
 ) -> ExportResolution {
     let mut resolved_ids: BTreeSet<String> = BTreeSet::new();
     for binding in direct {
-        let matches: Vec<&str> = file
+        let matches: Vec<&SyntaxEntity> = file
             .entities
             .iter()
             .filter(|entity| entity.kind != EntityKind::Module && entity.name == binding.local_name)
-            .map(|entity| entity.id.as_str())
             .collect();
         match matches.as_slice() {
             // Declared as exported but no (or an ambiguous) matching
@@ -1173,7 +1227,7 @@ fn resolve_direct_export(
             // rather than guess.
             [] => return ExportResolution::Unresolved,
             [single] => {
-                resolved_ids.insert((*single).to_owned());
+                resolved_ids.insert(single.id.clone());
             }
             _ => return ExportResolution::Ambiguous,
         }
@@ -1943,6 +1997,7 @@ mod tests {
             export_bindings,
             export_star_specifiers,
             ambient_modules: Vec::new(),
+            line_index: crate::LineIndex::from_text(""),
         }
     }
 
@@ -2833,6 +2888,90 @@ mod tests {
         assert_eq!(
             index.resolve_export("my-lib", "thing"),
             AmbientResolution::Resolved("jsts:function:shim.d.ts:20:thing".to_owned())
+        );
+    }
+
+    // A5b (2026-09-05 references-parity task), bucket 1: barrel re-export of
+    // an imported binding (`import { X } from './x'; export { X };`, no
+    // `from` on the `export` itself) -- see `resolve_direct_export`'s own
+    // doc comment for why the OTHER sub-bucket this task measured (function
+    // overloads) was deliberately left unimplemented.
+
+    #[test]
+    fn resolve_named_export_follows_barrel_reexport_of_an_imported_binding() {
+        // A5b bucket 1: what `SyntaxCollector::visit_export_specifier` now
+        // emits for `import { Widget } from './impl'; export { Widget };`
+        // in a barrel -- a re-export binding (`source_specifier` set, NOT a
+        // local declaration lookup), already resolved to `source_target_
+        // path` here exactly as `parse_source`'s own generic per-binding
+        // pass would leave it. `resolve_named_export` must chase it exactly
+        // like an ordinary with-source `export { a } from "./x"` re-export
+        // (`resolve_named_export_follows_one_hop_reexport`'s own sibling
+        // test), landing on the REAL declaration in the target file, not
+        // `Unresolved` (the pre-fix behavior: the old sourceless-specifier
+        // path treated `local_name: "Widget"` as a same-file declaration
+        // name, and a barrel re-exporting an import never has one).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "src/impl.ts".to_owned(),
+            file(
+                "src/impl.ts",
+                vec![entity(EntityKind::Class, "src/impl.ts", 10, "Widget")],
+                vec![binding("Widget", "Widget", None, None)],
+            ),
+        );
+        files.insert(
+            "src/index.ts".to_owned(),
+            file(
+                "src/index.ts",
+                vec![],
+                vec![binding(
+                    "Widget",
+                    "Widget",
+                    Some("./impl"),
+                    Some("src/impl.ts"),
+                )],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "src/index.ts", "Widget"),
+            ExportResolution::Resolved("jsts:class:src/impl.ts:10:Widget".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_named_export_barrel_reexport_of_a_default_import() {
+        // `import Def from './impl'; export { Def };` -> A5b's
+        // `ImportedName::Default` arm gives this binding `local_name:
+        // "default"`, the SAME local name a with-source `export { default as
+        // X } from "./impl"` already produces (see `visit_export_specifier`'s
+        // own doc comment) -- both must resolve through the SAME `name ==
+        // "default"` lookup `visit_export_default_declaration` populates.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "src/impl.ts".to_owned(),
+            file(
+                "src/impl.ts",
+                vec![entity(EntityKind::Function, "src/impl.ts", 10, "Widget")],
+                vec![binding("default", "Widget", None, None)],
+            ),
+        );
+        files.insert(
+            "src/index.ts".to_owned(),
+            file(
+                "src/index.ts",
+                vec![],
+                vec![binding(
+                    "Def",
+                    "default",
+                    Some("./impl"),
+                    Some("src/impl.ts"),
+                )],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "src/index.ts", "Def"),
+            ExportResolution::Resolved("jsts:function:src/impl.ts:10:Widget".to_owned())
         );
     }
 }

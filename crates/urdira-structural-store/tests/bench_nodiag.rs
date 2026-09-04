@@ -111,6 +111,8 @@ fn load_spike_cache(path: &Path) -> io::Result<(Vec<RecordRow>, Dictionaries)> {
         artifacts: artifacts.into_iter().map(|a| (a, String::new())).collect(),
         facet_names: Vec::new(),
         subject_text: Vec::new(),
+        artifact_paths: Vec::new(),
+        entity_kinds: Vec::new(),
     };
 
     let mut rows = Vec::with_capacity(row_count);

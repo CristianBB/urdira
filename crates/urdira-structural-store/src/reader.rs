@@ -452,6 +452,20 @@ impl RecordView {
         let v = u16le(self.meta(), meta::RELATION_KIND_ID);
         (v != crate::row::NONE_U16).then_some(v)
     }
+    /// A3a-fix: ordinal into `dicts.entity_kinds` (the row's own FINE
+    /// per-declaration entity-kind word), `None` unless `identity_layout()
+    /// == IDENTITY_LAYOUT_ENTITY`.
+    pub fn entity_kind_ordinal(&self) -> Option<u8> {
+        let v = self.meta()[meta::ENTITY_KIND];
+        (v != meta::ENTITY_KIND_NONE).then_some(v)
+    }
+    /// A3a-fix: this row's raw `IDENTITY_LAYOUT_*` tag (`crate::layout::
+    /// meta`) -- exposed read-only for tests/tooling that want to inspect
+    /// storage layout distribution without decoding a full identity key
+    /// (e.g. counting rows by tag over a real corpus).
+    pub fn identity_layout(&self) -> u8 {
+        self.meta()[meta::IDENTITY_LAYOUT]
+    }
     pub fn body(&self) -> &[u8] {
         let off = u64le(self.meta(), meta::BODY_OFF) as usize;
         let len = u32le(self.meta(), meta::BODY_LEN) as usize;
@@ -473,6 +487,8 @@ impl RecordView {
             self.reconstruct_entity_identity_key()
         } else if layout == meta::IDENTITY_LAYOUT_RELATION {
             self.reconstruct_relation_identity_key()
+        } else if layout == meta::IDENTITY_LAYOUT_RELATION_NO_SPAN {
+            self.reconstruct_relation_no_span_identity_key()
         } else {
             None
         };
@@ -489,9 +505,11 @@ impl RecordView {
         Cow::Borrowed(&self.segment.ident[HEADER_LEN + off..HEADER_LEN + off + len])
     }
 
-    /// `jsts:{kind}:{path}:{start}:{name}`, rebuilt from `kind_id` ->
-    /// `dicts.kinds`, `owner_artifact` -> `dicts.artifacts` (stripping the
-    /// fixed `"artifact:"` prefix), `span_start_byte`, and `name_id` ->
+    /// `jsts:{kind}:{path}:{start}:{name}`, rebuilt from `ENTITY_KIND` ->
+    /// `dicts.entity_kinds` (the FINE per-declaration word -- NOT `kind_id`
+    /// -> `dicts.kinds`, which only ever carries the COARSE `UniversalKind`
+    /// -bucketed word, see `identity_codec`'s module doc), `owner_artifact`
+    /// -> `dicts.artifact_paths`, `span_start_byte`, and `name_id` ->
     /// `dicts.names`. `None` on any missing/out-of-range field -- this
     /// should never actually happen for a row this crate itself tagged
     /// `IDENTITY_LAYOUT_ENTITY` at write time (the writer only tags a row
@@ -501,9 +519,9 @@ impl RecordView {
     /// that in tests.
     fn reconstruct_entity_identity_key(&self) -> Option<Vec<u8>> {
         let dicts = &self.store.dicts;
-        let kind = dicts.kinds.get(self.kind_id() as usize)?;
-        let (artifact_text, _version) = dicts.artifacts.get(self.owner_artifact() as usize)?;
-        let path = artifact_text.strip_prefix("artifact:")?;
+        let entity_kind_ord = self.entity_kind_ordinal()?;
+        let kind = dicts.entity_kinds.get(entity_kind_ord as usize)?;
+        let path = dicts.artifact_paths.get(self.owner_artifact() as usize)?;
         let name_id = self.name_id()?;
         let name = dicts.names.get(name_id as usize)?;
         Some(identity_codec::reconstruct_entity(
@@ -516,19 +534,20 @@ impl RecordView {
 
     /// `jsts:{rel}:{path}:{start}:{end}:{source_identity_key}:
     /// {target_identity_key}` -- `{rel}` from `kind_id` -> `dicts.kinds`
-    /// stripped of the fixed `"jsts:relation_"` prefix; the two endpoint
-    /// identity keys resolved one level deep: `source_subject`/
-    /// `target_subject` -> `dicts.subjects[ord]` (that entity's own
-    /// `record_id`) -> `store.get(record_id)?.identity_key()` (which may
-    /// itself be `RAW` or `ENTITY`-tagged -- either way, this is exactly
-    /// that entity's own identity key bytes). Same never-panic contract as
-    /// [`Self::reconstruct_entity_identity_key`].
+    /// stripped of the fixed `"jsts:relation_"` prefix; `{path}` from
+    /// `owner_artifact` -> `dicts.artifact_paths` (A3a-fix: NOT `dicts.
+    /// artifacts`, which carries the artifact digest pair, not a real
+    /// path); the two endpoint identity keys resolved one level deep:
+    /// `source_subject`/`target_subject` -> `dicts.subjects[ord]` (that
+    /// entity's own `record_id`) -> `store.get(record_id)?.identity_key()`
+    /// (which may itself be `RAW` or `ENTITY`-tagged -- either way, this is
+    /// exactly that entity's own identity key bytes). Same never-panic
+    /// contract as [`Self::reconstruct_entity_identity_key`].
     fn reconstruct_relation_identity_key(&self) -> Option<Vec<u8>> {
         let dicts = &self.store.dicts;
         let kind_text = dicts.kinds.get(self.kind_id() as usize)?;
         let rel = kind_text.strip_prefix("jsts:relation_")?;
-        let (artifact_text, _version) = dicts.artifacts.get(self.owner_artifact() as usize)?;
-        let path = artifact_text.strip_prefix("artifact:")?;
+        let path = dicts.artifact_paths.get(self.owner_artifact() as usize)?;
         let source_ord = self.source_subject()?;
         let target_ord = self.target_subject()?;
         let source_record_id = dicts.subjects.get(source_ord as usize)?;
@@ -542,6 +561,29 @@ impl RecordView {
             path,
             self.span_start_byte(),
             self.span_end_byte(),
+            &source_key,
+            &target_key,
+        ))
+    }
+
+    /// A3a-fix: `jsts:{rel}:{source_identity_key}:{target_identity_key}` --
+    /// no path or span at all (`jsts:contains:*` in particular). Same
+    /// endpoint-resolution discipline as [`Self::
+    /// reconstruct_relation_identity_key`], minus the path/span segments.
+    fn reconstruct_relation_no_span_identity_key(&self) -> Option<Vec<u8>> {
+        let dicts = &self.store.dicts;
+        let kind_text = dicts.kinds.get(self.kind_id() as usize)?;
+        let rel = kind_text.strip_prefix("jsts:relation_")?;
+        let source_ord = self.source_subject()?;
+        let target_ord = self.target_subject()?;
+        let source_record_id = dicts.subjects.get(source_ord as usize)?;
+        let target_record_id = dicts.subjects.get(target_ord as usize)?;
+        let source_view = self.store.get(source_record_id)?;
+        let target_view = self.store.get(target_record_id)?;
+        let source_key = source_view.identity_key();
+        let target_key = target_view.identity_key();
+        Some(identity_codec::reconstruct_relation_no_span(
+            rel,
             &source_key,
             &target_key,
         ))
@@ -908,12 +950,43 @@ impl StoreInner {
         // base's keys/meta/digests plus the newest segment's keys, if
         // different. Full verification is `StoreReader::verify_all`.
         if let Some(base) = segments.first() {
-            verify_xxh3(&base.keys, "base/records.keys")?;
-            verify_xxh3(&base.meta, "base/records.meta")?;
-            verify_xxh3(&base.digests, "base/records.digests")?;
+            // A2: keys/meta/digests are now hashed per-nibble-partition
+            // (`hash_of_partition_hashes`), same formula for a base
+            // segment (`write_base`/`write_base_partitioned`) and a delta
+            // container (`build_delta_sections`'s `encode_framed_
+            // partitioned`) alike -- `nibble_row_boundaries` re-derives the
+            // boundaries straight from `keys`' own (sorted-by-record_id)
+            // bytes.
+            let (_, base_keys_data) = header_and_data(&base.keys)?;
+            let base_row_boundaries = nibble_row_boundaries(base_keys_data);
+            verify_xxh3_partitioned_stride(
+                &base.keys,
+                &base_row_boundaries,
+                KEYS_STRIDE,
+                "base/records.keys",
+            )?;
+            verify_xxh3_partitioned_stride(
+                &base.meta,
+                &base_row_boundaries,
+                META_STRIDE,
+                "base/records.meta",
+            )?;
+            verify_xxh3_partitioned_stride(
+                &base.digests,
+                &base_row_boundaries,
+                DIGESTS_STRIDE,
+                "base/records.digests",
+            )?;
         }
         if let Some(newest) = segments.last() {
-            verify_xxh3(&newest.keys, "newest/records.keys")?;
+            let (_, newest_keys_data) = header_and_data(&newest.keys)?;
+            let newest_row_boundaries = nibble_row_boundaries(newest_keys_data);
+            verify_xxh3_partitioned_stride(
+                &newest.keys,
+                &newest_row_boundaries,
+                KEYS_STRIDE,
+                "newest/records.keys",
+            )?;
         }
 
         segments.reverse(); // newest delta first, base last
@@ -1562,12 +1635,23 @@ impl StoreReader {
     pub fn verify_all(&self) -> Result<()> {
         let inner = self.snapshot();
         for seg in &inner.segments {
+            // A2: the 5 hot `records.*` sections are hashed per-nibble-
+            // partition (`hash_of_partition_hashes`) by every writer
+            // (`write_base`/`write_base_partitioned`/`build_delta_
+            // sections`) -- verified together via `verify_records_hot_
+            // partitioned`, which re-derives the nibble boundaries from
+            // `keys`/`meta` themselves. The other 9 mandatory sections are
+            // never partitioned, so they keep the plain whole-data
+            // `verify_xxh3`.
+            verify_records_hot_partitioned(
+                &seg.keys,
+                &seg.meta,
+                &seg.digests,
+                &seg.body,
+                &seg.ident,
+                "records",
+            )?;
             for (name, section) in [
-                ("records.keys", &seg.keys),
-                ("records.meta", &seg.meta),
-                ("records.digests", &seg.digests),
-                ("records.body", &seg.body),
-                ("records.ident", &seg.ident),
                 ("records.by_owner", &seg.by_owner),
                 ("records.by_name", &seg.by_name),
                 ("records.by_kind", &seg.by_kind),

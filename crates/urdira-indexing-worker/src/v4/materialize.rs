@@ -45,14 +45,24 @@
 //!   where identity churn across generations first matters. An
 //!   unresolved endpoint (external module, or a target this workspace
 //!   never emitted a record for) leaves that side `None`.
-//! - `span_start_line`/`span_end_line` are NOT computed (always 0): no
-//!   producer in this pipeline emits line numbers (`ProposedRecord.
-//!   source_span` only ever carries `{path, start, end}` byte offsets --
-//!   confirmed by reading every `source_span` construction site in
-//!   `urdira-jsts-syntax-worker`), and deriving them would require a
-//!   byte/UTF-16-offset-aware scan of the owner's source text per record;
-//!   deferred as a documented gap (span identity/determinism is
-//!   unaffected: `structural_record_digest` hashes only `record.body`).
+//! - `span_start_line`/`span_end_line` (A4, line numbers task, 2026-09-05):
+//!   copied straight from `ProposedRecord::span_start_line`/`span_end_line`
+//!   (`urdira-jsts-syntax-worker`'s producers fill these from a per-file
+//!   `LineIndex` built once per parse -- see that crate's `line_index`
+//!   module), with `0` ("no line known", e.g. a synthetic external-package
+//!   entity's span) mapped to `NONE_U32` here so the N-API layer emits
+//!   `None`/`null` rather than the misleading literal `0`. `StructuralKernelRow`
+//!   (the kernel-canonicalized intermediate this module builds `RecordRow`s
+//!   from) deliberately carries NEITHER field -- it is a pure function of
+//!   `record.body`/`record.source_span`/identity, and a line number must
+//!   never perturb `record_digest` -- so `OwnerKernelRows::span_lines` (this
+//!   module) carries them PARALLEL to `rows`, indexed the same way
+//!   `kind_universal_category`/`relation_endpoints`/`proposal_keys` already
+//!   are, extracted straight from the original `ProposedRecord`s in
+//!   `canonicalize_owner` before they are consumed. Never affects
+//!   `records_root` (span identity/determinism is unaffected: `structural_
+//!   record_digest` hashes only `record.body`, never a span or a line
+//!   number).
 
 use super::ScanError;
 use super::analyze::OwnerFacts;
@@ -71,7 +81,7 @@ use urdira_native_core::{
     structural_kernel_rows_typed,
 };
 use urdira_structural_store::row::{
-    CATEGORY_DIAGNOSTIC, CATEGORY_ENTITY, CATEGORY_RELATION, NONE_U16,
+    CATEGORY_DIAGNOSTIC, CATEGORY_ENTITY, CATEGORY_RELATION, NONE_U16, NONE_U32,
 };
 use urdira_structural_store::{
     DependencyRow, Dictionaries, N_NIBBLES, PENDING_SITE_KIND_CALL, PENDING_SITE_KIND_IMPLEMENTS,
@@ -464,6 +474,12 @@ struct OwnerKernelRows {
     /// still exist (not yet dropped) at that point but their heap payloads
     /// move rather than copy.
     rows: Vec<StructuralKernelRow>,
+    /// A4 (line numbers task): `(span_start_line, span_end_line)` per
+    /// record, straight from `ProposedRecord` (see this module's own doc
+    /// comment for why these live here rather than on `StructuralKernelRow`
+    /// itself) -- index-aligned with `rows`/`kind_universal_category`/
+    /// `relation_endpoints`/`proposal_keys`.
+    span_lines: Vec<(u32, u32)>,
     proposal_keys: Vec<String>,
     dependencies: Vec<ProposedRecordDependency>,
     /// A2 (pending.sites migration): this owner's own no-target call/
@@ -527,6 +543,12 @@ fn canonicalize_owner(owner: OwnerFacts) -> Result<OwnerKernelRows, ScanError> {
     let mut kind_universal_category = Vec::with_capacity(records.len());
     let mut relation_endpoints = Vec::with_capacity(records.len());
     let mut proposal_keys = Vec::with_capacity(records.len());
+    // A4 (line numbers task): captured here, alongside the other per-record
+    // fields this same loop already pulls off `record` before it is
+    // consumed by `to_structural_record_ref` -- see `OwnerKernelRows::
+    // span_lines`'s own doc comment for why these never reach
+    // `StructuralKernelRow`.
+    let mut span_lines: Vec<(u32, u32)> = Vec::with_capacity(records.len());
     // P2-2g item 3: borrows straight into `records` (still owned by this
     // function's local `records`, destructured from `owner` above) instead
     // of cloning every field into an owned `StructuralKernelRecord` per
@@ -556,6 +578,7 @@ fn canonicalize_owner(owner: OwnerFacts) -> Result<OwnerKernelRows, ScanError> {
                 (category == CATEGORY_RELATION).then(|| relation_endpoints_from_body(&record.body)),
             );
             typed_facets.push(record.facets_list.as_slice());
+            span_lines.push((record.span_start_line, record.span_end_line));
             to_structural_record_ref(record)
         })
         .collect();
@@ -572,6 +595,7 @@ fn canonicalize_owner(owner: OwnerFacts) -> Result<OwnerKernelRows, ScanError> {
         kind_universal_category,
         relation_endpoints,
         rows,
+        span_lines,
         proposal_keys,
         dependencies,
         pending_site_rows,
@@ -855,6 +879,28 @@ pub fn materialize_cold_partitioned(
         .collect();
     artifact_values.par_sort_unstable();
     artifact_values.dedup();
+    // A3a-fix: `dicts.artifact_paths` (`urdira-structural-store`) must
+    // carry the REAL owner path aligned 1:1 by ordinal with `artifact_
+    // values`/`artifacts` below -- the ONLY thing that lets the store's
+    // identity-key reconstruction recover a `{path}` segment at all (the
+    // `artifact_id` itself is a content digest, `urdira-source-frontier::
+    // ids::digest_logical_value`, with no path embedded in it). Built here,
+    // before `owner_rows` is consumed by the parallel assembly below,
+    // keyed by `owner_artifact_id` (the id half of the interned pair) since
+    // that alone already uniquely names one real path in this scan.
+    let artifact_path_by_id: FxHashMap<&str, &str> = owner_rows
+        .iter()
+        .map(|owner| (owner.owner_artifact_id.as_str(), owner.owner_path.as_str()))
+        .collect();
+    let artifact_paths: Vec<String> = artifact_values
+        .iter()
+        .map(|(id, _version)| {
+            artifact_path_by_id
+                .get(id.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        })
+        .collect();
 
     let mut kinds = OrdinalDict::new();
     for value in &kind_values {
@@ -1076,6 +1122,21 @@ pub fn materialize_cold_partitioned(
                         let (span_start_byte, span_end_byte) = (row.span_start, row.span_end);
                         let facets = facets_bitmask(&row.facets);
                         let identity_type = identity_type_byte(row.identity_type);
+                        // A4: `0` means "no line known" on `ProposedRecord`
+                        // (see `OwnerKernelRows::span_lines`'s doc comment);
+                        // map that to `NONE_U32` so napi emits `None`, never
+                        // the misleading literal line `0`.
+                        let (raw_start_line, raw_end_line) = owner.span_lines[index];
+                        let span_start_line = if raw_start_line == 0 {
+                            NONE_U32
+                        } else {
+                            raw_start_line
+                        };
+                        let span_end_line = if raw_end_line == 0 {
+                            NONE_U32
+                        } else {
+                            raw_end_line
+                        };
 
                         let (source_subject, target_subject) = match &endpoints[index] {
                             Some((source, target)) => (
@@ -1103,8 +1164,8 @@ pub fn materialize_cold_partitioned(
                             span_artifact_version: owner_ordinal,
                             span_start_byte,
                             span_end_byte,
-                            span_start_line: 0,
-                            span_end_line: 0,
+                            span_start_line,
+                            span_end_line,
                             identity_type,
                             assignment_kind: 0,
                             name_id,
@@ -1278,6 +1339,11 @@ pub fn materialize_cold_partitioned(
     dicts.relation_kinds = relation_kinds.into_values();
     dicts.names = names.into_values();
     dicts.artifacts = artifacts.into_values();
+    // A3a-fix: `artifact_paths` is already ordinal-aligned with `artifact_
+    // values` (built above, before `owner_rows` was consumed) -- and
+    // `artifacts.into_values()` above is EXACTLY `artifact_values` (interned
+    // in the same sorted order), so no re-derivation is needed here.
+    dicts.artifact_paths = artifact_paths;
     dicts.facet_names = FACET_ORDER.iter().map(|name| (*name).to_string()).collect();
     dicts.subject_text = dicts
         .subjects
@@ -1379,6 +1445,16 @@ fn materialize_generation(
         Some(base) => OrdinalDict::from_existing(&base.names),
         None => OrdinalDict::new(),
     };
+    // A3a-fix: `artifact_paths`, ordinal-aligned with `artifacts` above --
+    // seeded from the base's own (already ordinal-aligned) list, then
+    // extended below every time the owner loop mints a genuinely NEW
+    // artifact ordinal (never touched for an ordinal `artifacts.intern`
+    // returns that already existed, in the base or earlier in this same
+    // loop).
+    let mut artifact_paths: Vec<String> = match base_dicts {
+        Some(base) => base.artifact_paths.clone(),
+        None => Vec::new(),
+    };
 
     let mut records: Vec<RecordRow> = Vec::new();
     // `FxHashMap` (not `std`'s default `SipHash`-based `HashMap`) for these
@@ -1420,6 +1496,39 @@ fn materialize_generation(
             owner.owner_artifact_id.clone(),
             owner.owner_artifact_version_id.clone(),
         ));
+        // A3a-fix (patched): `owner_ordinal >= artifact_paths.len()` iff this
+        // intern call minted an ordinal `artifact_paths` doesn't cover yet
+        // -- either because it's a BRAND NEW ordinal one past the current
+        // tail (the common case), or because a PRIOR `deps::
+        // materialize_dependencies` call (in an earlier generation, via
+        // `base_dicts`) minted one or more dependency-only ordinals with no
+        // known path, leaving a gap before this owner's own ordinal. A
+        // pre-existing ordinal's path was already recorded (by the base's
+        // own materialize call, or an earlier owner in this loop) and is
+        // not touched again -- that's the `<` case, correctly skipped.
+        //
+        // KNOWN LIMITATION (acceptable per `Dictionaries::artifact_paths`'s
+        // own "may be shorter, never a bug" contract): if `deps::
+        // materialize_dependencies` (below) ever interns a dependency's
+        // target artifact that was NEVER itself a scanned owner in any
+        // generation (its own doc comment: "virtually always already
+        // interned... but interns defensively" for the rare case it
+        // isn't), that mints an ordinal with NO known path. `resize` below
+        // pads any such gap with empty strings (`identity_codec`'s
+        // ordinary "no known path" signal -- an empty string never matches
+        // a real path, so it always falls back to Raw for that ordinal)
+        // BEFORE pushing this owner's real path at its own ordinal, so the
+        // padding never shifts anything out of alignment and never costs
+        // any LATER real owner ordinal its path. The only remaining cost is
+        // exactly what the contract promises: the padded (dependency-only)
+        // ordinals themselves stay unpathed, i.e. compressed as Raw instead
+        // of reconstructed -- a missed space-saving opportunity for those
+        // rows only, not a correctness issue and not something that
+        // propagates to any other ordinal.
+        if (owner_ordinal as usize) >= artifact_paths.len() {
+            artifact_paths.resize(owner_ordinal as usize, String::new());
+            artifact_paths.push(owner.owner_path.clone());
+        }
         owner_ordinals.insert(owner.owner_path.clone(), owner_ordinal);
         for (index, row) in owner.rows.iter_mut().enumerate() {
             let (kind, universal_kind, category) = &owner.kind_universal_category[index];
@@ -1455,6 +1564,19 @@ fn materialize_generation(
             let (span_start_byte, span_end_byte) = (row.span_start, row.span_end);
             let facets = facets_bitmask(&row.facets);
             let identity_type = identity_type_byte(row.identity_type);
+            // A4: see the cold-path loop above for the `0` -> `NONE_U32`
+            // rationale.
+            let (raw_start_line, raw_end_line) = owner.span_lines[index];
+            let span_start_line = if raw_start_line == 0 {
+                NONE_U32
+            } else {
+                raw_start_line
+            };
+            let span_end_line = if raw_end_line == 0 {
+                NONE_U32
+            } else {
+                raw_end_line
+            };
 
             let ordinal = u32::try_from(records.len())
                 .map_err(|_| ScanError("v4 materialize: record ordinal overflowed u32".into()))?;
@@ -1478,8 +1600,8 @@ fn materialize_generation(
                 span_artifact_version: owner_ordinal,
                 span_start_byte,
                 span_end_byte,
-                span_start_line: 0,
-                span_end_line: 0,
+                span_start_line,
+                span_end_line,
                 identity_type,
                 assignment_kind: 0,
                 name_id,
@@ -1702,6 +1824,16 @@ fn materialize_generation(
     dicts.relation_kinds = relation_kinds.into_values();
     dicts.names = names.into_values();
     dicts.artifacts = artifacts.into_values();
+    // A3a-fix: `artifact_paths` was seeded from `base_dicts` and extended
+    // during the owner loop above (before `deps::materialize_dependencies`
+    // ran) -- it may end up SHORTER than `dicts.artifacts` here in the rare
+    // case a dependency's target artifact was never itself a scanned owner
+    // this generation (`materialize_dependencies`'s own doc comment: it
+    // interns defensively for exactly this edge case). That's the
+    // documented, safe "can't reconstruct this ordinal's path" contract
+    // (`Dictionaries::artifact_paths`'s own doc comment) -- never
+    // re-derived or padded here.
+    dicts.artifact_paths = artifact_paths;
     // P2-2e deliverable 3: `facet_names` is NOT append-order-interned like
     // every dictionary above -- its ordinal IS the bit index (`FACET_ORDER`
     // is a fixed compile-time constant, never grown/reordered at runtime),
@@ -2046,6 +2178,11 @@ mod tests {
             ],
             schema_version: 1,
             source_span: serde_json::to_string(&source_span).unwrap(),
+            // A4 (line numbers task): no `LineIndex` behind this synthetic
+            // fixture (there is no real file text) -- `0` is the documented
+            // "no line known" sentinel.
+            span_start_line: 0,
+            span_end_line: 0,
             identity_key: format!("jsts:variable:{path}:0:{name}"),
             body: json!({"name": name, "path": path, "start": 0u32, "end": 10u32}),
             evidence_references: serde_json::to_string(&evidence).unwrap(),
@@ -2078,6 +2215,8 @@ mod tests {
             facets_list: vec!["core:structural_relation".to_string()],
             schema_version: 1,
             source_span: serde_json::to_string(&source_span).unwrap(),
+            span_start_line: 0,
+            span_end_line: 0,
             identity_key: format!("jsts:contains:{source_identity_key}:{target_identity_key}"),
             body,
             evidence_references: serde_json::to_string(&evidence).unwrap(),
@@ -2313,6 +2452,8 @@ mod tests {
             facets_list: vec!["core:reference_relation".to_string()],
             schema_version: 1,
             source_span: serde_json::to_string(&source_span).unwrap(),
+            span_start_line: 0,
+            span_end_line: 0,
             identity_key,
             body,
             evidence_references: serde_json::to_string(&evidence).unwrap(),
@@ -2494,6 +2635,70 @@ mod tests {
         assert_eq!(
             identity,
             format!("jsts:call:src/a.ts:0:20:{source_identity_key}:{target_identity_key}")
+        );
+    }
+
+    /// Group A wave 2, item 0: regression test for the `materialize_
+    /// generation` `artifact_paths` alignment bug fixed alongside this
+    /// test -- `base_dicts.artifacts` carries a pre-existing ordinal (1)
+    /// that was minted with NO known path (the documented "a dependency
+    /// target that was never itself a scanned owner" case), so `base_
+    /// dicts.artifact_paths` is one entry SHORTER than `base_dicts.
+    /// artifacts`. Before the fix, the old `owner_ordinal == artifact_
+    /// paths.len()` check would see this NEW owner's ordinal (2) fail to
+    /// equal `artifact_paths.len()` (1) -- since a gap already exists --
+    /// and PERMANENTLY skip appending this (and every later) owner's real
+    /// path, even though it IS known. This test would have failed on that
+    /// old code (`artifact_paths` would stay length 1, `artifacts` length
+    /// 3) and must pass now that the gap is padded with empty strings
+    /// instead of derailing every ordinal after it.
+    #[test]
+    fn materialize_generation_pads_a_pathless_ordinal_gap_before_a_new_owner() {
+        let base_dicts = Dictionaries {
+            artifacts: vec![
+                (
+                    "artifact:src/a.ts".to_string(),
+                    "version:src/a.ts".to_string(),
+                ),
+                (
+                    "artifact:dep-only".to_string(),
+                    "version:dep-only".to_string(),
+                ),
+            ],
+            // Only ordinal 0 (`src/a.ts`) has a known path -- ordinal 1
+            // (`dep-only`) is the pathless dependency-only gap.
+            artifact_paths: vec!["src/a.ts".to_string()],
+            ..Dictionaries::default()
+        };
+
+        let owner_record = entity_record("new_owner", "new_owner", "src/new.ts");
+        let owners = vec![owner_facts("src/new.ts", vec![owner_record])];
+
+        let materialized = materialize_generation(owners, 2, Some(&base_dicts), None)
+            .expect("materialize_generation succeeds");
+
+        let owner_ordinal = materialized
+            .dicts
+            .artifacts
+            .iter()
+            .position(|(id, _version)| id == "artifact:src/new.ts")
+            .expect("new owner artifact interned") as u32;
+
+        // The new owner mints the NEXT ordinal after the pre-existing gap
+        // (2), never reusing or collapsing it.
+        assert_eq!(owner_ordinal, 2);
+        assert_eq!(
+            materialized.dicts.artifact_paths.len(),
+            materialized.dicts.artifacts.len(),
+            "artifact_paths must stay 1:1 aligned with artifacts"
+        );
+        assert_eq!(
+            materialized.dicts.artifact_paths[1], "",
+            "the pre-existing pathless ordinal stays padded, never a stale/wrong path"
+        );
+        assert_eq!(
+            materialized.dicts.artifact_paths[owner_ordinal as usize], "src/new.ts",
+            "the new owner's real path must land at its own ordinal, not be lost to the gap"
         );
     }
 

@@ -375,8 +375,13 @@ mod tests {
             span_artifact_version: owner,
             span_start_byte: 0,
             span_end_byte: 0,
-            span_start_line: 0,
-            span_end_line: 0,
+            // A4 (line numbers task): this synthetic test row carries no
+            // real span, so "no line known" (`NONE_U32`) is the correct
+            // sentinel here -- matches what a real producer emits for a
+            // record whose `ProposedRecord::span_start_line`/`span_end_line`
+            // are `0` (see `materialize.rs`'s own doc comment).
+            span_start_line: NONE_U32,
+            span_end_line: NONE_U32,
             identity_type: 0,
             assignment_kind: 0,
             name_id: NONE_U32,

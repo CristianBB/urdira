@@ -8179,6 +8179,11 @@ mod tests {
             facets_list: Vec::new(),
             schema_version: 1,
             source_span: "{}".into(),
+            // A4 (line numbers task): no real `LineIndex` behind this
+            // synthetic fixture -- `0` is the documented "no line known"
+            // sentinel.
+            span_start_line: 0,
+            span_end_line: 0,
             identity_key: identity_key.to_owned(),
             body: json!({"source_id": "src", "target_id": "tgt", "classification": "confirmed"}),
             evidence_references: "[]".into(),
@@ -8324,6 +8329,8 @@ mod tests {
             facets_list: Vec::new(),
             schema_version: 1,
             source_span: "{}".into(),
+            span_start_line: 0,
+            span_end_line: 0,
             identity_key: identity_key.to_owned(),
             body: json!({"source_id": "test_module", "target_id": "tgt", "classification": "confirmed"}),
             evidence_references: "[]".into(),

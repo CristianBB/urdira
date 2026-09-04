@@ -21,7 +21,13 @@ pub fn write_dict_body(w: &mut impl Write, dict: &Dictionaries) -> std::io::Resu
     // `subject_text`: no real ordering requirement between the two, this
     // one is just the declaration order in `Dictionaries` itself.
     write_str_list(w, &dict.facet_names)?;
-    write_str_list(w, &dict.subject_text)
+    write_str_list(w, &dict.subject_text)?;
+    // A3a-fix: `artifact_paths`/`entity_kinds`, same trailing-append
+    // tolerance as `facet_names`/`subject_text` above -- appended even
+    // further out so an older reader (pre-A3a-fix, or pre-P2-2e) simply
+    // stops decoding one list earlier than this one exists.
+    write_str_list(w, &dict.artifact_paths)?;
+    write_str_list(w, &dict.entity_kinds)
 }
 
 pub fn read_dict_body(r: &mut impl Read) -> std::io::Result<Dictionaries> {
@@ -42,6 +48,9 @@ pub fn read_dict_body(r: &mut impl Read) -> std::io::Result<Dictionaries> {
     // them apart.
     let facet_names = read_str_list(r).unwrap_or_default();
     let subject_text = read_str_list(r).unwrap_or_default();
+    // A3a-fix: same tolerance, one layer further out.
+    let artifact_paths = read_str_list(r).unwrap_or_default();
+    let entity_kinds = read_str_list(r).unwrap_or_default();
     Ok(Dictionaries {
         kinds,
         universal_kinds,
@@ -51,6 +60,8 @@ pub fn read_dict_body(r: &mut impl Read) -> std::io::Result<Dictionaries> {
         artifacts,
         facet_names,
         subject_text,
+        artifact_paths,
+        entity_kinds,
     })
 }
 
@@ -80,6 +91,8 @@ mod tests {
                 "record:0707070707070707070707070707070707070707070707070707070707070707"
                     .to_string(),
             ],
+            artifact_paths: vec!["src/a.ts".to_string()],
+            entity_kinds: vec!["function".to_string(), "class".to_string()],
         };
         let mut buf = Vec::new();
         write_dict_body(&mut buf, &dict).unwrap();
@@ -91,6 +104,8 @@ mod tests {
         assert_eq!(decoded.artifacts, dict.artifacts);
         assert_eq!(decoded.facet_names, dict.facet_names);
         assert_eq!(decoded.subject_text, dict.subject_text);
+        assert_eq!(decoded.artifact_paths, dict.artifact_paths);
+        assert_eq!(decoded.entity_kinds, dict.entity_kinds);
         // `subjects` is never part of `dict.bin` (its own `subjects.keys`
         // file) -- always empty coming out of `read_dict_body`.
         assert!(decoded.subjects.is_empty());
@@ -111,5 +126,27 @@ mod tests {
         assert_eq!(decoded.kinds, vec!["k".to_string()]);
         assert!(decoded.facet_names.is_empty());
         assert!(decoded.subject_text.is_empty());
+        assert!(decoded.artifact_paths.is_empty());
+        assert!(decoded.entity_kinds.is_empty());
+    }
+
+    /// A more realistic upgrade scenario than the pre-P2-2e test above: a
+    /// body written by the version of this crate that HAD `facet_names`/
+    /// `subject_text` but predates A3a-fix's two newest trailing lists.
+    #[test]
+    fn read_dict_body_tolerates_a_body_missing_only_artifact_paths_and_entity_kinds() {
+        let mut buf = Vec::new();
+        write_str_list(&mut buf, &["k".to_string()]).unwrap();
+        write_str_list(&mut buf, &["u".to_string()]).unwrap();
+        write_str_list(&mut buf, &["r".to_string()]).unwrap();
+        write_str_list(&mut buf, &["n".to_string()]).unwrap();
+        write_str_pair_list(&mut buf, &[("a".to_string(), "v".to_string())]).unwrap();
+        write_str_list(&mut buf, &["facet".to_string()]).unwrap();
+        write_str_list(&mut buf, &["record:aa".to_string()]).unwrap();
+        let decoded = read_dict_body(&mut &buf[..]).unwrap();
+        assert_eq!(decoded.facet_names, vec!["facet".to_string()]);
+        assert_eq!(decoded.subject_text, vec!["record:aa".to_string()]);
+        assert!(decoded.artifact_paths.is_empty());
+        assert!(decoded.entity_kinds.is_empty());
     }
 }

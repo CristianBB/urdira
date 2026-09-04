@@ -76,6 +76,8 @@ pub fn build_dictionaries(n_owners: u32, n_subjects: u32) -> Dictionaries {
             .collect(),
         facet_names: Vec::new(),
         subject_text: Vec::new(),
+        artifact_paths: Vec::new(),
+        entity_kinds: Vec::new(),
     }
 }
 

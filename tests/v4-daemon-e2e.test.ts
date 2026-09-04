@@ -416,6 +416,23 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
       expect(v4Declarations[0]!["entity_id"]).toMatch(/^entity:[0-9a-f]{64}$/);
       expect(v4Declarations[0]!["identity_key"]).toBe("jsts:class:errors.ts:183:InvalidTaskTransitionError");
 
+      // A4 (line numbers task, 2026-09-05): a declaration's own
+      // `source_span` now carries a real 1-based `start_line`/`end_line`
+      // (`urdira-jsts-syntax-worker`'s per-file `LineIndex`, threaded all
+      // the way through the native store's `RecordRow.span_start_line`/
+      // `span_end_line` to `recordValue`'s `source_span` here) -- verified
+      // by independently counting newlines in the fixture's own text up to
+      // the SAME `start_byte`/`end_byte` this span already carries, rather
+      // than trusting the producer's own arithmetic.
+      const v4DeclarationSpan = v4Declarations[0]!["source_span"] as
+        | { readonly start_byte?: string; readonly end_byte?: string; readonly start_line?: string; readonly end_line?: string }
+        | undefined;
+      expect(v4DeclarationSpan?.start_line).toBeDefined();
+      expect(v4DeclarationSpan?.end_line).toBeDefined();
+      const errorsText = await readFile(join(fixtureRoot, "errors.ts"), "utf8");
+      expect(v4DeclarationSpan!.start_line).toBe(String(errorsText.slice(0, Number(v4DeclarationSpan!.start_byte)).split("\n").length));
+      expect(v4DeclarationSpan!.end_line).toBe(String(errorsText.slice(0, Number(v4DeclarationSpan!.end_byte)).split("\n").length));
+
       const v4Search = await queryOneStream(v4Client, v4WorkspaceId, "core:search_text", { pattern: "InvalidTaskTransitionError", syntax: "literal", case_sensitive: true, word_mode: "identifier", result_projection: "record" }, "matches");
       expect(v4Search.length).toBeGreaterThan(0);
 
@@ -483,6 +500,25 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
       const v4TaskStatusRefs = await queryStreams(v4Client, v4WorkspaceId, "core:find_references", { target: { subject_type: "entity", entity_id: v4TaskStatusDecl[0]!["entity_id"] }, include_declarations: true });
       expect(v4TaskStatusRefs["references"]!.items.length).toBeGreaterThan(0);
       expect(v4TaskStatusRefs["references"]!.items.some((entry) => (entry.value as Record<string, unknown>)["kind"] === "jsts:relation_references")).toBe(true);
+
+      // A4 (line numbers task): same check as the declaration above, but
+      // for a RELATION record (`jsts:relation_references`) -- confirms the
+      // line-number producer is wired for both `semantic_sites.rs`'s
+      // relation builders and `lib.rs`'s entity builder, not just one.
+      const v4ReferenceRecord = v4TaskStatusRefs["references"]!.items
+        .map((entry) => entry.value as Record<string, unknown>)
+        .find((record) => record["kind"] === "jsts:relation_references");
+      expect(v4ReferenceRecord).toBeDefined();
+      const v4ReferenceSpan = v4ReferenceRecord!["source_span"] as
+        | { readonly start_byte?: string; readonly end_byte?: string; readonly start_line?: string; readonly end_line?: string }
+        | undefined;
+      expect(v4ReferenceSpan?.start_line).toBeDefined();
+      expect(v4ReferenceSpan?.end_line).toBeDefined();
+      const v4ReferencePath = (v4ReferenceRecord!["body"] as Record<string, unknown> | undefined)?.["path"];
+      expect(typeof v4ReferencePath).toBe("string");
+      const v4ReferenceText = await readFile(join(fixtureRoot, v4ReferencePath as string), "utf8");
+      expect(v4ReferenceSpan!.start_line).toBe(String(v4ReferenceText.slice(0, Number(v4ReferenceSpan!.start_byte)).split("\n").length));
+      expect(v4ReferenceSpan!.end_line).toBe(String(v4ReferenceText.slice(0, Number(v4ReferenceSpan!.end_byte)).split("\n").length));
 
       expect(typeof v4EntityId).toBe("string");
       const v4ReferenceStreams = await queryStreams(v4Client, v4WorkspaceId, "core:find_references", { target: { subject_type: "entity", entity_id: v4EntityId }, include_declarations: true });

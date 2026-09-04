@@ -131,10 +131,20 @@ fn assert_identity_roundtrip(dir: &std::path::Path, rows: &[RecordRow]) {
 }
 
 /// A canonical entity, a canonical relation pointing at it plus a second
-/// canonical entity, and one non-canonical (`jsts:external_module:*`)
-/// entity -- the full mix `classify_identity` needs to exercise both the
-/// `ENTITY`/`RELATION` tagged paths and the `RAW` fallback in the same
-/// batch. Returns `(dicts, rows)`.
+/// canonical entity, a canonical NO-SPAN `contains` relation over the same
+/// two entities, and one non-canonical (`jsts:external_module:*`) entity --
+/// the full mix `classify_identity` needs to exercise the `ENTITY`/
+/// `RELATION`/`RELATION_NO_SPAN` tagged paths and the `RAW` fallback in the
+/// same batch. Returns `(dicts, rows)`.
+///
+/// A3a-fix note: `dicts.kinds[0]`/`[1]` here are deliberately the COARSE
+/// `UniversalKind`-bucketed word a REAL entity producer would stamp
+/// (`"jsts:entity_callable"`), NOT the fine word -- this fixture no longer
+/// needs to lie about that the way the pre-fix version of this test did
+/// (`try_entity` used to read the fine word straight out of `dicts.kinds`,
+/// which is exactly the bug this fix corrects), because the fine word is
+/// now parsed straight out of each row's own `identity_key` and interned
+/// into `dicts.entity_kinds` by the writer itself.
 fn canonical_and_noncanonical_fixture() -> (Dictionaries, Vec<RecordRow>) {
     let entity_a_id = digest(b"entity-a");
     let entity_a_identity = b"jsts:function:src/a.ts:10:greet".to_vec();
@@ -163,6 +173,29 @@ fn canonical_and_noncanonical_fixture() -> (Dictionaries, Vec<RecordRow>) {
         relation_identity,
     );
 
+    // A3a-fix: a NO-SPAN relation (`jsts:contains:*`, `IDENTITY_LAYOUT_
+    // RELATION_NO_SPAN`) over the SAME two entities -- start/end are 0
+    // (never part of this shape's identity string, so their actual value
+    // is irrelevant to classification).
+    let contains_identity = [
+        b"jsts:contains:".as_slice(),
+        entity_a_identity.as_slice(),
+        b":",
+        entity_b_identity.as_slice(),
+    ]
+    .concat();
+    let contains_relation = relation_row(
+        digest(b"contains-ab"),
+        0,
+        2, // kinds[2] == "jsts:relation_contains"
+        1, // relation_kinds[1] == "contains"
+        0,
+        0,
+        Some(0),
+        Some(1),
+        contains_identity,
+    );
+
     let external = entity_row(
         digest(b"external-lodash"),
         0,
@@ -173,17 +206,26 @@ fn canonical_and_noncanonical_fixture() -> (Dictionaries, Vec<RecordRow>) {
     );
 
     let dicts = Dictionaries {
-        kinds: vec!["function".to_string(), "jsts:relation_call".to_string()],
+        kinds: vec![
+            "jsts:entity_callable".to_string(),
+            "jsts:relation_call".to_string(),
+            "jsts:relation_contains".to_string(),
+        ],
         universal_kinds: vec!["core:callable".to_string()],
-        relation_kinds: vec!["call".to_string()],
+        relation_kinds: vec!["call".to_string(), "contains".to_string()],
         names: vec!["greet".to_string(), "helper".to_string()],
         subjects: vec![entity_a_id, entity_b_id],
         artifacts: vec![("artifact:src/a.ts".to_string(), "v1".to_string())],
         facet_names: Vec::new(),
         subject_text: Vec::new(),
+        artifact_paths: vec!["src/a.ts".to_string()],
+        entity_kinds: Vec::new(), // interned by the writer itself, not the caller
     };
 
-    (dicts, vec![entity_a, entity_b, relation, external])
+    (
+        dicts,
+        vec![entity_a, entity_b, relation, contains_relation, external],
+    )
 }
 
 #[test]
@@ -199,7 +241,7 @@ fn canonical_and_noncanonical_rows_roundtrip_through_write_base() {
     // `records.ident` -- the two entities and the relation are all
     // canonical and store zero bytes each.
     let ident_path = dir.join("base-1").join("records.ident");
-    let external_len = rows[3].identity_key.len() as u64;
+    let external_len = rows[4].identity_key.len() as u64;
     let actual = std::fs::metadata(&ident_path).unwrap().len();
     assert_eq!(
         actual,
@@ -225,7 +267,7 @@ fn canonical_and_noncanonical_rows_roundtrip_through_write_base_partitioned() {
     assert_identity_roundtrip(&dir, &rows);
 
     let ident_path = dir.join("base-1").join("records.ident");
-    let external_len = rows[3].identity_key.len() as u64;
+    let external_len = rows[4].identity_key.len() as u64;
     let actual = std::fs::metadata(&ident_path).unwrap().len();
     assert_eq!(actual, HEADER_LEN + external_len);
 }
@@ -235,7 +277,7 @@ fn canonical_and_noncanonical_rows_roundtrip_through_write_base_partitioned() {
 #[test]
 fn fully_canonical_store_writes_zero_ident_bytes() {
     let (dicts, rows) = canonical_and_noncanonical_fixture();
-    let canonical_rows: Vec<RecordRow> = rows.into_iter().take(3).collect(); // drop the external row
+    let canonical_rows: Vec<RecordRow> = rows.into_iter().take(4).collect(); // drop the external row
     let dir = tmp_dir("identity-fully-canonical");
     SegmentWriter::new()
         .write_base(&dir, &canonical_rows, &[], &dicts, 1)
@@ -279,6 +321,8 @@ fn delta_relation_resolves_source_endpoint_from_the_base_via_the_store() {
         artifacts: vec![("artifact:src/a.ts".to_string(), "v1".to_string())],
         facet_names: Vec::new(),
         subject_text: Vec::new(),
+        artifact_paths: vec!["src/a.ts".to_string()],
+        entity_kinds: Vec::new(),
     };
 
     let dir = tmp_dir("identity-delta-store-fallback");
@@ -318,6 +362,8 @@ fn delta_relation_resolves_source_endpoint_from_the_base_via_the_store() {
         artifacts: Vec::new(),
         facet_names: Vec::new(),
         subject_text: Vec::new(),
+        artifact_paths: Vec::new(), // owner_artifact 0 already resolved via the base's own entry
+        entity_kinds: Vec::new(),
     };
 
     SegmentWriter::new()
