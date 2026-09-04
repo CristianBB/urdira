@@ -16,4 +16,5 @@ oxc_syntax = "=0.142.0"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"
 sha2 = "=0.11.0"
+urdira-jsts-typeflow = { version = "=0.1.0", path = "../urdira-jsts-typeflow" }
 urdira-worker-protocol = { version = "=0.1.0", path = "../urdira-worker-protocol" }

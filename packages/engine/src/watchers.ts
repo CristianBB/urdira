@@ -158,12 +158,32 @@ export class WorkspaceWatcherManager {
               && !(deletedUris.has(event.normalized_uri) && event.event_class === "modify"))
             .map((event) => event.normalized_uri)
             .filter((uri) => uri.length > 0 && uri !== ".git" && !uri.startsWith(".git/")))];
-          // Publish an authoritative absence first. A same-batch create is
-          // deliberately queued as a follow-up presence so a rename closes
-          // the old lifecycle in one generation and reopens the new path in
-          // the next, rather than coalescing both transitions.
-          if (authoritativeDeletes.length > 0) await this.options.on_reconcile?.(binding.workspace_id, [], "changed", authoritativeDeletes);
-          if (changedUris.length > 0) await this.options.on_reconcile?.(binding.workspace_id, changedUris, "changed");
+          // P3-2 item 4: a cross-path RENAME (an authoritative absence of
+          // path A plus a presence of a DIFFERENT path B in the SAME batch)
+          // now reaches `on_reconcile` as ONE call carrying both A (as
+          // `authoritativeDeletes`) and B (as `changedUris`) -- the v4
+          // worker's `ScanScope::Changed` already accepts a delete and a
+          // create in the SAME `paths` list and handles it as a single
+          // rename generation (`crates/urdira-indexing-worker/src/v4/
+          // delta.rs`); the daemon used to always split ANY batch
+          // containing an authoritative delete into two SEQUENTIAL
+          // `on_reconcile` calls regardless of whether a same-batch create
+          // was for a different path (a real rename) or the same path (a
+          // genuine delete-then-recreate, which still MUST stay a second
+          // generation -- collapsing both onto one `ChangedPath` for the
+          // SAME uri would silently discard one half via `mapV4
+          // ChangedPaths`' last-write-wins map, per-`packages/daemon/src/
+          // runtime.ts`'s own dedup rule). `samePathRecreates` isolates
+          // exactly that ambiguous case and keeps it deferred to a second,
+          // ordered `on_reconcile` call, same as before; every other
+          // (cross-path) changed uri now travels WITH the deletes in one
+          // call.
+          const samePathRecreates = changedUris.filter((uri) => deletedUris.has(uri));
+          const combinableUris = changedUris.filter((uri) => !deletedUris.has(uri));
+          if (authoritativeDeletes.length > 0 || combinableUris.length > 0) {
+            await this.options.on_reconcile?.(binding.workspace_id, combinableUris, "changed", authoritativeDeletes);
+          }
+          if (samePathRecreates.length > 0) await this.options.on_reconcile?.(binding.workspace_id, samePathRecreates, "changed");
         }
       });
       this.deliveries.set(binding.workspace_id, delivery.catch(() => undefined));
@@ -225,9 +245,58 @@ export function watcherOptionsForSourceProvider(sourceProvider: string): parcelW
   // backends, and @parcel/watcher falls back to its platform default if a
   // compiled backend is unavailable. The package's declaration file omits
   // kqueue even though the native backend accepts it, hence the narrow cast.
+  //
+  // P3-5 (plan section 6.1's daemon-latency item) measured kqueue's OWN
+  // detection latency at n8n scale (14,083 owners) at a median ~2.0-3.0s and
+  // hypothesized this was inherent to kqueue's own directory-watching
+  // strategy (no OS-level recursive-watch primitive the way FSEvents has).
+  //
+  // P3-7 (plan's watcher-detection-latency item) DISPROVED that hypothesis:
+  // a direct probe of the real watcher (`scripts/watch-latency-probe.mjs`,
+  // bypassing the mutation harness entirely) measured kqueue's actual
+  // detection latency at the SAME n8n scale (20,280 files) at p50 7-9ms /
+  // p95 11-13ms -- three orders of magnitude faster than P3-5's number, and
+  // confirmed by reading `@parcel/watcher`'s kqueue source
+  // (`KqueueBackend.cc`): it registers one kernel-level `EVFILT_VNODE`
+  // watch per FILE (not just per directory) at `subscribe()` time, so a
+  // write to an already-tracked file fires that file's own kevent directly
+  // (O(1) per event) -- the O(files) directory-diff path (`compareDir`)
+  // only runs for a directory's own NOTE_WRITE (an add/remove of an entry),
+  // never a plain content write. P3-5's reported 2.0-3.0s was a HARNESS
+  // measurement artifact: `scripts/v4-mutation-harness.mjs`'s
+  // `applyMutation` re-scans the whole corpus and rebuilds an import graph
+  // (~2.2-3.5s at this scale) BEFORE performing its actual mutating write,
+  // and the harness used to capture its "mutation happened at" timestamp
+  // before calling `applyMutation` rather than immediately before that
+  // write -- fixed in this task (`applyMutation` now returns
+  // `mutation_write_epoch_ms`, captured at the right instant). See
+  // docs/evidence/2026-09-03-v4-p3-7-watcher-latency.md for the full
+  // writeup, and docs/evidence/2026-09-03-v4-p3-5-daemon-latency.md for the
+  // original (now-corrected) measurement.
+  //
+  // fs-events was independently re-tested (same probe, plus a second,
+  // independent implementation: the Rust `notify` crate via the
+  // `crates/urdira-fs-watch` spike) and remains unreliable on this specific
+  // machine at this scale regardless of implementation: @parcel/watcher's
+  // fs-events backend showed a consistent ~12s median per-edit delay (p50
+  // 11,988.7ms, p95 14,988.9ms, n=8, zero misses within a generous 15s
+  // window); `notify`'s FSEvents backend was faster but wildly inconsistent
+  // (p50 546ms, p95 7,317.7ms, n=8). A SEPARATE, always-reproducible
+  // correctness bug was also found and fixed (see `ParcelWatcherAdapter`'s
+  // `normalize_events` call below): FSEvents canonicalizes every delivered
+  // path (resolving symlinks) while kqueue does not, so a workspace root
+  // with a symlinked path component (anything under macOS's `/tmp` or
+  // `/var`) used to silently lose every fs-events-reported event forever.
+  // kqueue therefore REMAINS the default, now on solid, re-verified
+  // evidence rather than the superseded 2.0-3.0s hypothesis --
+  // `URDIRA_WATCHER_BACKEND=fs-events` is kept only as an opt-in,
+  // never-on-by-default escape hatch for a future investigation, made safer
+  // (not silent) by this task's `normalize_events` fix.
+  const forcedBackend = process.env["URDIRA_WATCHER_BACKEND"];
+  const useKqueue = process.platform === "darwin" && forcedBackend !== "fs-events";
   return {
     ignore: [...new Set([...excludedPaths, ...excludedGlobs])],
-    ...(process.platform === "darwin" ? { backend: "kqueue" as unknown as parcelWatcher.Options["backend"] } : {}),
+    ...(useKqueue ? { backend: "kqueue" as unknown as parcelWatcher.Options["backend"] } : {}),
   } as parcelWatcher.Options;
 }
 
@@ -375,7 +444,38 @@ export class ParcelWatcherAdapter {
           return;
         }
         consecutiveErrors = 0;
-        if (events.length > 0) this.#deliver(handler, this.normalize_events(events));
+        if (events.length === 0) return;
+        // P3-7: `normalize_events` throws `engine:watcher_path_outside_root`
+        // if a backend-reported event path does not literally start with
+        // `this.#binding.root`. This is reachable in real conditions, not
+        // only a defensive fallback: FSEvents (macOS) canonicalizes every
+        // delivered path (resolving symlinks) while kqueue does not (its own
+        // paths come from @parcel/watcher's own directory-string walk, never
+        // touching the OS's canonical-path resolution) -- so a workspace root
+        // with any symlinked path component (anything under macOS's `/tmp`
+        // or `/var`, both symlinks to `/private/...`) throws on every single
+        // fs-events-reported event while the identical root works fine under
+        // kqueue. Proven live: `ParcelWatcherAdapter#normalize_events` called
+        // directly with a raw `/var/folders/...` root and an
+        // FSEvents-realistic canonicalized `/private/var/folders/...` event
+        // path throws exactly this error (see
+        // docs/evidence/2026-09-03-v4-p3-7-watcher-latency.md §2b). This
+        // call used to be unguarded: the throw would propagate out of a
+        // native ThreadSafeFunction-invoked callback with no `on_error` call
+        // and no visible crash, silently discarding the event forever. This
+        // is orthogonal to which backend is the shipped default -- kqueue
+        // remains default and is not affected by this bug -- but the
+        // `URDIRA_WATCHER_BACKEND=fs-events` escape hatch (`watcherOptionsForSourceProvider`
+        // below) is safer and observable now instead of silently eating
+        // events for any symlinked root.
+        try {
+          this.#deliver(handler, this.normalize_events(events));
+        } catch (normalizeError) {
+          const normalized = normalizeError instanceof Error ? normalizeError : new Error(String(normalizeError));
+          console.error(`[urdira] watcher event normalization failed for workspace ${this.#binding.workspace_id} root=${this.#binding.root}: ${normalized.message}`);
+          this.#onError?.(normalized);
+          this.#deliver(handler, this.#batch([this.#hint("provider_reset", "")]));
+        }
       }, this.#watcherOptions);
       if (stopped || rearmExhausted || generation !== activeGeneration) {
         await subscription.unsubscribe().catch(() => undefined);

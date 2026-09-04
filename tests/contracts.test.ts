@@ -585,10 +585,10 @@ describe("Task 2 contract registries", () => {
   it("keeps the initial core registry counts aligned with the approved registries", () => {
     expect(operationRegistry).toHaveLength(18);
     expect(recipeRegistry).toHaveLength(11);
-    expect(canonicalSchemaRegistry).toHaveLength(48);
+    expect(canonicalSchemaRegistry).toHaveLength(49);
     expect(comparatorRegistry).toHaveLength(18);
     expect(operationErrorRegistry).toHaveLength(48);
-    expect(Object.keys(generatedJsonSchemaRegistry)).toHaveLength(48);
+    expect(Object.keys(generatedJsonSchemaRegistry)).toHaveLength(49);
     expect(Object.values(generatedJsonSchemaRegistry).every((schema) => schema.$schema === "https://json-schema.org/draft/2020-12/schema")).toBe(true);
     expect(operationDefinitions.every((operation) => operation.operation_id && operation.operation_version && operation.argument_schema_id)).toBe(true);
     expect(new Set(operationDefinitions.map((operation) => operation.argument_schema_id)).size).toBeGreaterThan(1);
@@ -758,7 +758,7 @@ describe("Task 2 contract registries", () => {
     expect(getGeneratedJsonSchema("core:ModelAssetManifest", 1)).toMatchObject({ $ref: expect.stringContaining("ModelAssetManifest") });
     expect(() => getGeneratedJsonSchema("core:does_not_exist@1")).not.toThrow();
     expect(getGeneratedJsonSchema("core:does_not_exist@1")).toBeUndefined();
-    expect(coreSchemaDefinitions).toHaveLength(48);
+    expect(coreSchemaDefinitions).toHaveLength(49);
     for (const definition of coreSchemaDefinitions) {
       expect(() => validateSchemaDefinition(definition)).not.toThrow();
       const generated = generatedJsonSchemaRegistry[`${definition.schema_id}@${definition.schema_version}`];

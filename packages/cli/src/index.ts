@@ -147,6 +147,62 @@ function output(data: unknown, json: boolean, notice = ""): string {
   const body = json ? `${JSON.stringify(data)}\n` : typeof data === "string" ? `${data}\n` : `${JSON.stringify(data)}\n`;
   return json ? body : `${notice}${body}`;
 }
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function padColumn(value: string, width: number): string {
+  return value.length >= width ? value : value + " ".repeat(width - value.length);
+}
+
+/**
+ * P4-d: one `urdira index` row per workspace. Additive to a v3 workspace's
+ * existing `structural_ready`/`semantic_ready` booleans (`storage_format`
+ * is only ever "v3"/"v4" -- see `v4StatusFields`, `packages/daemon/src/
+ * runtime.ts`) -- a v3 row's STRUCTURAL/LEXICAL/SEMANTIC cells read "ready"/
+ * "not ready" exactly as they would have before this task, while a v4 row
+ * shows the queryable/durable and completed generation pair plus a
+ * "(lagging)" tag whenever the daemon's own `queryable`/`current` booleans
+ * say a lane has not caught up to the latest scan yet.
+ */
+function indexStatusRow(workspace: Readonly<Record<string, unknown>>): { readonly workspace: string; readonly status: string; readonly format: string; readonly structural: string; readonly lexical: string; readonly semantic: string; readonly last_scan: string } {
+  const id = typeof workspace["workspace_id"] === "string" ? workspace["workspace_id"] : "?";
+  const root = typeof workspace["display_root"] === "string" ? workspace["display_root"] : undefined;
+  const status = typeof workspace["workspace_status"] === "string" ? workspace["workspace_status"] : "unknown";
+  const format = typeof workspace["storage_format"] === "string" ? workspace["storage_format"] : "v3";
+  const structural = isPlainRecord(workspace["structural"]) ? workspace["structural"] : {};
+  const lexical = isPlainRecord(workspace["lexical"]) ? workspace["lexical"] : {};
+  const semantic = isPlainRecord(workspace["semantic"]) ? workspace["semantic"] : {};
+  const isV4 = format === "v4";
+  const structuralCell = isV4
+    ? `q${structural["queryable_generation"] ?? "-"}/d${structural["durable_generation"] ?? "-"}${structural["queryable"] === true ? "" : " (lagging)"}`
+    : workspace["structural_ready"] === true ? "ready" : "not ready";
+  const lexicalCell = isV4
+    ? `gen ${lexical["completed_generation"] ?? "-"} (${lexical["current"] === true ? "current" : "lagging"})`
+    : workspace["structural_ready"] === true ? "ready" : "not ready";
+  const semanticCell = isV4
+    ? `gen ${semantic["completed_generation"] ?? "-"} (${semantic["current"] === true ? "current" : "lagging"})`
+    : workspace["semantic_ready"] === true ? "ready" : "not ready";
+  const lastScan = isPlainRecord(workspace["last_scan"]) ? workspace["last_scan"] : undefined;
+  const timings = lastScan && isPlainRecord(lastScan["timings"]) ? lastScan["timings"] : undefined;
+  const lastScanCell = lastScan === undefined
+    ? "-"
+    : `${lastScan["kind"]}${typeof lastScan["changed_paths"] === "number" ? ` (${lastScan["changed_paths"]} paths)` : ""}${typeof timings?.["total_ms"] === "number" ? `, ${timings["total_ms"]}ms` : ""}`;
+  return { workspace: root !== undefined ? `${id} (${root})` : id, status, format, structural: structuralCell, lexical: lexicalCell, semantic: semanticCell, last_scan: lastScanCell };
+}
+
+/** Human-readable rendering of `core:index_status` for `urdira index` (non `--json` output); `--json` bypasses this entirely and prints the raw daemon payload verbatim (see the `index` dispatch below). */
+function formatIndexStatusTable(payload: unknown): string {
+  const record = isPlainRecord(payload) ? payload : {};
+  const workspaces = Array.isArray(record["workspaces"]) ? record["workspaces"].filter(isPlainRecord) : [];
+  if (workspaces.length === 0) return "no workspaces registered\nhint: run `urdira workspace add <path>` to register one.";
+  const headers = ["WORKSPACE", "STATUS", "FORMAT", "STRUCTURAL", "LEXICAL", "SEMANTIC", "LAST_SCAN"] as const;
+  const rows = workspaces.map(indexStatusRow).map((row) => [row.workspace, row.status, row.format, row.structural, row.lexical, row.semantic, row.last_scan]);
+  const widths = headers.map((header, column) => Math.max(header.length, ...rows.map((row) => row[column]!.length)));
+  const renderRow = (cells: readonly string[]): string => cells.map((cell, column) => padColumn(cell, widths[column]!)).join("  ").trimEnd();
+  return [renderRow(headers), ...rows.map(renderRow)].join("\n");
+}
 // Both the interactive confirm path and the `--confirm` scripted path confirm the
 // same detection preview, so they must derive the same default plugin/technology selection from
 // it -- the full set of technologies (and their compatible plugins) the daemon's
@@ -289,5 +345,12 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
           : command.name === "codebase-list" ? "core:codebase_list"
             : "core:query";
   const data = await dependencies.client.call(call, command.options.payload ?? { args: command.args, values: command.options.values });
-  return { exit_code: data.outcome === "success" ? 0 : 1, data: data.payload ?? data.error ?? data, stdout: output(data.payload ?? data.error ?? data, command.options.json) };
+  const resultPayload = data.payload ?? data.error ?? data;
+  // `--json` always passes the raw payload through verbatim (per this
+  // command's own descriptor and every other read-only command here); the
+  // table rendering below is purely a human-terminal convenience for
+  // `urdira index` and never changes `data` (what a scripted caller reading
+  // `CliResult.data` sees), only `stdout`.
+  const rendered = command.name === "index" && !command.options.json && data.outcome === "success" ? formatIndexStatusTable(resultPayload) : resultPayload;
+  return { exit_code: data.outcome === "success" ? 0 : 1, data: resultPayload, stdout: output(rendered, command.options.json) };
 }

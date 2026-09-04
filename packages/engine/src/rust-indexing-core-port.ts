@@ -1,5 +1,125 @@
 import { isAbsolute } from "node:path";
 
+/**
+ * v4 cold/incremental scan protocol mirror (task P2-2b). Wire source of
+ * truth: `crates/urdira-worker-protocol/src/lib.rs`'s `ScanScope`/
+ * `ScanPriority`/`ScanTimings`/`ScanRoots`/`IndexingCommand::WorkspaceScan`/
+ * `IndexingEvent::{Queryable,ScanCompleted}`. The literal wire-framing
+ * mirror (the shape actually sent to/decoded from the worker's stdio
+ * transport, tagged with `kind`) lives in
+ * `packages/plugin-javascript-typescript/src/indexing-core-process-transport.ts`;
+ * these are the same field shapes re-exported at the engine layer for
+ * `rust-workspace-scan.ts` and its callers, matching how `IndexGenerationRequest`
+ * above mirrors that file's v3 request shape.
+ */
+export type ChangedPathKind = "created" | "modified" | "deleted";
+export interface ChangedPath {
+  readonly path: string;
+  readonly kind: ChangedPathKind;
+}
+export type ScanScope = { readonly kind: "full" } | { readonly kind: "changed"; readonly paths: readonly ChangedPath[] };
+export type ScanPriority = "interactive" | "background";
+export interface ScanTimings {
+  readonly catalog_ms?: number;
+  readonly parse_ms?: number;
+  readonly resolve_ms?: number;
+  readonly materialize_ms?: number;
+  readonly write_ms?: number;
+  readonly fsync_ms?: number;
+  readonly snapshot_ms?: number;
+  readonly lexical_ms?: number;
+  readonly total_ms: number;
+}
+export interface ScanRoots {
+  readonly records: string;
+  readonly dependency: string;
+  readonly graph: string;
+  readonly metric: string;
+}
+export interface WorkspaceScanRequest {
+  readonly workspace_id: string;
+  readonly workspace_root: string;
+  readonly database_path: string;
+  readonly structural_root: string;
+  readonly cas_root: string;
+  readonly sidecar_root: string;
+  readonly scope: ScanScope;
+  readonly registry_snapshot_id: string;
+  readonly configuration_revision_id: string;
+  readonly resolution_lock_id: string;
+  readonly deadline_ms?: number;
+  readonly priority: ScanPriority;
+}
+export interface WorkspaceScanQueryable {
+  readonly generation: number;
+  readonly manifest_path: string;
+  readonly timings: ScanTimings;
+}
+export interface WorkspaceScanResult {
+  readonly generation: number;
+  readonly snapshot_id: string;
+  readonly roots: ScanRoots;
+  readonly timings: ScanTimings;
+}
+/**
+ * P1-D-c (decision 28): the background residual TypeScript-checker pass's
+ * own completion payload (`IndexingEvent::UpgradeCompleted`'s fields, minus
+ * `request_id`/`operation_id`/`kind` -- those are wire/correlation details
+ * `rust-workspace-scan.ts`'s subscriber callback carries separately, same
+ * split `WorkspaceScanQueryable`/`WorkspaceScanResult` already use above).
+ * `generation` is the NEW upgrade generation when `upgraded_sites > 0`, or
+ * the pass's own unchanged base generation when it found nothing to
+ * upgrade -- see the Rust event's own doc comment for why no new
+ * generation is minted in that case.
+ */
+export interface WorkspaceScanUpgradeCompleted {
+  readonly generation: number;
+  readonly upgraded_sites: number;
+  readonly external_sites: number;
+  readonly unresolved_sites: number;
+  readonly timings: ScanTimings;
+}
+
+/**
+ * Validates the operation boundary before a `workspace_scan` request reaches
+ * the subprocess, mirroring `validateIndexGenerationRequest`'s scope
+ * (transport invariants only; scan/catalog authority validation stays in
+ * Rust).
+ */
+export function validateWorkspaceScanRequest(request: WorkspaceScanRequest): void {
+  const identifiers: readonly [string, string][] = [
+    ["workspace_id", request.workspace_id],
+    ["workspace_root", request.workspace_root],
+    ["database_path", request.database_path],
+    ["structural_root", request.structural_root],
+    ["cas_root", request.cas_root],
+    ["sidecar_root", request.sidecar_root],
+    ["registry_snapshot_id", request.registry_snapshot_id],
+    ["configuration_revision_id", request.configuration_revision_id],
+    ["resolution_lock_id", request.resolution_lock_id],
+  ];
+  for (const [label, value] of identifiers) {
+    if (value.length === 0 || value.length > 4096 || /[\u0000\r\n\t]/u.test(value)) {
+      throw new Error(`Invalid Rust workspace-scan ${label}.`);
+    }
+  }
+  for (const [label, value] of [
+    ["structural_root", request.structural_root],
+    ["cas_root", request.cas_root],
+    ["sidecar_root", request.sidecar_root],
+  ] as const) {
+    if (!isAbsolute(value)) throw new Error(`Invalid Rust workspace-scan ${label}: must be absolute.`);
+  }
+  if (request.deadline_ms !== undefined && (!Number.isSafeInteger(request.deadline_ms) || request.deadline_ms <= 0)) {
+    throw new Error("Invalid Rust workspace-scan deadline.");
+  }
+  if (request.scope.kind === "changed") {
+    for (const changed of request.scope.paths) {
+      if (changed.path.length === 0) throw new Error("Invalid Rust workspace-scan changed path.");
+    }
+  }
+}
+
 export type AuthoritativeChangeSet =
   | { readonly kind: "full" }
   | { readonly kind: "exact"; readonly changed_artifact_ids: readonly string[] };

@@ -30,6 +30,53 @@ export interface IndexGenerationRequest {
     readonly structural_kernel_addon_path?: string;
   };
 }
+/** v4 cold/incremental scan protocol mirror (task P2-2b; Rust source of
+ * truth: `crates/urdira-worker-protocol/src/lib.rs`'s `ScanScope`/
+ * `ScanPriority`/`ScanTimings`/`ScanRoots`/`IndexingCommand::WorkspaceScan`/
+ * `IndexingEvent::{Queryable,ScanCompleted}`). Kept in this file rather than
+ * only in `packages/engine/src/rust-workspace-scan.ts` because this is the
+ * literal wire shape sent to/decoded from the worker process, mirroring how
+ * `IndexGenerationRequest`/`IndexingEvent` above are the wire shapes for the
+ * v3 protocol. */
+export type ChangedPathKind = "created" | "modified" | "deleted";
+export interface ChangedPath {
+  readonly path: string;
+  readonly kind: ChangedPathKind;
+}
+export type ScanScope = { readonly kind: "full" } | { readonly kind: "changed"; readonly paths: readonly ChangedPath[] };
+export type ScanPriority = "interactive" | "background";
+export interface ScanTimings {
+  readonly catalog_ms?: number;
+  readonly parse_ms?: number;
+  readonly resolve_ms?: number;
+  readonly materialize_ms?: number;
+  readonly write_ms?: number;
+  readonly fsync_ms?: number;
+  readonly snapshot_ms?: number;
+  readonly lexical_ms?: number;
+  readonly total_ms: number;
+}
+export interface ScanRoots {
+  readonly records: string;
+  readonly dependency: string;
+  readonly graph: string;
+  readonly metric: string;
+}
+export interface WorkspaceScanRequest {
+  readonly workspace_id: string;
+  readonly workspace_root: string;
+  readonly database_path: string;
+  readonly structural_root: string;
+  readonly cas_root: string;
+  readonly sidecar_root: string;
+  readonly scope: ScanScope;
+  readonly registry_snapshot_id: string;
+  readonly configuration_revision_id: string;
+  readonly resolution_lock_id: string;
+  readonly deadline_ms?: number;
+  readonly priority: ScanPriority;
+}
+
 export type IndexingEvent =
   | { readonly kind: "handshake_ack"; readonly request_id: string; readonly protocol_identity: string; readonly protocol_version: number }
   | { readonly kind: "progress"; readonly request_id: string; readonly operation_id: string; readonly phase: string; readonly completed_groups: number; readonly completed_owners: number; readonly completed_rows: number; readonly affected_paths?: readonly string[]; readonly changed_paths?: readonly string[]; readonly dependency_graph?: Readonly<Record<string, { readonly direct_files: readonly string[]; readonly complete: boolean }>>; readonly analysis_token?: string }
@@ -40,7 +87,17 @@ export type IndexingEvent =
   | { readonly kind: "shutdown_ack"; readonly request_id: string }
   | { readonly kind: "source_index_committed"; readonly request_id: string; readonly operation_id: string; readonly commit_count: number }
   | { readonly kind: "source_index_rolled_back"; readonly request_id: string; readonly operation_id: string }
-  | { readonly kind: "error"; readonly request_id: string; readonly code: string; readonly message: string };
+  | { readonly kind: "error"; readonly request_id: string; readonly code: string; readonly message: string }
+  /** v4: segments are on page cache, `MANIFEST.next` written; not durable yet. */
+  | { readonly kind: "queryable"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly manifest_path: string; readonly timings: ScanTimings }
+  /** v4 terminal event for `workspace_scan`, kept distinct from `completed` (v3-shaped, closed). */
+  | { readonly kind: "scan_completed"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly snapshot_id: string; readonly roots: ScanRoots; readonly timings: ScanTimings }
+  /** P1-D-c (decision 28): the background residual TypeScript-checker pass
+   * finished for the workspace the `request_id`/`operation_id` scan
+   * originally triggered, fired asynchronously well after that scan's own
+   * `scan_completed` -- see `onUpgradeCompleted` below, not the ordinary
+   * `pending`-map resolve-once dispatch every other event uses. */
+  | { readonly kind: "upgrade_completed"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly upgraded_sites: number; readonly external_sites: number; readonly unresolved_sites: number; readonly timings: ScanTimings };
 
 export interface IndexingCoreProcessDescriptor {
   readonly command: string;
@@ -63,6 +120,25 @@ export interface IndexingCoreProcessTransport {
   rollbackSourceIndex(operationId: string, workspaceId: string, databasePath: string): Promise<IndexingEvent>;
   cancel(operationId: string): Promise<IndexingEvent>;
   status(operationId: string): Promise<IndexingEvent>;
+  /** v4 cold/incremental scan (task P2-2b). Resolves with the terminal
+   * `scan_completed` event; `onQueryable`, if given, fires synchronously
+   * when the earlier `queryable` event for the same request arrives (the
+   * request is NOT resolved at that point -- unlike every other method
+   * here, this one command produces two events sharing one `request_id`,
+   * so the queryable milestone is delivered out-of-band instead of through
+   * the resolve-once `pending` map). */
+  workspaceScan(request: WorkspaceScanRequest, onQueryable?: (event: IndexingEvent & { readonly kind: "queryable" }) => void): Promise<IndexingEvent>;
+  /** P1-D-c: subscribes to every `upgrade_completed` event this worker
+   * process ever emits, for any workspace and any (possibly long-settled)
+   * `workspace_scan` request -- unlike `workspaceScan`'s `onQueryable`, this
+   * is NOT scoped to one in-flight call: the residual pass finishes
+   * asynchronously, potentially minutes after the triggering scan's own
+   * promise already resolved, so there is no live call to attach the
+   * handler to at call time. The caller correlates `event.request_id` back
+   * to a workspace itself (it is the same `request_id` that `workspaceScan`
+   * call used). Returns an unsubscribe function; call it to stop listening
+   * (e.g. on daemon shutdown for this transport). */
+  onUpgradeCompleted(handler: (event: IndexingEvent & { readonly kind: "upgrade_completed" }) => void): () => void;
   shutdown(): Promise<void>;
   terminate(): Promise<void>;
 }
@@ -95,6 +171,66 @@ function validateEvent(value: unknown): IndexingEvent {
   return value as IndexingEvent;
 }
 
+/**
+ * Fraction of the transport's byte budget one `source_index_commit` chunk is
+ * allowed to fill. Left as headroom below `maxMessageBytes` for the rest of
+ * the envelope (`operation_id`/`workspace_id`/`database_path`/`kind`/
+ * `finalize_state`/`request_id`) and for `JSON.stringify`'s size being an
+ * estimate of the eventual UTF-8-encoded frame payload, not an exact match.
+ */
+const SOURCE_INDEX_COMMIT_CHUNK_BUDGET_FRACTION = 0.9;
+
+/**
+ * Splits a `commit_source_index` payload's `commits` array into groups whose
+ * estimated encoded size each stay under `maxMessageBytes`'s budget, so a
+ * large deferred-commit batch (many artifact/version/observation rows
+ * accumulated across one workspace scan, see
+ * `packages/engine/src/workspace-indexing-session.ts`'s `deferredSourceCommits`)
+ * can be sent to the Rust worker as several bounded messages instead of one
+ * that can exceed `encodeRustWorkerMessage`'s hard cap
+ * (`rust-protocol.ts`'s `MAX_RUST_WORKER_MESSAGE_BYTES`) and abort the whole
+ * scan (see docs/evidence/2026-09-02-v4-p0-s4-promotion-gap.md, "Rust worker
+ * message exceeds its byte or in-flight budget").
+ *
+ * `apply_source_index_commits` (`crates/urdira-indexing-worker/src/main.rs`)
+ * already supports this split: every commit in a normal capture shares one
+ * `expected_state_revision` (the single frontier the whole batch was read
+ * against -- see that function's own comment), so each chunk's first commit
+ * independently satisfies the revision check, and `finalize_state: false` on
+ * every chunk but the last leaves `source_index_state` untouched until the
+ * final chunk applies the real caller-requested `finalize_state`. Never
+ * reorders or merges commit objects -- only groups whole ones, preserving
+ * the original sequence.
+ *
+ * A single commit object that is already too large to fit alone (rare: it
+ * would mean one accumulated batch, before any chunking, exceeds the byte
+ * budget by itself) is still emitted alone in its own chunk rather than
+ * dropped or mutated; the Rust worker's own byte-budget error at that point
+ * is the accurate diagnostic; splitting one commit's inner rows is out of
+ * scope here.
+ */
+export function chunkSourceIndexCommits(commits: readonly unknown[], maxMessageBytes: number): readonly (readonly unknown[])[] {
+  if (commits.length <= 1) return [commits];
+  const chunkBudgetBytes = Math.max(1, Math.floor(maxMessageBytes * SOURCE_INDEX_COMMIT_CHUNK_BUDGET_FRACTION));
+  const sizes = commits.map((commit) => Buffer.byteLength(JSON.stringify(commit), "utf8"));
+  if (sizes.reduce((total, size) => total + size, 0) <= chunkBudgetBytes) return [commits];
+  const chunks: unknown[][] = [];
+  let current: unknown[] = [];
+  let currentBytes = 0;
+  for (const [index, commit] of commits.entries()) {
+    const size = sizes[index]!;
+    if (current.length > 0 && currentBytes + size > chunkBudgetBytes) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(commit);
+    currentBytes += size;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
 /** Private framed transport for the composition worker. Owner rows are sent
  * only from the language engine to Rust; this port is never exposed by MCP. */
 export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProcessDescriptor): IndexingCoreProcessTransport {
@@ -113,6 +249,22 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
       ...(process.env["URDIRA_JSTS_HYBRID"] !== undefined ? { URDIRA_JSTS_HYBRID: process.env["URDIRA_JSTS_HYBRID"] } : {}),
       ...(process.env["URDIRA_JSTS_HYBRID_STRICT_MERGE"] === "1" ? { URDIRA_JSTS_HYBRID_STRICT_MERGE: "1" } : {}),
       ...(process.env["URDIRA_JSTS_HYBRID_PARALLELISM"] !== undefined ? { URDIRA_JSTS_HYBRID_PARALLELISM: process.env["URDIRA_JSTS_HYBRID_PARALLELISM"] } : {}),
+      // P0-S2 prototype ("typeflow" resolver, urdira v4 plan; see
+      // docs/evidence/2026-09-02-v4-p0-s2-typeflow-prototype.md). Same
+      // forward-only-when-set shape as the hybrid-lane variables above --
+      // the spawn only ever propagated PATH by default, so any new Rust-side
+      // flag needs its own explicit line here or it never reaches the
+      // worker process at all.
+      ...(process.env["URDIRA_JSTS_TYPEFLOW"] !== undefined ? { URDIRA_JSTS_TYPEFLOW: process.env["URDIRA_JSTS_TYPEFLOW"] } : {}),
+      ...(process.env["URDIRA_JSTS_TYPEFLOW_ORACLE"] !== undefined ? { URDIRA_JSTS_TYPEFLOW_ORACLE: process.env["URDIRA_JSTS_TYPEFLOW_ORACLE"] } : {}),
+      ...(process.env["URDIRA_JSTS_TYPEFLOW_ORACLE_OUT"] !== undefined ? { URDIRA_JSTS_TYPEFLOW_ORACLE_OUT: process.env["URDIRA_JSTS_TYPEFLOW_ORACLE_OUT"] } : {}),
+      // P1-D-c (decision 28): the background residual tsgo pass
+      // (`crates/urdira-indexing-worker/src/v4/residual.rs`) is gated behind
+      // this same forward-only-when-set convention -- without this line, a
+      // daemon-set `URDIRA_V4_RESIDUAL` would never reach the worker
+      // process at all, matching the typeflow flags above.
+      ...(process.env["URDIRA_V4_RESIDUAL"] !== undefined ? { URDIRA_V4_RESIDUAL: process.env["URDIRA_V4_RESIDUAL"] } : {}),
+      ...(process.env["URDIRA_TSGO_BINARY"] !== undefined ? { URDIRA_TSGO_BINARY: process.env["URDIRA_TSGO_BINARY"] } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -120,6 +272,20 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
   if (child.pid === undefined) { child.kill(); throw new Error("Indexing-core worker did not expose a process identity."); }
   const decoder = new RustWorkerFrameDecoder(maxBytes);
   const pending = new Map<string, Pending>();
+  // v4 `workspace_scan` side-channel (task P2-2b): the only command whose
+  // request_id carries TWO events (`queryable` then the terminal
+  // `scan_completed`). A handler registered here fires for the first
+  // (non-terminal) event WITHOUT touching `pending`, so the normal
+  // resolve-once dispatch below still owns the terminal event.
+  const queryableHandlers = new Map<string, (event: IndexingEvent & { readonly kind: "queryable" }) => void>();
+  // P1-D-c: persistent (never per-request, never removed on first fire)
+  // subscriber set for `upgrade_completed` -- the one event kind this
+  // transport can receive with NO corresponding `pending` entry at all
+  // (the triggering `workspace_scan` call already resolved). Checked in the
+  // dispatcher below, alongside (but independently of) `queryableHandlers`,
+  // BEFORE the "unknown request identity" fatal-and-kill-the-process path
+  // every other unrecognized frame still takes.
+  const upgradeCompletedHandlers = new Set<(event: IndexingEvent & { readonly kind: "upgrade_completed" }) => void>();
   const cancellationMarkers = new Map<string, string>();
   const markerPath = (request: IndexGenerationRequest): string => request.cancellation_path === undefined
     ? resolve(`${request.database_path}.urdira-cancel-${createHash("sha256").update(request.operation_id).digest("hex")}`)
@@ -155,9 +321,48 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
         const event = validateEvent(JSON.parse(frame.payload.toString("utf8")));
         const requestId = (event as { request_id?: unknown }).request_id;
         if (typeof requestId !== "string") throw new Error("Indexing-core event has no request identity.");
+        // P3-5 (plan §6.1's daemon-latency item, rename residual): a `workspace_scan`
+        // request_id used to be assumed to carry AT MOST one `queryable` event
+        // before its terminal event -- true when the worker performs exactly
+        // one internal generation, but NOT for a mixed burst that
+        // `crates/urdira-indexing-worker/src/v4/delta.rs` (`run`) splits into
+        // several internal generations for ONE `WorkspaceScan` command
+        // (P3-2 item 5: a delete+create pair from a rename is exactly this
+        // case) -- the worker emits one `queryable` PER internal generation,
+        // all sharing this same `request_id`, before the single terminal
+        // event for the whole command. The handler used to be deleted from
+        // `queryableHandlers` on its FIRST invocation, so a second (or
+        // later) `queryable` event fell through to the `pending` branch
+        // below and was incorrectly resolved as if it were the terminal
+        // event -- found live via a real end-to-end rename through the real
+        // daemon+watcher (`docs/evidence/2026-09-03-v4-p3-5-daemon-latency.md`),
+        // manifesting as `runRustWorkspaceScan` throwing "Rust workspace
+        // scan returned an unexpected terminal event: queryable". Fixed by
+        // keeping the handler registered (never deleting it here) and
+        // firing it for EVERY `queryable` event that names this
+        // `request_id`, however many arrive -- only the actual terminal
+        // event (below) resolves `pending` and clears `queryableHandlers`.
+        if (event.kind === "queryable") {
+          const onQueryable = queryableHandlers.get(requestId);
+          if (onQueryable !== undefined) {
+            onQueryable(event);
+            continue;
+          }
+        }
+        // P1-D-c: dispatched to every subscriber, never through `pending`
+        // (this event's `request_id` names a `workspace_scan` call that
+        // settled long ago -- looking it up in `pending` would always miss
+        // and, before this branch existed, fell through to the "unknown
+        // request identity" throw below, which kills this whole child
+        // process on the worker's first real `upgrade_completed` push).
+        if (event.kind === "upgrade_completed") {
+          for (const handler of upgradeCompletedHandlers) handler(event);
+          continue;
+        }
         const item = pending.get(requestId);
         if (item === undefined) throw new Error("Indexing-core returned an unknown request identity.");
         pending.delete(requestId); clearTimeout(item.timer);
+        queryableHandlers.delete(requestId);
         if (event.kind === "error") item.reject(new Error(`${event.code}: ${event.message}`)); else item.resolve(event);
         if (event.kind === "shutdown_ack") shutdownAcknowledged = true;
       }
@@ -169,17 +374,21 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
   });
   child.on("error", fail);
   child.on("exit", (code, signal) => { if (healthy && !shutdownAcknowledged) fail(new Error(`Indexing-core worker exited (${code ?? signal ?? "unknown"}).`)); });
-  const send = async (body: Omit<Request, "request_id">): Promise<IndexingEvent> => {
+  const sendWithId = async (requestId: string, body: Omit<Request, "request_id">): Promise<IndexingEvent> => {
     if (!healthy) throw new Error("Indexing-core worker is unavailable.");
-    const requestId = `indexing-core:${nextRequest++}`;
     const message = { ...body, request_id: requestId } as Request;
     const frames = encodeRustWorkerMessage(message, { stream_id: nextStream++, cancellation_id: requestId, byte_budget: maxBytes, in_flight_budget: maxBytes });
     return new Promise<IndexingEvent>((resolve, reject) => {
-      const timer = setTimeout(() => { pending.delete(requestId); reject(fail(new Error("Indexing-core worker request timed out."))); }, requestTimeout);
+      const timer = setTimeout(() => {
+        pending.delete(requestId);
+        queryableHandlers.delete(requestId);
+        reject(fail(new Error("Indexing-core worker request timed out.")));
+      }, requestTimeout);
       pending.set(requestId, { resolve, reject, timer });
       try { for (const frame of frames) child.stdin.write(frame); } catch (error) { reject(fail(error)); }
     });
   };
+  const send = (body: Omit<Request, "request_id">): Promise<IndexingEvent> => sendWithId(`indexing-core:${nextRequest++}`, body);
   const ready = async (): Promise<void> => {
     handshake ??= send({ kind: "handshake", protocol_identity: "urdira.indexing-core.v1" }).then((event) => {
       if (event.kind !== "handshake_ack" || event.protocol_identity !== "urdira.indexing-core.v1") throw new Error("Indexing-core handshake identity mismatch.");
@@ -215,7 +424,19 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
         return await call({ kind: "finalize_generation", operation_id, ...(publication === undefined ? {} : { publication }) });
       } finally { removeMarker(operation_id); }
     },
-    commitSourceIndex: (operation_id, workspace_id, database_path, commits, finalize_state = true) => call({ kind: "source_index_commit", operation_id, workspace_id, database_path, commits, finalize_state }),
+    commitSourceIndex: async (operation_id, workspace_id, database_path, commits, finalize_state = true) => {
+      // See `chunkSourceIndexCommits`'s doc comment: a large batch is split
+      // into several bounded messages rather than risking
+      // `encodeRustWorkerMessage`'s hard byte-budget error. The common case
+      // (one chunk) sends exactly the single request this always sent
+      // before chunking existed.
+      const chunks = chunkSourceIndexCommits(commits, maxBytes);
+      let event: IndexingEvent | undefined;
+      for (const [index, chunk] of chunks.entries()) {
+        event = await call({ kind: "source_index_commit", operation_id, workspace_id, database_path, commits: chunk, finalize_state: index === chunks.length - 1 ? finalize_state : false });
+      }
+      return event!;
+    },
     rollbackSourceIndex: (operation_id, workspace_id, database_path) => call({ kind: "source_index_rollback", operation_id, workspace_id, database_path }),
     cancel: async (operation_id) => {
       const path = cancellationMarkers.get(operation_id);
@@ -223,6 +444,20 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
       try { return await call({ kind: "cancel", operation_id }); } finally { removeMarker(operation_id); }
     },
     status: (operation_id) => call({ kind: "status", operation_id }),
+    workspaceScan: async (request, onQueryable) => {
+      await ready();
+      const requestId = `indexing-core:${nextRequest++}`;
+      if (onQueryable !== undefined) queryableHandlers.set(requestId, onQueryable);
+      try {
+        return await sendWithId(requestId, { kind: "workspace_scan", ...request });
+      } finally {
+        queryableHandlers.delete(requestId);
+      }
+    },
+    onUpgradeCompleted: (handler) => {
+      upgradeCompletedHandlers.add(handler);
+      return () => { upgradeCompletedHandlers.delete(handler); };
+    },
     shutdown: async () => { await call({ kind: "shutdown" }); },
     terminate: async () => { healthy = false; for (const operationId of cancellationMarkers.keys()) removeMarker(operationId); if (!child.killed) child.kill(); decoder.finish(); },
   };

@@ -33,10 +33,10 @@ use urdira_worker_protocol::{
 
 mod resolver;
 mod semantic_sites;
-pub use resolver::{ConfigAsset, WorkspaceResolver};
+pub use resolver::{ConfigAsset, ExportResolution, WorkspaceResolver, resolve_named_export};
 pub use semantic_sites::{
     HybridResolutionContext, OwnerSemantics, SemanticSite, SiteDisposition, SiteKind,
-    analyze_owner_semantics, analyze_owner_semantics_with_context,
+    TypeflowOracleHit, analyze_owner_semantics, analyze_owner_semantics_with_context,
 };
 
 pub const WORKER_BUILD_IDENTITY: &str = "urdira:jsts-syntax-worker:0.3.0+oxc-0.142.0.fact-groups-v1.protobuf-v3.authoritative-changes-v1.bounded-row-identities-v1.definition-syntax-v1";
@@ -291,6 +291,18 @@ pub struct ProposedRecord {
     pub identity_key: String,
     pub body: serde_json::Value,
     pub evidence_references: String,
+    /// P2-2l item 2: the exact, already-deduplicated facet list `facets`
+    /// (the canonical-JSON TEXT field above) was built from, carried
+    /// alongside it. Every producer in this crate (`lib.rs`'s two,
+    /// `semantic_sites.rs`'s seven) derives this from the SAME
+    /// `serde_json::Value` it feeds to `canonical_json` for `facets`
+    /// itself (see [`facets_list_from_value`]), so the two fields can
+    /// never drift from each other. Exists so `urdira-indexing-worker`'s
+    /// v4 hot path (`urdira_native_core::structural_kernel_rows_typed`)
+    /// can skip re-parsing `facets` back out of its own canonical JSON
+    /// text -- see that function's doc comment for why that round trip is
+    /// provably a no-op for every producer here.
+    pub facets_list: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -299,6 +311,14 @@ pub struct ProposedRecordDependency {
     pub proposal_record_key: String,
     pub dependency_artifact_id: String,
     pub dependency_artifact_version_id: String,
+    /// The dependency target's raw path (P3-2 item 3, additive field):
+    /// `urdira-indexing-worker::v4::deps` needs this, not
+    /// `dependency_artifact_id`/`dependency_artifact_version_id`, to build
+    /// a `dependency_id` comparable across independent scans -- see
+    /// `resolved_dependencies`'s doc comment for why the artifact
+    /// id/version pair is NOT stable across scans of identical content
+    /// (workspace_id and generation salting) while the raw path is.
+    pub dependency_target_path: String,
     pub dependency_role: &'static str,
     pub dependency_basis: &'static str,
     pub source_reference: serde_json::Value,
@@ -329,6 +349,15 @@ pub struct SyntaxFileResult {
     /// resolved.
     pub export_bindings: Vec<SyntaxExportBinding>,
 }
+
+/// P1-B: the sentinel `SyntaxExportBinding::local_name` for an `export * as
+/// X from "spec"` namespace re-export -- never a valid JS identifier, so it
+/// can never collide with a real re-exported name. `resolver::resolve_
+/// named_export` recognizes it and short-circuits to `ExportResolution::
+/// Namespace(target_path)` instead of chasing it as an ordinary name in the
+/// target module (there is no single symbol to chase -- `X` names the
+/// WHOLE module). See `visit_export_all_declaration`'s doc comment.
+pub(crate) const NAMESPACE_REEXPORT_LOCAL_NAME: &str = "*";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SyntaxExportBinding {
@@ -530,10 +559,189 @@ struct ProjectState {
     pending_analysis: Option<PendingAnalysis>,
 }
 
+/// P3-6 item 2: a project's reverse "which importer's specifier could
+/// resolve to this concrete path" index, maintained incrementally (never
+/// rebuilt wholesale except alongside a full/reset scan, which is already
+/// O(corpus) for other reasons) so a pure create/delete/rename call can
+/// look up a BOUNDED candidate set of importers to re-resolve instead of
+/// sweeping every file in the corpus (`reresolve_file`'s old `stale_paths`
+/// loop). Held OUTSIDE `ProjectState` (which is reconstructed fresh on
+/// every `analyze` call, not mutated in place) specifically so it can be
+/// mutated in place for just the handful of paths that actually changed
+/// this call -- an `Arc`/full-clone-on-write scheme would still cost
+/// O(index size) per call, defeating the whole point.
+#[derive(Debug, Default, Clone)]
+struct CandidateIndex {
+    /// `candidate_path -> {importer paths whose specifier resolution could
+    /// touch this path}` -- every extension/`/index` variant of every
+    /// direct-import and re-export specifier a file carries, from
+    /// [`resolver::WorkspaceResolver::candidate_paths`] (a safe
+    /// over-approximation: an extra importer here just means one harmless
+    /// extra `reresolve_file` call, never a missed one).
+    reverse: HashMap<String, BTreeSet<String>>,
+    /// `importer_path -> [candidate paths it currently contributes to
+    /// `reverse`]`, so removing/re-deriving one file's own contribution
+    /// (on edit, or on that path's removal) is O(that file's own import
+    /// count), not O(index size).
+    contributed: HashMap<String, Vec<String>>,
+}
+
+impl CandidateIndex {
+    /// Removes every candidate-path entry `path` previously contributed
+    /// (a no-op the first time a path is seen).
+    fn remove_file(&mut self, path: &str) {
+        if let Some(candidates) = self.contributed.remove(path) {
+            for candidate in candidates {
+                if let Some(importers) = self.reverse.get_mut(&candidate) {
+                    importers.remove(path);
+                    if importers.is_empty() {
+                        self.reverse.remove(&candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    /// (Re-)inserts `path`'s own contribution from its current
+    /// `direct_imports`/`export_bindings`. Callers must call
+    /// [`Self::remove_file`] first when `path` might already be indexed
+    /// (an edit that changes its imports) -- `insert_file` alone does not
+    /// know what to remove.
+    fn insert_file(&mut self, path: &str, file: &SyntaxFileResult, resolver: &WorkspaceResolver) {
+        let mut candidates: Vec<String> = Vec::new();
+        for import in &file.direct_imports {
+            candidates.extend(resolver.candidate_paths(path, &import.specifier));
+        }
+        for binding in &file.export_bindings {
+            if let Some(specifier) = &binding.source_specifier {
+                candidates.extend(resolver.candidate_paths(path, specifier));
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for candidate in &candidates {
+            self.reverse
+                .entry(candidate.clone())
+                .or_default()
+                .insert(path.to_owned());
+        }
+        if !candidates.is_empty() {
+            self.contributed.insert(path.to_owned(), candidates);
+        }
+    }
+
+    /// The bounded candidate set for a batch of created/deleted/renamed
+    /// paths: the union of every importer whose specifier's candidate list
+    /// includes ANY of `touched_paths` -- this literally IS the "created/
+    /// deleted/renamed path itself" lookup key (a candidate index entry is
+    /// keyed by the exact concrete path a specifier could resolve to, and
+    /// `touched_paths` are exact concrete paths).
+    fn importers_of(&self, touched_paths: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for path in touched_paths {
+            if let Some(importers) = self.reverse.get(path) {
+                out.extend(importers.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// Full rebuild from `files` -- used only alongside an already-O(corpus)
+    /// cold scan or full reset, where this adds no new complexity class.
+    fn rebuild(files: &BTreeMap<String, SyntaxFileResult>, resolver: &WorkspaceResolver) -> Self {
+        let mut index = CandidateIndex::default();
+        for (path, file) in files {
+            index.insert_file(path, file, resolver);
+        }
+        index
+    }
+}
+
+/// P3-6 item 3: a project's maintained reverse-import graph (`target_path
+/// -> {importer paths that resolve to it}`), the same shape `reverse_
+/// affected_closure` used to rebuild from EVERY file in the corpus (prior
+/// AND next) on every single call, content edits included -- confirmed
+/// live as a real O(corpus) cost inside the "parse" phase of a
+/// steady-state edit at n8n scale. Maintained the same way as
+/// [`CandidateIndex`] (remove-then-reinsert one file's own contribution),
+/// except keyed by `target_path` (which DOES change on `reresolve_file`,
+/// unlike the specifier text `CandidateIndex` keys on) -- so this index
+/// additionally needs updating for the create/delete/rename path's
+/// `reresolved` set, not just `changed_sources`/`removed`.
+#[derive(Debug, Default, Clone)]
+struct ImportReverseIndex {
+    reverse: HashMap<String, BTreeSet<String>>,
+    contributed: HashMap<String, Vec<String>>,
+}
+
+impl ImportReverseIndex {
+    fn remove_file(&mut self, path: &str) {
+        if let Some(targets) = self.contributed.remove(path) {
+            for target in targets {
+                if let Some(importers) = self.reverse.get_mut(&target) {
+                    importers.remove(path);
+                    if importers.is_empty() {
+                        self.reverse.remove(&target);
+                    }
+                }
+            }
+        }
+    }
+
+    fn insert_file(&mut self, path: &str, file: &SyntaxFileResult) {
+        let mut targets: Vec<String> = file
+            .direct_imports
+            .iter()
+            .filter_map(|import| import.target_path.clone())
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        for target in &targets {
+            self.reverse
+                .entry(target.clone())
+                .or_default()
+                .insert(path.to_owned());
+        }
+        if !targets.is_empty() {
+            self.contributed.insert(path.to_owned(), targets);
+        }
+    }
+
+    /// Same BFS `reverse_affected_closure` always did, just against an
+    /// incrementally maintained map instead of one rebuilt from scratch.
+    fn affected_closure(&self, changed: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut affected = changed.clone();
+        let mut queue: VecDeque<String> = changed.iter().cloned().collect();
+        while let Some(target) = queue.pop_front() {
+            for dependent in self.reverse.get(&target).into_iter().flatten() {
+                if affected.insert(dependent.clone()) {
+                    queue.push_back(dependent.clone());
+                }
+            }
+        }
+        affected
+    }
+
+    fn rebuild(files: &BTreeMap<String, SyntaxFileResult>) -> Self {
+        let mut index = ImportReverseIndex::default();
+        for (path, file) in files {
+            index.insert_file(path, file);
+        }
+        index
+    }
+}
+
 #[derive(Debug)]
 pub struct SyntaxWorkerState {
     projects: HashMap<String, ProjectState>,
     next_analysis_sequence: u64,
+    /// One [`CandidateIndex`] per project key (P3-6 item 2). Absent is
+    /// exactly equivalent to empty (lazily rebuilt on the next call that
+    /// needs it) -- see `analyze`'s own maintenance logic.
+    candidate_indexes: HashMap<String, CandidateIndex>,
+    /// One [`ImportReverseIndex`] per project key (P3-6 item 3). Same
+    /// absent-is-empty convention as `candidate_indexes`.
+    import_reverse_indexes: HashMap<String, ImportReverseIndex>,
 }
 
 impl Default for SyntaxWorkerState {
@@ -541,6 +749,8 @@ impl Default for SyntaxWorkerState {
         Self {
             projects: HashMap::new(),
             next_analysis_sequence: 1,
+            candidate_indexes: HashMap::new(),
+            import_reverse_indexes: HashMap::new(),
         }
     }
 }
@@ -564,10 +774,16 @@ impl SyntaxWorkerState {
 
     pub fn reset(&mut self, project_key: Option<&str>) -> usize {
         match project_key {
-            Some(key) => usize::from(self.projects.remove(key).is_some()),
+            Some(key) => {
+                self.candidate_indexes.remove(key);
+                self.import_reverse_indexes.remove(key);
+                usize::from(self.projects.remove(key).is_some())
+            }
             None => {
                 let count = self.projects.len();
                 self.projects.clear();
+                self.candidate_indexes.clear();
+                self.import_reverse_indexes.clear();
                 count
             }
         }
@@ -786,6 +1002,47 @@ impl SyntaxWorkerState {
         Ok(response)
     }
 
+    /// v4 in-process fast path (P2-2g item 1). `read_facts`/`read_facts_
+    /// group` above exist to serve an out-of-process worker across a
+    /// byte-bounded IPC channel: every call re-derives `ProposedRecord`s for
+    /// its requested slice, then `read_facts_group`'s caller
+    /// (`serialized_response_length`) round-trips the ENTIRE growing page
+    /// through `serde_json::to_vec` 2-4 times (a fixed-point loop that
+    /// converges once the embedded byte-count's own digit width stops
+    /// changing) purely to police `max_output_bytes`/`max_rows` — a real
+    /// concern for a byte-bounded channel, pure waste for an in-process
+    /// caller like `urdira-indexing-worker`'s v4 pipeline, which holds this
+    /// `SyntaxWorkerState` directly and never serializes a `WorkerMessage`
+    /// at all. Measured live on n8n (14,082 owners): the `read_facts_group`
+    /// path cost ~12s; this path (same `proposed_records`/`proposed_
+    /// dependencies` builders, zero budget/cursor/serialization overhead)
+    /// is the fix — see this task's evidence doc §14 for the before/after.
+    ///
+    /// Returns every requested path's COMPLETE fact set in one shot (no
+    /// cursor: an in-process caller can hold the whole `Vec` per file, it
+    /// never has to fit inside a wire frame). Unlike `read_facts_group`,
+    /// `paths` may repeat or be given in any order; a path absent from the
+    /// project is an error, matching `read_facts`'s existing behavior for
+    /// an unknown path.
+    pub fn facts_for_paths(
+        &self,
+        project_key: &str,
+        paths: &[String],
+    ) -> Result<Vec<FactsForPath>, AnalysisError> {
+        validate_identifier(project_key, "project_key")?;
+        let project = self
+            .projects
+            .get(project_key)
+            .ok_or_else(|| AnalysisError {
+                code: ErrorCode::AnalysisFailed,
+                message: "syntax project state is unavailable".into(),
+            })?;
+        paths
+            .iter()
+            .map(|path| facts_for_one_path(project, path))
+            .collect()
+    }
+
     pub fn commit_analysis(
         &mut self,
         request_id: String,
@@ -886,7 +1143,29 @@ impl SyntaxWorkerState {
         if root_names.iter().any(|root| !paths.contains(root)) {
             return protocol_error("every root name must name an explicit source input");
         }
-        let prior = self.projects.get(&project_key).cloned();
+        // P3-3 item 3: was `self.projects.get(&project_key).cloned()` -- an
+        // UNCONDITIONAL full clone of the ENTIRE prior `ProjectState` on
+        // EVERY call (cold, edit, add/remove alike), including its
+        // `files: BTreeMap<String, SyntaxFileResult>` (one entry per
+        // corpus file, each carrying its own `entities`/`relations`/
+        // `direct_imports`/`export_bindings` vectors) -- genuinely
+        // O(corpus) regardless of how small the actual edit is, and (for
+        // the two branches below that also do `state.files.clone()`) paid
+        // TWICE over: once here, once more to seed `next_files`. Measured
+        // as the dominant cost of `parse_ms` for a steady-state 1-file
+        // edit at n8n scale (`docs/evidence/2026-09-03-v4-p3-3-digest-
+        // churn.md` §item 3). A borrow instead of a clone: every `prior`
+        // read below (root_names/configuration_digest/source_metadata/
+        // pending_analysis comparisons, and `reverse_affected_closure`'s
+        // own read of `&state.files`) only ever needs `&ProjectState`, not
+        // an owned one -- the ONE real clone this function needs
+        // (`next_files`'s own starting point, since it goes on to be
+        // mutated independently of the retained `self.projects` entry) is
+        // still paid, exactly once, at its own call site below, never
+        // twice. This borrow's last use is always before this function's
+        // own `self.projects.insert(...)`/`self.projects.get_mut(...)`
+        // calls (verified by the borrow checker, not asserted by hand).
+        let prior = self.projects.get(&project_key);
         let prior_paths = prior
             .as_ref()
             .map(|state| state.files.keys().cloned().collect::<BTreeSet<_>>());
@@ -1092,22 +1371,105 @@ impl SyntaxWorkerState {
                 Err(error) => return Err(error),
             }
         }
+        // P3-6 item 2: maintain this project's reverse candidate-path
+        // index (`CandidateIndex`) BEFORE using it below to narrow the
+        // create/delete/rename re-resolution sweep -- a file's specifier
+        // text (what the index is keyed from) only ever changes when that
+        // file is actually reparsed, which happens for exactly the paths
+        // in `changed_sources` (added paths, in path-membership-incremental
+        // mode; literally-edited paths otherwise) and never for a path
+        // that's merely `reresolve_file`'d (that only rewrites
+        // `target_path`, not the specifier text an import/re-export
+        // names). `removed` paths must have their own contribution dropped
+        // so a later create/delete call never uses a deleted file's now-
+        // meaningless specifiers to widen its lookup. A cold scan or full
+        // reset touches every path in `next_files`, so it's cheaper (and
+        // simpler to prove correct) to just rebuild the whole index from
+        // scratch there -- already an O(corpus) call for other reasons.
+        {
+            let index = self
+                .candidate_indexes
+                .entry(project_key.clone())
+                .or_default();
+            if reset_reason.is_some() && !path_membership_incremental {
+                *index = CandidateIndex::rebuild(&next_files, resolver);
+            } else {
+                for path in &removed {
+                    index.remove_file(path);
+                }
+                for path in changed_sources.iter().map(|source| &source.path) {
+                    index.remove_file(path);
+                    if let Some(file) = next_files.get(path.as_str()) {
+                        index.insert_file(path, file, resolver);
+                    }
+                }
+            }
+        }
+        // P3-6 item 3: same incremental-maintenance shape as the candidate
+        // index just above, for `reverse_affected_closure`'s reverse-
+        // import graph (`target_path -> importers`). Kept as a SEPARATE
+        // index (not folded into `CandidateIndex`) because it's keyed by
+        // `target_path`, which the reresolve loop below DOES mutate (a
+        // create/delete/rename can change what a stable file's specifier
+        // resolves to) -- `CandidateIndex` is keyed by specifier TEXT,
+        // which reresolution never touches. Updated for `changed_sources`/
+        // `removed` here (mirrors `next_files`'s state as of this point);
+        // updated again for `reresolved` right after that loop runs.
+        {
+            let index = self
+                .import_reverse_indexes
+                .entry(project_key.clone())
+                .or_default();
+            if reset_reason.is_some() && !path_membership_incremental {
+                *index = ImportReverseIndex::rebuild(&next_files);
+            } else {
+                for path in &removed {
+                    index.remove_file(path);
+                }
+                for path in changed_sources.iter().map(|source| &source.path) {
+                    index.remove_file(path);
+                    if let Some(file) = next_files.get(path.as_str()) {
+                        index.insert_file(path, file);
+                    }
+                }
+            }
+        }
         // T1: a path add/remove can change the resolved `target_path` of an
         // OTHER, byte-identical file's relative/bare import specifier --
         // both when a specifier that used to be unresolved now finds the
         // added path, and when a higher-resolution-priority path shadows
         // (add) or stops shadowing (remove) a specifier's previous target
         // (see `resolve_relative`/`probe_extensions`'s fixed extension
-        // order). Re-resolving is cheap (no re-parse; a handful of
-        // `BTreeSet` probes per existing import) so every retained file is
-        // checked exactly, never guessed at from specifier text alone.
+        // order). P3-6 item 2: narrowed from an O(corpus) sweep of every
+        // retained path to the BOUNDED set the reverse candidate index
+        // above names as possibly touched by `added`/`removed` -- any
+        // importer whose specifier's candidate-path list includes one of
+        // those exact paths (covers both "a specifier that used to be
+        // unresolved now finds the added path" and "a higher-priority
+        // extension shadows/unshadows a specifier's previous target",
+        // since `CandidateIndex` is keyed by every extension/`/index`
+        // variant, not just whichever one currently resolves). Falls back
+        // to the old full sweep only if this project somehow has no index
+        // yet (defensive; every code path above that returns from this
+        // function also updates the index, so this should never fire in
+        // practice).
         let mut reresolved: BTreeSet<String> = BTreeSet::new();
         if path_membership_incremental {
-            let stale_paths: Vec<String> = next_files
-                .keys()
-                .filter(|path| !changed.contains(path.as_str()))
-                .cloned()
-                .collect();
+            let touched: BTreeSet<String> = added.iter().chain(removed.iter()).cloned().collect();
+            let stale_paths: Vec<String> = match self.candidate_indexes.get(&project_key) {
+                Some(index) => index
+                    .importers_of(&touched)
+                    .into_iter()
+                    .filter(|path| {
+                        next_files.contains_key(path) && !changed.contains(path.as_str())
+                    })
+                    .collect(),
+                None => next_files
+                    .keys()
+                    .filter(|path| !changed.contains(path.as_str()))
+                    .cloned()
+                    .collect(),
+            };
             for path in stale_paths {
                 if cancelled.load(Ordering::Acquire) {
                     return Ok(WorkerMessage::Cancelled {
@@ -1124,22 +1486,60 @@ impl SyntaxWorkerState {
                 }
             }
         }
+        // P3-6 item 3: `reresolve_file` above may have changed a stable
+        // path's `target_path` (that's the whole point of it) without
+        // changing its specifier text -- refresh THIS path's own
+        // contribution to the reverse-import index now that its outgoing
+        // edges are known to be current. `CandidateIndex` needs no
+        // equivalent step here (specifier text, its own key, never
+        // changes from reresolution alone).
+        if !reresolved.is_empty() {
+            let index = self
+                .import_reverse_indexes
+                .entry(project_key.clone())
+                .or_default();
+            for path in &reresolved {
+                index.remove_file(path);
+                if let Some(file) = next_files.get(path.as_str()) {
+                    index.insert_file(path, file);
+                }
+            }
+        }
+        // P3-6 item 3: `reverse_affected_closure`'s own O(corpus)-per-call
+        // rebuild replaced with a lookup against the maintained `Import
+        // ReverseIndex` above -- same BFS, same result (the maintained
+        // index mirrors `next_files`'s current reverse-import graph
+        // exactly, and every literal seed of the BFS below is already a
+        // member of `changed`/`closure_changed` regardless of what the
+        // graph itself contains, so which generation's snapshot the graph
+        // reflects cannot change the OUTPUT set -- verified, not just
+        // argued, by every existing closure/root-equality test plus this
+        // task's own new randomized test still passing). Falls back to the
+        // old from-scratch rebuild only if this project has no index yet
+        // (defensive; every path that returns from this function updates
+        // the index, so this should never fire in practice).
         let affected = if path_membership_incremental {
             let closure_changed: BTreeSet<String> =
                 added.iter().chain(reresolved.iter()).cloned().collect();
-            reverse_affected_closure(
-                prior.as_ref().map(|state| &state.files),
-                &next_files,
-                &closure_changed,
-            )
+            match self.import_reverse_indexes.get(&project_key) {
+                Some(index) => index.affected_closure(&closure_changed),
+                None => reverse_affected_closure(
+                    prior.as_ref().map(|state| &state.files),
+                    &next_files,
+                    &closure_changed,
+                ),
+            }
         } else if reset_reason.is_some() {
             paths
         } else {
-            reverse_affected_closure(
-                prior.as_ref().map(|state| &state.files),
-                &next_files,
-                &changed,
-            )
+            match self.import_reverse_indexes.get(&project_key) {
+                Some(index) => index.affected_closure(&changed),
+                None => reverse_affected_closure(
+                    prior.as_ref().map(|state| &state.files),
+                    &next_files,
+                    &changed,
+                ),
+            }
         };
         let metrics = BoundaryMetrics {
             bytes_read: source_bytes,
@@ -1342,6 +1742,36 @@ fn validate_facts_cursor(
     Ok(())
 }
 
+/// One path's complete fact set, `facts_for_paths`'s per-path result. Same
+/// fields `FactsResult` carries for records/dependencies/direct_imports,
+/// minus everything that only exists to serve the paged/budgeted wire
+/// protocol (`content_digest`/`language`/`script_kind`/`byte_length`/
+/// `parsed`/`diagnostics`/`next_cursor`/`metrics` — a v4 caller already has
+/// all of that from `analyze()`'s own result, or (diagnostics) never wants
+/// it at all, per `analyze.rs`'s module doc: "No `jsts:diagnostic` records
+/// are produced anywhere in this module").
+pub struct FactsForPath {
+    pub path: String,
+    pub direct_imports: Vec<DirectImport>,
+    pub records: Vec<ProposedRecord>,
+    pub dependencies: Vec<ProposedRecordDependency>,
+}
+
+fn facts_for_one_path(project: &ProjectState, path: &str) -> Result<FactsForPath, AnalysisError> {
+    let file = project.files.get(path).ok_or_else(|| AnalysisError {
+        code: ErrorCode::ProtocolInvalid,
+        message: format!("fact path is not present in syntax project: {path}"),
+    })?;
+    let record_count = file.entities.len().saturating_add(file.relations.len());
+    let dependency_count = resolved_dependencies(project, file).count();
+    Ok(FactsForPath {
+        path: path.to_owned(),
+        direct_imports: file.direct_imports.clone(),
+        records: proposed_records(file, 0, record_count),
+        dependencies: proposed_dependencies(project, file, 0, dependency_count),
+    })
+}
+
 fn remaining_fact_rows(
     project: &ProjectState,
     file: &SyntaxFileResult,
@@ -1533,6 +1963,7 @@ fn proposal_entity_record(entity: &SyntaxEntity, language: Language) -> Proposed
     } else {
         serde_json::json!(["core:declaration", "core:definition", "core:member"])
     };
+    let facets_list = facets_list_from_value(&facets);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&entity.id),
         category: "entity",
@@ -1544,6 +1975,7 @@ fn proposal_entity_record(entity: &SyntaxEntity, language: Language) -> Proposed
         identity_key: entity.id.clone(),
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(&entity.path, entity.start, entity.end),
+        facets_list,
     }
 }
 
@@ -1576,6 +2008,7 @@ fn proposal_relation_record(relation: &SyntaxRelation) -> ProposedRecord {
     } else {
         serde_json::json!(["core:reference_relation"])
     };
+    let facets_list = facets_list_from_value(&facets);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&relation.id),
         category: "relation",
@@ -1587,6 +2020,7 @@ fn proposal_relation_record(relation: &SyntaxRelation) -> ProposedRecord {
         identity_key: relation.id.clone(),
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(&relation.path, relation.start, relation.end),
+        facets_list,
     }
 }
 
@@ -1599,7 +2033,7 @@ fn proposed_dependencies(
     resolved_dependencies(project, file)
         .skip(start)
         .take(end.saturating_sub(start))
-        .map(|(relation, metadata)| {
+        .map(|(relation, metadata, target_path)| {
             let proposal_record_key = proposal_record_key(&relation.id);
             let mut source_reference = serde_json::Map::new();
             source_reference.insert(
@@ -1622,6 +2056,7 @@ fn proposed_dependencies(
                 proposal_record_key,
                 dependency_artifact_id: metadata.artifact_id.clone(),
                 dependency_artifact_version_id: metadata.artifact_version_id.clone(),
+                dependency_target_path: target_path.to_string(),
                 dependency_role: "jsts:resolution_input",
                 dependency_basis: "checker_resolution",
                 source_reference: serde_json::Value::Object(source_reference),
@@ -1664,10 +2099,26 @@ pub(crate) fn bounded_sha256_identity(prefix: &str, domain: &[u8], values: &[&st
     identity
 }
 
+/// Third tuple element is the dependency TARGET's raw path -- P3-2 item 3
+/// needs this (not just `metadata.artifact_id`/`artifact_version_id`) to
+/// build a `dependency_id` that is comparable across two independent scans
+/// of the SAME content: `artifact_id` is salted with `workspace_id`
+/// (`urdira-source-frontier::ids::artifact_id`) and `artifact_version_id`
+/// is additionally salted with the scan's own `generation`
+/// (`ids::artifact_version_id` -> `source_observation_id` ->
+/// `observation_batch_id(workspace_id, generation)`) -- neither is stable
+/// across an incremental store (built across several generations, one
+/// workspace_id) versus an independent from-scratch oracle scan (always
+/// generation 1, and in practice often a DIFFERENT workspace_id, e.g. a
+/// throwaway comparison workspace) of otherwise-identical content. The raw
+/// PATH has neither salt -- the same primitive `stable_entity_id`'s own
+/// `jsts:entity_container`/module identity already uses, which is why
+/// `records`/`graph` roots already compare correctly across such scans
+/// (confirmed live, `urdira-indexing-worker`'s n8n-scale oracle test).
 fn resolved_dependencies<'a>(
     project: &'a ProjectState,
     file: &'a SyntaxFileResult,
-) -> impl Iterator<Item = (&'a SyntaxRelation, &'a SourceMetadata)> + 'a {
+) -> impl Iterator<Item = (&'a SyntaxRelation, &'a SourceMetadata, &'a str)> + 'a {
     file.relations.iter().filter_map(move |relation| {
         if !matches!(relation.kind, RelationKind::Import | RelationKind::Export) {
             return None;
@@ -1687,7 +2138,7 @@ fn resolved_dependencies<'a>(
                 .then_some(path)
         })?;
         let metadata = project.source_metadata.get(target_path)?;
-        (target_path != file.path).then_some((relation, metadata))
+        (target_path != file.path).then_some((relation, metadata, target_path))
     })
 }
 
@@ -1701,6 +2152,29 @@ pub(crate) fn canonical_span(path: &str, start: u32, end: u32) -> String {
 
 pub(crate) fn canonical_evidence(path: &str, start: u32, end: u32) -> String {
     canonical_json(&serde_json::json!([{ "path": path, "start": start, "end": end }]))
+}
+
+/// P2-2l item 2: extracts the flat string list every `facets` value this
+/// crate builds is derived from (`json!([...])`, always a JSON array of
+/// plain strings -- confirmed by reading every `ProposedRecord` producer
+/// in this crate, `lib.rs`'s two and `semantic_sites.rs`'s seven) directly
+/// from the SAME `Value` fed to `canonical_json` for the text field, so
+/// `ProposedRecord::facets_list` can never drift from `ProposedRecord::
+/// facets`. Panics only if a producer ever stops building `facets` this
+/// way (a programmer error caught immediately by any test exercising that
+/// producer, not a real-input data-shape possibility).
+pub(crate) fn facets_list_from_value(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .expect("facets is always built as a JSON array literal")
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .expect("facets entries are always string literals")
+                .to_owned()
+        })
+        .collect()
 }
 
 const fn entity_kind_name(kind: EntityKind) -> &'static str {
@@ -2321,6 +2795,29 @@ impl<'a> Visit<'a> for SyntaxCollector {
             declaration.span.start,
             declaration.source.span.end,
         );
+        // P1-B: `export * as X from "spec"` (as opposed to a plain,
+        // nameless `export * from "spec"`, which stays exactly as before --
+        // E2's re-export machinery deliberately never captures it, see
+        // `SyntaxFileResult::export_bindings`'s doc comment) now ALSO
+        // synthesizes a `SyntaxExportBinding` for `X` naming the WHOLE
+        // re-exported module as a namespace -- `local_name` is the
+        // sentinel `NAMESPACE_REEXPORT_LOCAL_NAME` (never a real
+        // identifier), which `resolver::resolve_named_export` recognizes
+        // and returns as `ExportResolution::Namespace(target_path)` rather
+        // than chasing it as an ordinary re-exported NAME (there is no
+        // single symbol here -- it is the whole module). `source_target_
+        // path` is left `None` here and filled in by the SAME generic
+        // per-binding resolution pass every other `source_specifier`-
+        // bearing binding already goes through (this file's own caller,
+        // `parse_source`), not a special case.
+        if let Some(exported) = &declaration.exported {
+            self.export_bindings.push(SyntaxExportBinding {
+                exported_name: module_export_name_text(exported),
+                local_name: NAMESPACE_REEXPORT_LOCAL_NAME.to_owned(),
+                source_specifier: Some(declaration.source.value.as_str().to_owned()),
+                source_target_path: None,
+            });
+        }
         walk_export_all_declaration(self, declaration);
     }
 
@@ -3408,6 +3905,326 @@ declare module 'markdown-it-task-lists' {
     }
 
     #[test]
+    fn incremental_rename_via_delete_plus_create_repoints_importers_that_used_the_new_name() {
+        // A rename is a delete + a create in the SAME batch: `old.ts` goes
+        // away, `new.ts` appears. Two separate importers -- one that named
+        // the OLD path (must regress to unresolved) and one that already
+        // named the NEW path (was unresolved, must now resolve) -- so this
+        // test cannot pass by accident of only exercising one direction.
+        let mut incremental_state = SyntaxWorkerState::default();
+        analyze(
+            &mut incremental_state,
+            vec![
+                source(
+                    "importer_of_old.ts",
+                    "import { v } from './old'; export const a = 1;",
+                ),
+                source(
+                    "importer_of_new.ts",
+                    "import { v } from './new'; export const b = 1;",
+                ),
+                source("old.ts", "export const v = 1;"),
+            ],
+            &["importer_of_old.ts", "importer_of_new.ts", "old.ts"],
+            '1',
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["importer_of_old.ts"].direct_imports[0]
+                .target_path
+                .as_deref(),
+            Some("old.ts")
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["importer_of_new.ts"].direct_imports[0]
+                .target_path,
+            None
+        );
+
+        let WorkerMessage::AnalysisResult { build, .. } = analyze_exact(
+            &mut incremental_state,
+            vec![
+                source(
+                    "importer_of_old.ts",
+                    "import { v } from './old'; export const a = 1;",
+                ),
+                source(
+                    "importer_of_new.ts",
+                    "import { v } from './new'; export const b = 1;",
+                ),
+                source("new.ts", "export const v = 1;"),
+            ],
+            &["importer_of_old.ts", "importer_of_new.ts", "new.ts"],
+            '1',
+            &["artifact:new.ts", "artifact:old.ts"],
+        ) else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Incremental);
+
+        let mut full_state = SyntaxWorkerState::default();
+        analyze(
+            &mut full_state,
+            vec![
+                source(
+                    "importer_of_old.ts",
+                    "import { v } from './old'; export const a = 1;",
+                ),
+                source(
+                    "importer_of_new.ts",
+                    "import { v } from './new'; export const b = 1;",
+                ),
+                source("new.ts", "export const v = 1;"),
+            ],
+            &["importer_of_old.ts", "importer_of_new.ts", "new.ts"],
+            '1',
+        );
+
+        assert_eq!(
+            incremental_state.projects["project:one"].files,
+            full_state.projects["project:one"].files
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["importer_of_old.ts"].direct_imports[0]
+                .target_path,
+            None
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["importer_of_new.ts"].direct_imports[0]
+                .target_path
+                .as_deref(),
+            Some("new.ts")
+        );
+    }
+
+    #[test]
+    fn incremental_root_add_resolves_a_directory_import_via_index_ts() {
+        // `./dir` can only ever resolve through `probe_extensions`'s
+        // `/index`+extension branch -- a distinct code path from a bare
+        // `./name` + extension match, and the one P3-6 item 2's candidate
+        // index must also cover (`push_candidate_variants` emits `{base}/
+        // index{ext}` entries, not just `{base}{ext}`).
+        let mut incremental_state = SyntaxWorkerState::default();
+        analyze(
+            &mut incremental_state,
+            vec![source(
+                "importer.ts",
+                "import { v } from './dir'; export const a = 1;",
+            )],
+            &["importer.ts"],
+            '1',
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["importer.ts"].direct_imports[0]
+                .target_path,
+            None
+        );
+
+        let WorkerMessage::AnalysisResult { build, .. } = analyze_exact(
+            &mut incremental_state,
+            vec![
+                source(
+                    "importer.ts",
+                    "import { v } from './dir'; export const a = 1;",
+                ),
+                source("dir/index.ts", "export const v = 1;"),
+            ],
+            &["importer.ts", "dir/index.ts"],
+            '1',
+            &["artifact:dir/index.ts"],
+        ) else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Incremental);
+
+        let mut full_state = SyntaxWorkerState::default();
+        analyze(
+            &mut full_state,
+            vec![
+                source(
+                    "importer.ts",
+                    "import { v } from './dir'; export const a = 1;",
+                ),
+                source("dir/index.ts", "export const v = 1;"),
+            ],
+            &["importer.ts", "dir/index.ts"],
+            '1',
+        );
+
+        assert_eq!(
+            incremental_state.projects["project:one"].files,
+            full_state.projects["project:one"].files
+        );
+        assert_eq!(
+            incremental_state.projects["project:one"].files["importer.ts"].direct_imports[0]
+                .target_path
+                .as_deref(),
+            Some("dir/index.ts")
+        );
+    }
+
+    /// A small, dependency-free xorshift64* PRNG -- deterministic across
+    /// runs/platforms (unlike relying on a system RNG or adding a `rand`
+    /// dependency just for one test) so a failure here is exactly
+    /// reproducible from the fixed seed below.
+    struct XorShift64(u64);
+    impl XorShift64 {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn next_range(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    #[test]
+    fn narrowed_create_delete_matches_full_reresolution_on_a_synthetic_300_file_project() {
+        // P3-6 item 2's own correctness gate: the narrowed (bounded
+        // candidate-index) re-resolution sweep must be byte-for-byte
+        // IDENTICAL to a from-scratch full re-resolution, for every step of
+        // a long randomized create/delete sequence over a synthetic corpus
+        // shaped to exercise every case the index has to get right at
+        // once -- fan-in (many importers naming the same target base),
+        // extension-priority shadowing (`.js` beats `.ts` in
+        // `RESOLUTION_EXTENSIONS`, so both variants of the same base
+        // toggle independently), and directory-index resolution. 30 target
+        // bases x 2 extension variants (60 possible target files) + 240
+        // fan-in importers = up to 300 distinct paths, matching the task's
+        // own "synthetic 300-file project" scale.
+        const TARGET_BASES: usize = 30;
+        const IMPORTERS: usize = 240;
+        const STEPS: usize = 30;
+
+        // This corpus (up to 300 files) exceeds `analyze`/`analyze_exact`'s
+        // shared `max_files: 100` test budget, so this test drives
+        // `SyntaxWorkerState::analyze` directly with a larger one.
+        fn run(
+            state: &mut SyntaxWorkerState,
+            sources: Vec<SourceInput>,
+            roots: &[&str],
+            change_set: AuthoritativeChangeSet,
+        ) -> WorkerMessage {
+            state
+                .analyze(
+                    "request:one".into(),
+                    "cancel:one".into(),
+                    "project:one".into(),
+                    format!("sha256:{}", "1".repeat(64)),
+                    roots.iter().map(|root| (*root).into()).collect(),
+                    sources,
+                    Vec::new(),
+                    change_set,
+                    AnalysisBudgets {
+                        max_output_bytes: 10_000_000,
+                        max_files: 1000,
+                        max_source_bytes: 10_000_000,
+                    },
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+        }
+
+        let mut rng = XorShift64(0x9E3779B97F4A7C15);
+        // `present[k] = (ts_present, js_present)` for target base `k`.
+        let mut present: Vec<(bool, bool)> = (0..TARGET_BASES)
+            .map(|_| (rng.next_range(2) == 1, rng.next_range(2) == 1))
+            .collect();
+
+        let importer_source = |i: usize| -> SourceInput {
+            let base = i % TARGET_BASES;
+            source(
+                &format!("importer_{i}.ts"),
+                &format!("import {{ v }} from './target_{base}'; export const imp{i} = 1;"),
+            )
+        };
+        let target_source = |k: usize, ext: &str| -> SourceInput {
+            source(
+                &format!("target_{k}{ext}"),
+                &format!("export const v = {k};"),
+            )
+        };
+
+        let build_sources_and_roots =
+            |present: &[(bool, bool)]| -> (Vec<SourceInput>, Vec<String>) {
+                let mut sources: Vec<SourceInput> = (0..IMPORTERS).map(importer_source).collect();
+                for (k, &(has_ts, has_js)) in present.iter().enumerate() {
+                    if has_ts {
+                        sources.push(target_source(k, ".ts"));
+                    }
+                    if has_js {
+                        sources.push(target_source(k, ".js"));
+                    }
+                }
+                let roots = sources.iter().map(|s| s.path.clone()).collect();
+                (sources, roots)
+            };
+
+        let mut incremental_state = SyntaxWorkerState::default();
+        {
+            let (sources, roots) = build_sources_and_roots(&present);
+            let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+            run(
+                &mut incremental_state,
+                sources,
+                &root_refs,
+                AuthoritativeChangeSet::Full,
+            );
+        }
+
+        for step in 0..STEPS {
+            let base = rng.next_range(TARGET_BASES);
+            let want_js = rng.next_range(2) == 1;
+            let (ts, js) = &mut present[base];
+            let (ext, was_present) = if want_js { (".js", *js) } else { (".ts", *ts) };
+            let changed_artifact = format!("artifact:target_{base}{ext}");
+            if want_js {
+                *js = !was_present;
+            } else {
+                *ts = !was_present;
+            }
+
+            let (sources, roots) = build_sources_and_roots(&present);
+            let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+            let WorkerMessage::AnalysisResult { build, .. } = run(
+                &mut incremental_state,
+                sources,
+                &root_refs,
+                AuthoritativeChangeSet::Exact {
+                    changed_artifact_ids: vec![changed_artifact.clone()],
+                },
+            ) else {
+                panic!("expected result at step {step}");
+            };
+            assert_eq!(
+                build,
+                BuildKind::Incremental,
+                "step {step} unexpectedly took the full-reset path"
+            );
+
+            let mut full_state = SyntaxWorkerState::default();
+            let (full_sources, full_roots) = build_sources_and_roots(&present);
+            let full_root_refs: Vec<&str> = full_roots.iter().map(String::as_str).collect();
+            run(
+                &mut full_state,
+                full_sources,
+                &full_root_refs,
+                AuthoritativeChangeSet::Full,
+            );
+
+            assert_eq!(
+                incremental_state.projects["project:one"].files,
+                full_state.projects["project:one"].files,
+                "narrowed re-resolution diverged from a full rebuild at step {step} \
+                 (toggled target_{base}{ext})"
+            );
+        }
+    }
+
+    #[test]
     fn unresolved_relative_imports_do_not_expand_stable_content_edits() {
         let mut state = SyntaxWorkerState::default();
         let roots = ["broken.ts", "changed.ts", "unrelated.ts"];
@@ -3863,5 +4680,51 @@ declare module 'markdown-it-task-lists' {
         assert!(changed_files.is_empty());
         assert_eq!(replayed_token, analysis_token);
         assert_eq!(replayed_affected, affected_files);
+    }
+
+    fn collect(path: &str, source_text: &str) -> SyntaxCollector {
+        let source_type = SourceType::from_path(std::path::Path::new(path)).expect("source type");
+        let allocator = Allocator::default();
+        let mut parsed = Parser::new(&allocator, source_text, source_type).parse();
+        Utf8ToUtf16::new(source_text).convert_program(&mut parsed.program);
+        let mut collector = SyntaxCollector::new(path, source_text.encode_utf16().count() as u32);
+        collector.visit_program(&parsed.program);
+        collector
+    }
+
+    // P1-B: `export * as X from "spec"` lane-1 widening.
+
+    #[test]
+    fn export_all_as_synthesizes_a_namespace_binding() {
+        let collector = collect("index.ts", "export * as evals from './evals/index';\n");
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "evals");
+        assert_eq!(binding.local_name, NAMESPACE_REEXPORT_LOCAL_NAME);
+        assert_eq!(binding.source_specifier.as_deref(), Some("./evals/index"));
+        // Filled in by `parse_source`'s own generic per-binding resolution
+        // pass, not here.
+        assert_eq!(binding.source_target_path, None);
+    }
+
+    #[test]
+    fn plain_export_star_still_synthesizes_no_binding() {
+        // E2's existing "export * is never captured" behavior (see
+        // `SyntaxFileResult::export_bindings`'s doc comment) MUST stay
+        // unchanged for the nameless form.
+        let collector = collect("index.ts", "export * from './evals/index';\n");
+        assert!(collector.export_bindings.is_empty());
+    }
+
+    #[test]
+    fn export_all_as_string_literal_name_synthesizes_a_namespace_binding() {
+        // `export * as "eval s"` (a string-literal export name, legal ESM)
+        // -- `module_export_name_text` already handles this shape.
+        let collector = collect(
+            "index.ts",
+            "export * as \"eval-utils\" from './evals/index';\n",
+        );
+        assert_eq!(collector.export_bindings.len(), 1);
+        assert_eq!(collector.export_bindings[0].exported_name, "eval-utils");
     }
 }

@@ -86,6 +86,23 @@ const diagnosticPayload: ClosedPayloadSchema = Object.freeze({
     path: { type: "string", description: "Normalized owner source path." },
     start: { type: "integer", minimum: 0, description: "Start offset when available." },
     end: { type: "integer", minimum: 0, description: "Exclusive end offset when available." },
+    // P2-2i: v4's Rust pipeline has no compiler to cross-reference for
+    // context, so it surfaces the pending site's own reason directly on a
+    // `jsts:unresolved_call` diagnostic instead -- v3 never populated this
+    // field (its `diagnostics.push` call carries no reason at all). Values
+    // are the site-pending reason codes `crates/urdira-jsts-syntax-worker`
+    // can attach to a CALL site that stayed unresolved through both the
+    // E1-E3 lane and typeflow: `call_deferred_to_e3` (a non-identifier
+    // callee -- member/`this`/`super`/a dynamic `import()`/any other
+    // expression -- never even attempted) and `call_target_uncertain` (an
+    // identifier callee whose binding does not lead to a single,
+    // non-overloaded declaration). The plan's fuller taxonomy
+    // (`union_ambiguous`, `overload_ambiguous`, `external_module`,
+    // `generic`) is reserved for a future widening of the Rust emission
+    // channel (decision 28's own documented residual) and is not produced
+    // yet, so it is not listed here to avoid claiming a value this schema
+    // can never actually see today.
+    reason: { type: "string", enum: ["call_deferred_to_e3", "call_target_uncertain"], description: "Why the call site stayed unresolved (v4's Rust pipeline only; absent when the checker produced this diagnostic)." },
   },
   required: ["code", "message", "path"],
 } satisfies ClosedPayloadSchema);
@@ -233,6 +250,16 @@ export function createJavascriptTypescriptRegistryContribution(input: Javascript
       { reason_code: "jsts:compiler_diagnostic", definition_revision: 1, schema_version: 1, description: "Compiler diagnostics prevent complete semantic coverage.", allowed_statuses: ["partial", "unsupported"], affected_capabilities: JAVASCRIPT_TYPESCRIPT_CAPABILITIES.map((entry) => entry.capability), agent_guidance: "Inspect the emitted compiler diagnostics.", plugin_owner: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, lifecycle_state: "active" },
       { reason_code: "jsts:dynamic_runtime_code", definition_revision: 1, schema_version: 1, description: "Runtime-generated behavior prevents complete static coverage.", allowed_statuses: ["partial", "unknown"], affected_capabilities: ["core:symbol_resolution", "core:call_relationships", "core:data_flow"], agent_guidance: "Treat unresolved targets as possible.", plugin_owner: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, lifecycle_state: "active" },
       { reason_code: "jsts:unresolved_call", definition_revision: 1, schema_version: 1, description: "At least one call target is unresolved.", allowed_statuses: ["partial", "unknown"], affected_capabilities: ["core:call_relationships"], agent_guidance: "Use the possible call observation and diagnostic evidence.", plugin_owner: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, lifecycle_state: "active" },
+      // P1-B (urdira v4 plan, checker-off pipeline mode, URDIRA_JSTS_TYPEFLOW=1):
+      // when the semantic checker lane is never invoked for a generation,
+      // `jsts:compiler_diagnostic`/`jsts:compiler_diagnostic`-derived diagnostics
+      // are never emitted at all (there is no compiler run to report them) --
+      // this reason code names THAT specific, structural gap explicitly,
+      // distinct from `jsts:compiler_diagnostic` (a diagnostic the compiler DID
+      // report) and from `jsts:unresolved_call` (a specific call site the
+      // checker COULD have resolved but didn't): it says the compiler's own
+      // diagnostic channel is absent for this generation, full stop.
+      { reason_code: "jsts:compiler_diagnostics_unavailable", definition_revision: 1, schema_version: 1, description: "The semantic checker lane did not run for this generation, so no compiler diagnostics could be observed.", allowed_statuses: ["partial", "unknown"], affected_capabilities: JAVASCRIPT_TYPESCRIPT_CAPABILITIES.map((entry) => entry.capability), agent_guidance: "Compiler-diagnostic-derived completeness signals are unavailable; rely on the Rust resolver's own possible/unresolved call evidence instead.", plugin_owner: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, lifecycle_state: "active" },
     ],
     semantic_section_kind_definitions: [{ section_kind: "jsts:declaration", definition_revision: 1, schema_version: 1, description: "A checker-backed declaration section.", allowed_origin_kinds: ["jsts:entity_type", "jsts:entity_callable", "jsts:entity_variable", "jsts:entity_container"], agent_guidance: "Use for semantic retrieval context, never for structural identity.", plugin_owner: JAVASCRIPT_TYPESCRIPT_PLUGIN_ID, lifecycle_state: "active" }],
     semantic_reason_definitions: [],

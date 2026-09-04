@@ -68,28 +68,34 @@ const RESOLUTION_EXTENSIONS: [&str; 11] = [
 
 const MAX_EXTENDS_DEPTH: u8 = 10;
 
+/// Every concrete path `probe_extensions` would test for `base`, in the
+/// same order (the exact path, then each extension appended, then each
+/// extension appended after `/index`) -- the single authoritative
+/// candidate-path enumeration, shared by `probe_extensions` itself and by
+/// P3-6 item 2's reverse candidate-path index (`WorkspaceResolver::
+/// candidate_paths`, `lib.rs`'s `build_candidate_index`), which needs the
+/// same list WITHOUT stopping at the first `available` hit.
+fn push_candidate_variants(base: &str, out: &mut Vec<String>) {
+    out.push(base.to_owned());
+    for extension in RESOLUTION_EXTENSIONS {
+        out.push(format!("{base}{extension}"));
+    }
+    for extension in RESOLUTION_EXTENSIONS {
+        out.push(format!("{base}/index{extension}"));
+    }
+}
+
 /// Probe `base` (an extension-less candidate path) against `available`: the
 /// exact path, each extension appended, then each extension appended after
 /// `/index`. The single authoritative extension list, shared by every
 /// resolution strategy in this module (moved here verbatim from the former
 /// `resolve_relative` in `lib.rs`).
 fn probe_extensions(available: &BTreeSet<String>, base: &str) -> Option<String> {
-    if available.contains(base) {
-        return Some(base.to_owned());
-    }
-    for extension in RESOLUTION_EXTENSIONS {
-        let candidate = format!("{base}{extension}");
-        if available.contains(&candidate) {
-            return Some(candidate);
-        }
-    }
-    for extension in RESOLUTION_EXTENSIONS {
-        let candidate = format!("{base}/index{extension}");
-        if available.contains(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    let mut variants = Vec::with_capacity(2 * RESOLUTION_EXTENSIONS.len() + 1);
+    push_candidate_variants(base, &mut variants);
+    variants
+        .into_iter()
+        .find(|candidate| available.contains(candidate))
 }
 
 fn dirname(path: &str) -> &str {
@@ -350,6 +356,38 @@ impl PackageInfo {
         }
         None
     }
+
+    /// P3-6 item 2: every extension-less BASE this package's resolution
+    /// strategy (`exports`, then `main`/`module`/`types` for a bare
+    /// specifier) could name for `subpath`, regardless of what's actually
+    /// in `available` -- i.e. [`Self::resolve`]'s own candidate list
+    /// without the `available.contains` short-circuit. A safe OVER-
+    /// approximation is fine here (this only feeds a bounded-but-not-
+    /// necessarily-minimal reverse index, never resolution itself): unlike
+    /// `resolve`, this does not stop at `exports`' condition-priority
+    /// order, and does not enforce the "subpath never falls back to
+    /// main/module/types" rule -- both would only make the returned set
+    /// SMALLER, and a smaller candidate set is the one thing a reverse
+    /// index must never risk.
+    fn candidate_bases(&self, subpath: Option<&str>) -> Vec<String> {
+        let mut bases = Vec::new();
+        if let Some(exports) = &self.exports {
+            for target in resolve_exports_subpath(exports, subpath) {
+                bases.push(join_subpath(&self.root, &target));
+            }
+        }
+        for target in [
+            self.main.as_ref(),
+            self.module.as_ref(),
+            self.types.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bases.push(join_subpath(&self.root, target));
+        }
+        bases
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -385,6 +423,35 @@ impl TsConfigResolved {
             return probe_extensions(available, &candidate);
         }
         None
+    }
+
+    /// P3-6 item 2: [`Self::resolve`]'s own candidate BASE(s) for
+    /// `specifier`, without the `available.contains` short-circuit --
+    /// same safe-over-approximation contract as `PackageInfo::
+    /// candidate_bases`.
+    fn candidate_bases(&self, specifier: &str) -> Vec<String> {
+        let base_dir = self.base_url_dir.as_deref().unwrap_or(&self.dir);
+        let best_pattern = self
+            .paths
+            .iter()
+            .filter_map(|(pattern, targets)| {
+                let prefix_len = pattern.find('*').unwrap_or(pattern.len());
+                match_wildcard(pattern, specifier).map(|captured| (prefix_len, captured, targets))
+            })
+            .max_by_key(|(prefix_len, _, _)| *prefix_len);
+        if let Some((_, captured, targets)) = best_pattern {
+            return targets
+                .iter()
+                .map(|target| {
+                    let substituted = substitute_wildcard(target, captured);
+                    join_subpath(base_dir, &substituted)
+                })
+                .collect();
+        }
+        if self.base_url_dir.is_some() {
+            return vec![join_subpath(base_dir, specifier)];
+        }
+        Vec::new()
     }
 }
 
@@ -754,6 +821,41 @@ impl WorkspaceResolver {
             .and_then(|config| config.resolve(specifier, available))
     }
 
+    /// P3-6 item 2: every CONCRETE candidate path (extension/`/index`
+    /// variants included) `specifier` (imported from `from`) could
+    /// possibly resolve to under ANY of this resolver's strategies --
+    /// relative, workspace-package, and tsconfig/jsconfig `paths`/
+    /// `baseUrl` alike -- regardless of which one `resolve` would actually
+    /// pick or what's currently in `available`. Deliberately a superset of
+    /// what `resolve` itself would ever try in one call (it tries package
+    /// resolution, and only falls back to tsconfig if THAT fails; this
+    /// method always includes both): the only consumer is `lib.rs`'s
+    /// reverse candidate-path index for bounded create/delete/rename
+    /// re-resolution (P3-6 item 2), where a safe over-approximation just
+    /// means a few extra (still cheap) `reresolve_file` calls, while an
+    /// under-approximation would silently break the "identical to a full
+    /// re-resolution" guarantee that index exists to preserve.
+    pub fn candidate_paths(&self, from: &str, specifier: &str) -> Vec<String> {
+        let mut bases = Vec::new();
+        if specifier.starts_with('.') {
+            bases.push(join_relative(dirname(from), specifier));
+        } else {
+            if let Some((package_name, subpath)) = split_bare_specifier(specifier)
+                && let Some(package) = self.packages.get(&package_name)
+            {
+                bases.extend(package.candidate_bases(subpath.as_deref()));
+            }
+            if let Some(config) = self.nearest_tsconfig(from) {
+                bases.extend(config.candidate_bases(specifier));
+            }
+        }
+        let mut paths = Vec::with_capacity(bases.len() * (2 * RESOLUTION_EXTENSIONS.len() + 1));
+        for base in &bases {
+            push_candidate_variants(base, &mut paths);
+        }
+        paths
+    }
+
     fn nearest_tsconfig(&self, from: &str) -> Option<&TsConfigResolved> {
         let mut dir = dirname(from);
         loop {
@@ -911,6 +1013,13 @@ const MAX_EXPORT_RESOLUTION_DEPTH: u8 = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportResolution {
     Resolved(String),
+    /// P1-B: the chased name resolved to a namespace re-export (`export *
+    /// as X from "spec"` -- see `crate::NAMESPACE_REEXPORT_LOCAL_NAME`'s
+    /// doc comment) rather than a single declaration: `String` is the
+    /// re-exported module's OWN resolved path, for the caller to look a
+    /// FURTHER member name up against (`resolve_named_export` again, or
+    /// the typeflow namespace-member rule) -- never itself a `target_id`.
+    Namespace(String),
     Ambiguous,
     Unresolved,
 }
@@ -965,6 +1074,20 @@ fn resolve_named_export_inner(
     }
     match reexport.as_slice() {
         [] => ExportResolution::Unresolved,
+        [binding] if binding.local_name == crate::NAMESPACE_REEXPORT_LOCAL_NAME => {
+            // P1-B: `export * as X from "spec"` -- `X` names the WHOLE
+            // re-exported module, never a single symbol to chase further
+            // here (see `ExportResolution::Namespace`'s doc comment). A
+            // deeper chain (`export * as X from "spec"` where `spec` ITSELF
+            // does the same) is still handled transitively: the CALLER
+            // re-invokes `resolve_named_export` against this same target
+            // path for a further member name, which recurses into this
+            // exact function again.
+            match &binding.source_target_path {
+                Some(target_path) => ExportResolution::Namespace(target_path.clone()),
+                None => ExportResolution::Unresolved,
+            }
+        }
         [binding] => match &binding.source_target_path {
             Some(target_path) => resolve_named_export_inner(
                 files,
@@ -1520,6 +1643,87 @@ mod tests {
         assert_eq!(
             resolve_named_export(&files, "a.ts", "x"),
             ExportResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn resolve_named_export_namespace_reexport() {
+        // `export * as evals from "./evals/index"` -- see
+        // `crate::NAMESPACE_REEXPORT_LOCAL_NAME`'s doc comment.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "evals/index.ts".to_owned(),
+            file(
+                "evals/index.ts",
+                vec![entity(
+                    EntityKind::Function,
+                    "evals/index.ts",
+                    899,
+                    "stringSimilarity",
+                )],
+                vec![binding("stringSimilarity", "stringSimilarity", None, None)],
+            ),
+        );
+        files.insert(
+            "index.ts".to_owned(),
+            file(
+                "index.ts",
+                vec![],
+                vec![binding(
+                    "evals",
+                    crate::NAMESPACE_REEXPORT_LOCAL_NAME,
+                    Some("./evals/index"),
+                    Some("evals/index.ts"),
+                )],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "index.ts", "evals"),
+            ExportResolution::Namespace("evals/index.ts".to_owned())
+        );
+        // The whole point: a FURTHER member name resolves against the
+        // re-exported module directly.
+        assert_eq!(
+            resolve_named_export(&files, "evals/index.ts", "stringSimilarity"),
+            ExportResolution::Resolved(
+                "jsts:function:evals/index.ts:899:stringSimilarity".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_named_export_namespace_reexport_chains_transitively() {
+        // `export * as evals from "./mid"` where `./mid` ITSELF does
+        // `export * as evals from "./leaf"` -- the outer namespace's own
+        // resolution recurses into the inner one automatically (the
+        // CALLER re-invokes `resolve_named_export` against the first
+        // hop's target path, which lands on the SAME sentinel-checking
+        // branch again).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "leaf.ts".to_owned(),
+            file(
+                "leaf.ts",
+                vec![entity(EntityKind::Function, "leaf.ts", 5, "f")],
+                vec![binding("f", "f", None, None)],
+            ),
+        );
+        files.insert(
+            "mid.ts".to_owned(),
+            file(
+                "mid.ts",
+                vec![],
+                vec![binding(
+                    "evals",
+                    crate::NAMESPACE_REEXPORT_LOCAL_NAME,
+                    Some("./leaf"),
+                    Some("leaf.ts"),
+                )],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "mid.ts", "evals"),
+            ExportResolution::Namespace("leaf.ts".to_owned())
         );
     }
 

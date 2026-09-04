@@ -167,10 +167,130 @@ pub enum IndexingCommand {
     Shutdown {
         request_id: String,
     },
+    /// v4 cold/incremental scan (plan §6.1, task P2-2b). No nested
+    /// `operation_id` field: unlike `IndexGeneration`'s
+    /// `IndexingGenerationRequest`, one `WorkspaceScan` command is exactly
+    /// one operation, so `crates/urdira-indexing-worker/src/v4` uses
+    /// `request_id` as the `operation_id` on every event it emits for this
+    /// command (documented in that module's `scan.rs`, not a general
+    /// protocol rule).
+    ///
+    /// Deviation from the plan §6.1 protocol sketch: `workspace_root` is
+    /// NOT in that sketch (nor in this task's own brief), but the Rust
+    /// walker (`urdira-source-frontier::Walker::enumerate`, plan §4.1) has
+    /// to be told which filesystem tree to walk, and it is not derivable
+    /// from `cas_root`/`structural_root`/`database_path`/`sidecar_root` --
+    /// those all live under `<data_root>/workspaces/<ws>/` (plan §1's
+    /// topology diagram), an entirely different directory than the
+    /// workspace's own source checkout. Added here rather than worked
+    /// around with a directory-layout convention so the protocol stays the
+    /// single source of truth for what this command needs.
+    WorkspaceScan {
+        request_id: String,
+        workspace_id: String,
+        workspace_root: String,
+        database_path: String,
+        structural_root: String,
+        cas_root: String,
+        sidecar_root: String,
+        scope: ScanScope,
+        registry_snapshot_id: String,
+        configuration_revision_id: String,
+        resolution_lock_id: String,
+        deadline_ms: Option<u64>,
+        priority: ScanPriority,
+    },
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// v4 cold/incremental scan protocol (plan `resilient-knitting-twilight.md`
+/// §6.1, task P2-2b). `WorkspaceScan` replaces the v3
+/// `IndexGeneration`/`AcceptGroup`/`AcceptCanonicalGroup`/
+/// `AnalyzeSemanticGroup`/`InvokeSemantic`/`FinalizeGeneration`/
+/// `SourceIndexCommit`/`SourceIndexRollback` sequence for the Rust-owned v4
+/// pipeline: one command in, `Queryable` then `ScanCompleted` out. The v3
+/// variants above are intentionally left untouched (still consumed by the
+/// v3 candidate pipeline; removal is scoped to plan P4).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChangedPath {
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
+/// `Full` re-derives the entire catalog/structural set from a from-scratch
+/// walk (plan §4.1's "cold: todo es `added`"). `Changed` names an exact set
+/// of edited/created/deleted paths for an incremental scan (plan §6);
+/// `crates/urdira-indexing-worker/src/v4` may reject `Changed` with an
+/// `unsupported_scope` error until the P3 delta path lands (see that
+/// module's `scan.rs`), while still parsing/round-tripping it here.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScanScope {
+    Full,
+    Changed { paths: Vec<ChangedPath> },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanPriority {
+    Interactive,
+    Background,
+}
+
+/// Per-phase wall-clock milliseconds, plan §4/§10 gate vocabulary
+/// (`structural_queryable_ms`/`structural_durable_ms` are derived by the
+/// caller from which event carried a given `timings` value, not stored
+/// twice here). Every field is optional so a phase this pipeline does not
+/// yet implement (e.g. `lexical` before P2-6 wires the FTS sidecar) can be
+/// omitted rather than reported as a dishonest zero.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScanTimings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialize_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsync_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_ms: Option<u64>,
+    pub total_ms: u64,
+}
+
+/// Merkle roots published for this generation (plan §8.2), hex-prefixed
+/// (`sha256:...`) the same way `urdira_indexing_core::merkle_bucket::
+/// to_prefixed_hex` formats every other root in this codebase. `graph` and
+/// `metric` are computed by `crates/urdira-indexing-worker/src/v4/publish.rs`
+/// itself (the shared `urdira-structural-store` crate only tracks
+/// `records`/`dependency`, see its own evidence doc) -- `metric` is the
+/// canonical empty-set root until a metric projection generator exists.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScanRoots {
+    pub records: String,
+    pub dependency: String,
+    pub graph: String,
+    pub metric: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -243,6 +363,48 @@ pub enum IndexingEvent {
         request_id: String,
         code: String,
         message: String,
+    },
+    /// v4: segments are on page cache and `MANIFEST.next` is written; the 18
+    /// query operations can serve this generation from the daemon's mmap
+    /// (plan §2.6). Not durable yet -- `ScanCompleted` follows once fsync +
+    /// the SQLite `snapshots` transaction + `MANIFEST` publish complete.
+    Queryable {
+        request_id: String,
+        operation_id: String,
+        generation: u64,
+        manifest_path: String,
+        timings: ScanTimings,
+    },
+    /// v4 terminal event for `WorkspaceScan` (kept distinct from `Completed`
+    /// rather than extending it: `Completed`'s fields are v3-candidate-
+    /// pipeline-specific -- `group_count`/`owner_count`/`ordered_digest` --
+    /// and `#[serde(deny_unknown_fields)]` plus existing v3 consumers of
+    /// `Completed` make silently widening that variant unsafe).
+    ScanCompleted {
+        request_id: String,
+        operation_id: String,
+        generation: u64,
+        snapshot_id: String,
+        roots: ScanRoots,
+        timings: ScanTimings,
+    },
+    /// P1-D-c: the background residual TypeScript-checker pass (decision 28)
+    /// finished for one workspace and, if it upgraded at least one site,
+    /// published a `semantic_upgrade` generation through the normal delta
+    /// path (`generation_manifests.publication_kind = 'semantic_upgrade'`).
+    /// Fired asynchronously, well after the `ScanCompleted` of the
+    /// generation that triggered it -- never blocks a `WorkspaceScan`
+    /// response. `generation` is the NEW (upgrade) generation when
+    /// `upgraded_sites > 0`, or the pass's OWN base generation (unchanged)
+    /// when it found nothing to upgrade (no new generation was published).
+    UpgradeCompleted {
+        request_id: String,
+        operation_id: String,
+        generation: u64,
+        upgraded_sites: u64,
+        external_sites: u64,
+        unresolved_sites: u64,
+        timings: ScanTimings,
     },
 }
 
@@ -849,6 +1011,132 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<IndexingCommand>(&encoded).unwrap(),
             rollback
+        );
+    }
+
+    /// Fixture shared with `tests/rust-protocol-v4.test.ts` (TS serializes,
+    /// this test decodes -- see that file for the JSON literal both sides
+    /// assert against, `crates/urdira-worker-protocol/tests/fixtures/
+    /// workspace-scan-v4.json`) so the two mirrors cannot silently drift on
+    /// a field name or `kind` tag.
+    #[test]
+    fn workspace_scan_command_is_closed_and_round_trips() {
+        let command = IndexingCommand::WorkspaceScan {
+            request_id: "request:scan".into(),
+            workspace_id: "workspace:1".into(),
+            workspace_root: "/tmp/urdira-workspace-root".into(),
+            database_path: "/tmp/workspace.sqlite".into(),
+            structural_root: "/tmp/structural".into(),
+            cas_root: "/tmp/urdira-cas".into(),
+            sidecar_root: "/tmp/sidecar".into(),
+            scope: ScanScope::Full,
+            registry_snapshot_id: "registry:1".into(),
+            configuration_revision_id: "configuration:1".into(),
+            resolution_lock_id: "resolution:1".into(),
+            deadline_ms: Some(45_000),
+            priority: ScanPriority::Interactive,
+        };
+        let encoded = serde_json::to_vec(&command).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<IndexingCommand>(&encoded).unwrap(),
+            command
+        );
+        assert!(
+            serde_json::from_slice::<IndexingCommand>(
+                br#"{"kind":"workspace_scan","request_id":"r","workspace_id":"w","workspace_root":"wr","database_path":"d","structural_root":"s","cas_root":"c","sidecar_root":"x","scope":{"kind":"full"},"registry_snapshot_id":"r","configuration_revision_id":"c","resolution_lock_id":"r","deadline_ms":null,"priority":"interactive","extra":true}"#
+            )
+            .is_err()
+        );
+        let changed = IndexingCommand::WorkspaceScan {
+            request_id: "request:scan-2".into(),
+            workspace_id: "workspace:1".into(),
+            workspace_root: "/tmp/urdira-workspace-root".into(),
+            database_path: "/tmp/workspace.sqlite".into(),
+            structural_root: "/tmp/structural".into(),
+            cas_root: "/tmp/urdira-cas".into(),
+            sidecar_root: "/tmp/sidecar".into(),
+            scope: ScanScope::Changed {
+                paths: vec![
+                    ChangedPath {
+                        path: "src/a.ts".into(),
+                        kind: ChangeKind::Modified,
+                    },
+                    ChangedPath {
+                        path: "src/b.ts".into(),
+                        kind: ChangeKind::Created,
+                    },
+                ],
+            },
+            registry_snapshot_id: "registry:1".into(),
+            configuration_revision_id: "configuration:1".into(),
+            resolution_lock_id: "resolution:1".into(),
+            deadline_ms: None,
+            priority: ScanPriority::Background,
+        };
+        let encoded = serde_json::to_vec(&changed).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<IndexingCommand>(&encoded).unwrap(),
+            changed
+        );
+    }
+
+    #[test]
+    fn queryable_and_scan_completed_events_are_closed_and_round_trip() {
+        let queryable = IndexingEvent::Queryable {
+            request_id: "request:scan".into(),
+            operation_id: "request:scan".into(),
+            generation: 1,
+            manifest_path: "/tmp/structural/MANIFEST".into(),
+            timings: ScanTimings {
+                catalog_ms: Some(120),
+                parse_ms: Some(900),
+                resolve_ms: Some(200),
+                materialize_ms: Some(1_500),
+                write_ms: Some(2_600),
+                fsync_ms: None,
+                snapshot_ms: None,
+                lexical_ms: None,
+                total_ms: 5_320,
+            },
+        };
+        let encoded = serde_json::to_vec(&queryable).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<IndexingEvent>(&encoded).unwrap(),
+            queryable
+        );
+        let completed = IndexingEvent::ScanCompleted {
+            request_id: "request:scan".into(),
+            operation_id: "request:scan".into(),
+            generation: 1,
+            snapshot_id: "snapshot:1".into(),
+            roots: ScanRoots {
+                records: "sha256:aa".into(),
+                dependency: "sha256:bb".into(),
+                graph: "sha256:cc".into(),
+                metric: "sha256:dd".into(),
+            },
+            timings: ScanTimings {
+                catalog_ms: Some(120),
+                parse_ms: Some(900),
+                resolve_ms: Some(200),
+                materialize_ms: Some(1_500),
+                write_ms: Some(2_600),
+                fsync_ms: Some(400),
+                snapshot_ms: Some(80),
+                lexical_ms: None,
+                total_ms: 5_800,
+            },
+        };
+        let encoded = serde_json::to_vec(&completed).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<IndexingEvent>(&encoded).unwrap(),
+            completed
+        );
+        assert!(
+            serde_json::from_slice::<IndexingEvent>(
+                br#"{"kind":"queryable","request_id":"r","operation_id":"o","generation":1,"manifest_path":"m","timings":{"total_ms":1},"extra":true}"#
+            )
+            .is_err()
         );
     }
 }

@@ -239,6 +239,40 @@ describe("Phase 7 physical watcher adapters", () => {
     ]);
   });
 
+  // P3-7 (plan's watcher-detection-latency item, docs/evidence/2026-09-03-v4-p3-7-watcher-latency.md):
+  // a backend that reports a canonicalized path for a root that was
+  // subscribed under its raw (symlinked) form -- exactly what macOS's real
+  // FSEvents backend does (it resolves symlinks; kqueue does not, since its
+  // paths come from @parcel/watcher's own directory-string walk) -- used to
+  // throw `engine:watcher_path_outside_root` INSIDE the unguarded backend
+  // callback and silently vanish: no batch delivered, `on_error` never
+  // called, no crash. Now the normalization failure is caught, reported to
+  // `on_error`, and turned into a `provider_reset` hint so the caller still
+  // widens to a full reconcile instead of losing the event forever.
+  it("reports a provider_reset (not a silent drop) when a backend delivers a canonicalized path outside the subscribed root", async () => {
+    let deliver: ((error: Error | null, events: readonly { readonly type: "create" | "update" | "delete"; readonly path: string }[]) => unknown) | undefined;
+    const backend: ParcelWatcherBackend = {
+      subscribe: async (_root, callback) => {
+        deliver = callback;
+        return { unsubscribe: async () => undefined };
+      },
+    };
+    const symlinkedBinding: WatcherBinding = { ...directoryBinding, root: "/var/folders/xx/T/foo" };
+    const errors: Error[] = [];
+    const batches: WatcherHint[] = [];
+    const adapter = new ParcelWatcherAdapter(symlinkedBinding, { backend, on_error: (error) => errors.push(error) });
+    await adapter.subscribe((batch) => { batches.push(...batch.events); });
+
+    // FSEvents-realistic: the OS resolves the symlinked root's real path
+    // before reporting the event.
+    deliver?.(null, [{ type: "update", path: "/private/var/folders/xx/T/foo/a.ts" }]);
+    await adapter.idle();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toContain("engine:watcher_path_outside_root");
+    expect(batches.map((event) => [event.event_class, event.normalized_uri])).toEqual([["provider_reset", ""]]);
+  });
+
   it("serializes real and fake delivery and routes handler rejection to on_error", async () => {
     let deliver: ((error: Error | null, events: readonly { readonly type: "create" | "update" | "delete"; readonly path: string }[]) => unknown) | undefined;
     const errors: string[] = [];

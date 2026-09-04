@@ -11,6 +11,7 @@ import { digestRelationalValue, hydrateRelationalValue, type RelationalValueRow 
 import { WORKSPACE_V3_SCHEMA } from "./workspace-v3-sql.js";
 import { WorkspaceProjectionRepository } from "./projections.js";
 import { logicalRecordSetDigest } from "./publication-authority.js";
+import { readStructuralStore } from "./schema.js";
 
 function canonicalSha256(value: unknown): string { return digestBytes(encodeCanonical(value)); }
 
@@ -684,18 +685,40 @@ export class WorkspaceLifecycleRepository {
 export class StorageMaintenance {
   constructor(private readonly database: SqliteDatabase, private readonly cas: ContentAddressedStore, private readonly blobs: BlobStore, private readonly rootDir: string, private readonly workspaceId: string, private readonly faults: FaultInjector = noFaults) {}
 
+  /**
+   * v4 (`index_contract 0x34`, P2-4) gating: a v4 workspace's catalog
+   * SQLite has no `record_occurrences`/`graph_edges`/`artifact_dependencies`/
+   * `metric_projections`/`lexical_documents`/`vector_shards`/
+   * `vector_projection_rows` tables at all (`packages/storage/sql/
+   * workspace-v4.sql`'s own header comment: "Structural data ... has no
+   * SQL representation here at all"; lexical/vector live in separate
+   * sidecar files, not this database). Querying those tables would throw
+   * ("no such table"), not report an empty result, so every block below
+   * that reads one is skipped for a v4 workspace -- v3 behavior is
+   * unchanged (`isV4` is always `false` there). The structural digest
+   * layer those blocks would have checked (`canonical_record_set_digest`/
+   * `projection_set_digests` against the real record/dependency/graph
+   * corpus) has a v4-specific from-scratch check instead:
+   * `packages/engine/src/v4-verify.ts`'s `verifyV4Workspace` (this package
+   * cannot reach the native structural store or import `@urdira/engine`,
+   * layer 3, per `architecture/manifest.json`) -- callers verifying a v4
+   * workspace should call that in addition to this method.
+   */
   async verify(): Promise<VerificationReport> {
     const failures: VerificationFailure[] = [];
+    const isV4 = (await readStructuralStore(this.database)) !== undefined;
     try { const row = await this.database.get<{ quick_check: string }>("PRAGMA quick_check"); if (row?.quick_check !== "ok") failures.push({ component_kind: "sqlite", component_id: this.database.filename, error_code: "quick_check_failed" }); } catch (error) { failures.push({ component_kind: "sqlite", component_id: this.database.filename, error_code: error instanceof Error ? error.name : "sqlite_error" }); }
-    const casRows = await this.database.all<{ content_hash: string; component_kind: string; component_id: string }>(`SELECT content_hash, 'lexical' AS component_kind, artifact_id AS component_id FROM lexical_documents WHERE workspace_id = ? UNION ALL SELECT content_hash, 'vector_shard', shard_id FROM vector_shards WHERE workspace_id = ? UNION ALL SELECT content_hash, 'pinned_cas_object', content_hash FROM lifecycle_cas_pins WHERE workspace_id = ? UNION ALL SELECT content_hash, 'retention_root', root_id FROM lifecycle_roots WHERE workspace_id = ? UNION ALL SELECT content_digest, 'manifest_segment', query_execution_id || '/' || segment_id FROM query_manifest_segments WHERE query_execution_id IN (SELECT query_execution_id FROM query_executions WHERE workspace_id = ?) UNION ALL SELECT content_hash, 'content_blob', content_blob_id FROM content_blobs WHERE storage_reference LIKE 'cas:%'`, [this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId]);
+    const casRows = isV4
+      ? await this.database.all<{ content_hash: string; component_kind: string; component_id: string }>(`SELECT content_hash, 'pinned_cas_object' AS component_kind, content_hash AS component_id FROM lifecycle_cas_pins WHERE workspace_id = ? UNION ALL SELECT content_hash, 'retention_root', root_id FROM lifecycle_roots WHERE workspace_id = ? UNION ALL SELECT content_digest, 'manifest_segment', query_execution_id || '/' || segment_id FROM query_manifest_segments WHERE query_execution_id IN (SELECT query_execution_id FROM query_executions WHERE workspace_id = ?) UNION ALL SELECT content_hash, 'content_blob', content_blob_id FROM content_blobs WHERE storage_reference LIKE 'cas:%'`, [this.workspaceId, this.workspaceId, this.workspaceId])
+      : await this.database.all<{ content_hash: string; component_kind: string; component_id: string }>(`SELECT content_hash, 'lexical' AS component_kind, artifact_id AS component_id FROM lexical_documents WHERE workspace_id = ? UNION ALL SELECT content_hash, 'vector_shard', shard_id FROM vector_shards WHERE workspace_id = ? UNION ALL SELECT content_hash, 'pinned_cas_object', content_hash FROM lifecycle_cas_pins WHERE workspace_id = ? UNION ALL SELECT content_hash, 'retention_root', root_id FROM lifecycle_roots WHERE workspace_id = ? UNION ALL SELECT content_digest, 'manifest_segment', query_execution_id || '/' || segment_id FROM query_manifest_segments WHERE query_execution_id IN (SELECT query_execution_id FROM query_executions WHERE workspace_id = ?) UNION ALL SELECT content_hash, 'content_blob', content_blob_id FROM content_blobs WHERE storage_reference LIKE 'cas:%'`, [this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId, this.workspaceId]);
     for (const row of casRows) {
       try { await this.cas.read(row.content_hash); } catch (error) { failures.push({ component_kind: row.component_kind, component_id: row.component_id, error_code: error instanceof StorageError ? error.code : "cas_error" }); }
     }
-    const vectors = await this.database.all<{ projection_record_id: string; valid_from_generation: number }>("SELECT projection_record_id, valid_from_generation FROM vector_projection_rows WHERE workspace_id = ?", [this.workspaceId]);
+    const vectors = isV4 ? [] : await this.database.all<{ projection_record_id: string; valid_from_generation: number }>("SELECT projection_record_id, valid_from_generation FROM vector_projection_rows WHERE workspace_id = ?", [this.workspaceId]);
     for (const vector of vectors) {
       try { await this.verifyVector(vector.projection_record_id, vector.valid_from_generation); } catch (error) { failures.push({ component_kind: "vector", component_id: vector.valid_from_generation === 0 ? vector.projection_record_id : `${vector.projection_record_id}@${vector.valid_from_generation}`, error_code: error instanceof StorageError ? error.code : "vector_error" }); }
     }
-    const graphRows = await this.database.all<{ edge_id: string; source_subject_id: string; target_subject_id: string; relation_record_id: string; relation_kind: string; role: string; evidence_class: string; owner_artifact_id: string; owner_artifact_version_id: string; valid_from_generation: number; valid_to_generation: number | null; content_digest: string }>("SELECT edge_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest FROM graph_edges WHERE workspace_id = ?", [this.workspaceId]);
+    const graphRows = isV4 ? [] : await this.database.all<{ edge_id: string; source_subject_id: string; target_subject_id: string; relation_record_id: string; relation_kind: string; role: string; evidence_class: string; owner_artifact_id: string; owner_artifact_version_id: string; valid_from_generation: number; valid_to_generation: number | null; content_digest: string }>("SELECT edge_id, source_subject_id, target_subject_id, relation_record_id, relation_kind, role, evidence_class, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest FROM graph_edges WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of graphRows) {
       try {
         const expected = { edge_id: row.edge_id, source_subject_id: row.source_subject_id, target_subject_id: row.target_subject_id, relation_record_id: row.relation_record_id, relation_kind: row.relation_kind, role: row.role, evidence_class: row.evidence_class, owner_artifact_id: row.owner_artifact_id, owner_artifact_version_id: row.owner_artifact_version_id, valid_from_generation: row.valid_from_generation, ...(row.valid_to_generation === null ? {} : { valid_to_generation: row.valid_to_generation }) };
@@ -703,7 +726,7 @@ export class StorageMaintenance {
         await this.requireOwner(row.owner_artifact_id, row.owner_artifact_version_id);
       } catch (error) { failures.push({ component_kind: "graph", component_id: `${row.edge_id}@${row.valid_from_generation}`, error_code: error instanceof StorageError ? error.code : "graph_corrupt" }); }
     }
-    const lexicalRows = await this.database.all<{ artifact_id: string; artifact_version_id: string; content_hash: string; byte_length: number; valid_from_generation: number; valid_to_generation: number | null }>("SELECT artifact_id, artifact_version_id, content_hash, byte_length, valid_from_generation, valid_to_generation FROM lexical_documents WHERE workspace_id = ?", [this.workspaceId]);
+    const lexicalRows = isV4 ? [] : await this.database.all<{ artifact_id: string; artifact_version_id: string; content_hash: string; byte_length: number; valid_from_generation: number; valid_to_generation: number | null }>("SELECT artifact_id, artifact_version_id, content_hash, byte_length, valid_from_generation, valid_to_generation FROM lexical_documents WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of lexicalRows) {
       try {
         const source = await this.cas.read(row.content_hash);
@@ -711,7 +734,7 @@ export class StorageMaintenance {
         await this.requireOwner(row.artifact_id, row.artifact_version_id);
       } catch (error) { failures.push({ component_kind: "lexical", component_id: `${row.artifact_id}/${row.artifact_version_id}`, error_code: error instanceof StorageError ? error.code : "lexical_corrupt" }); }
     }
-    const dependencyRows = await this.database.all<{ dependency_entry_id: string; record_id: string; owner_artifact_id: string; owner_artifact_version_id: string; dependency_artifact_id: string; dependency_artifact_version_id: string; dependency_role: string; producer_id: string; producer_version: string; valid_from_generation: number; valid_to_generation: number | null; content_digest: string }>("SELECT dependency_entry_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, content_digest FROM artifact_dependencies WHERE workspace_id = ?", [this.workspaceId]);
+    const dependencyRows = isV4 ? [] : await this.database.all<{ dependency_entry_id: string; record_id: string; owner_artifact_id: string; owner_artifact_version_id: string; dependency_artifact_id: string; dependency_artifact_version_id: string; dependency_role: string; producer_id: string; producer_version: string; valid_from_generation: number; valid_to_generation: number | null; content_digest: string }>("SELECT dependency_entry_id, record_id, owner_artifact_id, owner_artifact_version_id, dependency_artifact_id, dependency_artifact_version_id, dependency_role, producer_id, producer_version, valid_from_generation, valid_to_generation, content_digest FROM artifact_dependencies WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of dependencyRows) {
       try {
         const expected = { dependency_entry_id: row.dependency_entry_id, record_id: row.record_id, owner_artifact_id: row.owner_artifact_id, owner_artifact_version_id: row.owner_artifact_version_id, dependency_artifact_id: row.dependency_artifact_id, dependency_artifact_version_id: row.dependency_artifact_version_id, dependency_role: row.dependency_role, producer_id: row.producer_id, producer_version: row.producer_version, valid_from_generation: row.valid_from_generation, ...(row.valid_to_generation === null ? {} : { valid_to_generation: row.valid_to_generation }) };
@@ -719,7 +742,7 @@ export class StorageMaintenance {
         await this.requireOwner(row.owner_artifact_id, row.owner_artifact_version_id); await this.requireOwner(row.dependency_artifact_id, row.dependency_artifact_version_id);
       } catch (error) { failures.push({ component_kind: "dependency", component_id: `${row.dependency_entry_id}@${row.valid_from_generation}`, error_code: error instanceof StorageError ? error.code : "dependency_corrupt" }); }
     }
-    const metricRows = await this.database.all<{ metric_id: string; projection_record_id: string; metric_kind: string; metric_value: number; valid_from_generation: number; valid_to_generation: number | null; content_digest: string; owner_artifact_id: string; owner_artifact_version_id: string }>("SELECT metric_id, projection_record_id, metric_kind, metric_value, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest FROM metric_projections WHERE workspace_id = ?", [this.workspaceId]);
+    const metricRows = isV4 ? [] : await this.database.all<{ metric_id: string; projection_record_id: string; metric_kind: string; metric_value: number; valid_from_generation: number; valid_to_generation: number | null; content_digest: string; owner_artifact_id: string; owner_artifact_version_id: string }>("SELECT metric_id, projection_record_id, metric_kind, metric_value, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation, content_digest FROM metric_projections WHERE workspace_id = ?", [this.workspaceId]);
     for (const row of metricRows) {
       try {
         const expected = { metric_id: row.metric_id, projection_record_id: row.projection_record_id, metric_kind: row.metric_kind, metric_value: row.metric_value, owner_artifact_id: row.owner_artifact_id, owner_artifact_version_id: row.owner_artifact_version_id, valid_from_generation: row.valid_from_generation, ...(row.valid_to_generation === null ? {} : { valid_to_generation: row.valid_to_generation }) };
@@ -742,17 +765,25 @@ export class StorageMaintenance {
       try {
         const expected = { snapshot_id: String(row["snapshot_id"]), workspace_id: String(row["workspace_id"]), generation: Number(row["generation"]), ...(row["parent_snapshot_id"] === null ? {} : { parent_snapshot_id: String(row["parent_snapshot_id"]) }), generation_manifest_id: String(row["generation_manifest_id"]), registry_snapshot_id: String(row["registry_snapshot_id"]), resolution_lock_id: String(row["resolution_lock_id"]), configuration_revision_id: String(row["configuration_revision_id"]), source_state_digest: String(row["source_state_digest"]), ...(row["source_snapshot_id"] === null ? {} : { source_snapshot_id: String(row["source_snapshot_id"]), snapshot_contract_version: Number(row["snapshot_contract_version"] ?? 2) }), source_observation_watermarks: String(row["source_observation_watermarks"]), canonical_record_set_digest: String(row["canonical_record_set_digest"]), projection_set_digests: String(row["projection_set_digests"]), capability_state_digest: String(row["capability_state_digest"]), published_at: String(row["published_at"]), snapshot_digest: String(row["snapshot_digest"]) };
         if (!(await this.database.get("SELECT registry_snapshot_id FROM registry_snapshots WHERE workspace_id = ? AND registry_snapshot_id = ?", [this.workspaceId, row.registry_snapshot_id]))) throw new StorageError("storage:registry_missing", `Snapshot ${row.snapshot_id} references a registry from another workspace or an absent registry.`);
-        const visibleRecords = await this.database.all<{ record_id: string; record_digest: string }>("SELECT record_id, record_digest FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?) ORDER BY record_id", [this.workspaceId, row.generation, row.generation]);
-        const recordSetDigest = logicalRecordSetDigest(visibleRecords);
-        const projectionEntries = await this.getProjectionSetDigestEntries(row.generation);
-        if (isDigest(row.canonical_record_set_digest) && visibleRecords.every((record) => isDigest(record.record_digest)) && row.canonical_record_set_digest !== recordSetDigest) throw new StorageError("storage:canonical_set_digest_corrupt", `Snapshot ${row.snapshot_id} canonical record-set digest does not match visible records.`);
-        if (isDigest(row.projection_set_digests)) throw new StorageError("storage:projection_set_digest_corrupt", `Snapshot ${row.snapshot_id} uses a non-normative aggregate projection-set digest.`);
-        const declaredProjectionSet = String(row.projection_set_digests);
-        if (declaredProjectionSet.startsWith("[")) {
-          try {
-            const declared = JSON.parse(declaredProjectionSet) as unknown;
-            if (Array.isArray(declared) && !sameBytes(encodeCanonical(declared), encodeCanonical(projectionEntries))) throw new StorageError("storage:projection_set_digest_corrupt", `Snapshot ${row.snapshot_id} projection-set entries differ from authoritative projections.`);
-          } catch (error) { if (error instanceof StorageError) throw error; throw new StorageError("storage:projection_set_digest_corrupt", `Snapshot ${row.snapshot_id} has malformed projection-set entries.`); }
+        // v4: the visible record/dependency/graph corpus lives in the
+        // native structural store, not `record_occurrences`/the relational
+        // projection tables this package can query -- see this method's
+        // doc comment and `packages/engine/src/v4-verify.ts`'s
+        // `verifyV4Workspace` for the from-scratch equivalent of the check
+        // this block does for v3.
+        if (!isV4) {
+          const visibleRecords = await this.database.all<{ record_id: string; record_digest: string }>("SELECT record_id, record_digest FROM record_occurrences WHERE workspace_id = ? AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?) ORDER BY record_id", [this.workspaceId, row.generation, row.generation]);
+          const recordSetDigest = logicalRecordSetDigest(visibleRecords);
+          const projectionEntries = await this.getProjectionSetDigestEntries(row.generation);
+          if (isDigest(row.canonical_record_set_digest) && visibleRecords.every((record) => isDigest(record.record_digest)) && row.canonical_record_set_digest !== recordSetDigest) throw new StorageError("storage:canonical_set_digest_corrupt", `Snapshot ${row.snapshot_id} canonical record-set digest does not match visible records.`);
+          if (isDigest(row.projection_set_digests)) throw new StorageError("storage:projection_set_digest_corrupt", `Snapshot ${row.snapshot_id} uses a non-normative aggregate projection-set digest.`);
+          const declaredProjectionSet = String(row.projection_set_digests);
+          if (declaredProjectionSet.startsWith("[")) {
+            try {
+              const declared = JSON.parse(declaredProjectionSet) as unknown;
+              if (Array.isArray(declared) && !sameBytes(encodeCanonical(declared), encodeCanonical(projectionEntries))) throw new StorageError("storage:projection_set_digest_corrupt", `Snapshot ${row.snapshot_id} projection-set entries differ from authoritative projections.`);
+            } catch (error) { if (error instanceof StorageError) throw error; throw new StorageError("storage:projection_set_digest_corrupt", `Snapshot ${row.snapshot_id} has malformed projection-set entries.`); }
+          }
         }
         if ([row.source_state_digest, row.source_observation_watermarks, row.canonical_record_set_digest, row.projection_set_digests, row.capability_state_digest].every(isDigest)) {
           const snapshotPositive = { ...expected } as Record<string, unknown>;

@@ -88,4 +88,39 @@ describe("Phase 12 closed CLI", () => {
     expect(plain.stdout).not.toContain("model ready");
     expect(plain.stdout).not.toContain("could not be downloaded");
   });
+
+  // P4-d: `urdira index` renders `core:index_status`'s v4 lane fields
+  // (`v4StatusFields`, `packages/daemon/src/runtime.ts`) as a compact table
+  // in human (non `--json`) output; `--json` always passes the raw payload
+  // through verbatim, unaffected by this task (see `runCli`'s own comment
+  // above `formatIndexStatusTable`).
+  it("renders a table with v4 lane generations for human output, and the raw payload for --json", async () => {
+    const indexClient: CliDaemonClient = { call: vi.fn(async () => ({ outcome: "success", payload: { workspaces: [
+      { workspace_id: "workspace-v4", display_root: "project-v4", workspace_status: "ready", storage_format: "v4", structural: { queryable_generation: 5, durable_generation: 5, queryable: true }, lexical: { completed_generation: 4, current: false }, semantic: { current: false }, last_scan: { kind: "full", timings: { total_ms: 1200 } } },
+      { workspace_id: "workspace-v3", display_root: "project-v3", workspace_status: "ready", storage_format: "v3", structural_ready: true, semantic_ready: true },
+    ] } })) };
+
+    const human = await runCli(["index"], { client: indexClient });
+    expect(human.exit_code).toBe(0);
+    expect(human.stdout).toContain("WORKSPACE");
+    expect(human.stdout).toContain("STRUCTURAL");
+    expect(human.stdout).toContain("workspace-v4 (project-v4)");
+    expect(human.stdout).toContain("q5/d5");
+    expect(human.stdout).toContain("lagging");
+    expect(human.stdout).toContain("workspace-v3 (project-v3)");
+    expect(human.stdout).toContain("ready");
+    expect(human.stdout).not.toContain("{\"workspaces\"");
+
+    const json = await runCli(["index", "--json"], { client: indexClient });
+    expect(JSON.parse(json.stdout)).toEqual({ workspaces: [
+      { workspace_id: "workspace-v4", display_root: "project-v4", workspace_status: "ready", storage_format: "v4", structural: { queryable_generation: 5, durable_generation: 5, queryable: true }, lexical: { completed_generation: 4, current: false }, semantic: { current: false }, last_scan: { kind: "full", timings: { total_ms: 1200 } } },
+      { workspace_id: "workspace-v3", display_root: "project-v3", workspace_status: "ready", storage_format: "v3", structural_ready: true, semantic_ready: true },
+    ] });
+  });
+
+  it("prints a plain no-workspaces message for urdira index with no registered workspaces", async () => {
+    const emptyClient: CliDaemonClient = { call: vi.fn(async () => ({ outcome: "success", payload: { workspaces: [] } })) };
+    const human = await runCli(["index"], { client: emptyClient });
+    expect(human.stdout).toContain("no workspaces registered");
+  });
 });

@@ -43,7 +43,8 @@ describe("machine-readable coverage gate", () => {
       "packages/plugin-sdk/src/sandbox.ts",
       "packages/plugin-sdk/src/port-boundary.ts",
       "packages/plugin-sdk/src/index.ts",
-      "packages/testkit/src/synthetic-workers.ts"
+      "packages/testkit/src/synthetic-workers.ts",
+      "packages/canonical/src/merkle-bucket.ts"
     ];
     expect(gate.version).toBe(1);
     expect(gate.minimum_repository_line_percent).toBeGreaterThanOrEqual(90);
@@ -51,7 +52,12 @@ describe("machine-readable coverage gate", () => {
     expect(gate.required_modules.map((required) => required.module)).toEqual(expect.arrayContaining(expectedModules));
     for (const required of gate.required_modules) {
       const source = (await Promise.all(required.tests.map((test) => readFile(join(root, test), "utf8")))).join("\n");
-      expect(required.module).toMatch(/^packages\/(?:engine|storage|plugin-sdk|testkit)\/src\//);
+      // v4 added packages/canonical/src/merkle-bucket.ts (the bucketed-Merkle
+      // digest primitive shared by the v4 record-set/projection-set/source-
+      // state recipes); packages/contracts/src/ is allowed too since v4's
+      // schema/registry coordinates for it (core:RecordSetMerkleRoot@1) live
+      // there, even though no required_modules row names it yet.
+      expect(required.module).toMatch(/^packages\/(?:engine|storage|plugin-sdk|testkit|canonical|contracts)\/src\//);
       for (const behavior of required.required_behaviors) expect(source).toContain(behavior);
     }
   });

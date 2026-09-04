@@ -1,13 +1,15 @@
 import { access, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalBytes, decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { ModelPackInstallation, Workspace, WorkspaceCurrentState, Snapshot, IndexCandidate, RegistrySnapshot, PluginResolutionLock, WorkspaceConfigurationRevision, WorkspaceFreshnessCheckpoint } from "@urdira/contracts";
 import { BlobStore, CAS_LAYOUT_MARKER_FILENAME, CAS_LAYOUT_VERSION, ContentAddressedStore, writeCasLayoutMarker, type BlobReference } from "./cas.js";
 import { record, resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
-import { CATALOG_SCHEMA, ensureCatalogSchemaCompatibility, ensureWorkspaceSchemaCompatibility, initializeSchema } from "./schema.js";
+import { isOutdatedWorkspaceError } from "./recreate-outdated.js";
+import { CATALOG_SCHEMA, ensureCatalogSchemaCompatibility, ensureWorkspaceSchemaCompatibility, ensureWorkspaceSchemaCompatibilityV4, initializeSchema, WORKSPACE_V4_INDEX_CONTRACT } from "./schema.js";
+import { WORKSPACE_V4_LEXICAL_SCHEMA, WORKSPACE_V4_SCHEMA, WORKSPACE_V4_SEMANTIC_SCHEMA } from "./workspace-v4-sql.js";
 import { WORKSPACE_V3_SCHEMA } from "./workspace-v3-sql.js";
 import { createWorkspaceRepositories, type WorkspaceRepositories } from "./repositories.js";
 import { openSqliteDatabase, type SqliteCommand, type SqliteDatabase, type SqliteValue } from "./sqlite.js";
@@ -50,6 +52,39 @@ export interface DurableStorageOptions {
 
 export interface RegisteredWorkspace extends Workspace {
   readonly database_path: string;
+}
+
+/**
+ * v4 (P4-b-prep, plan §9): one catalogued workspace `DurableStorage.open`'s
+ * unconditional startup recovery sweep (`recoverMigrations`/
+ * `recoverWorkspaceGcEpochs`) found to be at an outdated or unsupported
+ * index contract while it opened every catalogued workspace's database file
+ * sequentially. Before this, that sweep applied the v3
+ * schema-compatibility check unconditionally to EVERY catalogued workspace
+ * regardless of its actual on-disk format -- unlike `openWorkspace`/
+ * `registerWorkspaceSerialized`, which both consult `readIndexContractByte`
+ * first -- so a v4 database (rejected as an unsupported v3 contract byte) or
+ * a genuinely pre-v3/corrupt database (rejected by
+ * `ensureWorkspaceSchemaCompatibility` itself) crashed `DurableStorage.open`
+ * -- and so `DaemonRuntime.start` -- entirely, before the daemon ever served
+ * a single RPC for ANY workspace, including perfectly healthy ones. The
+ * sweep now branches on the contract byte the same way `openWorkspace` does
+ * (a v4 database gets the v4 compatibility path, never the v3 one) and
+ * catches `isOutdatedWorkspaceError` instead of letting it escape,
+ * recording one of these per affected workspace here instead of opening it.
+ * `packages/daemon/src/runtime.ts`'s `DaemonRuntime.start` reads
+ * `DurableStorage.outdatedWorkspaces` right after construction and marks
+ * each one's `WorkspaceRegistry` entry so its next scheduled scan reaches
+ * `recreateOutdatedWorkspaceDatabase` (the same P4-a recovery
+ * `scheduleWorkspaceScan`'s own catch block already applies when an
+ * already-running daemon discovers this mid-scan) instead of leaving the
+ * workspace silently un-opened forever.
+ */
+export interface OutdatedWorkspaceRecord {
+  readonly workspace_id: string;
+  readonly database_path: string;
+  readonly error_code: string;
+  readonly error_message: string;
 }
 
 export interface SqliteCapabilities {
@@ -402,21 +437,28 @@ export class InstallationCatalog {
   private async registerWorkspaceSerialized(workspace: Workspace, databasePath: string): Promise<RegisteredWorkspace> {
     const absolutePath = resolve(databasePath);
     const existing = await this.getWorkspaceRegistration(workspace.workspace_id);
-    if (existing) return await this.resolveWorkspaceRegistration(workspace, absolutePath, existing);
-    await mkdir(dirname(absolutePath), { recursive: true });
-    // Registration stamps and mutates the workspace database before the
-    // catalog row exists. Use the same marker as the Rust writer so a new
-    // composition generation cannot race schema/identity initialization.
-    const mutationLock = await acquireWorkspaceMutationLock(`${absolutePath}.urdira-writer.lock`);
-    let workspaceDatabase: SqliteDatabase | undefined;
-    try {
-      workspaceDatabase = await openSqliteDatabase({ filename: absolutePath, busy_timeout_ms: this.busyTimeoutMs });
-      await initializeSchema(workspaceDatabase, WORKSPACE_V3_SCHEMA);
-      await ensureWorkspaceSchemaCompatibility(workspaceDatabase);
-      await stampIdentityFormat(workspaceDatabase);
-    } finally {
-      try { await workspaceDatabase?.close(); } finally { await mutationLock.release(); }
+    if (existing) {
+      const resolved = await this.resolveWorkspaceRegistration(workspace, absolutePath, existing);
+      // v4 destructive-cutover recovery (plan §9, P4-a): `recreateOutdatedWorkspaceDatabase`
+      // (`packages/daemon/src/runtime.ts`'s `scheduleWorkspaceScan`) moves an
+      // already-catalogued workspace's outdated `.sqlite` file aside (never
+      // deletes it) the moment `openWorkspace` rejects it as an unsupported
+      // index contract or identity format, then schedules a fresh scan --
+      // which reaches THIS "already registered" fast path again for the
+      // SAME workspace id (the catalog row itself is correct and untouched:
+      // workspace identity has nothing to do with the physical file's
+      // format). Without this check, the fast path would return here
+      // without ever re-running the stamping below, leaving `openWorkspace`
+      // to create a bare, schema-only file at the now-empty path with no
+      // `identity_format` marker at all -- and reject it again with the
+      // exact error this recovery exists to clear. Detecting the missing
+      // file and re-stamping it here, while leaving the (already correct)
+      // catalog row alone, is what makes that recovery actually converge
+      // instead of looping forever.
+      if (!(await pathExists(absolutePath))) await this.stampFreshWorkspaceDatabase(absolutePath);
+      return resolved;
     }
+    await this.stampFreshWorkspaceDatabase(absolutePath);
     const inserted = await this.database.run(
       `INSERT INTO installation_workspaces (workspace_id, canonical_root, display_root, status, source_provider_bindings, database_path, registered_at, removed_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -429,6 +471,49 @@ export class InstallationCatalog {
       return await this.resolveWorkspaceRegistration(workspace, absolutePath, raced);
     }
     return { ...workspace, database_path: absolutePath };
+  }
+
+  /**
+   * Creates and fully stamps a brand-new workspace database file at
+   * `absolutePath` -- schema, `index_contract`, and (for v3) `identity_format`
+   * -- exactly the physical-file half of `registerWorkspaceSerialized`'s
+   * "not yet registered" branch, extracted so its OWN "already registered,
+   * but the file is missing" branch (see that method's doc comment) can
+   * reuse it verbatim rather than only running it on a workspace's very
+   * first-ever registration.
+   */
+  private async stampFreshWorkspaceDatabase(absolutePath: string): Promise<void> {
+    await mkdir(dirname(absolutePath), { recursive: true });
+    // Registration stamps and mutates the workspace database before the
+    // catalog row exists (or, on a re-stamp after `recreateOutdatedWorkspaceDatabase`,
+    // while the catalog row is already durable but the file it names is
+    // not). Use the same marker as the Rust writer so a new composition
+    // generation cannot race schema/identity initialization.
+    const mutationLock = await acquireWorkspaceMutationLock(`${absolutePath}.urdira-writer.lock`);
+    let workspaceDatabase: SqliteDatabase | undefined;
+    try {
+      workspaceDatabase = await openSqliteDatabase({ filename: absolutePath, busy_timeout_ms: this.busyTimeoutMs });
+      // v4 (plan §9, P2-7): a workspace file that `ensureV4Workspace`
+      // (`@urdira/engine`'s `workspace-v4-bootstrap.ts`) already created --
+      // with its schema, `index_contract=0x34`, and `identity_format=3`
+      // meta rows all stamped -- BEFORE this registration call ever runs
+      // must never have the v3 schema/compatibility path applied on top of
+      // it. `readIndexContractByte` detects that case by reading the byte a
+      // v4-bootstrapped file already has (a genuinely brand-new v3 file has
+      // no `workspace_meta` table yet, so this reads back `undefined` and
+      // falls through to the v3 path exactly as before this change).
+      const contractByte = await readIndexContractByte(workspaceDatabase);
+      if (contractByte === WORKSPACE_V4_INDEX_CONTRACT) {
+        await initializeSchema(workspaceDatabase, WORKSPACE_V4_SCHEMA);
+        await ensureWorkspaceSchemaCompatibilityV4(workspaceDatabase);
+      } else {
+        await initializeSchema(workspaceDatabase, WORKSPACE_V3_SCHEMA);
+        await ensureWorkspaceSchemaCompatibility(workspaceDatabase);
+        await stampIdentityFormat(workspaceDatabase);
+      }
+    } finally {
+      try { await workspaceDatabase?.close(); } finally { await mutationLock.release(); }
+    }
   }
 
   private async getWorkspaceRegistration(workspaceId: string): Promise<WorkspaceRegistrationRow | undefined> {
@@ -895,7 +980,17 @@ export class InstallationCatalog {
 
   async close(): Promise<void> { await this.writer.run(() => this.database.close()); }
 
-  private defaultWorkspacePath(workspaceId: string): string {
+  /**
+   * v4 (P2-7): exposed (was `private`) so `ensureV4Workspace`
+   * (`@urdira/engine`'s `workspace-v4-bootstrap.ts`, via
+   * `DurableStorage.defaultWorkspaceDatabasePath` below) can pre-create a v4
+   * database at the EXACT path `registerWorkspace`'s own default parameter
+   * will resolve to for the same workspace id, before `registerWorkspace`
+   * itself ever runs -- so the file already exists (with its v4 schema and
+   * `index_contract` byte already stamped) by the time `registerWorkspaceSerialized`
+   * opens it and takes the v4 branch instead of initializing v3 on top of it.
+   */
+  defaultWorkspacePath(workspaceId: string): string {
     const safeId = workspaceId.replace(/[^A-Za-z0-9._-]/g, "_");
     return join(this.rootDir, "workspaces", `${safeId}.sqlite`);
   }
@@ -929,6 +1024,12 @@ export class WorkspaceDatabase {
   private readonly writer: SerializedWriter;
   private closed = false;
   private readonly stagingCleanups = new Set<Promise<void>>();
+  // v4 (plan §1): lazily-opened, workspace-scoped sidecar SQLite files
+  // (`<workspace>.lexical.sqlite`, `<workspace>.semantic.sqlite`), keyed by
+  // kind so a second `openSidecar` call for the same kind reuses the
+  // connection instead of racing a second `initializeSchema`. See
+  // `openSidecar` below; closed together with this handle in `close()`.
+  private readonly sidecarDatabases = new Map<"lexical" | "semantic", SqliteDatabase>();
   // Warm digest corpus (`RecordSetDigestCorpusEntry`,
   // `publication-authority.ts`): `computeSnapshotDigestFields`'s own
   // `sortedVisible` output for the generation most recently committed
@@ -1365,6 +1466,31 @@ export class WorkspaceDatabase {
     }).finally(() => this.stagingCleanups.delete(cleanup));
   }
 
+  /**
+   * v4 sidecar (plan §1): opens (creating on first use) `<workspace>.<kind>.sqlite`
+   * next to this workspace's catalog database file, initialized with the
+   * matching v4 sidecar schema (`workspace-v4-lexical.sql` /
+   * `workspace-v4-semantic.sql`). Every writer-mode `openSqliteDatabase`
+   * connection already gets WAL + `synchronous = FULL` +
+   * `busy_timeout`/`foreign_keys` pragmas from `sqlite.ts`'s worker
+   * `openDatabase` -- the same ones the catalog database gets -- so no
+   * separate pragma step is needed here. Cached per kind for this handle's
+   * lifetime and closed together with it. Not called by any production code
+   * path yet; P2/P3 wire the lexical/semantic reconcilers to this instead of
+   * the tables `workspace-v4.sql` no longer has.
+   */
+  async openSidecar(kind: "lexical" | "semantic"): Promise<SqliteDatabase> {
+    const cached = this.sidecarDatabases.get(kind);
+    if (cached) return cached;
+    const fileName = basename(this.rawDatabase.filename);
+    const name = fileName.endsWith(".sqlite") ? fileName.slice(0, -".sqlite".length) : fileName;
+    const sidecarPath = join(dirname(this.rawDatabase.filename), `${name}.${kind}.sqlite`);
+    const database = await openSqliteDatabase({ filename: sidecarPath });
+    await initializeSchema(database, kind === "lexical" ? WORKSPACE_V4_LEXICAL_SCHEMA : WORKSPACE_V4_SEMANTIC_SCHEMA);
+    this.sidecarDatabases.set(kind, database);
+    return database;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -1375,6 +1501,8 @@ export class WorkspaceDatabase {
     // survivor harmless -- see `workspaceDigestCorpora`'s comment.
     try {
       await Promise.allSettled([...this.stagingCleanups]);
+      await Promise.allSettled([...this.sidecarDatabases.values()].map((database) => database.close()));
+      this.sidecarDatabases.clear();
       await this.writer.run(() => this.rawDatabase.close(), "background");
     } finally {
       decrementWorkspaceHandle(this.rawDatabase.filename);
@@ -1395,6 +1523,21 @@ export class DurableStorage {
   private readonly ownerId: string;
   private readonly ownerPid: number;
   private readonly faults: FaultInjector;
+  // v4 (P4-b-prep): populated by `recoverMigrations`/`recoverWorkspaceGcEpochs`
+  // during `open()` -- see `OutdatedWorkspaceRecord`'s doc comment above.
+  private readonly outdated: OutdatedWorkspaceRecord[] = [];
+  private readonly outdatedWorkspaceIds = new Set<string>();
+  // v4 (P4-b-2, default flip): tallied once, in `recoverMigrations` (the
+  // first of the two per-workspace sweeps -- counting again in
+  // `recoverWorkspaceGcEpochs` would double-count every non-outdated
+  // workspace, since both methods iterate the same catalogued list), by
+  // reading the exact same `contractByte` that sweep already computes for
+  // schema routing. Counts only CATALOGUED workspaces whose database file
+  // exists on disk (an outdated/unreadable one is excluded -- its format is
+  // unknown until `recreateOutdatedWorkspaceDatabase` re-stamps it). Read by
+  // `DaemonRuntime.start`'s one-line startup log (`workspaceFormatCounts`).
+  private v3WorkspaceCount = 0;
+  private v4WorkspaceCount = 0;
 
   private constructor(rootDir: string, busyTimeoutMs: number, catalog: InstallationCatalog, cas: ContentAddressedStore, blobs: BlobStore, faults: FaultInjector, byteTelemetry: ByteBoundaryTelemetry) {
     this.rootDir = rootDir;
@@ -1406,6 +1549,73 @@ export class DurableStorage {
     this.byteTelemetry = byteTelemetry;
     this.ownerId = `handle-owner:${randomUUID()}`;
     this.ownerPid = process.pid;
+  }
+
+  /** v4 (P2-7): the path `registerWorkspace`'s own default parameter resolves to for `workspaceId` -- see `InstallationCatalog.defaultWorkspacePath`'s doc comment for why `ensureV4Workspace` needs to read this BEFORE registration runs. */
+  defaultWorkspaceDatabasePath(workspaceId: string): string {
+    return this.catalog.defaultWorkspacePath(workspaceId);
+  }
+
+  /**
+   * v4 (P4-b-prep): every catalogued workspace `open()`'s startup recovery
+   * sweep found at an outdated/unsupported index contract instead of
+   * opening -- see `OutdatedWorkspaceRecord`'s doc comment. Stable for the
+   * lifetime of this `DurableStorage` instance: the sweep runs exactly once,
+   * inside `open()`, before this instance is ever returned to a caller.
+   */
+  get outdatedWorkspaces(): readonly OutdatedWorkspaceRecord[] {
+    return this.outdated;
+  }
+
+  /**
+   * v4 (P4-b-2, default flip): how many of this installation's catalogued,
+   * on-disk-present workspaces are v3 (`index_contract` `0x33`) versus v4
+   * (`WORKSPACE_V4_INDEX_CONTRACT`), as observed by `recoverMigrations`
+   * during this `DurableStorage.open()`. Stable for the instance's lifetime,
+   * same as `outdatedWorkspaces`. An outdated/unreadable workspace (see
+   * `outdatedWorkspaces`) is counted in neither bucket -- its on-disk format
+   * could not be established.
+   */
+  get workspaceFormatCounts(): { readonly v3: number; readonly v4: number } {
+    return { v3: this.v3WorkspaceCount, v4: this.v4WorkspaceCount };
+  }
+
+  /**
+   * v4 (P4-b-prep): `recoverMigrations`/`recoverWorkspaceGcEpochs` catch
+   * `isOutdatedWorkspaceError` ONLY when this instance was constructed with
+   * the default `noFaults` injector. `tests/storage.test.ts`'s "rejects old
+   * candidate layouts at the destructive v3 boundary" deliberately proves
+   * the OPPOSITE contract for a distinct, pre-existing failure mode reached
+   * through the exact same error code and the exact same
+   * `ensureWorkspaceSchemaCompatibility` call this sweep already made
+   * (unconditionally) before this change: a workspace whose candidate
+   * schema is at the pre-v3 destructive boundary must hard-fail
+   * `open()` -- not be silently archived and rescanned -- so its
+   * `fault_injector: createFaultInjector(["migration.candidate_fk_rebuild"])`
+   * argument proves no partial fk-rebuild ran before the rejection. No
+   * production caller (`packages/daemon/src/runtime.ts`'s
+   * `createDurableStorage` call has no `fault_injector` option at all)
+   * ever configures a non-default injector, so this never narrows the
+   * real-world recovery path this task exists to fix -- only test-only
+   * fault-injection scenarios, which want to observe the raw failure
+   * rather than have unrelated resilience logic absorb it.
+   */
+  private shouldRecoverOutdatedWorkspace(error: unknown): boolean {
+    return this.faults === noFaults && isOutdatedWorkspaceError(error);
+  }
+
+  private recordOutdatedWorkspace(workspaceId: string, databasePath: string, error: unknown): void {
+    if (this.outdatedWorkspaceIds.has(workspaceId)) return;
+    this.outdatedWorkspaceIds.add(workspaceId);
+    const code = error !== null && typeof error === "object" && "code" in error && typeof (error as { readonly code?: unknown }).code === "string"
+      ? (error as { readonly code: string }).code
+      : "storage:workspace_format_outdated";
+    this.outdated.push({
+      workspace_id: workspaceId,
+      database_path: databasePath,
+      error_code: code,
+      error_message: error instanceof Error ? error.message : String(error),
+    });
   }
 
   static async open(options: DurableStorageOptions): Promise<DurableStorage> {
@@ -1441,16 +1651,55 @@ export class DurableStorage {
   private async recoverMigrations(): Promise<void> {
     const workspaces = await this.catalog.database.all<{ workspace_id: string; database_path: string }>("SELECT workspace_id, database_path FROM installation_workspaces ORDER BY workspace_id");
     for (const workspace of workspaces) {
+      // A workspace already found outdated by an earlier pass (this method,
+      // or `recoverWorkspaceGcEpochs`, whichever ran first) is skipped
+      // outright here: re-opening it would just rediscover and re-record
+      // the identical failure a second time. See `OutdatedWorkspaceRecord`.
+      if (this.outdatedWorkspaceIds.has(workspace.workspace_id)) continue;
       try { await access(workspace.database_path); } catch { continue; }
       const mutationLock = await acquireWorkspaceMutationLock(`${resolve(workspace.database_path)}.urdira-writer.lock`);
       let database: SqliteDatabase | undefined;
       try {
         database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
+        // v4 (P4-b-prep): mirror of `openWorkspace`'s own branch -- a v4
+        // database must never have the v3 schema/compatibility path applied
+        // to it (its tables don't match, and v3's `index_contract` check
+        // would reject the v4 contract byte outright). v4 has no
+        // `storage_migrations` table yet (see `workspace-v4.sql`) -- there
+        // is no TypeScript-owned migration concept for it -- so recovery
+        // here is limited to confirming the schema/contract are healthy.
+        // Also mirrors `openWorkspace`'s identity check (`bindWorkspaceIdentity`
+        // + `ensureIdentityFormat(V4)`): an outdated `identity_format` marker
+        // (`storage:workspace_format_outdated`) never fails the schema/
+        // contract check above at all, so without this an already-catalogued
+        // "ready"/"degraded" workspace whose IDENTITY format alone has gone
+        // stale would sail through this entire sweep undetected -- exactly
+        // the "(b) v3-stale-identity" category `recreateOutdatedWorkspaceDatabase`
+        // exists for.
+        const contractByte = await readIndexContractByte(database);
+        if (contractByte === WORKSPACE_V4_INDEX_CONTRACT) {
+          await initializeSchema(database, WORKSPACE_V4_SCHEMA);
+          await ensureWorkspaceSchemaCompatibilityV4(database);
+          await bindWorkspaceIdentity(database, workspace.workspace_id);
+          await ensureIdentityFormatV4(database, workspace.workspace_id);
+          this.v4WorkspaceCount += 1;
+          continue;
+        }
         await initializeSchema(database, WORKSPACE_V3_SCHEMA);
         await ensureWorkspaceSchemaCompatibility(database, this.faults);
+        await bindWorkspaceIdentity(database, workspace.workspace_id);
+        await ensureIdentityFormat(database, workspace.workspace_id);
+        this.v3WorkspaceCount += 1;
         const maintenance = new StorageMaintenance(database, this.cas, this.blobs, this.rootDir, workspace.workspace_id);
         const migrations = await database.all<{ migration_id: string }>("SELECT migration_id FROM storage_migrations WHERE workspace_id = ? AND state = 'running' ORDER BY started_at", [workspace.workspace_id]);
         for (const migration of migrations) await maintenance.reconcileMigration(migration.migration_id);
+      } catch (error) {
+        // An outdated/unsupported index contract must not abort `open()` for
+        // every OTHER catalogued workspace -- see `OutdatedWorkspaceRecord`.
+        // Any other failure (a genuine I/O error, a corrupt migration row,
+        // etc.) still propagates exactly as before this change.
+        if (!this.shouldRecoverOutdatedWorkspace(error)) throw error;
+        this.recordOutdatedWorkspace(workspace.workspace_id, workspace.database_path, error);
       } finally {
         try { await database?.close(); } finally { await mutationLock.release(); }
       }
@@ -1461,14 +1710,38 @@ export class DurableStorage {
     const workspaces = await this.catalog.database.all<{ workspace_id: string; database_path: string }>("SELECT workspace_id, database_path FROM installation_workspaces ORDER BY workspace_id");
     const recoveredAt = new Date().toISOString();
     for (const workspace of workspaces) {
+      if (this.outdatedWorkspaceIds.has(workspace.workspace_id)) continue;
       try { await access(workspace.database_path); } catch { continue; }
       const mutationLock = await acquireWorkspaceMutationLock(`${resolve(workspace.database_path)}.urdira-writer.lock`);
       let database: SqliteDatabase | undefined;
       try {
         database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
-        await initializeSchema(database, WORKSPACE_V3_SCHEMA);
-        await ensureWorkspaceSchemaCompatibility(database);
+        // v4 (P4-b-prep): mirror of `openWorkspace`'s own branch. Unlike
+        // `storage_migrations`, `garbage_collection_epochs` exists in both
+        // schemas with the same shape, so the recovery UPDATE below applies
+        // unchanged either way -- only the schema/compatibility path taken
+        // to get there differs. Also mirrors `openWorkspace`'s identity
+        // check -- see `recoverMigrations`'s identical branch for why. In
+        // the common case `recoverMigrations` (which runs first, in `open()`)
+        // already found and recorded any outdated workspace, so this rarely
+        // does new detection work; kept here too so this method stays
+        // correct standing alone.
+        const contractByte = await readIndexContractByte(database);
+        if (contractByte === WORKSPACE_V4_INDEX_CONTRACT) {
+          await initializeSchema(database, WORKSPACE_V4_SCHEMA);
+          await ensureWorkspaceSchemaCompatibilityV4(database);
+          await bindWorkspaceIdentity(database, workspace.workspace_id);
+          await ensureIdentityFormatV4(database, workspace.workspace_id);
+        } else {
+          await initializeSchema(database, WORKSPACE_V3_SCHEMA);
+          await ensureWorkspaceSchemaCompatibility(database);
+          await bindWorkspaceIdentity(database, workspace.workspace_id);
+          await ensureIdentityFormat(database, workspace.workspace_id);
+        }
         await database.run("UPDATE garbage_collection_epochs SET state = 'recovered', completed_at = COALESCE(completed_at, ?), failure_code = 'storage:gc_recovered_after_restart' WHERE workspace_id = ? AND state IN ('marking', 'sweeping')", [recoveredAt, workspace.workspace_id]);
+      } catch (error) {
+        if (!this.shouldRecoverOutdatedWorkspace(error)) throw error;
+        this.recordOutdatedWorkspace(workspace.workspace_id, workspace.database_path, error);
       } finally {
         try { await database?.close(); } finally { await mutationLock.release(); }
       }
@@ -1487,10 +1760,26 @@ export class DurableStorage {
     let database: SqliteDatabase | undefined;
     try {
       database = await openSqliteDatabase({ filename: workspace.database_path, busy_timeout_ms: this.busyTimeoutMs });
-      await initializeSchema(database, WORKSPACE_V3_SCHEMA);
-      await ensureWorkspaceSchemaCompatibility(database, this.faults);
-      await bindWorkspaceIdentity(database, workspaceId);
-      await ensureIdentityFormat(database, workspaceId);
+      // v4 (plan §9, P2-7): mirror of `registerWorkspaceSerialized`'s own
+      // branch above -- a v4 database must never have the v3 schema/
+      // compatibility/identity checks run against it (v4 has no
+      // `record_occurrences`/etc. at all, so `ensureWorkspaceSchemaCompatibility`'s
+      // legacy column/index backfills would fail outright against it, and
+      // `ensureIdentityFormat` hardcodes format 2). `bindWorkspaceIdentity`
+      // is reused as-is: `workspace_meta`'s `key`/`value` shape is identical
+      // in both schemas, so the same workspace-id binding check applies.
+      const contractByte = await readIndexContractByte(database);
+      if (contractByte === WORKSPACE_V4_INDEX_CONTRACT) {
+        await initializeSchema(database, WORKSPACE_V4_SCHEMA);
+        await ensureWorkspaceSchemaCompatibilityV4(database);
+        await bindWorkspaceIdentity(database, workspaceId);
+        await ensureIdentityFormatV4(database, workspaceId);
+      } else {
+        await initializeSchema(database, WORKSPACE_V3_SCHEMA);
+        await ensureWorkspaceSchemaCompatibility(database, this.faults);
+        await bindWorkspaceIdentity(database, workspaceId);
+        await ensureIdentityFormat(database, workspaceId);
+      }
       await this.catalog.acquireWorkspaceLease(workspaceId, this.ownerId, this.ownerPid);
       const opened = new WorkspaceDatabase(workspaceId, database, this.blobs, this.rootDir, () => this.catalog.releaseWorkspaceLease(workspaceId, this.ownerId), this.faults);
       this.openedWorkspaces.add(opened);
@@ -1722,6 +2011,19 @@ async function publicationControlsExist(database: SqliteDatabase, workspaceId: s
 // existing rows were minted under a derivation this code no longer computes.
 const CURRENT_IDENTITY_FORMAT = 2;
 
+// v4 (plan §9, P2-7): the identity format a v4 workspace stamps at creation
+// (`ensureV4Workspace`, `@urdira/engine`'s `workspace-v4-bootstrap.ts`).
+// Content-derived record/identity ids are unchanged from format 2 -- this
+// bump exists purely so a v4 database can never be opened by v3 code (or
+// vice versa) even if its `index_contract` byte were somehow missed:
+// `ensureIdentityFormat` compares against `CURRENT_IDENTITY_FORMAT` (still 2,
+// v3's runtime), so a v4-stamped database fails that check, exactly like any
+// other unsupported format -- `ensureIdentityFormatV4` (above) is the v4
+// counterpart, checked instead once `openWorkspace`/`registerWorkspaceSerialized`
+// detect `index_contract == WORKSPACE_V4_INDEX_CONTRACT`. Exported so
+// `ensureV4Workspace` stamps the exact same value at creation.
+export const V4_IDENTITY_FORMAT = 3;
+
 /** Written once, only when a workspace database is first created (`registerWorkspaceSerialized`) -- never on later opens, so an existing pre-format-2 database is never silently "healed" into looking current. */
 async function stampIdentityFormat(database: SqliteDatabase): Promise<void> {
   await database.run("INSERT INTO workspace_meta (key, value) VALUES ('identity_format', ?) ON CONFLICT(key) DO NOTHING", [encodeCanonical(CURRENT_IDENTITY_FORMAT)]);
@@ -1746,6 +2048,35 @@ async function ensureIdentityFormat(database: SqliteDatabase, workspaceId: strin
     throw new StorageError("storage:workspace_format_outdated", `Workspace ${workspaceId} identity-format marker is unreadable; ${IDENTITY_FORMAT_REMEDIATION}`, { cause: error instanceof Error ? error.message : String(error), remediation: IDENTITY_FORMAT_REMEDIATION });
   }
   if (storedFormat !== CURRENT_IDENTITY_FORMAT) throw new StorageError("storage:workspace_format_outdated", `Workspace ${workspaceId} is at identity format ${String(storedFormat)}, not ${CURRENT_IDENTITY_FORMAT}; ${IDENTITY_FORMAT_REMEDIATION}`, { remediation: IDENTITY_FORMAT_REMEDIATION });
+}
+
+/** v4 mirror of `ensureIdentityFormat` above, checked against `V4_IDENTITY_FORMAT` (3) instead of `CURRENT_IDENTITY_FORMAT` (2). A v4 database is stamped by `ensureV4Workspace` (`@urdira/engine`) at creation, never by this module -- there is no v4 equivalent of `stampIdentityFormat` here. */
+async function ensureIdentityFormatV4(database: SqliteDatabase, workspaceId: string): Promise<void> {
+  const row = await database.get<{ value: unknown }>("SELECT value FROM workspace_meta WHERE key = 'identity_format'");
+  if (!row) throw new StorageError("storage:workspace_format_outdated", `Workspace ${workspaceId} v4 database is missing its identity-format marker; ${IDENTITY_FORMAT_REMEDIATION}`, { remediation: IDENTITY_FORMAT_REMEDIATION });
+  let storedFormat: unknown;
+  try { storedFormat = decodeCanonical(toBytes(row.value)); } catch (error) {
+    throw new StorageError("storage:workspace_format_outdated", `Workspace ${workspaceId} identity-format marker is unreadable; ${IDENTITY_FORMAT_REMEDIATION}`, { cause: error instanceof Error ? error.message : String(error), remediation: IDENTITY_FORMAT_REMEDIATION });
+  }
+  if (storedFormat !== V4_IDENTITY_FORMAT) throw new StorageError("storage:workspace_format_outdated", `Workspace ${workspaceId} is at identity format ${String(storedFormat)}, not v4's ${V4_IDENTITY_FORMAT}; ${IDENTITY_FORMAT_REMEDIATION}`, { remediation: IDENTITY_FORMAT_REMEDIATION });
+}
+
+/**
+ * v4 (P2-7): detects whether a workspace database FILE that already exists
+ * on disk was bootstrapped as v4 (`ensureV4Workspace`) before this call ever
+ * touched it. Returns `undefined` for a genuinely brand-new file (no
+ * `workspace_meta` table yet -- `sqlite_master` lookup, so this never
+ * fails with "no such table" the way a direct `SELECT ... FROM workspace_meta`
+ * would) or a v3 database (whose `index_contract` byte is `0x33`, not
+ * `WORKSPACE_V4_INDEX_CONTRACT`).
+ */
+async function readIndexContractByte(database: SqliteDatabase): Promise<number | undefined> {
+  const table = await database.get<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workspace_meta'");
+  if (!table) return undefined;
+  const row = await database.get<{ value: unknown }>("SELECT value FROM workspace_meta WHERE key = 'index_contract'");
+  if (!row) return undefined;
+  const bytes = toBytes(row.value);
+  return bytes.byteLength === 1 ? bytes[0] : undefined;
 }
 
 async function bindWorkspaceIdentity(database: SqliteDatabase, workspaceId: string): Promise<void> {

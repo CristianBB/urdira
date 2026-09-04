@@ -1,9 +1,11 @@
-import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { createReadStream, createWriteStream, existsSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { availableParallelism, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { Worker } from "node:worker_threads";
 import { createGunzip, createGzip, type Gzip } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
@@ -15,7 +17,8 @@ import type {
   WorkspaceFreshnessCheckpoint,
 } from "@urdira/contracts";
 import type { DurableStorage, ForkPublicationPlanInput, WorkspaceDatabase } from "@urdira/storage";
-import { buildForkPublicationPlan, computeForkSnapshotDigestFields, normalizeObservationBatchIds, publicationTransactionCommands, snapshotDigest } from "@urdira/storage";
+import { buildForkPublicationPlan, computeForkSnapshotDigestFields, normalizeObservationBatchIds, openSqliteDatabase, publicationTransactionCommands, snapshotDigest } from "@urdira/storage";
+import { readTreeFile } from "./v4-verify.js";
 import { recordIntegrityFailure } from "./index-pack-verify-core.js";
 import type { GitIgnoreRules, InclusionRules } from "@urdira/security";
 import { record, resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
@@ -1365,4 +1368,252 @@ async function importAfterEnumeration(options: IndexPackImportOptions, context: 
   } finally {
     await scratch?.close();
   }
+}
+
+// =============================================================================
+// v4 (index_contract 0x34, P2-4): a NEW, separate pack container.
+//
+// Everything above this line is the v3 pack format (untouched): gzip-
+// compressed tagged NDJSON of RELATIONAL ROWS (`record_occurrences`,
+// `graph_edges`, ...), imported by replaying those rows through the same
+// `bulkCopy*` functions a local fork uses. A v4 workspace's structural
+// corpus has no row-level representation at all -- it is a binary mmap
+// segment store (`crates/urdira-structural-store`) -- so that format
+// cannot represent it; per this task's brief, v4 export/import instead use
+// a NEW simple container (a `.urdira-index-pack-v4` file: gzip-compressed,
+// one small JSON manifest followed by whole files concatenated in the
+// order the manifest lists them), gated entirely separately from the v3
+// code above. `exportV4IndexPack`/`importV4IndexPack` stream file bytes
+// through (never buffering a whole `structural/merkle/<set>.tree` file,
+// which is a fixed ~35.8 MB regardless of corpus size -- see
+// `docs/evidence/2026-09-02-v4-p0-s3-merkle-bucket.md` -- so a v4 pack is
+// at minimum ~140 MB before compression, even for a tiny fixture).
+//
+// Self-contained and directly tested (`tests/index-pack-v4.test.ts`), not
+// wired into `attemptIndexPackImport`'s v3 orchestration above or into any
+// daemon RPC -- see `workspace-fork.ts`'s matching v4 section for why.
+// =============================================================================
+
+export const V4_INDEX_PACK_FORMAT = "urdira-index-pack-v4" as const;
+export const V4_INDEX_PACK_SCHEMA_VERSION = 1 as const;
+
+export interface V4IndexPackFileEntry {
+  /** Posix-style, relative to the pack root: `"workspace.sqlite"`, or
+   * `"structural/<...>"` / `"sidecar/<...>"` for everything under those
+   * directories (recursively). */
+  readonly path: string;
+  readonly byte_length: number;
+}
+
+export interface V4IndexPackManifest {
+  readonly format: typeof V4_INDEX_PACK_FORMAT;
+  readonly schema_version: typeof V4_INDEX_PACK_SCHEMA_VERSION;
+  readonly workspace_id: string;
+  readonly generation: number;
+  /** From `merkle_roots` at `generation` (`sha256:`-prefixed hex); empty
+   * until the donor has completed at least one cold scan. */
+  readonly roots: Readonly<Record<string, string>>;
+  readonly canonical_record_set_digest: string;
+  readonly source_state_digest: string;
+  readonly files: readonly V4IndexPackFileEntry[];
+}
+
+async function walkV4PackDirectory(root: string, posixPrefix: string): Promise<{ readonly path: string; readonly absolutePath: string }[]> {
+  const out: { readonly path: string; readonly absolutePath: string }[] = [];
+  async function walk(directory: string, prefix: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    // Deterministic order: two exports of the identical store produce a
+    // byte-identical pack, which is also what makes the "flip one byte"
+    // corruption test in `tests/index-pack-v4.test.ts` target a
+    // predictable offset.
+    for (const entry of [...entries].sort((left, right) => left.name.localeCompare(right.name))) {
+      const absolutePath = join(directory, entry.name);
+      const path = `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) await walk(absolutePath, path);
+      else if (entry.isFile()) out.push({ path, absolutePath });
+    }
+  }
+  if (existsSync(root)) await walk(root, posixPrefix);
+  return out;
+}
+
+export interface ExportV4IndexPackOptions {
+  readonly databasePath: string;
+  readonly structuralRoot: string;
+  readonly sidecarRoot?: string;
+  readonly workspaceId: string;
+  readonly outputPath: string;
+}
+
+/**
+ * Writes a v4 index pack to `options.outputPath`: `workspace.sqlite` (the
+ * catalog), everything under `structural/` (segments, dictionaries, the
+ * `merkle/*.tree` files), and everything under `sidecar/` if it exists.
+ * `roots`/`canonical_record_set_digest`/`source_state_digest` in the
+ * manifest are read straight from the catalog's `merkle_roots`/`snapshots`
+ * rows (the same authorities `packages/engine/src/v4-verify.ts` checks
+ * against) -- not recomputed here, so an already-corrupt donor produces a
+ * pack whose manifest reports its existing (wrong) values rather than
+ * silently repairing them; `importV4IndexPack` independently re-derives
+ * roots from the copied `.tree` files, so a mismatch is still caught on
+ * import, not just trusted from the manifest.
+ */
+export async function exportV4IndexPack(options: ExportV4IndexPackOptions): Promise<{ readonly packPath: string; readonly manifest: V4IndexPackManifest }> {
+  const files = [
+    { path: "workspace.sqlite", absolutePath: options.databasePath },
+    ...(await walkV4PackDirectory(options.structuralRoot, "structural")),
+    ...(await walkV4PackDirectory(options.sidecarRoot ?? "", "sidecar")),
+  ];
+  const sized = await Promise.all(files.map(async (file) => ({ ...file, byte_length: (await stat(file.absolutePath)).size })));
+
+  const database = await openSqliteDatabase({ filename: options.databasePath, read_only: true });
+  let generation = 0;
+  const roots: Record<string, string> = {};
+  let canonicalRecordSetDigest = "";
+  let sourceStateDigest = "";
+  try {
+    const current = await database.get<{ current_generation: number }>("SELECT current_generation FROM workspace_current_state WHERE workspace_id = ?", [options.workspaceId]);
+    generation = current?.current_generation ?? 0;
+    if (generation > 0) {
+      const merkleRoots = await database.all<{ set_kind: string; root: Uint8Array; member_count: number }>("SELECT set_kind, root, member_count FROM merkle_roots WHERE generation = ?", [generation]);
+      for (const row of merkleRoots) roots[row.set_kind] = `sha256:${Buffer.from(row.root).toString("hex")}`;
+      const snapshot = await database.get<{ canonical_record_set_digest: string; source_state_digest: string }>("SELECT canonical_record_set_digest, source_state_digest FROM snapshots WHERE workspace_id = ? AND generation = ?", [options.workspaceId, generation]);
+      canonicalRecordSetDigest = snapshot?.canonical_record_set_digest ?? "";
+      sourceStateDigest = snapshot?.source_state_digest ?? "";
+    }
+  } finally {
+    await database.close();
+  }
+
+  const manifest: V4IndexPackManifest = {
+    format: V4_INDEX_PACK_FORMAT,
+    schema_version: V4_INDEX_PACK_SCHEMA_VERSION,
+    workspace_id: options.workspaceId,
+    generation,
+    roots,
+    canonical_record_set_digest: canonicalRecordSetDigest,
+    source_state_digest: sourceStateDigest,
+    files: sized.map(({ path, byte_length }) => ({ path, byte_length })),
+  };
+  const manifestBytes = Buffer.from(JSON.stringify(manifest), "utf8");
+  const lengthPrefix = Buffer.alloc(4);
+  lengthPrefix.writeUInt32LE(manifestBytes.length, 0);
+
+  await mkdir(dirname(options.outputPath), { recursive: true });
+  async function* source(): AsyncGenerator<Buffer> {
+    yield lengthPrefix;
+    yield manifestBytes;
+    for (const file of sized) {
+      for await (const chunk of createReadStream(file.absolutePath)) yield chunk as Buffer;
+    }
+  }
+  await pipeline(Readable.from(source()), createGzip(), createWriteStream(options.outputPath));
+  return { packPath: options.outputPath, manifest };
+}
+
+/** Pull-based reader over an async byte stream: lets `importV4IndexPack`
+ * read the manifest length prefix, the manifest itself, and then each
+ * file's exact byte range in turn, without ever buffering more than one
+ * upstream chunk beyond what a caller asked for. */
+class V4PackStreamReader {
+  private readonly iterator: AsyncIterator<Buffer>;
+  private pending: Buffer = Buffer.alloc(0);
+  private pendingOffset = 0;
+
+  constructor(source: AsyncIterable<Buffer>) {
+    this.iterator = source[Symbol.asyncIterator]();
+  }
+
+  private async ensure(): Promise<boolean> {
+    if (this.pendingOffset < this.pending.length) return true;
+    const { value, done } = await this.iterator.next();
+    if (done === true || value === undefined) return false;
+    this.pending = value;
+    this.pendingOffset = 0;
+    return true;
+  }
+
+  async readExactly(length: number): Promise<Buffer> {
+    const parts: Buffer[] = [];
+    let remaining = length;
+    while (remaining > 0) {
+      if (!(await this.ensure())) throw new IndexPackFormatError("v4 index pack stream ended before the expected number of bytes was read");
+      const take = Math.min(this.pending.length - this.pendingOffset, remaining);
+      parts.push(this.pending.subarray(this.pendingOffset, this.pendingOffset + take));
+      this.pendingOffset += take;
+      remaining -= take;
+    }
+    return parts.length === 1 ? parts[0]! : Buffer.concat(parts, length);
+  }
+
+  async pipeExactlyTo(length: number, destination: NodeJS.WritableStream): Promise<void> {
+    let remaining = length;
+    while (remaining > 0) {
+      if (!(await this.ensure())) throw new IndexPackFormatError("v4 index pack stream ended before the expected number of bytes was read");
+      const take = Math.min(this.pending.length - this.pendingOffset, remaining);
+      const chunk = Buffer.from(this.pending.subarray(this.pendingOffset, this.pendingOffset + take));
+      this.pendingOffset += take;
+      remaining -= take;
+      await new Promise<void>((resolve, reject) => destination.write(chunk, (error) => (error ? reject(error) : resolve())));
+    }
+  }
+}
+
+function v4PackDestinationPath(entryPath: string, options: { readonly targetDatabasePath: string; readonly targetStructuralRoot: string; readonly targetSidecarRoot?: string }): string {
+  if (entryPath === "workspace.sqlite") return options.targetDatabasePath;
+  if (entryPath.startsWith("structural/")) return join(options.targetStructuralRoot, entryPath.slice("structural/".length));
+  if (entryPath.startsWith("sidecar/")) {
+    if (options.targetSidecarRoot === undefined) throw new IndexPackFormatError(`v4 index pack contains a sidecar entry (${entryPath}) but no targetSidecarRoot was given`);
+    return join(options.targetSidecarRoot, entryPath.slice("sidecar/".length));
+  }
+  throw new IndexPackFormatError(`v4 index pack contains an entry outside the known roots: ${entryPath}`);
+}
+
+export interface ImportV4IndexPackOptions {
+  readonly packPath: string;
+  readonly targetDatabasePath: string;
+  readonly targetStructuralRoot: string;
+  readonly targetSidecarRoot?: string;
+}
+
+export interface ImportV4IndexPackResult {
+  readonly manifest: V4IndexPackManifest;
+  readonly roots_verified: boolean;
+  readonly root_mismatches: readonly string[];
+}
+
+/**
+ * Extracts a v4 index pack written by `exportV4IndexPack` to the given
+ * target paths, then independently re-derives each `merkle/<set>.tree`
+ * file's own root/count from the JUST-WRITTEN bytes (`readTreeFile`, the
+ * same reader `packages/engine/src/v4-verify.ts` and `workspace-fork.ts`'s
+ * `verifyV4ForkRoots` use) and compares it against the manifest's `roots` --
+ * this is what makes import verification independent of the manifest's own
+ * claims (see `exportV4IndexPack`'s doc comment) rather than a pass-through
+ * trust of whatever the exporter said.
+ */
+export async function importV4IndexPack(options: ImportV4IndexPackOptions): Promise<ImportV4IndexPackResult> {
+  const gunzipped = createReadStream(options.packPath).pipe(createGunzip());
+  const reader = new V4PackStreamReader(gunzipped as unknown as AsyncIterable<Buffer>);
+  const manifestLength = (await reader.readExactly(4)).readUInt32LE(0);
+  const manifest = JSON.parse((await reader.readExactly(manifestLength)).toString("utf8")) as V4IndexPackManifest;
+  if (manifest.format !== V4_INDEX_PACK_FORMAT) throw new IndexPackFormatError(`unrecognized v4 index pack format: ${String((manifest as { format?: unknown }).format)}`);
+  if (manifest.schema_version !== V4_INDEX_PACK_SCHEMA_VERSION) throw new IndexPackFormatError(`unsupported v4 index pack schema_version: ${String((manifest as { schema_version?: unknown }).schema_version)}`);
+
+  for (const file of manifest.files) {
+    const destinationPath = v4PackDestinationPath(file.path, options);
+    await mkdir(dirname(destinationPath), { recursive: true });
+    const writeStream = createWriteStream(destinationPath);
+    await reader.pipeExactlyTo(file.byte_length, writeStream);
+    await new Promise<void>((resolve, reject) => writeStream.end((error?: Error | null) => (error ? reject(error) : resolve())));
+  }
+
+  const mismatches: string[] = [];
+  for (const [setKind, expectedRoot] of Object.entries(manifest.roots)) {
+    const file = await readTreeFile(join(options.targetStructuralRoot, "merkle", `${setKind}.tree`));
+    if (file === undefined) { mismatches.push(`${setKind}: expected in manifest but missing after import`); continue; }
+    if (file.headerRoot !== expectedRoot) mismatches.push(`${setKind}: header root differs from the manifest's`);
+    if (file.recomputedRoot !== file.headerRoot) mismatches.push(`${setKind}: imported file's own bucket levels no longer match its header root`);
+  }
+  return { manifest, roots_verified: mismatches.length === 0, root_mismatches: mismatches };
 }

@@ -1,0 +1,106 @@
+{
+  "workspace_scan_full": {
+    "kind": "workspace_scan",
+    "request_id": "request:scan-fixture-1",
+    "workspace_id": "workspace:fixture",
+    "workspace_root": "/tmp/urdira-fixture/source",
+    "database_path": "/tmp/urdira-fixture/workspace.sqlite",
+    "structural_root": "/tmp/urdira-fixture/structural",
+    "cas_root": "/tmp/urdira-fixture/cas",
+    "sidecar_root": "/tmp/urdira-fixture/sidecar",
+    "scope": {
+      "kind": "full"
+    },
+    "registry_snapshot_id": "registry:fixture-1",
+    "configuration_revision_id": "configuration:fixture-1",
+    "resolution_lock_id": "resolution:fixture-1",
+    "deadline_ms": 45000,
+    "priority": "interactive"
+  },
+  "workspace_scan_changed": {
+    "kind": "workspace_scan",
+    "request_id": "request:scan-fixture-2",
+    "workspace_id": "workspace:fixture",
+    "workspace_root": "/tmp/urdira-fixture/source",
+    "database_path": "/tmp/urdira-fixture/workspace.sqlite",
+    "structural_root": "/tmp/urdira-fixture/structural",
+    "cas_root": "/tmp/urdira-fixture/cas",
+    "sidecar_root": "/tmp/urdira-fixture/sidecar",
+    "scope": {
+      "kind": "changed",
+      "paths": [
+        {
+          "path": "src/a.ts",
+          "kind": "modified"
+        },
+        {
+          "path": "src/b.ts",
+          "kind": "created"
+        },
+        {
+          "path": "src/c.ts",
+          "kind": "deleted"
+        }
+      ]
+    },
+    "registry_snapshot_id": "registry:fixture-1",
+    "configuration_revision_id": "configuration:fixture-1",
+    "resolution_lock_id": "resolution:fixture-1",
+    "deadline_ms": null,
+    "priority": "background"
+  },
+  "queryable": {
+    "kind": "queryable",
+    "request_id": "request:scan-fixture-1",
+    "operation_id": "request:scan-fixture-1",
+    "generation": 1,
+    "manifest_path": "/tmp/urdira-fixture/structural/MANIFEST",
+    "timings": {
+      "catalog_ms": 120,
+      "parse_ms": 900,
+      "resolve_ms": 200,
+      "materialize_ms": 1500,
+      "write_ms": 2600,
+      "total_ms": 5320
+    }
+  },
+  "scan_completed": {
+    "kind": "scan_completed",
+    "request_id": "request:scan-fixture-1",
+    "operation_id": "request:scan-fixture-1",
+    "generation": 1,
+    "snapshot_id": "snapshot:fixture-1",
+    "roots": {
+      "records": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "dependency": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "graph": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "metric": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "timings": {
+      "catalog_ms": 120,
+      "parse_ms": 900,
+      "resolve_ms": 200,
+      "materialize_ms": 1500,
+      "write_ms": 2600,
+      "fsync_ms": 400,
+      "snapshot_ms": 80,
+      "total_ms": 5800
+    }
+  },
+  "upgrade_completed": {
+    "kind": "upgrade_completed",
+    "request_id": "request:scan-fixture-1",
+    "operation_id": "request:scan-fixture-1",
+    "generation": 2,
+    "upgraded_sites": 731,
+    "external_sites": 42,
+    "unresolved_sites": 205,
+    "timings": {
+      "resolve_ms": 2300,
+      "materialize_ms": 180,
+      "write_ms": 90,
+      "snapshot_ms": 30,
+      "total_ms": 2600
+    }
+  }
+}

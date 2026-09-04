@@ -1,11 +1,12 @@
-import { canonicalBytes, decodeCanonical, digestBytes } from "@urdira/canonical";
+import { canonicalBytes, digestBytes } from "@urdira/canonical";
 import { facetRegistry, languageRegistry, universalEntityKinds, universalRelationKinds, type QueryScope, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
-import { hydrateRelationalValue, type RelationalValueRow } from "@urdira/storage";
+import type { RelationalValueRow } from "@urdira/storage";
 import type { SqliteDatabase } from "@urdira/storage";
 import { EngineError, EngineErrorWithDetails } from "./errors.js";
 import { QueryPlanError } from "./query-plan.js";
 import { toSubjectSelector } from "./recipe-executor.js";
 import { expandRelations, findShortestPaths, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem, type RelationEdge } from "./query-operators.js";
+import { decodeRow, object, type RecordRow } from "./query-record-decode.js";
 import type { RecordBodyInterner } from "./record-body-interner.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
 import { exactVectorScan, fuseSemanticLanes, rerankSemanticMatches } from "./semantic-retrieval.js";
@@ -375,33 +376,6 @@ const SEMANTIC_ENTITY_CANDIDATE_CAP = SEMANTIC_CANDIDATE_CAP;
 // this constant is a duplicated-but-documented assumption, not a derived one.
 const SEMANTIC_MAX_DOCUMENT_BYTES = 2_000_000;
 
-type RecordRow = {
-  readonly record_id: string; readonly workspace_id: string; readonly category: string; readonly kind: string; readonly universal_kind: string;
-  readonly owner_artifact_id: string; readonly owner_artifact_version_id: string; readonly value_rows?: readonly RelationalValueRow[]; readonly facet_rows?: readonly string[];
-  readonly body_payload: Uint8Array | ArrayBuffer | null;
-  readonly primary_source_span_artifact_version_id: string | number | null;
-  readonly primary_source_span_start_byte: string | number | null;
-  readonly primary_source_span_end_byte: string | number | null;
-  readonly primary_source_span_start_line: string | number | null;
-  readonly primary_source_span_end_line: string | number | null;
-  readonly identity_id: string | null; readonly identity_key: string | null;
-};
-
-function recordBodyPayload(value: Uint8Array | ArrayBuffer): Uint8Array {
-  return value instanceof Uint8Array ? value : new Uint8Array(value);
-}
-
-function primarySourceSpan(row: RecordRow): SourceSpan | undefined {
-  if (row.primary_source_span_artifact_version_id == null || row.primary_source_span_start_byte == null || row.primary_source_span_end_byte == null) return undefined;
-  return {
-    artifact_version_id: String(row.primary_source_span_artifact_version_id),
-    start_byte: String(row.primary_source_span_start_byte),
-    end_byte: String(row.primary_source_span_end_byte),
-    ...(row.primary_source_span_start_line == null ? {} : { start_line: String(row.primary_source_span_start_line) }),
-    ...(row.primary_source_span_end_line == null ? {} : { end_line: String(row.primary_source_span_end_line) }),
-  };
-}
-
 function chunk<T>(values: readonly T[], size: number): readonly T[][] {
   const chunks: T[][] = [];
   for (let start = 0; start < values.length; start += size) chunks.push(values.slice(start, start + size));
@@ -554,35 +528,12 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    * full decode, exactly as if no interner were configured, and registers
    * both for future hits.
    */
+  /** Thin forward to the shared `decodeRow` (`query-record-decode.ts`,
+   * extracted verbatim in P2-5 so `NativeCanonicalQuerySnapshotPort` can
+   * reuse it byte-for-byte) -- kept as a method so every `this.decodeRow(...)`
+   * call site below is unaffected by the extraction. */
   private decodeRow(row: RecordRow): CanonicalQueryRecord {
-    const internedBody = this.interner?.lookup(row.record_id);
-    let body: Record<string, unknown>;
-    let facets: readonly string[];
-    if (internedBody !== undefined && row.facet_rows !== undefined) {
-      body = internedBody as Record<string, unknown>;
-      facets = row.facet_rows;
-    } else {
-      body = row.body_payload == null
-        ? object(hydrateRelationalValue(row.value_rows ?? []))
-        : object(decodeCanonical(recordBodyPayload(row.body_payload)));
-      facets = row.facet_rows ?? [];
-      this.interner?.register(row.record_id, body);
-    }
-    const sourceSpan = primarySourceSpan(row);
-    return {
-      record_id: row.record_id,
-      workspace_id: row.workspace_id,
-      category: row.category,
-      kind: row.kind,
-      universal_kind: row.universal_kind,
-      owner_artifact_id: row.owner_artifact_id,
-      owner_artifact_version_id: row.owner_artifact_version_id,
-      ...(sourceSpan === undefined ? {} : { primary_source_span: sourceSpan }),
-      ...(row.identity_id === null ? {} : { identity_id: row.identity_id }),
-      ...(row.identity_key === null ? {} : { identity_key: row.identity_key }),
-      facets,
-      body,
-    };
+    return decodeRow(row, this.interner);
   }
 
   private async attachRelationalValues(rows: readonly RecordRow[]): Promise<readonly RecordRow[]> {
@@ -1480,10 +1431,6 @@ function item(record: CanonicalQueryRecord, classification: "confirmed" | "possi
 
 function relationClassification(record: CanonicalQueryRecord): "confirmed" | "possible" {
   return record.body["classification"] === "possible" ? "possible" : "confirmed";
-}
-
-function object(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 function strings(value: unknown): readonly string[] {

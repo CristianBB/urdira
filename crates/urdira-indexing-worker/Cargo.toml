@@ -11,11 +11,28 @@ name = "urdira-indexing-worker"
 path = "src/main.rs"
 
 [dependencies]
+rayon = "1"
 rusqlite = { version = "=0.32.1", features = ["bundled"] }
+# v4 materialize (task P2-2c): `identity_key_to_ordinal`/`proposal_key_to_
+# ordinal`/`OrdinalDict` are `String`/`[u8; 32]`-keyed `HashMap`s taking
+# ~1.5M inserts + lookups per n8n-scale cold scan (see the evidence doc's
+# profiling). Already present in Cargo.lock transitively (rustc/hashbrown's
+# own tooling depends on it) -- promoted to a direct dependency here purely
+# to use `FxHashMap` in place of `std`'s default `SipHash`-based hasher for
+# these specific hot maps, no new crate added to the dependency graph.
+rustc-hash = "2"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 urdira-indexing-core = { version = "=0.1.0", path = "../urdira-indexing-core" }
 urdira-jsts-indexing-engine = { version = "=0.1.0", path = "../urdira-jsts-indexing-engine" }
 urdira-jsts-syntax-worker = { version = "=0.3.0", path = "../urdira-jsts-syntax-worker" }
+urdira-jsts-typeflow = { version = "=0.1.0", path = "../urdira-jsts-typeflow" }
 urdira-worker-protocol = { version = "=0.1.0", path = "../urdira-worker-protocol" }
+# v4 cold-scan pipeline (task P2-2b): new modules under src/v4/ only.
+urdira-source-frontier = { version = "=0.1.0", path = "../urdira-source-frontier" }
+urdira-structural-store = { version = "=0.1.0", path = "../urdira-structural-store" }
+urdira-native-core = { version = "=0.1.0", path = "../urdira-native-core" }
+# P1-D-c: the background residual TypeScript-checker pass (decision 28)
+# drives `urdira-tsgo-client`'s `ResidualPass` directly from `v4::residual`.
+urdira-tsgo-client = { version = "=0.1.0", path = "../urdira-tsgo-client" }

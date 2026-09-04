@@ -34,20 +34,22 @@
 use crate::resolver::{self, WorkspaceResolver};
 use crate::{
     AnalysisError, ErrorCode, ProposedRecord, SyntaxFileResult, bounded_sha256_identity,
-    canonical_evidence, canonical_json, canonical_span, proposal_record_key,
+    canonical_evidence, canonical_json, canonical_span, facets_list_from_value,
+    proposal_record_key,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast::Comment;
 use oxc_ast::ast::{
-    BindingPattern, CallExpression, Class, ClassType, ExportSpecifier, Expression, FormalParameter,
-    Function, FunctionType, IdentifierReference, ImportDeclaration, ImportDefaultSpecifier,
-    ImportExpression, ImportNamespaceSpecifier, ImportSpecifier, MethodDefinition,
-    MethodDefinitionKind, ModuleExportName, ObjectProperty, PropertyDefinition, PropertyKey,
-    PropertyKind, StaticMemberExpression, TSEnumDeclaration, TSInterfaceDeclaration,
-    TSMethodSignature, TSMethodSignatureKind, TSModuleDeclaration, TSQualifiedName,
-    TSTypeAliasDeclaration, TSTypeName, TSTypePredicate, TSTypePredicateName, ThisExpression,
-    VariableDeclarator,
+    BindingPattern, CallExpression, ChainElement, Class, ClassType, ComputedMemberExpression,
+    ExportSpecifier, Expression, FormalParameter, Function, FunctionType, IdentifierReference,
+    ImportDeclaration, ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier,
+    ImportSpecifier, MethodDefinition, MethodDefinitionKind, ModuleExportName, ObjectPattern,
+    ObjectProperty, PropertyDefinition, PropertyKey, PropertyKind, StaticMemberExpression,
+    TSEnumDeclaration, TSInterfaceDeclaration, TSMethodSignature, TSMethodSignatureKind,
+    TSModuleDeclaration, TSQualifiedName, TSSignature, TSType, TSTypeAliasDeclaration,
+    TSTypeAnnotation, TSTypeName, TSTypePredicate, TSTypePredicateName, TSTypeQueryExprName,
+    ThisExpression, VariableDeclarator,
 };
 use oxc_ast_visit::{
     Visit,
@@ -56,10 +58,10 @@ use oxc_ast_visit::{
         walk_call_expression, walk_class, walk_export_specifier, walk_formal_parameter,
         walk_function, walk_import_declaration, walk_import_default_specifier,
         walk_import_expression, walk_import_namespace_specifier, walk_import_specifier,
-        walk_method_definition, walk_object_property, walk_property_definition,
-        walk_static_member_expression, walk_ts_enum_declaration, walk_ts_interface_declaration,
-        walk_ts_method_signature, walk_ts_module_declaration, walk_ts_qualified_name,
-        walk_ts_type_alias_declaration, walk_ts_type_predicate, walk_variable_declarator,
+        walk_object_property, walk_property_definition, walk_static_member_expression,
+        walk_ts_enum_declaration, walk_ts_interface_declaration, walk_ts_method_signature,
+        walk_ts_module_declaration, walk_ts_qualified_name, walk_ts_type_alias_declaration,
+        walk_ts_type_predicate, walk_variable_declarator,
     },
 };
 use oxc_parser::Parser;
@@ -112,6 +114,60 @@ pub struct OwnerSemantics {
     /// (`Base<T>`), and mixin expressions (anything but a bare identifier)
     /// are never even attempted here and stay `checker_pending`.
     pub heritage_rows: Vec<ProposedRecord>,
+    /// P0-S2 prototype (typeflow): `core:call` rows resolved through
+    /// declared-type member lookup (`ProgramIndex::members`) rather than
+    /// E1-E3's plain-identifier resolution -- kept in a SEPARATE bucket from
+    /// `call_rows` purely so the orchestrator's census can attribute rows to
+    /// the rule that produced them; both merge into the same observation
+    /// the same way. Empty whenever `URDIRA_JSTS_TYPEFLOW` is off.
+    pub typeflow_call_rows: Vec<ProposedRecord>,
+    /// P0-S2 prototype (typeflow): `core:inherits` rows resolved through a
+    /// class's own `extends` clause when its type has generic arguments
+    /// (erased) -- see `HeritageTarget`'s doc comment in
+    /// `urdira-jsts-typeflow` for the exact scope. Empty whenever
+    /// `URDIRA_JSTS_TYPEFLOW` is off.
+    pub typeflow_heritage_rows: Vec<ProposedRecord>,
+    /// P2-2i: v4 parity fix for the gap decision 28 documents -- v3's
+    /// checker-backed `relate()` always publishes a `classification:
+    /// "possible"` `core:call` row (plus a paired `jsts:unresolved_call`
+    /// diagnostic) for a call site with no resolved declaration; v4's
+    /// checker-free pipeline published nothing at all for such a site
+    /// before this field existed. One `possible` relation record
+    /// immediately followed by its paired diagnostic record, per pending
+    /// call site (see `possible_call_record`/`unresolved_call_diagnostic_
+    /// record`'s doc comments for the exact body shapes -- built
+    /// byte-for-byte to the shape `fact-delta.ts`'s `proposalRelationRecord`/
+    /// `proposalDiagnosticRecord` produce for the checker-resolved
+    /// equivalent, plus a new `reason` field on the diagnostic that v3
+    /// never carried). Empty whenever this owner had no pending call site
+    /// (or none with a resolvable `source_id` -- `current_owner()` always
+    /// succeeds, so in practice this is simply "no pending call sites").
+    pub possible_call_rows: Vec<ProposedRecord>,
+    /// P2-2i: same parity fix as `possible_call_rows`, for heritage clauses
+    /// (`core:inherits`/`core:implements`, `classification: "possible"`).
+    /// No paired diagnostic (v3 never emits one for a heritage clause
+    /// either). Excludes a clause whose enclosing declaration has no entity
+    /// of its own (an anonymous class -- see `finish_heritage_clause`'s doc
+    /// comment), the one case where no `source_id` exists to build a row
+    /// from; that clause's site stays in `pending_sites` with no possible
+    /// row, same gap v3's own `entityForDeclaration` would hit.
+    pub possible_heritage_rows: Vec<ProposedRecord>,
+    /// P0-S2 prototype (typeflow), `URDIRA_JSTS_TYPEFLOW_ORACLE=1` only:
+    /// every site typeflow resolved WITHOUT removing it from
+    /// `pending_sites`, so the orchestrator can compare typeflow's guess
+    /// against the checker's own independent resolution of the same site.
+    /// Always empty when oracle mode is off (including when typeflow itself
+    /// is off).
+    pub typeflow_oracle_hits: Vec<TypeflowOracleHit>,
+    /// P1-A, `URDIRA_JSTS_TYPEFLOW_ORACLE=1` only (diagnostic): the receiver-
+    /// expression SHAPE of every call site that stayed pending with
+    /// `call_deferred_to_e3` (a non-identifier callee), regardless of
+    /// whether typeflow itself resolved it -- lets the census classifier
+    /// (`urdira-indexing-worker`'s `census_typeflow_owner`) break the
+    /// `checker_confirmed_rust_pending` bucket down by shape (`this_return`
+    /// chains, `chained_member_of_call`, an untyped local, ...). Always
+    /// empty when oracle mode is off.
+    pub typeflow_pending_call_shapes: Vec<TypeflowPendingShape>,
     /// Every semantic site the checker still needs to look at, with a reason.
     pub pending_sites: Vec<SemanticSite>,
     /// Stable sha256 digest of the *full* candidate site listing (both
@@ -175,6 +231,39 @@ pub struct SemanticSite {
     pub disposition: SiteDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// One typeflow guess recorded under `URDIRA_JSTS_TYPEFLOW_ORACLE=1` (see
+/// `OwnerSemantics::typeflow_oracle_hits`'s doc comment). `edge_kind` is
+/// `"call"`, `"inherits"`, or `"implements"` -- matches the `universal_kind`
+/// suffix the checker's own equivalent row would carry, so the orchestrator
+/// can look up the checker's own row at the same `(start, end)` span for
+/// comparison.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TypeflowOracleHit {
+    pub start: u32,
+    pub end: u32,
+    pub edge_kind: &'static str,
+    /// Diagnostic (P0-S2, 2026-09-02): which rule produced this guess --
+    /// "this", "super", "member_class_static" (a plain identifier
+    /// naming the class/interface itself), "member_declared_type" (a
+    /// param/variable type annotation), "member_new_expression" (a
+    /// `new T()` initializer), or "heritage_generic" (a class's own
+    /// `extends` with generic arguments erased).
+    pub rule: &'static str,
+    pub source_id: String,
+    pub target_id: String,
+}
+
+/// P1-A census classifier (diagnostic only, `URDIRA_JSTS_TYPEFLOW_ORACLE=1`):
+/// one call site's receiver-expression SHAPE, tagged regardless of whether
+/// typeflow resolved it -- see `OwnerSemantics::typeflow_pending_call_
+/// shapes`'s doc comment and `SemanticWalker::classify_receiver_shape`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TypeflowPendingShape {
+    pub start: u32,
+    pub end: u32,
+    pub shape: &'static str,
 }
 
 /// Pending reasons. These are the exhaustive set of reasons E1a can attach
@@ -500,6 +589,79 @@ struct HeritageRow {
     relation_kind: &'static str,
 }
 
+/// P2-2i: one CALL site neither E1-E3 nor typeflow could resolve, still
+/// carrying the enclosing entity (`source_id`, always present -- `current_
+/// owner()` never returns `None`, see its own doc comment) and the reason
+/// E1a/E3 already attached to it. Turned into a `possible` `core:call` row
+/// plus a `jsts:unresolved_call` diagnostic by `unresolved_call_diagnostic`/
+/// `possible_call_record` in `finish`.
+struct PendingCallSite {
+    start: u32,
+    end: u32,
+    source_id: String,
+    reason: &'static str,
+}
+
+/// P2-2i: one heritage clause entry that stayed `checker_pending` with a
+/// real enclosing declaration to attribute it to. `relation_kind` is
+/// `"inherits"` or `"implements"`, same convention as `HeritageRow`.
+struct PendingHeritageSite {
+    start: u32,
+    end: u32,
+    source_id: String,
+    relation_kind: &'static str,
+}
+
+/// P1-A: the resolved static type of an expression this walker's typeflow
+/// machinery reasons about, generalizing P0-S2's `(entity_id, is_static)`
+/// pair with the two wrapper shapes chain propagation needs to see through
+/// one hop at a time (`T[]`/`Array<T>` for `a[i]`, `Promise<T>` for
+/// `await`). Mirrors `urdira_jsts_typeflow::ResolvedTypeRef` almost exactly,
+/// except `Entity` carries `is_static` (needed at every USE site here,
+/// cross-file lookup only cares about the entity id) and there is no
+/// standalone `ThisType` variant: `this`/`super` resolve directly to an
+/// `Entity` from `class_stack` (this walker always knows the concrete
+/// enclosing class), while a MEMBER's declared `this` return type is
+/// resolved relative to its own receiver by `resolve_type_ref_relative`
+/// before a `TypeflowValue` is ever produced for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TypeflowValue {
+    Entity {
+        entity_id: String,
+        is_static: bool,
+    },
+    ArrayOf(Box<TypeflowValue>),
+    PromiseOf(Box<TypeflowValue>),
+    /// P1-C: `Record<K, V>`'s own value type `V` -- see `urdira_jsts_
+    /// typeflow::RawTypeRef::RecordOf`'s doc comment. Unwrapped by a
+    /// computed access (`a[i]`/`a["x"]`) exactly like `ArrayOf`.
+    RecordOf(Box<TypeflowValue>),
+    /// P1-A (rule (j), local half): a LOCAL parameter/variable annotated
+    /// with an ANONYMOUS `{ ... }` object type (as opposed to a NAMED
+    /// interface/class -- those resolve to `Entity` via `resolve_
+    /// identifier_to_kind`) -- found live: `function f(options: { RunTree:
+    /// LangSmithRunTree }) { options.RunTree.getSharedClient()... }`.
+    /// Carries each member's own NAME and TYPE directly (never an entity
+    /// id -- an inline type literal has no declaration of its own the
+    /// checker could confirm as a member-access TARGET, only as a type to
+    /// keep chaining through), so member access on it is resolved by a
+    /// linear scan (`type_of_static_member`/`type_of_call_expression`)
+    /// rather than `ProgramIndex::member_type_ref`. This is the LOCAL
+    /// counterpart of the crate's own cross-file inline-type-literal
+    /// support (`urdira_jsts_typeflow`'s synthetic containers) -- see that
+    /// crate's `raw_type_ref_of_ts_type` doc comment for the shared
+    /// reasoning; the two never interact directly (a hop into a NAMED
+    /// interface/class always switches to `Entity`, backed by the real
+    /// cross-file index, from then on).
+    Inline(Vec<(String, TypeflowValue)>),
+}
+
+/// P0-S2 typeflow: see `SemanticWalker::class_stack`'s doc comment.
+struct ClassFrame {
+    entity_id: Option<String>,
+    extends_entity_id: Option<String>,
+}
+
 /// One not-yet-published heritage clause entry's own span plus its
 /// individually-computed resolution, as collected by `visit_class`/
 /// `visit_ts_interface_declaration` before handing the whole group to
@@ -532,6 +694,21 @@ pub struct HybridResolutionContext<'a> {
     pub resolver: &'a WorkspaceResolver,
     pub available: &'a BTreeSet<String>,
     pub files: &'a BTreeMap<String, SyntaxFileResult>,
+    /// P0-S2 prototype ("typeflow", `docs/evidence/2026-09-02-v4-p0-s2-
+    /// typeflow-prototype.md`): the cross-file class/interface member index,
+    /// built by the orchestrator ONLY when `URDIRA_JSTS_TYPEFLOW=1` from
+    /// every project file's `urdira_jsts_typeflow::extract_decl_summary`.
+    /// `None` is exactly the flag-off default; every typeflow branch below
+    /// degrades to the pre-existing E1-E3 `checker_pending` behavior when
+    /// this is absent.
+    pub typeflow_index: Option<&'a urdira_jsts_typeflow::ProgramIndex>,
+    /// `URDIRA_JSTS_TYPEFLOW_ORACLE=1`: a typeflow resolution is recorded as
+    /// an oracle hit (`OwnerSemantics::typeflow_oracle_hits`) instead of
+    /// replacing the site's disposition -- the site stays `checker_pending`
+    /// exactly as E1-E3 alone would have left it, so the checker still
+    /// independently resolves it and the orchestrator can compare the two
+    /// answers. Ignored when `typeflow_index` is `None`.
+    pub typeflow_oracle: bool,
 }
 
 struct SemanticWalker<'a, 'ctx, 'r> {
@@ -553,6 +730,69 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// `core:inherits`/`core:implements` rows resolved with certainty (E3,
     /// T2). See `OwnerSemantics::heritage_rows`'s doc comment.
     heritage_rows: Vec<HeritageRow>,
+    /// P0-S2 prototype (typeflow): `core:call`/`core:inherits` rows resolved
+    /// through declared-type member lookup. See `OwnerSemantics::
+    /// typeflow_call_rows`/`typeflow_heritage_rows`'s doc comments.
+    typeflow_call_rows: Vec<CallRow>,
+    typeflow_heritage_rows: Vec<HeritageRow>,
+    /// P2-2i: every CALL site that stayed `checker_pending` after E1-E3 and
+    /// typeflow both had their turn -- the residual the checker-off v4
+    /// pipeline must now speak for itself, mirroring `analyzer.ts`'s own
+    /// `relate("call", relationSource, undefined, node, "possible")` +
+    /// paired `jsts:unresolved_call` diagnostic. See `OwnerSemantics::
+    /// possible_call_rows`'s doc comment for the exact contract.
+    pending_call_sites: Vec<PendingCallSite>,
+    /// P2-2i: every heritage clause entry that stayed `checker_pending` with
+    /// a real enclosing declaration to attribute it to (`self_id` present --
+    /// see `finish_heritage_clause`'s doc comment for the one case this
+    /// deliberately excludes). Mirrors `analyzer.ts`'s own
+    /// `relate("inherits"|"implements", relationSource, undefined, type,
+    /// "possible")`.
+    pending_heritage_sites: Vec<PendingHeritageSite>,
+    /// `URDIRA_JSTS_TYPEFLOW_ORACLE=1` only. See `OwnerSemantics::
+    /// typeflow_oracle_hits`'s doc comment.
+    typeflow_oracle_hits: Vec<TypeflowOracleHit>,
+    /// `URDIRA_JSTS_TYPEFLOW_ORACLE=1` only. See `OwnerSemantics::
+    /// typeflow_pending_call_shapes`'s doc comment.
+    typeflow_pending_call_shapes: Vec<TypeflowPendingShape>,
+    /// Ids of enclosing class declarations, innermost last (P0-S2 typeflow:
+    /// `this`/`super` call-target resolution). `entity_id` is `None` for an
+    /// anonymous class expression (matches `visit_class`'s own `self_class_
+    /// id`); `extends_entity_id` is the best KNOWN base-class entity id --
+    /// set regardless of whether the heritage EDGE itself was published or
+    /// stayed pending/oracle-only, since `super.x()` resolution only needs
+    /// to know what the base class IS, not whether that fact was already
+    /// published.
+    class_stack: Vec<ClassFrame>,
+    /// Whether the class member body currently being walked is `static`
+    /// (innermost last) -- disambiguates `this`/`super` member lookup inside
+    /// a static method/property initializer from an instance one. Empty
+    /// (defaults to instance, `false`) outside any member body.
+    static_context: Vec<bool>,
+    /// P0-S2/P1-A typeflow: every local variable/parameter this walk has
+    /// typed, through a declared type annotation OR (P1-A, rule (b))
+    /// recursively through its own initializer expression when unannotated
+    /// (`type_of_expression`), keyed by oxc `SymbolId`. Consulted (never
+    /// guessed at) by `type_of_expression`'s `Identifier` arm for a plain
+    /// identifier used as a call/member-access base (`a.b()`).
+    local_types: HashMap<SymbolId, (TypeflowValue, &'static str)>,
+    /// P1-C: every destructured-METHOD local binding this walk has typed
+    /// (`record_destructured_object_types`'s leaf case), keyed by the
+    /// binding's own `SymbolId`, valued by the member's OWN declaration
+    /// entity id (`ProgramIndex::members`, never `member_type_ref` -- the
+    /// declaration id itself, not its return type). Distinct from `local_
+    /// types` on purpose: that map answers "what TYPE does calling this
+    /// produce" (needed for further chain propagation, e.g. `createTable(
+    /// name).withColumns()`); THIS map answers "what DECLARATION does
+    /// calling this resolve to" (needed to emit the call edge for a BARE
+    /// destructured-method call with no further chaining at all -- found
+    /// live, the migration DSL's own dominant pattern: `await dropColumns(
+    /// 'user', [...], {...})`, never chained further because `dropColumns`
+    /// returns `void`, `RawTypeRef::Unknown` in this crate's own
+    /// classification, which is exactly why `local_types` alone could never
+    /// resolve this call). Consulted by `resolve_call_target_typeflow`'s
+    /// new identifier-callee branch.
+    destructured_member_entities: HashMap<SymbolId, String>,
     /// Safe-partition rule (see `is_jsdoc_typed_file`): when set, every
     /// identifier-kind site in this owner is forced `checker_pending` with
     /// `REASON_JSDOC_TYPED_FILE`, and zero `reference_rows` are produced,
@@ -575,6 +815,26 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// of real code; a genuinely out-of-order import (legal but unusual JS)
     /// simply leaves that one usage `checker_pending` -- safe, not wrong.
     import_bindings: HashMap<SymbolId, ReferenceResolution>,
+    /// P1-A (rule (f), namespace member call): every `import * as ns from
+    /// "specifier"` binding this walk has seen, keyed by `ns`'s own
+    /// `SymbolId`, valued by the raw module specifier text -- consulted by
+    /// `resolve_namespace_member` for a LATER `ns.member(...)` call/chain
+    /// base, closed the same way a named import is (`WorkspaceResolver::
+    /// resolve` + `resolver::resolve_named_export`), just keyed by the
+    /// PROPERTY name at the use site instead of a name captured at the
+    /// import site (a namespace import binds no single name up front).
+    namespace_import_specifiers: HashMap<SymbolId, String>,
+    /// P1-B: every NAMED import this walk has seen that resolved (through
+    /// `resolver::resolve_named_export`) to a namespace re-export (`export
+    /// * as X from "spec"` -- see `NAMESPACE_REEXPORT_LOCAL_NAME`'s doc
+    /// comment) rather than a single declaration -- keyed by the LOCAL
+    /// binding's own `SymbolId`, valued by the re-exported module's OWN
+    /// already-resolved path (no further `WorkspaceResolver::resolve` hop
+    /// needed, unlike `namespace_import_specifiers`, which only ever holds
+    /// a raw specifier). Consulted by `resolve_namespace_member` for a
+    /// LATER `evals.member(...)` use site, exactly the same way a direct
+    /// `import * as evals from "..."` binding already is.
+    namespace_reexport_targets: HashMap<SymbolId, String>,
     /// Whether THIS owner is itself a test container (`core:covers` fix,
     /// F5 hybrid gap, 2026-09-01): read from `ctx.files[self.path]`'s own
     /// module entity `is_test` flag -- the SAME flag lane 1's
@@ -620,10 +880,22 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             reference_rows: Vec::new(),
             call_rows: Vec::new(),
             heritage_rows: Vec::new(),
+            typeflow_call_rows: Vec::new(),
+            typeflow_heritage_rows: Vec::new(),
+            pending_call_sites: Vec::new(),
+            pending_heritage_sites: Vec::new(),
+            typeflow_oracle_hits: Vec::new(),
+            typeflow_pending_call_shapes: Vec::new(),
+            class_stack: Vec::new(),
+            static_context: Vec::new(),
+            local_types: HashMap::new(),
+            destructured_member_entities: HashMap::new(),
             jsdoc_typed_file,
             ctx,
             current_import_source: None,
             import_bindings: HashMap::new(),
+            namespace_import_specifiers: HashMap::new(),
+            namespace_reexport_targets: HashMap::new(),
             is_test_source,
         }
     }
@@ -663,9 +935,49 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                     cross_file: true,
                 }
             }
-            resolver::ExportResolution::Ambiguous | resolver::ExportResolution::Unresolved => {
+            // P1-B: a namespace re-export (`export * as X from "spec"`) has
+            // no single declaration of its own to resolve THIS plain
+            // identifier reference to -- stays pending here exactly like
+            // `Ambiguous`/`Unresolved` (see `register_namespace_reexport`
+            // for the SEPARATE mechanism that makes `evals.member(...)`
+            // member access resolve).
+            resolver::ExportResolution::Namespace(_)
+            | resolver::ExportResolution::Ambiguous
+            | resolver::ExportResolution::Unresolved => {
                 ReferenceResolution::Pending(REASON_IMPORT_BINDING)
             }
+        }
+    }
+
+    /// P1-B: `evals` in `import { evals } from "../../index"` where
+    /// `../../index` does `export * as evals from "./evals/index"` -- see
+    /// `NAMESPACE_REEXPORT_LOCAL_NAME`'s doc comment. Chases the SAME
+    /// import -> export chain `resolve_import_binding` does (a second,
+    /// cheap in-memory pass -- simpler than threading this through that
+    /// function's own `&self` return value) and, ONLY when it lands on
+    /// `ExportResolution::Namespace`, records `symbol_id` into `namespace_
+    /// reexport_targets` for `resolve_namespace_member` to consult later.
+    /// A no-op for every other outcome (a plain resolved/ambiguous/
+    /// unresolved named import never needs this).
+    fn register_namespace_reexport(&mut self, symbol_id: SymbolId, imported_name: &str) {
+        if self.jsdoc_typed_file {
+            return;
+        }
+        let Some(source_specifier) = &self.current_import_source else {
+            return;
+        };
+        let Some(target_path) =
+            self.ctx
+                .resolver
+                .resolve(&self.path, source_specifier, self.ctx.available)
+        else {
+            return;
+        };
+        if let resolver::ExportResolution::Namespace(reexport_target) =
+            resolver::resolve_named_export(self.ctx.files, &target_path, imported_name)
+        {
+            self.namespace_reexport_targets
+                .insert(symbol_id, reexport_target);
         }
     }
 
@@ -883,6 +1195,1023 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .ok_or(REASON_HERITAGE_TARGET_UNCERTAIN)
     }
 
+    fn current_is_static(&self) -> bool {
+        self.static_context.last().copied().unwrap_or(false)
+    }
+
+    /// P1-A: classify a `TSType`'s declared shape into a `TypeflowValue`,
+    /// the SAME wrapper shapes `urdira_jsts_typeflow::raw_type_ref_of_ts_type`
+    /// classifies for a cross-file member/return type (`T[]`/`Array<T>`/
+    /// `ReadonlyArray<T>`, `Promise<T>`, a parenthesized type), but resolved
+    /// through THIS walker's own `resolve_identifier_to_kind` (local symbol
+    /// table + E2 import/export chain) rather than a second file's own
+    /// summary -- a local variable/parameter annotation is inherently
+    /// owner-local, never something another file's `DeclSummary` could have
+    /// captured. `this` as a local annotation type has no meaning (only a
+    /// MEMBER's own return type can be `this`) and is not attempted here.
+    fn type_ref_of_ts_type(&self, ty: &TSType<'a>) -> Option<TypeflowValue> {
+        match ty {
+            TSType::TSParenthesizedType(parenthesized) => {
+                self.type_ref_of_ts_type(&parenthesized.type_annotation)
+            }
+            TSType::TSArrayType(array) => Some(TypeflowValue::ArrayOf(Box::new(
+                self.type_ref_of_ts_type(&array.element_type)?,
+            ))),
+            TSType::TSTypeReference(reference) => {
+                let TSTypeName::IdentifierReference(ident) = &reference.type_name else {
+                    return None;
+                };
+                let name = ident.name.as_str();
+                if let Some(type_arguments) = &reference.type_arguments {
+                    if name == "Promise" && type_arguments.params.len() == 1 {
+                        return Some(TypeflowValue::PromiseOf(Box::new(
+                            self.type_ref_of_ts_type(&type_arguments.params[0])?,
+                        )));
+                    }
+                    if (name == "Array" || name == "ReadonlyArray")
+                        && type_arguments.params.len() == 1
+                    {
+                        return Some(TypeflowValue::ArrayOf(Box::new(
+                            self.type_ref_of_ts_type(&type_arguments.params[0])?,
+                        )));
+                    }
+                    // P1-C: see `urdira_jsts_typeflow::raw_type_ref_of_ts_
+                    // type`'s own doc comment for the exact same set of
+                    // utility types, mirrored here for a LOCAL parameter/
+                    // variable annotation (resolved through THIS walker's
+                    // own `resolve_identifier_to_kind` instead of a second
+                    // file's `DeclSummary` -- see this function's own doc
+                    // comment for why).
+                    if name == "Record" && type_arguments.params.len() == 2 {
+                        return Some(TypeflowValue::RecordOf(Box::new(
+                            self.type_ref_of_ts_type(&type_arguments.params[1])?,
+                        )));
+                    }
+                    if matches!(name, "Partial" | "Required" | "Readonly" | "NonNullable")
+                        && type_arguments.params.len() == 1
+                    {
+                        return self.type_ref_of_ts_type(&type_arguments.params[0]);
+                    }
+                    if matches!(name, "Pick" | "Omit") && type_arguments.params.len() == 2 {
+                        return self.type_ref_of_ts_type(&type_arguments.params[0]);
+                    }
+                    if name == "Awaited" && type_arguments.params.len() == 1 {
+                        let mut inner = self.type_ref_of_ts_type(&type_arguments.params[0])?;
+                        while let TypeflowValue::PromiseOf(unwrapped) = inner {
+                            inner = *unwrapped;
+                        }
+                        return Some(inner);
+                    }
+                    if name == "ReturnType" && type_arguments.params.len() == 1 {
+                        let TSType::TSTypeQuery(query) = &type_arguments.params[0] else {
+                            return None;
+                        };
+                        let TSTypeQueryExprName::IdentifierReference(fn_ident) = &query.expr_name
+                        else {
+                            return None;
+                        };
+                        let index = self.ctx.typeflow_index?;
+                        // P1-C: `DeclKind::Variable` too -- `typeof f` may
+                        // name a callable VARIABLE (`const f = (...) =>
+                        // ...`), not just a `function` declaration; see
+                        // `urdira_jsts_typeflow`'s `DeclSummary::
+                        // callable_variables` doc comment. `function_
+                        // return_type` is populated for both kinds by
+                        // `ProgramIndex::build`, keyed by whichever entity
+                        // id the declaration site actually produced.
+                        let entity_id = self.resolve_identifier_to_kind(
+                            fn_ident,
+                            &[DeclKind::Function, DeclKind::Variable],
+                        )?;
+                        let type_ref = index.function_return_type(&entity_id)?;
+                        return Self::resolve_type_ref_relative(&type_ref, None);
+                    }
+                    if name == "InstanceType" && type_arguments.params.len() == 1 {
+                        let TSType::TSTypeQuery(query) = &type_arguments.params[0] else {
+                            return None;
+                        };
+                        let TSTypeQueryExprName::IdentifierReference(inst_ident) = &query.expr_name
+                        else {
+                            return None;
+                        };
+                        let entity_id = self.resolve_identifier_to_kind(
+                            inst_ident,
+                            &[DeclKind::Class, DeclKind::Interface],
+                        )?;
+                        return Some(TypeflowValue::Entity {
+                            entity_id,
+                            is_static: false,
+                        });
+                    }
+                }
+                let entity_id = self
+                    .resolve_identifier_to_kind(ident, &[DeclKind::Class, DeclKind::Interface])?;
+                Some(TypeflowValue::Entity {
+                    entity_id,
+                    is_static: false,
+                })
+            }
+            // P1-A (rule (j), local half): see `TypeflowValue::Inline`'s
+            // doc comment. A member with an unresolvable type (a plain
+            // data property whose own type this crate does not classify,
+            // a computed/private key, ...) is simply absent from the
+            // list -- consulted the same "found or not" way `ProgramIndex::
+            // member_type_ref` is, never a guess.
+            TSType::TSTypeLiteral(literal) => {
+                let members = literal
+                    .members
+                    .iter()
+                    .filter_map(|signature| self.inline_member_of_signature(signature))
+                    .collect();
+                Some(TypeflowValue::Inline(members))
+            }
+            _ => None,
+        }
+    }
+
+    /// One `(name, type)` pair contributed by a signature inside an inline
+    /// `{ ... }` type literal -- see `TypeflowValue::Inline`'s doc comment.
+    /// A method signature's own "type" (for member-access purposes) is its
+    /// declared RETURN type, matching `MemberEntry`'s own convention in
+    /// `urdira-jsts-typeflow` exactly.
+    fn inline_member_of_signature(
+        &self,
+        signature: &TSSignature<'a>,
+    ) -> Option<(String, TypeflowValue)> {
+        match signature {
+            TSSignature::TSPropertySignature(property) => {
+                let (_, name) = property_key_name(&property.key)?;
+                let value = self.type_ref_of_annotation(property.type_annotation.as_deref())?;
+                Some((name, value))
+            }
+            TSSignature::TSMethodSignature(method) => {
+                let (_, name) = property_key_name(&method.key)?;
+                let value = self.type_ref_of_annotation(method.return_type.as_deref())?;
+                Some((name, value))
+            }
+            _ => None,
+        }
+    }
+
+    /// `type_ref_of_ts_type` over an optional `TSTypeAnnotation` (a
+    /// variable/parameter's own `: T` annotation site).
+    fn type_ref_of_annotation(
+        &self,
+        annotation: Option<&TSTypeAnnotation<'a>>,
+    ) -> Option<TypeflowValue> {
+        self.type_ref_of_ts_type(&annotation?.type_annotation)
+    }
+
+    /// P1-A: resolve a `ResolvedTypeRef` (a cross-file member/function
+    /// return type, already closed against imports by `ProgramIndex`)
+    /// relative to `this_context` -- TypeScript's own `this` return type
+    /// resolves to WHATEVER RECEIVER the call was made on (a fluent
+    /// builder's `description(): this` returns the SAME runtime type as its
+    /// receiver, not a fixed class), everything else maps straight across.
+    /// `this_context` is `None` for a free function's return type (a `this`
+    /// return type is meaningless there and stays unresolved, never a
+    /// guess).
+    fn resolve_type_ref_relative(
+        type_ref: &urdira_jsts_typeflow::ResolvedTypeRef,
+        this_context: Option<&TypeflowValue>,
+    ) -> Option<TypeflowValue> {
+        match type_ref {
+            urdira_jsts_typeflow::ResolvedTypeRef::Entity(entity_id) => {
+                Some(TypeflowValue::Entity {
+                    entity_id: entity_id.clone(),
+                    is_static: false,
+                })
+            }
+            urdira_jsts_typeflow::ResolvedTypeRef::ThisType => this_context.cloned(),
+            urdira_jsts_typeflow::ResolvedTypeRef::ArrayOf(inner) => Some(TypeflowValue::ArrayOf(
+                Box::new(Self::resolve_type_ref_relative(inner, this_context)?),
+            )),
+            urdira_jsts_typeflow::ResolvedTypeRef::PromiseOf(inner) => {
+                Some(TypeflowValue::PromiseOf(Box::new(
+                    Self::resolve_type_ref_relative(inner, this_context)?,
+                )))
+            }
+            urdira_jsts_typeflow::ResolvedTypeRef::RecordOf(inner) => {
+                Some(TypeflowValue::RecordOf(Box::new(
+                    Self::resolve_type_ref_relative(inner, this_context)?,
+                )))
+            }
+        }
+    }
+
+    /// The `(entity_id, is_static)` pair a `TypeflowValue` carries, when it
+    /// is itself directly a class/interface entity (never an `ArrayOf`/
+    /// `PromiseOf` wrapper -- those need an explicit unwrap first, e.g.
+    /// `a[i]`/`await`, before they can be used as a member-access/call
+    /// base). Shared by every call site that needs a concrete container to
+    /// look a member up on.
+    fn as_entity(value: &TypeflowValue) -> Option<(String, bool)> {
+        match value {
+            TypeflowValue::Entity {
+                entity_id,
+                is_static,
+            } => Some((entity_id.clone(), *is_static)),
+            TypeflowValue::ArrayOf(_)
+            | TypeflowValue::PromiseOf(_)
+            | TypeflowValue::RecordOf(_)
+            | TypeflowValue::Inline(_) => None,
+        }
+    }
+
+    /// The type of member `name` on `value`, when `value` is itself an
+    /// inline `{ ... }` type literal (`TypeflowValue::Inline`) -- a linear
+    /// scan, never a guess for a missing member. `None` (not just "member
+    /// missing") for any OTHER `TypeflowValue` shape, so a caller can
+    /// `.or_else` into the entity-based `ProgramIndex::member_type_ref`
+    /// path without double-attempting the same lookup two different ways.
+    fn inline_member(value: &TypeflowValue, name: &str) -> Option<TypeflowValue> {
+        let TypeflowValue::Inline(members) = value else {
+            return None;
+        };
+        members
+            .iter()
+            .find(|(member_name, _)| member_name == name)
+            .map(|(_, member_value)| member_value.clone())
+    }
+
+    /// P1-A (rule (b), `new T()` initializer shape folded in): `Some(entity_id)`
+    /// only for a bare `new T(...)` whose callee is a plain identifier
+    /// resolving to a class declaration -- a qualified/generic/computed
+    /// callee, or a target that is not itself a class, is never attempted.
+    fn new_expression_type_entity(&self, expr: &Expression<'a>) -> Option<String> {
+        let Expression::NewExpression(new_expr) = expr else {
+            return None;
+        };
+        let Expression::Identifier(ident) = &new_expr.callee else {
+            return None;
+        };
+        self.resolve_identifier_to_kind(ident, &[DeclKind::Class])
+    }
+
+    /// P1-A: the static type of `expr`, recursively -- this is the single
+    /// entry point every typeflow call/member/heritage rule in this walker
+    /// now goes through (widened from P0-S2's `typeflow_object_base`, which
+    /// only handled `this`/`super`/a plain identifier). Handles: `this`/
+    /// `super` (current `class_stack` frame); a plain identifier (a class/
+    /// interface name used statically, else a local variable/parameter this
+    /// walk already typed via `local_types`); `new T(...)` (rule (b)); a
+    /// call expression, resolved through `type_of_call_expression` (rule
+    /// (a): a free function's declared return type, OR -- the fluent-chain
+    /// case -- a member call's declared return type, `this` included);
+    /// `a.b` member access, resolved by looking up `b`'s own declared type
+    /// on `a`'s type (rule (a)'s property-chain half, plus rule (h)'s
+    /// object-shape access once `a`'s own type is a container); `a[i]`
+    /// array element access unwrapping one `ArrayOf` layer (rule (g));
+    /// `await x` unwrapping one `PromiseOf` layer (rule (c)); and
+    /// parenthesized/`as T`/`<T>x`/`x!`/optional-chain (`a?.b`) transparency
+    /// (rule (d)). Anything else (a template/conditional/logical/object-
+    /// literal/array-literal expression, a computed callee this walker
+    /// cannot type, ...) is `None` -- never a guess, exactly like every
+    /// other typeflow rule in this file.
+    fn type_of_expression(&self, expr: &Expression<'a>) -> Option<(TypeflowValue, &'static str)> {
+        match expr {
+            Expression::ThisExpression(_) => {
+                let frame = self.class_stack.last()?;
+                Some((
+                    TypeflowValue::Entity {
+                        entity_id: frame.entity_id.clone()?,
+                        is_static: self.current_is_static(),
+                    },
+                    "this",
+                ))
+            }
+            Expression::Super(_) => {
+                let frame = self.class_stack.last()?;
+                Some((
+                    TypeflowValue::Entity {
+                        entity_id: frame.extends_entity_id.clone()?,
+                        is_static: self.current_is_static(),
+                    },
+                    "super",
+                ))
+            }
+            Expression::Identifier(ident) => {
+                if let Some(entity_id) =
+                    self.resolve_identifier_to_kind(ident, &[DeclKind::Class, DeclKind::Interface])
+                {
+                    return Some((
+                        TypeflowValue::Entity {
+                            entity_id,
+                            is_static: true,
+                        },
+                        "member_class_static",
+                    ));
+                }
+                let reference_id = ident.reference_id.get()?;
+                let reference = self.scoping.get_reference(reference_id);
+                let symbol_id = reference.symbol_id()?;
+                if let Some(tagged) = self.local_types.get(&symbol_id).cloned() {
+                    return Some(tagged);
+                }
+                // P1-A: widens `resolve_identifier_to_kind` to allow
+                // `Variable` for a top-level `const X` this crate captured
+                // EITHER an explicit declared type OR an inferred object-
+                // literal shape for -- see `VariableSummary`'s doc comment
+                // for why the two are tried in this exact order (an
+                // explicit annotation always wins over the initializer's
+                // own structural shape, matching TypeScript exactly; found
+                // live as a wrong-target regression before this ordering
+                // was enforced: `const allNodesConnected: BinaryCheck = {
+                // ..., run() {...} }` resolves `.run` to `BinaryCheck`'s
+                // OWN member, never the object literal's). An ordinary
+                // variable holding, say, a number is neither a declared-
+                // type nor object-shape entry and correctly falls through
+                // to `None`.
+                let index = self.ctx.typeflow_index?;
+                let entity_id = self.resolve_identifier_to_kind(ident, &[DeclKind::Variable])?;
+                if let Some(type_ref) = index.variable_declared_type(&entity_id) {
+                    return Self::resolve_type_ref_relative(&type_ref, None)
+                        .map(|value| (value, "variable_declared_type"));
+                }
+                index.is_container(&entity_id).then_some((
+                    TypeflowValue::Entity {
+                        entity_id,
+                        is_static: false,
+                    },
+                    "object_shape_static",
+                ))
+            }
+            Expression::NewExpression(_) => {
+                let entity_id = self.new_expression_type_entity(expr)?;
+                Some((
+                    TypeflowValue::Entity {
+                        entity_id,
+                        is_static: false,
+                    },
+                    "member_new_expression",
+                ))
+            }
+            Expression::ParenthesizedExpression(parenthesized) => {
+                let (value, rule) = self.type_of_expression(&parenthesized.expression)?;
+                Some((
+                    value,
+                    if rule == "this" || rule == "super" {
+                        rule
+                    } else {
+                        "parenthesized"
+                    },
+                ))
+            }
+            Expression::TSNonNullExpression(inner) => {
+                let (value, rule) = self.type_of_expression(&inner.expression)?;
+                Some((
+                    value,
+                    if rule == "this" || rule == "super" {
+                        rule
+                    } else {
+                        "non_null"
+                    },
+                ))
+            }
+            Expression::TSAsExpression(as_expr) => {
+                let value = self.type_ref_of_ts_type(&as_expr.type_annotation)?;
+                Some((value, "as_expression"))
+            }
+            Expression::TSTypeAssertion(assertion) => {
+                let value = self.type_ref_of_ts_type(&assertion.type_annotation)?;
+                Some((value, "type_assertion"))
+            }
+            Expression::AwaitExpression(await_expr) => {
+                let (value, rule) = self.type_of_expression(&await_expr.argument)?;
+                match value {
+                    TypeflowValue::PromiseOf(inner) => Some((*inner, "await")),
+                    other => Some((other, rule)),
+                }
+            }
+            Expression::ChainExpression(chain) => self.type_of_chain_element(&chain.expression),
+            Expression::CallExpression(call) => self.type_of_call_expression(call),
+            Expression::StaticMemberExpression(member) => self.type_of_static_member(member),
+            Expression::ComputedMemberExpression(member) => self.type_of_computed_member(member),
+            _ => None,
+        }
+    }
+
+    fn type_of_chain_element(
+        &self,
+        element: &ChainElement<'a>,
+    ) -> Option<(TypeflowValue, &'static str)> {
+        match element {
+            ChainElement::CallExpression(call) => self.type_of_call_expression(call),
+            ChainElement::StaticMemberExpression(member) => self.type_of_static_member(member),
+            ChainElement::ComputedMemberExpression(member) => self.type_of_computed_member(member),
+            ChainElement::PrivateFieldExpression(_) | ChainElement::TSNonNullExpression(_) => None,
+        }
+    }
+
+    /// `a.b` (property access, no call): rule (a)'s property-chain half --
+    /// resolve `a`'s own type, then look up `b`'s declared type on it
+    /// through `ProgramIndex::member_type_ref`, resolved relative to `a`'s
+    /// own entity (so a `this`-typed property behaves the same way a
+    /// `this`-returning method does).
+    fn type_of_static_member(
+        &self,
+        member: &StaticMemberExpression<'a>,
+    ) -> Option<(TypeflowValue, &'static str)> {
+        let (base_value, _rule) = self.type_of_expression(&member.object)?;
+        if let Some(value) = Self::inline_member(&base_value, member.property.name.as_str()) {
+            return Some((value, "inline_type_literal_member"));
+        }
+        let index = self.ctx.typeflow_index?;
+        let (base_entity, is_static) = Self::as_entity(&base_value)?;
+        let type_ref =
+            index.member_type_ref(&base_entity, member.property.name.as_str(), is_static)?;
+        let this_context = TypeflowValue::Entity {
+            entity_id: base_entity,
+            is_static: false,
+        };
+        let resolved = Self::resolve_type_ref_relative(&type_ref, Some(&this_context))?;
+        Some((resolved, "member_declared_type_chain"))
+    }
+
+    /// `a[i]` (rule (g)): only when `a`'s own type is known to be an array
+    /// (`TypeflowValue::ArrayOf`, from an explicit `T[]`/`Array<T>`
+    /// annotation or return type) -- the index expression's own value is
+    /// never inspected (any index unwraps the SAME element type).
+    fn type_of_computed_member(
+        &self,
+        member: &ComputedMemberExpression<'a>,
+    ) -> Option<(TypeflowValue, &'static str)> {
+        let (base_value, _rule) = self.type_of_expression(&member.object)?;
+        match base_value {
+            TypeflowValue::ArrayOf(inner) => Some((*inner, "array_element")),
+            // P1-C: `a[i]`/`a["x"]` on a `Record<K, V>`-typed base unwraps
+            // to `V` the same way an array element access does -- the key
+            // expression's own value is never inspected, matching `ArrayOf`.
+            TypeflowValue::RecordOf(inner) => Some((*inner, "record_element")),
+            TypeflowValue::Entity { .. }
+            | TypeflowValue::PromiseOf(_)
+            | TypeflowValue::Inline(_) => None,
+        }
+    }
+
+    /// The static type of a CALL expression's result (rule (a)): an
+    /// identifier callee resolves to a top-level function declaration's own
+    /// declared return type (`ProgramIndex::function_return_type`); a
+    /// member callee (`a.b(...)`) resolves `b`'s declared return type on
+    /// `a`'s own type the same way `type_of_static_member` does for a
+    /// non-called property access, `this` return types included -- this is
+    /// the fluent/builder-chain rule: `createTool({...}).description(...)
+    /// .input(...)` propagates `Tool`'s own entity through every `.method()`
+    /// hop as long as each one's declared return type is `this`.
+    fn type_of_call_expression(
+        &self,
+        call: &CallExpression<'a>,
+    ) -> Option<(TypeflowValue, &'static str)> {
+        let index = self.ctx.typeflow_index?;
+        match &call.callee {
+            Expression::Identifier(ident) => {
+                if let Some(entity_id) =
+                    self.resolve_identifier_to_kind(ident, &[DeclKind::Function])
+                    && let Some(type_ref) = index.function_return_type(&entity_id)
+                    && let Some(resolved) = Self::resolve_type_ref_relative(&type_ref, None)
+                {
+                    return Some((resolved, "call_return_type"));
+                }
+                // P1-B: `createTable(...)` where `createTable` is a
+                // DESTRUCTURED method-valued binding (`local_types`
+                // already stores its OWN declared return type as the
+                // binding's "value" -- see `record_destructured_object_
+                // types`'s doc comment: a method member's `type_ref` IS
+                // its return type by construction, never a separate
+                // "callable" wrapper) or any other local/parameter this
+                // walk has typed via a call-returning declared shape
+                // (found live: the migration DSL's `up({ schemaBuilder: {
+                // createTable, column } }: MigrationContext) { createTable(
+                // name).withColumns(...) }` pattern, repeated across
+                // `packages/@n8n/db/src/migrations/**`). Calling the SAME
+                // binding a plain identifier reference would ALSO see this
+                // exact value (`type_of_expression`'s own `Identifier`
+                // arm), so this is not a new lookup, only a new USE of an
+                // existing one -- sound because a well-typed corpus never
+                // calls a binding whose recorded type came from anything
+                // but a return type in the first place (a non-callable
+                // local's own type is never consulted this way in
+                // practice).
+                let reference_id = ident.reference_id.get()?;
+                let reference = self.scoping.get_reference(reference_id);
+                let symbol_id = reference.symbol_id()?;
+                let (value, _rule) = self.local_types.get(&symbol_id)?.clone();
+                Some((value, "call_through_locally_typed_callable"))
+            }
+            Expression::StaticMemberExpression(member) => {
+                if let Some((base_value, _rule)) = self.type_of_expression(&member.object) {
+                    if let Some(value) =
+                        Self::inline_member(&base_value, member.property.name.as_str())
+                    {
+                        return Some((value, "inline_type_literal_member"));
+                    }
+                    if let Some((base_entity, is_static)) = Self::as_entity(&base_value)
+                        && let Some(type_ref) = index.member_type_ref(
+                            &base_entity,
+                            member.property.name.as_str(),
+                            is_static,
+                        )
+                    {
+                        let this_context = TypeflowValue::Entity {
+                            entity_id: base_entity,
+                            is_static: false,
+                        };
+                        let resolved =
+                            Self::resolve_type_ref_relative(&type_ref, Some(&this_context))?;
+                        return Some((resolved, "call_chain_this_return"));
+                    }
+                }
+                // P1-A (rule (f)): `ns.fn(...)` used as a chain receiver
+                // (`ns.fn().method()`) -- `ns` is not a class/interface, so
+                // the branch above never even attempts it; resolve `fn`
+                // directly to its target module's own declaration and use
+                // ITS declared return type instead.
+                let target_id =
+                    self.resolve_namespace_member(&member.object, member.property.name.as_str())?;
+                let type_ref = index.function_return_type(&target_id)?;
+                let resolved = Self::resolve_type_ref_relative(&type_ref, None)?;
+                Some((resolved, "namespace_member_call_return_type"))
+            }
+            _ => None,
+        }
+    }
+
+    /// P1-A (rule (f)): resolve `object.member_name` when `object` is a
+    /// plain identifier bound EITHER by `import * as object from
+    /// "specifier"` (a raw specifier, resolved here) OR (P1-B) by a NAMED
+    /// import that itself resolved to a namespace re-export (`namespace_
+    /// reexport_targets`, already a resolved path -- see that field's own
+    /// doc comment) -- the SAME import -> export -> declaration closure
+    /// `resolve_import_binding` uses for an ordinary NAMED import
+    /// (`WorkspaceResolver::resolve` + `resolver::resolve_named_export`),
+    /// just keyed by the member name at the USE site rather than a name
+    /// captured once at the import site. `None` for anything but a plain
+    /// identifier object, an unresolved/ambiguous export, or an object that
+    /// is neither kind of namespace binding at all -- never a guess.
+    fn resolve_namespace_member(
+        &self,
+        object: &Expression<'a>,
+        member_name: &str,
+    ) -> Option<String> {
+        let Expression::Identifier(ident) = object else {
+            return None;
+        };
+        let reference_id = ident.reference_id.get()?;
+        let reference = self.scoping.get_reference(reference_id);
+        let symbol_id = reference.symbol_id()?;
+        let target_path = match self.namespace_import_specifiers.get(&symbol_id) {
+            Some(specifier) => {
+                self.ctx
+                    .resolver
+                    .resolve(&self.path, specifier, self.ctx.available)?
+            }
+            None => self.namespace_reexport_targets.get(&symbol_id)?.clone(),
+        };
+        match resolver::resolve_named_export(self.ctx.files, &target_path, member_name) {
+            resolver::ExportResolution::Resolved(target_id) => Some(target_id),
+            resolver::ExportResolution::Namespace(_)
+            | resolver::ExportResolution::Ambiguous
+            | resolver::ExportResolution::Unresolved => None,
+        }
+    }
+
+    /// P1-A: record `binding`'s declared type (see `local_types`'s doc
+    /// comment) from whichever source resolved one -- an explicit type
+    /// annotation (rule (a)/(g)/(c)'s local-annotation half), else (rule
+    /// (b), unannotated `const`/`let`) recursively through the initializer
+    /// expression itself via `type_of_expression`. Does nothing when
+    /// `binding` is not a plain identifier or neither source resolves (the
+    /// binding is simply absent from `local_types`, which `type_of_
+    /// expression`'s `Identifier` arm already treats as "untyped", never a
+    /// guess).
+    fn record_local_type(
+        &mut self,
+        binding: &BindingPattern<'a>,
+        annotation: Option<&TSTypeAnnotation<'a>>,
+        initializer: Option<&Expression<'a>>,
+    ) {
+        if self.ctx.typeflow_index.is_none() {
+            return;
+        }
+        let tagged = self
+            .type_ref_of_annotation(annotation)
+            .map(|value| (value, "member_declared_type"))
+            .or_else(|| initializer.and_then(|init| self.type_of_expression(init)));
+        match binding {
+            BindingPattern::BindingIdentifier(ident) => {
+                if let (Some(symbol_id), Some(tagged)) = (ident.symbol_id.get(), tagged) {
+                    self.local_types.insert(symbol_id, tagged);
+                }
+            }
+            // P1-A (rule (h)): `const { a, b: renamed } = expr` / a
+            // destructured parameter -- type each simple-identifier
+            // property from `expr`'s (or the annotation's) own resolved
+            // type's member table. Nested patterns (`{ a: { b } }`),
+            // computed keys, a rest element, and array destructuring
+            // (`const [a] = arr]`) are all out of scope -- left pending,
+            // never a guess.
+            BindingPattern::ObjectPattern(pattern) => {
+                if let Some((base_value, _rule)) = tagged {
+                    self.record_destructured_object_types(pattern, &base_value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// P1-A (rule (h)): see `record_local_type`'s `ObjectPattern` arm.
+    fn record_destructured_object_types(
+        &mut self,
+        pattern: &ObjectPattern<'a>,
+        base_value: &TypeflowValue,
+    ) {
+        let Some(index) = self.ctx.typeflow_index else {
+            return;
+        };
+        let Some((base_entity, is_static)) = Self::as_entity(base_value) else {
+            return;
+        };
+        for property in &pattern.properties {
+            if property.computed {
+                continue;
+            }
+            let Some((_, key_name)) = property_key_name(&property.key) else {
+                continue;
+            };
+            // P1-C: the member's own DECLARATION entity id (never its
+            // return type) -- attempted independently of the `member_type_
+            // ref` lookup below, since a member whose own declared return
+            // type this crate cannot classify (`dropColumns(): void`,
+            // `RawTypeRef::Unknown` -- `void` has no `raw_type_ref_of_ts_
+            // type` arm) still has a perfectly good declaration id, needed
+            // for a BARE call with no further chaining. See `destructured_
+            // member_entities`'s own doc comment for why this is a
+            // SEPARATE map from `local_types`.
+            if let BindingPattern::BindingIdentifier(ident) = &property.value
+                && let Some(symbol_id) = ident.symbol_id.get()
+                && let urdira_jsts_typeflow::MemberLookup::One(member_entity_id) =
+                    index.members(&base_entity, &key_name, is_static)
+            {
+                self.destructured_member_entities
+                    .insert(symbol_id, member_entity_id);
+            }
+            let Some(type_ref) = index.member_type_ref(&base_entity, &key_name, is_static) else {
+                continue;
+            };
+            let this_context = TypeflowValue::Entity {
+                entity_id: base_entity.clone(),
+                is_static: false,
+            };
+            let Some(resolved) = Self::resolve_type_ref_relative(&type_ref, Some(&this_context))
+            else {
+                continue;
+            };
+            match &property.value {
+                BindingPattern::BindingIdentifier(ident) => {
+                    if let Some(symbol_id) = ident.symbol_id.get() {
+                        self.local_types
+                            .insert(symbol_id, (resolved, "destructured_property"));
+                    }
+                }
+                // P1-C: `{ schemaBuilder: { dropColumns } }` -- a NESTED
+                // destructuring pattern, found live in this corpus's own
+                // migration DSL (every `up`/`down` migration method
+                // destructures `schemaBuilder` straight through to its own
+                // members, never binding a `schemaBuilder` local at all).
+                // One level of recursion, matching this whole function's
+                // own "never widen past what's proven" discipline: `key_
+                // name`'s OWN declared type (just resolved above) becomes
+                // the base for `nested`'s own property lookups -- exactly
+                // the same call this function's caller already makes for
+                // the OUTER pattern, just against a DIFFERENT base entity.
+                BindingPattern::ObjectPattern(nested) => {
+                    self.record_destructured_object_types(nested, &resolved);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// P0-S2/P1-A typeflow (widens E3's T1 to member-access/`this`/`super`/
+    /// chained-call calls): `Some(target_id)` only when the callee is
+    /// `<base>.<member>` AND `type_of_expression` resolves `<base>` to a
+    /// concrete entity AND `ProgramIndex::members` finds EXACTLY ONE
+    /// matching member -- a union (`MemberLookup::Many`) or a miss stays
+    /// pending, never a guess.
+    fn resolve_call_target_typeflow(
+        &self,
+        expr: &CallExpression<'a>,
+    ) -> Option<(String, &'static str)> {
+        let index = self.ctx.typeflow_index?;
+        // P1-C: a BARE call to a destructured-METHOD identifier (`await
+        // dropColumns(...)`, no further chaining) -- see `destructured_
+        // member_entities`'s own doc comment for why this needs a
+        // SEPARATE map from the member-callee branch below (which resolves
+        // `<base>.<member>(...)`, a structurally different callee shape:
+        // this one's callee IS the plain identifier itself). Checked
+        // first: a destructured binding is never ALSO a real function
+        // declaration, so this cannot shadow `resolve_call_target`'s own
+        // (already-tried, already-failed by the time this function runs)
+        // identifier resolution.
+        if let Expression::Identifier(ident) = &expr.callee {
+            let reference_id = ident.reference_id.get()?;
+            let reference = self.scoping.get_reference(reference_id);
+            let symbol_id = reference.symbol_id()?;
+            let target_id = self.destructured_member_entities.get(&symbol_id)?.clone();
+            return Some((target_id, "destructured_method_call"));
+        }
+        let Expression::StaticMemberExpression(member) = &expr.callee else {
+            return None;
+        };
+        if let Some((base_value, rule)) = self.type_of_expression(&member.object)
+            && let Some((base_entity, is_static)) = Self::as_entity(&base_value)
+            && let urdira_jsts_typeflow::MemberLookup::One(target) =
+                index.members(&base_entity, member.property.name.as_str(), is_static)
+        {
+            return Some((target, rule));
+        }
+        // P1-A (rule (f)): `ns.fn(...)` as the call ITSELF (not merely a
+        // chain receiver) -- see `resolve_namespace_member`'s doc comment.
+        // Restricted to `Function` (never `Class`/`Method`/...) to match
+        // `resolve_call_target`'s own T1 scope exactly.
+        let target_id =
+            self.resolve_namespace_member(&member.object, member.property.name.as_str())?;
+        target_id_kind_is_one_of(&target_id, &[DeclKind::Function])
+            .then_some((target_id, "namespace_member_call"))
+    }
+
+    /// P1-A census classifier (diagnostic only): the shape of a non-
+    /// identifier call CALLEE, from the callee expression's own point of
+    /// view -- unwraps the wrappers `type_of_expression` also sees through
+    /// (parenthesized/non-null/optional-chain) before delegating to
+    /// `classify_expr_shape` on the actual receiver (`member.object` for a
+    /// `<base>.<name>(...)` callee, the only shape that matters for the
+    /// method-chain classification this exists to drive -- see
+    /// `docs/evidence/2026-09-02-v4-p1a-typeflow.md`'s classifier
+    /// histogram). A computed callee (`obj[key](...)`) has no "receiver
+    /// shape" in that sense and is tagged directly.
+    fn classify_receiver_shape(&self, callee: &Expression<'a>) -> &'static str {
+        match callee {
+            Expression::StaticMemberExpression(member) => self.classify_expr_shape(&member.object),
+            Expression::ComputedMemberExpression(_) => "computed_callee",
+            Expression::TSNonNullExpression(inner) => self.classify_expr_shape(&inner.expression),
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.classify_expr_shape(&parenthesized.expression)
+            }
+            Expression::ChainExpression(chain) => match &chain.expression {
+                ChainElement::StaticMemberExpression(member) => {
+                    self.classify_expr_shape(&member.object)
+                }
+                ChainElement::ComputedMemberExpression(_) => "computed_callee",
+                ChainElement::CallExpression(_) => "call_expression_receiver",
+                ChainElement::PrivateFieldExpression(_) | ChainElement::TSNonNullExpression(_) => {
+                    "other_callee_shape"
+                }
+            },
+            _ => "other_callee_shape",
+        }
+    }
+
+    /// The shape of one RECEIVER expression (`a` in `a.b(...)`) -- the
+    /// classifier's own taxonomy, ranked by expected frequency from the
+    /// P0-S2 census's miss samples (see `docs/evidence/2026-09-02-v4-p0-s2-
+    /// typeflow-prototype.md`): a fluent/builder chain (`chained_member_of_
+    /// call`), a bare call receiver (`createTool(...)`), an untyped local/
+    /// parameter, `this`/`super` where the enclosing class itself is
+    /// unknown (an anonymous class expression), and so on. Every arm here
+    /// is diagnostic-only and never affects resolution.
+    fn classify_expr_shape(&self, expr: &Expression<'a>) -> &'static str {
+        match expr {
+            Expression::ThisExpression(_) => "this_unresolved",
+            Expression::Super(_) => "super_unresolved",
+            Expression::Identifier(ident) => self.classify_identifier_shape(ident),
+            Expression::CallExpression(_) => "call_expression_receiver",
+            Expression::NewExpression(_) => "new_expr_inline",
+            Expression::StaticMemberExpression(member) => match &member.object {
+                Expression::CallExpression(_) => "chained_member_of_call",
+                _ => "nested_member_chain",
+            },
+            Expression::ComputedMemberExpression(_) => "array_element",
+            Expression::AwaitExpression(_) => "await_expr",
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.classify_expr_shape(&parenthesized.expression)
+            }
+            Expression::TSAsExpression(_) => "as_expression",
+            Expression::TSNonNullExpression(inner) => self.classify_expr_shape(&inner.expression),
+            Expression::TSTypeAssertion(_) => "type_assertion",
+            Expression::ChainExpression(chain) => match &chain.expression {
+                ChainElement::StaticMemberExpression(member) => match &member.object {
+                    Expression::CallExpression(_) => "chained_member_of_call",
+                    _ => "nested_member_chain",
+                },
+                ChainElement::ComputedMemberExpression(_) => "array_element",
+                ChainElement::CallExpression(_) => "call_expression_receiver",
+                ChainElement::PrivateFieldExpression(_) => "other",
+                ChainElement::TSNonNullExpression(inner) => {
+                    self.classify_expr_shape(&inner.expression)
+                }
+            },
+            Expression::ConditionalExpression(_) => "conditional",
+            Expression::LogicalExpression(_) => "logical",
+            Expression::TemplateLiteral(_) | Expression::TaggedTemplateExpression(_) => "template",
+            Expression::ArrayExpression(_) => "array_literal",
+            Expression::ObjectExpression(_) => "object_literal_inline",
+            Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {
+                "function_literal"
+            }
+            Expression::PrivateFieldExpression(_) => "private_field",
+            _ => "other",
+        }
+    }
+
+    /// The shape of an IDENTIFIER used as a receiver: a class/interface name
+    /// used statically (already resolved by rule `member_class_static`, so
+    /// landing here means the class-static lookup itself found no matching
+    /// member -- rare, tagged distinctly so it doesn't inflate the
+    /// "untyped" buckets), an import-bound name (namespace import member
+    /// access, `ns.Foo`), an already-typed local whose member lookup came
+    /// back empty/ambiguous, or an untyped parameter/local/other symbol
+    /// kind.
+    fn classify_identifier_shape(&self, ident: &IdentifierReference<'a>) -> &'static str {
+        if self
+            .resolve_identifier_to_kind(ident, &[DeclKind::Class, DeclKind::Interface])
+            .is_some()
+        {
+            return "static_member_via_class_name_lookup_failed";
+        }
+        let Some(reference_id) = ident.reference_id.get() else {
+            return "unresolved_identifier";
+        };
+        let reference = self.scoping.get_reference(reference_id);
+        let Some(symbol_id) = reference.symbol_id() else {
+            return "unresolved_global";
+        };
+        let flags = self.scoping.symbol_flags(symbol_id);
+        if flags.is_import() {
+            return "namespace_import_member";
+        }
+        if !self.scoping.symbol_redeclarations(symbol_id).is_empty() {
+            return "multiple_declarations";
+        }
+        if self.local_types.contains_key(&symbol_id) {
+            return "identifier_typed_lookup_failed";
+        }
+        match classify_symbol_declaration(self.nodes, self.scoping, symbol_id) {
+            Some(DeclKind::Parameter) => "identifier_param_unannotated",
+            Some(DeclKind::Variable) => "identifier_unannotated_local",
+            Some(DeclKind::Enum) => "enum_member_receiver",
+            Some(DeclKind::Namespace) => "namespace_member_receiver",
+            _ => "identifier_other",
+        }
+    }
+
+    /// P0-S2 typeflow: resolve a heritage identifier the SAME way E3 already
+    /// does (`resolve_identifier_to_kind`) -- the only genuinely NEW case
+    /// this ever succeeds for is a generic type whose args E3's own call
+    /// site never even attempted (`Base<T>`, ident passed as `Some` here
+    /// with args erased by the caller); a plain identifier E3 already tried
+    /// and failed on (`REASON_HERITAGE_TARGET_UNCERTAIN`) fails here too,
+    /// deterministically, since both call the identical resolver.
+    fn resolve_heritage_ident_typeflow(&self, ident: &IdentifierReference<'a>) -> Option<String> {
+        let index = self.ctx.typeflow_index?;
+        let entity_id =
+            self.resolve_identifier_to_kind(ident, &[DeclKind::Class, DeclKind::Interface])?;
+        index.is_container(&entity_id).then_some(entity_id)
+    }
+
+    /// P1-A: resolve a CALL-EXPRESSION super class (`extends Z.class({...})`)
+    /// to a known container entity id -- see `resolve_super_class`'s doc
+    /// comment on its own call site for the exact scope and why this is
+    /// safe (generic-erasure reasoning identical to the already-shipped
+    /// `heritage_generic` rule: a resolved container's OWN member table
+    /// never depends on which concrete type arguments the checker would
+    /// have substituted).
+    fn resolve_heritage_call_typeflow(&self, expr: &Expression<'a>) -> Option<String> {
+        let index = self.ctx.typeflow_index?;
+        let (value, _rule) = self.type_of_expression(expr)?;
+        let (entity_id, _is_static) = Self::as_entity(&value)?;
+        index.is_container(&entity_id).then_some(entity_id)
+    }
+
+    /// Resolve a class's own `super_class` clause (P0-S2 typeflow widening
+    /// of E3's T2), publish it, and track the resulting base entity id on
+    /// `class_stack` for `super.x()` call resolution -- regardless of
+    /// whether the edge itself was published or only recorded as an oracle
+    /// hit (see `class_stack`'s doc comment). Deliberately scoped to a
+    /// class's own `extends` ONLY (never `implements`/an interface's own
+    /// `extends`): those are multi-entry clauses subject to the
+    /// `REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING` atomicity rule (see that
+    /// reason's doc comment), which this prototype does not widen -- a
+    /// class's `super_class` is syntactically single-entry and therefore
+    /// exempt from that rule already.
+    fn resolve_super_class(
+        &mut self,
+        self_class_id: Option<&str>,
+        super_class: &Expression<'a>,
+        has_type_arguments: bool,
+    ) -> Option<String> {
+        let span = super_class.span();
+        let e3_ident = if has_type_arguments {
+            None
+        } else {
+            match super_class {
+                Expression::Identifier(ident) => Some(ident.as_ref()),
+                _ => None,
+            }
+        };
+        let e3_result = self.resolve_heritage_clause(self_class_id, e3_ident);
+        if let Ok((source_id, target_id)) = &e3_result {
+            self.push_site(
+                SiteKind::Heritage,
+                span.start,
+                span.end,
+                SiteDisposition::RustResolved,
+                None,
+            );
+            self.heritage_rows.push(HeritageRow {
+                start: span.start,
+                end: span.end,
+                source_id: source_id.clone(),
+                target_id: target_id.clone(),
+                relation_kind: "inherits",
+            });
+            return Some(target_id.clone());
+        }
+        let reason = e3_result.expect_err("checked Ok above");
+        let typeflow_target = match super_class {
+            Expression::Identifier(ident) => self.resolve_heritage_ident_typeflow(ident),
+            // P1-A (unlocks the `class LoginDto extends Z.class({...}) {}`
+            // mixin factory pattern found live in this corpus's `zod-
+            // class.ts`): the super class is a CALL, not a bare identifier
+            // -- resolve its own static TYPE the same general way a call
+            // RECEIVER would be (`type_of_expression`, object-shape
+            // resolution included), and accept it as a heritage target only
+            // when it names a KNOWN container (a class/interface/object-
+            // shape this index actually indexed) -- never a guess.
+            Expression::CallExpression(_) => self.resolve_heritage_call_typeflow(super_class),
+            _ => None,
+        };
+        match (self_class_id, &typeflow_target) {
+            (Some(source_id), Some(target_id)) if self.ctx.typeflow_oracle => {
+                self.typeflow_oracle_hits.push(TypeflowOracleHit {
+                    start: span.start,
+                    end: span.end,
+                    edge_kind: "inherits",
+                    rule: "heritage_generic",
+                    source_id: source_id.to_owned(),
+                    target_id: target_id.clone(),
+                });
+                self.push_site(
+                    SiteKind::Heritage,
+                    span.start,
+                    span.end,
+                    SiteDisposition::CheckerPending,
+                    Some(reason),
+                );
+                self.pending_heritage_sites.push(PendingHeritageSite {
+                    start: span.start,
+                    end: span.end,
+                    source_id: source_id.to_owned(),
+                    relation_kind: "inherits",
+                });
+            }
+            (Some(source_id), Some(target_id)) => {
+                self.push_site(
+                    SiteKind::Heritage,
+                    span.start,
+                    span.end,
+                    SiteDisposition::RustResolved,
+                    None,
+                );
+                self.typeflow_heritage_rows.push(HeritageRow {
+                    start: span.start,
+                    end: span.end,
+                    source_id: source_id.to_owned(),
+                    target_id: target_id.clone(),
+                    relation_kind: "inherits",
+                });
+            }
+            _ => {
+                self.push_site(
+                    SiteKind::Heritage,
+                    span.start,
+                    span.end,
+                    SiteDisposition::CheckerPending,
+                    Some(reason),
+                );
+                if let Some(source_id) = self_class_id {
+                    self.pending_heritage_sites.push(PendingHeritageSite {
+                        start: span.start,
+                        end: span.end,
+                        source_id: source_id.to_owned(),
+                        relation_kind: "inherits",
+                    });
+                }
+            }
+        }
+        typeflow_target
+    }
+
     /// Push either a `rust_resolved` `Heritage` site plus its `HeritageRow`,
     /// or a `checker_pending` one with `reason` -- the common tail shared by
     /// every heritage clause branch in `visit_class`/`visit_ts_interface_
@@ -893,6 +2222,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         end: u32,
         relation_kind: &'static str,
         resolution: Result<(String, String), &'static str>,
+        self_id: Option<&str>,
     ) {
         match resolution {
             Ok((source_id, target_id)) => {
@@ -919,6 +2249,22 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                     SiteDisposition::CheckerPending,
                     Some(reason),
                 );
+                // P2-2i: `self_id` is `None` exactly when `resolve_heritage_
+                // clause` never had a real enclosing declaration to begin
+                // with (`REASON_HERITAGE_DEFERRED`'s anonymous-declaration
+                // case) -- `analyzer.ts`'s own `entityForDeclaration(node.
+                // parent)` is `undefined` there too, so `relate` is never
+                // even called (see its `if (relationSource !== undefined)`
+                // guard). No possible row for that specific case, matching
+                // v3 exactly; every other `self_id` present.
+                if let Some(source_id) = self_id {
+                    self.pending_heritage_sites.push(PendingHeritageSite {
+                        start,
+                        end,
+                        source_id: source_id.to_owned(),
+                        relation_kind,
+                    });
+                }
             }
         }
     }
@@ -936,6 +2282,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         &mut self,
         relation_kind: &'static str,
         entries: Vec<HeritageClauseEntry>,
+        self_id: Option<&str>,
     ) {
         let all_resolved = entries.iter().all(|(_, _, resolution)| resolution.is_ok());
         for (start, end, resolution) in entries {
@@ -947,7 +2294,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             } else {
                 resolution.and(Err(REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING))
             };
-            self.finish_heritage_clause(start, end, relation_kind, resolution);
+            self.finish_heritage_clause(start, end, relation_kind, resolution, self_id);
         }
     }
 
@@ -1000,6 +2347,23 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                     &right.target_id,
                 ))
         });
+        // P2-2i: deterministic order for the possible/diagnostic rows below,
+        // same (start, end, source_id) key `call_rows`/`heritage_rows` sort
+        // by above -- `pending_call_sites`/`pending_heritage_sites` are
+        // collected in AST visitation order, which is not guaranteed stable
+        // across otherwise-equivalent parses the same way an explicit sort
+        // is.
+        self.pending_call_sites.sort_by(|left, right| {
+            (left.start, left.end, &left.source_id).cmp(&(right.start, right.end, &right.source_id))
+        });
+        self.pending_heritage_sites.sort_by(|left, right| {
+            (left.start, left.end, left.relation_kind, &left.source_id).cmp(&(
+                right.start,
+                right.end,
+                right.relation_kind,
+                &right.source_id,
+            ))
+        });
         let sites_digest = compute_sites_digest(&self.sites);
         let pending_sites = self
             .sites
@@ -1040,11 +2404,47 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .iter()
             .map(|row| heritage_proposed_record(&self.path, row))
             .collect();
+        let typeflow_call_rows = self
+            .typeflow_call_rows
+            .iter()
+            .map(|row| call_proposed_record(&self.path, row))
+            .collect();
+        let typeflow_heritage_rows = self
+            .typeflow_heritage_rows
+            .iter()
+            .map(|row| heritage_proposed_record(&self.path, row))
+            .collect();
+        // P2-2i: one `possible` `core:call` row immediately followed by its
+        // paired `jsts:unresolved_call` diagnostic, per `PendingCallSite`, in
+        // sorted order -- see `possible_call_rows`'s own doc comment for why
+        // the two live in one field.
+        let possible_call_rows = self
+            .pending_call_sites
+            .iter()
+            .enumerate()
+            .flat_map(|(index, site)| {
+                [
+                    possible_call_record(&self.path, site),
+                    unresolved_call_diagnostic_record(&self.path, site, index),
+                ]
+            })
+            .collect();
+        let possible_heritage_rows = self
+            .pending_heritage_sites
+            .iter()
+            .map(|site| possible_heritage_record(&self.path, site))
+            .collect();
         OwnerSemantics {
             reference_rows,
             covers_rows,
             call_rows,
             heritage_rows,
+            typeflow_call_rows,
+            typeflow_heritage_rows,
+            possible_call_rows,
+            possible_heritage_rows,
+            typeflow_oracle_hits: self.typeflow_oracle_hits,
+            typeflow_pending_call_shapes: self.typeflow_pending_call_shapes,
             pending_sites,
             sites_digest,
             jsdoc_typed_file: self.jsdoc_typed_file,
@@ -1095,12 +2495,14 @@ fn reference_proposed_record(path: &str, row: &ReferenceRow) -> ProposedRecord {
     body.insert("path".into(), serde_json::Value::String(path.to_owned()));
     body.insert("start".into(), serde_json::Value::from(row.start));
     body.insert("end".into(), serde_json::Value::from(row.end));
+    let facets = serde_json::json!(["core:reference_relation"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
         category: "relation",
         kind: "jsts:relation_references".to_owned(),
         universal_kind: "core:references".to_owned(),
-        facets: canonical_json(&serde_json::json!(["core:reference_relation"])),
+        facets_list: facets_list_from_value(&facets),
+        facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
         identity_key,
@@ -1148,12 +2550,14 @@ fn covers_proposed_record(
     body.insert("path".into(), serde_json::Value::String(path.to_owned()));
     body.insert("start".into(), serde_json::Value::from(row.start));
     body.insert("end".into(), serde_json::Value::from(row.end));
+    let facets = serde_json::json!(["core:reference_relation"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
         category: "relation",
         kind: "jsts:relation_covers".to_owned(),
         universal_kind: "core:covers".to_owned(),
-        facets: canonical_json(&serde_json::json!(["core:reference_relation"])),
+        facets_list: facets_list_from_value(&facets),
+        facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
         identity_key,
@@ -1197,12 +2601,14 @@ fn call_proposed_record(path: &str, row: &CallRow) -> ProposedRecord {
     body.insert("path".into(), serde_json::Value::String(path.to_owned()));
     body.insert("start".into(), serde_json::Value::from(row.start));
     body.insert("end".into(), serde_json::Value::from(row.end));
+    let facets = serde_json::json!(["core:reference_relation"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
         category: "relation",
         kind: "jsts:relation_call".to_owned(),
         universal_kind: "core:call".to_owned(),
-        facets: canonical_json(&serde_json::json!(["core:reference_relation"])),
+        facets_list: facets_list_from_value(&facets),
+        facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
         identity_key,
@@ -1243,17 +2649,170 @@ fn heritage_proposed_record(path: &str, row: &HeritageRow) -> ProposedRecord {
     body.insert("path".into(), serde_json::Value::String(path.to_owned()));
     body.insert("start".into(), serde_json::Value::from(row.start));
     body.insert("end".into(), serde_json::Value::from(row.end));
+    let facets = serde_json::json!(["core:reference_relation"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
         category: "relation",
         kind: format!("jsts:relation_{}", row.relation_kind),
         universal_kind: format!("core:{}", row.relation_kind),
-        facets: canonical_json(&serde_json::json!(["core:reference_relation"])),
+        facets_list: facets_list_from_value(&facets),
+        facets: canonical_json(&facets),
         schema_version: 1,
         source_span: canonical_span(path, row.start, row.end),
         identity_key,
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(path, row.start, row.end),
+    }
+}
+
+/// `core:call` proposed record, `classification: "possible"`, for one
+/// `PendingCallSite` -- byte-for-byte identical, for the equivalent
+/// checker-resolved case, to the record `fact-delta.ts`'s
+/// `proposalRelationRecord` produces from `analyzer.ts`'s `relate("call",
+/// relationSource, undefined, node, "possible")`: identity_key
+/// `jsts:call:{path}:{start}:{end}:{source_id}:unresolved` (mirrors
+/// `target?.id ?? "unresolved"` with `target` always `undefined` here), NO
+/// `target_id` key in `body` at all (`...(target === undefined ? {} :
+/// { target_id: target.id })`), facets gain `"core:indirect"`
+/// (`fact-delta.ts`'s `relation.classification === "possible" ?
+/// ["core:indirect"] : []`).
+fn possible_call_record(path: &str, site: &PendingCallSite) -> ProposedRecord {
+    let identity_key = format!(
+        "jsts:call:{path}:{}:{}:{}:unresolved",
+        site.start, site.end, site.source_id
+    );
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "source_id".into(),
+        serde_json::Value::String(site.source_id.clone()),
+    );
+    body.insert(
+        "classification".into(),
+        serde_json::Value::String("possible".into()),
+    );
+    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
+    body.insert("start".into(), serde_json::Value::from(site.start));
+    body.insert("end".into(), serde_json::Value::from(site.end));
+    let facets = serde_json::json!(["core:reference_relation", "core:indirect"]);
+    ProposedRecord {
+        proposal_record_key: proposal_record_key(&identity_key),
+        category: "relation",
+        kind: "jsts:relation_call".to_owned(),
+        universal_kind: "core:call".to_owned(),
+        facets_list: facets_list_from_value(&facets),
+        facets: canonical_json(&facets),
+        schema_version: 1,
+        source_span: canonical_span(path, site.start, site.end),
+        identity_key,
+        body: serde_json::Value::Object(body),
+        evidence_references: canonical_evidence(path, site.start, site.end),
+    }
+}
+
+/// `jsts:unresolved_call` diagnostic proposed record, paired 1:1 with
+/// `possible_call_record` for the same `PendingCallSite` -- v3's own
+/// `diagnostics.push({ code: "jsts:unresolved_call", message: "...", path,
+/// start, end })` in `analyzer.ts`, plus a NEW `reason` field (this task's
+/// own extension: v3 never carried one, since a human/agent reading the
+/// diagnostic could cross-reference the checker's own richer context; v4
+/// has no checker, so the pending site's own reason is the only signal
+/// available and is surfaced here instead of silently lost -- registered
+/// in `registry-contribution.ts`'s `diagnosticPayload`).
+///
+/// v3 only emits this diagnostic when the checker found NO declaration at
+/// all (`target === undefined && !declarationWasResolved`); v4 has no
+/// checker to draw that finer distinction -- a `PendingCallSite` is BY
+/// CONSTRUCTION a call Rust never resolved to any declaration (E1-E3 and
+/// typeflow both gave up), so v4 emits this diagnostic for every pending
+/// call site unconditionally. This is a documented simplification (see
+/// this task's evidence doc), not a behavioral claim that every such site
+/// would ALSO fail a real checker's own resolution.
+///
+/// `index` disambiguates identity keys the same way `fact-delta.ts`'s
+/// `proposalDiagnosticRecord`'s own `index` parameter does for v3 (both are
+/// simply "this diagnostic's position in a same-shaped list for this
+/// owner", not required to match v3's own numbering, which spans every
+/// diagnostic kind, not just this one).
+fn unresolved_call_diagnostic_record(
+    path: &str,
+    site: &PendingCallSite,
+    index: usize,
+) -> ProposedRecord {
+    let key = format!(
+        "jsts:diagnostic:{path}:{}:jsts:unresolved_call:{index}",
+        site.start
+    );
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "code".into(),
+        serde_json::Value::String("jsts:unresolved_call".into()),
+    );
+    body.insert(
+        "message".into(),
+        serde_json::Value::String(
+            "The TypeScript checker could not establish a unique call target.".into(),
+        ),
+    );
+    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
+    body.insert("start".into(), serde_json::Value::from(site.start));
+    body.insert("end".into(), serde_json::Value::from(site.end));
+    body.insert(
+        "reason".into(),
+        serde_json::Value::String(site.reason.to_owned()),
+    );
+    let facets = serde_json::json!([]);
+    ProposedRecord {
+        proposal_record_key: proposal_record_key(&key),
+        category: "diagnostic",
+        kind: "jsts:diagnostic".to_owned(),
+        universal_kind: "core:construct".to_owned(),
+        facets_list: facets_list_from_value(&facets),
+        facets: canonical_json(&facets),
+        schema_version: 1,
+        source_span: canonical_span(path, site.start, site.end),
+        identity_key: key,
+        body: serde_json::Value::Object(body),
+        evidence_references: canonical_evidence(path, site.start, site.end),
+    }
+}
+
+/// `core:inherits`/`core:implements` proposed record, `classification:
+/// "possible"`, for one `PendingHeritageSite` -- mirrors `possible_call_
+/// record` above for the heritage case (`analyzer.ts`'s own
+/// `relate("inherits"|"implements", relationSource, undefined, type,
+/// "possible")`). No paired diagnostic: v3 never emits one for a heritage
+/// clause either (only the call branch of `visit` in `analyzer.ts` ever
+/// pushes to `diagnostics`).
+fn possible_heritage_record(path: &str, site: &PendingHeritageSite) -> ProposedRecord {
+    let identity_key = format!(
+        "jsts:{}:{path}:{}:{}:{}:unresolved",
+        site.relation_kind, site.start, site.end, site.source_id
+    );
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "source_id".into(),
+        serde_json::Value::String(site.source_id.clone()),
+    );
+    body.insert(
+        "classification".into(),
+        serde_json::Value::String("possible".into()),
+    );
+    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
+    body.insert("start".into(), serde_json::Value::from(site.start));
+    body.insert("end".into(), serde_json::Value::from(site.end));
+    let facets = serde_json::json!(["core:reference_relation", "core:indirect"]);
+    ProposedRecord {
+        proposal_record_key: proposal_record_key(&identity_key),
+        category: "relation",
+        kind: format!("jsts:relation_{}", site.relation_kind),
+        universal_kind: format!("core:{}", site.relation_kind),
+        facets_list: facets_list_from_value(&facets),
+        facets: canonical_json(&facets),
+        schema_version: 1,
+        source_span: canonical_span(path, site.start, site.end),
+        identity_key,
+        body: serde_json::Value::Object(body),
+        evidence_references: canonical_evidence(path, site.start, site.end),
     }
 }
 
@@ -1375,6 +2934,9 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         }
         if let Some(symbol_id) = specifier.local.symbol_id.get() {
             self.import_bindings.insert(symbol_id, resolution);
+            if let Some(name) = imported_name.as_deref() {
+                self.register_namespace_reexport(symbol_id, name);
+            }
         }
         walk_import_specifier(self, specifier);
     }
@@ -1412,6 +2974,15 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             SiteDisposition::CheckerPending,
             Some(self.identifier_pending_reason(REASON_IMPORT_BINDING)),
         );
+        // P1-A (rule (f)): record `ns`'s own specifier for `resolve_
+        // namespace_member`'s later `ns.member(...)` lookups -- see
+        // `namespace_import_specifiers`'s doc comment.
+        if let (Some(symbol_id), Some(source)) =
+            (specifier.local.symbol_id.get(), &self.current_import_source)
+        {
+            self.namespace_import_specifiers
+                .insert(symbol_id, source.clone());
+        }
         walk_import_namespace_specifier(self, specifier);
     }
 
@@ -1547,13 +3118,77 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 } else {
                     REASON_CALL_DEFERRED
                 };
-                self.push_site(
-                    SiteKind::Call,
-                    start,
-                    end,
-                    SiteDisposition::CheckerPending,
-                    Some(reason),
-                );
+                // P0-S2 typeflow: widen to a member-access/`this`/`super`
+                // callee E3 never even attempts (see `resolve_call_target_
+                // typeflow`'s doc comment).
+                // P1-A census classifier (diagnostic only): record the
+                // receiver shape for every non-identifier-callee call BEFORE
+                // deciding whether typeflow resolved it -- see
+                // `OwnerSemantics::typeflow_pending_call_shapes`'s doc
+                // comment. Gated on oracle mode (never touched in
+                // production, where nothing reads this vector).
+                if !callee_is_identifier && self.ctx.typeflow_oracle {
+                    let shape = self.classify_receiver_shape(&expr.callee);
+                    self.typeflow_pending_call_shapes
+                        .push(TypeflowPendingShape { start, end, shape });
+                }
+                match self.resolve_call_target_typeflow(expr) {
+                    Some((target_id, rule)) if self.ctx.typeflow_oracle => {
+                        let source_id = self.current_owner();
+                        self.typeflow_oracle_hits.push(TypeflowOracleHit {
+                            start,
+                            end,
+                            edge_kind: "call",
+                            rule,
+                            source_id: source_id.clone(),
+                            target_id,
+                        });
+                        self.push_site(
+                            SiteKind::Call,
+                            start,
+                            end,
+                            SiteDisposition::CheckerPending,
+                            Some(reason),
+                        );
+                        self.pending_call_sites.push(PendingCallSite {
+                            start,
+                            end,
+                            source_id,
+                            reason,
+                        });
+                    }
+                    Some((target_id, _rule)) => {
+                        self.push_site(
+                            SiteKind::Call,
+                            start,
+                            end,
+                            SiteDisposition::RustResolved,
+                            None,
+                        );
+                        let source_id = self.current_owner();
+                        self.typeflow_call_rows.push(CallRow {
+                            start,
+                            end,
+                            source_id,
+                            target_id,
+                        });
+                    }
+                    None => {
+                        self.push_site(
+                            SiteKind::Call,
+                            start,
+                            end,
+                            SiteDisposition::CheckerPending,
+                            Some(reason),
+                        );
+                        self.pending_call_sites.push(PendingCallSite {
+                            start,
+                            end,
+                            source_id: self.current_owner(),
+                            reason,
+                        });
+                    }
+                }
             }
         }
         walk_call_expression(self, expr);
@@ -1578,6 +3213,12 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             SiteDisposition::CheckerPending,
             Some(REASON_CALL_DEFERRED),
         );
+        self.pending_call_sites.push(PendingCallSite {
+            start: expr.span.start,
+            end: expr.span.end,
+            source_id: self.current_owner(),
+            reason: REASON_CALL_DEFERRED,
+        });
         walk_import_expression(self, expr);
     }
 
@@ -1602,19 +3243,17 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                     ident.name.as_str(),
                 )
             });
-        if let Some(super_class) = &class.super_class {
-            let span = super_class.span();
-            let ident = if class.super_type_arguments.is_some() {
-                None
-            } else {
-                match super_class {
-                    Expression::Identifier(ident) => Some(ident.as_ref()),
-                    _ => None,
-                }
-            };
-            let resolution = self.resolve_heritage_clause(self_class_id.as_deref(), ident);
-            self.finish_heritage_clause(span.start, span.end, "inherits", resolution);
-        }
+        // P0-S2 typeflow: `resolve_super_class` both publishes this clause
+        // (E3, or E3-widened via typeflow -- see its own doc comment) AND
+        // returns the best-known base entity id for `super.x()` resolution
+        // inside this class's own body, tracked on `class_stack` below.
+        let extends_entity_id = class.super_class.as_ref().and_then(|super_class| {
+            self.resolve_super_class(
+                self_class_id.as_deref(),
+                super_class,
+                class.super_type_arguments.is_some(),
+            )
+        });
         // Atomic per clause (all entries or none) -- see
         // `REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING`'s doc comment: TS
         // groups every `implements` entry under one syntactic
@@ -1640,7 +3279,11 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 )
             })
             .collect();
-        self.finish_heritage_clause_group("implements", implements_entries);
+        self.finish_heritage_clause_group(
+            "implements",
+            implements_entries,
+            self_class_id.as_deref(),
+        );
         if class.r#type == ClassType::ClassDeclaration && class.id.is_some() {
             self.push_site(
                 SiteKind::TypedDecl,
@@ -1650,7 +3293,12 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 Some(REASON_TYPE_INFERENCE_REQUIRED),
             );
         }
+        self.class_stack.push(ClassFrame {
+            entity_id: self_class_id,
+            extends_entity_id,
+        });
         walk_class(self, class);
+        self.class_stack.pop();
     }
 
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
@@ -1675,7 +3323,26 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 Some(REASON_TYPE_INFERENCE_REQUIRED),
             );
         }
+        // P1-A (rule (e)): a `function`/`function expression` REBINDS
+        // `this` -- unlike an arrow function (which oxc never routes
+        // through `visit_function` at all: `ArrowFunctionExpression` is its
+        // own, separate AST node, so arrows correctly never reach here and
+        // never push this blocking frame), so `this`/`super` inside one
+        // must NOT resolve to whatever class happens to be lexically
+        // enclosing. Pushing a `None`/`None` frame here makes `type_of_
+        // expression`'s `ThisExpression`/`Super` arms fail closed (`frame.
+        // entity_id.clone()?` returns `None`) instead of leaking the outer
+        // class in. `visit_method_definition` bypasses THIS override for
+        // its own `.value` function (an ordinary class method's `this` DOES
+        // mean the enclosing class) -- see that override's own doc comment
+        // for why a class method cannot be told apart from a plain function
+        // EXPRESSION by shape alone, and how it works around that.
+        self.class_stack.push(ClassFrame {
+            entity_id: None,
+            extends_entity_id: None,
+        });
         walk_function(self, function, flags);
+        self.class_stack.pop();
         if pushed {
             self.callable_stack.pop();
         }
@@ -1711,7 +3378,36 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         } else {
             false
         };
-        walk_method_definition(self, method);
+        // P0-S2 typeflow: `this`/`super` inside this method's body resolve
+        // against the enclosing class's static/instance side per THIS
+        // member's own `static` keyword, not the class's.
+        self.static_context.push(method.r#static);
+        // P1-A (rule (e)): deliberately NOT `walk_method_definition(self,
+        // method)` -- that default walk dispatches to `self.visit_function`
+        // for `method.value`, which (as of the P1-A fix above) pushes a
+        // `this`-BLOCKING frame for every ordinary function/function
+        // expression. A class method's OWN `.value` is ALWAYS a
+        // `FunctionExpression` -- structurally IDENTICAL to a plain nested
+        // function expression used as a value elsewhere (oxc's `Function`
+        // node carries no "this is a method body" bit) -- so `visit_
+        // function` cannot tell the two apart by shape alone. The fix is to
+        // never let it try for THIS call: replicate `walk_method_
+        // definition`'s own traversal (decorators, property key, matching
+        // `visit_method_definition`'s flags computation exactly) but call
+        // the free `walk_function` directly instead of `self.visit_
+        // function`, so this one function body skips the override and
+        // keeps seeing the enclosing class's `class_stack` frame, exactly
+        // as before this fix.
+        self.visit_decorators(&method.decorators);
+        self.visit_property_key(&method.key);
+        let flags = match method.kind {
+            MethodDefinitionKind::Get => ScopeFlags::Function | ScopeFlags::GetAccessor,
+            MethodDefinitionKind::Set => ScopeFlags::Function | ScopeFlags::SetAccessor,
+            MethodDefinitionKind::Constructor => ScopeFlags::Function | ScopeFlags::Constructor,
+            MethodDefinitionKind::Method => ScopeFlags::Function,
+        };
+        walk_function(self, &method.value, flags);
+        self.static_context.pop();
         if pushed {
             self.callable_stack.pop();
         }
@@ -1810,6 +3506,11 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 Some(REASON_TYPE_INFERENCE_REQUIRED),
             );
         }
+        self.record_local_type(
+            &declarator.id,
+            declarator.type_annotation.as_deref(),
+            declarator.init.as_ref(),
+        );
         walk_variable_declarator(self, declarator);
     }
 
@@ -1850,7 +3551,12 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 Some(REASON_TYPE_INFERENCE_REQUIRED),
             );
         }
+        // P0-S2 typeflow: a field initializer's own `this`/`super` (e.g.
+        // `x = this.makeDefault()`) resolves against this field's own
+        // static/instance side.
+        self.static_context.push(property.r#static);
         walk_property_definition(self, property);
+        self.static_context.pop();
     }
 
     /// E3, T2: an interface's own `extends` entries resolve the same way a
@@ -1886,7 +3592,7 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 )
             })
             .collect();
-        self.finish_heritage_clause_group("inherits", extends_entries);
+        self.finish_heritage_clause_group("inherits", extends_entries, Some(&self_id));
         self.push_site(
             SiteKind::TypedDecl,
             declaration.span.start,
@@ -1963,6 +3669,11 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 Some(REASON_TYPE_INFERENCE_REQUIRED),
             );
         }
+        self.record_local_type(
+            &parameter.pattern,
+            parameter.type_annotation.as_deref(),
+            None,
+        );
         walk_formal_parameter(self, parameter);
     }
 }
@@ -1990,6 +3701,8 @@ pub fn analyze_owner_semantics(
         resolver: &resolver,
         available: &available,
         files: &files,
+        typeflow_index: None,
+        typeflow_oracle: false,
     };
     analyze_owner_semantics_with_context(path, source_text, &ctx)
 }
@@ -2589,6 +4302,86 @@ mod tests {
         );
     }
 
+    /// P2-2i: every pending `Call` site (member/`this`/`super` callee here)
+    /// gets a `classification: "possible"` `core:call` row -- no `target_id`
+    /// key at all, `"core:indirect"` in its facets -- immediately followed
+    /// by a paired `jsts:unresolved_call` diagnostic carrying the site's own
+    /// `reason`. Mirrors `analyzer.ts`'s `relate("call", relationSource,
+    /// undefined, node, "possible")` + `jsts:unresolved_call` push.
+    #[test]
+    fn pending_call_sites_produce_possible_rows_and_paired_diagnostics() {
+        let source = "function run() {\n  this.greet();\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert_eq!(
+            semantics.possible_call_rows.len(),
+            2,
+            "one possible relation + one paired diagnostic: {:?}",
+            semantics.possible_call_rows
+        );
+        let relation = &semantics.possible_call_rows[0];
+        assert_eq!(relation.category, "relation");
+        assert_eq!(relation.kind, "jsts:relation_call");
+        assert_eq!(relation.universal_kind, "core:call");
+        assert_eq!(relation.body["classification"], "possible");
+        assert!(
+            relation.body.get("target_id").is_none(),
+            "a possible call row must carry no target_id key at all: {:?}",
+            relation.body
+        );
+        assert!(relation.identity_key.ends_with(":unresolved"));
+        assert!(
+            relation.facets.contains("core:indirect"),
+            "facets: {}",
+            relation.facets
+        );
+        assert!(
+            relation.facets.contains("core:reference_relation"),
+            "facets: {}",
+            relation.facets
+        );
+
+        let diagnostic = &semantics.possible_call_rows[1];
+        assert_eq!(diagnostic.category, "diagnostic");
+        assert_eq!(diagnostic.kind, "jsts:diagnostic");
+        assert_eq!(diagnostic.universal_kind, "core:construct");
+        assert_eq!(diagnostic.body["code"], "jsts:unresolved_call");
+        assert_eq!(diagnostic.body["reason"], REASON_CALL_DEFERRED);
+        assert_eq!(diagnostic.body["path"], "a.ts");
+    }
+
+    /// P2-2i: `import("./x")` is not a `CallExpression` (see
+    /// `marks_dynamic_import_expression_pending_as_a_call_site` above) but
+    /// still gets the same possible-row + diagnostic treatment as any other
+    /// pending call site.
+    #[test]
+    fn dynamic_import_produces_a_possible_call_row_and_diagnostic() {
+        let source = "async function load() {\n  return import(\"./x.js\");\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert_eq!(semantics.possible_call_rows.len(), 2);
+        assert_eq!(
+            semantics.possible_call_rows[0].body["classification"],
+            "possible"
+        );
+        assert_eq!(
+            semantics.possible_call_rows[1].body["reason"],
+            REASON_CALL_DEFERRED
+        );
+    }
+
+    /// P2-2i: an overloaded (ambiguous) local function call is a plain
+    /// identifier callee (`REASON_CALL_TARGET_UNCERTAIN`), still gets a
+    /// possible row + diagnostic exactly like a non-identifier callee does.
+    #[test]
+    fn overloaded_local_call_produces_a_possible_row_with_the_uncertain_reason() {
+        let source = "function f(a: string): void;\nfunction f(a: number): void;\nfunction f(a: unknown): void {}\nfunction use() {\n  f(1);\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert_eq!(semantics.possible_call_rows.len(), 2);
+        assert_eq!(
+            semantics.possible_call_rows[1].body["reason"],
+            REASON_CALL_TARGET_UNCERTAIN
+        );
+    }
+
     #[test]
     fn new_expression_produces_no_call_site_at_all() {
         // `new Foo()` is never tracked by this pipeline at all (the checker's
@@ -2742,6 +4535,32 @@ mod tests {
         );
     }
 
+    /// P2-2i: a pending heritage clause on a NAMED declaration (a real
+    /// `source_id` to attribute it to) gets a `classification: "possible"`
+    /// `core:inherits`/`core:implements` row -- no diagnostic (v3 never
+    /// diagnoses a heritage clause either).
+    #[test]
+    fn pending_named_heritage_clause_produces_a_possible_row() {
+        let source = "class Base<T> {}\nclass Derived extends Base<string> {}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert_eq!(
+            semantics.possible_heritage_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.possible_heritage_rows
+        );
+        let record = &semantics.possible_heritage_rows[0];
+        assert_eq!(record.category, "relation");
+        assert_eq!(record.kind, "jsts:relation_inherits");
+        assert_eq!(record.universal_kind, "core:inherits");
+        assert_eq!(record.body["classification"], "possible");
+        assert!(record.body.get("target_id").is_none());
+        assert!(record.identity_key.ends_with(":unresolved"));
+        let derived_start = source.find("Derived").unwrap() as u32;
+        let derived_id = format!("jsts:class:a.ts:{derived_start}:Derived");
+        assert_eq!(record.body["source_id"], derived_id);
+    }
+
     #[test]
     fn multi_type_implements_clause_is_resolved_atomically() {
         // Regression: found live against the n8n corpus (E3 gate 3) --
@@ -2847,6 +4666,14 @@ mod tests {
                 .iter()
                 .any(|site| site.site_kind == SiteKind::Heritage
                     && site.reason.as_deref() == Some(REASON_HERITAGE_DEFERRED))
+        );
+        // P2-2i: no `source_id` to build a possible row from -- matches v3's
+        // own `entityForDeclaration(node.parent)` gap exactly (see
+        // `finish_heritage_clause`'s doc comment).
+        assert!(
+            semantics.possible_heritage_rows.is_empty(),
+            "rows: {:?}",
+            semantics.possible_heritage_rows
         );
     }
 
@@ -3172,6 +4999,7 @@ mod tests {
                 match kind {
                     crate::EntityKind::Function => "function",
                     crate::EntityKind::Class => "class",
+                    crate::EntityKind::Variable => "variable",
                     other => panic!("unhandled entity kind in test helper: {other:?}"),
                 }
             ),
@@ -3220,6 +5048,8 @@ mod tests {
             resolver: Box::leak(Box::new(resolver)),
             available: Box::leak(Box::new(available)),
             files: Box::leak(Box::new(files)),
+            typeflow_index: None,
+            typeflow_oracle: false,
         }
     }
 
@@ -3698,6 +5528,841 @@ mod tests {
         assert!(
             semantics.covers_rows.is_empty(),
             "a non-test owner must never synthesize covers rows"
+        );
+    }
+
+    // --- P0-S2 typeflow prototype -----------------------------------------
+
+    /// Build a `HybridResolutionContext` carrying a real `ProgramIndex` over
+    /// `sources` (path -> text), so typeflow's own widened resolution runs.
+    /// `typeflow_oracle` controls `ctx.typeflow_oracle`.
+    fn typeflow_ctx(
+        sources: &[(&str, &str)],
+        typeflow_oracle: bool,
+    ) -> (
+        HybridResolutionContext<'static>,
+        &'static urdira_jsts_typeflow::ProgramIndex,
+    ) {
+        let mut summaries = BTreeMap::new();
+        for (path, text) in sources {
+            summaries.insert(
+                (*path).to_owned(),
+                urdira_jsts_typeflow::extract_decl_summary(path, text).expect("parses"),
+            );
+        }
+        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new());
+        let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
+        let resolver = WorkspaceResolver::default();
+        let available: BTreeSet<String> = BTreeSet::new();
+        let files: BTreeMap<String, crate::SyntaxFileResult> = BTreeMap::new();
+        let ctx = HybridResolutionContext {
+            resolver: Box::leak(Box::new(resolver)),
+            available: Box::leak(Box::new(available)),
+            files: Box::leak(Box::new(files)),
+            typeflow_index: Some(index),
+            typeflow_oracle,
+        };
+        (ctx, index)
+    }
+
+    #[test]
+    fn typeflow_resolves_this_call_to_the_declaring_class_method() {
+        let source = "class Base {\n  greet() {}\n}\nclass Derived extends Base {\n  run() {\n    this.greet();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.site_kind != SiteKind::Call),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+        let base_start = source.find("greet").unwrap() as u32;
+        assert_eq!(
+            semantics.typeflow_call_rows[0].body["target_id"],
+            format!("jsts:method:a.ts:{base_start}:greet")
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_super_call_to_the_base_class_method() {
+        let source = "class Base {\n  greet() {}\n}\nclass Derived extends Base {\n  greet() {\n    super.greet();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+        let base_start = source.find("greet").unwrap() as u32;
+        assert_eq!(
+            semantics.typeflow_call_rows[0].body["target_id"],
+            format!("jsts:method:a.ts:{base_start}:greet")
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_declared_type_parameter_member_call() {
+        let source =
+            "class Base {\n  greet() {}\n}\nfunction use(obj: Base) {\n  obj.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_new_expression_initializer_member_call() {
+        let source = "class Base {\n  greet() {}\n}\nfunction use() {\n  const obj = new Base();\n  obj.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_generic_heritage_with_erased_type_arguments() {
+        let source = "class Box<T> {}\nclass IntBox extends Box<number> {}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.site_kind != SiteKind::Heritage),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+        assert_eq!(
+            semantics.typeflow_heritage_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_heritage_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_union_member_lookup_stays_pending() {
+        // Two members named `run`, one on each side of an unrelated pair of
+        // classes reachable only through separate bindings -- a genuinely
+        // ambiguous member never has this test hit `MemberLookup::Many`
+        // directly (that needs a diamond a class can't legally form), so
+        // this instead exercises the "member not found anywhere" -> `None`
+        // path staying pending, the far more common miss shape.
+        let source =
+            "class Base {\n  greet() {}\n}\nfunction use(obj: Base) {\n  obj.missing();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(semantics.typeflow_call_rows.is_empty());
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::Call
+                    && site.reason.as_deref() == Some(REASON_CALL_DEFERRED))
+        );
+    }
+
+    #[test]
+    fn typeflow_oracle_mode_records_a_hit_without_removing_the_pending_site() {
+        let source = "class Base {\n  greet() {}\n}\nclass Derived extends Base {\n  run() {\n    this.greet();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], true);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.typeflow_call_rows.is_empty(),
+            "oracle mode must never publish a real row"
+        );
+        assert_eq!(
+            semantics.typeflow_oracle_hits.len(),
+            1,
+            "hits: {:?}",
+            semantics.typeflow_oracle_hits
+        );
+        assert_eq!(semantics.typeflow_oracle_hits[0].edge_kind, "call");
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::Call
+                    && site.reason.as_deref() == Some(REASON_CALL_DEFERRED)),
+            "oracle mode must leave the site checker_pending: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    #[test]
+    fn typeflow_is_a_no_op_when_the_flag_is_off() {
+        // `analyze_owner_semantics` (no context override) must behave
+        // byte-identically to before this prototype existed.
+        let source = "class Base {\n  greet() {}\n}\nclass Derived extends Base {\n  run() {\n    this.greet();\n  }\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert!(semantics.typeflow_call_rows.is_empty());
+        assert!(semantics.typeflow_heritage_rows.is_empty());
+        assert!(semantics.typeflow_oracle_hits.is_empty());
+    }
+
+    // --- P1-A: fluent-chain / recursive type_of_expression rules ----------
+
+    #[test]
+    fn typeflow_resolves_a_fluent_builder_chain_through_new_and_this_return_types() {
+        // The dominant miss pattern found in the P0-S2 census (`docs/
+        // evidence/2026-09-02-v4-p0-s2-typeflow-prototype.md`): a builder
+        // whose methods return `this`, chained straight off a `new T()`
+        // expression with no intermediate variable.
+        let source = "class Tool {\n  description(x: string): this { return this; }\n  input(x: string): this { return this; }\n}\nfunction use() {\n  new Tool().description(\"a\").input(\"b\");\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            2,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_call_expression_receiver_through_a_free_functions_return_type() {
+        let source = "class Foo {\n  greet() {}\n}\nfunction make(): Foo {\n  return new Foo();\n}\nfunction use() {\n  make().greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_an_unannotated_variable_initialized_from_a_call_expression() {
+        // Rule (b): `const x = make();` has no type ANNOTATION, but its
+        // initializer recursively resolves through `type_of_expression`.
+        let source = "class Foo {\n  greet() {}\n}\nfunction make(): Foo {\n  return new Foo();\n}\nfunction use() {\n  const x = make();\n  x.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_await_unwrapping_a_promise_return_type() {
+        let source = "class Foo {\n  greet() {}\n}\nasync function load(): Promise<Foo> {\n  return new Foo();\n}\nasync function use() {\n  (await load()).greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_array_element_access_through_a_declared_array_type() {
+        let source =
+            "class Foo {\n  greet() {}\n}\nfunction use(items: Foo[]) {\n  items[0].greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_through_an_as_expression_cast() {
+        let source =
+            "class Foo {\n  greet() {}\n}\nfunction use(x: unknown) {\n  (x as Foo).greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_through_a_non_null_assertion() {
+        let source = "class Foo {\n  greet() {}\n}\nfunction use(x?: Foo) {\n  x!.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_through_an_optional_chained_member_call() {
+        let source = "class Foo {\n  greet() {}\n}\nfunction use(x: Foo) {\n  x?.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_prefers_an_explicit_variable_annotation_over_its_object_literal_shape() {
+        // Regression (2k-owner census, wrong-target found live): `const
+        // allNodesConnected: BinaryCheck = { run() {...} }` -- `.run` on a
+        // USE of `allNodesConnected` must resolve to `BinaryCheck`'s OWN
+        // `run` member (TypeScript's declared-type rule), never the object
+        // literal's own `run` method, even though both happen to share the
+        // same name.
+        let source = "interface BinaryCheck {\n  run(): void;\n}\nconst allNodesConnected: BinaryCheck = {\n  run() {\n    return undefined;\n  },\n};\nfunction use() {\n  allNodesConnected.run();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+        // The interface's own `run` (at offset 26) must win, never the
+        // object literal's own `run` method (at offset 84).
+        assert_eq!(
+            semantics.typeflow_call_rows[0].body["target_id"], "jsts:method:a.ts:26:run",
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_this_inside_a_nested_plain_function_does_not_leak_the_enclosing_class() {
+        // Regression (rule (e)): a plain `function` REBINDS `this` -- a
+        // nested function expression inside a method must NOT resolve
+        // `this` to the enclosing class, unlike an arrow function (which
+        // does not rebind, see the next test).
+        let source = "class Base {\n  greet() {}\n}\nclass Derived extends Base {\n  run() {\n    const inner = function () {\n      this.greet();\n    };\n    inner();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.typeflow_call_rows.is_empty(),
+            "a nested plain function's `this` must stay pending, never resolve to the enclosing \
+             class: rows {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_this_inside_a_nested_arrow_function_still_resolves_to_the_enclosing_class() {
+        // Rule (e)'s other half: an ARROW function does NOT rebind `this`,
+        // so it must keep seeing the enclosing class/method's `this`.
+        let source = "class Base {\n  greet() {}\n}\nclass Derived extends Base {\n  run() {\n    const inner = () => {\n      this.greet();\n    };\n    inner();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_the_zod_class_mixin_heritage_pattern_across_files() {
+        // Same pattern as `typeflow_resolves_the_zod_class_mixin_heritage_
+        // pattern`, but with `Z` imported from a SEPARATE file (the real
+        // shape in the corpus: `packages/@n8n/api-types/src/zod-class.ts`'s
+        // `Z` used from `.../dto.ts`'s `class CreateAgentSkillDto extends
+        // Z.class({...}) {}`) -- exercises the CROSS-FILE half of the
+        // object-shape rule (`resolve_identifier_to_kind`'s import branch,
+        // `import_bindings` populated from `resolve_named_export`).
+        let zod_class_source = "export interface ZodClass {\n  safeParse(): void;\n}\nexport const Z = {\n  class: (): ZodClass => ({}) as ZodClass,\n};\n";
+        let dto_source =
+            "import { Z } from \"./zod-class\";\nexport class Dto extends Z.class() {}\n";
+        let user_source =
+            "import { Dto } from \"./dto\";\nfunction use(dto: Dto) {\n  dto.safeParse();\n}\n";
+        let mut summaries = BTreeMap::new();
+        summaries.insert(
+            "zod-class.ts".to_owned(),
+            urdira_jsts_typeflow::extract_decl_summary("zod-class.ts", zod_class_source)
+                .expect("parses"),
+        );
+        summaries.insert(
+            "dto.ts".to_owned(),
+            urdira_jsts_typeflow::extract_decl_summary("dto.ts", dto_source).expect("parses"),
+        );
+        let z_id = "jsts:variable:zod-class.ts:64:Z".to_owned();
+        assert_eq!(
+            summaries["zod-class.ts"].object_shapes[0].entity_id, z_id,
+            "test's assumed Z offset drifted"
+        );
+        let mut import_targets = HashMap::new();
+        import_targets.insert(
+            (
+                "dto.ts".to_owned(),
+                "./zod-class".to_owned(),
+                "Z".to_owned(),
+            ),
+            z_id.clone(),
+        );
+        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets);
+        let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "zod-class.ts".to_owned(),
+            target_file(
+                "zod-class.ts",
+                vec![target_entity(
+                    crate::EntityKind::Variable,
+                    "zod-class.ts",
+                    64,
+                    "Z",
+                )],
+                vec![export_binding("Z", "Z")],
+            ),
+        );
+        files.insert(
+            "dto.ts".to_owned(),
+            target_file(
+                "dto.ts",
+                vec![target_entity(crate::EntityKind::Class, "dto.ts", 46, "Dto")],
+                vec![export_binding("Dto", "Dto")],
+            ),
+        );
+        let resolver = WorkspaceResolver::default();
+        let available: BTreeSet<String> = files.keys().cloned().collect();
+        let ctx = HybridResolutionContext {
+            resolver: Box::leak(Box::new(resolver)),
+            available: Box::leak(Box::new(available)),
+            files: Box::leak(Box::new(files)),
+            typeflow_index: Some(index),
+            typeflow_oracle: false,
+        };
+        let semantics = analyze_owner_semantics_with_context("dto.ts", dto_source, &ctx)
+            .expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_heritage_rows.len(),
+            1,
+            "heritage rows: {:?}; pending: {:?}",
+            semantics.typeflow_heritage_rows,
+            semantics.pending_sites
+        );
+        let user_semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
+            .expect("analysis succeeds");
+        assert_eq!(
+            user_semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}; pending: {:?}",
+            user_semantics.typeflow_call_rows,
+            user_semantics.pending_sites
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_the_zod_class_mixin_heritage_pattern() {
+        // The dominant miss pattern found in the 2k census (docs/evidence/
+        // 2026-09-02-v4-p1a-typeflow.md): `class Dto extends Z.class({...})
+        // {}` where `Z` is a top-level `const Z = { class: (...): ZodClass
+        // => ... }` object literal -- a mixin FACTORY, not a plain class
+        // identifier. Both same-file (this test) and cross-file (import)
+        // must resolve to `ZodClass`'s own `safeParse` member.
+        let source = "interface ZodClass {\n  safeParse(): void;\n}\nconst Z = {\n  class: (): ZodClass => ({}) as ZodClass,\n};\nclass Dto extends Z.class() {}\nfunction use(dto: Dto) {\n  dto.safeParse();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_heritage_rows.len(),
+            1,
+            "heritage rows: {:?}",
+            semantics.typeflow_heritage_rows
+        );
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "call rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_namespace_member_call_directly() {
+        // Rule (f): `ns.fn()` where `ns` is `import * as ns`, and `fn` is a
+        // top-level function declared in the target module -- both as the
+        // direct call target itself (`ns.make()`) AND as a chain receiver
+        // for the following `.greet()`.
+        let base_source =
+            "class Foo {\n  greet() {}\n}\nexport function make(): Foo {\n  return new Foo();\n}\n";
+        let user_source =
+            "import * as ns from \"./base\";\nfunction use() {\n  ns.make().greet();\n}\n";
+        let mut summaries = BTreeMap::new();
+        summaries.insert(
+            "base.ts".to_owned(),
+            urdira_jsts_typeflow::extract_decl_summary("base.ts", base_source).expect("parses"),
+        );
+        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new());
+        let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "base.ts".to_owned(),
+            target_file(
+                "base.ts",
+                vec![
+                    target_entity(crate::EntityKind::Class, "base.ts", 6, "Foo"),
+                    target_entity(crate::EntityKind::Function, "base.ts", 43, "make"),
+                ],
+                vec![export_binding("make", "make")],
+            ),
+        );
+        let resolver = WorkspaceResolver::default();
+        let available: BTreeSet<String> = files.keys().cloned().collect();
+        let ctx = HybridResolutionContext {
+            resolver: Box::leak(Box::new(resolver)),
+            available: Box::leak(Box::new(available)),
+            files: Box::leak(Box::new(files)),
+            typeflow_index: Some(index),
+            typeflow_oracle: false,
+        };
+        let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
+            .expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            2,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+        assert!(
+            semantics
+                .typeflow_call_rows
+                .iter()
+                .any(|row| row.body["target_id"] == "jsts:function:base.ts:43:make"),
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_member_call_through_a_named_import_of_a_namespace_reexport() {
+        // P1-B: `import { evals } from "./index"` where `index.ts` does
+        // `export * as evals from "./evals/index"` -- see
+        // `crate::NAMESPACE_REEXPORT_LOCAL_NAME`'s doc comment. Found live:
+        // `packages/@n8n/agents/src/__tests__/integration/evaluate.test.ts`
+        // imports `evals` this way and calls `evals.stringSimilarity(...)`.
+        let user_source = "import { evals } from \"./index\";\nfunction use() {\n  evals.stringSimilarity();\n}\n";
+        let mut files = BTreeMap::new();
+        files.insert(
+            "index.ts".to_owned(),
+            target_file(
+                "index.ts",
+                vec![],
+                vec![reexport_binding(
+                    "evals",
+                    crate::NAMESPACE_REEXPORT_LOCAL_NAME,
+                    "./evals/index",
+                    "evals/index.ts",
+                )],
+            ),
+        );
+        files.insert(
+            "evals/index.ts".to_owned(),
+            target_file(
+                "evals/index.ts",
+                vec![target_entity(
+                    crate::EntityKind::Function,
+                    "evals/index.ts",
+                    899,
+                    "stringSimilarity",
+                )],
+                vec![export_binding("stringSimilarity", "stringSimilarity")],
+            ),
+        );
+        let index = urdira_jsts_typeflow::ProgramIndex::build(&BTreeMap::new(), &HashMap::new());
+        let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
+        let mut ctx = helper_ctx(files);
+        ctx.typeflow_index = Some(index);
+        let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
+            .expect("analysis succeeds");
+        assert!(
+            semantics
+                .typeflow_call_rows
+                .iter()
+                .any(|row| row.body["target_id"]
+                    == "jsts:function:evals/index.ts:899:stringSimilarity"),
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_destructured_binding_from_a_typed_object() {
+        // Rule (h): `const { agent } = setup();` types `agent` from
+        // `setup()`'s own return type's `agent` property.
+        let source = "class Agent {\n  close() {}\n}\ninterface Setup {\n  agent: Agent;\n}\nfunction setup(): Setup {\n  return { agent: new Agent() };\n}\nfunction use() {\n  const { agent } = setup();\n  agent.close();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_call_through_a_destructured_method_valued_parameter() {
+        // P1-B: the migration-DSL pattern found live (`packages/@n8n/db/
+        // src/migrations/**`): `createTable` is a destructured METHOD
+        // (not a plain data property), so calling `createTable(name)`
+        // itself must resolve to `TableBuilder` for the following
+        // `.withColumns()` chain hop to work.
+        //
+        // P1-C: `createTable("x")` ITSELF is now ALSO resolved (a bare
+        // call to a destructured-method identifier -- see `destructured_
+        // member_entities`'s own doc comment), in addition to the
+        // `.withColumns()` chain hop this test originally covered alone --
+        // 2 rows, not 1.
+        let source = "class TableBuilder {\n  withColumns(): void {}\n}\ninterface SchemaBuilder {\n  createTable(name: string): TableBuilder;\n}\nfunction up({ createTable }: SchemaBuilder) {\n  createTable(\"x\").withColumns();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            2,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+        assert!(
+            semantics
+                .typeflow_call_rows
+                .iter()
+                .any(|row| row.body["target_id"] == "jsts:method:a.ts:76:createTable"),
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_destructured_parameter_from_an_annotated_type() {
+        let source = "class Agent {\n  close() {}\n}\ninterface Setup {\n  agent: Agent;\n}\nfunction use({ agent }: Setup) {\n  agent.close();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_nested_destructured_parameter_two_levels_deep() {
+        // Found live in this corpus's own migration DSL: EVERY migration's
+        // `up`/`down` method destructures straight through `schemaBuilder`
+        // to its own members, never binding a `schemaBuilder` local at
+        // all: `async up({ schemaBuilder: { dropColumns } }: MigrationContext)`.
+        let source = "class Builder {\n  dropColumns(): void {}\n}\ninterface Context {\n  schemaBuilder: Builder;\n}\nfunction up({ schemaBuilder: { dropColumns } }: Context) {\n  dropColumns();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_the_full_return_type_of_typeof_migration_dsl_pattern_end_to_end() {
+        // The COMPLETE flagship pattern this session chased, combining
+        // three separate fixes: `ReturnType<typeof f>` where `f` is a
+        // callable VARIABLE (`const createSchemaBuilder = (...) => ({
+        // ... })`, never a `function` declaration) whose returned object
+        // shape is a member-bearing container, reached through a NESTED
+        // destructured parameter that never binds the intermediate
+        // `schemaBuilder` name at all.
+        let source = "class Builder {\n  dropColumns(): void {}\n}\nconst createSchemaBuilder = (prefix) => ({\n  dropColumns(name) {},\n});\ninterface Context {\n  schemaBuilder: ReturnType<typeof createSchemaBuilder>;\n}\nfunction up({ schemaBuilder: { dropColumns } }: Context) {\n  dropColumns('x');\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_chain_through_a_locally_annotated_inline_type_literal() {
+        // Found live in this corpus's `langsmith.ts`: `function f(options:
+        // { runner: Runner }) { options.runner.run(); }` -- `options`'s OWN
+        // annotation is an anonymous `{ ... }` type, not a named interface
+        // (rule (j), local half: `TypeflowValue::Inline`).
+        let source = "class Runner {\n  run() {}\n}\nfunction use(options: { runner: Runner }) {\n  options.runner.run();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_property_chain_through_an_inline_type_literal() {
+        // Found live in this corpus's own migration DSL: `interface
+        // MigrationContext { escape: { columnName(name: string): string; };
+        // }`, used as `context.escape.columnName(...)` -- rule (j),
+        // partial: an ANONYMOUS `{ ... }` object type, not a named
+        // interface.
+        let source = "interface MigrationContext {\n  escape: {\n    columnName(name: string): string;\n  };\n}\nfunction use(context: MigrationContext) {\n  context.escape.columnName(\"x\");\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_property_chain_through_a_declared_object_member_type() {
+        // `a.b.c()`: `b`'s own declared type on `a`'s class, then `c` on
+        // `b`'s type -- two hops, neither of which is `this`/`super`/`new`.
+        let source = "class Foo {\n  greet() {}\n}\nclass Holder {\n  foo: Foo;\n}\nfunction use(h: Holder) {\n  h.foo.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    // P1-C: utility types, local-annotation half (`type_ref_of_ts_type`).
+
+    #[test]
+    fn typeflow_resolves_a_local_parameter_annotated_return_type_of_typeof_fn() {
+        // The migration-DSL pattern found live: `schemaBuilder: ReturnType<
+        // typeof createSchemaBuilder>` as a PARAMETER annotation.
+        let source = "class Builder {\n  column() {}\n}\nfunction createBuilder(): Builder { return new Builder(); }\nfunction up(schemaBuilder: ReturnType<typeof createBuilder>) {\n  schemaBuilder.column();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_local_parameter_annotated_instance_type_of_typeof_class() {
+        let source = "class Foo {\n  greet() {}\n}\nfunction use(foo: InstanceType<typeof Foo>) {\n  foo.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_local_parameter_annotated_awaited_of_promise() {
+        let source = "class Foo {\n  greet() {}\n}\nfunction use(foo: Awaited<Promise<Foo>>) {\n  foo.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_local_parameter_annotated_record_element_via_computed_access() {
+        let source = "class Foo {\n  greet() {}\n}\nfunction use(items: Record<string, Foo>) {\n  items[\"x\"].greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn typeflow_resolves_a_local_parameter_annotated_pick_of_an_interface() {
+        // Per the task's own framing: `Pick<T, K>`/`Omit<T, K>` keep `T`'s
+        // FULL member table rather than narrowing it -- never a wrong
+        // target, only a theoretical over-acceptance out of this crate's
+        // scope.
+        let source = "interface Foo {\n  greet(): void;\n}\nfunction use(foo: Pick<Foo, \"greet\">) {\n  foo.greet();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
         );
     }
 }

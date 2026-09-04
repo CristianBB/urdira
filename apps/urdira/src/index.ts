@@ -587,6 +587,23 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
       // selecting a second TypeScript staging/publication route for stages two
       // and three.
       const coreGenerationEnabled = indexingCore !== undefined;
+      // P1-B (urdira v4 plan, checker-off pipeline mode): the Rust worker
+      // itself already ignores a `semantic_engine` descriptor whenever
+      // `URDIRA_JSTS_TYPEFLOW=1` (see `hybrid_owner_can_skip_checker`'s doc
+      // comment in `crates/urdira-indexing-worker/src/main.rs`) -- this
+      // flag is a pure TS-side optimization mirroring that same contract,
+      // so this app never bothers building the (otherwise-discarded)
+      // worker descriptor at all when the checker lane is globally off.
+      //
+      // P1-C fix: `URDIRA_JSTS_TYPEFLOW_ORACLE=1` (the census measurement
+      // mode) needs the checker to keep running so the Rust side can
+      // compare typeflow's own guess against the checker's independent
+      // answer -- see the matching fix (and its "found live" note) at the
+      // Rust `semantic_descriptor` gate this mirrors. Building the
+      // descriptor here is never wasted work in oracle mode: the Rust side
+      // now actually uses it.
+      const typeflowCheckerLaneDisabled = process.env["URDIRA_JSTS_TYPEFLOW"] === "1"
+        && process.env["URDIRA_JSTS_TYPEFLOW_ORACLE"] !== "1";
       // The engine always supplies this compact digest on the production
       // route. Direct provider tests/oracle callers may invoke `analyze`
       // without the coordinator, so retain a compatibility-only fallback
@@ -825,7 +842,7 @@ function buildJavascriptTypescriptPluginProvider(prepared: PreparedJavascriptTyp
           ...(coreGenerationEnabled ? { direct_publication: true } : {}),
           change_set: changedArtifactIds === undefined ? { kind: "full" } : { kind: "exact", changed_artifact_ids: [...changedArtifactIds] },
           engine: { engine_id: "urdira:jsts", engine_version: JAVASCRIPT_TYPESCRIPT_VERSION, implementation_digest: prepared.plugin.compatibility.analysis_digest },
-          ...(!nativeStageOne && coreGenerationEnabled ? { semantic_engine: {
+          ...(!nativeStageOne && coreGenerationEnabled && !typeflowCheckerLaneDisabled ? { semantic_engine: {
             node_executable: process.execPath,
             worker_entrypoint: rustSemanticWorkerEntrypoint,
             build_identity: JSTS_SEMANTIC_PROCESS_BUILD_IDENTITY,
@@ -2429,6 +2446,26 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
             if (result.kind !== "source_index_rolled_back") throw new Error("Rust indexing-core did not roll back the generic source index.");
           },
       };
+    },
+    /* c8 ignore stop */
+    // v4 (plan §9, P2-7): `URDIRA_V4=1` workspaces send `WorkspaceScan`
+    // through the SAME persistent, per-workspace `indexingCoreSessions`
+    // transport `resolve_plugin_provider`/`resolve_source_indexing_core`
+    // above already maintain (`IndexingCoreProcessTransport` implements
+    // `workspaceScan` alongside its v3 generation methods -- see
+    // `packages/plugin-javascript-typescript/src/indexing-core-process-transport.ts`)
+    // -- never a fresh spawn per scan, which is exactly this option's
+    // contract (`DaemonRuntimeOptions.resolve_workspace_scan_transport`'s
+    // doc comment, `@urdira/daemon`).
+    /* c8 ignore start -- exercised through daemon startup/runtime integration (tests/v4-daemon-e2e.test.ts) rather than the app unit harness. */
+    resolve_workspace_scan_transport: async (workspace: { readonly workspace_id: string }) => {
+      if (indexingCoreSessions === undefined || indexingCoreWorkerPath === undefined) return undefined;
+      let core = indexingCoreSessions.get(workspace.workspace_id);
+      if (core === undefined) {
+        core = createIndexingCoreProcessTransport({ command: indexingCoreWorkerPath, request_timeout_ms: indexingCoreRequestTimeoutMs() });
+        indexingCoreSessions.set(workspace.workspace_id, core);
+      }
+      return core;
     },
     /* c8 ignore stop */
     // Wired straight through to `AnalysisWorkerPool.evict`/`closeAll` -- see

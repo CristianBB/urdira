@@ -212,6 +212,36 @@
       "module": "packages/engine/src/semantic-selection.ts",
       "tests": ["tests/phase10-semantic.test.ts"],
       "required_behaviors": ["selectBundledProfile", "frozen evaluation gates"]
+    },
+    {
+      "module": "packages/engine/src/rust-workspace-scan.ts",
+      "tests": ["tests/v4-scan.test.ts", "tests/index-pack-v4.test.ts"],
+      "required_behaviors": ["runRustWorkspaceScan"]
+    },
+    {
+      "module": "packages/engine/src/workspace-v4-bootstrap.ts",
+      "tests": ["tests/phase-daemon-v4-scan.test.ts", "tests/phase-daemon-recreate-outdated.test.ts"],
+      "required_behaviors": ["ensureV4Workspace"]
+    },
+    {
+      "module": "packages/engine/src/v4-verify.ts",
+      "tests": ["tests/v4-verify.test.ts"],
+      "required_behaviors": ["verifyV4Workspace"]
+    },
+    {
+      "module": "packages/engine/src/native-query-snapshot-port.ts",
+      "tests": ["tests/native-query-snapshot-port.test.ts"],
+      "required_behaviors": ["NativeCanonicalQuerySnapshotPort"]
+    },
+    {
+      "module": "packages/storage/src/recreate-outdated.ts",
+      "tests": ["tests/recreate-outdated.test.ts", "tests/phase-daemon-recreate-outdated.test.ts"],
+      "required_behaviors": ["recreateOutdatedWorkspaceDatabase", "isOutdatedWorkspaceError"]
+    },
+    {
+      "module": "packages/canonical/src/merkle-bucket.ts",
+      "tests": ["tests/merkle-bucket.test.ts"],
+      "required_behaviors": ["BucketedMerkleSet", "rootFromBucketDigests"]
     }
   ]
 }

@@ -83,3 +83,62 @@ recipe versions in `docs/serialization/`; embedding profile identity rules in
 `docs/decisions/16-semantic-search-wiring.md` — where any output-affecting
 change mints a NEW identity rather than reusing a bumped one). Where such a
 regime exists, it wins; this document covers the plain semver surfaces.
+
+## v4 index-contract bump (2026-09-03)
+
+The v4 structural store, digest recipes, and Rust-owned scan pipeline
+(`docs/decisions/26-v4-structural-store.md` through
+`docs/decisions/29-v4-rust-owned-scan-pipeline.md`) are a breaking
+storage-and-behavior change under the rule above: a stored row, a query
+result, and a digest value can all tell v4 apart from v3 given identical
+inputs, so this is a minor bump while the project is `0.x` (the same slot
+decision 22's v3 cutover used), not a patch, regardless of how the change is
+gated at runtime.
+
+The runtime consequence follows decision 22's own destructive, non-migrated
+boundary, extended unchanged: `index_contract` gains a new value (`0x34`)
+disjoint from v3's `0x33`; a v4 daemon has no reader for a v3 root and vice
+versa; there is no in-place migration, compatibility adapter, or dual-format
+reader. An operator moving a workspace onto v4 gets `recreateOutdatedWorkspaceDatabase`
+(old database and structural directory renamed aside, never deleted
+automatically) and a full reindex from scratch, exactly as decision 22
+already requires when the contract byte changes at all. CAS content may be
+reused across the boundary only when its scope, length, and digest all
+verify, per decision 22's existing policy.
+
+### Default flip (2026-09-04, P4-b-2)
+
+v4 is now the **default format for NEW workspaces**: `isV4Enabled()`
+(`packages/daemon/src/runtime.ts`) selects v4 unless `URDIRA_V4` is set to
+the exact string `"0"`. `URDIRA_V4=1` still works (redundant with the new
+default) so nothing that already sets it explicitly needs to change. This
+flip only decides the format a workspace gets stamped with the first time
+its database file is created (`ensureV4Workspace`/`maybeBootstrapV4Workspace`
+no-op the instant that file already exists) -- it is not a migration:
+
+- An **existing v3 workspace keeps working as v3 forever**, with no
+  automatic conversion. The P4-a/P4-b-prep "outdated workspace" recreation
+  path (`recreateOutdatedWorkspaceDatabase`) only fires for a genuinely
+  **outdated/unsupported** `index_contract` (a stale pre-v3 layout, or a v3
+  database missing a required migration) -- a healthy, current v3 database
+  (`0x33`) is not outdated and is never recreated by this flip.
+  `DaemonRuntime.start` logs one line at every startup naming how many
+  catalogued workspaces are currently v3 versus v4
+  (`DurableStorage.workspaceFormatCounts`, tallied during the same
+  `recoverMigrations` sweep that already opens every catalogued workspace at
+  startup -- no extra file opens).
+- The opt-out (`URDIRA_V4=0`) is intended for **one release**: a later
+  release may remove the v3 route entirely, at which point `isV4Enabled`
+  and the flag itself go away. Until then, every workspace-registration path
+  (the daemon's `core:workspace_add` RPC, the CLI, the web UI, and any
+  composing application) goes through this same, single decision function --
+  there is no second place a workspace's format is decided.
+- A test suite that starts a bare `DaemonRuntime`/`DurableStorage` without
+  wiring a v4 scan transport must still get v3 (most of this repository's
+  own pre-existing tests do exactly that): `vitest.config.ts` sets a
+  suite-wide baseline of `URDIRA_V4=0`, and individual tests that want the
+  v4 route override it locally, exactly as they did before this flip.
+
+No default flip or existing-workspace migration path existed before this
+note (decision 29's own "Open items" listed the flip as outstanding for P4);
+migration of already-registered v3 workspaces onto v4 remains unaddressed.

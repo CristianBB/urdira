@@ -1,0 +1,24 @@
+[package]
+name = "urdira-fs-watch"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# P3-7 spike (plan `resilient-knitting-twilight.md`'s watcher-detection-
+# latency item, docs/evidence/2026-09-03-v4-p3-7-watcher-latency.md): a tiny
+# CLI that subscribes to one directory tree via the `notify` crate (its
+# macOS default backend is FSEvents, via `fsevent-sys`) and prints one JSON
+# line per event to stdout with a receive-side timestamp, so
+# `scripts/watch-latency-probe.mjs` can drive it exactly like it drives
+# `@parcel/watcher` and compare detection latency apples-to-apples. This
+# crate is a measurement spike only -- NOT wired into
+# `crates/urdira-indexing-worker` or any shipped code path; that is a later
+# task, per this task's own hard rule.
+[[bin]]
+name = "urdira-fs-watch"
+path = "src/main.rs"
+
+[dependencies]
+notify = "8.2.0"

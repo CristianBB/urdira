@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { computeDigest } from "@urdira/canonical";
+import { BucketedMerkleSet, computeDigest, projectionSetDigest } from "@urdira/canonical";
 import { createDurableStorage, projectionSetDigestEntries } from "../packages/storage/src/index.js";
 import type { EntityRecord, Workspace } from "@urdira/contracts";
 
@@ -249,5 +249,56 @@ describe("Stored projection content_digest (publish_projection_digests perf)", {
       expect(stored).toEqual(recompute);
       await opened.close();
     });
+  });
+});
+
+// v4 (index_contract 0x34, P2-4): a v4 cold-scan publish
+// (`crates/urdira-indexing-worker/src/v4/publish.rs`) writes
+// `Snapshot.projection_set_digests` with the identical entry SELECTION
+// this file's v3 coverage above asserts -- dependency/graph/metric only,
+// lexical and vector excluded -- but a different per-entry ALGORITHM (a
+// bucketed-Merkle root, not a materialized-row digest). This is a
+// self-contained shape check (no real storage/publish needed) covering
+// exactly that entry-shape contract, so it stays valid whether the
+// producer is the v3 SQLite candidate publisher above or the v4 Rust cold
+// scan.
+describe("v4 projection_set_digests entry shape (dependency/graph/metric, no lexical/vector)", () => {
+  it("matches the exact object shape and kind order publish.rs writes", () => {
+    const dependencyTree = BucketedMerkleSet.fromSorted([{ member_digest: `sha256:${"1".repeat(64)}`, logical_digest: `sha256:${"2".repeat(64)}` }]);
+    const graphTree = BucketedMerkleSet.fromSorted([]);
+    const metricTree = BucketedMerkleSet.fromSorted([]);
+    const zeroDigest = `sha256:${"0".repeat(64)}`;
+
+    const entries = (
+      [
+        ["dependency", "core:v4-dependency-generator", dependencyTree, 1],
+        ["graph", "core:v4-graph-generator", graphTree, 0],
+        ["metric", "core:v4-metric-generator", metricTree, 0],
+      ] as const
+    ).map(([projection_kind, generator, tree, count]) => ({
+      projection_kind,
+      generator,
+      generator_version: "1",
+      generator_configuration_digest: zeroDigest,
+      projection_set_digest: projectionSetDigest(projection_kind, tree.root(), count),
+    }));
+
+    expect(entries).toHaveLength(3);
+    expect(entries.map((entry) => entry.projection_kind)).toEqual(["dependency", "graph", "metric"]);
+    expect(entries.every((entry) => Object.keys(entry).length === 5)).toBe(true);
+    for (const entry of entries) {
+      expect(entry).toMatchObject({
+        projection_kind: expect.stringMatching(/^(dependency|graph|metric)$/),
+        generator: expect.stringMatching(/^core:v4-(dependency|graph|metric)-generator$/),
+        generator_version: "1",
+        generator_configuration_digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+        projection_set_digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      });
+    }
+    expect(entries.find((entry) => entry.projection_kind === "metric")?.projection_set_digest).toBe(projectionSetDigest("metric", zeroDigest, 0));
+    // Different kinds over the same (empty) root/count must still diverge --
+    // the kind is part of the framing, not incidental metadata.
+    expect(entries.find((entry) => entry.projection_kind === "graph")?.projection_set_digest).not.toBe(entries.find((entry) => entry.projection_kind === "metric")?.projection_set_digest);
+    expect(entries.some((entry) => (entry.projection_kind as string) === "lexical" || (entry.projection_kind as string) === "vector")).toBe(false);
   });
 });

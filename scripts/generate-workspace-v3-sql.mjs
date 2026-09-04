@@ -83,7 +83,15 @@ writeFileSync(
 );
 
 // Keep generated Rust stable under the repository's formatter so regeneration
-// is a clean, reviewable operation.
-execFileSync("cargo", ["fmt", "--all"], { cwd: root, stdio: "ignore" });
+// is a clean, reviewable operation. Best-effort: a sibling in-progress crate
+// elsewhere in the workspace with an incomplete manifest (no src/lib.rs yet)
+// makes `cargo metadata` -- and therefore this workspace-wide `cargo fmt
+// --all` -- fail for reasons unrelated to this generator, and that must not
+// block regenerating the SQL mirrors here.
+try {
+  execFileSync("cargo", ["fmt", "--all"], { cwd: root, stdio: "ignore" });
+} catch (error) {
+  console.warn(`workspace-v3 SQL: skipped cargo fmt (${error instanceof Error ? error.message : String(error)})`);
+}
 
 console.log(`workspace-v3 SQL generated (${digest})`);

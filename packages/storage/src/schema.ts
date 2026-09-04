@@ -1,4 +1,4 @@
-import { digestBytes } from "@urdira/canonical";
+import { decodeCanonical, digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { SqliteCommand, SqliteDatabase } from "./sqlite.js";
 import { StorageError } from "./errors.js";
 import type { FaultInjector } from "./faults.js";
@@ -216,4 +216,67 @@ async function ensureCandidateForeignKeys(database: SqliteDatabase, faults?: Fau
   ]);
   const violations = await database.all<Record<string, unknown>>("PRAGMA foreign_key_check");
   if (violations.length > 0) throw new StorageError("storage:schema_migration_failed", "Candidate schema foreign-key validation failed after rebuild.");
+}
+
+// v4 (plan §3/§9). A distinct byte from the v3 marker (0x33) so a v3
+// database can never be misread as v4 or vice versa: the two schemas are
+// structurally incompatible (v4 has no record_occurrences/graph_edges/etc.
+// at all), so the only valid transition between them is
+// `recreateOutdatedWorkspaceDatabase` (recreate-outdated.ts), never an
+// in-place migration. NOT wired into `openWorkspace`/
+// `registerWorkspaceSerialized` yet -- see docs/evidence/2026-09-02-v4-p2-1-schema.md.
+export const WORKSPACE_V4_INDEX_CONTRACT = 0x34;
+
+/**
+ * v4 mirror of `ensureWorkspaceSchemaCompatibility`, scoped to the v4
+ * catalog schema (packages/storage/sql/workspace-v4.sql). Unlike the v3
+ * function, this has no legacy-preview column/index repairs to run: v4 has
+ * no prior shipped shape to be compatible with, so an unstamped, non-empty
+ * database is always rejected rather than backfilled. Not called from any
+ * production code path yet (P4 wires this into `openWorkspace`).
+ */
+export async function ensureWorkspaceSchemaCompatibilityV4(database: SqliteDatabase): Promise<void> {
+  const contract = await database.get<{ value: unknown }>("SELECT value FROM workspace_meta WHERE key = 'index_contract'");
+  if (contract === undefined) {
+    const populated = await database.get<{ count: number }>("SELECT COUNT(*) AS count FROM source_artifacts");
+    if ((populated?.count ?? 0) > 0) {
+      throw new StorageError("core:index_contract_unsupported", "The workspace uses an unsupported pre-v4 index contract; recreate the workspace database and reindex.", { contract_kind: "workspace_index", data_format_version: 4 });
+    }
+    await database.run("INSERT INTO workspace_meta (key, value) VALUES ('index_contract', ?)", [Uint8Array.of(WORKSPACE_V4_INDEX_CONTRACT)]);
+    return;
+  }
+  const bytes = contract.value instanceof Uint8Array ? contract.value : new Uint8Array(contract.value as ArrayBuffer);
+  if (bytes.byteLength !== 1 || bytes[0] !== WORKSPACE_V4_INDEX_CONTRACT) {
+    throw new StorageError("core:index_contract_unsupported", "The workspace index contract is not supported by this Urdira v4 runtime; recreate the workspace database and reindex.", { contract_kind: "workspace_index", data_format_version: 4 });
+  }
+}
+
+/**
+ * `workspace_meta` key recording which structural-store engine a v4
+ * workspace was created with (plan §2/§2.7): `"native"` for the mmap
+ * segment store (Path N, structural/), `"sqlite"` for the Path S SQLite
+ * fallback. Written once at creation, read at open so a daemon can route
+ * queries to the right `CanonicalQuerySnapshotPort` implementation (plan
+ * §9) -- neither of which exists yet; these helpers are the meta-key
+ * contract other P2 subtasks build on.
+ */
+export const STRUCTURAL_STORE_META_KEY = "structural_store";
+
+const STRUCTURAL_STORE_VALUES = new Set(["native", "sqlite"]);
+
+export async function readStructuralStore(database: SqliteDatabase): Promise<"native" | "sqlite" | undefined> {
+  const row = await database.get<{ value: unknown }>("SELECT value FROM workspace_meta WHERE key = ?", [STRUCTURAL_STORE_META_KEY]);
+  if (!row) return undefined;
+  const bytes = row.value instanceof Uint8Array ? row.value : row.value instanceof ArrayBuffer ? new Uint8Array(row.value) : undefined;
+  if (!bytes) return undefined;
+  let decoded: unknown;
+  try { decoded = decodeCanonical(bytes); } catch { return undefined; }
+  return typeof decoded === "string" && STRUCTURAL_STORE_VALUES.has(decoded) ? (decoded as "native" | "sqlite") : undefined;
+}
+
+export async function writeStructuralStore(database: SqliteDatabase, value: "native" | "sqlite"): Promise<void> {
+  await database.run(
+    "INSERT INTO workspace_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    [STRUCTURAL_STORE_META_KEY, encodeCanonical(value)],
+  );
 }

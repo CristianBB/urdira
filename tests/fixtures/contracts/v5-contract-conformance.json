@@ -22192,6 +22192,10 @@
       "schema_version": 1
     },
     {
+      "schema_id": "core:RecordSetMerkleRoot",
+      "schema_version": 1
+    },
+    {
       "schema_id": "core:RetentionRootReference",
       "schema_version": 1
     },

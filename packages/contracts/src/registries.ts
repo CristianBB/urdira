@@ -91,6 +91,7 @@ export const canonicalSchemaRegistry = [
   entry("core:ProjectionSetDigestItem@1", "Approved core canonical schema coordinate core:ProjectionSetDigestItem@1."),
   entry("core:QueryableVectorDigestEntry@1", "Approved core canonical schema coordinate core:QueryableVectorDigestEntry@1."),
   entry("core:RecordSetDigestEntry@1", "Approved core canonical schema coordinate core:RecordSetDigestEntry@1."),
+  entry("core:RecordSetMerkleRoot@1", "v4 (index_contract 0x34) bucketed-Merkle root coordinate for canonical_record_set_digest and projection_set_digest (dependency/graph kinds), plan section 8.2 (docs/serialization/core-digest-field-contracts.md); packages/canonical/src/merkle-bucket.ts's BucketedMerkleSet. Coexists with core:RecordSetDigestEntry@1 (the v3 linear-array recipe, still active for v3 workspaces) rather than replacing it, since v4 is a destructive, non-migrated format (docs/versioning.md) and the two never apply to the same workspace."),
   entry("core:RetentionRootReference@1", "Approved core canonical schema coordinate core:RetentionRootReference@1."),
   entry("core:StoredObjectReference@1", "Approved core canonical schema coordinate core:StoredObjectReference@1."),
   entry("core:VisibleSourceStateSet@1", "Approved core canonical schema coordinate core:VisibleSourceStateSet@1."),

@@ -26,6 +26,51 @@ pub struct StructuralKernelRecord {
     pub evidence_references: String,
 }
 
+/// P2-2g item 3: a borrowed view over exactly the fields the kernel's
+/// digest/canonicalization pass reads (`structural_record_digest_hash`,
+/// `canonical_nested_record_fields`, `structural_kernel_row`) -- same field
+/// set as [`StructuralKernelRecord`], `&str`/`&Value` instead of owned
+/// `String`/`Value`. Exists so a caller that already owns these fields
+/// inside a larger structure (`urdira-indexing-worker`'s v4 materialize
+/// pass, holding `ProposedRecord`s) can feed the kernel directly, without
+/// first cloning every field into a temporary owned `StructuralKernelRecord`
+/// per record. `StructuralKernelRecord::as_ref` below produces one of these
+/// trivially, and every existing owned-input entrypoint
+/// (`structural_kernel_rows`, `structural_kernel_batch_parts`, ...) is
+/// rewritten in terms of the ref-based core functions so there is exactly
+/// one digest/canonicalization implementation, never two that could drift.
+#[derive(Debug, Clone, Copy)]
+pub struct StructuralKernelRecordRef<'a> {
+    pub proposal_record_key: &'a str,
+    pub category: &'a str,
+    pub kind: &'a str,
+    pub universal_kind: &'a str,
+    pub facets: &'a str,
+    pub schema_version: u32,
+    pub source_span: &'a str,
+    pub identity_key: &'a str,
+    pub body: &'a Value,
+    pub evidence_references: &'a str,
+}
+
+impl StructuralKernelRecord {
+    /// Borrows every field this record owns into a [`StructuralKernelRecordRef`].
+    pub fn as_ref(&self) -> StructuralKernelRecordRef<'_> {
+        StructuralKernelRecordRef {
+            proposal_record_key: &self.proposal_record_key,
+            category: &self.category,
+            kind: &self.kind,
+            universal_kind: &self.universal_kind,
+            facets: &self.facets,
+            schema_version: self.schema_version,
+            source_span: &self.source_span,
+            identity_key: &self.identity_key,
+            body: &self.body,
+            evidence_references: &self.evidence_references,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuralKernelDependency {
@@ -207,8 +252,29 @@ fn update_uce_text(hash: &mut Sha256, value: &str) {
     hash.update(value.as_bytes());
 }
 
+/// P2-2l item 3: depth bound unified to [`MAX_LOGICAL_DEPTH`] (64), matching
+/// [`encode_publication_body`]'s own limit -- this function used to allow
+/// twice the depth (128). P2-2k found and documented that divergence as a
+/// blocker to fusing this traversal with `encode_publication_body`'s own
+/// walk of the SAME `record.body` tree: for a value nested to depth 65-128,
+/// `structural_record_digest_hash` (via this function) would previously
+/// succeed while `encode_publication_body` already failed, so a record at
+/// that depth was rejected EITHER WAY (by `structural_kernel_row`'s call to
+/// `encode_publication_body`, downstream of a digest that had already
+/// succeeded) -- the only actual divergence was which function's error
+/// MESSAGE reached the caller, never whether the record was ultimately
+/// accepted. No real `ProposedRecord` this pipeline's producers emit
+/// nests anywhere near depth 64 (confirmed live: every n8n cold scan
+/// processes 2.83M records with zero depth-related rejections), so
+/// tightening this bound has no observed effect on any real input --
+/// verified directly (not just argued) by `depth_boundary_*` in this
+/// module's own test suite, which checks both functions agree at depths
+/// 63/64/65/128/129. This is a prerequisite for [`fused_body_pass`]: with
+/// both traversals sharing one depth threshold, a single fused pass can
+/// check depth once per node instead of needing to reconcile two
+/// different limits.
 fn update_uce_value(hash: &mut Sha256, value: &Value, depth: usize) -> NativeCoreResult<()> {
-    if depth > 128 {
+    if depth > MAX_LOGICAL_DEPTH {
         return Err(NativeCoreError::new(
             "Structural kernel UCE value exceeds the maximum depth.",
         ));
@@ -242,13 +308,27 @@ fn update_uce_value(hash: &mut Sha256, value: &Value, depth: usize) -> NativeCor
             }
         }
         Value::Object(fields) => {
-            let mut keys = fields.keys().collect::<Vec<_>>();
-            keys.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            // P2-2k: `Value::Object` is a `serde_json::Map` backed by
+            // `BTreeMap<String, Value>` in this build (the workspace never
+            // enables serde_json's `preserve_order` feature -- confirmed
+            // both by `Cargo.lock` carrying a single unified `serde_json`
+            // entry with no `preserve_order` anywhere, and live via
+            // profiling the n8n cold scan: leaf samples resolve straight
+            // into `alloc::collections::btree::map::Iter::next`). A
+            // `BTreeMap`'s `iter()` already yields entries in ascending
+            // key order via `Ord for str`, which compares the UTF-8 byte
+            // sequence directly -- byte-for-byte identical to the
+            // `sort_by(|l, r| l.as_bytes().cmp(r.as_bytes()))` this used to
+            // do explicitly. Iterating `fields` directly skips a
+            // `Vec<&String>` allocation + a redundant sort + a second
+            // `fields.get(key)` lookup per JSON object, for every nested
+            // object in every record's body -- this profiled as one of
+            // Pass 1's largest single costs (see P2-2k's evidence entry).
             hash.update([6]);
-            update_varint(hash, keys.len());
-            for key in keys {
+            update_varint(hash, fields.len());
+            for (key, value) in fields {
                 update_uce_text(hash, key);
-                update_uce_value(hash, fields.get(key).expect("object key exists"), depth + 1)?;
+                update_uce_value(hash, value, depth + 1)?;
             }
         }
     }
@@ -264,45 +344,66 @@ fn sha256_text(hash: Sha256) -> String {
     output
 }
 
+/// P2-2f bytes-native counterpart of [`sha256_text`]: finalizes into
+/// `[u8; 32]` directly, with no `sha256:`-prefixed hex `String` ever built.
+fn sha256_bytes(hash: Sha256) -> [u8; 32] {
+    hash.finalize().into()
+}
+
 fn update_uce_key_value_text(hash: &mut Sha256, key: &str, value: &str) {
     update_uce_text(hash, key);
     update_uce_text(hash, value);
 }
 
-fn structural_record_digest(record: &StructuralKernelRecord) -> NativeCoreResult<String> {
+/// Shared hash-building step behind [`structural_record_digest`] (text
+/// output, used by the v3/N-API JSON kernel path). P2-2l item 3: the
+/// bytes-native v4 hot path (`structural_kernel_rows`/`_typed`) no longer
+/// calls this at all -- `structural_kernel_row` now builds its own
+/// equivalent hash inline, sharing ONE traversal of `record.body` with
+/// body-payload encoding via `fused_body_pass` instead of calling this
+/// function (which walks `record.body` via `update_uce_value`) separately
+/// beforehand. The former `structural_record_digest_bytes` bytes-native
+/// wrapper around this function was deleted as dead code once its one
+/// caller (`structural_kernel_rows_ref`) switched to the fused path.
+fn structural_record_digest_hash(
+    record: StructuralKernelRecordRef<'_>,
+) -> NativeCoreResult<Sha256> {
     // Same byte ordering as UCE over serde_json::to_value(record), without
     // allocating and walking a second generic object graph.
     let mut hash = Sha256::new();
     hash.update([6]);
     update_varint(&mut hash, 10);
     update_uce_text(&mut hash, "body");
-    update_uce_value(&mut hash, &record.body, 1)?;
-    update_uce_key_value_text(&mut hash, "category", &record.category);
-    update_uce_key_value_text(
-        &mut hash,
-        "evidence_references",
-        &record.evidence_references,
-    );
-    update_uce_key_value_text(&mut hash, "facets", &record.facets);
-    update_uce_key_value_text(&mut hash, "identity_key", &record.identity_key);
-    update_uce_key_value_text(&mut hash, "kind", &record.kind);
-    update_uce_key_value_text(
-        &mut hash,
-        "proposal_record_key",
-        &record.proposal_record_key,
-    );
+    update_uce_value(&mut hash, record.body, 1)?;
+    update_uce_key_value_text(&mut hash, "category", record.category);
+    update_uce_key_value_text(&mut hash, "evidence_references", record.evidence_references);
+    update_uce_key_value_text(&mut hash, "facets", record.facets);
+    update_uce_key_value_text(&mut hash, "identity_key", record.identity_key);
+    update_uce_key_value_text(&mut hash, "kind", record.kind);
+    update_uce_key_value_text(&mut hash, "proposal_record_key", record.proposal_record_key);
     update_uce_text(&mut hash, "schema_version");
     hash.update([7]);
     hash.update((record.schema_version as f64).to_be_bytes());
-    update_uce_key_value_text(&mut hash, "source_span", &record.source_span);
-    update_uce_key_value_text(&mut hash, "universal_kind", &record.universal_kind);
-    Ok(sha256_text(hash))
+    update_uce_key_value_text(&mut hash, "source_span", record.source_span);
+    update_uce_key_value_text(&mut hash, "universal_kind", record.universal_kind);
+    Ok(hash)
+}
+
+fn structural_record_digest(record: &StructuralKernelRecord) -> NativeCoreResult<String> {
+    Ok(sha256_text(structural_record_digest_hash(record.as_ref())?))
 }
 
 fn uce_text_digest(value: &str) -> String {
     let mut hash = Sha256::new();
     update_uce_text(&mut hash, value);
     sha256_text(hash)
+}
+
+/// P2-2f bytes-native counterpart of [`uce_text_digest`].
+fn uce_text_digest_bytes(value: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    update_uce_text(&mut hash, value);
+    sha256_bytes(hash)
 }
 
 fn uce_text_object_digest(fields: &[(&str, &str)]) -> String {
@@ -313,6 +414,17 @@ fn uce_text_object_digest(fields: &[(&str, &str)]) -> String {
         update_uce_key_value_text(&mut hash, key, value);
     }
     sha256_text(hash)
+}
+
+/// P2-2f bytes-native counterpart of [`uce_text_object_digest`].
+fn uce_text_object_digest_bytes(fields: &[(&str, &str)]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update([6]);
+    update_varint(&mut hash, fields.len());
+    for (key, value) in fields {
+        update_uce_key_value_text(&mut hash, key, value);
+    }
+    sha256_bytes(hash)
 }
 
 fn append_varint(output: &mut Vec<u8>, mut value: usize) {
@@ -329,11 +441,30 @@ fn append_varint(output: &mut Vec<u8>, mut value: usize) {
     }
 }
 
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// P2-2k lever (d): lookup-table hex encoder. The former implementation
+/// ran `write!(&mut output, "{byte:02x}")` per byte -- one `core::fmt`
+/// formatting call (with `LowerHex`'s own padding/width machinery) for
+/// every one of a digest's 32 bytes, on the hot `structural_kernel_row`
+/// path that builds `record_id_text` for every one of n8n's 2.83M
+/// records. A direct table lookup into ASCII hex digit bytes produces the
+/// exact same characters without ever going through `fmt::Write`.
+/// Appends `bytes` as lowercase hex directly onto `output`, so a caller
+/// that needs a prefixed hex string (e.g. `structural_kernel_row`'s
+/// `"record:"`-prefixed `record_id_text`) can push the prefix and the hex
+/// digits into ONE `String` instead of allocating the hex text separately
+/// and then `format!`-concatenating it onto the prefix.
+fn push_hex_bytes(output: &mut String, bytes: &[u8]) {
+    for byte in bytes {
+        output.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        output.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
+    }
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
+    push_hex_bytes(&mut output, bytes);
     output
 }
 
@@ -399,24 +530,156 @@ fn encode_publication_body(
         }
         Value::Object(fields) => {
             validate_collection_length(fields.len())?;
-            let mut keys = fields.keys().collect::<Vec<_>>();
-            keys.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            // P2-2k: same BTreeMap-already-sorted argument as
+            // `update_uce_value`'s Object arm above -- iterate directly,
+            // no `Vec<&String>` collect + sort + second lookup.
             logical.tag(10);
-            logical.length(keys.len());
+            logical.length(fields.len());
             payload.push(6);
-            append_varint(payload, keys.len());
-            for key in keys {
+            append_varint(payload, fields.len());
+            for (key, value) in fields {
                 logical.text(key);
                 logical.boolean(true);
                 payload.push(3);
                 append_varint(payload, key.len());
                 payload.extend_from_slice(key.as_bytes());
-                encode_publication_body(
-                    fields.get(key).expect("object key exists"),
-                    logical,
-                    payload,
-                    depth + 1,
-                )?;
+                encode_publication_body(value, logical, payload, depth + 1)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// P2-2l item 3: fuses [`update_uce_value`]'s traversal (feeds the WHOLE-
+/// record digest hasher) with [`encode_publication_body`]'s traversal
+/// (produces `body_digest`/the UCE body payload bytes) into ONE walk of
+/// `record.body`, used only by the v4 bytes-native hot path
+/// (`structural_kernel_row`, below -- the ONLY caller). The two ORIGINAL
+/// functions stay exactly as they were and remain the v3/N-API path's own
+/// implementation (`structural_record_digest_hash`/`publication_record`,
+/// unchanged, still used by `structural_kernel_batch_parts_with_
+/// canonical`): fusing them for that lower-volume path was never this
+/// task's ask, and duplicating the logic here (rather than trying to
+/// share it) keeps the v3 path's own byte-for-byte contract untouched by
+/// construction.
+///
+/// Safe because, with item 3's own depth-limit unification directly
+/// above, `encode_publication_body`'s checks are now a STRICT SUPERSET of
+/// `update_uce_value`'s: identical depth bound (both [`MAX_LOGICAL_
+/// DEPTH`]), identical finite-number requirement, PLUS two checks
+/// `update_uce_value` never had at all (`validate_collection_length` on
+/// every array/object, and negative-zero rejection for non-integer
+/// numbers). So whenever this fused walk reaches a leaf/branch
+/// successfully, both original functions would ALSO have accepted it
+/// there (there is no `update_uce_value`-only rejection this walk could
+/// silently skip), and whenever it errors, so would `structural_kernel_
+/// row`'s ORIGINAL two-call sequence have -- `encode_publication_body`
+/// unconditionally ran and could reject the row even when `update_uce_
+/// value` (called first, by `structural_record_digest_bytes`) had already
+/// succeeded, which is exactly the "record rejected either way" case item
+/// 3's own doc comment on `update_uce_value` traces through.
+///
+/// For every value that DOES succeed, the hash bytes pushed here into
+/// `hash` are byte-for-byte the same sequence `update_uce_value` would
+/// have pushed for the identical `Value` (same match arms, same tag
+/// bytes, same varint/text encoding, same `real == 0.0` zero
+/// normalization for the shared numeric case) -- `hash` is a live,
+/// already-partially-fed `Sha256` (the caller has already hashed the
+/// record's fixed preamble up to and including the `"body"` key text), so
+/// feeding it the identical byte sequence a standalone `update_uce_value`
+/// call would have fed it produces the identical final digest, regardless
+/// of what was hashed into it before or is hashed into it after --
+/// verified directly, not just argued, by `native_core_rows_match_
+/// batch_parts_oracle`/`typed_rows_match_untyped_rows_oracle` (this
+/// module's own oracle tests, comparing this fused path's output against
+/// the UNCHANGED two-traversal v3 path's own digest/body-byte output field
+/// by field) and by live n8n root reproduction (this task's evidence
+/// entry).
+fn fused_body_pass(
+    value: &Value,
+    hash: &mut Sha256,
+    logical: &mut LogicalDigestWriter,
+    payload: &mut Vec<u8>,
+    depth: usize,
+) -> NativeCoreResult<()> {
+    if depth > MAX_LOGICAL_DEPTH {
+        return Err(NativeCoreError::new(
+            "Structural publication body exceeds the maximum depth.",
+        ));
+    }
+    match value {
+        Value::Null => {
+            hash.update([0]);
+            logical.tag(3);
+            payload.push(0);
+        }
+        Value::Bool(value) => {
+            hash.update([if *value { 2 } else { 1 }]);
+            logical.boolean(*value);
+            payload.push(if *value { 2 } else { 1 });
+        }
+        Value::String(value) => {
+            update_uce_text(hash, value);
+            logical.text(value);
+            payload.push(3);
+            append_varint(payload, value.len());
+            payload.extend_from_slice(value.as_bytes());
+        }
+        Value::Number(value) => {
+            let real = value.as_f64().ok_or_else(|| {
+                NativeCoreError::new("Structural publication body contains an invalid number.")
+            })?;
+            if !real.is_finite() {
+                return Err(NativeCoreError::new(
+                    "Structural publication body contains an invalid number.",
+                ));
+            }
+            if let Some(integer) = value.as_i64() {
+                logical.tag(5);
+                logical.text(&integer.to_string());
+            } else {
+                if real.to_bits() == (-0.0_f64).to_bits() {
+                    return Err(NativeCoreError::new(
+                        "Logical digest real values must not be negative zero.",
+                    ));
+                }
+                logical.tag(6);
+                logical.raw(&real.to_be_bytes());
+            }
+            let normalized = if real == 0.0 { 0.0 } else { real };
+            hash.update([7]);
+            hash.update(normalized.to_be_bytes());
+            payload.push(7);
+            payload.extend_from_slice(&normalized.to_be_bytes());
+        }
+        Value::Array(values) => {
+            validate_collection_length(values.len())?;
+            hash.update([5]);
+            update_varint(hash, values.len());
+            logical.tag(9);
+            logical.length(values.len());
+            payload.push(5);
+            append_varint(payload, values.len());
+            for value in values {
+                fused_body_pass(value, hash, logical, payload, depth + 1)?;
+            }
+        }
+        Value::Object(fields) => {
+            validate_collection_length(fields.len())?;
+            hash.update([6]);
+            update_varint(hash, fields.len());
+            logical.tag(10);
+            logical.length(fields.len());
+            payload.push(6);
+            append_varint(payload, fields.len());
+            for (key, value) in fields {
+                update_uce_text(hash, key);
+                logical.text(key);
+                logical.boolean(true);
+                payload.push(3);
+                append_varint(payload, key.len());
+                payload.extend_from_slice(key.as_bytes());
+                fused_body_pass(value, hash, logical, payload, depth + 1)?;
             }
         }
     }
@@ -506,14 +769,15 @@ fn canonical_json_into(value: &Value, output: &mut String, depth: usize) -> Nati
             output.push(']');
         }
         Value::Object(fields) => {
-            let mut keys = fields.keys().collect::<Vec<_>>();
-            keys.sort_by(|left, right| {
-                left.as_bytes()
-                    .cmp(right.as_bytes())
-                    .then_with(|| left.cmp(right))
-            });
+            // P2-2k: same BTreeMap-already-sorted argument as
+            // `update_uce_value`'s Object arm -- iterate directly. The
+            // dropped `.then_with(|| left.cmp(right))` tie-break was
+            // already dead code: a `BTreeMap` never holds two equal keys,
+            // so `left.as_bytes().cmp(right.as_bytes())` (used as the
+            // ordering key everywhere else in this file) never actually
+            // ties here.
             output.push('{');
-            for (index, key) in keys.into_iter().enumerate() {
+            for (index, (key, value)) in fields.iter().enumerate() {
                 if index > 0 {
                     output.push(',');
                 }
@@ -523,11 +787,7 @@ fn canonical_json_into(value: &Value, output: &mut String, depth: usize) -> Nati
                     ))
                 })?);
                 output.push(':');
-                canonical_json_into(
-                    fields.get(key).expect("object key exists"),
-                    output,
-                    depth + 1,
-                )?;
+                canonical_json_into(value, output, depth + 1)?;
             }
             output.push('}');
         }
@@ -680,8 +940,8 @@ fn canonical_array_digest(values: &[String]) -> String {
     output
 }
 
-fn canonical_nested_record_fields(record: &StructuralKernelRecord) -> Option<Vec<String>> {
-    let facets = serde_json::from_str::<Value>(&record.facets).ok()?;
+fn canonical_nested_record_fields(record: StructuralKernelRecordRef<'_>) -> Option<Vec<String>> {
+    let facets = serde_json::from_str::<Value>(record.facets).ok()?;
     if canonical_json(&facets).ok()? != record.facets {
         return None;
     }
@@ -696,16 +956,118 @@ fn canonical_nested_record_fields(record: &StructuralKernelRecord) -> Option<Vec
         facet_values.push(facet);
     }
     if !record.source_span.is_empty() {
-        let source_span = serde_json::from_str::<Value>(&record.source_span).ok()?;
+        let source_span = serde_json::from_str::<Value>(record.source_span).ok()?;
         if canonical_json(&source_span).ok()? != record.source_span {
             return None;
         }
     }
-    let evidence = serde_json::from_str::<Value>(&record.evidence_references).ok()?;
+    let evidence = serde_json::from_str::<Value>(record.evidence_references).ok()?;
     if canonical_json(&evidence).ok()? != record.evidence_references {
         return None;
     }
     Some(facet_values)
+}
+
+/// P2-2k: fused sibling of [`canonical_nested_record_fields`] and (the
+/// former) `source_span_bytes_from_text`, used only by
+/// [`structural_kernel_rows_ref`]'s hot loop. Those two functions used to
+/// each parse `record.source_span` independently -- one purely to check
+/// its canonical form (discarding the parsed tree immediately after), the
+/// other purely to pull `start`/`end` back out -- so every record with a
+/// non-empty `source_span` paid for two full `serde_json::Value` parses of
+/// the same text. Profiling the n8n cold scan (P2-2k's evidence entry)
+/// found `serde_json`'s `Value` deserializer among Pass 1's largest leaf
+/// costs, so this parses `source_span` at most ONCE and serves both needs
+/// from that one parse.
+///
+/// Returns the exact same `Option<Vec<String>>` as
+/// `canonical_nested_record_fields` would for this record (byte-for-byte:
+/// same `None`/`Some` conditions, same values), plus `(span_start,
+/// span_end)` populated the exact same way the former
+/// `source_span_bytes_from_text` populated it -- from the parsed JSON
+/// whenever it parses at all, independent of whether the text also turns
+/// out to be exactly canonical (a non-canonical-but-parseable span, e.g.
+/// extra whitespace, still yields real `start`/`end` values here, exactly
+/// as it did when the two checks were separate calls).
+/// P2-2k lever (e): compares `value`'s canonical JSON rendering against
+/// `expected` by rendering into a caller-owned, reused `scratch` buffer
+/// (cleared, capacity kept) instead of `canonical_json`'s fresh
+/// `String::new()` per call. `structural_kernel_rows_ref`'s hot loop calls
+/// this up to three times per record (facets/source_span/
+/// evidence_references), each on a short-lived comparison result that is
+/// immediately discarded -- reusing one buffer across every record in a
+/// batch turns those into a handful of one-time allocations instead of
+/// millions of them.
+fn canonical_json_matches(
+    value: &Value,
+    expected: &str,
+    scratch: &mut String,
+) -> NativeCoreResult<bool> {
+    scratch.clear();
+    canonical_json_into(value, scratch, 0)?;
+    Ok(scratch == expected)
+}
+
+/// Parses `source_span` into a `Value` only when non-empty (matching every
+/// call site's own pre-existing "empty means no span" convention) --
+/// factored out so [`canonical_nested_record_fields_and_span`] and the
+/// P2-2l typed hot path ([`parse_span_start_end`]) share one parse
+/// implementation rather than drifting.
+fn parse_span_value(source_span: &str) -> Option<Value> {
+    if source_span.is_empty() {
+        None
+    } else {
+        serde_json::from_str::<Value>(source_span).ok()
+    }
+}
+
+/// P2-2l item 2: span-only counterpart of [`parse_span_value`] +
+/// [`span_start_end`], used by [`structural_kernel_rows_typed`]'s hot loop,
+/// which (unlike [`canonical_nested_record_fields_and_span`]) never needs
+/// the parsed `Value` for anything beyond `start`/`end` extraction -- its
+/// caller already trusts `facets`/`evidence_references` are canonical by
+/// construction (see that function's own doc comment), so there is nothing
+/// left to validate `source_span`'s parsed tree against.
+fn parse_span_start_end(source_span: &str) -> (u32, u32) {
+    parse_span_value(source_span)
+        .as_ref()
+        .map_or((0, 0), span_start_end)
+}
+
+fn canonical_nested_record_fields_and_span(
+    record: StructuralKernelRecordRef<'_>,
+    scratch: &mut String,
+    unique: &mut HashSet<String>,
+) -> (Option<Vec<String>>, (u32, u32)) {
+    let span_value = parse_span_value(record.source_span);
+    let span_bytes = span_value.as_ref().map_or((0, 0), span_start_end);
+    let facets = (|| {
+        let facets = serde_json::from_str::<Value>(record.facets).ok()?;
+        if !canonical_json_matches(&facets, record.facets, scratch).ok()? {
+            return None;
+        }
+        let facets = facets.as_array()?;
+        let mut facet_values = Vec::with_capacity(facets.len());
+        unique.clear();
+        for facet in facets {
+            let facet = facet.as_str()?.to_owned();
+            if !unique.insert(facet.clone()) {
+                return None;
+            }
+            facet_values.push(facet);
+        }
+        if !record.source_span.is_empty()
+            && !canonical_json_matches(span_value.as_ref()?, record.source_span, scratch).ok()?
+        {
+            return None;
+        }
+        let evidence = serde_json::from_str::<Value>(record.evidence_references).ok()?;
+        if !canonical_json_matches(&evidence, record.evidence_references, scratch).ok()? {
+            return None;
+        }
+        Some(facet_values)
+    })();
+    (facets, span_bytes)
 }
 
 /// Producer-side physical seal. This deliberately does not compute record
@@ -808,7 +1170,7 @@ fn structural_kernel_batch_parts_with_canonical(
     let mut publication_body_byte_length = 0usize;
     let mut canonical_byte_length = 0usize;
     for (index, record) in records.iter().enumerate() {
-        let facets = canonical_nested_record_fields(record);
+        let facets = canonical_nested_record_fields(record.as_ref());
         record_structural_attestations.push(facets.is_some());
         let canonical = supplied_canonical_records
             .map(|values| values[index].clone())
@@ -872,6 +1234,335 @@ fn structural_kernel_batch_parts_with_canonical(
         publication_descriptor,
         canonical_byte_length,
     })
+}
+
+/// P2-2f bytes-native per-record output: the same digests/ids/body/span
+/// scalars as one `StructuralPublicationRecord` +
+/// `record_body_payload_hexes[i]`, but `[u8; 32]`/raw `Vec<u8>` instead of
+/// `sha256:`/`record:`-prefixed hex `String`s and a hex-encoded body, and
+/// with `primary_source_span` collapsed to the two integers a caller
+/// actually reads instead of kept around as a `serde_json::Value` tree.
+///
+/// Built for callers (`urdira-indexing-worker`'s v4 materialize pass) that
+/// only need ids/digests/body bytes, never the canonical JSON text or the
+/// N-API/JSON-shaped `StructuralPublicationRecord` -- see this crate's
+/// evidence trail (P2-2f) for the allocation counts this removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralKernelRow {
+    pub record_id: [u8; 32],
+    pub record_digest: [u8; 32],
+    pub body_digest: [u8; 32],
+    pub body_byte_length: usize,
+    pub body: Vec<u8>,
+    pub facets: Vec<String>,
+    pub structural_attestation: bool,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub identity_type: &'static str,
+    pub identity_key: String,
+    pub identity_id: [u8; 32],
+    pub identity_key_digest: [u8; 32],
+    pub identity_assignment_id: [u8; 32],
+}
+
+/// Result of [`structural_kernel_rows`]: rows plus the summed
+/// `body_byte_length`, which callers use the same way the N-API path uses
+/// `StructuralKernelResult::canonical_byte_length` -- as the signal to
+/// bisect a batch that is too large to process/hold in one shot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StructuralKernelRows {
+    pub rows: Vec<StructuralKernelRow>,
+    pub byte_length: usize,
+}
+
+/// Pulls `start`/`end` out of an already-parsed `source_span` (always a
+/// producer-emitted `{"path", "start", "end"}` JSON text -- see
+/// `materialize.rs`'s module doc), without ever storing the parsed
+/// `serde_json::Value` tree anywhere beyond this call: the tree is a
+/// function-local temporary owned by the caller, never carried in a
+/// per-record `Vec` the way `StructuralPublicationRecord::
+/// primary_source_span` was. P2-2k: split out of the former
+/// `source_span_bytes_from_text` so [`canonical_nested_record_fields_and_
+/// span`] can call this on a `Value` it already parsed once, instead of
+/// parsing `source_span` a second time.
+fn span_start_end(span: &Value) -> (u32, u32) {
+    let start = span
+        .get("start")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let end = span
+        .get("end")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    (start, end)
+}
+
+/// One record's [`StructuralKernelRow`]. `record_id` is literally the same
+/// 32 bytes as `record_digest` (matching `structural_kernel_batch_parts_
+/// with_canonical`'s `record_id = format!("record:{}", digest...)`: a
+/// re-labeled copy of the digest, not a second hash -- see this function's
+/// own body for the one place that distinction (the `record:`-prefixed
+/// text form) still matters, as an input to `identity_assignment_id`'s
+/// hash).
+///
+/// P2-2l item 3: `record_digest` is no longer a parameter -- this function
+/// now computes it ITSELF, via [`fused_body_pass`], as part of the SAME
+/// single walk of `record.body` that also produces `body_digest`/the body
+/// payload bytes. Before this task, the caller computed `record_digest`
+/// separately (via `structural_record_digest_bytes`, itself calling
+/// `update_uce_value` over `record.body`) and handed it in as a plain
+/// `[u8; 32]`, so `record.body` was walked TWICE per record: once for the
+/// digest, once here for the body payload. See `fused_body_pass`'s own doc
+/// comment for why merging the two walks into one is safe (item 3's own
+/// depth-limit unification directly above makes `encode_publication_
+/// body`'s checks a strict superset of `update_uce_value`'s, so nothing
+/// this fused walk accepts/rejects differs from what the two original,
+/// separately-called functions would have accepted/rejected together).
+fn structural_kernel_row(
+    record: StructuralKernelRecordRef<'_>,
+    facets: Vec<String>,
+    structural_attestation: bool,
+    span: (u32, u32),
+) -> NativeCoreResult<StructuralKernelRow> {
+    // Same fixed field/hash sequence as `structural_record_digest_hash`
+    // (unchanged, still used by the v3/N-API path), with `record.body`'s
+    // own subtree fed through `fused_body_pass` -- which ALSO builds
+    // `body_digest`/the body payload bytes in this same call -- instead of
+    // a separate `update_uce_value` call. `Sha256::update` is purely
+    // sequential (Merkle-Damgard), so feeding this hasher the identical
+    // byte sequence `update_uce_value` would have fed it for `record.body`
+    // produces the identical final digest, regardless of what is hashed
+    // into it immediately before (the `[6]`/varint/`"body"` preamble
+    // below) or after (the flat field hashes following this block).
+    let mut record_hash = Sha256::new();
+    record_hash.update([6]);
+    update_varint(&mut record_hash, 10);
+    update_uce_text(&mut record_hash, "body");
+
+    let mut body_writer = LogicalDigestWriter::new("urdira:relational-value:v3");
+    let mut body = Vec::new();
+    fused_body_pass(
+        record.body,
+        &mut record_hash,
+        &mut body_writer,
+        &mut body,
+        1,
+    )?;
+    let (body_digest, body_byte_length) = body_writer.finish_bytes();
+
+    update_uce_key_value_text(&mut record_hash, "category", record.category);
+    update_uce_key_value_text(
+        &mut record_hash,
+        "evidence_references",
+        record.evidence_references,
+    );
+    update_uce_key_value_text(&mut record_hash, "facets", record.facets);
+    update_uce_key_value_text(&mut record_hash, "identity_key", record.identity_key);
+    update_uce_key_value_text(&mut record_hash, "kind", record.kind);
+    update_uce_key_value_text(
+        &mut record_hash,
+        "proposal_record_key",
+        record.proposal_record_key,
+    );
+    update_uce_text(&mut record_hash, "schema_version");
+    record_hash.update([7]);
+    record_hash.update((record.schema_version as f64).to_be_bytes());
+    update_uce_key_value_text(&mut record_hash, "source_span", record.source_span);
+    update_uce_key_value_text(&mut record_hash, "universal_kind", record.universal_kind);
+
+    let record_digest = sha256_bytes(record_hash);
+    let identity_type: &'static str = match record.category {
+        "relation" => "relation",
+        "diagnostic" => "diagnostic",
+        _ => "entity",
+    };
+    // The one place this function still needs a text form of `record_id`:
+    // `identity_assignment_id`'s hash input is `("record_id", "record:
+    // <hex>")`, matching `publication_record`'s `uce_text_object_digest`
+    // call byte for byte. Cheap (one ~71-byte allocation), unlike the
+    // canonical-JSON/hex-body text this function otherwise avoids.
+    let mut record_id_text = String::with_capacity(7 + record_digest.len() * 2);
+    record_id_text.push_str("record:");
+    push_hex_bytes(&mut record_id_text, &record_digest);
+    let identity_key_digest = uce_text_digest_bytes(record.identity_key);
+    let identity_id = uce_text_object_digest_bytes(&[("identity_key", record.identity_key)]);
+    let identity_assignment_id = uce_text_object_digest_bytes(&[
+        ("identity_key", record.identity_key),
+        ("record_id", &record_id_text),
+    ]);
+    let (span_start, span_end) = span;
+    Ok(StructuralKernelRow {
+        record_id: record_digest,
+        record_digest,
+        body_digest,
+        body_byte_length,
+        body,
+        facets,
+        structural_attestation,
+        span_start,
+        span_end,
+        identity_type,
+        identity_key: record.identity_key.to_owned(),
+        identity_id,
+        identity_key_digest,
+        identity_assignment_id,
+    })
+}
+
+/// Bytes-native counterpart of [`structural_kernel_batch_parts`], scoped to
+/// records only (P2-2f): `urdira-indexing-worker`'s v4 materialize pass
+/// never reads `StructuralKernelResult`'s dependency-canonicalization
+/// output (`canonical_dependencies`/`dependencies_digest`) or its
+/// record-side canonical-JSON/text fields (`canonical_records`,
+/// `records_digest`, `record_ids`, `record_digests`,
+/// `record_structural_attestations`, `record_facets`,
+/// `publication_descriptor`) at all -- it only ever reads
+/// `publication_records` and `record_body_payload_hexes`. This function
+/// computes exactly that subset, through the SAME digest/canonicalization
+/// primitives (`structural_record_digest_hash`, `canonical_nested_record_
+/// fields`, `encode_publication_body`, the `uce_text_*` recipes) so every
+/// id/digest/body byte is byte-identical to what
+/// `structural_kernel_batch_parts` would have produced for the same input
+/// -- verified by the `native_core_rows_match_batch_parts_oracle` test.
+///
+/// The row-count bound (`MAX_BATCH_RECORDS`) and a byte-length bound
+/// (`MAX_BATCH_FRAMED_BYTES`, applied to summed body bytes rather than
+/// summed canonical-JSON-text bytes -- there is no canonical JSON text on
+/// this path, and nothing downstream of this function ever crosses an
+/// N-API/JSON boundary with it) are both still enforced, so a caller that
+/// bisects on this function's `Err` retains the same safety valve against
+/// unbounded per-call memory.
+pub fn structural_kernel_rows(
+    records: &[StructuralKernelRecord],
+) -> NativeCoreResult<StructuralKernelRows> {
+    let refs: Vec<StructuralKernelRecordRef<'_>> =
+        records.iter().map(StructuralKernelRecord::as_ref).collect();
+    structural_kernel_rows_ref(&refs)
+}
+
+/// P2-2g item 3: borrowed-input sibling of [`structural_kernel_rows`] --
+/// same output, same digest/canonicalization primitives, but takes
+/// [`StructuralKernelRecordRef`] directly instead of an owned
+/// `StructuralKernelRecord`. Lets a caller that already holds these fields
+/// inside a larger owned structure (`urdira-indexing-worker`'s v4
+/// `materialize.rs`, holding `ProposedRecord`s) skip cloning every
+/// `String`/`Value` field into a temporary `StructuralKernelRecord` per
+/// record purely to call the kernel -- on n8n's 1.5M records that clone was
+/// 7 `String`s + 1 `body: Value` tree per record (see this task's evidence
+/// doc). `structural_kernel_rows` above is now a thin wrapper over this
+/// function, so both entrypoints stay byte-identical by construction.
+pub fn structural_kernel_rows_ref(
+    records: &[StructuralKernelRecordRef<'_>],
+) -> NativeCoreResult<StructuralKernelRows> {
+    if records.len() > MAX_BATCH_RECORDS {
+        return Err(NativeCoreError::new(format!(
+            "Structural kernel batch exceeds the {MAX_BATCH_RECORDS}-row bound."
+        )));
+    }
+    let mut rows = Vec::with_capacity(records.len());
+    let mut byte_length = 0usize;
+    // P2-2k lever (e): one reused canonical-JSON scratch buffer and one
+    // reused facet-dedup set for the whole batch, instead of allocating a
+    // fresh `String`/`HashSet` per record purely to throw them away after
+    // one comparison -- see `canonical_json_matches`'s doc comment.
+    let mut canonical_scratch = String::new();
+    let mut facet_dedup = HashSet::new();
+    for &record in records {
+        let (facets, span) = canonical_nested_record_fields_and_span(
+            record,
+            &mut canonical_scratch,
+            &mut facet_dedup,
+        );
+        let structural_attestation = facets.is_some();
+        let row = structural_kernel_row(
+            record,
+            facets.unwrap_or_default(),
+            structural_attestation,
+            span,
+        )?;
+        byte_length = byte_length
+            .checked_add(row.body_byte_length)
+            .ok_or_else(|| NativeCoreError::new("Structural kernel byte length overflowed."))?;
+        rows.push(row);
+    }
+    if byte_length > MAX_BATCH_FRAMED_BYTES {
+        return Err(NativeCoreError::new(format!(
+            "Structural kernel batch exceeds the {MAX_BATCH_FRAMED_BYTES}-byte bound."
+        )));
+    }
+    Ok(StructuralKernelRows { rows, byte_length })
+}
+
+/// P2-2l item 2: typed-facets sibling of [`structural_kernel_rows_ref`],
+/// additive (does NOT change [`StructuralKernelRecordRef`] itself, so
+/// every existing caller of that struct/of `structural_kernel_rows_ref` --
+/// including `urdira-indexing-worker`'s own residual pass, out of this
+/// task's crate-ownership scope -- keeps compiling and behaving
+/// identically). `structural_kernel_rows_ref`'s hot loop calls
+/// `canonical_nested_record_fields_and_span`, which parses `record.facets`/
+/// `.evidence_references` back out of their own canonical-JSON TEXT into a
+/// generic `serde_json::Value` tree purely to re-verify canonical form and
+/// pull the facet list back out -- P2-2k's own profiling found this among
+/// Pass 1's largest remaining costs on n8n (`Index::index_into` +
+/// `Value::deserialize` + `skip_to_escape` + `format_escaped_str` ~13% of
+/// leaf samples). For `urdira-indexing-worker`'s v4 hot path this
+/// round-trip is PROVABLY a no-op: every `ProposedRecord` producer that
+/// feeds it (`urdira-jsts-syntax-worker`'s `lib.rs`/`semantic_sites.rs`,
+/// confirmed by reading every one of their 9 construction sites this task
+/// audited) builds `facets`/`source_span`/`evidence_references` via
+/// `canonical_json`/`canonical_span`/`canonical_evidence` -- the SAME
+/// function this crate's own canonical-form check compares against -- so
+/// the text is canonical by construction and the check can never fail for
+/// it. This entrypoint accepts the typed facet list
+/// (`ProposedRecord::facets_list`, populated by every one of those
+/// producers alongside the text) directly, per record, skips the generic
+/// `Value` parse+validate for `facets`/`evidence_references` entirely
+/// (`evidence_references`'s parsed tree was NEVER read for anything beyond
+/// that validation -- confirmed by reading `canonical_nested_record_
+/// fields`/`_and_span` directly: no field of `StructuralKernelRow` is ever
+/// populated from it), and unconditionally sets `structural_attestation =
+/// true` (matching what the untyped path would ALSO compute for this
+/// input, per the argument above). `source_span` is still parsed (its
+/// `start`/`end` ARE read, by `structural_kernel_row`), just without the
+/// no-op canonical-form comparison. Every other step -- `structural_
+/// record_digest_hash` (same `record.facets`/`.evidence_references` TEXT,
+/// unchanged), `structural_kernel_row`'s body encoding -- is IDENTICAL to
+/// the untyped path, so output is byte-for-byte identical whenever the
+/// typed facet list matches what parsing `record.facets` would have
+/// produced -- verified by `typed_rows_match_untyped_rows_oracle`, below,
+/// and by live n8n root reproduction (this task's evidence entry).
+pub fn structural_kernel_rows_typed(
+    records: &[StructuralKernelRecordRef<'_>],
+    typed_facets: &[&[String]],
+) -> NativeCoreResult<StructuralKernelRows> {
+    if records.len() != typed_facets.len() {
+        return Err(NativeCoreError::new(
+            "Structural kernel typed facets length does not match record count.",
+        ));
+    }
+    if records.len() > MAX_BATCH_RECORDS {
+        return Err(NativeCoreError::new(format!(
+            "Structural kernel batch exceeds the {MAX_BATCH_RECORDS}-row bound."
+        )));
+    }
+    let mut rows = Vec::with_capacity(records.len());
+    let mut byte_length = 0usize;
+    for (&record, &facets) in records.iter().zip(typed_facets.iter()) {
+        let span = parse_span_start_end(record.source_span);
+        let row = structural_kernel_row(record, facets.to_vec(), true, span)?;
+        byte_length = byte_length
+            .checked_add(row.body_byte_length)
+            .ok_or_else(|| NativeCoreError::new("Structural kernel byte length overflowed."))?;
+        rows.push(row);
+    }
+    if byte_length > MAX_BATCH_FRAMED_BYTES {
+        return Err(NativeCoreError::new(format!(
+            "Structural kernel batch exceeds the {MAX_BATCH_FRAMED_BYTES}-byte bound."
+        )));
+    }
+    Ok(StructuralKernelRows { rows, byte_length })
 }
 
 /// Revalidates canonical producer rows without first rebuilding their nested
@@ -1059,7 +1750,7 @@ pub fn structural_kernel_canonical_batch_parts_with_records(
     let record_schema_attestations = records
         .iter()
         .map(|record| {
-            let facets = canonical_nested_record_fields(record);
+            let facets = canonical_nested_record_fields(record.as_ref());
             structural_record_matches_definition(
                 record,
                 facets.as_deref(),
@@ -1316,6 +2007,14 @@ impl LogicalDigestWriter {
             digest,
             byte_length: self.byte_length,
         }
+    }
+
+    /// Bytes-native counterpart of [`Self::finish`] (P2-2f): same hash, no
+    /// `sha256:`-prefixed `String` ever built. Used by
+    /// [`structural_kernel_rows`], whose callers want `[u8; 32]` digests
+    /// directly.
+    fn finish_bytes(self) -> ([u8; 32], usize) {
+        (self.hash.finalize().into(), self.byte_length)
     }
 }
 
@@ -1763,6 +2462,81 @@ fn vector_distance(left: &[f64], right: &[f64], metric: DistanceMetric) -> Nativ
             } else {
                 Err(NativeCoreError::new("Exact vector distance is not finite."))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod depth_boundary_tests {
+    //! P2-2l item 3: proves `update_uce_value` and `encode_publication_
+    //! body` agree on success/failure at the exact depths this task's own
+    //! doc comments argue about (63/64/65/128/129), now that `update_uce_
+    //! value`'s bound is unified to `MAX_LOGICAL_DEPTH` (64) instead of
+    //! its former 128. Before this task's change, `update_uce_value`
+    //! would have SUCCEEDED at depth 65 and 128 while `encode_publication_
+    //! body` already failed at both -- this test would have failed on the
+    //! unmodified tree, which is the whole point: it is a regression test
+    //! for the unification, not just a smoke test of the current code.
+    use super::*;
+
+    /// Builds a `Value` nested `levels` object levels deep around a leaf
+    /// number, such that a depth-first walk starting at parameter
+    /// `depth == 1` (this crate's own convention: `update_uce_value(hash,
+    /// record.body, 1)`, `encode_publication_body(record.body, ..., 1)`)
+    /// reaches its deepest call at parameter depth `1 + levels`.
+    fn nested(levels: usize) -> Value {
+        let mut value = serde_json::json!(1);
+        for _ in 0..levels {
+            value = serde_json::json!({ "a": value });
+        }
+        value
+    }
+
+    fn uce_value_accepts(max_depth: usize) -> bool {
+        let value = nested(max_depth.saturating_sub(1));
+        let mut hash = Sha256::new();
+        update_uce_value(&mut hash, &value, 1).is_ok()
+    }
+
+    fn publication_body_accepts(max_depth: usize) -> bool {
+        let value = nested(max_depth.saturating_sub(1));
+        let mut logical = LogicalDigestWriter::new("test:depth");
+        let mut payload = Vec::new();
+        encode_publication_body(&value, &mut logical, &mut payload, 1).is_ok()
+    }
+
+    #[test]
+    fn both_traversals_agree_at_every_boundary_depth() {
+        for depth in [63_usize, 64, 65, 128, 129] {
+            let uce = uce_value_accepts(depth);
+            let publication = publication_body_accepts(depth);
+            assert_eq!(
+                uce, publication,
+                "update_uce_value and encode_publication_body disagree at depth {depth}: uce={uce} publication={publication}"
+            );
+            // Both traversals use MAX_LOGICAL_DEPTH (64) as their shared
+            // bound after this task's unification: depth <= 64 succeeds,
+            // depth > 64 fails, for both.
+            assert_eq!(uce, depth <= MAX_LOGICAL_DEPTH, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn fused_body_pass_matches_both_traversals_at_every_boundary_depth() {
+        for depth in [63_usize, 64, 65, 128, 129] {
+            let value = nested(depth.saturating_sub(1));
+            let mut hash = Sha256::new();
+            let mut logical = LogicalDigestWriter::new("test:depth");
+            let mut payload = Vec::new();
+            let fused_ok =
+                fused_body_pass(&value, &mut hash, &mut logical, &mut payload, 1).is_ok();
+            assert_eq!(
+                fused_ok,
+                depth <= MAX_LOGICAL_DEPTH,
+                "fused_body_pass at depth {depth}"
+            );
+            assert_eq!(fused_ok, uce_value_accepts(depth), "depth {depth}");
+            assert_eq!(fused_ok, publication_body_accepts(depth), "depth {depth}");
         }
     }
 }

@@ -323,8 +323,14 @@ describe("Daemon workspace indexing integration: core:workspace_add reaches stat
       await expect(inspectionStorage.catalog.getWorkspace(workspaceId)).resolves.toMatchObject({ workspace_id: workspaceId });
       const status = await client.call("core:index_status", { workspace_ids: [workspaceId] });
       expect(status.outcome).toBe("success");
-      expect(warnSpy.mock.calls.flat().map((call) => call.map(String).join(" ")).join("\n")).not.toContain("storage:workspace_not_found");
-      expect(errorSpy.mock.calls.flat().map((call) => call.map(String).join(" ")).join("\n")).not.toContain("workspace fork skipped");
+      // `.flat()` before `.map` was a pre-existing bug here: each `.mock.calls`
+      // entry is already one call's own argument array, so flattening merged
+      // every call's arguments together and made each "call" here a single
+      // string with no `.map` method -- silently masked only because these
+      // two spies never actually observed a call in this test before v4's
+      // (P4-b-2) new startup log line started exercising `errorSpy`.
+      expect(warnSpy.mock.calls.map((call) => call.map(String).join(" ")).join("\n")).not.toContain("storage:workspace_not_found");
+      expect(errorSpy.mock.calls.map((call) => call.map(String).join(" ")).join("\n")).not.toContain("workspace fork skipped");
     } finally {
       warnSpy.mockRestore();
       errorSpy.mockRestore();

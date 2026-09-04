@@ -2,9 +2,10 @@ import { chmod, readdir, readFile, stat, unlink, writeFile } from "node:fs/promi
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, resolve } from "node:path";
-import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, semanticMaterializationIdentity, SqliteCanonicalQuerySnapshotPort, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort } from "@urdira/engine";
+import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
-import { createDurableStorage, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
+import { createDurableStorage, isOutdatedWorkspaceError, readStructuralStore, recreateOutdatedWorkspaceDatabase, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
+import { existsSync } from "node:fs";
 import { runIndexPackExportInThread } from "./index-pack-export-thread.js";
 import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-thread.js";
 import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths } from "./ownership.js";
@@ -45,6 +46,24 @@ export interface DaemonRuntimeOptions {
   readonly resolve_plugin_provider?: (workspace: RegisteredWorkspace, database: WorkspaceDatabase) => Promise<WorkspaceScanPluginProvider | undefined>;
   /** Resolves the persistent Rust source writer for generic scans without a language plugin. */
   readonly resolve_source_indexing_core?: (workspace: RegisteredWorkspace, database: WorkspaceDatabase) => Promise<RustIndexingCoreGenerationPort | undefined>;
+  /**
+   * v4 (plan §9, P2-7): resolves the persistent `RustWorkspaceScanTransport`
+   * (`@urdira/engine`'s `rust-workspace-scan.ts`) a v4 workspace's
+   * `WorkspaceScan` commands are sent through. A v4 workspace never calls
+   * `resolve_plugin_provider` above at all (there is no language-plugin
+   * facts lane in v4 -- the composition worker does catalog, parse, and
+   * materialize in one Rust-owned pass), so this is a SEPARATE resolver, not
+   * a field on that one's return value. The composing application
+   * (`apps/urdira/src/index.ts`) is expected to cache one transport per
+   * workspace id (mirroring `resolve_plugin_provider`'s own
+   * `indexingCoreSessions` map) and return the SAME instance on every call
+   * for a given workspace, so the worker process backing it is spawned once
+   * and reused across scans -- never spawned fresh per scan (see
+   * `scheduleWorkspaceScan`'s v4 branch, which never terminates whatever
+   * this returns). Returning `undefined` fails the scan with a diagnosable
+   * error rather than silently falling back to any other route.
+   */
+  readonly resolve_workspace_scan_transport?: (workspace: RegisteredWorkspace) => Promise<RustWorkspaceScanTransport | undefined>;
   /**
    * Optional overrides for the per-provider-call scan resource budget
    * (duration / response size), injected by the composing application
@@ -427,6 +446,8 @@ export interface DaemonStatus {
   readonly endpoint: string;
   readonly active_jobs: number;
   readonly restart_leases: number;
+  /** P3-5 (plan §6.1's daemon-latency item): epoch ms this daemon process's `runtime.ts` module loaded at -- see its own doc comment (`DAEMON_START_EPOCH_MS`) for what an external caller uses this for. */
+  readonly daemon_epoch_ms_offset: number;
 }
 
 function workspaceDigest(value: string): string {
@@ -732,6 +753,31 @@ interface WorkspaceReadiness {
   readonly semantic_build_state: "not_started" | "building" | "idle" | "failed" | "disabled";
   readonly readiness_reason_codes: readonly string[];
   readonly retry_after_ms?: number;
+  // v4 (plan §9, P2-7): populated only by `v4WorkspaceReadinessFrom` (a v3
+  // workspace's `WorkspaceReadiness` never sets these -- there is no
+  // `Queryable`/`ScanCompleted` generation pair for a plugin-driven,
+  // multi-stage v3 scan to report). Surfaced by `readinessPayload` as
+  // `readiness.structural.queryable_generation`/`durable_generation` and
+  // `readiness.lexical.completed_generation`/`readiness.semantic.completed_generation`.
+  readonly structural_queryable_generation?: number;
+  readonly structural_durable_generation?: number;
+  readonly lexical_completed_generation?: number;
+  readonly semantic_completed_generation?: number;
+  // P1-D-c (decision 28): populated only by `v4WorkspaceReadinessFrom`, from
+  // `V4WorkspaceReadinessState`'s own same-named fields -- see that
+  // interface's doc comment. Surfaced by `v4StatusFields` as the
+  // `semantic_upgrade` lane.
+  readonly upgrade_completed_generation?: number;
+  readonly upgrade_running?: boolean;
+  readonly upgrade_pending_sites?: number;
+  // P4-d (plan §9, user-facing status surfaces): which pipeline produced
+  // this readiness -- "v4" only from `v4WorkspaceReadinessFrom`, "v3" only
+  // from `workspaceReadiness`'s own v3 branch below. Consumed by
+  // `v4StatusFields` to decide whether the queryable/durable generation
+  // pair and the lexical/semantic completed-generation markers mean
+  // anything for this workspace, or whether to fall back to the coarser
+  // `structural_ready`/`semantic_ready` booleans v3 has always reported.
+  readonly storage_format: "v3" | "v4";
 }
 
 // Rate-limits the warning below to at most one line per workspace per
@@ -807,12 +853,113 @@ function recordReadinessPollMs(ms: number): void {
  * current when its published generation is at least the latest source
  * generation.
  */
+/**
+ * v4 (plan §9, P2-7): derives `WorkspaceReadiness` for a v4 workspace purely
+ * from `v4ReadinessState`'s in-memory record -- see `workspaceReadiness`'s
+ * own doc comment for why this is a separate function rather than a few
+ * branches inside the v3 one. `structural_ready` flips true as soon as a
+ * `Queryable` generation has been recorded (the harness/daemon readiness
+ * contract this task's brief calls for: "make sure a v4 workspace reports
+ * `structural_ready` at `Queryable`"), gated only on there being no recorded
+ * scan failure.
+ *
+ * P3-5 (plan §6.1's daemon-latency item): this USED TO also require
+ * `workspace.status !== "indexing"` -- which sounds like a reasonable extra
+ * guard (mirroring v3's own convention) but is actually a hidden
+ * serialization bug for v4: `workspace.status` only leaves `"indexing"` when
+ * `registry.markReady` runs, and `runV4WorkspaceScan` (below) only calls
+ * that AFTER the whole scan (`Queryable` AND `ScanCompleted`) has settled --
+ * so this gate silently forced `structural_ready` to wait for the DURABLE
+ * phase regardless of how early a live `Queryable` notification arrived,
+ * defeating the entire point of tracking `queryable_generation` and
+ * `durable_generation` separately. `runV4WorkspaceScan` now calls
+ * `v4ReadinessState.set` (and rolls it back on a subsequent failure) the
+ * MOMENT its own live `onQueryable` callback fires, live during the scan,
+ * not after; `structural_ready` must therefore be derived purely from
+ * `v4ReadinessState` having a `queryable_generation`, with no coupling to
+ * the coarse `workspace.status` label a completely different concern
+ * (`scheduleWorkspaceScan`'s own admission checks) still uses `"indexing"`
+ * for. `scanRunning` (from `scanInFlight`, a THIRD, also-`"indexing"`-shaped
+ * signal) is deliberately not consulted here either, for the same reason --
+ * it is still used below for `structural_build_state`'s cosmetic value.
+ */
+function v4WorkspaceReadinessFrom(
+  workspace: RegisteredWorkspace,
+  state: V4WorkspaceReadinessState,
+  semantic: ReadonlyMap<string, SemanticMaterializationStatusView>,
+  scanRunning: boolean,
+): WorkspaceReadiness {
+  const queryable = state.queryable_generation !== undefined;
+  const durable = state.durable_generation !== undefined;
+  const structuralReady = queryable && workspace.last_scan_error === undefined;
+  // v4 has no separate "source catalog written, structural analysis still
+  // pending" phase to distinguish (plan §4: catalog, parse, and materialize
+  // are one Rust-owned pass) -- source and structural readiness coincide.
+  const sourceReady = structuralReady;
+  const sourceSnapshotId = durable ? `source-snapshot:${state.durable_generation}` : undefined;
+  // Referenced for parity with v3's signature and to keep a future
+  // entity-grain-aware semantic reconciler a pure addition here (this
+  // function would start reading `semantic.get(...)` the same way v3's
+  // `workspaceReadiness` does); semantic maintenance is not wired for v4
+  // yet (`runV4WorkspaceScan`'s own doc comment), so it is always
+  // unavailable regardless of what this map holds for the workspace.
+  void semantic;
+  return {
+    storage_format: "v4",
+    source_ready: sourceReady,
+    syntax_ready: structuralReady,
+    structural_stage_1_ready: structuralReady,
+    structural_ready: structuralReady,
+    semantic_ready: false,
+    ...(sourceSnapshotId === undefined ? {} : { source_snapshot_id: sourceSnapshotId }),
+    ...(workspace.current_snapshot_id === undefined ? {} : { structural_snapshot_id: workspace.current_snapshot_id, ...(sourceSnapshotId === undefined ? {} : { structural_source_snapshot_id: sourceSnapshotId }) }),
+    source_availability: sourceReady ? "available" : "unavailable",
+    source_completeness: sourceReady ? "complete" : "unknown",
+    source_freshness: sourceReady ? "equivalent" : "degraded",
+    source_build_state: sourceReady ? "idle" : workspace.status === "indexing" ? "building" : "not_started",
+    structural_availability: structuralReady ? "available" : "unavailable",
+    structural_completeness: structuralReady ? "complete" : queryable ? "partial" : "unknown",
+    structural_freshness: structuralReady ? "equivalent" : "degraded",
+    structural_build_state: structuralReady ? "idle" : scanRunning ? "building" : "not_started",
+    semantic_availability: "unavailable",
+    semantic_completeness: "unsupported",
+    semantic_build_state: "disabled",
+    readiness_reason_codes: [
+      ...(sourceReady ? [] : ["core:source_catalog_unavailable"]),
+      ...(structuralReady ? [] : [scanRunning ? "core:analysis_in_progress" : "core:structural_snapshot_unavailable"]),
+      "core:plugin_unavailable",
+    ],
+    ...(scanRunning && !structuralReady ? { retry_after_ms: 1000 } : {}),
+    ...(state.queryable_generation === undefined ? {} : { structural_queryable_generation: state.queryable_generation }),
+    ...(state.durable_generation === undefined ? {} : { structural_durable_generation: state.durable_generation }),
+    ...(state.lexical_completed_generation === undefined ? {} : { lexical_completed_generation: state.lexical_completed_generation }),
+    ...(state.semantic_completed_generation === undefined ? {} : { semantic_completed_generation: state.semantic_completed_generation }),
+    ...(state.upgrade_completed_generation === undefined ? {} : { upgrade_completed_generation: state.upgrade_completed_generation }),
+    ...(state.upgrade_running === undefined ? {} : { upgrade_running: state.upgrade_running }),
+    ...(state.upgrade_pending_sites === undefined ? {} : { upgrade_pending_sites: state.upgrade_pending_sites }),
+  };
+}
+
 async function workspaceReadiness(
   workspace: RegisteredWorkspace,
   storage: DurableStorage | undefined,
   semantic: ReadonlyMap<string, SemanticMaterializationStatusView>,
   scanRunning: boolean,
 ): Promise<WorkspaceReadiness> {
+  // v4 (plan §9, P2-7): a workspace `runV4WorkspaceScan` has ever touched
+  // (its very first scan sets this the moment the scan starts, before any
+  // generation has landed -- see that function's doc comment) is answered
+  // ENTIRELY from `v4ReadinessState`'s in-memory record, never from a v3-shaped
+  // DB read: v4's `source_index_state` table has no rows the Rust scan
+  // pipeline ever writes (it commits `snapshots`/`workspace_current_state`
+  // directly, in one transaction, with no separate progressive "catalog
+  // phase" the way v3's multi-fragment source indexer has), so the v3 logic
+  // below this branch would see `sourceState === undefined` forever and
+  // report `source_ready: false` even after a real, durable v4 scan
+  // completed. This is also strictly cheaper than v3's read-only DB open --
+  // no I/O at all -- so there is no readiness-poll cost regression here.
+  const v4State = v4ReadinessState.get(workspace.workspace_id);
+  if (v4State !== undefined) return v4WorkspaceReadinessFrom(workspace, v4State, semantic, scanRunning);
   let sourceState: Awaited<ReturnType<WorkspaceDatabase["sourceIndex"]["getState"]>>;
   let structuralGeneration: number | undefined;
   let structuralStageId: string | undefined;
@@ -922,6 +1069,7 @@ async function workspaceReadiness(
   // that window honestly instead of claiming "complete"/"equivalent".
   const sourceCatalogSettling = sourceAvailable && scanRunning && !structuralReady;
   return {
+    storage_format: "v3",
     source_ready: sourceReady,
     syntax_ready: syntaxReady,
     structural_stage_1_ready: syntaxReady,
@@ -976,8 +1124,18 @@ function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown
         ? ["core:semantic_indexing_in_progress"]
         : ["core:structural_required"];
   const blockedReasonCode = structuralReasonCodes[0] ?? "core:analysis_in_progress";
+  // v4 (P2-7): `scripts/native-acceleration-controller.mjs` polls
+  // `core:index_status` for `structural_ready` (already true, unchanged --
+  // see `v4WorkspaceReadinessFrom`) AND `structural_durable`: `true` once
+  // `ScanCompleted` has been observed for a v4 workspace
+  // (`structural_durable_generation` set), or -- for a v3 workspace, which
+  // never sets that field at all -- simply mirrors `structural_ready` (v3
+  // has no separate queryable-vs-durable distinction: a v3 structural
+  // snapshot is only ever visible once fully durable).
+  const structuralDurable = readiness.structural_durable_generation !== undefined ? true : readiness.structural_ready;
   return {
     ...readiness,
+    structural_durable: structuralDurable,
     ...(readiness.source_snapshot_id === undefined ? {} : { source_snapshot_id: readiness.source_snapshot_id }),
     readiness: {
       source: {
@@ -1005,13 +1163,26 @@ function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown
         ...(readiness.structural_source_snapshot_id === undefined ? {} : { based_on_source_snapshot_id: readiness.structural_source_snapshot_id }),
         reason_codes: structuralReasonCodes,
         ...(readiness.retry_after_ms === undefined ? {} : { retry_after_ms: readiness.retry_after_ms }),
+        // v4 (P2-7): `Queryable`/`ScanCompleted` generations -- see
+        // `V4WorkspaceReadinessState`'s doc comment. Absent entirely for a
+        // v3 workspace (neither field is ever set on its `WorkspaceReadiness`).
+        ...(readiness.structural_queryable_generation === undefined ? {} : { queryable_generation: readiness.structural_queryable_generation }),
+        ...(readiness.structural_durable_generation === undefined ? {} : { durable_generation: readiness.structural_durable_generation }),
       },
       semantic: {
         availability: readiness.semantic_availability,
         completeness: readiness.semantic_completeness,
         build_state: readiness.semantic_build_state,
         reason_codes: semanticReasonCodes,
+        ...(readiness.semantic_completed_generation === undefined ? {} : { completed_generation: readiness.semantic_completed_generation }),
       },
+      // v4 (P2-7): lexical maintenance is wired for v4 (unlike semantic --
+      // see `runV4WorkspaceScan`'s doc comment); this sub-object only
+      // appears once a completed pass has recorded a generation (v3
+      // workspaces never set `lexical_completed_generation`, and a v4
+      // workspace with no lexical pass completed yet also omits it, rather
+      // than reporting a misleading `0`).
+      ...(readiness.lexical_completed_generation === undefined ? {} : { lexical: { completed_generation: readiness.lexical_completed_generation } }),
     },
     operation_availability: {
       available_now: available,
@@ -1027,6 +1198,111 @@ function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown
     },
     available_operations: available,
     blocked_operations: blocked,
+  };
+}
+
+/**
+ * P4-d (plan §9, user-facing status surfaces): additive `core:index_status`
+ * fields for the v4 lane model -- `storage_format`, structural
+ * queryable/durable generations plus a `queryable` convenience boolean,
+ * lexical/semantic completion plus a `current` convenience boolean, the
+ * last completed scan's kind/paths/timings/timeline, and two top-level
+ * `search_text_ready`/`search_semantic_ready` booleans so a caller does not
+ * have to re-derive "is this lane caught up" from the raw generation
+ * numbers itself. Every field here is DERIVED from state already recorded
+ * elsewhere (`WorkspaceReadiness`, `v4LastScanSummaries`,
+ * `v4ActiveScanTimelines`/`v4LastScanTimelines` via the caller-supplied
+ * `scanTimeline`, and the workspace's own `SemanticMaterializationStatusView`
+ * for `profile_id`) -- nothing here performs I/O.
+ *
+ * A v3 workspace (`readiness.storage_format === "v3"`) never populates the
+ * queryable/durable generation pair or the lexical/semantic completed
+ * generation (see `workspaceReadiness`'s v3 branch and
+ * `v4WorkspaceReadinessFrom`'s own doc comment) -- `lexical.current`/
+ * `semantic.current`/`search_text_ready`/`search_semantic_ready` fall back
+ * to the existing `structural_ready`/`semantic_ready` booleans for v3
+ * rather than comparing generation numbers that do not exist for it, and
+ * `last_scan` is omitted entirely for v3 (there is no v4-shaped
+ * `ScanCompleted` timings breakdown to report).
+ */
+function v4StatusFields(
+  readiness: WorkspaceReadiness,
+  semanticView: SemanticMaterializationStatusView | undefined,
+  lastScanSummary: V4LastScanSummary | undefined,
+  scanTimeline: V4ScanTimeline | undefined,
+): Record<string, unknown> {
+  const isV4 = readiness.storage_format === "v4";
+  const structuralDurableGeneration = readiness.structural_durable_generation;
+  const lexicalCompletedGeneration = readiness.lexical_completed_generation;
+  // "Current" means the lexical sidecar has closed out AT LEAST the
+  // generation the structural snapshot durably published -- v4's lexical
+  // maintenance (`reconcileLexicalProjection`, submitted on `ScanCompleted`)
+  // runs asynchronously after the scan itself settles, so `search_text`
+  // remains available (source-frontier gated, `queryRequiresStructural`)
+  // but reports against a stale/partial lexical index until this catches
+  // up. v3 has no equivalent tracked generation for lexical maintenance
+  // (`workspaceReadiness`'s v3 branch never reads `lexicalCompletedGeneration`
+  // at all) -- `structural_ready` is the closest existing signal.
+  const lexicalCurrent = isV4
+    ? lexicalCompletedGeneration !== undefined && structuralDurableGeneration !== undefined && lexicalCompletedGeneration >= structuralDurableGeneration
+    : readiness.structural_ready;
+  const semanticCompletedGeneration = readiness.semantic_completed_generation;
+  // Semantic maintenance is not wired for v4 yet (`runV4WorkspaceScan`'s own
+  // doc comment) -- always "not current" there, which is simply accurate.
+  const semanticCurrent = isV4 ? false : readiness.semantic_ready;
+  return {
+    storage_format: readiness.storage_format,
+    structural: {
+      ...(readiness.structural_queryable_generation === undefined ? {} : { queryable_generation: readiness.structural_queryable_generation }),
+      ...(structuralDurableGeneration === undefined ? {} : { durable_generation: structuralDurableGeneration }),
+      // v3 has no separate queryable-vs-durable phase (a v3 structural
+      // snapshot is only ever visible once fully durable, `readinessPayload`'s
+      // own `structuralDurable` comment above) -- `queryable` mirrors
+      // `structural_ready` there instead of a generation comparison.
+      queryable: isV4 ? readiness.structural_queryable_generation !== undefined : readiness.structural_ready,
+    },
+    lexical: {
+      ...(lexicalCompletedGeneration === undefined ? {} : { completed_generation: lexicalCompletedGeneration }),
+      current: lexicalCurrent,
+    },
+    semantic: {
+      ...(semanticCompletedGeneration === undefined ? {} : { completed_generation: semanticCompletedGeneration }),
+      current: semanticCurrent,
+      ...(semanticView?.embedding_profile_id === undefined ? {} : { profile_id: semanticView.embedding_profile_id }),
+    },
+    // P1-D-c (decision 28): the background residual tsgo pass, v4-only
+    // (a v3 workspace never sets any `upgrade_*` field, see
+    // `V4WorkspaceReadinessState`'s own doc comment) -- `running` is a
+    // best-effort daemon-side signal (optimistically `true` once a scan
+    // completes with the pass enabled, cleared by the next
+    // `upgrade_completed` event), and `pending_sites` is a snapshot from
+    // that event's own report, not a live query against the current store.
+    semantic_upgrade: {
+      ...(readiness.upgrade_completed_generation === undefined ? {} : { completed_generation: readiness.upgrade_completed_generation }),
+      ...(readiness.upgrade_pending_sites === undefined ? {} : { pending_sites: readiness.upgrade_pending_sites }),
+      running: readiness.upgrade_running ?? false,
+    },
+    ...(isV4 && lastScanSummary !== undefined ? {
+      last_scan: {
+        kind: lastScanSummary.kind,
+        ...(lastScanSummary.changed_paths === undefined ? {} : { changed_paths: lastScanSummary.changed_paths }),
+        timings: lastScanSummary.timings,
+        ...(scanTimeline === undefined ? {} : { timeline: relativeTimeline(scanTimeline) }),
+      },
+    } : {}),
+    // Folds the lane arithmetic above into one answer per operation family:
+    // `search_text` is source-frontier gated (always "available" once
+    // `source_ready`) but its RESULTS stay partial until the lexical sidecar
+    // catches up, and `search_semantic` mirrors `semantic_ready` exactly
+    // (v4 always false today, matching `runV4WorkspaceScan`'s own doc
+    // comment that semantic maintenance is not wired for it yet).
+    search_text_ready: readiness.source_ready && lexicalCurrent,
+    search_semantic_ready: semanticCurrent,
+    // P1-D-c: mirrors `search_text_ready`'s convenience-boolean pattern --
+    // "has at least one residual pass ever upgraded a possible call/heritage
+    // site to confirmed for this workspace" (a v3 workspace, or a v4
+    // workspace whose pass has not completed even once yet, is `false`).
+    calls_upgraded: readiness.upgrade_completed_generation !== undefined,
   };
 }
 
@@ -1112,10 +1388,24 @@ function createScanRequestBuffer(activity: WorkspaceIndexingActivity): ScanReque
  * rules `scheduleWorkspaceScan` has always applied while a scan is in
  * flight: an unsafe/lost-coverage request (`changedUris === undefined`)
  * supersedes and clears any narrower work already buffered; while an
- * authoritative-delete phase is active (buffered, in progress, or carried by
- * this very request), incoming URIs are treated as post-delete presences
- * (kept for a second, later generation) rather than folded into the same
- * scan as the deletes.
+ * authoritative-delete phase is ALREADY active -- buffered from an earlier,
+ * separate merge call, or a scan for one is already in progress -- incoming
+ * URIs are treated as post-delete presences (kept for a second, later
+ * generation) rather than folded into the same scan as those deletes.
+ *
+ * P3-2 item 4: THIS call's own `authoritativeDeletes` no longer forces THIS
+ * call's own `changedUris` into that deferred bucket (the old condition
+ * included `authoritativeDeletes.length > 0` unconditionally, which
+ * deferred a cross-path rename's create even when it arrived in the exact
+ * same `on_reconcile` invocation as its matching delete -- see `packages/
+ * engine/src/watchers.ts`'s `on_reconcile` call site, which now sends a
+ * cross-path rename as ONE combined call). A same-batch delete+create pair
+ * now folds into the SAME buffer generation (`buffer.uris` +
+ * `buffer.authoritativeDeletes`, dispatched together by `flushScanAggregation`/
+ * the post-scan `pendingScans` follow-up below); only a uri arriving in a
+ * genuinely LATER, separate call (once a delete phase is already buffered
+ * or running) still defers to a second generation, which is unavoidable --
+ * a scan already in flight cannot retroactively grow its own `paths` list.
  */
 function mergeScanRequestIntoBuffer(buffer: ScanRequestBuffer, changedUris: readonly string[] | undefined, authoritativeDeletes: readonly ScanWatcherHint[], activity: WorkspaceIndexingActivity, deletePhaseActive: boolean): void {
   if (activity === "indexing") buffer.activity = "indexing";
@@ -1124,7 +1414,7 @@ function mergeScanRequestIntoBuffer(buffer: ScanRequestBuffer, changedUris: read
     buffer.uris.clear();
     buffer.authoritativeDeletes.clear();
     buffer.presencesAfterDeletes.clear();
-  } else if (buffer.authoritativeDeletes.size > 0 || authoritativeDeletes.length > 0 || deletePhaseActive) {
+  } else if (buffer.authoritativeDeletes.size > 0 || deletePhaseActive) {
     for (const uri of changedUris) buffer.presencesAfterDeletes.add(uri);
   } else {
     for (const uri of changedUris) buffer.uris.add(uri);
@@ -1252,7 +1542,18 @@ interface CachedWorkspaceQueryEngine {
   readonly database: WorkspaceDatabase;
   readonly engine: QueryEngine;
   readonly data_port: CanonicalRecordQueryDataPort;
-  readonly snapshot_port: SqliteCanonicalQuerySnapshotPort;
+  /**
+   * v4 plan P2-5: `NativeCanonicalQuerySnapshotPort` when
+   * `workspace_meta.structural_store === "native"` AND the sibling
+   * `<db>.structural/` directory exists, else `SqliteCanonicalQuerySnapshotPort`
+   * (today's only path, still the default for every v3 workspace and any
+   * v4 workspace that has not been converted). Both classes implement
+   * `approxWarmBytes()`/`evictWarmRecords()` for the LRU loop below --
+   * the native port's are no-ops (it holds no in-process record cache to
+   * evict; the OS page cache backing its mmap reads is a different memory
+   * class this budget does not track).
+   */
+  readonly snapshot_port: SqliteCanonicalQuerySnapshotPort | NativeCanonicalQuerySnapshotPort;
   readonly operation_telemetry?: QueryOperationTelemetry;
 }
 
@@ -1318,6 +1619,10 @@ function enforceWarmRecordsBudget(cache: ReadonlyMap<string, CachedWorkspaceQuer
   }
 }
 
+// `structuralStoreDirFor` (P2-5) is now `@urdira/engine`'s `structuralStoreDirFor`
+// (`workspace-v4-bootstrap.ts`, P2-7) -- one shared definition, since
+// `ensureV4Workspace` and this module must agree on exactly the same path.
+
 async function acquireWorkspaceQueryEngine(workspaceId: string, registry: WorkspaceRegistry, storage: DurableStorage, cursorCache: CursorCache, cache: Map<string, CachedWorkspaceQueryEngine>, interner: RecordBodyInterner, lru: WarmRecordsLru, semanticProvider?: ResolvedSemanticProvider, allowSourceBinding = false): Promise<CachedWorkspaceQueryEngine> {
   const registeredWorkspace = await findQueryWorkspace(workspaceId, registry);
   const sourceWorkspace = allowSourceBinding ? registeredWorkspace : undefined;
@@ -1346,7 +1651,51 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
   // workspaces' ports -- typically a forked workspace and its donor -- share
   // one decoded `body` object instead of each port holding its own
   // byte-for-byte duplicate.
-  const snapshotPort = new SqliteCanonicalQuerySnapshotPort(database.database, storage.cas, interner);
+  // v4 plan P2-5/§9: route to the native structural store only when this
+  // workspace was actually converted/created for it (`workspace_meta.structural_store`)
+  // AND its sibling `<db>.structural/` directory is actually present --
+  // the meta flag alone is not enough (e.g. a fork/restore that copied the
+  // catalog but not yet the structural directory), so this never silently
+  // falls back to reading nonexistent structural data as if it were an
+  // empty workspace.
+  const structuralStoreDir = structuralStoreDirFor(database.database.filename);
+  const structuralStoreKind = await readStructuralStore(database.database);
+  // v4 (P2-7): `SqliteCanonicalQuerySnapshotPort`'s `search_literal`/
+  // `semantic_index_state`/`semantic_vectors` methods run unqualified SQL
+  // against `lexical_index_state`/`lexical_fts`/`lexical_documents`/
+  // `vector_projection_rows`/`semantic_index_state` -- tables the v4 catalog
+  // schema does not have at all (they live in the lexical/semantic sidecar
+  // files, per docs/evidence/2026-09-02-v4-p2-1-schema.md). Without this,
+  // `core:search_text` fails outright with "no such table:
+  // lexical_index_state" for every v4 workspace, instead of the intended
+  // "may be partial until lexical maintenance completes" contract.
+  // `ensureV4Workspace` pre-creates and schemas both sidecar files at
+  // workspace-creation time specifically so this ATTACH (on a READ-ONLY
+  // connection, which cannot create a missing file itself) always finds
+  // them already there -- `existsSync` here is a defensive check for a
+  // workspace that predates that pre-creation, not the expected path.
+  // ATTACHed table names are disjoint from the main schema's by
+  // construction (P2-1), so leaving the unqualified references in that
+  // shared port completely unchanged still resolves correctly.
+  if (structuralStoreKind === "native") {
+    for (const kind of ["lexical", "semantic"] as const) {
+      const sidecarPath = sidecarDatabasePathFor(database.database.filename, kind);
+      if (!existsSync(sidecarPath)) continue;
+      try {
+        await database.database.exec(`ATTACH DATABASE '${sidecarPath.replace(/'/g, "''")}' AS v4_${kind}`);
+      } catch (error) {
+        // Best-effort: a failed ATTACH (e.g. a transient file lock) must not
+        // break structural queries -- it only means `search_literal`/
+        // semantic reads see "no such table" until the NEXT cache miss
+        // (workspace eviction/restart) retries the attach.
+        console.error(`[urdira] failed to attach v4 ${kind} sidecar for workspace ${resolution.workspace_id}:`, error);
+      }
+    }
+  }
+  const sqliteSnapshotPort = new SqliteCanonicalQuerySnapshotPort(database.database, storage.cas, interner);
+  const snapshotPort = structuralStoreKind === "native" && existsSync(structuralStoreDir)
+    ? NativeCanonicalQuerySnapshotPort.open(database.database, structuralStoreDir, sqliteSnapshotPort, interner)
+    : sqliteSnapshotPort;
   const dataPort = new CanonicalRecordQueryDataPort(snapshotPort, semanticProvider === undefined ? undefined : { semantic: semanticProvider });
   // Query instrumentation is deliberately opt-in because canonical byte
   // accounting and event-loop histograms add measurable work. The existing
@@ -1493,6 +1842,44 @@ function pluginStatusForWorkspace(workspace: RegisteredWorkspace, catalog: reado
 }
 
 /**
+ * v4 (plan §9/P4-b-2, default flip): the v4 (Rust-owned `WorkspaceScan` +
+ * native structural store) route is now the DEFAULT for NEWLY added
+ * workspaces -- opt out with the exact string `"0"` (not merely falsy: an
+ * empty string, `"false"`, or any other value still means v4, matching this
+ * function's pre-flip convention of one exact string deciding the outcome,
+ * just inverted). `URDIRA_V4=1` continues to work (redundant with the new
+ * default, kept so nothing that already sets it explicitly needs to
+ * change). An existing workspace's database file already exists (as
+ * whichever format it was created with) by the time this runs, so
+ * `ensureV4Workspace` sees it and no-ops, leaving it untouched: there is no
+ * default-flip-triggered migration, only a routing decision for a workspace
+ * that does not have a database file yet (`docs/versioning.md`'s v4
+ * index-contract-bump note; decision 29's own "Open items" listed this flip
+ * as outstanding for P4).
+ *
+ * `URDIRA_V4=0` is documented as a one-release opt-out (`docs/versioning.md`,
+ * `docs/README.md`): a later release may remove the v3 route entirely, at
+ * which point this function -- and the flag -- go away.
+ *
+ * Called from every `registerWorkspace`/`ensureWorkspaceCatalogRegistration`
+ * call site (this function is idempotent, so calling it once per site is
+ * exactly as safe as calling it once per process) rather than gated on "is
+ * this the very first scan": a workspace's very first `registerWorkspace`
+ * call can happen from `core:workspace_add`, from `scheduleWorkspaceScan`'s
+ * own registration (a fresh workspace whose `core:workspace_add` response
+ * already returned but whose background scan had not yet registered it),
+ * or from `withWorkspaceDatabase` (an administrative RPC racing either of
+ * those) -- there is no single "the" first call site to special-case.
+ */
+function isV4Enabled(): boolean {
+  return process.env["URDIRA_V4"] !== "0";
+}
+async function maybeBootstrapV4Workspace(workspaceId: string, storage: DurableStorage): Promise<void> {
+  if (!isV4Enabled()) return;
+  await ensureV4Workspace({ storage, workspace_id: workspaceId });
+}
+
+/**
  * Makes the durable workspace registration visible before an indexing
  * operation is exposed through the in-memory registry. `core:workspace_add`
  * publishes `indexing` immediately and the readiness poll starts as soon as
@@ -1501,6 +1888,7 @@ function pluginStatusForWorkspace(workspace: RegisteredWorkspace, catalog: reado
  * window between those two events.
  */
 async function ensureWorkspaceCatalogRegistration(workspace: RegisteredWorkspace, storage: DurableStorage): Promise<void> {
+  await maybeBootstrapV4Workspace(workspace.workspace_id, storage);
   await storage.catalog.registerWorkspace({
     workspace_id: workspace.workspace_id,
     canonical_root: workspace.canonical_root,
@@ -1540,6 +1928,411 @@ function selectionHasCompatiblePlugin(technologies: readonly string[], plugins: 
     const compatible = catalog.filter((plugin) => plugin.verified && plugin.language_ids.includes(technology));
     return compatible.length === 0 || compatible.some((plugin) => plugins.includes(plugin.plugin_id));
   });
+}
+
+/**
+ * v4 (plan §9, P2-7): in-memory readiness facts for a v4 workspace, updated
+ * by `runV4WorkspaceScan` below and consulted by `workspaceReadiness`'s own
+ * v4 branch. This is a SEPARATE source of truth from v3's `workspaceReadiness`
+ * (which reads `source_index_state`/`snapshots` off the workspace database
+ * via `openWorkspaceReadOnly`) rather than an extension of it, because the
+ * v4 catalog schema has no `source_index_state` rows written by the Rust
+ * scan pipeline (it writes `snapshots`/`workspace_current_state` directly,
+ * in one transaction, with no separate "catalog phase" the way v3's
+ * multi-fragment source indexer has) -- deriving v3-shaped readiness from
+ * that would either require guessing or a second DB read per poll, neither
+ * of which this fast in-memory record needs.
+ *
+ * `queryable_generation` and `durable_generation` are set TOGETHER, from the
+ * one `RustWorkspaceScanOutcome` `runRustWorkspaceScan` resolves with: that
+ * engine-layer helper (`@urdira/engine`'s `rust-workspace-scan.ts`) only
+ * reports the intermediate `queryable` event's generation/timing AFTER the
+ * whole scan has already completed (it has no live mid-flight callback
+ * surface for a caller), and per docs/evidence/2026-09-02-v4-p2-2b-cold-pipeline.md
+ * §4.1, the current Rust pipeline's `write_base` call performs the
+ * page-cache write, fsync, AND `MANIFEST` publish synchronously in one call
+ * anyway -- there is no real wall-clock gap between "queryable" and
+ * "durable" to observe yet. The two fields stay distinct in this record's
+ * shape (and in `readinessPayload`'s `structural.queryable_generation`/
+ * `durable_generation`) so a future engine-layer change that DOES expose a
+ * live `Queryable` callback can flip `structural_ready` earlier without any
+ * further shape change here.
+ */
+interface V4WorkspaceReadinessState {
+  readonly queryable_generation?: number | undefined;
+  readonly durable_generation?: number | undefined;
+  readonly lexical_completed_generation?: number | undefined;
+  readonly semantic_completed_generation?: number | undefined;
+  // P1-D-c (decision 28): unlike every field above, these are NOT set by
+  // `runV4WorkspaceScan` itself -- the background residual tsgo pass
+  // finishes asynchronously, potentially minutes after the scan that
+  // triggered it already updated every other field here. `upgrade_running`
+  // is set optimistically (`true`) the moment a scan completes with the
+  // pass enabled (`URDIRA_V4_RESIDUAL`), and `upgrade_completed_generation`/
+  // `upgrade_pending_sites`/`upgrade_running: false` are set together by the
+  // `onUpgradeCompleted` subscription in `runV4WorkspaceScan` once the pass
+  // actually reports in -- see `handleV4UpgradeCompleted`.
+  readonly upgrade_completed_generation?: number | undefined;
+  readonly upgrade_running?: boolean | undefined;
+  /** `unresolved_sites` as of the last completed residual pass -- a
+   * point-in-time count from that pass's own report, NOT a live query
+   * against the current store (no such query is wired here); `undefined`
+   * until the first residual pass for this workspace completes in this
+   * daemon process's lifetime. */
+  readonly upgrade_pending_sites?: number | undefined;
+}
+const v4ReadinessState = new Map<string, V4WorkspaceReadinessState>();
+/**
+ * P1-D-c: per-workspace-process (decision 29) transport instances are
+ * reused across scans, so this tracks which ones this daemon process has
+ * already registered an `onUpgradeCompleted` subscription against --
+ * `runV4WorkspaceScan` calls `resolveTransport` on every scan, and without
+ * this guard a long-lived workspace would accumulate one duplicate-firing
+ * listener per scan for the rest of the process's life.
+ */
+const v4UpgradeSubscribed = new WeakSet<RustWorkspaceScanTransport>();
+
+/**
+ * Applies one `onUpgradeCompleted` event to `v4ReadinessState`, preserving
+ * every other field already recorded for `workspaceId` (a plain `.set`
+ * with a partial object -- the map's writers do not merge automatically,
+ * see the `runV4WorkspaceScan` call site's own comment on why every field
+ * must be carried forward explicitly there too). `event.request_id` is
+ * available (correlating back to the exact `workspace_scan` request that
+ * triggered this pass) but not needed for routing here: decision 29's
+ * per-workspace worker process means `transport` (and therefore this
+ * closure's captured `workspaceId`) already IS that correlation.
+ */
+function handleV4UpgradeCompleted(workspaceId: string, event: WorkspaceScanUpgradeCompleted): void {
+  const prior = v4ReadinessState.get(workspaceId);
+  v4ReadinessState.set(workspaceId, {
+    ...prior,
+    upgrade_completed_generation: event.generation,
+    upgrade_running: false,
+    upgrade_pending_sites: event.unresolved_sites,
+  });
+  notifyReadinessChanged(workspaceId);
+}
+
+/**
+ * P3-5 (plan `resilient-knitting-twilight.md` §6.1's daemon-latency item):
+ * epoch ms captured at module load (effectively "the daemon's start" -- this
+ * module loads once, early in `DaemonRuntime.start`'s own import chain, well
+ * before any workspace scan can run). Every timestamp in a `V4ScanTimeline`
+ * (below) is reported relative to this zero point via `relativeTimeline`, so
+ * `core:index_status`'s `last_scan_timeline` carries small, stable numbers
+ * instead of raw wall-clock epoch values. `core:status`'s
+ * `daemon_epoch_ms_offset` field exposes this same constant so an external
+ * harness -- which has its own epoch-ms clock for the moment it performed a
+ * mutation's filesystem write (`performance.timeOrigin + performance.now()`,
+ * the same clock family `Date.now()` is drawn from) -- can add it back to a
+ * reported relative timestamp and diff against its own write timestamp on
+ * the SAME clock, rather than being limited to poll-granularity latency.
+ */
+const DAEMON_START_EPOCH_MS = Date.now();
+
+/**
+ * `URDIRA_DEBUG_TIMING=1` gate for a one-line-per-milestone log at every
+ * point `V4ScanTimeline` (below) is populated. Off by default -- this is a
+ * diagnostic aid for attributing daemon-side edit latency (plan §6.1), not a
+ * normal daemon log line.
+ */
+function debugTiming(line: string): void {
+  if (process.env["URDIRA_DEBUG_TIMING"] === "1") console.error(`[urdira][timing] ${line} t=${Date.now() - DAEMON_START_EPOCH_MS}ms`);
+}
+
+/**
+ * P3-5: one v4 workspace scan's own wall-clock milestones (epoch ms,
+ * reported relative to `DAEMON_START_EPOCH_MS`). `core:index_status` exposes
+ * the most recently touched (in-flight, then settled) scan's timeline for a
+ * v4 workspace as `last_scan_timeline`. Every field is best-effort: a scan
+ * that did not originate from a real watcher burst (the first-ever cold
+ * scan, `core:reindex`, the periodic reconciliation sweep) has no
+ * `fs_event_at`/`aggregated_at` to report, and a scan that fails before
+ * reaching a milestone simply never sets the later fields -- reported
+ * partially rather than withheld entirely, since a partial timeline is still
+ * evidence of where time went.
+ */
+interface V4ScanTimeline {
+  fs_event_at?: number;
+  aggregated_at?: number;
+  request_sent_at?: number;
+  queryable_at?: number;
+  completed_at?: number;
+  readiness_updated_at?: number;
+}
+/**
+ * Timeline fields observed so far for a workspace's CURRENT watcher-burst
+ * buffer, before a scan has actually been admitted (`scanInFlight.add`) --
+ * populated by `scheduleWorkspaceScan`'s aggregation branch and
+ * `flushScanAggregation`, consumed (moved into `v4ActiveScanTimelines`) at
+ * admission.
+ */
+const v4PendingScanTimelines = new Map<string, V4ScanTimeline>();
+/**
+ * The timeline for the scan currently in flight for a workspace (from
+ * admission through settlement), populated by `runV4WorkspaceScan`. Moved
+ * into `v4LastScanTimelines` once the scan settles, success or failure.
+ */
+const v4ActiveScanTimelines = new Map<string, V4ScanTimeline>();
+/** The most recently settled scan's timeline, exposed via `core:index_status`'s `last_scan_timeline` (relative ms, see `relativeTimeline`). */
+const v4LastScanTimelines = new Map<string, V4ScanTimeline>();
+
+/**
+ * P4-d: the last SUCCESSFULLY completed v4 scan's scope kind, changed-path
+ * count, and `ScanCompleted` timings breakdown -- surfaced via
+ * `core:index_status`'s `last_scan` (see `v4StatusFields`). Populated only
+ * on success (`runV4WorkspaceScan`'s success path, right alongside
+ * `v4LastScanTimelines`); a failed attempt has no `ScanCompleted` timings to
+ * report and leaves whatever was recorded for the PRIOR successful scan in
+ * place, matching `v4ReadinessState`'s own "never regress on failure"
+ * convention.
+ */
+interface V4LastScanSummary {
+  readonly kind: "full" | "changed";
+  readonly changed_paths?: number;
+  readonly timings: ScanTimings;
+}
+const v4LastScanSummaries = new Map<string, V4LastScanSummary>();
+
+/** Converts a `V4ScanTimeline`'s absolute epoch-ms fields to `DAEMON_START_EPOCH_MS`-relative ms for the `core:index_status` wire shape (`last_scan_timeline`'s own doc comment above). */
+function relativeTimeline(timeline: V4ScanTimeline): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(timeline)) if (value !== undefined) out[key] = value - DAEMON_START_EPOCH_MS;
+  return out;
+}
+
+/** Rate-limits the "Changed scope rejected as uninitialized, falling back to Full" warning to once per workspace (see `runV4WorkspaceScan` below) -- P3-1 landed the real `ScanScope::Changed` path server-side; the only legitimate reason it can still reject a `Changed` request is the worker having no prior generation/state cached for this workspace (a fresh worker process, or a workspace this worker has never scanned before), which requires a `Full` scan first regardless. */
+const v4ChangedScopeUnsupportedWarned = new Set<string>();
+
+/** Builds the `ChangedPath[]` a v4 watcher-driven scan attempts (plan §9, P2-7): a delete always wins over a same-path modify/create hint arriving in the same coalesced buffer (mirrors `mergeScanRequestIntoBuffer`'s own delete-phase precedence). P3-1: `ScanScope::Changed` is now a real, implemented path server-side (`crates/urdira-indexing-worker/src/v4/delta.rs`). Every non-delete path is still mapped to `kind: "modified"` here rather than distinguishing a genuine create -- this is intentionally NOT a correctness gap: the Rust side never trusts a caller-declared `kind` for its own added/changed/deleted classification (`urdira_source_frontier::Delta::compute_partial` re-derives that from re-observing the filesystem against its own cached frontier, `crates/urdira-indexing-worker/src/v4/delta.rs`'s module doc), so a "modified" hint for a path the frontier has never seen before is classified as `added` regardless of what this function declared. Threading a real created/modified distinction through the watcher's own event stream is a documented follow-up, not required for this path's correctness today. */
+function mapV4ChangedPaths(requestedUris: readonly string[] | undefined, authoritativeDeletes: readonly ScanWatcherHint[]): ChangedPath[] {
+  const byPath = new Map<string, ChangedPath>();
+  for (const uri of requestedUris ?? []) byPath.set(uri, { path: uri, kind: "modified" });
+  for (const event of authoritativeDeletes) byPath.set(event.normalized_uri, { path: event.normalized_uri, kind: "deleted" });
+  return [...byPath.values()];
+}
+
+interface RunV4WorkspaceScanInput {
+  readonly workspace: RegisteredWorkspace;
+  readonly workspaceId: string;
+  readonly durableStorage: DurableStorage;
+  readonly requestedUris: readonly string[] | undefined;
+  readonly authoritativeDeletes: readonly ScanWatcherHint[];
+  readonly activity: WorkspaceIndexingActivity;
+  readonly registry: WorkspaceRegistry;
+  readonly resolveTransport?: ((workspace: RegisteredWorkspace) => Promise<RustWorkspaceScanTransport | undefined>) | undefined;
+  readonly submitLexicalMaintenance: (workspaceId: string) => void;
+}
+
+/**
+ * v4 (plan §9, P2-7) scan entry point, called from `scheduleWorkspaceScan`'s
+ * `run` in place of the whole v3 plugin-resolution/fork/pack/
+ * `runProgressiveWorkspaceScan` sequence, once that caller has confirmed
+ * (`readStructuralStore(database.database) === "native"`) that this
+ * workspace is v4. Deliberately throws (rather than swallowing) on every
+ * failure -- `scheduleWorkspaceScan`'s existing `catch` block already
+ * implements exactly the retry/degrade semantics a v4 failure needs
+ * (`storage:workspace_writer_busy` bounded retry, `core:source_changed`
+ * retry, terminal degrade-to-`priorSnapshotId` with a recorded
+ * `last_scan_error`) -- duplicating that here would be a second, divergent
+ * copy of the same policy.
+ */
+async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void> {
+  const { workspace, workspaceId, durableStorage, requestedUris, authoritativeDeletes, activity, registry, resolveTransport, submitLexicalMaintenance } = input;
+  // Visible to a readiness poll racing this scan's own first await, before
+  // any generation has actually landed: still v4, still "not ready yet",
+  // exactly like a v3 workspace mid its own first scan.
+  if (!v4ReadinessState.has(workspaceId)) v4ReadinessState.set(workspaceId, {});
+  const transport = await resolveTransport?.(workspace);
+  if (!transport) {
+    throw new Error(`No v4 workspace-scan transport is configured for workspace ${workspaceId} (URDIRA_V4 requires DaemonRuntimeOptions.resolve_workspace_scan_transport to be wired by the composing application).`);
+  }
+  // P1-D-c: subscribe exactly once per transport instance (decision 29's
+  // one-worker-process-per-workspace model means this transport, and
+  // therefore this closure's captured `workspaceId`, never serves a
+  // different workspace later).
+  if (!v4UpgradeSubscribed.has(transport)) {
+    v4UpgradeSubscribed.add(transport);
+    onRustWorkspaceUpgradeCompleted(transport, (event) => {
+      handleV4UpgradeCompleted(workspaceId, event);
+    });
+  }
+  const paths = await ensureV4Workspace({ storage: durableStorage, workspace_id: workspaceId });
+  // Mirrors `attemptWorkspaceFork`'s own "genuine first-ever scan" predicate
+  // (`priorSnapshotId === undefined`, i.e. `workspace.current_snapshot_id`):
+  // no v4 snapshot has ever published for this workspace yet.
+  const isFirstScan = workspace.current_snapshot_id === undefined;
+  // `requestedUris === undefined` is `mergeScanRequestIntoBuffer`'s own
+  // "unsafe/lost-coverage" signal (an explicit reindex, or a coalesced
+  // buffer that saw one) -- treated the same way v3's full scan already
+  // treats it: as requiring a full rescan, not a narrow changed-paths one.
+  let scope: ScanScope = isFirstScan || requestedUris === undefined
+    ? { kind: "full" }
+    : { kind: "changed", paths: mapV4ChangedPaths(requestedUris, authoritativeDeletes) };
+  // P3-1: the worker rejects `Changed{paths: []}` outright (`crates/urdira-
+  // indexing-worker/src/v4/delta.rs`, "requires at least one path") -- found
+  // live via `tests/v4-mutation-harness.test.ts`'s rename mutation, which
+  // can coalesce into a `requestedUris`/`authoritativeDeletes` pair that
+  // `mapV4ChangedPaths` collapses to zero paths (e.g. a create+delete of the
+  // SAME uri arriving in one buffer). Nothing to scan is a legitimate,
+  // silent no-op here -- this workspace's current snapshot is already
+  // accurate -- not a scan failure.
+  if (scope.kind === "changed" && scope.paths.length === 0) return;
+  const priority = activity === "indexing" ? "interactive" as const : "background" as const;
+  const buildRequest = (currentScope: ScanScope) => ({
+    workspace_id: workspaceId,
+    workspace_root: workspace.canonical_root,
+    database_path: paths.database_path,
+    structural_root: paths.structural_root,
+    cas_root: paths.cas_root,
+    sidecar_root: paths.sidecar_root,
+    scope: currentScope,
+    // Stable, workspace-scoped placeholder identities: v4 has no JS/TS
+    // plugin registry/configuration/lock concept the way v3's
+    // `resolve_plugin_provider` does (the Rust worker owns catalog, parse,
+    // and materialize as one pass with no external configuration surface
+    // yet) -- these three ids exist purely to satisfy the protocol's
+    // `registry_snapshots`/`FOREIGN KEY` placeholder rows
+    // (docs/evidence/2026-09-02-v4-p2-2b-cold-pipeline.md §4.3), so a fixed,
+    // per-workspace value that never changes across scans is exactly right.
+    registry_snapshot_id: `registry:${workspaceId}:v4`,
+    configuration_revision_id: `configuration:${workspaceId}:v4`,
+    resolution_lock_id: `resolution:${workspaceId}:v4`,
+    priority,
+  });
+  // P3-5 timeline (plan §6.1's daemon-latency item): `timeline` is either the
+  // draft `scheduleWorkspaceScan`'s aggregation branch built for this exact
+  // scan (moved from `v4PendingScanTimelines` into `v4ActiveScanTimelines`
+  // at admission -- `fs_event_at`/`aggregated_at` already set, for a
+  // watcher-driven scan) or a fresh empty object (a non-watcher scan: first
+  // cold scan, `core:reindex`, the reconciliation sweep -- neither of those
+  // two fields is meaningful for it).
+  const timeline = v4ActiveScanTimelines.get(workspaceId) ?? {};
+  v4ActiveScanTimelines.set(workspaceId, timeline);
+  // Snapshot to roll back to if a live `Queryable` notification below turns
+  // out to have been premature (the scan fails AFTER reporting queryable --
+  // see `onQueryableLive`'s own doc comment). Captured once, before either
+  // scan attempt, so a "Changed rejected, retry Full" cycle rolls back to
+  // the state from BEFORE this whole `runV4WorkspaceScan` call, not to an
+  // intermediate value.
+  const priorReadinessForRollback = v4ReadinessState.get(workspaceId);
+  let liveQueryableApplied = false;
+  // P3-5 item 2c: flips `v4ReadinessState.queryable_generation` (and
+  // `structural_ready`, via `v4WorkspaceReadinessFrom`'s own doc comment
+  // above) the MOMENT the worker reports `Queryable`, live during the scan
+  // -- not after the whole scan (`ScanCompleted` included) settles, which is
+  // what this used to wait for (the only place `v4ReadinessState` was ever
+  // written was after this function's own `await` below returned). If the
+  // scan goes on to fail anyway (queryable data was published but the
+  // durable/publish phase then errored -- not observed in the current Rust
+  // pipeline, where `write_base` performs both synchronously, but not
+  // impossible), the `catch` block below rolls this back to
+  // `priorReadinessForRollback` before re-throwing, so a failed scan never
+  // leaves a dangling `queryable_generation` with no corresponding durable
+  // state.
+  const onQueryableLive = (event: { readonly generation: number }): void => {
+    timeline.queryable_at = Date.now();
+    debugTiming(`workspace=${workspaceId} queryable_at generation=${event.generation}`);
+    v4ReadinessState.set(workspaceId, { ...v4ReadinessState.get(workspaceId), queryable_generation: event.generation });
+    liveQueryableApplied = true;
+    timeline.readiness_updated_at = Date.now();
+    debugTiming(`workspace=${workspaceId} readiness_updated_at (queryable)`);
+    notifyReadinessChanged(workspaceId);
+  };
+  let outcome: Awaited<ReturnType<typeof runRustWorkspaceScan>>;
+  try {
+    try {
+      timeline.request_sent_at = Date.now();
+      debugTiming(`workspace=${workspaceId} request_sent_at scope=${scope.kind}`);
+      outcome = await runRustWorkspaceScan(transport, buildRequest(scope), onQueryableLive);
+    } catch (error) {
+      // P3-1: `ScanScope::Changed` is a real, implemented path server-side
+      // now (`crates/urdira-indexing-worker/src/v4/delta.rs`) -- this is no
+      // longer a blanket "not supported yet" fallback. The ONE legitimate
+      // reason a `Changed` request can still fail this way is the worker
+      // having no prior generation for this workspace cached (a freshly
+      // restarted worker process that has never scanned this workspace, or
+      // this daemon process's own `isFirstScan`/`current_snapshot_id` state
+      // disagreeing with what the worker persisted) -- `delta::run` rejects
+      // that case explicitly with this exact message
+      // (`crates/urdira-indexing-worker/src/v4/delta.rs`), and a `Full` scan
+      // is the only correct recovery (there is nothing to diff against).
+      // Every OTHER `Changed`-scope failure (a real bug, a corrupt delta, an
+      // I/O error) is NOT caught here -- it propagates to the outer `catch`
+      // below (rollback + timeline bookkeeping), same as any other scan
+      // failure, rather than being silently masked by a full-rescan retry.
+      const isUninitializedState = scope.kind === "changed" && error instanceof Error && error.message.includes("requires a prior generation; send scope: Full");
+      if (!isUninitializedState) throw error;
+      if (!v4ChangedScopeUnsupportedWarned.has(workspaceId)) {
+        v4ChangedScopeUnsupportedWarned.add(workspaceId);
+        console.warn(`[urdira] v4 workspace scan: worker has no prior generation cached for workspace ${workspaceId} yet; falling back to Full once (this warning is logged once per workspace).`);
+      }
+      scope = { kind: "full" };
+      timeline.request_sent_at = Date.now();
+      debugTiming(`workspace=${workspaceId} request_sent_at scope=full (retry)`);
+      outcome = await runRustWorkspaceScan(transport, buildRequest(scope), onQueryableLive);
+    }
+  } catch (error) {
+    // Reached by a genuine failure from EITHER attempt above (the initial
+    // `Changed`/`Full` call, or the "no prior generation" retry) -- one
+    // rollback path for both, so a failure during the retry cannot skip
+    // the same bookkeeping a first-attempt failure gets.
+    if (liveQueryableApplied) v4ReadinessState.set(workspaceId, priorReadinessForRollback ?? {});
+    v4ActiveScanTimelines.delete(workspaceId);
+    v4LastScanTimelines.set(workspaceId, timeline);
+    throw error;
+  }
+  timeline.completed_at = Date.now();
+  debugTiming(`workspace=${workspaceId} completed_at generation=${outcome.generation}`);
+  // P4-d: `scope` here is whichever request actually succeeded -- either
+  // the original request, or the `Full` retry after a `Changed` rejection
+  // (both reassignments above keep `scope` pointing at the attempt that
+  // produced `outcome`).
+  v4LastScanSummaries.set(workspaceId, scope.kind === "changed"
+    ? { kind: "changed", changed_paths: scope.paths.length, timings: outcome.timings }
+    : { kind: "full", timings: outcome.timings });
+  const priorReadiness = v4ReadinessState.get(workspaceId);
+  // P1-D-c: the residual pass is gated behind the SAME env var
+  // `indexing-core-process-transport.ts` forwards to the worker child
+  // process (`URDIRA_V4_RESIDUAL`) -- read here too so `upgrade_running`
+  // does not optimistically latch `true` forever when the pass is not even
+  // enabled (no `upgrade_completed` event would ever arrive to clear it).
+  // `upgrade_completed_generation`/`upgrade_pending_sites` are carried
+  // forward explicitly (this `.set` replaces the whole record, same
+  // convention `lexical_completed_generation`/`semantic_completed_generation`
+  // already follow above) -- a residual pass's own reported completion must
+  // survive the NEXT structural scan, not be wiped by it.
+  const residualEnabled = process.env["URDIRA_V4_RESIDUAL"] !== undefined && process.env["URDIRA_V4_RESIDUAL"] !== "0";
+  v4ReadinessState.set(workspaceId, {
+    queryable_generation: outcome.queryable?.generation ?? outcome.generation,
+    durable_generation: outcome.generation,
+    lexical_completed_generation: priorReadiness?.lexical_completed_generation,
+    semantic_completed_generation: priorReadiness?.semantic_completed_generation,
+    upgrade_completed_generation: priorReadiness?.upgrade_completed_generation,
+    upgrade_pending_sites: priorReadiness?.upgrade_pending_sites,
+    upgrade_running: residualEnabled ? true : priorReadiness?.upgrade_running,
+  });
+  timeline.readiness_updated_at = Date.now();
+  debugTiming(`workspace=${workspaceId} readiness_updated_at (durable)`);
+  registry.markReady(workspaceId, outcome.snapshot_id, "ready");
+  v4ActiveScanTimelines.delete(workspaceId);
+  v4LastScanTimelines.set(workspaceId, timeline);
+  // Semantic maintenance (`reconcileSemanticProjection`) is deliberately NOT
+  // submitted for a v4 workspace here: its entity-grain lane (decision 17,
+  // `@urdira/engine`'s `semantic-reconciler.ts`) reads `record_occurrences`/
+  // `record_value_nodes` -- structural v3 tables that do not exist at all in
+  // the v4 catalog schema (structural data lives entirely in the native
+  // segment store, not SQL, per docs/evidence/2026-09-02-v4-p2-1-schema.md).
+  // Running it against a v4 sidecar+ATTACHed-catalog connection (the way
+  // lexical maintenance below is wired) would fail outright on that lane's
+  // very first query. A structural-store-aware semantic reconciler is real
+  // future work (tracked in docs/evidence/2026-09-02-v4-p2-7-daemon-wiring.md),
+  // not something this task's scope can safely paper over. Lexical
+  // maintenance has no such dependency (it only ever touches catalog +
+  // lexical-sidecar tables), so it is wired for real -- see
+  // `submitLexicalMaintenance`'s v4 branch.
+  submitLexicalMaintenance(workspaceId);
 }
 
 function hasPotentialWorkspaceForkDonor(workspace: RegisteredWorkspace, registry: WorkspaceRegistry): boolean {
@@ -1601,6 +2394,52 @@ export class DaemonRuntime {
       indexingStorage = options.workspace_registry && options.resolve_plugin_provider
         ? await createDurableStorage({ rootDir: options.data_root, ...(options.cas_put_concurrency === undefined ? {} : { cas_put_concurrency: options.cas_put_concurrency }), ...(options.busy_timeout_ms === undefined ? {} : { busyTimeoutMs: options.busy_timeout_ms }) })
         : undefined;
+      // v4 (P4-b-prep, plan §9): `createDurableStorage` above no longer
+      // throws when its startup recovery sweep finds a catalogued workspace
+      // at an outdated/unsupported index contract (a v3 database from
+      // before a since-applied migration, or a stale pre-cutover leftover);
+      // it records each one on `indexingStorage.outdatedWorkspaces` instead
+      // of opening it (see `OutdatedWorkspaceRecord`'s doc comment in
+      // `@urdira/storage`). Reflect every such workspace into the
+      // `WorkspaceRegistry` here, BEFORE the crash-recovery loop and the
+      // "ready"/"degraded" warm-up filter below ever read `.list()`:
+      // `recordScanFailure` stamps the error code (visible on
+      // `core:index_status` as `last_scan_error_code`) without touching
+      // `status`, then `beginReconciliation` (unless already `"indexing"`,
+      // or `"suspended"` -- a suspended workspace's own `resume()` contract
+      // is untouched here) flips `status` to `"indexing"`. That is the
+      // exact state the UNCHANGED crash-recovery loop below already scans
+      // for, so the workspace's `openWorkspace`/`registerWorkspace` call
+      // inside `scheduleWorkspaceScan` throws the identical outdated-format
+      // error again, and the P4-a `isOutdatedWorkspaceError` catch branch
+      // there runs `recreateOutdatedWorkspaceDatabase` and reschedules a
+      // fresh Full scan -- the same recovery an already-running daemon
+      // applies when it discovers this mid-scan, now also reachable from a
+      // cold start. A workspace already removed/removing by the time this
+      // runs (a narrow race with a concurrent `core:workspace_remove`) is
+      // left alone: its database is going away regardless.
+      if (indexingStorage && options.workspace_registry) {
+        const registry = options.workspace_registry;
+        for (const outdated of indexingStorage.outdatedWorkspaces) {
+          const workspace = registry.get(outdated.workspace_id);
+          if (!workspace || workspace.status === "removed" || workspace.status === "removing") continue;
+          registry.recordScanFailure(outdated.workspace_id, outdated.error_code);
+          if (workspace.status !== "indexing" && workspace.status !== "suspended") registry.beginReconciliation(outdated.workspace_id);
+        }
+      }
+      // v4 (P4-b-2, default flip): one diagnostic line per daemon start,
+      // naming how many catalogued workspaces this installation already has
+      // in each format -- an operator's first signal of how far along a
+      // fleet is from v4 without a separate admin query. Counts come from
+      // `recoverMigrations`'s own per-workspace format detection (no extra
+      // file opens); an installation with no `indexingStorage` (no
+      // `workspace_registry`/`resolve_plugin_provider` configured -- see the
+      // comment on `indexingStorage`'s assignment above) never scans a
+      // workspace at all, so there is nothing to count.
+      if (indexingStorage) {
+        const counts = indexingStorage.workspaceFormatCounts;
+        console.error(`[urdira] startup: ${counts.v3} v3 workspace(s), ${counts.v4} v4 workspace(s) registered under ${options.data_root} (new workspaces default to v4; set URDIRA_V4=0 to opt out)`);
+      }
       // `core:query`/`core:query_continue` reuse `indexingStorage` to open
       // (and cache, per `acquireWorkspaceQueryEngine` above) the target
       // workspace's `WorkspaceDatabase`, so they are gated on the same
@@ -1905,6 +2744,12 @@ export class DaemonRuntime {
       // usage below and its success-path resets).
       const workspaceWriterBusyRetries = new Map<string, number>();
       const WORKSPACE_WRITER_BUSY_MAX_RETRIES = 8;
+      // Parallel bounded-retry counter for a plugin resolving to nothing on
+      // a workspace that explicitly selected one -- see its use at
+      // `scheduleWorkspaceScan`'s `resolvePluginProvider` call, below.
+      // Cleared as soon as any later scan resolves the plugin again.
+      const pluginResolutionMissingRetries = new Map<string, number>();
+      const PLUGIN_RESOLUTION_MISSING_MAX_RETRIES = 8;
       // Scan-priority sidecar (docs/evidence/2026-09-02-edit-latency.md's
       // "primera edicion" residual): a real edit-triggered scan and detached
       // Rust lexical maintenance (`reconcile_lexical`'s `yield_mutation_lease`
@@ -1966,6 +2811,30 @@ export class DaemonRuntime {
       const scanAggregationStartedAt = new Map<string, number>();
       const scanAggregationWindowMs = Math.max(0, options.scan_aggregation_window_ms ?? 200);
       const scanAggregationMaxMs = Math.max(scanAggregationWindowMs, options.scan_aggregation_max_ms ?? 1_000);
+      /**
+       * P3-5 (plan §6.1's daemon-latency item): a v4 workspace's own
+       * single-pass Rust `WorkspaceScan` has a sub-second worker-compute
+       * floor (worker-only ~0.7-0.9s steady-state, see
+       * docs/evidence/2026-09-03-v4-p3-2-incremental-residuals.md §8.1) --
+       * v3's 200ms/1000ms debounce defaults were tuned for the JS/TS
+       * plugin's own multi-fragment source indexer and are a
+       * disproportionately large fraction of a v4 edit's total observed
+       * latency. When the composing application did not explicitly
+       * override `scan_aggregation_window_ms`/`scan_aggregation_max_ms`,
+       * a v4 workspace (`v4ReadinessState.has(workspaceId)`, set the
+       * instant `runV4WorkspaceScan` starts running for that workspace's
+       * first-ever scan, well before any watcher could fire a real edit
+       * event against it) uses a tighter 100ms/500ms pair instead. An
+       * EXPLICIT option always wins, for every workspace, v3 or v4 alike --
+       * this only changes an unset default, it adds no new knob.
+       */
+      const scanAggregationWindowMsFor = (workspaceId: string): number =>
+        options.scan_aggregation_window_ms !== undefined ? scanAggregationWindowMs : v4ReadinessState.has(workspaceId) ? 100 : scanAggregationWindowMs;
+      const scanAggregationMaxMsFor = (workspaceId: string): number => {
+        if (options.scan_aggregation_max_ms !== undefined) return scanAggregationMaxMs;
+        const window = scanAggregationWindowMsFor(workspaceId);
+        return v4ReadinessState.has(workspaceId) ? Math.max(window, 500) : scanAggregationMaxMs;
+      };
       // `aggregatable` is `true` ONLY at the one call site that represents a
       // real filesystem watcher event (`WorkspaceWatcherManagerOptions.on_reconcile`
       // below). Every other call site -- `core:workspace_add`'s first scan,
@@ -2003,7 +2872,8 @@ export class DaemonRuntime {
           // after this scan settles.
           return;
         }
-        if (aggregatable && activity === "indexing" && scanAggregationWindowMs > 0) {
+        const effectiveAggregationWindowMs = scanAggregationWindowMsFor(workspaceId);
+        if (aggregatable && activity === "indexing" && effectiveAggregationWindowMs > 0) {
           // No scan is in flight yet: this is the FIRST (or a subsequent,
           // still-within-window) event of a potential burst. Buffer it and
           // (re)start the debounce timer instead of starting a scan
@@ -2015,7 +2885,14 @@ export class DaemonRuntime {
           const isFirstEventOfBurst = !scanAggregationBuffers.has(workspaceId);
           scanAggregationBuffers.set(workspaceId, buffer);
           mergeScanRequestIntoBuffer(buffer, changedUris, authoritativeDeletes, activity, activeAuthoritativeDeletePhases.has(workspaceId));
-          if (isFirstEventOfBurst) scanAggregationStartedAt.set(workspaceId, now);
+          if (isFirstEventOfBurst) {
+            scanAggregationStartedAt.set(workspaceId, now);
+            // P3-5 timeline: the burst's first watcher event, the true
+            // `fs_event_at` for whatever scan this burst eventually becomes
+            // (consumed at admission, `scanInFlight.add` below).
+            v4PendingScanTimelines.set(workspaceId, { fs_event_at: now });
+            debugTiming(`workspace=${workspaceId} fs_event_at`);
+          }
           const startedAt = scanAggregationStartedAt.get(workspaceId) ?? now;
           const existingTimer = scanAggregationTimers.get(workspaceId);
           if (existingTimer !== undefined) clearTimeout(existingTimer);
@@ -2023,14 +2900,30 @@ export class DaemonRuntime {
           // measured from the burst's first event -- a continuous stream of
           // edits, each landing just inside the rolling window, must still
           // flush eventually instead of postponing the scan forever.
-          const delayMs = Math.min(scanAggregationWindowMs, Math.max(0, scanAggregationMaxMs - (now - startedAt)));
+          const delayMs = Math.min(effectiveAggregationWindowMs, Math.max(0, scanAggregationMaxMsFor(workspaceId) - (now - startedAt)));
           const timer = setTimeout(() => flushScanAggregation(workspaceId), delayMs);
           timer.unref?.();
           scanAggregationTimers.set(workspaceId, timer);
           return;
         }
+        // P3-5 timeline: a watcher-driven scan that skipped the aggregation
+        // branch above entirely (`scan_aggregation_window_ms` resolved to 0
+        // for this workspace) still gets a timeline -- `fs_event_at` and
+        // `aggregated_at` collapse to the same instant, correctly reflecting
+        // that no debounce delay was applied.
+        if (aggregatable && !v4PendingScanTimelines.has(workspaceId)) {
+          const now = Date.now();
+          v4PendingScanTimelines.set(workspaceId, { fs_event_at: now, aggregated_at: now });
+        }
         scanInFlight.add(workspaceId);
         notifyReadinessChanged(workspaceId);
+        {
+          const pendingTimeline = v4PendingScanTimelines.get(workspaceId);
+          if (pendingTimeline !== undefined) {
+            v4PendingScanTimelines.delete(workspaceId);
+            v4ActiveScanTimelines.set(workspaceId, pendingTimeline);
+          }
+        }
         const scanController = new AbortController();
         const scanGeneration = (scanGenerations.get(workspaceId) ?? 0) + 1;
         scanGenerations.set(workspaceId, scanGeneration);
@@ -2064,6 +2957,7 @@ export class DaemonRuntime {
                 const priorSnapshotId = workspace.current_snapshot_id;
                 let database: WorkspaceDatabase | undefined;
                 try {
+                  await maybeBootstrapV4Workspace(workspace.workspace_id, durableStorage);
                   await durableStorage.catalog.registerWorkspace({
                     workspace_id: workspace.workspace_id,
                     canonical_root: workspace.canonical_root,
@@ -2078,8 +2972,70 @@ export class DaemonRuntime {
                   // edit needs to pre-empt maintenance, not a passive
                   // freshness sweep.
                   if (activity === "indexing") markScanPending(database.database.filename);
+                  // v4 (plan §9, P2-7): a workspace whose database was
+                  // bootstrapped v4 (by `maybeBootstrapV4Workspace` just
+                  // above, on ITS first-ever scan, or by an earlier scan on
+                  // every scan since) is routed entirely differently from
+                  // here on -- no language-plugin resolution, no workspace
+                  // fork/index-pack compatibility copiers, no
+                  // `runProgressiveWorkspaceScan`: the Rust composition
+                  // worker owns catalog+parse+materialize+publish as one
+                  // `WorkspaceScan` command (`runRustWorkspaceScan`,
+                  // `@urdira/engine`). `runV4WorkspaceScan` either returns
+                  // normally (having already called `registry.markReady`
+                  // and submitted lexical maintenance) or throws, in which
+                  // case the SAME `catch` block below this `try` handles it
+                  // exactly like any v3 scan failure (writer-busy retry,
+                  // `core:source_changed` retry, terminal degrade) --
+                  // deliberately reusing that machinery rather than
+                  // duplicating it.
+                  if ((await readStructuralStore(database.database)) === "native") {
+                    await runV4WorkspaceScan({
+                      workspace,
+                      workspaceId,
+                      durableStorage,
+                      requestedUris,
+                      authoritativeDeletes,
+                      activity,
+                      registry,
+                      resolveTransport: options.resolve_workspace_scan_transport,
+                      submitLexicalMaintenance,
+                    });
+                    workspaceWriterBusyRetries.delete(workspaceId);
+                    notifyReadinessChanged(workspaceId);
+                    return undefined;
+                  }
                   const plugin = await resolvePluginProvider(workspace, database);
+                  if (plugin) pluginResolutionMissingRetries.delete(workspaceId);
                 if (!plugin) {
+                    // A workspace with an explicit plugin selection does not
+                    // change that selection between scans (`register`'s own
+                    // idempotent early return and `updateSelection` are the
+                    // only writers of `selected_plugin_ids`, and neither runs
+                    // as part of an ordinary scan -- `packages/engine/src/workspaces.ts`).
+                    // A plugin that resolved for an earlier scan of this same
+                    // workspace resolving to nothing here is therefore not a
+                    // legitimate "no language plugin configured" state; it is
+                    // a transient resolution failure (for example a composition
+                    // worker session that could not be recreated under memory
+                    // pressure right after a large cold publish). Treat it the
+                    // same way as `storage:workspace_writer_busy`: a bounded,
+                    // delayed retry, never a silent, permanent degrade to the
+                    // generic source-only path below -- which has its own
+                    // untested-at-this-scale byte-budget ceiling (see
+                    // docs/evidence/2026-09-02-v4-p0-s4-promotion-gap.md).
+                    if ((workspace.selected_plugin_ids ?? []).length > 0) {
+                      const attempts = (pluginResolutionMissingRetries.get(workspaceId) ?? 0) + 1;
+                      if (attempts <= PLUGIN_RESOLUTION_MISSING_MAX_RETRIES) {
+                        pluginResolutionMissingRetries.set(workspaceId, attempts);
+                        const delayMs = Math.min(2_000, 1_000 + attempts * 250);
+                        console.warn(`[urdira] workspace scan deferred for ${workspaceId}: plugin resolution returned no provider for a workspace with an explicit plugin selection (attempt ${attempts}/${PLUGIN_RESOLUTION_MISSING_MAX_RETRIES}); retrying in ${delayMs}ms`);
+                        setTimeout(() => scheduleWorkspaceScan(workspaceId, requestedUris, authoritativeDeletes, "indexing"), delayMs);
+                        return undefined;
+                      }
+                      pluginResolutionMissingRetries.delete(workspaceId);
+                      console.error(`[urdira] workspace scan giving up on plugin resolution for ${workspaceId} after ${attempts} attempts; falling back to a generic source-only scan`);
+                    }
                     // Generic source discovery is useful without a language
                     // plugin. Leave the registry in indexing state (there is
                     // intentionally no structural snapshot to mark ready),
@@ -2236,6 +3192,63 @@ export class DaemonRuntime {
                     console.error(`[urdira] workspace scan superseded for ${workspaceId}`);
                     return undefined;
                   }
+                  // v4 destructive-cutover recovery (plan §9, P4-a): the
+                  // database this workspace's `openWorkspace` call above just
+                  // tried to open is at an outdated index contract -- a v3
+                  // database opened by v4 code, a v4 database opened by v3
+                  // code, or a pre-v3/pre-v4 layout neither runtime accepts
+                  // (`core:index_contract_unsupported`/
+                  // `storage:workspace_format_outdated`, `packages/storage/src/schema.ts`
+                  // and `storage.ts`'s `ensureIdentityFormat(V4)`). There is
+                  // no in-place migration for this: `recreateOutdatedWorkspaceDatabase`
+                  // moves every file/directory that belongs to this one
+                  // workspace's on-disk footprint aside into a sibling
+                  // `*.v3.stale-<timestamp>/` directory (never deletes --
+                  // see that module's own doc comment), which clears the
+                  // path for a brand-new database. `maybeBootstrapV4Workspace`
+                  // then re-bootstraps that clear path in the CURRENT format
+                  // (v4 unless `URDIRA_V4=0`, per `isV4Enabled`'s doc comment
+                  // -- the same bootstrap step every first-ever scan already performs at
+                  // the top of this `run`), and the `pendingScans` full-scan
+                  // entry below reuses the exact same post-scan coalescer
+                  // `core:source_changed` uses just below to schedule a
+                  // fresh Full scan once this attempt settles.
+                  if (isOutdatedWorkspaceError(error)) {
+                    // `defaultWorkspaceDatabasePath`, not a `catalog.getWorkspace`
+                    // lookup: the throw above can come from EITHER
+                    // `durableStorage.catalog.registerWorkspace` (this
+                    // workspace's very first touch this process life, when
+                    // the on-disk file already exists at an outdated format
+                    // -- `registerWorkspaceSerialized` validates schema
+                    // compatibility before it ever inserts the catalog row,
+                    // so `getWorkspace` would still return `undefined` here)
+                    // or `durableStorage.openWorkspace` (every later scan of
+                    // an already-catalogued workspace) -- both resolve the
+                    // SAME default path for a fresh workspace id, and this
+                    // runtime never registers one under a non-default path.
+                    const outdatedDatabasePath = durableStorage.defaultWorkspaceDatabasePath(workspaceId);
+                    try {
+                      const recreated = await recreateOutdatedWorkspaceDatabase({
+                        rootDir: options.data_root,
+                        workspaceId,
+                        databasePath: outdatedDatabasePath,
+                        reason: error instanceof Error ? error.message : String(error),
+                        logger: (line) => console.error(line),
+                      });
+                      await maybeBootstrapV4Workspace(workspaceId, durableStorage);
+                      console.error(`[urdira] workspace scan for ${workspaceId} recovered from an outdated-format database (moved ${recreated.movedPaths.length} file(s)/directory(ies) to ${recreated.staleDirectory}); scheduling a fresh Full scan`);
+                      pendingScans.set(workspaceId, {
+                        full: true,
+                        uris: new Set(),
+                        authoritativeDeletes: new Map(),
+                        presencesAfterDeletes: new Set(),
+                        activity: "indexing",
+                      });
+                      return undefined;
+                    } catch (recreateError) {
+                      console.error(`[urdira] workspace scan failed to recreate the outdated-format database for ${workspaceId}; falling back to the generic failure handling below:`, recreateError);
+                    }
+                  }
                   const failureCode = scanFailureErrorCode(error);
                   // A watcher can legitimately deliver an edit while the
                   // source provider is streaming the same file. The provider
@@ -2338,9 +3351,16 @@ export class DaemonRuntime {
                   if (pending.full) {
                     scheduleWorkspaceScan(workspaceId, undefined, [], pending.activity);
                   } else if (pending.authoritativeDeletes.size > 0) {
-                    // Preserve a second generation for rename/recreate
-                    // batches even when both callbacks arrived while the
-                    // first scan was still running.
+                    // Preserve a second generation for same-path recreate
+                    // batches (`pending.presencesAfterDeletes`) even when
+                    // both callbacks arrived while the first scan was still
+                    // running. `pending.uris` (P3-2 item 4: a cross-path
+                    // rename's create, merged into the SAME buffer
+                    // generation as its matching delete by `mergeScanRequest
+                    // IntoBuffer`) is dispatched TOGETHER with the deletes
+                    // just below instead of being discarded -- this used to
+                    // hardcode `[]` here too, the same bug as `flushScan
+                    // Aggregation`'s sibling branch.
                     if (pending.presencesAfterDeletes.size > 0) {
                       pendingScans.set(workspaceId, {
                         full: false,
@@ -2350,7 +3370,7 @@ export class DaemonRuntime {
                         activity: pending.activity,
                       });
                     }
-                    scheduleWorkspaceScan(workspaceId, [], [...pending.authoritativeDeletes.values()], pending.activity);
+                    scheduleWorkspaceScan(workspaceId, [...pending.uris], [...pending.authoritativeDeletes.values()], pending.activity);
                   } else {
                     scheduleWorkspaceScan(workspaceId, [...pending.uris], [], pending.activity);
                   }
@@ -2366,6 +3386,15 @@ export class DaemonRuntime {
           notifyReadinessChanged(workspaceId);
           activeAuthoritativeDeletePhases.delete(workspaceId);
           scanActivities.delete(workspaceId);
+          // Scheduler admission never actually started this scan -- restore
+          // whatever timeline was already recorded (`fs_event_at`/
+          // `aggregated_at`) so the eventual retry's own `runV4WorkspaceScan`
+          // still reports them, instead of a silent gap.
+          const abandonedTimeline = v4ActiveScanTimelines.get(workspaceId);
+          if (abandonedTimeline !== undefined) {
+            v4ActiveScanTimelines.delete(workspaceId);
+            v4PendingScanTimelines.set(workspaceId, abandonedTimeline);
+          }
         }
       };
       // Fires when a burst's aggregation window elapses (or is force-flushed
@@ -2389,18 +3418,72 @@ export class DaemonRuntime {
         const buffer = scanAggregationBuffers.get(workspaceId);
         scanAggregationBuffers.delete(workspaceId);
         if (buffer === undefined) return;
+        // P3-5 timeline: the burst is settling into one (or two, for a
+        // rename's delete+create pair) actual scan(s) right now.
+        const pendingTimeline = v4PendingScanTimelines.get(workspaceId);
+        if (pendingTimeline !== undefined) {
+          pendingTimeline.aggregated_at = Date.now();
+          debugTiming(`workspace=${workspaceId} aggregated_at`);
+        }
         if (buffer.full) {
           scheduleWorkspaceScan(workspaceId, undefined, [], buffer.activity);
         } else if (buffer.authoritativeDeletes.size > 0) {
-          // Preserve a second generation for rename/recreate batches, same
-          // rationale as the post-scan `pendingScans` follow-up below: the
-          // tombstone generation for the deletes publishes first, and any
-          // post-delete presences buffered alongside them are queued as a
-          // normal follow-up request (by now `scanInFlight` already holds
-          // this workspace, so this second call coalesces into `pendingScans`
-          // instead of starting a second immediate scan).
-          scheduleWorkspaceScan(workspaceId, [], [...buffer.authoritativeDeletes.values()], buffer.activity);
-          if (buffer.presencesAfterDeletes.size > 0) scheduleWorkspaceScan(workspaceId, [...buffer.presencesAfterDeletes], [], buffer.activity);
+          // Preserve a second generation for same-path recreate batches
+          // (`buffer.presencesAfterDeletes`), same rationale as the
+          // post-scan `pendingScans` follow-up below: the tombstone
+          // generation for the deletes publishes first, and any post-delete
+          // presences buffered alongside them are queued as the follow-up
+          // scan's own buffer. `buffer.uris`, in contrast, is dispatched
+          // TOGETHER with the deletes in the SAME call just below (P3-2
+          // item 4): a cross-path rename's create already lives in
+          // `buffer.uris`, not `presencesAfterDeletes`, per `mergeScan
+          // RequestIntoBuffer`'s fix above -- this used to hardcode `[]`
+          // here, silently discarding `buffer.uris` and re-deferring even a
+          // same-generation create to a separate follow-up scan.
+          //
+          // P3-2 item 4 fix (found live: a rename's Created half was being
+          // silently dropped, causing the real daemon path to hang
+          // indefinitely on a rename mutation): this USED TO call
+          // `scheduleWorkspaceScan(workspaceId, [...presencesAfterDeletes],
+          // [], activity)` directly, the same way the post-scan `finally`
+          // block below calls it for `pending.uris`. That looked
+          // symmetrical but was NOT: `scheduleWorkspaceScan` for the
+          // deletes just above runs its `scanInFlight.add`/
+          // `activeAuthoritativeDeletePhases.set` SYNCHRONOUSLY (no `await`
+          // before either), so by the time control reached the
+          // `presencesAfterDeletes` call on the very next line,
+          // `scanInFlight` was already true for this workspace AND
+          // `activeAuthoritativeDeletePhases` was already set from the
+          // delete scan THIS SAME FLUSH just started. That call therefore
+          // fell into the `pendingScans` merge branch with
+          // `deletePhaseActive: true`, which routes its own uris into
+          // `presencesAfterDeletes` AGAIN instead of `uris` -- and the
+          // post-scan `finally` block's branch selection only ever reads
+          // `pending.uris` when `pending.authoritativeDeletes` is empty
+          // (see its own `else` branch below), never
+          // `pending.presencesAfterDeletes` in that case. The created
+          // path's presence silently vanished into a buffer field nothing
+          // downstream reads. Fixed by seeding `pendingScans` directly here
+          // (exactly like the post-scan `finally` block's own
+          // `presencesAfterDeletes` handling a few dozen lines below
+          // already does correctly) instead of routing through
+          // `scheduleWorkspaceScan`/`mergeScanRequestIntoBuffer` a second
+          // time -- `scanInFlight` is guaranteed false for this workspace
+          // at this point (the aggregation-buffer branch that produced
+          // `buffer` only runs while nothing is in flight), so the delete
+          // scan started just below is guaranteed to be the very next scan
+          // to observe this pre-seeded `pendingScans` entry in its own
+          // `finally` block once it completes.
+          if (buffer.presencesAfterDeletes.size > 0) {
+            pendingScans.set(workspaceId, {
+              full: false,
+              uris: new Set(buffer.presencesAfterDeletes),
+              authoritativeDeletes: new Map(),
+              presencesAfterDeletes: new Set(),
+              activity: buffer.activity,
+            });
+          }
+          scheduleWorkspaceScan(workspaceId, [...buffer.uris], [...buffer.authoritativeDeletes.values()], buffer.activity);
         } else {
           scheduleWorkspaceScan(workspaceId, [...buffer.uris], [], buffer.activity);
         }
@@ -2448,6 +3531,61 @@ export class DaemonRuntime {
             run: async () => {
               let database: WorkspaceDatabase | undefined;
               try {
+                // v4 (plan §9, P2-7): checked FIRST, ahead of the threaded
+                // path below -- `runLexicalReconcileInThread`'s worker
+                // thread (`lexical-worker-thread.ts`) calls
+                // `reconcileLexicalProjection` against the MAIN workspace
+                // database exactly like the non-threaded branch below it
+                // does, and neither of those knows about v4's sidecar
+                // split. `v4ReadinessState` (set by `runV4WorkspaceScan`,
+                // above, the moment a v4 workspace's first scan starts) is
+                // this function's cheap, synchronous way to tell without a
+                // DB read. Deliberately runs in-process, not threaded, for
+                // now (documented as a follow-up in this task's evidence
+                // doc) -- v4 lexical maintenance is new work, not a
+                // regression against any existing threaded contract.
+                if (v4ReadinessState.has(workspaceId)) {
+                  database = await durableStorage.openWorkspace(workspaceId);
+                  const sidecarSql = await database.openSidecar("lexical");
+                  // See this task's evidence doc, "maintenance on sidecars":
+                  // `reconcileLexicalProjection`'s own SQL joins
+                  // `lexical_documents` (sidecar-only) against
+                  // `artifact_versions`/`workspace_current_state`
+                  // (catalog-only) with UNQUALIFIED table names in the same
+                  // query. Rather than editing that shared, v3-serving
+                  // reconciler to qualify every reference, ATTACH the v4
+                  // catalog file onto the sidecar connection: SQLite
+                  // resolves an unqualified table name by searching `main`
+                  // (here, the sidecar's own schema) then every attached
+                  // database in attachment order, and the two schemas'
+                  // table names are disjoint by construction (P2-1), so
+                  // every reference in that shared SQL resolves correctly
+                  // with zero changes to it.
+                  const escapedCatalogPath = database.database.filename.replace(/'/g, "''");
+                  await sidecarSql.exec(`ATTACH DATABASE '${escapedCatalogPath}' AS v4_catalog`);
+                  // A duck-typed `WorkspaceDatabase`: `reconcileLexicalProjection`
+                  // only ever reads `input.database.database` (the SQL
+                  // connection, here the ATTACHed sidecar) and
+                  // `input.database.projections.{putLexicalDocument,markLexicalComplete,lexicalCompletedGeneration}`.
+                  // `WorkspaceDatabase` is a class with private fields, so it
+                  // cannot be satisfied structurally by a plain object --
+                  // this cast is the documented alternative to constructing
+                  // a second REAL `WorkspaceDatabase` around the same
+                  // already-`openSidecar`-owned connection, which would risk
+                  // double-closing it (that connection's lifetime is owned
+                  // by `database`, closed in this job's own `finally` below).
+                  const sidecarHandle = {
+                    database: sidecarSql,
+                    projections: new WorkspaceProjectionRepository(sidecarSql, durableStorage.blobs, workspaceId),
+                  } as unknown as WorkspaceDatabase;
+                  const result = await reconcileLexicalProjection({ database: sidecarHandle, workspace_id: workspaceId, content: durableStorage.cas });
+                  const priorReadiness = v4ReadinessState.get(workspaceId);
+                  v4ReadinessState.set(workspaceId, {
+                    ...priorReadiness,
+                    lexical_completed_generation: result.marker_written ? result.generation : priorReadiness?.lexical_completed_generation,
+                  });
+                  return undefined;
+                }
                 // See `DaemonRuntimeOptions.lexical_thread`'s doc comment:
                 // default ON, a kill switch. The threaded path never opens
                 // `database` on this thread at all -- `runLexicalReconcileInThread`
@@ -2551,6 +3689,16 @@ export class DaemonRuntime {
         if (provider === undefined) return;
         const durableStorage = indexingStorage;
         if (!durableStorage) return;
+        // v4 (plan §9, P2-7): semantic maintenance is not wired for v4
+        // workspaces at all -- see `runV4WorkspaceScan`'s own doc comment
+        // for why (the entity-grain lane reads structural v3-only tables
+        // that do not exist in the v4 catalog schema). Guarded here, not
+        // only by never calling this from `runV4WorkspaceScan`, so every
+        // OTHER call site (startup prewarm, the coalesced-pending retry,
+        // the periodic sweep) also no-ops instead of repeatedly failing
+        // (caught, logged, harmless, but pure noise) against a v4
+        // workspace's database.
+        if (v4ReadinessState.has(workspaceId)) return;
         if (semanticMaintenanceInFlight.has(workspaceId)) { semanticMaintenancePending.add(workspaceId); return; }
         semanticMaintenanceInFlight.add(workspaceId);
         try {
@@ -2679,7 +3827,16 @@ export class DaemonRuntime {
         },
       }) : undefined;
       server = new LocalIpcServer({ endpoint: paths.endpoint, ...(options.max_frame_bytes === undefined ? {} : { max_frame_bytes: options.max_frame_bytes }), handler: async (request, context) => {
-        if (request.call === "core:status") return { state: "ready", pid: process.pid, engine_build_id: options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: rpcCapabilities, endpoint: paths.endpoint, active_jobs: scheduler.activeCount, restart_leases: scheduler.restartLeaseCount } satisfies DaemonStatus;
+        // `daemon_epoch_ms_offset` (P3-5, plan §6.1's daemon-latency item):
+        // the epoch ms this module loaded at (`DAEMON_START_EPOCH_MS`), the
+        // zero point every v4 workspace's `last_scan_timeline` (below) is
+        // relative to. An external harness with its own epoch-ms clock for
+        // when it performed a mutation's filesystem write can add this back
+        // to a reported relative timestamp to compute a true latency on the
+        // SAME clock, rather than being limited to poll-granularity timing.
+        // Additive: not part of `DaemonStatus`'s declared shape, so this is
+        // a widening cast, not a type change.
+        if (request.call === "core:status") return { state: "ready", pid: process.pid, engine_build_id: options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: rpcCapabilities, endpoint: paths.endpoint, active_jobs: scheduler.activeCount, restart_leases: scheduler.restartLeaseCount, daemon_epoch_ms_offset: DAEMON_START_EPOCH_MS } satisfies DaemonStatus;
         if (request.call === "core:index_status" && options.workspace_status) return options.workspace_status(request, context);
         if (request.call === "core:index_status" && options.workspace_registry) {
           const payload = request.payload !== null && typeof request.payload === "object" ? request.payload as { readonly api_version?: unknown; readonly workspace_ids?: unknown; readonly workspace_root?: unknown } : {};
@@ -2690,7 +3847,17 @@ export class DaemonRuntime {
             const readiness = await workspaceReadiness(workspace, indexingStorage, semanticMaterializations, scanInFlight.has(workspace.workspace_id));
             const pluginStatus = pluginStatusForWorkspace(workspace, pluginCatalog, readiness);
             const administrative = workspaceAdministrativeView(options.workspace_registry!, workspace);
-            return { workspace_id: workspace.workspace_id, codebase_id: workspace.codebase_id, project_name: administrative["project_name"], workspace_label: administrative["workspace_label"], workspace_kind: administrative["workspace_kind"], display_root: basename(workspace.display_root), ...(administrative["vcs_state"] === undefined ? {} : { vcs_state: administrative["vcs_state"] }), workspace_status: workspace.status, startup_phase: workspace.status === "registering" ? "reconciling_sources" : readiness.source_ready && !readiness.structural_ready ? "publishing_structural" : "ready", ...(workspace.current_snapshot_id === undefined ? {} : { current_snapshot_id: workspace.current_snapshot_id }), freshness_status: workspaceFreshnessStatus(workspace), ...(workspace.last_scan_error === undefined ? {} : { last_scan_error_code: workspace.last_scan_error }), ...(workspace.last_scan_error_at === undefined ? {} : { last_scan_error_at: workspace.last_scan_error_at }), plugins: pluginStatus.plugins, capabilities: pluginStatus.capabilities, structural_progress: pluginStatus.structural_progress, semantic_materializations: semanticMaterializations.get(workspace.workspace_id) === undefined ? [] : [semanticMaterializations.get(workspace.workspace_id)!], configuration_issues: [], ...readinessPayload(readiness) };
+            // `last_scan_timeline` (P3-5, plan §6.1's daemon-latency item):
+            // only ever present for a v4 workspace (`v4ReadinessState.has`
+            // is v4's own bootstrap marker, see `runV4WorkspaceScan`'s first
+            // line) -- the currently in-flight scan's timeline if one is
+            // running, else the most recently settled one. Absent (not an
+            // empty object) for a v3 workspace or a v4 workspace that has
+            // never had a watcher-driven/timed scan yet.
+            const v4Timeline = v4ReadinessState.has(workspace.workspace_id)
+              ? (v4ActiveScanTimelines.get(workspace.workspace_id) ?? v4LastScanTimelines.get(workspace.workspace_id))
+              : undefined;
+            return { workspace_id: workspace.workspace_id, codebase_id: workspace.codebase_id, project_name: administrative["project_name"], workspace_label: administrative["workspace_label"], workspace_kind: administrative["workspace_kind"], display_root: basename(workspace.display_root), ...(administrative["vcs_state"] === undefined ? {} : { vcs_state: administrative["vcs_state"] }), workspace_status: workspace.status, startup_phase: workspace.status === "registering" ? "reconciling_sources" : readiness.source_ready && !readiness.structural_ready ? "publishing_structural" : "ready", ...(workspace.current_snapshot_id === undefined ? {} : { current_snapshot_id: workspace.current_snapshot_id }), freshness_status: workspaceFreshnessStatus(workspace), ...(workspace.last_scan_error === undefined ? {} : { last_scan_error_code: workspace.last_scan_error }), ...(workspace.last_scan_error_at === undefined ? {} : { last_scan_error_at: workspace.last_scan_error_at }), plugins: pluginStatus.plugins, capabilities: pluginStatus.capabilities, structural_progress: pluginStatus.structural_progress, semantic_materializations: semanticMaterializations.get(workspace.workspace_id) === undefined ? [] : [semanticMaterializations.get(workspace.workspace_id)!], configuration_issues: [], ...readinessPayload(readiness), ...(v4Timeline === undefined ? {} : { last_scan_timeline: relativeTimeline(v4Timeline) }), ...v4StatusFields(readiness, semanticMaterializations.get(workspace.workspace_id), v4LastScanSummaries.get(workspace.workspace_id), v4Timeline) };
           };
           if (apiVersion === 3 && workspaceIds.length === 0 && payload.workspace_root === undefined) return { workspaces: await Promise.all(options.workspace_registry.list().map(buildStatusView)) };
           const resolution = resolveIndexStatusRequest(options.workspace_registry, { api_version: apiVersion, workspace_ids: workspaceIds, ...(typeof payload.workspace_root === "string" ? { workspace_root: payload.workspace_root } : {}) });
@@ -3246,7 +4413,7 @@ export class DaemonRuntime {
       return runtime;
     } catch (error) { await server?.close().catch(() => undefined); await indexingStorage?.close().catch(() => undefined); if (process.platform !== "win32") await unlink(paths.endpoint).catch(() => undefined); await lock.release(); throw error; }
   }
-  status(): DaemonStatus { return { state: this.state, pid: process.pid, engine_build_id: this.options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: daemonRpcCapabilities(this.options.workspace_registry !== undefined), endpoint: this.endpoint, active_jobs: this.scheduler.activeCount, restart_leases: this.scheduler.restartLeaseCount }; }
+  status(): DaemonStatus { return { state: this.state, pid: process.pid, engine_build_id: this.options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: daemonRpcCapabilities(this.options.workspace_registry !== undefined), endpoint: this.endpoint, active_jobs: this.scheduler.activeCount, restart_leases: this.scheduler.restartLeaseCount, daemon_epoch_ms_offset: DAEMON_START_EPOCH_MS }; }
   byteTelemetrySnapshot(): Readonly<Record<string, unknown>> {
     return this.indexingStorage?.byteTelemetry.snapshot() ?? {};
   }

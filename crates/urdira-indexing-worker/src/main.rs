@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+// v4 cold-scan pipeline (task P2-2b, plan `resilient-knitting-twilight.md`
+// §4/§6.1). All new code lives under `src/v4/`; this file is touched only
+// for this declaration and the `IndexingCommand::WorkspaceScan` dispatch
+// arm below, so a concurrent effort touching this file's existing v3 facts
+// lane in a separate worktree can still merge cleanly.
+mod v4;
+
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use serde_json::Value;
@@ -20,9 +27,10 @@ use urdira_indexing_core::{
 };
 use urdira_jsts_indexing_engine::JavascriptTypescriptEngine;
 use urdira_jsts_syntax_worker::{
-    AnalysisBudgets, ConfigAssetInput, FactsCursor, FactsGroupEntry, HybridResolutionContext,
-    OwnerSemantics, ProposedRecord, SiteKind, SourceInput, SyntaxFileResult, SyntaxWorkerState,
-    WorkerMessage, WorkspaceResolver, analyze_owner_semantics_with_context, decode_config_assets,
+    AnalysisBudgets, ConfigAssetInput, ExportResolution, FactsCursor, FactsGroupEntry,
+    HybridResolutionContext, OwnerSemantics, ProposedRecord, SiteKind, SourceInput,
+    SyntaxFileResult, SyntaxWorkerState, WorkerMessage, WorkspaceResolver,
+    analyze_owner_semantics_with_context, decode_config_assets, resolve_named_export,
 };
 use urdira_worker_protocol::{
     AuthoritativeChangeSet, FrameDecoder, FrameOptions, INDEXING_CORE_PROTOCOL_IDENTITY,
@@ -789,6 +797,225 @@ fn hybrid_semantics_enabled_from(value: Option<&str>) -> bool {
     value != Some("0")
 }
 
+// --- P0-S2 prototype: the "typeflow" resolver (urdira v4 plan; see
+// docs/evidence/2026-09-02-v4-p0-s2-typeflow-prototype.md). Gated behind
+// `URDIRA_JSTS_TYPEFLOW=1`, default OFF, independent of `URDIRA_JSTS_HYBRID`
+// but meaningless without it (typeflow only ever widens E1-E3's own
+// `pending_sites`, so it is a no-op whenever the hybrid lane itself is off).
+
+/// Gate for the typeflow resolver. Exact value `"1"` only -- matches every
+/// other flag in this file's convention (`hybrid_semantics_enabled_from`'s
+/// doc comment).
+fn typeflow_enabled() -> bool {
+    std::env::var("URDIRA_JSTS_TYPEFLOW").ok().as_deref() == Some("1")
+}
+
+/// `URDIRA_JSTS_TYPEFLOW_ORACLE=1`: run typeflow's resolution WITHOUT
+/// removing the site from `pending_sites`, so the checker still
+/// independently resolves it and this generation's per-owner merge can
+/// compare the two answers (see `census_typeflow_owner`). Meaningless
+/// (never read) when `typeflow_enabled()` is false.
+fn typeflow_oracle_enabled() -> bool {
+    std::env::var("URDIRA_JSTS_TYPEFLOW_ORACLE").ok().as_deref() == Some("1")
+}
+
+/// Destination file for the oracle census JSON (`URDIRA_JSTS_TYPEFLOW_ORACLE_OUT`).
+/// `None` (oracle mode still runs, recording hits, but the census is never
+/// written) when unset -- never a silent requirement.
+fn typeflow_oracle_output_path() -> Option<PathBuf> {
+    std::env::var_os("URDIRA_JSTS_TYPEFLOW_ORACLE_OUT").map(PathBuf::from)
+}
+
+/// Build the corpus-wide class/interface member index (P0-S2 prototype)
+/// from every CURRENT project file's source text -- not just this
+/// generation's `affected_paths`, since a member lookup on an unaffected
+/// file's class is exactly as valid a typeflow target as an affected one.
+/// Deliberately NOT incremental (a known prototype limitation, see the
+/// evidence doc): every file is re-parsed here on every generation this
+/// flag is on, independent of `urdira-jsts-syntax-worker`'s own lane-1
+/// incremental cache. A file whose blob cannot be read/verified, or whose
+/// syntax this prototype's extractor rejects, contributes nothing to the
+/// index -- exactly as safe as it being absent, never a guess.
+fn build_typeflow_program_index(
+    input_files: &[SourceInput],
+    resolver: &WorkspaceResolver,
+    available: &BTreeSet<String>,
+    files: &BTreeMap<String, SyntaxFileResult>,
+) -> urdira_jsts_typeflow::ProgramIndex {
+    let mut summaries: BTreeMap<String, urdira_jsts_typeflow::DeclSummary> = BTreeMap::new();
+    for owner in input_files {
+        let Ok(text) = read_owner_source_text(owner) else {
+            continue;
+        };
+        if let Ok(summary) = urdira_jsts_typeflow::extract_decl_summary(&owner.path, &text) {
+            summaries.insert(owner.path.clone(), summary);
+        }
+    }
+    let mut import_targets: HashMap<(String, String, String), String> = HashMap::new();
+    // P1-A: every distinct (owning_path, specifier, imported_name) triple
+    // this generation's typeflow rules could ever need to close -- widened
+    // from P0-S2's heritage-clauses-only collection (`class.extends`/
+    // `implements`/`interface.extends`) to ALSO cover every class/interface
+    // MEMBER's own declared type (a property annotation, or a method's
+    // declared return type) and every top-level FUNCTION's declared return
+    // type, both of which very commonly name an IMPORTED interface/class
+    // (`generate(): Promise<GenerateResult>` where `GenerateResult` is
+    // imported from a sibling `types/` module) -- found live: without this,
+    // `resolve_raw_type_ref` silently failed to close almost every
+    // cross-file member/return type, since `import_targets` had no entry
+    // for a specifier/name pair no HERITAGE clause happened to also need.
+    let mut needed_imports: std::collections::HashSet<(&str, &str, &str)> =
+        std::collections::HashSet::new();
+    for summary in summaries.values() {
+        for class in &summary.classes {
+            if let Some(target) = &class.extends {
+                collect_heritage_import(&summary.path, target, &mut needed_imports);
+            }
+            for target in &class.implements {
+                collect_heritage_import(&summary.path, target, &mut needed_imports);
+            }
+            for member in &class.members {
+                collect_type_ref_import(&summary.path, &member.type_ref, &mut needed_imports);
+                collect_pending_return_import(
+                    &summary.path,
+                    &member.pending_return,
+                    &mut needed_imports,
+                );
+            }
+        }
+        for interface in &summary.interfaces {
+            for target in &interface.extends {
+                collect_heritage_import(&summary.path, target, &mut needed_imports);
+            }
+            for member in &interface.members {
+                collect_type_ref_import(&summary.path, &member.type_ref, &mut needed_imports);
+            }
+        }
+        for function in &summary.functions {
+            collect_type_ref_import(&summary.path, &function.return_type, &mut needed_imports);
+            collect_pending_return_import(
+                &summary.path,
+                &function.pending_return,
+                &mut needed_imports,
+            );
+        }
+        for shape in &summary.object_shapes {
+            for member in &shape.members {
+                collect_type_ref_import(&summary.path, &member.type_ref, &mut needed_imports);
+                collect_pending_return_import(
+                    &summary.path,
+                    &member.pending_return,
+                    &mut needed_imports,
+                );
+            }
+        }
+        for variable in &summary.variables {
+            collect_type_ref_import(&summary.path, &variable.type_ref, &mut needed_imports);
+        }
+    }
+    for (owning_path, specifier, imported_name) in needed_imports {
+        let key = (
+            owning_path.to_owned(),
+            specifier.to_owned(),
+            imported_name.to_owned(),
+        );
+        let Some(target_path) = resolver.resolve(owning_path, specifier, available) else {
+            continue;
+        };
+        if let ExportResolution::Resolved(target_id) =
+            resolve_named_export(files, &target_path, imported_name)
+        {
+            import_targets.insert(key, target_id);
+        }
+    }
+    urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets)
+}
+
+/// Push `(owning_path, specifier, imported_name)` into `out` when `target`
+/// is a NAMED import (a default/namespace import has no `imported_name` to
+/// close against, see `HeritageTarget::Imported`'s doc comment) -- shared by
+/// every heritage-clause collection site in `build_typeflow_program_index`.
+fn collect_heritage_import<'s>(
+    owning_path: &'s str,
+    target: &'s urdira_jsts_typeflow::HeritageTarget,
+    out: &mut std::collections::HashSet<(&'s str, &'s str, &'s str)>,
+) {
+    match target {
+        urdira_jsts_typeflow::HeritageTarget::Imported {
+            specifier,
+            imported_name: Some(imported_name),
+        } => {
+            out.insert((owning_path, specifier.as_str(), imported_name.as_str()));
+        }
+        // P1-A: `<base>.<member>(...)` heritage -- `base`'s own import
+        // need (e.g. `Z` in `Z.class({...})`) is exactly the same shape,
+        // one level down.
+        urdira_jsts_typeflow::HeritageTarget::CallMember { base, .. } => {
+            collect_heritage_import(owning_path, base, out);
+        }
+        _ => {}
+    }
+}
+
+/// P1-A: the same collection as `collect_heritage_import`, but for a
+/// member/function's own `RawTypeRef` -- recurses through `ArrayOf`/
+/// `PromiseOf` wrappers to reach the leaf reference (`Promise<Foo[]>`'s
+/// import need is `Foo`'s, exactly like `Foo[]`'s or a bare `Foo`'s).
+fn collect_type_ref_import<'s>(
+    owning_path: &'s str,
+    type_ref: &'s urdira_jsts_typeflow::RawTypeRef,
+    out: &mut std::collections::HashSet<(&'s str, &'s str, &'s str)>,
+) {
+    use urdira_jsts_typeflow::RawTypeRef;
+    match type_ref {
+        RawTypeRef::Imported {
+            specifier,
+            imported_name: Some(imported_name),
+        } => {
+            out.insert((owning_path, specifier.as_str(), imported_name.as_str()));
+        }
+        RawTypeRef::ArrayOf(inner) | RawTypeRef::PromiseOf(inner) => {
+            collect_type_ref_import(owning_path, inner, out);
+        }
+        _ => {}
+    }
+}
+
+/// P1-B: the SAME import-need collection as `collect_type_ref_import`, for
+/// a `pending_return` list's own `CallEntity(ReturnEntityRef::Imported)`
+/// shapes -- see `ProgramIndex::build`'s third-pass doc comment for why
+/// this must run BEFORE `import_targets` is built (the fixed point closes
+/// every `CallEntity` against it exactly once, up front).
+fn collect_pending_return_import<'s>(
+    owning_path: &'s str,
+    pending_return: &'s Option<Vec<urdira_jsts_typeflow::DeferredReturnShape>>,
+    out: &mut std::collections::HashSet<(&'s str, &'s str, &'s str)>,
+) {
+    use urdira_jsts_typeflow::{DeferredReturnShape, ReturnEntityRef};
+    fn walk<'s>(
+        owning_path: &'s str,
+        shape: &'s DeferredReturnShape,
+        out: &mut std::collections::HashSet<(&'s str, &'s str, &'s str)>,
+    ) {
+        match shape {
+            DeferredReturnShape::CallEntity(ReturnEntityRef::Imported {
+                specifier,
+                imported_name: Some(imported_name),
+            }) => {
+                out.insert((owning_path, specifier.as_str(), imported_name.as_str()));
+            }
+            DeferredReturnShape::AwaitOf(inner) => walk(owning_path, inner, out),
+            _ => {}
+        }
+    }
+    let Some(shapes) = pending_return else {
+        return;
+    };
+    for shape in shapes {
+        walk(owning_path, shape, out);
+    }
+}
+
 /// Pure parsing rule behind `hybrid_strict_merge` (E1c cutover invariant --
 /// see the call site in `run_jsts_semantic_generation`), split out for the
 /// same reason as `hybrid_semantics_enabled_from`. An explicit
@@ -1018,19 +1245,36 @@ fn compute_hybrid_semantics(
 /// has nothing left for the checker to resolve. E1a's policy marks every
 /// `TypedDecl` site `checker_pending` (`type_inference_required`)
 /// unconditionally, so `pending_sites` is never actually empty yet and this
-/// never fires in production. It is implemented and unit-tested here,
-/// against a synthetic `OwnerSemantics`, so E1c can wire the actual skip
-/// (omitting the owner from the checker's request group) directly once that
-/// policy changes, without re-deriving the predicate. It is deliberately
-/// **not** wired into the live per-owner request loop yet: that loop keys
+/// never fires from that policy alone.
+///
+/// P1-B (`checker_lane_disabled`, the caller's own `typeflow_enabled()`):
+/// unconditionally `true` regardless of `semantics`/`requires_stage_three`
+/// -- the checker-off pipeline mode skips the semantic lane for EVERY owner
+/// in the generation, uniformly (see the `typeflow_enabled()` gate at this
+/// generation's own `semantic_descriptor` construction, a few hundred lines
+/// above -- THAT gate, not this function, is what actually guarantees the
+/// checker subprocess is never spawned; this predicate does not depend on
+/// it). A per-owner SELECTIVE skip (this function's original, narrower
+/// `pending_sites.is_empty()` condition, still the `false`-branch behavior)
+/// is still not wired into any live per-owner request loop: that loop keys
 /// checker-response reassembly off a fixed 32-owner-per-group stride
 /// (`group_index * 32 + owner_index`, see `process_owner`'s callers below),
 /// and skipping a request without a matching hole in the returned owner
-/// list would desynchronize every later group -- a real hazard that only
-/// needs solving once this predicate can actually return `true`.
+/// list would desynchronize every later group -- a real hazard only the
+/// UNIFORM (every owner, or no owner) skip avoids, since the checker is
+/// either invoked for the whole generation or not invoked at all, never for
+/// a hole-riddled subset. This function itself therefore remains unwired
+/// into any live call site (still only exercised by its own unit tests
+/// below) -- an explicit `bool` parameter, not a direct `typeflow_enabled()`
+/// read, purely so those tests can exercise both branches deterministically
+/// without mutating shared process environment state.
 #[allow(dead_code)]
-fn hybrid_owner_can_skip_checker(semantics: &OwnerSemantics, requires_stage_three: bool) -> bool {
-    semantics.pending_sites.is_empty() && !requires_stage_three
+fn hybrid_owner_can_skip_checker(
+    semantics: &OwnerSemantics,
+    requires_stage_three: bool,
+    checker_lane_disabled: bool,
+) -> bool {
+    checker_lane_disabled || (semantics.pending_sites.is_empty() && !requires_stage_three)
 }
 
 /// Identity fields needed to merge or (in the empty-observations corner
@@ -1039,6 +1283,398 @@ struct HybridOwnerIdentity {
     path: String,
     artifact_id: String,
     artifact_version_id: String,
+}
+
+/// P0-S2 prototype (typeflow oracle census): one miss sample, kept for
+/// `docs/evidence/2026-09-02-v4-p0-s2-typeflow-prototype.md`'s report.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct TypeflowCensusSample {
+    path: String,
+    start: u32,
+    end: u32,
+    reason: String,
+    checker_target: Option<String>,
+    rust_target: Option<String>,
+}
+
+/// P0-S2 prototype (typeflow oracle census) counts for one edge kind
+/// (`core:call` or `core:inherits`) -- see `census_typeflow_owner`'s doc
+/// comment for exactly how each bucket is decided. Typeflow in this
+/// prototype only ever emits a CONFIRMED oracle hit (never a "possible"
+/// union edge, see `urdira_jsts_typeflow::MemberLookup`'s doc comment), so
+/// there is no `both_possible`/`rust_possible` bucket to report: a rust miss
+/// is always "still pending", never "possible".
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+struct TypeflowEdgeCensus {
+    /// Every `pending_sites` entry in this edge kind's own scope (the exact
+    /// reason typeflow widens -- `call_deferred_to_e3`/
+    /// `heritage_deferred_to_e3`), regardless of whether typeflow itself
+    /// attempted or resolved it. The denominator for a recovery rate is
+    /// `both_confirmed_same_target / (both_confirmed_same_target +
+    /// both_confirmed_different_target + checker_confirmed_rust_pending)`
+    /// -- the "checker-confirmed workspace-target sites" the task's
+    /// acceptance bar asks for.
+    attempted_sites: usize,
+    both_confirmed_same_target: usize,
+    both_confirmed_different_target: usize,
+    /// Checker confirmed a WORKSPACE-declared target (never under
+    /// `node_modules/`, e.g. TypeScript's own `lib.*.d.ts` ambient
+    /// declarations) that typeflow left pending -- this IS the
+    /// denominator's third term for the task's own "checker-confirmed
+    /// workspace-target sites" recovery rate.
+    checker_confirmed_rust_pending: usize,
+    /// Checker confirmed a target OUTSIDE the workspace (TypeScript's
+    /// standard library ambient declarations: `Array.prototype.filter`,
+    /// `console.log`, `Map`/`Set`/`JSON`/`Object`/`RegExp` methods, ...).
+    /// This crate's `ProgramIndex` only ever indexes workspace source
+    /// files' own class/interface declarations (see its module doc), so
+    /// typeflow can NEVER resolve one of these by construction -- tracked
+    /// separately, and deliberately EXCLUDED from the recovery-rate
+    /// denominator, rather than folded into `checker_confirmed_rust_
+    /// pending` and silently deflating the rate against a target class this
+    /// prototype was never scoped to reach.
+    checker_confirmed_external_target: usize,
+    checker_possible_or_missing_rust_confirmed: usize,
+    both_pending_or_possible: usize,
+    // `default` is required alongside `skip_serializing_if`: the latter
+    // only omits the key when EMPTY on write, but the derived
+    // `Deserialize` impl still demands every field be present unless it
+    // also has a default -- without this, `write_typeflow_census`'s own
+    // read-back of a file it just wrote (whenever a sample vec was empty)
+    // fails to parse, `.ok()` swallows the error, and the next generation's
+    // read-merge-write silently discards everything accumulated so far.
+    // Found live: a rich 48k-site cold census vanished on the very next
+    // (2-owner) mutation generation because of exactly this.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    different_target_samples: Vec<TypeflowCensusSample>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    checker_confirmed_rust_pending_samples: Vec<TypeflowCensusSample>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+struct TypeflowCensus {
+    calls: TypeflowEdgeCensus,
+    heritage: TypeflowEdgeCensus,
+    /// Diagnostic (P0-S2 debugging, 2026-09-02): how many owners actually
+    /// reached `census_typeflow_owner` at all (i.e. had a non-empty
+    /// `hybrid_semantics` entry). If this stays far below the corpus size,
+    /// the gap is upstream of typeflow entirely (hybrid lane not running
+    /// for most owners), not a typeflow rule-coverage problem.
+    owners_censused: usize,
+    /// Diagnostic: every `SiteKind::Call`/`SiteKind::Heritage` pending
+    /// site's own `reason` string, tallied regardless of whether it matches
+    /// typeflow's own scope. Lets a report distinguish "typeflow's rules
+    /// under-cover the corpus" (many sites, wrong reasons) from "the corpus
+    /// barely reaches the checker_pending stage at all" (few sites, period).
+    call_and_heritage_reason_counts: std::collections::BTreeMap<String, usize>,
+    /// Diagnostic: how many typeflow oracle hits (resolved sites) came from
+    /// each originating rule (`this`, `super`, `member_declared_type`,
+    /// `member_new_expression`, `member_class_static`, `heritage_generic`,
+    /// and P1-A's chain rules -- `call_return_type`, `call_chain_this_
+    /// return`, `member_declared_type_chain`, `array_element`, `await`,
+    /// `as_expression`, `type_assertion`, `non_null`, `parenthesized`).
+    resolved_by_rule: std::collections::BTreeMap<String, usize>,
+    /// P1-A step 1 (classifier): for every `calls.checker_confirmed_rust_
+    /// pending` site, the receiver-expression SHAPE tally (`SemanticWalker::
+    /// classify_receiver_shape`'s taxonomy) -- drives which rule to
+    /// implement next, ranked by frequency. Keyed by shape name.
+    receiver_shape_counts: std::collections::BTreeMap<String, usize>,
+    /// Up to 5 samples per shape (kept small -- this is for picking
+    /// representative snippets to read, not a full corpus dump; the
+    /// unfiltered miss list is `calls.checker_confirmed_rust_pending_
+    /// samples`, capped at `TYPEFLOW_CENSUS_SAMPLE_CAP`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
+    receiver_shape_samples: std::collections::BTreeMap<String, Vec<TypeflowCensusSample>>,
+    /// P1-A step 5: for every `calls.checker_confirmed_external_target`
+    /// site, the checker's target entity id's own `.d.ts` FILE basename
+    /// (`lib.es5.d.ts`, `lib.es2015.promise.d.ts`, `lib.dom.d.ts`, a
+    /// `@types/node` path, ...) -- a coarse but cheap proxy for "which
+    /// built-in surface (Array/Promise/Map/String vs. DOM vs. Node) is
+    /// actually being missed", so P1-B can decide whether a tiny built-in
+    /// member table is worth adding. See `external_target_basename`.
+    external_target_basename_counts: std::collections::BTreeMap<String, usize>,
+    /// P1-C: a SEPARATE census, same shape as `calls`, scoped to `reason ==
+    /// "call_target_uncertain"` sites (a plain IDENTIFIER callee E1-E3
+    /// tried and could not confirm -- structurally disjoint from `calls`,
+    /// which is scoped to `call_deferred_to_e3`, a callee E1-E3 never even
+    /// attempted: member/`this`/`super`/any non-identifier expression).
+    /// Found live, and large -- `call_and_heritage_reason_counts` shows
+    /// 27,683 such sites on this corpus, more than half again as many as
+    /// `calls.attempted_sites` itself -- once `destructured_member_
+    /// entities` (P1-C, `semantic_sites.rs`) started resolving a BARE call
+    /// to a destructured-method identifier (`await dropColumns(...)`, the
+    /// migration DSL's own dominant pattern), that resolution shows up
+    /// here, never in `calls` (whose own denominator this session
+    /// deliberately did NOT redefine, to keep P1-A/P1-B's own recovery
+    /// number comparable across sessions). Kept as its own independent
+    /// recovery rate rather than folded into `calls`' total.
+    #[serde(default)]
+    identifier_calls: TypeflowEdgeCensus,
+}
+
+const TYPEFLOW_CENSUS_SAMPLE_CAP: usize = 1000;
+/// Small, separate cap for `receiver_shape_samples` (see its own doc
+/// comment) -- kept far below `TYPEFLOW_CENSUS_SAMPLE_CAP` so raising the
+/// main miss-sample cap to 1000 does not also balloon the per-shape sample
+/// listing to the same size.
+const TYPEFLOW_SHAPE_SAMPLE_CAP: usize = 5;
+/// Must match `urdira_jsts_syntax_worker::semantic_sites`'s own
+/// `REASON_CALL_DEFERRED`/`REASON_HERITAGE_DEFERRED` constants byte for
+/// byte -- not exported (private to that crate's implementation), so
+/// duplicated here as plain string literals rather than widening that
+/// crate's public surface for a prototype-only consumer.
+const TYPEFLOW_REASON_CALL_DEFERRED: &str = "call_deferred_to_e3";
+const TYPEFLOW_REASON_HERITAGE_DEFERRED: &str = "heritage_deferred_to_e3";
+/// P1-C: must match `urdira_jsts_syntax_worker::semantic_sites`'s own
+/// `REASON_CALL_TARGET_UNCERTAIN` byte for byte -- see `TypeflowCensus::
+/// identifier_calls`'s doc comment for why this is measured separately
+/// from `TYPEFLOW_REASON_CALL_DEFERRED`.
+const TYPEFLOW_REASON_CALL_TARGET_UNCERTAIN: &str = "call_target_uncertain";
+
+/// P0-S2 prototype (typeflow oracle census, `URDIRA_JSTS_TYPEFLOW_ORACLE=1`
+/// only): for every `pending_sites` entry in typeflow's own scope (a
+/// member-access/`this`/`super` call, or a class's own generic `extends`),
+/// cross-reference the checker's OWN canonical `core:call`/`core:inherits`
+/// row at that exact span (read from `observations` BEFORE the hybrid merge
+/// appends anything -- these are the checker's independent answer, since
+/// oracle mode never removes the site from `pending_sites`, see
+/// `HybridResolutionContext::typeflow_oracle`'s doc comment) against
+/// typeflow's own guess (`semantics.typeflow_oracle_hits`, keyed by the
+/// same span). A site typeflow itself never attempted (an unsupported
+/// shape, e.g. a 2-hop member chain) or attempted and missed both show up
+/// identically here as "no oracle hit" -- this prototype does not
+/// distinguish "did not try" from "tried and failed", since both mean the
+/// exact same thing to a caller deciding whether this rule set is ready to
+/// take over the site.
+/// Whether an E0 entity id (`jsts:{kind}:{path}:{start}:{name}`) names a
+/// declaration inside THIS workspace, as opposed to TypeScript's own
+/// standard library (`lib.*.d.ts`, always reached through a `node_modules/`
+/// path segment in this pnpm-managed corpus). Used only to keep the oracle
+/// census's recovery-rate denominator scoped to what this prototype was
+/// ever meant to reach -- see `TypeflowEdgeCensus::checker_confirmed_
+/// external_target`'s doc comment.
+fn is_workspace_target(target_id: &str) -> bool {
+    !target_id.contains("/node_modules/")
+}
+
+/// P1-A step 5: a coarse bucket name for a `checker_confirmed_external_
+/// target` entity id's own declaring FILE -- see `TypeflowCensus::
+/// external_target_basename_counts`'s doc comment. `target_id`'s embedded
+/// path (`jsts:{kind}:{path}:{start}:{name}`) is a `.d.ts` file under
+/// `node_modules/` by construction (only reached via `is_workspace_target`
+/// returning false); every `@types/<pkg>` package (starting with `@types/
+/// node`, the only one this corpus's sampled misses hit) is folded into one
+/// `@types/<pkg>/<basename>` bucket so its many small files (`fs.d.ts`,
+/// `buffer.d.ts`, ...) still group under a recognizable package name, while
+/// TypeScript's OWN standard library files (`lib.es5.d.ts`, `lib.dom.d.ts`,
+/// `lib.es2015.promise.d.ts`, ...) already self-describe by basename alone.
+fn external_target_basename(target_id: &str) -> String {
+    let path = target_id.split(':').nth(2).unwrap_or("");
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    if let Some(at_types) = path.rfind("/node_modules/@types/") {
+        let rest = &path[at_types + "/node_modules/@types/".len()..];
+        let package = rest.split('/').next().unwrap_or(rest);
+        return format!("@types/{package}/{basename}");
+    }
+    // pnpm's own store layout for a scoped package (`@types/node@20.x`)
+    // nests it under `.pnpm/@types+node@<version>/node_modules/@types/node/`
+    // -- already covered by the `/node_modules/@types/` check above since
+    // that literal substring still appears once in the resolved path
+    // (pnpm's `node_modules/@types/<pkg>` symlink target). Anything else is
+    // TypeScript's own `lib.*.d.ts` (or another ambient global) -- basename
+    // alone is already the useful bucket.
+    basename.to_owned()
+}
+
+fn census_typeflow_owner(
+    observations: &[urdira_indexing_core::CanonicalOwnerObservation],
+    semantics: &OwnerSemantics,
+    owner_path: &str,
+    census: &mut TypeflowCensus,
+) {
+    type CheckerEdgeSpans = HashMap<(u32, u32), Vec<(String, Option<String>)>>;
+    census.owners_censused += 1;
+    for hit in &semantics.typeflow_oracle_hits {
+        *census
+            .resolved_by_rule
+            .entry(hit.rule.to_owned())
+            .or_insert(0) += 1;
+    }
+    for site in &semantics.pending_sites {
+        if site.site_kind == SiteKind::Call || site.site_kind == SiteKind::Heritage {
+            *census
+                .call_and_heritage_reason_counts
+                .entry(site.reason.clone().unwrap_or_else(|| "<none>".to_owned()))
+                .or_insert(0) += 1;
+        }
+    }
+    if semantics.pending_sites.is_empty() {
+        return;
+    }
+    let mut checker_calls: CheckerEdgeSpans = HashMap::new();
+    let mut checker_heritage: CheckerEdgeSpans = HashMap::new();
+    for observation in observations {
+        for row in &observation.canonical_records {
+            let Ok(parsed) = serde_json::from_str::<Value>(row) else {
+                continue;
+            };
+            let bucket = match parsed.get("universal_kind").and_then(Value::as_str) {
+                Some("core:call") => &mut checker_calls,
+                Some("core:inherits") => &mut checker_heritage,
+                _ => continue,
+            };
+            let body = parsed.get("body");
+            let (Some(start), Some(end)) = (
+                body.and_then(|b| b.get("start")).and_then(Value::as_u64),
+                body.and_then(|b| b.get("end")).and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            let classification = body
+                .and_then(|b| b.get("classification"))
+                .and_then(Value::as_str)
+                .unwrap_or("possible")
+                .to_owned();
+            let target = body
+                .and_then(|b| b.get("target_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            bucket
+                .entry((start as u32, end as u32))
+                .or_default()
+                .push((classification, target));
+        }
+    }
+    let oracle_calls: HashMap<(u32, u32), &str> = semantics
+        .typeflow_oracle_hits
+        .iter()
+        .filter(|hit| hit.edge_kind == "call")
+        .map(|hit| ((hit.start, hit.end), hit.target_id.as_str()))
+        .collect();
+    let oracle_heritage: HashMap<(u32, u32), &str> = semantics
+        .typeflow_oracle_hits
+        .iter()
+        .filter(|hit| hit.edge_kind == "inherits")
+        .map(|hit| ((hit.start, hit.end), hit.target_id.as_str()))
+        .collect();
+    // P1-A step 1 (classifier): every non-identifier-callee call site's
+    // receiver shape, keyed by span -- see `OwnerSemantics::typeflow_
+    // pending_call_shapes`'s doc comment.
+    let pending_shapes: HashMap<(u32, u32), &'static str> = semantics
+        .typeflow_pending_call_shapes
+        .iter()
+        .map(|shape| ((shape.start, shape.end), shape.shape))
+        .collect();
+    for site in &semantics.pending_sites {
+        let is_call = site.site_kind == SiteKind::Call
+            && site.reason.as_deref() == Some(TYPEFLOW_REASON_CALL_DEFERRED);
+        let is_heritage = site.site_kind == SiteKind::Heritage
+            && site.reason.as_deref() == Some(TYPEFLOW_REASON_HERITAGE_DEFERRED);
+        // P1-C: see `TypeflowCensus::identifier_calls`'s doc comment.
+        let is_identifier_call = site.site_kind == SiteKind::Call
+            && site.reason.as_deref() == Some(TYPEFLOW_REASON_CALL_TARGET_UNCERTAIN);
+        if !is_call && !is_heritage && !is_identifier_call {
+            continue;
+        }
+        let (edge_census, checker_by_span, oracle_by_span) = if is_call {
+            (&mut census.calls, &checker_calls, &oracle_calls)
+        } else if is_identifier_call {
+            (&mut census.identifier_calls, &checker_calls, &oracle_calls)
+        } else {
+            (&mut census.heritage, &checker_heritage, &oracle_heritage)
+        };
+        edge_census.attempted_sites += 1;
+        let span = (site.start_utf16, site.end_utf16);
+        let checker_confirmed_target = checker_by_span
+            .get(&span)
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|(classification, _)| classification == "confirmed")
+            })
+            .and_then(|(_, target)| target.clone());
+        let rust_target = oracle_by_span.get(&span).map(|target| (*target).to_owned());
+        match (&checker_confirmed_target, &rust_target) {
+            (Some(checker_target), Some(rust_target)) if checker_target == rust_target => {
+                edge_census.both_confirmed_same_target += 1;
+            }
+            (Some(_), Some(_)) => {
+                edge_census.both_confirmed_different_target += 1;
+                if edge_census.different_target_samples.len() < TYPEFLOW_CENSUS_SAMPLE_CAP {
+                    edge_census
+                        .different_target_samples
+                        .push(TypeflowCensusSample {
+                            path: owner_path.to_owned(),
+                            start: site.start_utf16,
+                            end: site.end_utf16,
+                            reason: site.reason.clone().unwrap_or_default(),
+                            checker_target: checker_confirmed_target.clone(),
+                            rust_target: rust_target.clone(),
+                        });
+                }
+            }
+            (Some(checker_target), None) if !is_workspace_target(checker_target) => {
+                // TypeScript's own standard library (`lib.*.d.ts`, always
+                // under `node_modules/`) -- this crate's `ProgramIndex`
+                // never indexes anything outside workspace source files
+                // (see `TypeflowEdgeCensus::checker_confirmed_external_
+                // target`'s doc comment), so this is out of scope BY
+                // CONSTRUCTION, not a rule gap, and must not deflate the
+                // recovery-rate denominator.
+                edge_census.checker_confirmed_external_target += 1;
+                *census
+                    .external_target_basename_counts
+                    .entry(external_target_basename(checker_target))
+                    .or_insert(0) += 1;
+            }
+            (Some(_), None) => {
+                edge_census.checker_confirmed_rust_pending += 1;
+                if edge_census.checker_confirmed_rust_pending_samples.len()
+                    < TYPEFLOW_CENSUS_SAMPLE_CAP
+                {
+                    edge_census
+                        .checker_confirmed_rust_pending_samples
+                        .push(TypeflowCensusSample {
+                            path: owner_path.to_owned(),
+                            start: site.start_utf16,
+                            end: site.end_utf16,
+                            reason: site.reason.clone().unwrap_or_default(),
+                            checker_target: checker_confirmed_target.clone(),
+                            rust_target: None,
+                        });
+                }
+                // P1-A step 1 (classifier): only calls carry a receiver
+                // shape (`typeflow_pending_call_shapes` is call-site-only,
+                // see its doc comment) -- heritage misses are excluded here,
+                // not double-counted under some default shape.
+                if is_call && let Some(shape) = pending_shapes.get(&span) {
+                    *census
+                        .receiver_shape_counts
+                        .entry((*shape).to_owned())
+                        .or_insert(0) += 1;
+                    let samples = census
+                        .receiver_shape_samples
+                        .entry((*shape).to_owned())
+                        .or_default();
+                    if samples.len() < TYPEFLOW_SHAPE_SAMPLE_CAP {
+                        samples.push(TypeflowCensusSample {
+                            path: owner_path.to_owned(),
+                            start: site.start_utf16,
+                            end: site.end_utf16,
+                            reason: site.reason.clone().unwrap_or_default(),
+                            checker_target: checker_confirmed_target.clone(),
+                            rust_target: None,
+                        });
+                    }
+                }
+            }
+            (None, Some(_)) => {
+                edge_census.checker_possible_or_missing_rust_confirmed += 1;
+            }
+            (None, None) => {
+                edge_census.both_pending_or_possible += 1;
+            }
+        }
+    }
 }
 
 /// One classified non-colliding row, kept for the pre-E1c census the owner
@@ -1190,7 +1826,9 @@ fn merge_hybrid_reference_rows(
         attempted: semantics.reference_rows.len()
             + semantics.covers_rows.len()
             + semantics.call_rows.len()
-            + semantics.heritage_rows.len(),
+            + semantics.heritage_rows.len()
+            + semantics.typeflow_call_rows.len()
+            + semantics.typeflow_heritage_rows.len(),
         collisions: 0,
         merged: 0,
         example_collision_key: None,
@@ -1203,6 +1841,8 @@ fn merge_hybrid_reference_rows(
         && semantics.covers_rows.is_empty()
         && semantics.call_rows.is_empty()
         && semantics.heritage_rows.is_empty()
+        && semantics.typeflow_call_rows.is_empty()
+        && semantics.typeflow_heritage_rows.is_empty()
     {
         return Ok(stats);
     }
@@ -1257,6 +1897,8 @@ fn merge_hybrid_reference_rows(
         .chain(semantics.covers_rows.iter())
         .chain(semantics.call_rows.iter())
         .chain(semantics.heritage_rows.iter())
+        .chain(semantics.typeflow_call_rows.iter())
+        .chain(semantics.typeflow_heritage_rows.iter())
         .map(hybrid_structural_record)
         .collect::<Vec<_>>();
     let sealed_canonical_records = canonicalize_structural_records_bounded(&structural_records)
@@ -1472,6 +2114,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut operations: HashMap<String, ActiveOperation> = HashMap::new();
     let mut reusable_semantic_checker: Option<ReusableSemanticChecker> = None;
     let mut syntax_state = SyntaxWorkerState::default();
+    // P3-1 deliverable 1: per-workspace `Frontier`/`StoreReader` cache for
+    // the v4 `WorkspaceScan` path, kept alive for this process's whole
+    // lifetime (same rationale as `syntax_state` above, which v4 ALSO
+    // reuses directly under its own `v4:{workspace_id}` project-key
+    // namespace -- see `v4::state`'s module doc for why one
+    // `SyntaxWorkerState` instance safely serves both v3 and v4 traffic).
+    let mut v4_worker_state: v4::state::WorkerState = HashMap::new();
     let flush_semantic_pending = |operation: &mut ActiveOperation| {
         if operation.semantic_pending.is_empty() {
             return Ok(None);
@@ -1487,9 +2136,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         operation.semantic_pending_owner_keys.clear();
         Ok(Some(receipt))
     };
-    let mut output = io::BufWriter::new(io::stdout().lock());
+    // P1-D-c: `output` is shared (not a plain local, and NOT `io::stdout()
+    // .lock()` -- a `StdoutLock` held for the process's whole life, as this
+    // used to be, would deadlock a second thread's own `io::stdout().lock()`
+    // attempt) so the residual-pass event pump below (a dedicated thread,
+    // not this loop) can write an `IndexingEvent::UpgradeCompleted` frame
+    // the MOMENT it arrives, real-time, without waiting for this loop to
+    // process another command first. Every write anywhere in this process
+    // -- this loop's own command responses, and the pump's residual events
+    // -- goes through this SAME mutex, so two frames can never interleave.
+    let output = Arc::new(Mutex::new(io::BufWriter::new(io::stdout())));
     let mut input = io::stdin().lock();
     let mut buffer = [0_u8; 64 * 1024];
+    // P1-D-c seam (`v4::residual`'s own module doc, "Why this module never
+    // touches `main.rs`'s command loop"): `v4::scan::run_with_residual`
+    // schedules the background checker pass and, on completion, sends a
+    // fully-built `(stream_id, cancellation_id, IndexingEvent)` frame
+    // through this channel -- picked up by the dedicated pump thread below,
+    // never by this loop directly.
+    let (residual_tx, residual_rx) =
+        mpsc::channel::<(u32, String, urdira_worker_protocol::IndexingEvent)>();
+    {
+        let output = Arc::clone(&output);
+        std::thread::spawn(move || {
+            while let Ok((stream_id, cancellation_id, event)) = residual_rx.recv() {
+                let mut guard = match output.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if write_event(&mut *guard, stream_id, &cancellation_id, &event).is_err() {
+                    break;
+                }
+                let _ = guard.flush();
+            }
+        });
+    }
     'read: loop {
         let read = input.read(&mut buffer)?;
         if read == 0 {
@@ -1585,7 +2266,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // syntax analysis and duplicated the source
                                 // manifest in the composition worker.
                                 let engine_input = request.engine_input.take();
-                                let semantic_descriptor = request.semantic_engine.clone();
+                                // P1-B: `URDIRA_JSTS_TYPEFLOW=1` never spawns
+                                // the semantic checker lane at all, even when
+                                // the caller still supplied a `semantic_
+                                // engine` descriptor (the request's own
+                                // field stays optional either way -- see
+                                // `hybrid_owner_can_skip_checker`'s doc
+                                // comment, updated alongside this). Treating
+                                // the descriptor as absent here is the
+                                // GLOBAL, uniform skip that doc comment's
+                                // "no wired live yet" caveat was about: a
+                                // per-owner selective skip would desync the
+                                // checker's fixed 32-owner-per-group request
+                                // stride, but skipping EVERY owner uniformly
+                                // (this generation never asks the checker
+                                // anything) has no such hazard.
+                                //
+                                // P1-C fix: this global skip must NOT apply
+                                // when the oracle census
+                                // (`URDIRA_JSTS_TYPEFLOW_ORACLE=1`) is also
+                                // requested -- the census's entire point is
+                                // comparing typeflow's own guess against the
+                                // checker's INDEPENDENT answer at the same
+                                // span (`census_typeflow_owner`), which needs
+                                // the checker to keep running. Found live: a
+                                // P1-C measurement run under `URDIRA_JSTS_
+                                // TYPEFLOW=1 URDIRA_JSTS_TYPEFLOW_ORACLE=1`
+                                // silently produced an EMPTY census (the
+                                // checker never started, so `observations`
+                                // never carried a `core:call`/`core:inherits`
+                                // row to compare against) -- diagnosed via
+                                // the complete absence of this generation's
+                                // own `URDIRA_DEBUG_TIMING` "jsts hybrid
+                                // semantics" log line, not a crash or an
+                                // error, which is exactly why this needed a
+                                // fix rather than a workaround: the
+                                // production checker-off path (oracle NOT
+                                // requested) is unaffected.
+                                let semantic_descriptor =
+                                    if typeflow_enabled() && !typeflow_oracle_enabled() {
+                                        None
+                                    } else {
+                                        request.semantic_engine.clone()
+                                    };
                                 let mut semantic_checker = if let Some(descriptor) =
                                     semantic_descriptor.as_ref()
                                 {
@@ -2368,6 +3091,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         active: false,
                     },
                 },
+                IndexingCommand::WorkspaceScan {
+                    request_id,
+                    workspace_id,
+                    workspace_root,
+                    database_path,
+                    structural_root,
+                    cas_root,
+                    sidecar_root,
+                    scope,
+                    registry_snapshot_id,
+                    configuration_revision_id,
+                    resolution_lock_id,
+                    deadline_ms,
+                    priority,
+                } => {
+                    let stream_id = message.stream_id;
+                    let cancellation_id = message.cancellation_id.clone();
+                    let mut emit_queryable =
+                        |queryable_event: IndexingEvent| -> Result<(), String> {
+                            let mut guard = output.lock().map_err(|error| error.to_string())?;
+                            write_event(&mut *guard, stream_id, &cancellation_id, &queryable_event)
+                                .map_err(|error| error.to_string())?;
+                            guard.flush().map_err(|error| error.to_string())
+                        };
+                    let scan_request = v4::scan::ScanRequest {
+                        request_id: request_id.clone(),
+                        workspace_id,
+                        workspace_root,
+                        database_path,
+                        structural_root,
+                        cas_root,
+                        sidecar_root,
+                        scope,
+                        registry_snapshot_id,
+                        configuration_revision_id,
+                        resolution_lock_id,
+                        deadline_ms,
+                        priority,
+                    };
+                    // P1-D-c: `run_with_residual` schedules the background
+                    // checker pass after a successful `ScanCompleted` (gated
+                    // internally by `URDIRA_V4_RESIDUAL`, see `scan.rs`'s own
+                    // doc comment) and is otherwise byte-identical to `run`
+                    // for every existing caller/test -- passing a real
+                    // `ResidualEventTarget` here is what lets its eventual
+                    // `IndexingEvent::UpgradeCompleted` reach this SAME
+                    // request's logical stream (see the channel declared
+                    // above `'read:`).
+                    let residual_target = Some(v4::residual::ResidualEventTarget {
+                        stream_id,
+                        cancellation_id: cancellation_id.clone(),
+                        sender: residual_tx.clone(),
+                    });
+                    match v4::scan::run_with_residual(
+                        scan_request,
+                        &mut syntax_state,
+                        &mut v4_worker_state,
+                        &mut emit_queryable,
+                        residual_target,
+                    ) {
+                        Ok(event) => event,
+                        Err(error) => IndexingEvent::Error {
+                            request_id,
+                            code: "core:workspace_scan_failed".into(),
+                            message: error.0,
+                        },
+                    }
+                }
                 IndexingCommand::Status {
                     request_id,
                     operation_id,
@@ -2397,27 +3188,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         reusable.checker.shutdown();
                     }
                     let event = IndexingEvent::ShutdownAck { request_id };
-                    write_event(
-                        &mut output,
-                        message.stream_id,
-                        &message.cancellation_id,
-                        &event,
-                    )?;
-                    output.flush()?;
+                    {
+                        let mut guard = output
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        write_event(
+                            &mut *guard,
+                            message.stream_id,
+                            &message.cancellation_id,
+                            &event,
+                        )?;
+                        guard.flush()?;
+                    }
                     return Ok(());
                 }
             };
-            write_event(
-                &mut output,
-                message.stream_id,
-                &message.cancellation_id,
-                &event,
-            )?;
-            output.flush()?;
+            {
+                let mut guard = output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                write_event(
+                    &mut *guard,
+                    message.stream_id,
+                    &message.cancellation_id,
+                    &event,
+                )?;
+                guard.flush()?;
+            }
         }
     }
     decoder.finish()?;
-    output.flush()?;
+    output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .flush()?;
     Ok(())
 }
 fn receipt_value(
@@ -3949,6 +4753,11 @@ fn run_jsts_semantic_generation(
     // hand to embed in each owner's `semantic_request` payload (step 3 of
     // the handoff), not just at merge time.
     let hybrid_active = hybrid_semantics_enabled();
+    // P0-S2 prototype (typeflow): read once, up front, so both the spawned
+    // thread below AND the post-join owner loop (`census_typeflow_owner`)
+    // see the same value for this whole generation.
+    let typeflow_active = typeflow_enabled();
+    let typeflow_oracle_active = typeflow_active && typeflow_oracle_enabled();
     // E2: build this generation's `WorkspaceResolver`/available-path-set/
     // resolved-files-map up front (moved wholesale into the spawned
     // thread below, not shared, so no `Arc` is needed) so the hybrid pass
@@ -3971,15 +4780,26 @@ fn run_jsts_semantic_generation(
             .unwrap_or_default();
         let paths = summary.affected_paths.clone();
         let owner_files = input.files.clone();
+        // P0-S2 prototype (typeflow): built on this SAME background thread,
+        // before the hybrid pass, so it overlaps with the checker's own
+        // closure-preparation call below exactly like the rest of this
+        // thread's work already does. `None` when the flag is off -- every
+        // typeflow branch downstream degrades to the pre-existing E1-E3
+        // behavior (see `HybridResolutionContext::typeflow_index`'s doc
+        // comment).
         Some(std::thread::spawn(move || {
             let by_path = owner_files
                 .iter()
                 .map(|file| (file.path.as_str(), file))
                 .collect::<HashMap<_, _>>();
+            let typeflow_index = typeflow_active
+                .then(|| build_typeflow_program_index(&owner_files, &resolver, &available, &files));
             let ctx = HybridResolutionContext {
                 resolver: &resolver,
                 available: &available,
                 files: &files,
+                typeflow_index: typeflow_index.as_ref(),
+                typeflow_oracle: typeflow_oracle_active,
             };
             compute_hybrid_semantics(&paths, &by_path, &ctx)
         }))
@@ -4054,6 +4874,15 @@ fn run_jsts_semantic_generation(
     const HYBRID_CENSUS_EXAMPLE_CAP: usize = 20;
     let mut hybrid_class_a_examples = Vec::<HybridClassExample>::new();
     let mut hybrid_class_b_examples = Vec::<HybridClassExample>::new();
+    // P0-S2 prototype (typeflow oracle census, see `census_typeflow_owner`'s
+    // doc comment). Stays all-zero whenever oracle mode is off.
+    let mut typeflow_census = TypeflowCensus::default();
+    // Diagnostic (2026-09-02 debugging session): how many times the
+    // per-owner census hook branch runs at all, and how often the owner
+    // path was actually found in `hybrid_semantics`.
+    let mut typeflow_census_branch_entries = 0_usize;
+    let mut typeflow_census_branch_hits = 0_usize;
+    let mut typeflow_census_branch_misses = 0_usize;
     // In the combined direct generation the syntax lane has already accepted
     // `summary.group_count` receipts. Continue the same generic sequence for
     // semantic groups so syntax and semantic rows can be committed atomically
@@ -4116,6 +4945,23 @@ fn run_jsts_semantic_generation(
             artifact_version_id: owner.owner_artifact_version_id.clone(),
         };
         let mut observations = bounded_semantic_observations(owner);
+        if typeflow_oracle_active {
+            typeflow_census_branch_entries += 1;
+            match hybrid_semantics.get(&hybrid_identity.path) {
+                Some(semantics) => {
+                    typeflow_census_branch_hits += 1;
+                    census_typeflow_owner(
+                        &observations,
+                        semantics,
+                        &hybrid_identity.path,
+                        &mut typeflow_census,
+                    );
+                }
+                None => {
+                    typeflow_census_branch_misses += 1;
+                }
+            }
+        }
         if let Some(semantics) = hybrid_semantics.get(&hybrid_identity.path) {
             let stats = merge_hybrid_reference_rows(
                 &mut observations,
@@ -4405,7 +5251,177 @@ fn run_jsts_semantic_generation(
             }
         }
     }
+    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        eprintln!(
+            "[urdira-indexing-worker] typeflow census diagnostic branch_entries={} branch_hits={} branch_misses={} hybrid_semantics_len={}",
+            typeflow_census_branch_entries,
+            typeflow_census_branch_hits,
+            typeflow_census_branch_misses,
+            hybrid_semantics.len()
+        );
+    }
+    if typeflow_oracle_active && let Some(output_path) = typeflow_oracle_output_path() {
+        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "[urdira-indexing-worker] typeflow census pre-write in_memory_calls_attempted={} in_memory_heritage_attempted={} owners_censused={} output_path={:?} output_path_exists_before_write={}",
+                typeflow_census.calls.attempted_sites,
+                typeflow_census.heritage.attempted_sites,
+                typeflow_census.owners_censused,
+                output_path,
+                output_path.exists()
+            );
+        }
+        write_typeflow_census(&output_path, &typeflow_census)?;
+        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+            let post = std::fs::read(&output_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<TypeflowCensus>(&bytes).ok());
+            eprintln!(
+                "[urdira-indexing-worker] typeflow census post-write on_disk_calls_attempted={:?} on_disk_owners_censused={:?}",
+                post.as_ref().map(|census| census.calls.attempted_sites),
+                post.as_ref().map(|census| census.owners_censused)
+            );
+        }
+    }
     Ok((group_sequence, owners_count, rows_count))
+}
+
+/// P0-S2 prototype: write (or, across more than one generation in the same
+/// process -- a mutation run -- ACCUMULATE into) the oracle census JSON at
+/// `URDIRA_JSTS_TYPEFLOW_ORACLE_OUT`. A prior file from an earlier
+/// generation this same run is read and summed field-by-field (a fresh
+/// `TypeflowCensus` for a fresh run, since the caller is expected to point
+/// this at a new/removed path per run); a missing or unparseable prior file
+/// is treated as an empty census, never a hard failure -- the census itself
+/// is diagnostic output, not a correctness-load-bearing artifact.
+fn write_typeflow_census(path: &std::path::Path, census: &TypeflowCensus) -> Result<(), CoreError> {
+    // Cross-process safety net (2026-09-02 debugging): even though the
+    // production plumbing keys one `urdira-indexing-worker` process per
+    // workspace (`indexingCoreSessions` in apps/urdira/src/index.ts), this
+    // read-merge-write is not otherwise atomic, and a benchmark harness
+    // that ever runs more than one such process against the SAME output
+    // path would silently lose updates. A simple atomic-create lock file
+    // (`O_EXCL` semantics via `create_new`) serializes every writer,
+    // in-process or cross-process, at negligible cost for this
+    // diagnostic-only artifact.
+    let lock_path = path.with_extension("census-lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => break,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(CoreError(format!(
+                    "typeflow census lock timed out for {lock_path:?}: {error}"
+                )));
+            }
+        }
+    }
+    let result = (|| -> Result<(), CoreError> {
+        let mut combined = match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<TypeflowCensus>(&bytes) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    // A PARSE failure on an EXISTING file is a real bug (a
+                    // schema drift, or the `skip_serializing_if`-without-
+                    // `default` mistake this comment used to describe from
+                    // experience) -- never treat it the same as "no prior
+                    // file yet". Loud on stderr (this whole artifact is
+                    // diagnostic-only, never worth failing the generation
+                    // over) so a future regression here is visible
+                    // immediately instead of silently discarding whatever
+                    // was accumulated so far.
+                    eprintln!(
+                        "[urdira-indexing-worker] WARNING: typeflow census at {path:?} failed to parse ({error}); starting a fresh census instead of accumulating onto it"
+                    );
+                    TypeflowCensus::default()
+                }
+            },
+            Err(_) => TypeflowCensus::default(),
+        };
+        combined.calls = sum_typeflow_edge_census(combined.calls, census.calls.clone());
+        combined.heritage = sum_typeflow_edge_census(combined.heritage, census.heritage.clone());
+        // P1-C fix: found live -- `identifier_calls` (added alongside
+        // `calls`/`heritage`) was never listed here, so every generation's
+        // own in-memory count was silently discarded on write, and the
+        // on-disk census always read back zero regardless of how many
+        // `call_target_uncertain` sites typeflow actually resolved. Same
+        // "loud, not silent" discipline as this function's own doc comment
+        // about a parse failure: a field added to `TypeflowCensus` without
+        // a matching line here degrades to "measures nothing", not a
+        // compile error, which is exactly how this went unnoticed until a
+        // census run's own numbers were checked by hand.
+        combined.identifier_calls =
+            sum_typeflow_edge_census(combined.identifier_calls, census.identifier_calls.clone());
+        combined.owners_censused += census.owners_censused;
+        for (reason, count) in &census.call_and_heritage_reason_counts {
+            *combined
+                .call_and_heritage_reason_counts
+                .entry(reason.clone())
+                .or_insert(0) += count;
+        }
+        for (rule, count) in &census.resolved_by_rule {
+            *combined.resolved_by_rule.entry(rule.clone()).or_insert(0) += count;
+        }
+        for (shape, count) in &census.receiver_shape_counts {
+            *combined
+                .receiver_shape_counts
+                .entry(shape.clone())
+                .or_insert(0) += count;
+        }
+        for (shape, samples) in &census.receiver_shape_samples {
+            let entry = combined
+                .receiver_shape_samples
+                .entry(shape.clone())
+                .or_default();
+            entry.extend(samples.iter().cloned());
+            entry.truncate(TYPEFLOW_SHAPE_SAMPLE_CAP);
+        }
+        for (basename, count) in &census.external_target_basename_counts {
+            *combined
+                .external_target_basename_counts
+                .entry(basename.clone())
+                .or_insert(0) += count;
+        }
+        let encoded = serde_json::to_vec_pretty(&combined)
+            .map_err(|error| CoreError(format!("typeflow census encode failed: {error}")))?;
+        std::fs::write(path, encoded).map_err(|error| {
+            CoreError(format!(
+                "typeflow census write failed for {path:?}: {error}"
+            ))
+        })
+    })();
+    let _ = std::fs::remove_file(&lock_path);
+    result
+}
+
+fn sum_typeflow_edge_census(
+    mut left: TypeflowEdgeCensus,
+    right: TypeflowEdgeCensus,
+) -> TypeflowEdgeCensus {
+    left.attempted_sites += right.attempted_sites;
+    left.both_confirmed_same_target += right.both_confirmed_same_target;
+    left.both_confirmed_different_target += right.both_confirmed_different_target;
+    left.checker_confirmed_rust_pending += right.checker_confirmed_rust_pending;
+    left.checker_confirmed_external_target += right.checker_confirmed_external_target;
+    left.checker_possible_or_missing_rust_confirmed +=
+        right.checker_possible_or_missing_rust_confirmed;
+    left.both_pending_or_possible += right.both_pending_or_possible;
+    left.different_target_samples
+        .extend(right.different_target_samples);
+    left.different_target_samples
+        .truncate(TYPEFLOW_CENSUS_SAMPLE_CAP);
+    left.checker_confirmed_rust_pending_samples
+        .extend(right.checker_confirmed_rust_pending_samples);
+    left.checker_confirmed_rust_pending_samples
+        .truncate(TYPEFLOW_CENSUS_SAMPLE_CAP);
+    left
 }
 
 /// Adds the workspace-specific publication envelope around the generic
@@ -5580,11 +6596,17 @@ fn finalize_workspace_publication(
     } else {
         descriptor_row.7.clone()
     };
+    debug_publish_phase(publish_started, "promo_descriptor_read");
     transaction.execute("UPDATE candidate_publication_record_occurrences SET valid_from_generation = ?1 WHERE candidate_generation_id = ?2", params![generation, &request.candidate_generation_id]).map_err(sql_error)?;
+    debug_publish_phase(publish_started, "promo_update_cpro");
     transaction.execute("UPDATE candidate_publication_record_facets SET valid_from_generation = ?1 WHERE candidate_generation_id = ?2", params![generation, &request.candidate_generation_id]).map_err(sql_error)?;
+    debug_publish_phase(publish_started, "promo_update_facets");
     transaction.execute("UPDATE candidate_publication_identity_assignments SET valid_from_generation = ?1 WHERE candidate_generation_id = ?2", params![generation, &request.candidate_generation_id]).map_err(sql_error)?;
+    debug_publish_phase(publish_started, "promo_update_ident");
     transaction.execute("UPDATE candidate_publication_record_closures SET valid_to_generation = ?1 WHERE candidate_generation_id = ?2", params![generation, &request.candidate_generation_id]).map_err(sql_error)?;
+    debug_publish_phase(publish_started, "promo_update_closures_vf");
     transaction.execute("UPDATE candidate_publication_descriptors SET record_sequence_digest = ?1, identity_sequence_digest = ?2, sealed_at = ?3 WHERE candidate_generation_id = ?4", params![record_sequence_digest, identity_sequence_digest, &published_at, &request.candidate_generation_id]).map_err(sql_error)?;
+    debug_publish_phase(publish_started, "promo_update_descriptors");
 
     // A cold workspace has no published structural rows. Avoid paying the
     // per-row uniqueness probe for that common path, while retaining the
@@ -5626,6 +6648,7 @@ fn finalize_workspace_publication(
             )
             .map_err(sql_error)?;
     }
+    debug_publish_phase(publish_started, "promo_records_exist_probe");
     let record_insert_sql = if records_exist {
         "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) SELECT record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, NULL, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest FROM candidate_publication_record_occurrences WHERE candidate_generation_id = ?1 ORDER BY record_id ON CONFLICT(record_id) DO NOTHING"
     } else {
@@ -5655,6 +6678,7 @@ fn finalize_workspace_publication(
         transaction
             .execute(direct_sql, params![&request.workspace_id, generation])
             .map_err(sql_error)?;
+        debug_publish_phase(publish_started, "promo_record_insert");
         // The core staging relation has a primary key for every facet and a
         // cold workspace has no durable facet rows to conflict with. Avoid
         // probing the destination uniqueness index once on that hot path;
@@ -5663,13 +6687,17 @@ fn finalize_workspace_publication(
         transaction
             .execute(facet_insert_sql, params![&request.workspace_id, generation])
             .map_err(sql_error)?;
+        debug_publish_phase(publish_started, "promo_facet_insert");
     } else {
         transaction
             .execute(record_insert_sql, [&request.candidate_generation_id])
             .map_err(sql_error)?;
+        debug_publish_phase(publish_started, "promo_record_insert");
         transaction.execute("INSERT INTO record_facets (workspace_id, record_id, valid_from_generation, facet_ordinal, facet) SELECT workspace_id, record_id, valid_from_generation, facet_ordinal, facet FROM candidate_publication_record_facets WHERE candidate_generation_id = ?1 ORDER BY record_id, facet_ordinal ON CONFLICT DO NOTHING", [&request.candidate_generation_id]).map_err(sql_error)?;
+        debug_publish_phase(publish_started, "promo_facet_insert");
     }
     transaction.execute("UPDATE record_occurrences SET valid_to_generation = ?1 WHERE workspace_id = ?2 AND valid_to_generation IS NULL AND record_id IN (SELECT record_id FROM candidate_publication_record_closures WHERE candidate_generation_id = ?3)", params![generation, &request.workspace_id, &request.candidate_generation_id]).map_err(sql_error)?;
+    debug_publish_phase(publish_started, "promo_closures_update");
     let identities_exist: bool = transaction
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM identity_assignments WHERE workspace_id = ?1 LIMIT 1)",
@@ -5684,6 +6712,7 @@ fn finalize_workspace_publication(
             )
             .map_err(sql_error)?;
     }
+    debug_publish_phase(publish_started, "promo_identities_exist_probe");
     let identity_insert_sql = if identities_exist {
         "INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation) SELECT identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, NULL, NULL, valid_from_generation, NULL FROM candidate_publication_identity_assignments WHERE candidate_generation_id = ?1 ORDER BY identity_assignment_id ON CONFLICT DO NOTHING"
     } else {
@@ -5705,10 +6734,12 @@ fn finalize_workspace_publication(
                 params![&request.workspace_id, generation],
             )
             .map_err(sql_error)?;
+        debug_publish_phase(publish_started, "promo_identity_insert");
     } else {
         transaction
             .execute(identity_insert_sql, [&request.candidate_generation_id])
             .map_err(sql_error)?;
+        debug_publish_phase(publish_started, "promo_identity_insert");
     }
     debug_publish_phase(publish_started, "record_and_identity_promotion");
     transaction.execute("UPDATE candidate_publication_projection_occurrences SET valid_from_generation = ?1 WHERE candidate_generation_id = ?2", params![generation, &request.candidate_generation_id]).map_err(sql_error)?;
@@ -7135,6 +8166,7 @@ mod tests {
             kind: "jsts:relation_references".into(),
             universal_kind: "core:references".into(),
             facets: "[]".into(),
+            facets_list: Vec::new(),
             schema_version: 1,
             source_span: "{}".into(),
             identity_key: identity_key.to_owned(),
@@ -7174,6 +8206,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7199,6 +8237,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7225,6 +8269,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7249,6 +8299,7 @@ mod tests {
             kind: "jsts:relation_covers".into(),
             universal_kind: "core:covers".into(),
             facets: "[]".into(),
+            facets_list: Vec::new(),
             schema_version: 1,
             source_span: "{}".into(),
             identity_key: identity_key.to_owned(),
@@ -7271,6 +8322,12 @@ mod tests {
             covers_rows: vec![synthetic_covers_record(covers_key)],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7329,6 +8386,12 @@ mod tests {
             covers_rows: vec![synthetic_covers_record(key)],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7356,6 +8419,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7439,6 +8508,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7501,6 +8576,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7605,6 +8686,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7695,6 +8782,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7776,6 +8869,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
@@ -7837,6 +8936,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:empty".into(),
             jsdoc_typed_file: false,
@@ -7856,11 +8961,17 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:empty".into(),
             jsdoc_typed_file: false,
         };
-        assert!(hybrid_owner_can_skip_checker(&semantics, false));
+        assert!(hybrid_owner_can_skip_checker(&semantics, false, false));
     }
 
     #[test]
@@ -7870,6 +8981,12 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![SemanticSite {
                 start_utf16: 0,
                 end_utf16: 5,
@@ -7880,7 +8997,7 @@ mod tests {
             sites_digest: "jsts:sites:sha256:nonempty".into(),
             jsdoc_typed_file: false,
         };
-        assert!(!hybrid_owner_can_skip_checker(&semantics, false));
+        assert!(!hybrid_owner_can_skip_checker(&semantics, false, false));
     }
 
     #[test]
@@ -7894,11 +9011,48 @@ mod tests {
             covers_rows: vec![],
             call_rows: vec![],
             heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:empty".into(),
             jsdoc_typed_file: false,
         };
-        assert!(!hybrid_owner_can_skip_checker(&semantics, true));
+        assert!(!hybrid_owner_can_skip_checker(&semantics, true, false));
+    }
+
+    #[test]
+    fn hybrid_owner_can_skip_checker_when_the_checker_lane_is_globally_disabled() {
+        // P1-B: the checker-off pipeline mode (`URDIRA_JSTS_TYPEFLOW=1`)
+        // skips EVERY owner uniformly, regardless of pending sites or a
+        // stage-3 requirement -- the opposite of both other "cannot skip"
+        // tests above, with `checker_lane_disabled: true` as the only
+        // difference.
+        let semantics = OwnerSemantics {
+            reference_rows: vec![],
+            covers_rows: vec![],
+            call_rows: vec![],
+            heritage_rows: vec![],
+            typeflow_call_rows: vec![],
+            typeflow_heritage_rows: vec![],
+            possible_call_rows: vec![],
+            possible_heritage_rows: vec![],
+            typeflow_oracle_hits: vec![],
+            typeflow_pending_call_shapes: vec![],
+            pending_sites: vec![SemanticSite {
+                start_utf16: 0,
+                end_utf16: 5,
+                site_kind: SiteKind::Call,
+                disposition: SiteDisposition::CheckerPending,
+                reason: Some("call_deferred_to_e3".into()),
+            }],
+            sites_digest: "jsts:sites:sha256:nonempty".into(),
+            jsdoc_typed_file: false,
+        };
+        assert!(hybrid_owner_can_skip_checker(&semantics, true, true));
     }
 
     #[test]
@@ -7933,6 +9087,8 @@ mod tests {
             resolver: &resolver,
             available: &available,
             files: &files,
+            typeflow_index: None,
+            typeflow_oracle: false,
         };
         let result = compute_hybrid_semantics(&affected_paths, &files_by_path, &ctx)
             .expect("hybrid analysis");
@@ -7972,10 +9128,45 @@ mod tests {
             resolver: &resolver,
             available: &available,
             files: &files,
+            typeflow_index: None,
+            typeflow_oracle: false,
         };
         let error = compute_hybrid_semantics(&affected_paths, &files_by_path, &ctx)
             .expect_err("a digest mismatch must fail closed instead of analyzing stale bytes");
         assert!(error.0.contains("digest mismatch"), "error: {}", error.0);
         let _ = std::fs::remove_file(&source_path);
+    }
+
+    /// P1-C: found live -- `TypeflowCensus::identifier_calls` was added
+    /// alongside `calls`/`heritage` but `write_typeflow_census`'s own
+    /// read-merge-write forgot to list it, so every generation's own
+    /// in-memory count was silently discarded on write and the on-disk
+    /// census always read back zero. Two writes to the SAME path (mirrors
+    /// a cold generation followed by a mutation generation, the exact
+    /// shape that surfaced this live) must accumulate `identifier_calls`
+    /// the same way `calls`/`heritage` already do.
+    #[test]
+    fn write_typeflow_census_accumulates_identifier_calls_across_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "urdira-typeflow-census-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("census.json");
+        let _ = std::fs::remove_file(&path);
+        let mut first = TypeflowCensus::default();
+        first.identifier_calls.attempted_sites = 3;
+        first.identifier_calls.both_confirmed_same_target = 2;
+        write_typeflow_census(&path, &first).expect("first write succeeds");
+        let mut second = TypeflowCensus::default();
+        second.identifier_calls.attempted_sites = 5;
+        second.identifier_calls.both_confirmed_same_target = 1;
+        write_typeflow_census(&path, &second).expect("second write succeeds");
+        let combined: TypeflowCensus =
+            serde_json::from_slice(&std::fs::read(&path).expect("read back census file"))
+                .expect("parse combined census");
+        assert_eq!(combined.identifier_calls.attempted_sites, 8);
+        assert_eq!(combined.identifier_calls.both_confirmed_same_target, 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

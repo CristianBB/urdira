@@ -94,6 +94,17 @@ the declared open embedding model. The CLI reports that action. Urdira does
 not download models during startup, indexing, query execution, pagination, or
 replay.
 
+A newly registered workspace is indexed with the v4 structural store by
+default: a native, immutable segment store plus a small SQLite catalog file,
+its lexical/semantic sidecar databases, and a `.structural/`/`.sidecar/`
+directory pair, all siblings of the workspace's data file under the data
+root (see [`docs/README.md`](docs/README.md) and
+[v4 structural store](docs/decisions/26-v4-structural-store.md)). Set
+`URDIRA_V4=0` before registering a workspace to opt it into the v3 SQLite
+pipeline described below instead; this opt-out is intended for one release.
+Neither format is migrated into the other automatically -- a workspace keeps
+whichever format it was created with until it is removed and re-added.
+
 ## Quick start
 
 Preview registration before changing local Urdira state:

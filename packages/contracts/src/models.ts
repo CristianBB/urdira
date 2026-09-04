@@ -2838,7 +2838,31 @@ export interface WorkspaceIndexStatusView {
   /** Detailed v3 readiness block; flattened fields above keep legacy consumers simple. */
   readiness?: WorkspaceReadinessView;
   operation_availability?: OperationAvailabilityView;
+  // P4-d (plan §9, user-facing status surfaces): additive v4 lane fields,
+  // emitted by `v4StatusFields` (`packages/daemon/src/runtime.ts`) for every
+  // workspace. `storage_format` is always present ("v3" for the legacy
+  // plugin-driven scan, "v4" for the native Rust structural pipeline);
+  // `structural`/`lexical`/`semantic`/`last_scan`/the two `*_ready`
+  // convenience booleans are best-effort projections that fall back to the
+  // existing `structural_ready`/`semantic_ready` booleans above for a v3
+  // workspace (which has no separate queryable/durable generation pair, and
+  // no tracked lexical/semantic completed generation).
+  storage_format?: "v3" | "v4";
+  structural?: WorkspaceStructuralLaneView;
+  lexical?: WorkspaceLexicalLaneView;
+  semantic?: WorkspaceSemanticLaneView;
+  /** The last completed scan's scope/timings/timeline; only ever present for a v4 workspace (a v3 scan has no equivalent `ScanTimings` breakdown to report). */
+  last_scan?: WorkspaceLastScanView;
+  /** `true` once `search_text` results reflect the lexical sidecar's latest completed pass, not merely once the operation is available. */
+  search_text_ready?: boolean;
+  /** Mirrors `semantic_ready` above; kept as its own field so a caller need not know the v3/v4 field name difference. */
+  search_semantic_ready?: boolean;
 }
+export interface WorkspaceStructuralLaneView { queryable_generation?: number; durable_generation?: number; queryable: boolean; }
+export interface WorkspaceLexicalLaneView { completed_generation?: number; current: boolean; }
+export interface WorkspaceSemanticLaneView { completed_generation?: number; current: boolean; profile_id?: string; }
+export interface WorkspaceScanTimingsView { catalog_ms?: number; parse_ms?: number; resolve_ms?: number; materialize_ms?: number; write_ms?: number; fsync_ms?: number; snapshot_ms?: number; lexical_ms?: number; total_ms: number; }
+export interface WorkspaceLastScanView { kind: "full" | "changed"; changed_paths?: number; timings: WorkspaceScanTimingsView; timeline?: Readonly<Record<string, number>>; }
 export type WorkspaceConfigurationAttemptState = "proposed" | "confirmed" | "running" | "succeeded" | "failed" | "superseded";
 export type WorkspaceConfigurationIssueSeverity = "info" | "warning" | "error";
 export type WorkspaceConfigurationIssueCode = "invalid_config" | "stale_proposal" | "plugin_unavailable" | "plugin_incompatible" | "technology_unconfirmed" | "reindex_required";

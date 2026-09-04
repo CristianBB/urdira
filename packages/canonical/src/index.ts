@@ -12,6 +12,7 @@ export {
 } from "./logical-encoding.js";
 export { SparseMerkleSet } from "./sparse-merkle.js";
 export { MerkleRadixSet } from "./merkle-radix.js";
+export { BucketedMerkleSet, recordSetDigest, projectionSetDigest, rootFromBucketDigests, sourceStateDigest } from "./merkle-bucket.js";
 export { digestLogicalValue, LogicalDigestWriter } from "./logical-digest-writer.js";
 export {
   canonicalSetValues,

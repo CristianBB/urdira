@@ -1,0 +1,24 @@
+[package]
+name = "urdira-structural-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memmap2 = "0.9"
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+urdira-indexing-core = { version = "=0.1.0", path = "../urdira-indexing-core" }
+# P2-2j item 2: `write_base_partitioned` (writer.rs) and its partition-aware
+# hot-file encoder (segment_io.rs) parallelize across the 16 nibble
+# partitions and the 6 secondary sorted-index arrays with rayon, instead of
+# the pre-existing `std::thread::scope` hand-rolled fan-out `write_base`
+# still uses. Additive: `write_base`/`write_hot_and_secondary_files` are
+# untouched.
+rayon = "1"
+
+[dev-dependencies]
+rand = "0.9"

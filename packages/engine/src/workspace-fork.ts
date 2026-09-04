@@ -1,12 +1,17 @@
-import { canonicalBytes, decodeCanonical as decodeCanonicalBlob, digestBytes, digestLogicalValue } from "@urdira/canonical";
+import { canonicalBytes, computeDigest, decodeCanonical as decodeCanonicalBlob, digestBytes, digestLogicalValue } from "@urdira/canonical";
 import type {
   PluginResolutionLock,
   RegistrySnapshot,
   WorkspaceConfigurationRevision,
   WorkspaceFreshnessCheckpoint,
 } from "@urdira/contracts";
-import type { DurableStorage, ForkPublicationPlanInput, SqliteDatabase, WorkspaceDatabase } from "@urdira/storage";
-import { buildForkPublicationPlan, publicationTransactionCommands, computeForkSnapshotDigestFields, normalizeObservationBatchIds, snapshotDigest } from "@urdira/storage";
+import type { DurableStorage, ForkPublicationPlanInput, SqliteCommand, SqliteDatabase, WorkspaceDatabase } from "@urdira/storage";
+import { buildForkPublicationPlan, publicationTransactionCommands, computeForkSnapshotDigestFields, normalizeObservationBatchIds, openSqliteDatabase, snapshotDigest } from "@urdira/storage";
+import { existsSync } from "node:fs";
+import { cp, copyFile, mkdir, rename } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { readTreeFile } from "./v4-verify.js";
 import type { GitIgnoreRules, InclusionRules } from "@urdira/security";
 import { ISOMORPHIC_GIT_OBJECT_PORT, peeledHeadFor, type GitObjectPort } from "./git-providers.js";
 import { DEFAULT_WORKSPACE_INCLUSION, DirectorySourceProvider, type EncodedObservationBatch } from "./directory-provider.js";
@@ -1277,4 +1282,221 @@ function toBytes(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) return value;
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   throw new TypeError("Expected a binary row payload.");
+}
+
+// =============================================================================
+// v4 (index_contract 0x34, P2-4): fork on the native structural store.
+//
+// Everything above this line is the v3 fork (untouched by this task): it
+// works by remapping donor artifact/record identities into the new
+// workspace and bulk-copying rows one table at a time
+// (`bulkCopyRecordsAndIdentities`/`bulkCopyDependencies`/
+// `bulkCopyProjections`), because v3's `record_id`/`identity_id` values are
+// not purely content-addressed (`docs/decisions/12-workspace-fork.md`).
+//
+// v4 needs none of that: `record_id`/`record_digest`/`dependency_id` are
+// derived ONLY from record content (never `workspace_id`) --
+// `structural_kernel_batch_parts`'s digest never reads `workspace_id`, and
+// this is confirmed structurally, not assumed: the whole structural corpus
+// (`structural/`, including its Merkle trees) is byte-for-byte valid under
+// ANY workspace_id, so a fork is a plain recursive file copy plus a root
+// re-verification, never a record-by-record remap. Only the SQLite catalog
+// (workspace-scoped rows: `snapshots`, `source_artifacts`,
+// `registry_snapshots`, ...) needs `workspace_id` rewritten, which this
+// does generically (below) rather than by hand-enumerating every table.
+//
+// This is a self-contained, directly-tested primitive (`tests/
+// workspace-fork-v4.test.ts`), not wired into `attemptWorkspaceFork`'s v3
+// orchestration above or into any daemon RPC -- the daemon-side v4 fork
+// trigger is part of the concurrent v4-routing work this task must not
+// touch (`packages/daemon/src/runtime.ts`).
+// =============================================================================
+
+/**
+ * Recursively copies a v4 workspace's `structural/` directory to a new
+ * location (copy-then-rename so a crash mid-copy never leaves a partial
+ * directory at `targetStructuralRoot`). No identity rewriting is needed or
+ * done: every byte under `structural/` -- segment files, dictionaries, and
+ * the `merkle/*.tree` files alike -- is workspace-independent content, by
+ * construction (see this section's doc comment).
+ */
+export async function forkV4StructuralStore(sourceStructuralRoot: string, targetStructuralRoot: string): Promise<void> {
+  await mkdir(dirname(targetStructuralRoot), { recursive: true });
+  const stagingRoot = `${targetStructuralRoot}.fork-staging-${randomUUID()}`;
+  await cp(sourceStructuralRoot, stagingRoot, { recursive: true });
+  await rename(stagingRoot, targetStructuralRoot);
+}
+
+export interface WorkspaceForkV4RootVerification {
+  readonly ok: boolean;
+  /** Human-readable `"<set_kind>: <what differed>"` entries; empty when `ok`. */
+  readonly mismatches: readonly string[];
+}
+
+const V4_MERKLE_SET_KINDS = ["records", "dependency", "graph", "metric"] as const;
+
+/**
+ * Confirms a structural-store copy is byte-for-byte faithful by comparing
+ * each `merkle/<set>.tree` file's own header (`generation`/`count`/`root`)
+ * between source and target -- cheaper than re-hashing every segment file,
+ * and sufficient because a `.tree` file's header only ever matches its own
+ * bucket levels when `write_to` wrote it as one atomic unit (temp file +
+ * rename, `crates/urdira-indexing-core/src/merkle_bucket.rs`), so a
+ * matching header is already strong evidence the copy is intact; combined
+ * with `readTreeFile`'s own node-level recompute (which the caller can run
+ * separately via `verifyV4Workspace`) this also catches node-level bit rot
+ * introduced by the copy itself.
+ */
+export async function verifyV4ForkRoots(sourceStructuralRoot: string, targetStructuralRoot: string): Promise<WorkspaceForkV4RootVerification> {
+  const mismatches: string[] = [];
+  for (const kind of V4_MERKLE_SET_KINDS) {
+    const relativePath = join("merkle", `${kind}.tree`);
+    const [sourceFile, targetFile] = await Promise.all([
+      readTreeFile(join(sourceStructuralRoot, relativePath)),
+      readTreeFile(join(targetStructuralRoot, relativePath)),
+    ]);
+    if ((sourceFile === undefined) !== (targetFile === undefined)) { mismatches.push(`${kind}: presence differs after copy`); continue; }
+    if (sourceFile !== undefined && targetFile !== undefined) {
+      if (sourceFile.headerRoot !== targetFile.headerRoot || sourceFile.count !== targetFile.count || sourceFile.generation !== targetFile.generation) mismatches.push(`${kind}: header root/count/generation differs after copy`);
+      if (targetFile.recomputedRoot !== targetFile.headerRoot) mismatches.push(`${kind}: copied file's own bucket levels no longer match its header root`);
+    }
+  }
+  return { ok: mismatches.length === 0, mismatches };
+}
+
+/**
+ * Rewrites every occurrence of `oldWorkspaceId` in every TEXT column of
+ * every table to `newWorkspaceId` -- generic over the v4 catalog schema
+ * (`packages/storage/sql/workspace-v4.sql`) rather than a hand-maintained
+ * per-table/per-column list, so it does not silently miss a table added
+ * later. Covers both plain `workspace_id` columns AND the workspace-id-
+ * templated primary/foreign keys v4 mints at publish time (e.g.
+ * `snapshot_id = "snapshot:<workspace_id>:<generation>"`,
+ * `crates/urdira-indexing-worker/src/v4/publish.rs`) in one pass, since
+ * both are just TEXT columns containing the same substring. Safe because
+ * workspace ids are opaque, high-entropy tokens (an accidental substring
+ * collision inside an unrelated sha256 hex digest or JSON blob is not a
+ * realistic risk); `BLOB`/`INTEGER` columns can never contain a TEXT
+ * substring and are skipped without inspection.
+ */
+export async function rewriteV4WorkspaceIdentity(database: SqliteDatabase, oldWorkspaceId: string, newWorkspaceId: string): Promise<void> {
+  if (oldWorkspaceId === newWorkspaceId) return;
+  const quoteIdentifier = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+  const tables = await database.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'");
+  const commands: SqliteCommand[] = [];
+  for (const { name: tableName } of tables) {
+    const columns = await database.all<{ name: string; type: string }>(`PRAGMA table_info(${quoteIdentifier(tableName)})`);
+    for (const column of columns) {
+      if (column.type.toUpperCase() !== "TEXT") continue;
+      commands.push({
+        kind: "run",
+        sql: `UPDATE ${quoteIdentifier(tableName)} SET ${quoteIdentifier(column.name)} = REPLACE(${quoteIdentifier(column.name)}, ?, ?) WHERE ${quoteIdentifier(column.name)} LIKE '%' || ? || '%'`,
+        params: [oldWorkspaceId, newWorkspaceId, oldWorkspaceId],
+      });
+    }
+  }
+  // Rewriting a referenced primary key (e.g. `registry_snapshots.registry_snapshot_id`)
+  // ahead of the foreign key that points at it (e.g.
+  // `registry_namespace_bindings.registry_snapshot_id`) would otherwise trip
+  // immediate FK enforcement mid-batch, since both keys carry the SAME
+  // `oldWorkspaceId`-templated substring and this pass has no reason to sort
+  // tables in dependency order. `defer_foreign_keys` (cleared automatically
+  // when this transaction ends) defers every FK check to commit, by which
+  // point every table's rewrite has applied consistently.
+  await database.run("PRAGMA defer_foreign_keys = ON");
+  await database.transaction(commands);
+}
+
+/**
+ * `Snapshot.snapshot_digest` (`docs/serialization/core-digest-field-contracts.md`
+ * row 93) is an envelope over the snapshot's OWN identity fields --
+ * `snapshot_id`/`workspace_id`/`generation_manifest_id`/`registry_snapshot_id`/
+ * `resolution_lock_id`/`configuration_revision_id` -- every one of which
+ * `rewriteV4WorkspaceIdentity` just changed (they are exactly the
+ * workspace-id-templated strings that function rewrites). The CONTENT
+ * digests (`canonical_record_set_digest`/`projection_set_digests`/
+ * `source_state_digest`/`capability_state_digest`) are untouched by the
+ * rewrite (none of them embed `workspace_id`), so recomputing the envelope
+ * with the SAME recipe `packages/engine/src/v4-verify.ts`'s
+ * `verifyV4Workspace` checks against is enough to make every forked
+ * snapshot row self-consistent again -- this is the v4 analogue of v3's
+ * `computeForkSnapshotDigestFields` (`packages/storage/src/publication-authority.ts`),
+ * scoped to exactly the one field identity rewriting invalidates.
+ */
+export async function recomputeV4SnapshotDigestsAfterRewrite(database: SqliteDatabase): Promise<void> {
+  const rows = await database.all<{
+    snapshot_id: string; workspace_id: string; generation: number; parent_snapshot_id: string | null; generation_manifest_id: string;
+    registry_snapshot_id: string; resolution_lock_id: string; configuration_revision_id: string; source_state_digest: string;
+    source_observation_watermarks: string; canonical_record_set_digest: string; projection_set_digests: string; capability_state_digest: string; published_at: string;
+  }>(
+    "SELECT snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at FROM snapshots",
+  );
+  const commands: SqliteCommand[] = rows.map((row) => {
+    const positive: Record<string, unknown> = {
+      snapshot_id: row.snapshot_id,
+      workspace_id: row.workspace_id,
+      generation: row.generation,
+      ...(row.parent_snapshot_id === null ? {} : { parent_snapshot_id: row.parent_snapshot_id }),
+      generation_manifest_id: row.generation_manifest_id,
+      registry_snapshot_id: row.registry_snapshot_id,
+      resolution_lock_id: row.resolution_lock_id,
+      configuration_revision_id: row.configuration_revision_id,
+      source_state_digest: row.source_state_digest,
+      source_observation_watermarks: row.source_observation_watermarks,
+      canonical_record_set_digest: row.canonical_record_set_digest,
+      projection_set_digests: row.projection_set_digests,
+      capability_state_digest: row.capability_state_digest,
+      published_at: row.published_at,
+    };
+    const snapshotDigest = computeDigest("core:snapshot", "core:snapshot_digest", 1, "core:SnapshotDigestPayload", 1, positive);
+    return { kind: "run", sql: "UPDATE snapshots SET snapshot_digest = ? WHERE snapshot_id = ?", params: [snapshotDigest, row.snapshot_id] };
+  });
+  if (commands.length > 0) await database.transaction(commands);
+}
+
+export interface WorkspaceForkV4Options {
+  readonly sourceStructuralRoot: string;
+  readonly targetStructuralRoot: string;
+  readonly sourceDatabasePath: string;
+  readonly targetDatabasePath: string;
+  readonly sourceWorkspaceId: string;
+  readonly targetWorkspaceId: string;
+  /** Sidecar directories (lexical/semantic, plan §9) -- copied verbatim,
+   * same identity-rewrite pass, when the source has one. Optional because
+   * a freshly cold-scanned donor may not have built either yet. */
+  readonly sourceSidecarRoot?: string;
+  readonly targetSidecarRoot?: string;
+}
+
+export type WorkspaceForkV4Result = WorkspaceForkV4RootVerification;
+
+/**
+ * File-level v4 fork primitive (plan §9: "fork ... copia de structural/ +
+ * sidecars + filas de catálogo/snapshot"): copies the catalog SQLite file,
+ * the `structural/` directory, and (if present) the sidecar directory to
+ * the target paths, rewrites `targetWorkspaceId` throughout the copied
+ * catalog, and re-verifies the copied structural store's Merkle roots.
+ * Does not touch the source in any way (plain reads/copies).
+ *
+ * Not wired into any daemon RPC or into `attemptWorkspaceFork`'s v3
+ * orchestration above -- see this section's doc comment for why, and for
+ * what a caller wiring this into a real fork trigger still needs to do
+ * (register the new workspace, choose its paths, decide fork eligibility).
+ */
+export async function forkV4Workspace(options: WorkspaceForkV4Options): Promise<WorkspaceForkV4Result> {
+  await mkdir(dirname(options.targetDatabasePath), { recursive: true });
+  await copyFile(options.sourceDatabasePath, options.targetDatabasePath);
+  await forkV4StructuralStore(options.sourceStructuralRoot, options.targetStructuralRoot);
+  if (options.sourceSidecarRoot !== undefined && options.targetSidecarRoot !== undefined && existsSync(options.sourceSidecarRoot)) {
+    await mkdir(dirname(options.targetSidecarRoot), { recursive: true });
+    await cp(options.sourceSidecarRoot, options.targetSidecarRoot, { recursive: true });
+  }
+  const target = await openSqliteDatabase({ filename: options.targetDatabasePath });
+  try {
+    await rewriteV4WorkspaceIdentity(target, options.sourceWorkspaceId, options.targetWorkspaceId);
+    await recomputeV4SnapshotDigestsAfterRewrite(target);
+  } finally {
+    await target.close();
+  }
+  return verifyV4ForkRoots(options.sourceStructuralRoot, options.targetStructuralRoot);
 }

@@ -490,7 +490,7 @@ const toolDescriptions: Readonly<Record<UrdiraMcpToolName, string>> = {
   urdira_context: `Use this as the default first choice for an ordinary coding task when you want definitions, callers, dependencies, tests, contracts, or extension points together and do not need custom stage wiring. It is the readiness-aware agent wrapper around core:build_context: it waits for the structural frontier by default and, if that wait expires, returns a compact notice naming source/syntax operations usable immediately. api_version: 3 is a required top-level field; scope, task, and facets are also required. Optional seeds anchor known subjects. All overrides stay inside options. Facets use exactly: ${buildContextFacetContract}. public_surfaces is an architecture view, not a context facet. Use urdira_query only when a registered recipe or custom pipeline is more precise.`,
   urdira_analyze_change: "Use this for one explicit hypothetical rename, signature change, deletion, move, type, visibility, contract, or behavior change. It is strictly read-only. Supply the exact target returned by prior discovery plus the change descriptor; receive will_break, must_update, may_be_affected, tests_to_run, and uncertain_dynamic_usage with evidence. Prefer this dedicated tool over constructing core:analyze_impact manually. Resolve and copy query_scope from urdira_index_status first.",
   urdira_build_context: "Use this explicit core:build_context wrapper when you already know the desired task, facets, and optional seed subjects and want the ordinary query-operation behavior. Required fields are api_version:3, scope, task, and facets; options is optional. For a general agent task prefer urdira_context because it adds readiness-aware degradation guidance. For custom dependent stages use urdira_query with a pipeline.",
-  urdira_index_status: "Always call this first with only workspace_root set to the exact repository root. It resolves or registers the workspace and returns a copy-ready query_scope; reuse that object byte-for-byte in every later tool and never synthesize its opaque workspace_id. It also reports source, syntax, structural, and semantic readiness plus operation_availability, retryability, scan failures, and retry timing. Call it again only when readiness or indexing state matters. Every input field is optional; no api_version or scope belongs in this tool.",
+  urdira_index_status: "Always call this first with only workspace_root set to the exact repository root. It resolves or registers the workspace and returns a copy-ready query_scope; reuse that object byte-for-byte in every later tool and never synthesize its opaque workspace_id. It also reports source, syntax, structural, and semantic readiness plus operation_availability, retryability, scan failures, and retry timing. For a v4 workspace it additionally reports per-lane generations (structural queryable/durable, lexical/semantic completed) and the last scan's kind, changed paths, and timings, so search_text/search_semantic can be seen as partial until their lane catches up. Call it again only when readiness or indexing state matters. Every input field is optional; no api_version or scope belongs in this tool.",
 };
 
 const operationErrorSchema: JsonSchema = objectSchema({ code: { type: "string" }, message: { type: "string" }, retryable: { type: "boolean" }, recovery_action: { type: "string" }, workspace_id: { type: "string" }, query_execution_id: { type: "string" }, details: { type: "object" } }, ["code", "message", "retryable"]);
@@ -1212,6 +1212,37 @@ function renderIndexStatusText(page: JsonRecord): string {
     lines.push(`workspace_id=${id}${root !== undefined ? ` (${root})` : ""}: ${status}, freshness=${freshness}${generation !== undefined ? `, generation=${generation}` : ""}`);
     lines.push(`  query_scope=${JSON.stringify({ scope_type: "single_workspace", workspace_id: id })}`);
     lines.push(`  ready: source=${sourceReady}, structural=${structuralReady}, semantic=${semanticReady}`);
+    // P4-d: v4 lane detail -- absent entirely for a v3 workspace (`storage_format`
+    // is only ever "v3"/"v4", set unconditionally by `v4StatusFields`,
+    // `packages/daemon/src/runtime.ts`), so a v3 render is byte-for-byte
+    // unchanged from before this task. One compact line per lane
+    // (generation(s) plus a "current"/"lagging" tag from the daemon's own
+    // `current`/`queryable` booleans), the last completed scan's kind/paths/
+    // wall time, and a hint only when a lane is actually lagging -- an agent
+    // reading `search_text_ready: false` on an otherwise-successful query
+    // should see WHY without a second lookup.
+    if (workspace["storage_format"] === "v4") {
+      const structural = isRecord(workspace["structural"]) ? workspace["structural"] as JsonRecord : {};
+      const lexical = isRecord(workspace["lexical"]) ? workspace["lexical"] as JsonRecord : {};
+      const semantic = isRecord(workspace["semantic"]) ? workspace["semantic"] as JsonRecord : {};
+      const structuralQueryable = structural["queryable"] === true;
+      const lexicalCurrent = lexical["current"] === true;
+      const semanticCurrent = semantic["current"] === true;
+      lines.push(`  structural: queryable_gen=${structural["queryable_generation"] ?? "-"}, durable_gen=${structural["durable_generation"] ?? "-"}${structuralQueryable ? "" : " (lagging)"}`);
+      lines.push(`  lexical: completed_gen=${lexical["completed_generation"] ?? "-"} (${lexicalCurrent ? "current" : "lagging"})`);
+      const profileId = firstNonEmptyString(semantic["profile_id"]);
+      lines.push(`  semantic: completed_gen=${semantic["completed_generation"] ?? "-"} (${semanticCurrent ? "current" : "lagging"})${profileId !== undefined ? `, profile=${profileId}` : ""}`);
+      const lastScan = isRecord(workspace["last_scan"]) ? workspace["last_scan"] as JsonRecord : undefined;
+      if (lastScan !== undefined) {
+        const kind = firstNonEmptyString(lastScan["kind"]) ?? "?";
+        const changedPaths = typeof lastScan["changed_paths"] === "number" ? `, changed_paths=${lastScan["changed_paths"]}` : "";
+        const timings = isRecord(lastScan["timings"]) ? lastScan["timings"] as JsonRecord : undefined;
+        const wallMs = typeof timings?.["total_ms"] === "number" ? `, wall_ms=${timings["total_ms"]}` : "";
+        lines.push(`  last_scan: kind=${kind}${changedPaths}${wallMs}`);
+      }
+      if (!lexicalCurrent) lines.push("  hint: search_text will report partial until lexical catches up");
+      if (!semanticCurrent) lines.push("  hint: search_semantic is unavailable until semantic indexing catches up");
+    }
     const availableOperations = Array.isArray(workspace["available_operations"]) ? workspace["available_operations"].filter((value): value is string => typeof value === "string") : [];
     const blockedOperations = Array.isArray(workspace["blocked_operations"]) ? workspace["blocked_operations"].filter((value): value is string => typeof value === "string") : [];
     if (availableOperations.length > 0) lines.push(`  use now: ${availableOperations.map((operation) => operation.replace(/^core:/, "")).join(", ")}`);

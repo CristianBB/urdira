@@ -749,14 +749,39 @@ describe("Phase 7 generic source indexing", () => {
     await storage.close();
   });
 
-  it("rejects a v1 workspace index before any source reader is invoked", async () => {
+  // v4 (P4-b-prep, plan §9): before `DurableStorage.open`'s startup recovery
+  // sweep (`recoverMigrations`/`recoverWorkspaceGcEpochs`) branched on the
+  // index contract and caught `isOutdatedWorkspaceError`, a v1 workspace
+  // index here made `createDurableStorage` REJECT outright -- crashing
+  // `DaemonRuntime.start` (and so the WHOLE daemon, for every OTHER
+  // catalogued workspace too) the moment any one workspace was this stale.
+  // The fix records it as an `OutdatedWorkspaceRecord` and lets `open()`
+  // succeed instead; `packages/daemon/src/runtime.ts`'s `DaemonRuntime.start`
+  // reads `outdatedWorkspaces` and reschedules a Full scan for each one,
+  // which reaches `recreateOutdatedWorkspaceDatabase` via the identical
+  // `isOutdatedWorkspaceError` catch `scheduleWorkspaceScan` already applies
+  // mid-scan (see `docs/evidence/2026-09-02-v4-p4-a-static-gates.md` and
+  // `tests/phase-daemon-recreate-outdated.test.ts`) -- "before any source
+  // reader is invoked" is still true: this workspace is never opened.
+  it("records a v1 workspace index as outdated instead of aborting startup, before any source reader is invoked", async () => {
     const { root, storage } = await temporaryStorage();
     const registration = workspace("workspace:legacy-source-schema");
     const registered = await storage.catalog.registerWorkspace(registration);
     await storage.close();
     await markV1WorkspaceContract(registered.database_path);
 
-    await expect(createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 })).rejects.toMatchObject({ code: "core:index_contract_unsupported" });
+    const reopened = await createDurableStorage({ rootDir: root, inlineThresholdBytes: 8 });
+    try {
+      expect(reopened.outdatedWorkspaces).toEqual([
+        expect.objectContaining({
+          workspace_id: registration.workspace_id,
+          database_path: registered.database_path,
+          error_code: "core:index_contract_unsupported",
+        }),
+      ]);
+    } finally {
+      await reopened.close();
+    }
   });
 
   // The scan path never writes lexical rows at all (see the top-of-file

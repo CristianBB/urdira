@@ -18,7 +18,36 @@ export {
   SqliteCanonicalQuerySnapshotPort,
   type CanonicalQueryRecord,
   type CanonicalQuerySnapshotPort,
+  type IndexedGraphEdge,
 } from "./canonical-query-data-port.js";
+export { decodeRow as decodeCanonicalQueryRecordRow, type RecordRow as CanonicalQueryRecordRow } from "./query-record-decode.js";
+export { NativeCanonicalQuerySnapshotPort } from "./native-query-snapshot-port.js";
+export { convertV3WorkspaceToNativeStore, type ConvertV3WorkspaceToNativeStoreOptions, type ConvertV3WorkspaceToNativeStoreResult } from "./native-store-convert.js";
+export { loadNativeStructuralStoreAddon, resetNativeStructuralStoreAddonCacheForTests, type NativeStructuralStoreAddon } from "./native-structural-store-binding.js";
+export {
+  onRustWorkspaceUpgradeCompleted,
+  runRustWorkspaceScan,
+  type ChangedPath,
+  type ChangedPathKind,
+  type RustWorkspaceScanOutcome,
+  type RustWorkspaceScanTransport,
+  type ScanPriority,
+  type ScanRoots,
+  type ScanScope,
+  type ScanTimings,
+  type WorkspaceScanQueryable,
+  type WorkspaceScanRequest,
+  type WorkspaceScanResult,
+  type WorkspaceScanUpgradeCompleted,
+} from "./rust-workspace-scan.js";
+export {
+  ensureV4Workspace,
+  sidecarDatabasePathFor,
+  sidecarScanDirFor,
+  structuralStoreDirFor,
+  type EnsureV4WorkspaceInput,
+  type V4WorkspacePaths,
+} from "./workspace-v4-bootstrap.js";
 export { RecordBodyInterner } from "./record-body-interner.js";
 export {
   classifyWorkspaceConfigurationImpact,

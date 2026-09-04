@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -211,6 +211,98 @@ describe("Daemon watcher-burst scan aggregation (scan_aggregation_window_ms)", (
       // No 200ms(+) default window to wait out -- generous upper bound for
       // watcher delivery + scan scheduling latency alone.
       expect(elapsedMs).toBeLessThan(2_000);
+    } finally {
+      await stopAggregationDaemon(daemon);
+    }
+  }, 30_000);
+});
+
+/**
+ * P3-2 item 4: real end-to-end coverage (real `DaemonRuntime`, real
+ * filesystem watcher) of the rename delete+create coalescing fix in
+ * `packages/daemon/src/runtime.ts` (`mergeScanRequestIntoBuffer`,
+ * `flushScanAggregation`, the post-scan `pendingScans` follow-up) and
+ * `packages/engine/src/watchers.ts` (`WorkspaceWatcherManager`'s
+ * `on_reconcile` combining). Two real defects were found and fixed here:
+ * (1) a rename's create half, arriving in the SAME watcher batch/burst as
+ * its matching delete, used to be split into a SEPARATE `on_reconcile`
+ * call and then a SEPARATE generation even when nothing required that; (2)
+ * `flushScanAggregation`'s own dispatch for a buffer with pending deletes
+ * called `scheduleWorkspaceScan` a SECOND time for the buffered creates
+ * immediately after starting the delete scan, which (because the delete
+ * scan's own `scanInFlight`/`activeAuthoritativeDeletePhases` bookkeeping
+ * runs synchronously, before any `await`) re-entered the coalescing
+ * buffer as though it were a genuinely later, separate event and silently
+ * dropped it into a buffer field nothing downstream reads -- confirmed
+ * live as the root cause of a real daemon hang on the mutation harness's
+ * `rename` mutation kind, which had to be excluded from every
+ * daemon-driven measurement run before this fix.
+ *
+ * `tests/phase15-workspace-control.test.ts` covers the pure
+ * `WorkspaceWatcherManager` + `DeterministicFakeWatcher` unit-level
+ * behavior (including a deliberately OUT-OF-ORDER batch: a `presence`
+ * event before its matching `absence`) without a real daemon/scheduler in
+ * the loop at all; the two tests below instead exercise the FULL
+ * `scheduleWorkspaceScan`/aggregation-buffer machinery those fixes live in,
+ * end to end, against a real filesystem and a real `DaemonRuntime`.
+ */
+describe("Daemon rename coalescing (delete+create in one Changed, P3-2 item 4)", () => {
+  it("a create arriving before its matching delete (out of order, same burst) collapses into at most one scan, never dropping either half", async () => {
+    // A generous window: two independent real syscalls plus OS-level
+    // (FSEvents/parcel-watcher) batching latency, in a sandboxed CI-like
+    // environment, need more headroom than the debounce window alone to
+    // reliably land in the SAME app-level burst -- this test's own claim is
+    // about coalescing when they DO land together, not about guaranteeing
+    // they always will on every OS/filesystem, so the window is generous
+    // rather than tight.
+    const daemon = await startAggregationDaemon({ scan_aggregation_window_ms: 800, scan_aggregation_max_ms: 3_000 });
+    try {
+      const oldPath = join(daemon.workspaceRoot, "rename-source.txt");
+      await writeFile(oldPath, "content", "utf8");
+      await settledCallCount(daemon.resolveCalls, 600, 10_000);
+      const callsBefore = daemon.resolveCalls.length;
+      // Out of order and split across two real syscalls, both well inside
+      // the aggregation window: the CREATE half of a would-be rename lands
+      // before the DELETE half.
+      await writeFile(join(daemon.workspaceRoot, "rename-target.txt"), "content", "utf8");
+      await unlink(oldPath);
+      await pollUntil(() => daemon.resolveCalls.length > callsBefore, 10_000);
+      const settled = await settledCallCount(daemon.resolveCalls, 900, 10_000);
+      // At most 2 (one per half, if OS-level batching happened to split
+      // them into two app-level bursts despite the generous window -- not
+      // itself a regression this test polices) and at least 1 (proving
+      // neither half was silently dropped, which the pre-fix bug could do
+      // for the create half specifically).
+      expect(settled).toBeGreaterThanOrEqual(callsBefore + 1);
+      expect(settled).toBeLessThanOrEqual(callsBefore + 2);
+    } finally {
+      await stopAggregationDaemon(daemon);
+    }
+  }, 30_000);
+
+  it("a delete's own scan settling before a later, unrelated create (split across the burst boundary) does not drop the create", async () => {
+    const daemon = await startAggregationDaemon({ scan_aggregation_window_ms: 150, scan_aggregation_max_ms: 1_000 });
+    try {
+      const targetPath = join(daemon.workspaceRoot, "will-be-deleted.txt");
+      await writeFile(targetPath, "content", "utf8");
+      await settledCallCount(daemon.resolveCalls, 600, 10_000);
+      const callsBeforeDelete = daemon.resolveCalls.length;
+      await unlink(targetPath);
+      // Wait for the delete's OWN scan to start AND fully settle -- this is
+      // the "burst boundary": by the time the create below happens, the
+      // delete has already been dispatched and completed as its own
+      // generation, exactly the scenario `activeAuthoritativeDeletePhases`
+      // exists to gate. Before the fix, a create observed at this point
+      // could vanish into `pendingScans`'s `presencesAfterDeletes` field
+      // with nothing left to ever read it back out -- the daemon would
+      // simply never schedule another scan for it, which is the real hang
+      // this task's evidence doc reports for the mutation harness's
+      // `rename` kind.
+      await pollUntil(() => daemon.resolveCalls.length > callsBeforeDelete, 10_000);
+      const callsAfterDelete = await settledCallCount(daemon.resolveCalls, 600, 10_000);
+      expect(callsAfterDelete).toBeGreaterThan(callsBeforeDelete);
+      await writeFile(join(daemon.workspaceRoot, "recreated-later.txt"), "content", "utf8");
+      await pollUntil(() => daemon.resolveCalls.length > callsAfterDelete, 10_000);
     } finally {
       await stopAggregationDaemon(daemon);
     }

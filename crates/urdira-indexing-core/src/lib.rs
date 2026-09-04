@@ -32,6 +32,8 @@ pub const MAX_GROUP_ROWS: usize = 4_096;
 pub const MAX_GROUP_BYTES: usize = 16 * 1024 * 1024;
 mod workspace_v3_sql;
 pub use workspace_v3_sql::WORKSPACE_V3_SCHEMA_DIGEST;
+pub mod merkle_bucket;
+pub mod workspace_v4_sql;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreError(pub String);
@@ -621,6 +623,13 @@ fn promote_direct_publication_metadata(
             ],
         )
         .map_err(sql_error)?;
+    if debug_timing {
+        eprintln!(
+            "[urdira-indexing-core] promote_direct_publication_metadata candidate_descriptor_upsert_ms={}",
+            descriptor_upsert_started.elapsed().as_millis()
+        );
+    }
+    let projection_descriptor_upsert_started = Instant::now();
     transaction
         .execute(
             "INSERT INTO candidate_publication_projection_descriptors (candidate_generation_id, workspace_id, projection_count, dependency_count, value_node_count, first_projection_record_id, last_projection_record_id, projection_sequence_digest, sealed_at) VALUES (?1, ?2, 0, 0, 0, NULL, NULL, 'rust:empty', ?3) ON CONFLICT(candidate_generation_id) DO UPDATE SET workspace_id = excluded.workspace_id, projection_count = 0, dependency_count = 0, value_node_count = 0, first_projection_record_id = NULL, last_projection_record_id = NULL, projection_sequence_digest = 'rust:empty', sealed_at = excluded.sealed_at WHERE candidate_publication_projection_descriptors.workspace_id = excluded.workspace_id AND candidate_publication_projection_descriptors.projection_count = 0 AND candidate_publication_projection_descriptors.dependency_count = 0 AND candidate_publication_projection_descriptors.value_node_count = 0 AND candidate_publication_projection_descriptors.first_projection_record_id IS NULL AND candidate_publication_projection_descriptors.last_projection_record_id IS NULL AND candidate_publication_projection_descriptors.projection_sequence_digest = 'rust:empty'",
@@ -629,8 +638,8 @@ fn promote_direct_publication_metadata(
         .map_err(sql_error)?;
     if debug_timing {
         eprintln!(
-            "[urdira-indexing-core] promote_direct_publication_metadata descriptor_upsert_ms={}",
-            descriptor_upsert_started.elapsed().as_millis()
+            "[urdira-indexing-core] promote_direct_publication_metadata projection_descriptor_upsert_ms={}",
+            projection_descriptor_upsert_started.elapsed().as_millis()
         );
     }
     Ok(())
@@ -1852,13 +1861,20 @@ impl IndexingCore {
                     |row| row.get::<_, bool>(0),
                 )
                 .map_err(sql_error)?;
+        let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
         if !cold_direct {
+            let temp_index_started = Instant::now();
             self.connection
                 .execute_batch("CREATE INDEX IF NOT EXISTS urdira_core_owner_rows_publication_order ON urdira_core_owner_rows (lane, publication_record_id, owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, row_ordinal); CREATE INDEX IF NOT EXISTS urdira_core_owner_rows_record_id ON urdira_core_owner_rows (lane, publication_record_id); CREATE INDEX IF NOT EXISTS urdira_core_owner_rows_dependency_binding ON urdira_core_owner_rows (owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, lane, proposal_key); CREATE INDEX IF NOT EXISTS urdira_core_owner_facets_join ON urdira_core_owner_facets (owner_artifact_id, owner_artifact_version_id, observation_lane, sequence, row_ordinal, facet_ordinal);")
                 .map_err(sql_error)?;
+            if debug_timing {
+                eprintln!(
+                    "[urdira-indexing-core] publish temp_index_create_ms={}",
+                    temp_index_started.elapsed().as_millis()
+                );
+            }
             debug_log_missing_incremental_indexes(&self.connection);
         }
-        let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
         if debug_timing {
             eprintln!(
                 "[urdira-indexing-core] publish prepare_ms={}",
@@ -2470,6 +2486,26 @@ impl<T> OptionalRow<T> for Result<T, rusqlite::Error> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // P2-1: the Rust workspace_v4_sql mirror is generated from the same SQL
+    // authorities as the TypeScript side (scripts/generate-workspace-v4-sql.mjs);
+    // this guards against the two drifting the way workspace_v3_sql's digest
+    // guards the v3 schema (see WORKSPACE_V3_SCHEMA_DIGEST above).
+    #[test]
+    fn workspace_v4_schema_matches_sql_authority() {
+        assert_eq!(
+            crate::workspace_v4_sql::WORKSPACE_V4_SCHEMA,
+            include_str!("../../../packages/storage/sql/workspace-v4.sql")
+        );
+        assert_eq!(
+            crate::workspace_v4_sql::WORKSPACE_V4_LEXICAL_SCHEMA,
+            include_str!("../../../packages/storage/sql/workspace-v4-lexical.sql")
+        );
+        assert_eq!(
+            crate::workspace_v4_sql::WORKSPACE_V4_SEMANTIC_SCHEMA,
+            include_str!("../../../packages/storage/sql/workspace-v4-semantic.sql")
+        );
+    }
 
     fn request() -> GenerationRequest {
         GenerationRequest {

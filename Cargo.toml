@@ -5,10 +5,16 @@ members = [
   "crates/urdira-jsts-indexing-engine",
   "crates/urdira-launcher",
   "crates/urdira-jsts-syntax-worker",
+  "crates/urdira-jsts-typeflow",
   "crates/urdira-jsts-native-projection",
   "crates/urdira-native-core",
   "crates/urdira-native-node",
   "crates/urdira-worker-protocol",
+  "crates/urdira-v4-spike",
+  "crates/urdira-fs-watch",
+  "crates/urdira-structural-store",
+  "crates/urdira-source-frontier",
+  "crates/urdira-tsgo-client",
 ]
 exclude = ["fuzz"]
 resolver = "3"

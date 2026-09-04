@@ -125,7 +125,64 @@ describe("Urdira Canonical Encoding", () => {
   });
 
   it("publishes the complete core canonical registries", () => {
-    expect(canonicalSchemaRegistry).toHaveLength(48);
+    // v4 (index_contract 0x34) added exactly one new schema coordinate,
+    // core:RecordSetMerkleRoot@1 (packages/canonical/src/merkle-bucket.ts's
+    // BucketedMerkleSet root shape), alongside the pre-existing v3
+    // core:RecordSetDigestEntry@1 -- the two coexist, v4 never replaces v3.
+    // Assert the exact resulting id set, not just its length, so a future
+    // accidental addition/removal is caught by name.
+    expect(canonicalSchemaRegistry).toHaveLength(49);
+    expect(canonicalSchemaRegistry.map((schema) => schema.id).toSorted()).toEqual([
+      "core:AnalysisConfiguration@1",
+      "core:AnalysisRelevantArtifactMetadata@1",
+      "core:AnalyzerImplementationManifest@1",
+      "core:ArtifactAnalysisContext@1",
+      "core:ArtifactPartitionKey@1",
+      "core:Bytes@1",
+      "core:CallablePartitionKey@1",
+      "core:CandidateRegistryState@1",
+      "core:CompareWorkspacesArguments@1",
+      "core:CompatibilityRequirementValue@1",
+      "core:CoreRegistryDefinition@1",
+      "core:CoreRegistryManifest@1",
+      "core:DefinitionToInstancesArguments@1",
+      "core:ExplainArchitectureSliceArguments@1",
+      "core:FindRelevantTestsArguments@1",
+      "core:FrameworkPartitionKey@1",
+      "core:FrozenCandidateDigestInputs@1",
+      "core:GeneratorConfiguration@1",
+      "core:LocateImplementationArguments@1",
+      "core:ModelAssetManifest@1",
+      "core:ModelPackRuntimeConfiguration@1",
+      "core:NormalizedConfigurationLayer@1",
+      "core:NormalizedIndexStatusProjection@1",
+      "core:NormalizedQueryPlan@1",
+      "core:NormalizedResponseBudget@1",
+      "core:NormalizedResultProjection@1",
+      "core:PluginPackageManifest@1",
+      "core:PluginRuntimeExecutableBinding@1",
+      "core:PrepareNewFeatureArguments@1",
+      "core:PrepareSymbolChangeArguments@1",
+      "core:ProjectPartitionKey@1",
+      "core:ProjectionSetDigestItem@1",
+      "core:QueryConfiguration@1",
+      "core:QueryableVectorDigestEntry@1",
+      "core:RecipeStaticArguments@1",
+      "core:RecordSetDigestEntry@1",
+      "core:RecordSetMerkleRoot@1",
+      "core:ResolveAndFindReferencesArguments@1",
+      "core:RetentionRootReference@1",
+      "core:RuntimeComponentBehaviorManifest@1",
+      "core:RuntimeComponentImplementationManifest@1",
+      "core:RuntimeComponentImplementationManifest@2",
+      "core:SemanticToCallersArguments@1",
+      "core:SourceProviderConfiguration@1",
+      "core:StoredObjectReference@1",
+      "core:TokenizerAssetManifest@1",
+      "core:TraceBehaviorArguments@1",
+      "core:UnderstandChangeImpactArguments@1",
+      "core:VisibleSourceStateSet@1",
+    ]);
     expect(canonicalComparatorRegistry).toHaveLength(18);
     expect(canonicalEncodingErrorDetailContracts).toHaveLength(canonicalEncodingErrorCodeRegistry.length);
     expect(digestFieldContracts).toHaveLength(142);

@@ -15,6 +15,8 @@ serde.workspace = true
 serde_json.workspace = true
 urdira-native-core = { version = "=0.1.0", path = "../urdira-native-core" }
 urdira-jsts-native-projection = { version = "=0.1.0", path = "../urdira-jsts-native-projection" }
+urdira-structural-store = { version = "=0.1.0", path = "../urdira-structural-store" }
+sha2.workspace = true
 
 [build-dependencies]
 napi-build.workspace = true

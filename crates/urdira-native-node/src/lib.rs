@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+mod structural_store_napi;
+
 use napi::{Error, Result, Status, bindgen_prelude::Uint8Array};
 use napi_derive::napi;
 use serde::de::DeserializeOwned;

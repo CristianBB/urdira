@@ -1,0 +1,16 @@
+[package]
+name = "urdira-jsts-typeflow"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+license = "MIT"
+
+[dependencies]
+oxc_allocator = "=0.142.0"
+oxc_ast = "=0.142.0"
+oxc_ast_visit = { version = "=0.142.0", features = ["serialize"] }
+oxc_parser = "=0.142.0"
+oxc_semantic = "=0.142.0"
+oxc_span = "=0.142.0"
+oxc_syntax = "=0.142.0"
+serde = { version = "=1.0.228", features = ["derive"] }

@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
-import { ContentAddressedStore, createDurableStorage, createFaultInjector, openSqliteDatabase, SerializedWriter, WORKSPACE_WRITER_BUSY_CODE } from "../packages/storage/src/index.js";
+import { ContentAddressedStore, createDurableStorage, createFaultInjector, openSqliteDatabase, SerializedWriter, WORKSPACE_V4_INDEX_CONTRACT, WORKSPACE_V4_SCHEMA, WORKSPACE_WRITER_BUSY_CODE } from "../packages/storage/src/index.js";
 import type { SqliteCommand, SqliteValue } from "../packages/storage/src/index.js";
 import type {
   ArtifactTombstone,
@@ -1918,6 +1919,78 @@ describe("Phase 4 durable storage", () => {
       await raw.run("INSERT INTO workspace_meta (key, value) VALUES ('identity_format', ?)", [encodeCanonical(1)]);
       await raw.close();
       await expect(storage.openWorkspace(workspace.workspace_id)).rejects.toMatchObject({ code: "storage:workspace_format_outdated" });
+    });
+  });
+
+  // ensureIdentityFormat's own decodeCanonical(...) call throwing (as opposed
+  // to decoding cleanly to an absent-or-wrong format value, both already
+  // covered above) is a distinct branch: a marker whose BYTES are not valid
+  // canonical data at all (as opposed to a validly-decoded, merely-wrong
+  // value). This is the v3 path; the next test below is its v4 mirror.
+  it("rejects opening a v3 workspace whose identity-format marker bytes are not valid canonical data", async () => {
+    await withStorage(async (root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      await opened.close();
+      const raw = await openSqliteDatabase({ filename: join(root, "workspaces", "ws-one.sqlite") });
+      // A single 0xff byte is not a valid canonical-encoding type tag.
+      await raw.run("UPDATE workspace_meta SET value = ? WHERE key = 'identity_format'", [Uint8Array.of(0xff)]);
+      await raw.close();
+      await expect(storage.openWorkspace(workspace.workspace_id)).rejects.toMatchObject({
+        code: "storage:workspace_format_outdated",
+        message: expect.stringContaining("identity-format marker is unreadable"),
+        details: expect.objectContaining({ cause: expect.any(String) }),
+      });
+    });
+  });
+
+  // v4 (index_contract 0x34) analogue of the v3 tests above:
+  // `ensureIdentityFormatV4` is a separate function (checked against
+  // `V4_IDENTITY_FORMAT` instead of `CURRENT_IDENTITY_FORMAT`) with its own
+  // missing/unreadable/wrong-value branches. Builds the v4 database file
+  // directly (schema + workspace_meta rows) the same way
+  // `tests/workspace-fork-v4.test.ts`/`tests/v4-verify.test.ts` do for their
+  // real-scan fixtures, but needs no native worker binary at all here: this
+  // only exercises `openWorkspace`'s identity-format gate, not a real scan.
+  it("rejects opening a v4 workspace whose identity-format marker bytes are not valid canonical data", async () => {
+    await withStorage(async (root, storage) => {
+      const v4Workspace: Workspace = { ...workspace, workspace_id: "ws-v4-corrupt-identity" };
+      const databasePath = join(root, "workspaces", "ws-v4-corrupt-identity.sqlite");
+      await mkdir(join(root, "workspaces"), { recursive: true });
+      const db = new DatabaseSync(databasePath);
+      db.exec(WORKSPACE_V4_SCHEMA);
+      const insertMeta = db.prepare("INSERT INTO workspace_meta (key, value) VALUES (?, ?)");
+      insertMeta.run("index_contract", Uint8Array.of(WORKSPACE_V4_INDEX_CONTRACT));
+      insertMeta.run("identity_format", Uint8Array.of(0xff));
+      insertMeta.run("structural_store", encodeCanonical("native"));
+      db.close();
+
+      await storage.catalog.registerWorkspace(v4Workspace, databasePath);
+      await expect(storage.openWorkspace(v4Workspace.workspace_id)).rejects.toMatchObject({
+        code: "storage:workspace_format_outdated",
+        message: expect.stringContaining("identity-format marker is unreadable"),
+        details: expect.objectContaining({ cause: expect.any(String) }),
+      });
+    });
+  });
+
+  // bindWorkspaceIdentity's own decodeCanonical(...) call throwing (shared by
+  // both the v3 and v4 openWorkspace branches) is distinct from the
+  // already-covered "decodes cleanly but names a DIFFERENT workspace" branch
+  // exercised above ("binds repositories and publication to their workspace
+  // database identity").
+  it("rejects opening a workspace whose workspace_id binding marker bytes are not valid canonical data", async () => {
+    await withStorage(async (root, storage) => {
+      await storage.catalog.registerWorkspace(workspace);
+      const opened = await storage.openWorkspace(workspace.workspace_id);
+      await opened.close();
+      const raw = await openSqliteDatabase({ filename: join(root, "workspaces", "ws-one.sqlite") });
+      await raw.run("UPDATE workspace_meta SET value = ? WHERE key = 'workspace_id'", [Uint8Array.of(0xff)]);
+      await raw.close();
+      await expect(storage.openWorkspace(workspace.workspace_id)).rejects.toMatchObject({
+        code: "storage:workspace_binding_mismatch",
+        message: "Workspace database identity is not valid canonical data.",
+      });
     });
   });
 

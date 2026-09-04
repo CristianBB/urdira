@@ -595,6 +595,23 @@ export const inlineSchemaSpecs: readonly InlineSchemaSpec[] = [
     ]
   },
   {
+    "id": "core:RecordSetMerkleRoot@1",
+    "fields": [
+      {
+        "name": "root",
+        "optional": false,
+        "type": "Digest",
+        "description": "The depth-5 bucketed-Merkle tree root (plan section 8.2) over the set's key/logical pairs; 32 zero bytes for an empty set."
+      },
+      {
+        "name": "count",
+        "optional": false,
+        "type": "Count",
+        "description": "The number of visible members folded into root."
+      }
+    ]
+  },
+  {
     "id": "core:RetentionRootReference@1",
     "fields": [
       {

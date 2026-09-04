@@ -2,7 +2,7 @@
 /* c8 ignore file -- this benchmark harness is exercised by explicit n8n runs, not the unit-test corpus. */
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { cp, mkdir, mkdtemp, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -23,13 +23,25 @@ import {
 
 function sha256(bytes) { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
 
+// Two directories are disjoint when neither contains the other. Compares
+// trailing-separator-normalized paths so a prefix match like
+// "/a/bench" vs "/a/bench-2" is not mistaken for containment.
+function assertDisjointPaths(pathA, pathB, labelA, labelB) {
+  const withSep = (path) => (path.endsWith("/") ? path : `${path}/`);
+  const normalizedA = withSep(pathA);
+  const normalizedB = withSep(pathB);
+  if (normalizedA === normalizedB || normalizedA.startsWith(normalizedB) || normalizedB.startsWith(normalizedA)) {
+    throw new Error(`${labelA} (${pathA}) and ${labelB} (${pathB}) must be disjoint paths.`);
+  }
+}
+
 function parseArguments(argv) {
   const result = { owners: 1000, mutations: 60, mutation_start: 0, readiness_timeout_ms: 120_000 };
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
     const value = argv[index + 1];
     if (value === undefined) throw new Error(`${key} requires a value.`);
-    if (["--corpus", "--native-root", "--output", "--owners", "--mutations", "--mutation-start", "--readiness-timeout-ms"].includes(key)) {
+    if (["--corpus", "--native-root", "--output", "--data-root", "--owners", "--mutations", "--mutation-start", "--readiness-timeout-ms"].includes(key)) {
       if (key === "--owners" || key === "--mutations" || key === "--mutation-start" || key === "--readiness-timeout-ms") {
         const parsed = Number(value);
         const minimum = key === "--mutation-start" ? 0 : 1;
@@ -42,15 +54,33 @@ function parseArguments(argv) {
     throw new Error(`Unknown argument: ${key}`);
   }
   for (const field of ["corpus", "native_root", "output"]) if (!isAbsolute(result[field] ?? "")) throw new Error(`--${field.replaceAll("_", "-")} requires an absolute path.`);
+  if (result.data_root !== undefined && !isAbsolute(result.data_root)) throw new Error("--data-root requires an absolute path.");
   return result;
 }
 
 async function run(options) {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "urdira-n8n-incremental-"));
   const corpus = join(temporaryRoot, "corpus");
-  const dataRoot = join(temporaryRoot, "data");
+  // An explicit --data-root retains the published workspace database past
+  // this run (e.g. for a later spike to read directly), so it must live
+  // outside the temporary root that gets deleted in the `finally` block
+  // below, and it must never overlap the source corpus.
+  const usesExternalDataRoot = options.data_root !== undefined;
+  const dataRoot = options.data_root ?? join(temporaryRoot, "data");
   const tracePath = join(temporaryRoot, "trace.json");
   await mkdir(corpus);
+  if (usesExternalDataRoot) {
+    assertDisjointPaths(dataRoot, options.corpus, "--data-root", "--corpus");
+    assertDisjointPaths(dataRoot, temporaryRoot, "--data-root", "the temporary run root");
+    let existingEntries = [];
+    try {
+      existingEntries = await readdir(dataRoot);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (existingEntries.length > 0) throw new Error(`--data-root (${dataRoot}) must be an empty or absent directory.`);
+    await mkdir(dataRoot, { recursive: true });
+  }
   let controller;
   let nativeClosure;
   try {

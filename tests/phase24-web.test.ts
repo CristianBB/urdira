@@ -7,7 +7,7 @@ import { startUrdiraWeb, type UrdiraWebHandle } from "../packages/web/src/server
 import { graphDataFromPage } from "../packages/web/src/client/graph-data.js";
 import { buildOperationRequest, buildSearchRequest } from "../packages/web/src/client/query.js";
 import { resolveThemePreference, toggledTheme } from "../packages/web/src/client/theme.js";
-import { operationAvailability, shouldUseRetainedSnapshot, workspaceHealthIssue } from "../packages/web/src/client/workspace-health.js";
+import { operationAvailability, shouldUseRetainedSnapshot, workspaceHealthIssue, workspaceV4Lanes } from "../packages/web/src/client/workspace-health.js";
 import {
   initialSchemaValue,
   parseMcpRequest,
@@ -161,6 +161,37 @@ describe("local Urdira web composition", () => {
       action: "none",
     });
     expect(workspaceHealthIssue({ status: "indexing", indexing_activity: "indexing" })).toMatchObject({ title: "Indexing is in progress" });
+  });
+
+  // P4-d: `workspaceV4Lanes` projects `core:index_status`'s additive v4
+  // lane fields (`v4StatusFields`, `packages/daemon/src/runtime.ts`) into
+  // the small shape the workspace card renders -- generations, a
+  // current/lagging flag per lane, and the last scan's kind/paths/wall time
+  // plus its queryable/durable timeline milestones.
+  it("projects a v4 workspace's lane generations and last-scan timeline", () => {
+    const lanes = workspaceV4Lanes({
+      storage_format: "v4",
+      structural: { queryable_generation: 7, durable_generation: 6, queryable: true },
+      lexical: { completed_generation: 5, current: false },
+      semantic: { current: false },
+      last_scan: { kind: "changed", changed_paths: 3, timings: { total_ms: 940 }, timeline: { queryable_at: 120, completed_at: 180 } },
+    });
+    expect(lanes).toEqual({
+      structural: { generation_label: "q7/d6", current: true },
+      lexical: { generation_label: "5", current: false },
+      semantic: { generation_label: "-", current: false },
+      last_scan: { kind: "changed", changed_paths: 3, wall_ms: 940, queryable_at_ms: 120, completed_at_ms: 180 },
+    });
+  });
+
+  // A v3 workspace's `index_status` never sets `storage_format: "v4"` (a v3
+  // payload either omits `storage_format` entirely on an older cached
+  // response, or carries `"v3"`) -- `workspaceV4Lanes` must return
+  // `undefined` for both, so the card renders no v4 lane block at all.
+  it("returns undefined for a v3 workspace (and for a missing index_status)", () => {
+    expect(workspaceV4Lanes({ storage_format: "v3", structural_ready: true })).toBeUndefined();
+    expect(workspaceV4Lanes({})).toBeUndefined();
+    expect(workspaceV4Lanes(undefined)).toBeUndefined();
   });
 
   it("builds and synchronizes MCP requests from advertised JSON schemas", () => {

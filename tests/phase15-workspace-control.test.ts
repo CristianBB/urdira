@@ -126,6 +126,60 @@ describe("MCP index status v3", () => {
     ]);
   });
 
+  // P4-d: compact-text rendering of a v4 workspace's lane fields
+  // (`v4StatusFields`, `packages/daemon/src/runtime.ts`) via
+  // `urdira_index_status`'s default text render (`renderIndexStatusText`,
+  // `packages/mcp/src/index.ts`). A stubbed daemon `client.call` stands in
+  // for the real daemon here (this test never spins one up) -- it returns
+  // the exact wire shape `v4StatusFields` produces for a v4 workspace whose
+  // lexical lane has NOT yet caught up to its durable structural
+  // generation, so the "lagging"/hint lines below have something to fire on.
+  test("renders v4 lane generations, a lagging lexical hint, and the last-scan summary as compact text", async () => {
+    const tools = createUrdiraToolDefinitions({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success", payload: { workspaces: [{
+      workspace_id: "workspace-v4", display_root: "project-v4", workspace_status: "ready", freshness_status: "current",
+      source_ready: true, structural_ready: true, semantic_ready: false,
+      storage_format: "v4",
+      structural: { queryable_generation: 3, durable_generation: 3, queryable: true },
+      lexical: { completed_generation: 2, current: false },
+      semantic: { current: false },
+      last_scan: { kind: "changed", changed_paths: 4, timings: { total_ms: 812 } },
+      search_text_ready: false,
+      search_semantic_ready: false,
+      plugins: [], capabilities: [],
+    }] } }) } });
+    const status = tools.find((tool) => tool.name === "urdira_index_status")!;
+    const response = await status.invoke({ requestType: "initial", apiVersion: 3, workspaceIds: [], includeCapabilities: false, includePlugins: false, includeActivationIssues: false, includeCandidateIssues: false, includeConfigurationIssues: false, responseBudget: { maxItems: 10, maxCharacters: 10_000 } });
+    const text = response.content.find((block): block is { type: "text"; text: string } => block.type === "text")!.text;
+    expect(text).toContain("workspace_id=workspace-v4 (project-v4): ready");
+    expect(text).toContain("structural: queryable_gen=3, durable_gen=3");
+    expect(text).toContain("lexical: completed_gen=2 (lagging)");
+    expect(text).toContain("semantic: completed_gen=- (lagging)");
+    expect(text).toContain("last_scan: kind=changed, changed_paths=4, wall_ms=812");
+    expect(text).toContain("hint: search_text will report partial until lexical catches up");
+    expect(text).toContain("hint: search_semantic is unavailable until semantic indexing catches up");
+  });
+
+  // A v3 workspace never sets `storage_format`/`structural`/`lexical`/
+  // `semantic`/`last_scan` at all (`v4StatusFields` only ever emits
+  // `storage_format: "v3"` alongside them for a v3 workspace, and
+  // `renderIndexStatusText`'s v4 block is gated on `storage_format === "v4"`)
+  // -- this pins that a v3 render carries none of the new lines.
+  test("keeps the v3 render free of v4 lane lines", async () => {
+    const tools = createUrdiraToolDefinitions({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success", payload: { workspaces: [{
+      workspace_id: "workspace-v3", display_root: "project-v3", workspace_status: "ready", freshness_status: "current",
+      source_ready: true, structural_ready: true, semantic_ready: true,
+      storage_format: "v3",
+      plugins: [], capabilities: [],
+    }] } }) } });
+    const status = tools.find((tool) => tool.name === "urdira_index_status")!;
+    const response = await status.invoke({ requestType: "initial", apiVersion: 3, workspaceIds: [], includeCapabilities: false, includePlugins: false, includeActivationIssues: false, includeCandidateIssues: false, includeConfigurationIssues: false, responseBudget: { maxItems: 10, maxCharacters: 10_000 } });
+    const text = response.content.find((block): block is { type: "text"; text: string } => block.type === "text")!.text;
+    expect(text).toContain("workspace_id=workspace-v3 (project-v3): ready");
+    expect(text).not.toContain("structural: queryable_gen");
+    expect(text).not.toContain("last_scan:");
+    expect(text).not.toContain("hint: search_text will report partial");
+  });
+
   test("publishes an actionable unregistered-root operation error", () => {
     const definition = operationErrorDefinitions.find((entry) => entry.code === "core:workspace_not_registered");
     expect(definition).toMatchObject({ retryable_default: false, recovery_actions: ["register_workspace"] });
@@ -398,7 +452,18 @@ describe("workspace watcher lifecycle", () => {
     await manager.stop("workspace-1");
   });
 
-  test("splits authoritative delete and rename presence into ordered generations", async () => {
+  test("P3-2 item 4: a cross-path rename (delete + create in one batch) reaches on_reconcile as ONE combined call", async () => {
+    // Was: "splits authoritative delete and rename presence into ordered
+    // generations" -- two SEQUENTIAL `on_reconcile` calls. Fixed: the v4
+    // worker already accepts a delete and a create together in one
+    // `ScanScope::Changed{paths}` and handles it as a single rename
+    // generation (`crates/urdira-indexing-worker/src/v4/delta.rs`), and a
+    // real bug in the daemon's own aggregation buffering
+    // (`packages/daemon/src/runtime.ts`'s `flushScanAggregation`) could
+    // silently DROP the create half entirely when the two callbacks landed
+    // far enough apart -- see that file's own `mergeScanRequestIntoBuffer`/
+    // `flushScanAggregation` comments for the full mechanism. A cross-path
+    // rename now reaches `on_reconcile` as one call with both halves.
     const watcher = new DeterministicFakeWatcher({ workspace_id: "workspace-1", source_provider_binding_id: "binding-1", source_provider: "core:directory_source_provider", source_provider_version: "1", ordering_domain: "fs:1", root: "/tmp/project", authoritative_delete_events: true });
     const reconciled: { readonly changedUris: readonly string[] | undefined; readonly deletes: readonly string[] }[] = [];
     const manager = new WorkspaceWatcherManager({ on_reconcile: async (_workspaceId, changedUris, _reason, deletes = []) => { reconciled.push({ changedUris, deletes: deletes.map((event) => event.normalized_uri) }); } });
@@ -406,9 +471,26 @@ describe("workspace watcher lifecycle", () => {
     watcher.emit([{ event_class: "absence", normalized_uri: "src/old.ts" }, { event_class: "presence", normalized_uri: "src/new.ts" }]);
     await watcher.idle();
     await manager.idle();
+    expect(reconciled).toEqual([{ changedUris: ["src/new.ts"], deletes: ["src/old.ts"] }]);
+    await manager.stop("workspace-1");
+  });
+
+  test("a same-path delete-then-recreate still splits into ordered generations", async () => {
+    // Unlike a cross-path rename, a delete and a presence for the SAME uri
+    // cannot be folded into one `ChangedPath` entry: `mapV4ChangedPaths`
+    // (`packages/daemon/src/runtime.ts`) dedupes by path with delete
+    // winning, so combining them would silently discard the recreate. This
+    // case must keep splitting into two ordered `on_reconcile` calls.
+    const watcher = new DeterministicFakeWatcher({ workspace_id: "workspace-1", source_provider_binding_id: "binding-1", source_provider: "core:directory_source_provider", source_provider_version: "1", ordering_domain: "fs:1", root: "/tmp/project", authoritative_delete_events: true });
+    const reconciled: { readonly changedUris: readonly string[] | undefined; readonly deletes: readonly string[] }[] = [];
+    const manager = new WorkspaceWatcherManager({ on_reconcile: async (_workspaceId, changedUris, _reason, deletes = []) => { reconciled.push({ changedUris, deletes: deletes.map((event) => event.normalized_uri) }); } });
+    await manager.start({ workspace_id: "workspace-1", watcher });
+    watcher.emit([{ event_class: "absence", normalized_uri: "src/same.ts" }, { event_class: "presence", normalized_uri: "src/same.ts" }]);
+    await watcher.idle();
+    await manager.idle();
     expect(reconciled).toEqual([
-      { changedUris: [], deletes: ["src/old.ts"] },
-      { changedUris: ["src/new.ts"], deletes: [] },
+      { changedUris: [], deletes: ["src/same.ts"] },
+      { changedUris: ["src/same.ts"], deletes: [] },
     ]);
     await manager.stop("workspace-1");
   });
