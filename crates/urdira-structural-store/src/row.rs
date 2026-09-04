@@ -110,6 +110,61 @@ pub struct Dictionaries {
     pub subject_text: Vec<String>,
 }
 
+pub const PENDING_SITE_KIND_CALL: u8 = 1;
+pub const PENDING_SITE_KIND_INHERITS: u8 = 2;
+pub const PENDING_SITE_KIND_IMPLEMENTS: u8 = 3;
+
+/// One unresolved call/heritage site awaiting the residual tsgo pass --
+/// the compact side-table counterpart of what used to be a full
+/// `RecordRow` with `classification: "possible"` and no target. The
+/// store never interprets `reason` (an opaque producer-assigned code);
+/// its only consumers are the residual checker and this crate's own
+/// tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSiteRow {
+    pub owner_artifact: u32,
+    pub owner_version: u32,
+    pub valid_from: u32,
+    pub valid_to: u32, // 0 == open, same convention as RecordRow
+    pub start: u32,    // UTF-16 code-unit offset, same convention as RecordRow::span_start_byte
+    pub end: u32,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub site_kind: u8, // one of the PENDING_SITE_KIND_* constants
+    pub reason: u8,
+    pub source_subject: Option<u32>, // ordinal into Dictionaries::subjects
+}
+
+impl PendingSiteRow {
+    /// This row's identity within a store: `(owner_artifact, start, end,
+    /// site_kind)`. Field order matches [`PendingSiteKey`]'s own derived
+    /// `Ord` exactly, which is also the on-disk sort order -- so sorting
+    /// a slice of rows by `.key()` IS sorting them into on-disk order.
+    pub fn key(&self) -> PendingSiteKey {
+        PendingSiteKey {
+            owner_artifact: self.owner_artifact,
+            start: self.start,
+            end: self.end,
+            site_kind: self.site_kind,
+        }
+    }
+}
+
+/// Identity of one pending site within a store: `(owner_artifact, start,
+/// end, site_kind)`. A key closes at most once per delta (mirrors
+/// `record_id`/`dependency_id` for `closures.records`/`closures.deps`),
+/// but -- unlike those two -- is not itself a stored digest: `closures.
+/// pending` inlines the four identity fields directly (20-byte fixed
+/// entries) rather than referencing a 32-byte key file, since there is no
+/// `pending.keys` file to reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PendingSiteKey {
+    pub owner_artifact: u32,
+    pub start: u32,
+    pub end: u32,
+    pub site_kind: u8,
+}
+
 impl Dictionaries {
     /// The entries in `self` beyond what `base` already has, assuming
     /// `self` extends `base` by simple append (asserted by callers via

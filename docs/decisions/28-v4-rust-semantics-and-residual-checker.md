@@ -295,3 +295,19 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
 - Whether the hybrid lane's actual diagnostic emission call sites exclude
   externally-resolved sites was verified only against the schema's stated
   intent, not line by line (P1-D-g §4).
+
+## Amendment 2026-09-05 (see `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`)
+
+- **Entity synthesis for members** is no longer the normal path: the cold producer now
+  materializes class/interface members (including constructor parameter properties), referenced
+  parameters, catch/rest bindings, ambient `declare module` namespaces and external
+  package/symbol entities, all with the identity recipes typeflow and v3 use. The residual pass
+  reuses the cold entity through its `(path, name_start)` index and only synthesizes when a
+  target is genuinely absent.
+- **Classification invariant** is replaced: no relation record without a target exists any more.
+  Unresolved call/heritage sites live in the store's `pending.sites` table (reason codes 0-9),
+  a `possible` relation record always carries a `target_id` (overload/union candidates, facet
+  `core:indirect`), and the `jsts:unresolved_call` diagnostic record is gone (its `reason` moved
+  to the pending site). The residual pass reads `pending.sites`, closes the site and any
+  candidate rows at the same span when it confirms a target, and additionally publishes
+  inferred types, `type_of` relations and compiler diagnostics in the same upgrade generation.

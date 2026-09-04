@@ -3,18 +3,21 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingIdentifier, BindingPattern, CallExpression, Class, ClassType, Declaration,
-    ExportAllDeclaration, ExportNamedDeclaration, ExportSpecifier, Expression, Function,
-    FunctionType, ImportDeclaration, ImportExpression, ModuleExportName, TSEnumDeclaration,
-    TSInterfaceDeclaration, TSTypeAliasDeclaration, VariableDeclaration,
+    ExportAllDeclaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
+    ExportNamedDeclaration, ExportSpecifier, Expression, Function, FunctionType, ImportDeclaration,
+    ImportExpression, ModuleExportName, Statement, TSEnumDeclaration, TSInterfaceDeclaration,
+    TSModuleDeclaration, TSModuleDeclarationBody, TSModuleDeclarationName, TSTypeAliasDeclaration,
+    VariableDeclaration,
 };
 use oxc_ast_visit::{
     Visit,
     utf8_to_utf16::Utf8ToUtf16,
     walk::{
         walk_call_expression, walk_class, walk_export_all_declaration,
-        walk_export_named_declaration, walk_export_specifier, walk_function,
-        walk_import_declaration, walk_import_expression, walk_ts_enum_declaration,
-        walk_ts_interface_declaration, walk_ts_type_alias_declaration, walk_variable_declaration,
+        walk_export_default_declaration, walk_export_named_declaration, walk_export_specifier,
+        walk_function, walk_import_declaration, walk_import_expression, walk_ts_enum_declaration,
+        walk_ts_interface_declaration, walk_ts_module_declaration, walk_ts_type_alias_declaration,
+        walk_variable_declaration,
     },
 };
 use oxc_parser::Parser;
@@ -33,10 +36,15 @@ use urdira_worker_protocol::{
 
 mod resolver;
 mod semantic_sites;
-pub use resolver::{ConfigAsset, ExportResolution, WorkspaceResolver, resolve_named_export};
+pub use resolver::{
+    AmbientModuleIndex, ConfigAsset, ExportResolution, WorkspaceResolver, resolve_named_export,
+};
 pub use semantic_sites::{
-    HybridResolutionContext, OwnerSemantics, SemanticSite, SiteDisposition, SiteKind,
-    TypeflowOracleHit, analyze_owner_semantics, analyze_owner_semantics_with_context,
+    HybridResolutionContext, OwnerSemantics, PendingReasonCode, PendingSiteKind,
+    PendingSiteProposal, REASON_HERITAGE_UNRESOLVED, REASON_TARGET_NOT_INTERNED, SemanticSite,
+    SiteDisposition, SiteKind, TypeflowOracleHit, ambiguous_ambient_would_be_external_count,
+    analyze_owner_semantics, analyze_owner_semantics_with_context,
+    reset_ambiguous_ambient_would_be_external_count,
 };
 
 pub const WORKER_BUILD_IDENTITY: &str = "urdira:jsts-syntax-worker:0.3.0+oxc-0.142.0.fact-groups-v1.protobuf-v3.authoritative-changes-v1.bounded-row-identities-v1.definition-syntax-v1";
@@ -342,12 +350,143 @@ pub struct SyntaxFileResult {
     /// narrower than `entities`: only a declaration reachable through a
     /// real `export` (direct `export function/class/const/interface/type/
     /// enum`, sourceless `export { a, b as c }`, or a named re-export
-    /// `export { a } from "./x"`) is captured here -- `export default` and
-    /// `export * from` are never captured (see `resolver.rs`'s module doc
-    /// for why), so a lookup that only exists through one of those always
-    /// misses here and stays `checker_pending` upstream, never wrongly
-    /// resolved.
+    /// `export { a } from "./x"`) is captured here -- `export default` is
+    /// never captured (see `resolver.rs`'s module doc for why) and a bare
+    /// `export * from "./x"` (no `as X`) is captured SEPARATELY, in
+    /// `export_star_specifiers` below, not here -- so a lookup that only
+    /// exists through one of those two still misses `export_bindings`
+    /// itself and stays `checker_pending` upstream, never wrongly resolved,
+    /// but a name reachable only through a plain `export *` barrel now has
+    /// a second, bounded chance via `export_star_specifiers` (2026-09-04
+    /// references-parity task, bucket 2 -- see `resolver::resolve_named_
+    /// export_inner`'s own doc comment for the exact algorithm).
     pub export_bindings: Vec<SyntaxExportBinding>,
+    /// 2026-09-04 references-parity task, bucket 2 (`import_binding`/
+    /// `re_export_binding`, multi-hop barrels): every bare `export * from
+    /// "./x"` this module has (no `as X` -- THAT form already gets a
+    /// `SyntaxExportBinding` with the `NAMESPACE_REEXPORT_LOCAL_NAME`
+    /// sentinel, see its own doc comment, and is NOT duplicated here).
+    /// `resolver::resolve_named_export_inner` consults this list, AFTER its
+    /// own `export_bindings` lookup for a name comes up empty, to chase the
+    /// name through each star target -- but ONLY when resolving the name
+    /// through this module's star re-exports lands on exactly one
+    /// candidate module (never a guess when two star targets could both
+    /// plausibly provide the same name, mirroring real ESM's own "ambiguous
+    /// export" restriction). Resolved the same way `DirectImport::
+    /// target_path`/`SyntaxExportBinding::source_target_path` are.
+    pub export_star_specifiers: Vec<ExportStarSpecifier>,
+    /// Ambient module resolution task (2026-09-04): every top-level
+    /// `declare module "specifier" { ... }` / `declare module "specifier";`
+    /// this file declares (a `TSModuleDeclaration` whose `id` is a STRING
+    /// LITERAL -- an ordinary `namespace X {}`/`declare namespace X {}`,
+    /// whose `id` is an `Identifier`, is NOT one of these: it names a local
+    /// binding, never a module specifier another file's `import`/`export
+    /// ... from` could target). Consulted by `resolver::AmbientModuleIndex`
+    /// (workspace-wide, built from every file's own list) so a bare
+    /// specifier that fails ordinary workspace-file resolution gets a
+    /// chance to resolve through one of these BEFORE `resolver::classify_
+    /// external_specifier`'s external-entity fallback fires -- see that
+    /// module's own doc comment for the exact rule and `docs/evidence/
+    /// 2026-09-04-v4-ambient-module-resolution.md` for the n8n regression
+    /// this closes (677 `v4_different_target` reference-parity rows, all
+    /// resolving externally where v3 resolved to a declaration inside one
+    /// of these).
+    pub ambient_modules: Vec<AmbientModuleDeclaration>,
+}
+
+/// One `declare module "specifier" { ... }` / `declare module "specifier";`
+/// block, as a structural fact independent of any particular importer.
+/// `namespace_entity_id` is ALWAYS populated (v3's own `addEntity` gives the
+/// `TSModuleDeclaration` node itself a `"namespace"`-kind entity regardless
+/// of whether it has a body -- `isModuleDeclaration(node)` never checks
+/// `node.body`), but only usable as an IMPORT's resolution target when
+/// `bodyful` -- see `resolver::AmbientModuleIndex::resolve_export`'s own
+/// doc comment for why a shorthand (bodyless) block's own entity still
+/// exists in the corpus but is never a named/default/namespace import's
+/// resolved target (fix item 3: TS treats a shorthand ambient module as
+/// `any`, so the checker never provides a declaration for the checker's own
+/// `entityByNode` lookup to land on either -- mirrored here as "stay
+/// pending", not "resolve to the block itself").
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AmbientModuleDeclaration {
+    pub specifier: String,
+    pub bodyful: bool,
+    /// Owner-flagged follow-up (2026-09-04, same day as the rest of this
+    /// task): TypeScript distinguishes an AMBIENT MODULE DECLARATION
+    /// (`declare module "x" { ... }` in a SCRIPT file -- one with NO
+    /// top-level `import`/`export` syntax of its own, e.g. `env.d.ts`'s
+    /// `declare module "~icons/*"`) from a MODULE AUGMENTATION (the exact
+    /// same syntax, but in a file that IS a module -- has at least one
+    /// top-level `import`/`export`/`export =` statement, e.g. a Vue/Pinia
+    /// `declare module "vue" { interface ComponentCustomProperties {...}
+    /// }` alongside a top-level `import`/`export {}`). An augmentation
+    /// EXTENDS an existing external package's own type surface; it never
+    /// stands in for the package's real declaration, so it must NEVER
+    /// enter `resolver::AmbientModuleIndex` (found live: n8n's Vue
+    /// frontend has many of these, one per file that augments `vue`/
+    /// `pinia`/`n8n-workflow`/...; treating every one as a genuine
+    /// ambient declaration made those specifiers workspace-"ambiguous"
+    /// under the multiple-declaring-files rule, silently reverting every
+    /// `vue`/`pinia`-style import back to pending -- a ~120K reference
+    /// regression, caught in review before this task shipped). Computed
+    /// PER FILE (uniform across every `declare module` block that file
+    /// contains -- see `parse_source`'s own post-walk patch) since
+    /// TypeScript's own script-vs-module classification is a whole-file
+    /// property, not a per-block one. Still emits its own namespace entity
+    /// either way (v3 parity, `push_namespace_entity`'s own doc comment) --
+    /// only RESOLUTION is gated on this flag, never entity emission.
+    pub is_augmentation: bool,
+    pub namespace_entity_id: String,
+    /// Every top-level member this block directly `export`s (`export
+    /// function`/`class`/`interface`/`type`/`enum`/`const`/`let`/`var`) --
+    /// deliberately narrower than v3's own `collect`, which walks the WHOLE
+    /// block recursively and gives every declaration (exported or not) an
+    /// entity: a non-exported member is invisible to an IMPORTER by
+    /// construction, so it is never worth carrying here (this list exists
+    /// purely to answer "what does a named import of this specifier
+    /// resolve to", never to enumerate every entity the block contains --
+    /// those are already published by the ordinary `push_entity`/`visit_*`
+    /// producers, which fire for every declaration regardless of nesting
+    /// inside an ambient block, unaffected by this task). A sourceless
+    /// re-export specifier form (`export { a }`, no `source`, naming a
+    /// declaration written WITHOUT its own `export` keyword elsewhere in
+    /// the same block) is deliberately NOT walked -- rare inside a
+    /// `declare module` block in practice, and never a guess.
+    pub members: Vec<AmbientModuleMember>,
+    /// `export default <nameable-decl>` inside the block, when present --
+    /// same restricted, nameable-only shape `visit_export_default_
+    /// declaration` (lib.rs, file-level) already uses: a named function/
+    /// class/interface declaration, or a bare identifier naming another
+    /// member already collected into `members` above. `export = X` (a
+    /// separate TS construct entirely, CommonJS-style) is deliberately NOT
+    /// treated as a default-import target here -- out of this task's
+    /// explicit scope (see the fix's own task description); a default
+    /// import of an `export =`-only ambient module stays pending, never a
+    /// guess.
+    pub default_member: Option<AmbientModuleMember>,
+}
+
+/// One member fact inside an [`AmbientModuleDeclaration`] -- `entity_id` is
+/// already the FULLY BUILT id (`stable_entity_id(kind, declaring_path,
+/// name_start, name)`), byte-identical to the id the SAME declaration's own
+/// ordinary `push_entity` call already publishes elsewhere in this file's
+/// `entities` list (member ids never depend on nesting/nesting depth --
+/// only `(kind, path, name_start, name)` -- see `AmbientModuleDeclaration`'s
+/// own doc comment), so storing it pre-built here avoids re-deriving it
+/// (and re-threading `kind`/`name_start`) at every resolution call site.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AmbientModuleMember {
+    pub name: String,
+    pub entity_id: String,
+}
+
+/// One bare `export * from "specifier"` this module has -- see
+/// `SyntaxFileResult::export_star_specifiers`'s own doc comment.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExportStarSpecifier {
+    pub specifier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
 }
 
 /// P1-B: the sentinel `SyntaxExportBinding::local_name` for an `export * as
@@ -404,6 +543,58 @@ pub enum EntityKind {
     Type,
     Enum,
     Variable,
+    /// A class instance/static method, or an interface method signature.
+    /// Kind word `"method"`, matching v3's `analyzer.ts` vocabulary byte for
+    /// byte (`MethodDeclaration`/`MethodSignature` both collapse to this
+    /// one word there -- see `urdira-indexing-worker::v4::residual::
+    /// member_kind_name`'s own doc comment for why that distinction was
+    /// deliberately dropped).
+    Method,
+    /// A class constructor. Its "name" is the `constructor` keyword's own
+    /// identifier span (`ClassElement::MethodDefinition`'s `key`, an
+    /// oxc `PropertyKey::StaticIdentifier` naming the keyword itself --
+    /// there is no separate syntax to special-case).
+    Constructor,
+    /// A class `get` accessor, or an interface `get`-kind method signature.
+    Getter,
+    /// A class `set` accessor, or an interface `set`-kind method signature.
+    Setter,
+    /// A class field/property definition, or an interface property
+    /// signature.
+    Property,
+    /// An identifier-pattern parameter declaration (function/method/
+    /// constructor/getter/setter/arrow/function-expression) that received
+    /// AT LEAST ONE resolved reference in its own body -- the "referenced-
+    /// only" variant (owner-approved, 2026-09-04): unlike every other
+    /// `EntityKind`, NOT every declaration of this kind gets an entity, only
+    /// the ones `semantic_sites.rs`'s reference resolution actually proved a
+    /// target for. See `semantic_sites::ParamOwner`/`ParameterDeclarationFact`
+    /// for the producer and `docs/evidence/2026-09-04-v4-pending-sites-fold-
+    /// and-member-entities.md`'s sibling page for the class/interface member
+    /// entity precedent this follows.
+    Parameter,
+    /// External package/symbol entities task (2026-09-04): the whole
+    /// external package/builtin an unresolved bare/scoped import specifier
+    /// names (`jsts:external_module:{specifier}`, `id` built directly by
+    /// [`crate::external_module_entity`] rather than through `stable_
+    /// entity_id` -- there is no owning workspace file/span to key off of).
+    /// See `docs/evidence/2026-09-04-v4-external-entities.md`.
+    ExternalModule,
+    /// One imported/exported/member-accessed NAME of an [`Self::
+    /// ExternalModule`] (`jsts:external_symbol:{specifier}#{name}`, `id`
+    /// built by [`crate::external_symbol_entity`]).
+    ExternalSymbol,
+    /// Ambient module resolution task (2026-09-04): a `namespace X {}` OR
+    /// `declare module "specifier" { ... }` declaration -- kind word
+    /// `"namespace"`, matching v3's `analyzer.ts` `addEntity`'s
+    /// `isModuleDeclaration(node)` branch byte for byte (`kind =
+    /// "namespace"`, `universalKind = "core:type"`). Until this task, no
+    /// `EntityKind` covered `TSModuleDeclaration` at all (see
+    /// `declaration_export_names`'s old doc comment) -- a bare specifier
+    /// resolving through a workspace `declare module "x" { ... }` block
+    /// needs THIS entity id as its `import * as ns` / `jsts:relation_
+    /// import` target (see `push_namespace_entity`).
+    Namespace,
 }
 
 impl EntityKind {
@@ -416,6 +607,15 @@ impl EntityKind {
             Self::Type => "type",
             Self::Enum => "enum",
             Self::Variable => "variable",
+            Self::Method => "method",
+            Self::Constructor => "constructor",
+            Self::Getter => "getter",
+            Self::Setter => "setter",
+            Self::Property => "property",
+            Self::Parameter => "parameter",
+            Self::ExternalModule => "external_module",
+            Self::ExternalSymbol => "external_symbol",
+            Self::Namespace => "namespace",
         }
     }
 }
@@ -430,6 +630,8 @@ pub enum UniversalKind {
     Type,
     #[serde(rename = "core:value")]
     Value,
+    #[serde(rename = "core:parameter")]
+    Parameter,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -616,6 +818,15 @@ impl CandidateIndex {
             if let Some(specifier) = &binding.source_specifier {
                 candidates.extend(resolver.candidate_paths(path, specifier));
             }
+        }
+        // 2026-09-04 references-parity task, bucket 2: a bare `export *
+        // from "./x"` is a real dependency edge too (this file's own
+        // re-exported surface depends on `./x`'s), so it must feed the
+        // reverse index exactly like a named re-export's `source_specifier`
+        // does just above -- otherwise an edit to the star target would
+        // never invalidate this file's importers.
+        for star in &file.export_star_specifiers {
+            candidates.extend(resolver.candidate_paths(path, &star.specifier));
         }
         candidates.sort_unstable();
         candidates.dedup();
@@ -1283,6 +1494,7 @@ impl SyntaxWorkerState {
             });
         }
         let available = paths.clone();
+        let next_files_clone_started = std::time::Instant::now();
         let mut next_files = if path_membership_incremental {
             let mut files = prior
                 .as_ref()
@@ -1298,6 +1510,13 @@ impl SyntaxWorkerState {
                 .as_ref()
                 .map_or_else(BTreeMap::new, |state| state.files.clone())
         };
+        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "[urdira-jsts-syntax-worker] v4 DEBUG: next_files clone: {:.3}s ({} entries)",
+                next_files_clone_started.elapsed().as_secs_f64(),
+                next_files.len(),
+            );
+        }
         let changed_sources = validated
             .iter()
             .filter(|source| changed.contains(&source.path))
@@ -1505,6 +1724,90 @@ impl SyntaxWorkerState {
                 }
             }
         }
+        // Ambient module resolution task (2026-09-04), fix item 2: a
+        // `declare module "specifier" { ... }` block anywhere in the
+        // workspace can change what a DIFFERENT file's bare import/export
+        // specifier resolves to (`build_import_export_facts`'s decision
+        // order) -- but `parse_source` (per-file, run in parallel above,
+        // with no cross-file view) always builds a freshly (re)parsed
+        // file's own relations with `ambient_index: None`, and neither
+        // `CandidateIndex` nor `ImportReverseIndex` can find the files this
+        // affects (both are keyed by resolvable workspace PATHS; an
+        // ambient specifier's raw text is not one). This pass corrects
+        // both gaps: (1) every file THIS call (re)parsed always needs its
+        // ambient-index decision revisited, regardless of mode; (2) when a
+        // touched file's OWN ambient declarations changed (added/removed/
+        // edited), every OTHER file importing that same specifier needs
+        // revisiting too, found via a bounded scan restricted to exactly
+        // those specifiers (never a corpus-wide sweep). Deliberately NOT
+        // incrementally maintained the way `CandidateIndex`/
+        // `ImportReverseIndex` are (no persistent index survives across
+        // calls) -- ambient declarations are rare (a handful of `.d.ts`
+        // files in a real corpus), so a fresh `AmbientModuleIndex::rebuild`
+        // over every file's already-in-memory, usually-empty `ambient_
+        // modules` vector is cheap: no AST walk, no reparse, not the
+        // per-edit cost class those P3-6 indexes exist to avoid.
+        let ambient_index_started = std::time::Instant::now();
+        let ambient_index = resolver::AmbientModuleIndex::rebuild(&next_files);
+        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "[urdira-jsts-syntax-worker] v4 DEBUG: analyze()'s own AmbientModuleIndex::rebuild: {:.3}s ({} files)",
+                ambient_index_started.elapsed().as_secs_f64(),
+                next_files.len(),
+            );
+        }
+        let mut ambient_touched_specifiers: BTreeSet<String> = BTreeSet::new();
+        for path in changed.iter().chain(removed.iter()) {
+            if let Some(file) = prior.as_ref().and_then(|state| state.files.get(path)) {
+                ambient_touched_specifiers.extend(
+                    file.ambient_modules
+                        .iter()
+                        .map(|decl| decl.specifier.clone()),
+                );
+            }
+            if let Some(file) = next_files.get(path.as_str()) {
+                ambient_touched_specifiers.extend(
+                    file.ambient_modules
+                        .iter()
+                        .map(|decl| decl.specifier.clone()),
+                );
+            }
+        }
+        let mut ambient_affected: BTreeSet<String> = BTreeSet::new();
+        if !ambient_touched_specifiers.is_empty() {
+            let mut specifier_importers: HashMap<&str, Vec<String>> = HashMap::new();
+            for (importer_path, file) in next_files.iter() {
+                for import in &file.direct_imports {
+                    if import.target_path.is_none()
+                        && ambient_touched_specifiers.contains(&import.specifier)
+                    {
+                        specifier_importers
+                            .entry(import.specifier.as_str())
+                            .or_default()
+                            .push(importer_path.clone());
+                    }
+                }
+            }
+            for specifier in &ambient_touched_specifiers {
+                for importer in specifier_importers
+                    .get(specifier.as_str())
+                    .into_iter()
+                    .flatten()
+                {
+                    if !changed.contains(importer.as_str()) {
+                        ambient_affected.insert(importer.clone());
+                    }
+                }
+            }
+        }
+        for path in changed.iter().chain(ambient_affected.iter()) {
+            if let Some(updated) = next_files
+                .get(path.as_str())
+                .and_then(|file| reresolve_ambient_relations(file, &ambient_index))
+            {
+                next_files.insert(path.clone(), updated);
+            }
+        }
         // P3-6 item 3: `reverse_affected_closure`'s own O(corpus)-per-call
         // rebuild replaced with a lookup against the maintained `Import
         // ReverseIndex` above -- same BFS, same result (the maintained
@@ -1541,6 +1844,14 @@ impl SyntaxWorkerState {
                 ),
             }
         };
+        // Ambient module resolution task (2026-09-04): fold in every
+        // importer `reresolve_ambient_relations` above rewrote because a
+        // DIFFERENT file's ambient declarations changed this call -- these
+        // are not reachable through `ImportReverseIndex`'s `target_path`
+        // graph (see that pass's own doc comment), so they would otherwise
+        // never be reported as `affected_files`, even though their own
+        // `jsts:relation_import`/`export` rows just changed.
+        let affected: BTreeSet<String> = affected.into_iter().chain(ambient_affected).collect();
         let metrics = BoundaryMetrics {
             bytes_read: source_bytes,
             bytes_transferred: 0,
@@ -1923,6 +2234,7 @@ fn proposal_entity_record(entity: &SyntaxEntity, language: Language) -> Proposed
         UniversalKind::Callable => "jsts:entity_callable",
         UniversalKind::Container => "jsts:entity_container",
         UniversalKind::Value => "jsts:entity_variable",
+        UniversalKind::Parameter => "jsts:entity_parameter",
     };
     let mut body = serde_json::Map::new();
     body.insert(
@@ -1933,9 +2245,52 @@ fn proposal_entity_record(entity: &SyntaxEntity, language: Language) -> Proposed
         "kind".into(),
         serde_json::Value::String(entity_kind_name(entity.kind).into()),
     );
+    // Cross-owner-dedup correctness bug found live 2026-09-05
+    // (`n8n_incremental_create_delete_roots_match_oracle`'s `records` root
+    // regression, root-caused via `debug_dump_external_entity_bodies`):
+    // `jsts:external_module:*`/`jsts:external_symbol:*` entities are
+    // documented (`external_module_entity`/`external_symbol_entity`'s own
+    // doc comments) as "owner-independent by construction... a pure
+    // function of specifier/name alone, never the importing file" -- a
+    // claim `dedupe_external_entities_across_owners`
+    // (`urdira-indexing-worker::v4::analyze`) relies on to justify keeping
+    // just ONE of many identical per-owner proposals. But every entity
+    // (this function is the ONLY producer of an entity's `body`, for every
+    // `EntityKind` alike) used to get the CALLING file's own `language`
+    // stamped in regardless of kind -- so two files importing the SAME
+    // external specifier, one `.ts` and one `.js`, propose the SAME
+    // identity with DIFFERENT bodies, breaking the "pure function" claim.
+    // Harmless at a COLD scan (dedup picks whichever owner is
+    // alphabetically first, deterministically, forever, as long as that
+    // exact file exists) -- but confirmed live to break root-parity the
+    // moment that owner is DELETED: an incremental scan and a from-scratch
+    // oracle of the same mutated tree can pick DIFFERENT alphabetically-
+    // first REMAINING importers with different languages, producing
+    // genuinely different bodies/digests for the identical identity_key
+    // (`node:test#after`: `language=typescript` under the original owner,
+    // `language=javascript` under the oracle's replacement owner).
+    // `record_id`/`record_digest` are pure kernel functions of this body
+    // (`urdira-native-core::structural_record_digest_hash`) -- once they
+    // differ, no `diff_owner` reopen/migration case can ever reproduce a
+    // from-scratch oracle's plain first-occurrence id anyway (chaining
+    // ALWAYS mints a new, non-oracle-matching id -- see `diff.rs`'s
+    // `chained_record_id`), so the only real fix is to stop the body from
+    // varying with the importer at all, exactly as the two builders' own
+    // doc comments already (aspirationally) promised. Fixed by stamping a
+    // FIXED, canonical language for these two kinds only -- every other
+    // entity kind's real, per-file language stamp is unchanged.
+    let external_entity = matches!(
+        entity.kind,
+        EntityKind::ExternalModule | EntityKind::ExternalSymbol
+    );
+    let stamped_language = if external_entity {
+        Language::Typescript
+    } else {
+        language
+    };
     body.insert(
         "language".into(),
-        serde_json::Value::String(language_name(language).into()),
+        serde_json::Value::String(language_name(stamped_language).into()),
     );
     body.insert(
         "path".into(),
@@ -2021,6 +2376,91 @@ fn proposal_relation_record(relation: &SyntaxRelation) -> ProposedRecord {
         body: serde_json::Value::Object(body),
         evidence_references: canonical_evidence(&relation.path, relation.start, relation.end),
         facets_list,
+    }
+}
+
+/// External package/symbol entities task (2026-09-04): the `SyntaxEntity`
+/// for `jsts:external_module:{specifier}`. Owner-independent by
+/// construction -- `path`/`start`/`end` are synthetic and never vary with
+/// the importing file, so every importer of the same `specifier` builds a
+/// byte-identical entity -- see `urdira-indexing-worker::v4::analyze::
+/// run_scoped`'s cross-owner dedup pass (the mechanism that makes a single
+/// visible record survive many identical per-owner proposals) for why that
+/// determinism is load-bearing, not incidental. `path` uses a synthetic
+/// `external:{specifier}` value (never a real workspace path, and never
+/// read by anything that expects a real artifact path -- see the entity
+/// schema's own `path` field, a free descriptive string) rather than the
+/// empty string, so a human or a debugging tool reading the record body can
+/// still tell at a glance that it names an external package, not a
+/// workspace file with an empty path.
+pub(crate) fn external_module_entity(specifier: &str) -> SyntaxEntity {
+    SyntaxEntity {
+        id: resolver::external_module_id(specifier),
+        name: specifier.to_owned(),
+        kind: EntityKind::ExternalModule,
+        universal_kind: UniversalKind::Container,
+        path: format!("external:{specifier}"),
+        start: 0,
+        end: 0,
+        parent_id: None,
+        qualified_name: None,
+        is_test: None,
+    }
+}
+
+/// External package/symbol entities task: the `SyntaxEntity` for
+/// `jsts:external_symbol:{specifier}#{name}`. `is_type` selects `core:type`
+/// (an `import type`/`export type` binding) over `core:value` -- see
+/// [`external_module_entity`]'s doc comment for why every field here is a
+/// pure function of `(specifier, name, is_type)`, never the importing file.
+pub(crate) fn external_symbol_entity(specifier: &str, name: &str, is_type: bool) -> SyntaxEntity {
+    SyntaxEntity {
+        id: resolver::external_symbol_id(specifier, name),
+        name: name.to_owned(),
+        kind: EntityKind::ExternalSymbol,
+        universal_kind: if is_type {
+            UniversalKind::Type
+        } else {
+            UniversalKind::Value
+        },
+        path: format!("external:{specifier}"),
+        start: 0,
+        end: 0,
+        parent_id: Some(resolver::external_module_id(specifier)),
+        qualified_name: Some(format!("{specifier}.{name}")),
+        is_test: None,
+    }
+}
+
+/// External package/symbol entities task: the `core:contains` `SyntaxEntity`
+/// -> `SyntaxEntity` edge from an external module to one of its symbols, for
+/// ONE occurrence (`owner_path`/`start`/`end` are the occurrence's own
+/// site -- the importing declaration or member-access use, UNLIKE the two
+/// entity builders above, which are occurrence-independent). Multiple
+/// importers/occurrences of the same `(specifier, name)` pair each propose
+/// their own `core:contains` row here, differentiated by `(owner_path,
+/// start, end)` exactly like `core:import`/`core:call`/... already are --
+/// no cross-owner dedup needed for this one, only the two ENTITY rows above
+/// need it (a relation's identity already varies per occurrence).
+pub(crate) fn external_contains_relation(
+    specifier: &str,
+    name: &str,
+    owner_path: &str,
+    start: u32,
+    end: u32,
+) -> SyntaxRelation {
+    let source_id = resolver::external_module_id(specifier);
+    let target_id = resolver::external_symbol_id(specifier, name);
+    let id = format!("jsts:contains:{owner_path}:{start}:{end}:{source_id}:{target_id}");
+    SyntaxRelation {
+        id,
+        kind: RelationKind::Contains,
+        source_id,
+        target_id: Some(target_id),
+        path: owner_path.to_owned(),
+        start,
+        end,
+        classification: RelationClassification::Confirmed,
     }
 }
 
@@ -2187,6 +2627,7 @@ const fn universal_kind_name(kind: UniversalKind) -> &'static str {
         UniversalKind::Callable => "core:callable",
         UniversalKind::Type => "core:type",
         UniversalKind::Value => "core:value",
+        UniversalKind::Parameter => "core:parameter",
     }
 }
 
@@ -2435,6 +2876,32 @@ fn parse_source(
     Utf8ToUtf16::new(text).convert_program(&mut parsed.program);
     let mut collector = SyntaxCollector::new(&source.path, text.encode_utf16().count() as u32);
     collector.visit_program(&parsed.program);
+    // Ambient module resolution task (2026-09-04) follow-up: patch every
+    // `declare module` block this file collected with the file's real
+    // script-vs-module status -- see `AmbientModuleDeclaration::is_
+    // augmentation`'s own doc comment for why this can only be known AFTER
+    // the whole-file walk completes (a top-level `import`/`export`
+    // anywhere in the file, not just before the `declare module` block,
+    // makes it a module augmentation). Skipped entirely when this file
+    // declared no ambient modules at all (the overwhelming majority) --
+    // `file_has_top_level_module_syntax` is never worth the scan otherwise.
+    if !collector.ambient_modules.is_empty() {
+        let is_augmentation = file_has_top_level_module_syntax(&parsed.program.body);
+        for declaration in &mut collector.ambient_modules {
+            declaration.is_augmentation = is_augmentation;
+        }
+    }
+    // Class/interface MEMBER entities (method/constructor/getter/setter/
+    // property): a distinct pass, deliberately not folded into the `Visit`
+    // walk above, because its discovery surface must match `urdira_jsts_
+    // typeflow::member_declarations`'s own (module-level/`export`-only,
+    // anonymous class skipped) byte for byte -- see that function's own doc
+    // comment for why a plain recursive `Visit` (which also descends into a
+    // class nested inside a function body) would over-collect relative to
+    // what typeflow's `ProgramIndex` ever builds a `MemberEntry` for.
+    let member_declarations =
+        urdira_jsts_typeflow::member_declarations(&parsed.program, &source.path);
+    collector.push_member_entities(&member_declarations);
     for import in &mut collector.imports {
         import.target_path = resolver.resolve(&source.path, &import.specifier, available);
     }
@@ -2442,6 +2909,9 @@ fn parse_source(
         if let Some(specifier) = &binding.source_specifier {
             binding.source_target_path = resolver.resolve(&source.path, specifier, available);
         }
+    }
+    for star in &mut collector.export_star_specifiers {
+        star.target_path = resolver.resolve(&source.path, &star.specifier, available);
     }
     collector.imports.sort_by(|left, right| {
         (left.start, left.end, left.kind, &left.specifier).cmp(&(
@@ -2461,6 +2931,11 @@ fn parse_source(
         .sort_by(|left, right| left.id.cmp(&right.id));
     collector.export_bindings.sort();
     collector.export_bindings.dedup();
+    collector.export_star_specifiers.sort();
+    collector.export_star_specifiers.dedup();
+    collector
+        .ambient_modules
+        .sort_by(|left, right| left.namespace_entity_id.cmp(&right.namespace_entity_id));
     let diagnostics = parsed
         .diagnostics
         .into_iter()
@@ -2490,6 +2965,8 @@ fn parse_source(
         relations: collector.relations,
         diagnostics,
         export_bindings: collector.export_bindings,
+        export_star_specifiers: collector.export_star_specifiers,
+        ambient_modules: collector.ambient_modules,
     })
 }
 
@@ -2501,6 +2978,11 @@ struct SyntaxCollector {
     relations: Vec<SyntaxRelation>,
     node_test_from: bool,
     export_bindings: Vec<SyntaxExportBinding>,
+    export_star_specifiers: Vec<ExportStarSpecifier>,
+    /// Ambient module resolution task (2026-09-04): every top-level
+    /// `declare module "specifier" { ... }` this file declares -- see
+    /// `SyntaxFileResult::ambient_modules`'s own doc comment.
+    ambient_modules: Vec<AmbientModuleDeclaration>,
 }
 
 impl SyntaxCollector {
@@ -2525,6 +3007,8 @@ impl SyntaxCollector {
             relations: Vec::new(),
             node_test_from: false,
             export_bindings: Vec::new(),
+            export_star_specifiers: Vec::new(),
+            ambient_modules: Vec::new(),
         }
     }
 
@@ -2583,6 +3067,127 @@ impl SyntaxCollector {
         );
     }
 
+    /// Ambient module resolution task (2026-09-04): `push_entity`'s sibling
+    /// for a `TSModuleDeclaration` whose `id` is a STRING LITERAL (`declare
+    /// module "specifier" { ... }`) -- `push_entity` itself only accepts a
+    /// `BindingIdentifier` (an `Identifier`-named `namespace X {}` would go
+    /// through it if `EntityKind::Namespace` were ever wired to that visitor
+    /// too, which it is not -- out of this task's scope). Mirrors v3's own
+    /// `addEntity` exactly: `id`'s identity anchors on the STRING LITERAL's
+    /// own span start (`identity_start` -- the position of the opening
+    /// quote, matching TypeScript's `nameNode.getStart(source)` for a
+    /// `StringLiteral` name node), while the PUBLISHED `start`/`end` cover
+    /// the WHOLE declaration (`declare` through the closing `}`, or through
+    /// the `;` for the shorthand form) -- same "identity span narrower than
+    /// published span" split `push_entity` uses for a `constructor`'s
+    /// keyword-anchored identity vs. its full-member published span.
+    fn push_namespace_entity(
+        &mut self,
+        name: &str,
+        identity_start: u32,
+        decl_start: u32,
+        decl_end: u32,
+    ) -> String {
+        let id = stable_entity_id(EntityKind::Namespace, &self.path, identity_start, name);
+        self.entities.push(SyntaxEntity {
+            id: id.clone(),
+            name: name.to_owned(),
+            kind: EntityKind::Namespace,
+            universal_kind: UniversalKind::Type,
+            path: self.path.clone(),
+            start: decl_start,
+            end: decl_end,
+            parent_id: Some(self.module_id.clone()),
+            qualified_name: Some(format!("{}.{}", self.path, name)),
+            is_test: None,
+        });
+        self.push_relation(
+            RelationKind::Contains,
+            self.module_id.clone(),
+            Some(id.clone()),
+            decl_start,
+            decl_end,
+            RelationClassification::Confirmed,
+        );
+        id
+    }
+
+    /// Materializes one `SyntaxEntity` + one `core:contains` relation per
+    /// `MemberDeclaration` -- the class/interface member entity producer
+    /// (see the module doc's "member entities" section). `declarations`
+    /// comes from `urdira_jsts_typeflow::member_declarations`, the SAME
+    /// helper `urdira-jsts-typeflow`'s own `ProgramIndex` builder uses to
+    /// construct its `MemberEntry`s, so the entity id this pushes is
+    /// byte-identical to the `target_id` a typeflow-confirmed member call
+    /// already carries -- the whole point of this producer (see decision 28
+    /// "Entity synthesis for members" for the residual-pass gap this
+    /// closes at cold). `start`/`end` are the member's own KEY (name) span
+    /// -- the constructor's own "name" is the `constructor` keyword span,
+    /// same as every other member (`class_element_member_shape`'s own doc
+    /// comment) -- never the whole member's body span, matching how
+    /// `push_entity` uses the identifier span for every other entity kind.
+    /// `qualified_name` extends the container's own `push_entity`-assigned
+    /// `{path}.{ContainerName}` with `.{name}`. The container is guaranteed
+    /// to already have an entity (`member_declarations` only enumerates
+    /// members of a NAMED, module-level `ClassDeclaration`/
+    /// `TSInterfaceDeclaration` -- the identical discovery surface `visit_
+    /// class`/`visit_ts_interface_declaration` already push an entity for,
+    /// see `member_declarations`'s own doc comment), so `parent_id` never
+    /// dangles.
+    fn push_member_entities(&mut self, declarations: &[urdira_jsts_typeflow::MemberDeclaration]) {
+        for declaration in declarations {
+            let (kind, universal_kind) = match declaration.kind_word {
+                "method" => (EntityKind::Method, UniversalKind::Callable),
+                "constructor" => (EntityKind::Constructor, UniversalKind::Callable),
+                "getter" => (EntityKind::Getter, UniversalKind::Callable),
+                "setter" => (EntityKind::Setter, UniversalKind::Callable),
+                "property" => (EntityKind::Property, UniversalKind::Value),
+                // 2026-09-04 references-parity task: a constructor
+                // parameter property (`constructor(public x: T)`) --
+                // `EntityKind::Parameter`/`UniversalKind::Parameter`, the
+                // SAME kind v3's `analyzer.ts` gives EVERY parameter
+                // (`isParameterDeclaration` fires before its
+                // `isPropertyDeclaration` arm, so a parameter property never
+                // gets a distinct "property" entity kind there either).
+                // `semantic_sites.rs`'s own "referenced-only" parameter
+                // producer (`visit_formal_parameter`) deliberately skips a
+                // parameter property (see its doc comment), so this is its
+                // ONLY entity producer -- unconditional, like every other
+                // member, never gated on whether the parameter turns out
+                // referenced.
+                "parameter" => (EntityKind::Parameter, UniversalKind::Parameter),
+                // `member_declarations` only ever produces the six kind
+                // words above (`class_element_member_shape`/`signature_
+                // member_shape`/`push_constructor_parameter_property_
+                // declarations`'s own exhaustive match) -- never reached.
+                _ => continue,
+            };
+            self.entities.push(SyntaxEntity {
+                id: declaration.entity_id.clone(),
+                name: declaration.name.clone(),
+                kind,
+                universal_kind,
+                path: self.path.clone(),
+                start: declaration.key_start,
+                end: declaration.key_end,
+                parent_id: Some(declaration.container_entity_id.clone()),
+                qualified_name: Some(format!(
+                    "{}.{}.{}",
+                    self.path, declaration.container_name, declaration.name
+                )),
+                is_test: None,
+            });
+            self.push_relation(
+                RelationKind::Contains,
+                declaration.container_entity_id.clone(),
+                Some(declaration.entity_id.clone()),
+                declaration.key_start,
+                declaration.key_end,
+                RelationClassification::Confirmed,
+            );
+        }
+    }
+
     fn push_relation(
         &mut self,
         kind: RelationKind,
@@ -2613,47 +3218,121 @@ impl SyntaxCollector {
         });
     }
 
+    /// External package/symbol entities task (2026-09-04, item 1), extended
+    /// by the ambient module resolution task (same date, item 2): builds
+    /// this file's `jsts:relation_import`/`jsts:relation_export` rows plus
+    /// any `external_module` entities they need, from `self.imports`, and
+    /// appends both -- delegates the actual per-edge decision to
+    /// [`build_import_export_facts`] with `ambient_index: None` (this
+    /// per-file, parse-time call site has no cross-file view of OTHER
+    /// files' `declare module` blocks yet -- see that function's own doc
+    /// comment for the full decision order, and `reresolve_ambient_
+    /// relations` for the project-level pass that revisits this decision
+    /// once the full workspace picture is available).
     fn finish_import_relations(&mut self) {
         if self.node_test_from {
             self.entities[0].is_test = Some(true);
         }
-        let facts = self
-            .imports
-            .iter()
-            .filter_map(|edge| match edge.kind {
-                ImportKind::Import => Some((RelationKind::Import, edge)),
-                ImportKind::Export => Some((RelationKind::Export, edge)),
-                ImportKind::DynamicImport | ImportKind::Require => None,
-            })
-            .map(|(kind, edge)| {
-                let target_id = edge
-                    .target_path
-                    .as_ref()
-                    .map(|path| stable_entity_id(EntityKind::Module, path, 0, path));
-                (
-                    kind,
-                    target_id.clone(),
-                    edge.start,
-                    edge.end,
-                    if target_id.is_some() {
-                        RelationClassification::Confirmed
-                    } else {
-                        RelationClassification::Possible
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        for (kind, target_id, start, end, classification) in facts {
-            self.push_relation(
-                kind,
-                self.module_id.clone(),
-                target_id,
-                start,
-                end,
-                classification,
-            );
-        }
+        let (relations, external_entities) =
+            build_import_export_facts(&self.path, &self.module_id, &self.imports, None);
+        self.entities.extend(external_entities);
+        self.relations.extend(relations);
     }
+}
+
+/// Ambient module resolution task (2026-09-04): shared core of
+/// `SyntaxCollector::finish_import_relations`'s import/export-edge lane and
+/// `reresolve_ambient_relations`'s project-level rebuild -- for every
+/// `import`/`export ... from` edge, decides its `jsts:relation_import`/
+/// `export` target and classification, and which (if any) `external_
+/// module` entity that decision needs (never `external_symbol` -- that kind
+/// only exists at the semantic reference layer, per name, see `semantic_
+/// sites.rs`'s `emit_external_use`).
+///
+/// Decision order per edge:
+/// 1. `target_path: Some(path)` (already resolved against the current
+///    workspace path set, upstream) -- targets that workspace file's own
+///    module entity, `Confirmed`. Unaffected by `ambient_index`.
+/// 2. `target_path: None`, and `ambient_index` names EXACTLY ONE workspace
+///    file declaring `declare module "{edge.specifier}"` (fix item 2) --
+///    targets that block's own namespace entity, `Confirmed`. Never pushes
+///    a synthetic entity locally: the target already exists, published by
+///    the DECLARING file's own `push_namespace_entity` call.
+/// 3. `target_path: None`, `ambient_index` names two-or-more declaring
+///    files for the specifier (workspace-ambiguous) -- `Possible`, no
+///    target. NEVER falls through to external classification below: the
+///    specifier is proven to be an ambient module somewhere in this
+///    workspace, so guessing "external" would misrepresent it exactly the
+///    way `resolver::classify_external_specifier`'s own doc comment warns
+///    against for a relative specifier that merely failed to resolve.
+/// 4. `target_path: None`, no ambient declaration anywhere (`ambient_index`
+///    is `None` -- the per-file call site -- or names zero declaring
+///    files): `resolver::classify_external_specifier`'s pre-existing
+///    fallback, byte-for-byte unchanged from before this task.
+fn build_import_export_facts(
+    path: &str,
+    module_id: &str,
+    direct_imports: &[DirectImport],
+    ambient_index: Option<&resolver::AmbientModuleIndex>,
+) -> (Vec<SyntaxRelation>, Vec<SyntaxEntity>) {
+    let mut relations = Vec::new();
+    let mut external_entities = Vec::new();
+    let mut external_ids_seen: BTreeSet<String> = BTreeSet::new();
+    for edge in direct_imports {
+        let kind = match edge.kind {
+            ImportKind::Import => RelationKind::Import,
+            ImportKind::Export => RelationKind::Export,
+            ImportKind::DynamicImport | ImportKind::Require => continue,
+        };
+        let (target_id, classification) = if let Some(target_path) = &edge.target_path {
+            (
+                Some(stable_entity_id(
+                    EntityKind::Module,
+                    target_path,
+                    0,
+                    target_path,
+                )),
+                RelationClassification::Confirmed,
+            )
+        } else if let Some(namespace_id) =
+            ambient_index.and_then(|index| index.unique_namespace_entity(&edge.specifier))
+        {
+            (Some(namespace_id), RelationClassification::Confirmed)
+        } else if ambient_index.is_some_and(|index| index.has_any_declaration(&edge.specifier)) {
+            (None, RelationClassification::Possible)
+        } else {
+            match resolver::classify_external_specifier(&edge.specifier) {
+                Some(canonical) => {
+                    let target_id = resolver::external_module_id(&canonical);
+                    if external_ids_seen.insert(target_id.clone()) {
+                        external_entities.push(external_module_entity(&canonical));
+                    }
+                    (Some(target_id), RelationClassification::Confirmed)
+                }
+                None => (None, RelationClassification::Possible),
+            }
+        };
+        let id = format!(
+            "jsts:{}:{}:{}:{}:{}:{}",
+            kind.identity_name(),
+            path,
+            edge.start,
+            edge.end,
+            module_id,
+            target_id.as_deref().unwrap_or("unresolved")
+        );
+        relations.push(SyntaxRelation {
+            id,
+            kind,
+            source_id: module_id.to_owned(),
+            target_id,
+            path: path.to_owned(),
+            start: edge.start,
+            end: edge.end,
+            classification,
+        });
+    }
+    (relations, external_entities)
 }
 
 /// The name a `ModuleExportName` carries, whichever variant it is (a plain
@@ -2709,10 +3388,180 @@ fn declaration_export_names(declaration: &Declaration<'_>) -> Vec<(u32, String)>
             enum_declaration.id.span.start,
             enum_declaration.id.name.as_str().to_owned(),
         )],
-        // `TSModuleDeclaration` (namespace) and `TSImportEqualsDeclaration`
-        // are not in `EntityKind`'s scope at all (see `SyntaxExportBinding`'s
-        // doc comment) -- left out deliberately, not an oversight.
+        // `TSModuleDeclaration` (namespace, now `EntityKind::Namespace` as
+        // of the 2026-09-04 ambient module resolution task -- but a direct
+        // `export namespace X {}`/`export declare module "x" {}` never
+        // reaches `declaration_export_names` at all: `visit_ts_module_
+        // declaration` below handles that node directly, unconditionally,
+        // regardless of whether it is wrapped in `export`, so folding it in
+        // HERE too would double-count it) and `TSImportEqualsDeclaration`
+        // (still genuinely out of `EntityKind`'s scope) are left out
+        // deliberately, not an oversight.
         _ => Vec::new(),
+    }
+}
+
+/// Ambient module resolution task (2026-09-04): the `EntityKind` a direct
+/// `export <decl>` declaration inside a `declare module "specifier" { ... }`
+/// block would get from its own ordinary `push_entity`/`visit_*` call
+/// elsewhere in this same walk (function/class/interface/type/enum/
+/// variable) -- used ONLY to build `AmbientModuleDeclaration::members`'
+/// entity ids ahead of time; never itself pushes an entity (the ordinary
+/// walk already does that, unaffected by ambient nesting -- see
+/// `AmbientModuleDeclaration`'s own doc comment for why member ids never
+/// depend on nesting). `None` for every declaration shape without a
+/// nameable `EntityKind` (mirrors `declaration_export_names`'s own
+/// fallthrough).
+/// Ambient module resolution task (2026-09-04) follow-up: TypeScript's own
+/// script-vs-module test, applied to `body` (a file's top-level statement
+/// list) -- a file is a MODULE the moment it contains AT LEAST ONE
+/// top-level `import`/`export ... `/`export ... from`/`export default`/
+/// `export = X` statement (`oxc_ast::Statement::as_module_declaration`
+/// covers exactly those five forms -- `ModuleDeclaration`'s own variant
+/// list: `ImportDeclaration`, `ExportAllDeclaration`, `ExportDefault
+/// Declaration`, `ExportNamedDeclaration` (this ALSO covers the bare
+/// `export {}` idiom some files use purely to force module mode -- oxc
+/// parses it as an `ExportNamedDeclaration` with empty specifiers, no
+/// `declaration`, no `source`), and `TSExportAssignment`), OR a top-level
+/// `import X = require(...)` (`TSImportEqualsDeclaration` -- a `Declaration`
+/// variant, not a `ModuleDeclaration` one in oxc's own split, so checked
+/// separately via `Statement::as_declaration`). A file with NONE of these
+/// is a SCRIPT: every `declare module "x" { ... }` it contains is a real
+/// ambient module declaration, not an augmentation of an existing package
+/// (see `AmbientModuleDeclaration::is_augmentation`'s own doc comment).
+fn file_has_top_level_module_syntax(body: &[Statement<'_>]) -> bool {
+    body.iter().any(|statement| {
+        statement.as_module_declaration().is_some()
+            || matches!(
+                statement.as_declaration(),
+                Some(Declaration::TSImportEqualsDeclaration(_))
+            )
+    })
+}
+
+fn declaration_entity_kind(declaration: &Declaration<'_>) -> Option<EntityKind> {
+    match declaration {
+        Declaration::VariableDeclaration(_) => Some(EntityKind::Variable),
+        Declaration::FunctionDeclaration(_) => Some(EntityKind::Function),
+        Declaration::ClassDeclaration(_) => Some(EntityKind::Class),
+        Declaration::TSTypeAliasDeclaration(_) => Some(EntityKind::Type),
+        Declaration::TSInterfaceDeclaration(_) => Some(EntityKind::Interface),
+        Declaration::TSEnumDeclaration(_) => Some(EntityKind::Enum),
+        _ => None,
+    }
+}
+
+/// Ambient module resolution task (2026-09-04): extracts `(members,
+/// default_member)` from one ambient module block's body -- see
+/// `AmbientModuleDeclaration`'s own doc comment for exactly which
+/// statement shapes are walked (direct `export <decl>` forms, plus a
+/// restricted, nameable-only `export default`) and which are deliberately
+/// left out.
+///
+/// Found live against the n8n corpus (references-parity task, all 649
+/// remaining `v4_different_target` rows after the wildcard-pattern fix
+/// below): the dominant real-world shape for a virtual-asset ambient
+/// module is `const component: T; export default component;` -- a BARE
+/// (non-`export`ed) top-level declaration, referenced only indirectly
+/// through `export default <identifier>`. `members` (the named-import
+/// resolution surface) stays export-gated as before, but `export default
+/// <identifier>` must also be able to resolve against a declaration that
+/// was NEVER itself exported -- so this collects a SEPARATE, wider
+/// `all_declarations` list (every top-level nameable declaration in the
+/// block, exported or not, via `Statement::as_declaration` -- oxc flattens
+/// `Declaration`'s variants directly into `Statement`, so a bare `const
+/// component: T;` is reached the exact same way an `export`ed one is,
+/// just without the `ExportNamedDeclaration` wrapper) purely for `export
+/// default <identifier>` to search, never published/exposed beyond that.
+fn ambient_module_members(
+    path: &str,
+    body: &[Statement<'_>],
+) -> (Vec<AmbientModuleMember>, Option<AmbientModuleMember>) {
+    let mut members = Vec::new();
+    let mut all_declarations = Vec::new();
+    let mut default_statement = None;
+    for statement in body {
+        if let Some(declaration) = statement.as_declaration()
+            && let Some(kind) = declaration_entity_kind(declaration)
+        {
+            for (start, name) in declaration_export_names(declaration) {
+                let entity_id = stable_entity_id(kind, path, start, &name);
+                all_declarations.push(AmbientModuleMember { name, entity_id });
+            }
+            continue;
+        }
+        match statement {
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(inner) = &export.declaration
+                    && let Some(kind) = declaration_entity_kind(inner)
+                {
+                    for (start, name) in declaration_export_names(inner) {
+                        let entity_id = stable_entity_id(kind, path, start, &name);
+                        members.push(AmbientModuleMember {
+                            name: name.clone(),
+                            entity_id: entity_id.clone(),
+                        });
+                        all_declarations.push(AmbientModuleMember { name, entity_id });
+                    }
+                }
+            }
+            Statement::ExportDefaultDeclaration(export_default) => {
+                default_statement = Some(export_default);
+            }
+            _ => {}
+        }
+    }
+    let default_member = default_statement
+        .and_then(|export_default| ambient_default_member(path, export_default, &all_declarations));
+    (members, default_member)
+}
+
+/// Ambient module resolution task (2026-09-04): the `AmbientModuleMember`
+/// an `export default <decl>` statement inside an ambient module block
+/// names, when nameable -- mirrors `visit_export_default_declaration`'s
+/// (lib.rs, file-level) own restricted shape: a named function/class/
+/// interface declaration resolves to ITS OWN entity id; a bare identifier
+/// resolves to an ALREADY-COLLECTED member of the SAME block sharing that
+/// name (unique match only -- ambiguous/absent stays `None`, never a
+/// guess, same "unique or bust" rule `resolver::resolve_direct_export`
+/// uses elsewhere). Every other shape (anonymous function/class expression,
+/// object/array literal, ...) has no name to resolve to and stays `None`.
+fn ambient_default_member(
+    path: &str,
+    export_default: &ExportDefaultDeclaration<'_>,
+    members: &[AmbientModuleMember],
+) -> Option<AmbientModuleMember> {
+    match &export_default.declaration {
+        ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+            let identifier = function.id.as_ref()?;
+            let name = identifier.name.as_str().to_owned();
+            let entity_id =
+                stable_entity_id(EntityKind::Function, path, identifier.span.start, &name);
+            Some(AmbientModuleMember { name, entity_id })
+        }
+        ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+            let identifier = class.id.as_ref()?;
+            let name = identifier.name.as_str().to_owned();
+            let entity_id = stable_entity_id(EntityKind::Class, path, identifier.span.start, &name);
+            Some(AmbientModuleMember { name, entity_id })
+        }
+        ExportDefaultDeclarationKind::TSInterfaceDeclaration(interface) => {
+            let name = interface.id.name.as_str().to_owned();
+            let entity_id =
+                stable_entity_id(EntityKind::Interface, path, interface.id.span.start, &name);
+            Some(AmbientModuleMember { name, entity_id })
+        }
+        ExportDefaultDeclarationKind::Identifier(ident) => {
+            let matches: Vec<&AmbientModuleMember> = members
+                .iter()
+                .filter(|member| member.name == ident.name.as_str())
+                .collect();
+            match matches.as_slice() {
+                [single] => Some((*single).clone()),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2796,10 +3645,8 @@ impl<'a> Visit<'a> for SyntaxCollector {
             declaration.source.span.end,
         );
         // P1-B: `export * as X from "spec"` (as opposed to a plain,
-        // nameless `export * from "spec"`, which stays exactly as before --
-        // E2's re-export machinery deliberately never captures it, see
-        // `SyntaxFileResult::export_bindings`'s doc comment) now ALSO
-        // synthesizes a `SyntaxExportBinding` for `X` naming the WHOLE
+        // nameless `export * from "spec"`, captured separately below) now
+        // ALSO synthesizes a `SyntaxExportBinding` for `X` naming the WHOLE
         // re-exported module as a namespace -- `local_name` is the
         // sentinel `NAMESPACE_REEXPORT_LOCAL_NAME` (never a real
         // identifier), which `resolver::resolve_named_export` recognizes
@@ -2817,8 +3664,79 @@ impl<'a> Visit<'a> for SyntaxCollector {
                 source_specifier: Some(declaration.source.value.as_str().to_owned()),
                 source_target_path: None,
             });
+        } else {
+            // 2026-09-04 references-parity task, bucket 2: a plain, nameless
+            // `export * from "spec"` -- there is no single exported NAME
+            // here (it re-exports EVERY name the target module itself
+            // exports), so it cannot become a `SyntaxExportBinding` the way
+            // the `as X` form above does. Recorded into the separate
+            // `export_star_specifiers` list instead, for `resolver::
+            // resolve_named_export_inner` to consult as a fallback AFTER an
+            // ordinary `export_bindings` lookup for a name comes up empty --
+            // see that function's own doc comment. `target_path` is left
+            // `None` here, filled in by the SAME generic per-specifier
+            // resolution pass `export_bindings`' own `source_target_path`
+            // goes through, just below in this file's own caller.
+            self.export_star_specifiers.push(ExportStarSpecifier {
+                specifier: declaration.source.value.as_str().to_owned(),
+                target_path: None,
+            });
         }
         walk_export_all_declaration(self, declaration);
+    }
+
+    /// 2026-09-04 references-parity task, Phase B bucket 1: `export default
+    /// <decl-or-expr>` is a DIFFERENT AST node from every other export form
+    /// (`ExportDefaultDeclaration`, not `ExportNamedDeclaration`) --
+    /// `declaration_export_names`'s own doc comment notes it "never reaches
+    /// this function" for exactly that reason, and until this fix
+    /// `export_bindings` carried NOTHING for a default export at all, so
+    /// `resolver::resolve_named_export(files, path, "default")` (what an
+    /// `import X from "path"` specifier looks up) always reported
+    /// `Unresolved` regardless of what the target module actually exports
+    /// as its default -- found live against the n8n corpus: 7,500
+    /// v3-confirmed reference sites stayed `checker_pending` this way,
+    /// `import buildTrivyBlocks from "./build-trivy-blocks.mjs"` (whose
+    /// target is `export default function buildTrivyBlocks(...) {}`) the
+    /// first sample found.
+    ///
+    /// Captured ONLY when the default-exported thing has a NAMEABLE,
+    /// already-existing entity to point `local_name` at (the same "never
+    /// guess" rule `resolve_named_export`'s own doc comment states): a
+    /// named function/class/interface declaration (its OWN entity --
+    /// `visit_function`/`visit_class`/`visit_ts_interface_declaration`
+    /// already push one for it regardless of the `export default` wrapper,
+    /// since the wrapper does not change the inner declaration's own AST
+    /// shape) or a bare identifier expression (`export default
+    /// someLocalThing;`, re-exporting an already-declared local binding by
+    /// name). Every other shape -- an ANONYMOUS function/class expression,
+    /// an object/array literal, an arrow function, a template/conditional/
+    /// binary expression, ... -- has no name to resolve to at all and is
+    /// left uncaptured, exactly like before this fix (stays `checker_
+    /// pending` upstream, never a guess).
+    fn visit_export_default_declaration(&mut self, declaration: &ExportDefaultDeclaration<'a>) {
+        let local_name: Option<String> = match &declaration.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                function.id.as_ref().map(|id| id.name.as_str().to_owned())
+            }
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                class.id.as_ref().map(|id| id.name.as_str().to_owned())
+            }
+            ExportDefaultDeclarationKind::TSInterfaceDeclaration(interface) => {
+                Some(interface.id.name.as_str().to_owned())
+            }
+            ExportDefaultDeclarationKind::Identifier(ident) => Some(ident.name.as_str().to_owned()),
+            _ => None,
+        };
+        if let Some(local_name) = local_name {
+            self.export_bindings.push(SyntaxExportBinding {
+                exported_name: "default".to_owned(),
+                local_name,
+                source_specifier: None,
+                source_target_path: None,
+            });
+        }
+        walk_export_default_declaration(self, declaration);
     }
 
     fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
@@ -2893,6 +3811,58 @@ impl<'a> Visit<'a> for SyntaxCollector {
         self.push_entity(&declaration.id, EntityKind::Interface, UniversalKind::Type);
         walk_ts_interface_declaration(self, declaration);
     }
+
+    /// Ambient module resolution task (2026-09-04): only a STRING-LITERAL-
+    /// named `TSModuleDeclaration` (`declare module "specifier" { ... }` /
+    /// `declare module "specifier";`) is an ambient module declaration --
+    /// see `AmbientModuleDeclaration`'s own doc comment. An `Identifier`-
+    /// named one (`namespace X {}`/`declare namespace X {}`) names a LOCAL
+    /// binding, never a module specifier, and is deliberately left
+    /// untouched here (out of this task's scope -- `EntityKind::Namespace`
+    /// is not wired to that shape). Every declaration nested inside the
+    /// block (function/class/interface/type/enum/variable) still gets its
+    /// own entity through the ordinary recursive walk below, unaffected --
+    /// this override only ADDS the block's own namespace entity plus the
+    /// `AmbientModuleDeclaration` fact; it never replaces or skips the
+    /// default walk.
+    fn visit_ts_module_declaration(&mut self, declaration: &TSModuleDeclaration<'a>) {
+        if let TSModuleDeclarationName::StringLiteral(literal) = &declaration.id {
+            let specifier = literal.value.as_str().to_owned();
+            let namespace_entity_id = self.push_namespace_entity(
+                &specifier,
+                literal.span.start,
+                declaration.span.start,
+                declaration.span.end,
+            );
+            let (bodyful, members, default_member) = match &declaration.body {
+                Some(TSModuleDeclarationBody::TSModuleBlock(block)) => {
+                    let (members, default_member) = ambient_module_members(&self.path, &block.body);
+                    (true, members, default_member)
+                }
+                // A nested `declare module "x" { declare module "y" {} }`
+                // is syntactically legal but vanishingly rare in practice
+                // (module augmentation blocks are conventionally top-
+                // level); treated the same as the bodyless shorthand below
+                // -- no members captured, never a guess.
+                _ => (false, Vec::new(), None),
+            };
+            self.ambient_modules.push(AmbientModuleDeclaration {
+                specifier,
+                bodyful,
+                // Patched to the file's real script-vs-module status by
+                // `parse_source` right after the walk completes (a
+                // whole-file property, not knowable mid-walk -- see
+                // `AmbientModuleDeclaration::is_augmentation`'s own doc
+                // comment). `false` here is a placeholder, never the
+                // published value.
+                is_augmentation: false,
+                namespace_entity_id,
+                members,
+                default_member,
+            });
+        }
+        walk_ts_module_declaration(self, declaration);
+    }
 }
 
 fn stable_entity_id(kind: EntityKind, path: &str, start: u32, name: &str) -> String {
@@ -2934,6 +3904,14 @@ fn reresolve_file(
             binding.source_target_path = resolved;
         }
     }
+    let mut export_star_specifiers = file.export_star_specifiers.clone();
+    for star in &mut export_star_specifiers {
+        let resolved = resolver.resolve(&file.path, &star.specifier, available);
+        if resolved != star.target_path {
+            resolution_changed = true;
+        }
+        star.target_path = resolved;
+    }
     if !resolution_changed {
         return None;
     }
@@ -2947,42 +3925,30 @@ fn reresolve_file(
         })
         .cloned()
         .collect();
-    for import in &direct_imports {
-        let kind = match import.kind {
-            ImportKind::Import => RelationKind::Import,
-            ImportKind::Export => RelationKind::Export,
-            ImportKind::DynamicImport | ImportKind::Require => continue,
-        };
-        let target_id = import
-            .target_path
-            .as_ref()
-            .map(|path| stable_entity_id(EntityKind::Module, path, 0, path));
-        let classification = if target_id.is_some() {
-            RelationClassification::Confirmed
-        } else {
-            RelationClassification::Possible
-        };
-        let id = format!(
-            "jsts:{}:{}:{}:{}:{}:{}",
-            kind.identity_name(),
-            file.path,
-            import.start,
-            import.end,
-            module_id,
-            target_id.as_deref().unwrap_or("unresolved")
-        );
-        relations.push(SyntaxRelation {
-            id,
-            kind,
-            source_id: module_id.clone(),
-            target_id,
-            path: file.path.clone(),
-            start: import.start,
-            end: import.end,
-            classification,
-        });
-    }
+    // Ambient module resolution task (2026-09-04): delegates to the SAME
+    // shared decision `finish_import_relations` uses (`ambient_index: None`
+    // here too -- T1's add/remove-root sweep has no cross-file ambient
+    // picture either, same reasoning as the per-file parse call site; the
+    // separate `reresolve_ambient_relations` pass below is what applies
+    // ambient resolution). Before this fix, this loop rebuilt an
+    // unresolved edge's relation as unconditionally `Possible`/no-target,
+    // NEVER re-applying `classify_external_specifier` -- a latent bug this
+    // refactor also fixes: a bare external import untouched by THIS call's
+    // own resolution change (e.g. a sibling relative import in the same
+    // file DID change, forcing this whole relation list to rebuild) used
+    // to silently lose its external classification here.
+    let (import_export_relations, external_entities) =
+        build_import_export_facts(&file.path, &module_id, &direct_imports, None);
+    relations.extend(import_export_relations);
     relations.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut entities: Vec<SyntaxEntity> = file
+        .entities
+        .iter()
+        .filter(|entity| entity.kind != EntityKind::ExternalModule)
+        .cloned()
+        .collect();
+    entities.extend(external_entities);
+    entities.sort_by(|left, right| left.id.cmp(&right.id));
     Some(SyntaxFileResult {
         path: file.path.clone(),
         content_digest: file.content_digest.clone(),
@@ -2991,10 +3957,73 @@ fn reresolve_file(
         byte_length: file.byte_length,
         parsed: file.parsed,
         direct_imports,
-        entities: file.entities.clone(),
+        entities,
         relations,
         diagnostics: file.diagnostics.clone(),
         export_bindings,
+        export_star_specifiers,
+        ambient_modules: file.ambient_modules.clone(),
+    })
+}
+
+/// Ambient module resolution task (2026-09-04), fix item 2: rebuilds ONLY
+/// `path`'s `jsts:relation_import`/`export` rows (plus the `external_
+/// module` entities they need) using `ambient_index`, WITHOUT re-deriving
+/// `direct_imports`/`export_bindings`/`export_star_specifiers` -- unlike
+/// `reresolve_file` (T1, triggered by a path add/remove), the trigger here
+/// is a DIFFERENT file's `declare module` block appearing/disappearing/
+/// changing, which never touches `path`'s own workspace-path resolution.
+/// Returns `None` when the rebuilt relations/entities are byte-identical to
+/// what `file` already had (a specifier this call reconsidered turned out
+/// to resolve the same way, e.g. still zero declaring files -> still
+/// external), sparing the caller a no-op `next_files` write.
+fn reresolve_ambient_relations(
+    file: &SyntaxFileResult,
+    ambient_index: &resolver::AmbientModuleIndex,
+) -> Option<SyntaxFileResult> {
+    let module_id = stable_entity_id(EntityKind::Module, &file.path, 0, &file.path);
+    let mut relations: Vec<SyntaxRelation> = file
+        .relations
+        .iter()
+        .filter(|relation| {
+            !(matches!(relation.kind, RelationKind::Import | RelationKind::Export)
+                && relation.source_id == module_id)
+        })
+        .cloned()
+        .collect();
+    let (import_export_relations, external_entities) = build_import_export_facts(
+        &file.path,
+        &module_id,
+        &file.direct_imports,
+        Some(ambient_index),
+    );
+    relations.extend(import_export_relations);
+    relations.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut entities: Vec<SyntaxEntity> = file
+        .entities
+        .iter()
+        .filter(|entity| entity.kind != EntityKind::ExternalModule)
+        .cloned()
+        .collect();
+    entities.extend(external_entities);
+    entities.sort_by(|left, right| left.id.cmp(&right.id));
+    if relations == file.relations && entities == file.entities {
+        return None;
+    }
+    Some(SyntaxFileResult {
+        path: file.path.clone(),
+        content_digest: file.content_digest.clone(),
+        language: file.language,
+        script_kind: file.script_kind,
+        byte_length: file.byte_length,
+        parsed: file.parsed,
+        direct_imports: file.direct_imports.clone(),
+        entities,
+        relations,
+        diagnostics: file.diagnostics.clone(),
+        export_bindings: file.export_bindings.clone(),
+        export_star_specifiers: file.export_star_specifiers.clone(),
+        ambient_modules: file.ambient_modules.clone(),
     })
 }
 
@@ -3100,6 +4129,13 @@ fn retained_bytes(files: &BTreeMap<String, SyntaxFileResult>) -> u64 {
                             + binding.local_name.len()
                             + binding.source_specifier.as_ref().map_or(0, String::len)
                             + binding.source_target_path.as_ref().map_or(0, String::len)
+                    })
+                    .sum::<usize>()
+                + file
+                    .export_star_specifiers
+                    .iter()
+                    .map(|star| {
+                        star.specifier.len() + star.target_path.as_ref().map_or(0, String::len)
                     })
                     .sum::<usize>()
         })
@@ -3416,6 +4452,583 @@ mod tests {
                 && record.body["kind"] == "variable"
                 && record.body["name"] == "V"
         }));
+    }
+
+    // -- 2026-09-04 external package/symbol entities task: lane 1 (module-
+    // level `jsts:relation_import`/`_export` target + `external_module`
+    // entity) ------------------------------------------------------------
+
+    #[test]
+    fn unresolved_bare_import_gets_an_external_module_entity_and_a_confirmed_relation_target() {
+        let mut state = SyntaxWorkerState::default();
+        let files = vec![source("a.ts", "import { get } from \"lodash\";\nget(1);\n")];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult {
+            records,
+            direct_imports,
+            ..
+        } = read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        // The workspace resolver still reports no workspace target -- lane 1
+        // never invents a fake file path.
+        assert_eq!(direct_imports[0].target_path, None);
+        let import_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_import")
+            .expect("expected an import relation record");
+        assert_eq!(
+            import_relation.body["target_id"], "jsts:external_module:lodash",
+            "the relation now carries the external module as its target"
+        );
+        assert_eq!(import_relation.body["classification"], "confirmed");
+        let module_entity = records
+            .iter()
+            .find(|record| record.identity_key == "jsts:external_module:lodash")
+            .expect("expected an external_module entity record");
+        assert_eq!(module_entity.category, "entity");
+        assert_eq!(module_entity.kind, "jsts:entity_container");
+        assert_eq!(module_entity.universal_kind, "core:container");
+        assert_eq!(module_entity.body["kind"], "external_module");
+        assert_eq!(module_entity.body["name"], "lodash");
+    }
+
+    #[test]
+    fn export_from_an_unresolved_bare_specifier_also_targets_the_external_module() {
+        let mut state = SyntaxWorkerState::default();
+        let files = vec![source("a.ts", "export { get } from \"lodash\";\n")];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let export_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_export")
+            .expect("expected an export relation record");
+        assert_eq!(
+            export_relation.body["target_id"],
+            "jsts:external_module:lodash"
+        );
+        assert_eq!(export_relation.body["classification"], "confirmed");
+    }
+
+    #[test]
+    fn relative_import_that_fails_to_resolve_never_gets_an_external_module_entity() {
+        let mut state = SyntaxWorkerState::default();
+        let files = vec![source("a.ts", "import { helper } from \"./missing\";\n")];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let import_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_import")
+            .expect("expected an import relation record");
+        assert_eq!(import_relation.body.get("target_id"), None);
+        assert_eq!(import_relation.body["classification"], "possible");
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.identity_key.starts_with("jsts:external_module:")),
+            "a relative specifier that merely failed to resolve must never synthesize an external entity: {records:?}"
+        );
+        // Exactly one entity (the owner's own module) -- same invariant the
+        // pre-existing `oxc_parses_all_four_syntax_families_and_extracts_
+        // direct_edges` test above already asserts for a resolvable import.
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.category == "entity")
+                .count(),
+            1
+        );
+    }
+
+    // -- Ambient module resolution task (2026-09-04) ----------------------
+
+    #[test]
+    fn ambient_module_declaration_gets_a_namespace_entity_and_its_members_keep_their_own_ids() {
+        let mut state = SyntaxWorkerState::default();
+        let files = vec![source(
+            "plugins.d.ts",
+            "declare module \"eslint-plugin-lodash\" {\n  export function configure(): void;\n}\n",
+        )];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["plugins.d.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "plugins.d.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let text =
+            "declare module \"eslint-plugin-lodash\" {\n  export function configure(): void;\n}\n";
+        let quote_start = text.find('"').unwrap() as u32;
+        let namespace_id =
+            format!("jsts:namespace:plugins.d.ts:{quote_start}:eslint-plugin-lodash");
+        let namespace_entity = records
+            .iter()
+            .find(|record| record.identity_key == namespace_id)
+            .unwrap_or_else(|| panic!("expected a namespace entity {namespace_id}: {records:?}"));
+        assert_eq!(namespace_entity.body["kind"], "namespace");
+        assert_eq!(namespace_entity.universal_kind, "core:type");
+        assert_eq!(namespace_entity.body["name"], "eslint-plugin-lodash");
+        // The member's own entity id is UNAFFECTED by ambient nesting -- the
+        // ordinary `visit_function`/`push_entity` producer already covers
+        // it, byte-identical to what `AmbientModuleDeclaration::members`
+        // records for resolution purposes.
+        let function_start = text.find("configure").unwrap() as u32;
+        let function_id = format!("jsts:function:plugins.d.ts:{function_start}:configure");
+        assert!(
+            records
+                .iter()
+                .any(|record| record.identity_key == function_id),
+            "expected a function entity {function_id}: {records:?}"
+        );
+    }
+
+    #[test]
+    fn ambient_named_import_relation_targets_the_namespace_entity_not_an_external_module() {
+        let mut state = SyntaxWorkerState::default();
+        let declaration_text =
+            "declare module \"eslint-plugin-lodash\" {\n  export function configure(): void;\n}\n";
+        let files = vec![
+            source("plugins.d.ts", declaration_text),
+            source(
+                "a.ts",
+                "import { configure } from \"eslint-plugin-lodash\";\nconfigure();\n",
+            ),
+        ];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["plugins.d.ts", "a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let quote_start = declaration_text.find('"').unwrap() as u32;
+        let namespace_id =
+            format!("jsts:namespace:plugins.d.ts:{quote_start}:eslint-plugin-lodash");
+        let import_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_import")
+            .expect("expected an import relation record");
+        assert_eq!(import_relation.body["target_id"], namespace_id);
+        assert_eq!(import_relation.body["classification"], "confirmed");
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.identity_key.starts_with("jsts:external_module:")),
+            "an ambiently-resolved specifier must never synthesize an external_module entity: {records:?}"
+        );
+    }
+
+    /// Fix item 2's own incremental requirement: adding a `declare module`
+    /// for a specifier previously external flips EVERY importer's relation
+    /// target on the NEXT scan, even when the importer's own content did
+    /// not change this call (so it is never among `changed_sources`, and
+    /// `ImportReverseIndex`/`CandidateIndex` -- both keyed by resolvable
+    /// PATHS -- can never find it either).
+    #[test]
+    fn incrementally_adding_an_ambient_declaration_flips_a_previously_external_importer() {
+        let mut state = SyntaxWorkerState::default();
+        let importer_text = "import { configure } from \"eslint-plugin-lodash\";\nconfigure();\n";
+        let first_pass = vec![source("a.ts", importer_text)];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, first_pass, &["a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let import_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_import")
+            .expect("expected an import relation record");
+        assert_eq!(
+            import_relation.body["target_id"], "jsts:external_module:eslint-plugin-lodash",
+            "before the ambient declaration exists, this stays external"
+        );
+
+        // Second scan: `a.ts` is byte-identical (never re-parsed this
+        // call), only `plugins.d.ts` is newly added.
+        let declaration_text =
+            "declare module \"eslint-plugin-lodash\" {\n  export function configure(): void;\n}\n";
+        let second_pass = vec![
+            source("a.ts", importer_text),
+            source("plugins.d.ts", declaration_text),
+        ];
+        let WorkerMessage::AnalysisResult {
+            build,
+            affected_files,
+            ..
+        } = analyze(&mut state, second_pass, &["a.ts", "plugins.d.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Incremental);
+        assert!(
+            affected_files.iter().any(|path| path == "a.ts"),
+            "the importer must be reported as affected even though its own text did not change: {affected_files:?}"
+        );
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let quote_start = declaration_text.find('"').unwrap() as u32;
+        let namespace_id =
+            format!("jsts:namespace:plugins.d.ts:{quote_start}:eslint-plugin-lodash");
+        let import_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_import")
+            .expect("expected an import relation record");
+        assert_eq!(
+            import_relation.body["target_id"], namespace_id,
+            "the importer's relation must flip to the ambient namespace entity on the next scan"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.identity_key.starts_with("jsts:external_module:")),
+            "the now-stale external_module entity must not survive the flip: {records:?}"
+        );
+    }
+
+    /// n8n corpus regression (found live: 649 `v4_different_target` rows,
+    /// all tracing back to `packages/frontend/@n8n/chat/src/env.d.ts`):
+    /// `declare module '~icons/*' { const component: T; export default
+    /// component; }` -- a WILDCARD specifier pattern, `export default`ing a
+    /// BARE (never itself `export`ed) local declaration. Both the wildcard
+    /// match and the non-exported default target must resolve.
+    #[test]
+    fn ambient_wildcard_default_export_of_a_bare_local_declaration_resolves() {
+        let mut state = SyntaxWorkerState::default();
+        let declaration_text = "declare module \"~icons/*\" {\n  const component: unknown;\n  export default component;\n}\n";
+        let files = vec![
+            source("env.d.ts", declaration_text),
+            source(
+                "a.ts",
+                "import IconLucideMessageSquare from \"~icons/lucide/message-square\";\nconsole.log(IconLucideMessageSquare);\n",
+            ),
+        ];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["env.d.ts", "a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let component_start = declaration_text.find("component").unwrap() as u32;
+        let target_id = format!("jsts:variable:env.d.ts:{component_start}:component");
+        let import_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_import")
+            .expect("expected an import relation record");
+        assert!(
+            import_relation.body["target_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("jsts:namespace:env.d.ts:"),
+            "the wildcard-matched import relation must target the namespace entity, got {:?}",
+            import_relation.body["target_id"]
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.identity_key.starts_with("jsts:external_module:")),
+            "a wildcard-matched specifier must never synthesize an external_module entity: {records:?}"
+        );
+        // The `component` variable entity itself must exist with that id,
+        // published under `env.d.ts`'s OWN facts page (the ordinary
+        // `visit_variable_declaration` producer, unaffected by ambient
+        // nesting -- never the importer's own page).
+        let WorkerMessage::FactsResult {
+            records: declaration_records,
+            ..
+        } = read_page(&state, "env.d.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        assert!(
+            declaration_records
+                .iter()
+                .any(|record| record.identity_key == target_id),
+            "expected a variable entity {target_id}: {declaration_records:?}"
+        );
+    }
+
+    /// Owner-flagged follow-up (2026-09-04): a `declare module "vue" {
+    /// ... }` block inside a file that ITSELF has top-level `import`/
+    /// `export` syntax is a MODULE AUGMENTATION, not a genuine ambient
+    /// module declaration -- it must never capture the `vue` specifier.
+    /// A real `import { Foo } from "vue"` elsewhere in the workspace must
+    /// stay classified `external_module`/`external_symbol`, exactly as it
+    /// would with no augmentation file present at all. This is the exact
+    /// n8n Vue-frontend regression the owner flagged: many files augment
+    /// `vue`/`pinia`/`n8n-workflow`, and without this file-level script-
+    /// vs-module distinction, `has_any_declaration("vue")` would return
+    /// `true`, permanently reverting every `vue` import to pending.
+    #[test]
+    fn module_augmentation_never_captures_the_specifier_for_resolution() {
+        let mut state = SyntaxWorkerState::default();
+        let augmentation_text = "import { ComponentCustomProperties } from \"vue\";\ndeclare module \"vue\" {\n  export interface ComponentCustomProperties {\n    foo: string;\n  }\n}\nexport {};\n";
+        let files = vec![
+            source("augment.ts", augmentation_text),
+            source(
+                "a.ts",
+                "import { defineComponent } from \"vue\";\ndefineComponent({});\n",
+            ),
+        ];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["augment.ts", "a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let import_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_import")
+            .expect("expected an import relation record");
+        assert_eq!(
+            import_relation.body["target_id"], "jsts:external_module:vue",
+            "a module augmentation must never make `vue` resolve ambiently -- it must stay external, got {:?}",
+            import_relation.body["target_id"]
+        );
+        assert_eq!(import_relation.body["classification"], "confirmed");
+        // The augmentation block's own namespace entity still exists (v3
+        // parity -- entity emission is unaffected, only RESOLUTION is
+        // gated on `is_augmentation`), published under `augment.ts`'s own
+        // facts page.
+        let WorkerMessage::FactsResult {
+            records: augment_records,
+            ..
+        } = read_page(&state, "augment.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        assert!(
+            augment_records
+                .iter()
+                .any(|record| record.body["kind"] == "namespace" && record.body["name"] == "vue"),
+            "the augmentation block's own namespace entity must still be published: {augment_records:?}"
+        );
+    }
+
+    #[test]
+    fn two_import_statements_of_the_same_external_package_share_one_module_entity() {
+        let mut state = SyntaxWorkerState::default();
+        let files = vec![source(
+            "a.ts",
+            "import { get } from \"lodash\";\nimport { set } from \"lodash\";\n",
+        )];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.identity_key == "jsts:external_module:lodash")
+                .count(),
+            1,
+            "within-file dedup must keep exactly one module entity for two import statements of the same package: {records:?}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.kind == "jsts:relation_import")
+                .count(),
+            2,
+            "each import STATEMENT still gets its own relation row"
+        );
+    }
+
+    /// The task brief's own unit-test list: class instance/static methods,
+    /// properties, constructor, getter/setter; interface method + property
+    /// signatures; an anonymous class skipped; ids equal `urdira_jsts_
+    /// typeflow::declaration_id(...)`'s own output; a `contains` relation
+    /// per member with the class/interface as source; module-level
+    /// `contains` unchanged.
+    #[test]
+    fn class_and_interface_members_materialize_as_entities_with_typeflow_identity() {
+        let mut state = SyntaxWorkerState::default();
+        let text = "class Base {\n  constructor(x) {}\n  greet() {}\n  static make() {}\n  get id() { return 1; }\n  set id(v) {}\n  name = \"x\";\n  static count = 0;\n}\ninterface Shape {\n  area(): number;\n  readonly kind: string;\n}\nexport default class {\n  hidden() {}\n}\n";
+        let files = vec![source("a.ts", text)];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+
+        let entity_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.category == "entity")
+            .collect();
+        let relation_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.category == "relation")
+            .collect();
+
+        // Anonymous default-export class is skipped entirely -- no entity
+        // for the class itself, and no member entity for `hidden` either
+        // (typeflow's own `summarize_class` never summarizes it, so there
+        // is no `MemberEntry`/`MemberDeclaration` to materialize).
+        assert!(
+            !entity_records
+                .iter()
+                .any(|record| record.body["name"] == "hidden")
+        );
+
+        let class_id = entity_records
+            .iter()
+            .find(|record| record.body["kind"] == "class" && record.body["name"] == "Base")
+            .expect("Base class entity present")
+            .identity_key
+            .clone();
+        assert_eq!(class_id, "jsts:class:a.ts:6:Base");
+        let interface_id = entity_records
+            .iter()
+            .find(|record| record.body["kind"] == "interface" && record.body["name"] == "Shape")
+            .expect("Shape interface entity present")
+            .identity_key
+            .clone();
+
+        let module_id = entity_records
+            .iter()
+            .find(|record| record.body["kind"] == "module")
+            .expect("module entity present")
+            .identity_key
+            .clone();
+
+        // Module-level `contains` (module -> Base, module -> Shape) is
+        // unchanged by member-entity emission.
+        assert!(relation_records.iter().any(|record| {
+            record.kind == "jsts:relation_contains"
+                && record.body["source_id"] == module_id
+                && record.body["target_id"] == class_id
+        }));
+        assert!(relation_records.iter().any(|record| {
+            record.kind == "jsts:relation_contains"
+                && record.body["source_id"] == module_id
+                && record.body["target_id"] == interface_id
+        }));
+
+        let member = |container_id: &str, name: &str, kind: &str| {
+            entity_records
+                .iter()
+                .find(|record| {
+                    record.body["parent_id"] == container_id
+                        && record.body["name"] == name
+                        && record.body["kind"] == kind
+                })
+                .unwrap_or_else(|| panic!("missing member entity {container_id}/{name}:{kind}"))
+        };
+
+        for (name, kind, projected_kind) in [
+            ("constructor", "constructor", "jsts:entity_callable"),
+            ("greet", "method", "jsts:entity_callable"),
+            ("make", "method", "jsts:entity_callable"),
+            ("id", "getter", "jsts:entity_callable"),
+            ("id", "setter", "jsts:entity_callable"),
+            ("name", "property", "jsts:entity_variable"),
+            ("count", "property", "jsts:entity_variable"),
+        ] {
+            let record = member(&class_id, name, kind);
+            assert_eq!(record.kind, projected_kind, "projected kind for {name}");
+            assert_eq!(
+                record.identity_key,
+                urdira_jsts_typeflow::declaration_id(
+                    kind,
+                    "a.ts",
+                    record.body["start"].as_u64().unwrap() as u32,
+                    name
+                ),
+                "identity for {name}:{kind} matches typeflow's declaration_id"
+            );
+            assert_eq!(record.body["qualified_name"], format!("a.ts.Base.{name}"));
+            // One `contains` relation, container -> this exact member.
+            assert!(relation_records.iter().any(|relation| {
+                relation.kind == "jsts:relation_contains"
+                    && relation.body["source_id"] == class_id
+                    && relation.body["target_id"] == record.identity_key
+            }));
+        }
+
+        for (name, kind, projected_kind) in [
+            ("area", "method", "jsts:entity_callable"),
+            ("kind", "property", "jsts:entity_variable"),
+        ] {
+            let record = member(&interface_id, name, kind);
+            assert_eq!(record.kind, projected_kind, "projected kind for {name}");
+            assert_eq!(
+                record.identity_key,
+                urdira_jsts_typeflow::declaration_id(
+                    kind,
+                    "a.ts",
+                    record.body["start"].as_u64().unwrap() as u32,
+                    name
+                ),
+            );
+            assert!(relation_records.iter().any(|relation| {
+                relation.kind == "jsts:relation_contains"
+                    && relation.body["source_id"] == interface_id
+                    && relation.body["target_id"] == record.identity_key
+            }));
+        }
     }
 
     #[test]
@@ -4709,11 +6322,21 @@ declare module 'markdown-it-task-lists' {
 
     #[test]
     fn plain_export_star_still_synthesizes_no_binding() {
-        // E2's existing "export * is never captured" behavior (see
-        // `SyntaxFileResult::export_bindings`'s doc comment) MUST stay
-        // unchanged for the nameless form.
+        // E2's existing "export * is never captured as a named binding"
+        // behavior (see `SyntaxFileResult::export_bindings`'s doc comment)
+        // MUST stay unchanged for the nameless form -- it is captured
+        // SEPARATELY, in `export_star_specifiers` (2026-09-04
+        // references-parity task, bucket 2).
         let collector = collect("index.ts", "export * from './evals/index';\n");
         assert!(collector.export_bindings.is_empty());
+        assert_eq!(collector.export_star_specifiers.len(), 1);
+        assert_eq!(
+            collector.export_star_specifiers[0].specifier,
+            "./evals/index"
+        );
+        // Filled in by `parse_source`'s own generic per-specifier
+        // resolution pass, not here.
+        assert_eq!(collector.export_star_specifiers[0].target_path, None);
     }
 
     #[test]

@@ -146,3 +146,22 @@ pub struct InitializeResponse {
 pub mod symbol_flags {
     pub const ALIAS: u32 = 0x0020_0000;
 }
+
+/// One entry of the `Diagnostic[]` array `getSyntacticDiagnostics`/
+/// `getBindDiagnostics`/`getSemanticDiagnostics` return (`Diagnostic` in
+/// `dist/api/async/types.d.ts`). Unlike the SYNC channel `analyzer.ts` talks
+/// to (whose `text` can be a nested `DiagnosticMessageChain`), the ASYNC
+/// channel's own `Diagnostic.text` is documented and observed to always be a
+/// plain `string` -- `messageChain`/`relatedInformation` (both present on
+/// the wire type) are deliberately not reproduced here, matching the crate's
+/// stated diagnostics scope (P1-D task brief: only what a `jsts:diagnostic`
+/// row needs).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiagnosticResponse {
+    #[serde(rename = "fileName", default)]
+    pub file_name: Option<String>,
+    pub pos: i32,
+    pub end: i32,
+    pub code: u32,
+    pub text: String,
+}

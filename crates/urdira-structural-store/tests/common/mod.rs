@@ -6,7 +6,9 @@
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use urdira_structural_store::{
-    CATEGORY_ENTITY, CATEGORY_RELATION, DependencyRow, Dictionaries, NONE_U16, NONE_U32, RecordRow,
+    CATEGORY_ENTITY, CATEGORY_RELATION, DependencyRow, Dictionaries, NONE_U16, NONE_U32,
+    PENDING_SITE_KIND_CALL, PENDING_SITE_KIND_IMPLEMENTS, PENDING_SITE_KIND_INHERITS,
+    PendingSiteRow, RecordRow,
 };
 
 /// Deterministic xorshift64* PRNG -- no external `rand` dependency needed
@@ -155,6 +157,49 @@ pub fn gen_deps(n: usize, seed: u64, n_owners: u32) -> Vec<DependencyRow> {
             role: rng.below(3) as u8,
             valid_from: 1,
             valid_to: 0,
+        })
+        .collect()
+}
+
+/// `n` synthetic pending-site rows, all opened at `generation`, with
+/// globally-unique `(owner_artifact, start, end, site_kind)` keys --
+/// `start` strictly increases with `i`, offset by `key_base`, so two
+/// separate calls (e.g. a base batch and a later delta's batch) never
+/// collide by accident, while `owner_artifact`/`site_kind` still vary
+/// randomly across the batch.
+pub fn gen_pending_sites(
+    n: usize,
+    seed: u64,
+    n_owners: u32,
+    generation: u32,
+    key_base: u32,
+) -> Vec<PendingSiteRow> {
+    let mut rng = Rng::new(seed);
+    (0..n)
+        .map(|i| {
+            let start = key_base + (i as u32) * 100;
+            let site_kind = match i % 3 {
+                0 => PENDING_SITE_KIND_CALL,
+                1 => PENDING_SITE_KIND_INHERITS,
+                _ => PENDING_SITE_KIND_IMPLEMENTS,
+            };
+            PendingSiteRow {
+                owner_artifact: rng.below(n_owners),
+                owner_version: 0,
+                valid_from: generation,
+                valid_to: 0,
+                start,
+                end: start + 40,
+                start_line: rng.below(500),
+                end_line: rng.below(500),
+                site_kind,
+                reason: rng.below(5) as u8,
+                source_subject: if rng.below(100) < 50 {
+                    Some(rng.below(10))
+                } else {
+                    None
+                },
+            }
         })
         .collect()
 }

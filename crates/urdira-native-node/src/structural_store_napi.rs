@@ -32,7 +32,10 @@ use urdira_structural_store::reader::Direction;
 use urdira_structural_store::row::{
     CATEGORY_RELATION, DependencyRow, Dictionaries, NONE_U16, NONE_U32, RecordRow,
 };
-use urdira_structural_store::{RecordView, StoreReader, to_prefixed_hex};
+use urdira_structural_store::{
+    PENDING_SITE_KIND_CALL, PENDING_SITE_KIND_IMPLEMENTS, PENDING_SITE_KIND_INHERITS, RecordView,
+    StoreReader, to_prefixed_hex,
+};
 
 fn napi_err(message: impl Into<String>) -> Error {
     Error::new(Status::GenericFailure, message.into())
@@ -349,6 +352,32 @@ pub struct NativeOutputDependencyRow {
     pub dependency_artifact_id: String,
     pub dependency_artifact_version_id: String,
     pub dependency_role: String,
+}
+
+/// One `pending.sites` row (`crates/urdira-structural-store`), shaped for
+/// `core:get_outline`'s additive `pending_sites` stream
+/// (`packages/engine/src/canonical-query-data-port.ts`,
+/// `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`
+/// §8). Deliberately omits `owner_artifact`/`owner_version`: every row a
+/// single `pending_sites_by_owner` call returns shares the SAME owner the
+/// caller already resolved to an ordinal, so the caller already knows it
+/// and can attach `path` itself.
+#[napi(object)]
+pub struct NativeOutputPendingSiteRow {
+    pub start: u32,
+    pub end: u32,
+    /// `"call" | "inherits" | "implements"` -- see `pending_site_kind_text`.
+    pub site_kind: String,
+    /// The `PendingReasonCode` name (see `pending_reason_text`).
+    pub reason: String,
+    /// The enclosing entity's `identity_key` text, resolved exactly like
+    /// the residual pass's own `source_subject -> dicts.subjects[ordinal]
+    /// -> StoreReader::get_visible -> identity_key` chain
+    /// (`crates/urdira-indexing-worker/src/v4/residual.rs::collect`, read
+    /// only -- not imported, since that crate depends on this one, not the
+    /// other way around). `None` when the site's `source_subject` is
+    /// absent or does not resolve at this generation.
+    pub source_id: Option<String>,
 }
 
 #[napi(object)]
@@ -724,6 +753,41 @@ fn kind_text(dict: &[String], id: u16) -> String {
 
 fn opt_u32_text(v: u32) -> Option<String> {
     (v != NONE_U32).then(|| v.to_string())
+}
+
+/// `pending.sites.site_kind` as query-facing text. Mirrors
+/// `urdira_structural_store::{PENDING_SITE_KIND_CALL,PENDING_SITE_KIND_INHERITS,PENDING_SITE_KIND_IMPLEMENTS}`,
+/// the on-disk contract those constants already own -- this just names them.
+fn pending_site_kind_text(kind: u8) -> &'static str {
+    match kind {
+        PENDING_SITE_KIND_CALL => "call",
+        PENDING_SITE_KIND_INHERITS => "inherits",
+        PENDING_SITE_KIND_IMPLEMENTS => "implements",
+        _ => "unspecified",
+    }
+}
+
+/// `pending.sites.reason` as query-facing text. SOURCE OF TRUTH:
+/// `PendingReasonCode` in `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`
+/// (that crate is owned by another agent this session and this crate does
+/// not depend on it, so the table is copied here rather than imported --
+/// see `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`
+/// §2.2 for the append-only on-disk contract: codes never change meaning,
+/// only grow). Keep in sync by hand if that enum ever grows.
+fn pending_reason_text(reason: u8) -> &'static str {
+    match reason {
+        0 => "unspecified",
+        1 => "call_deferred_to_e3",
+        2 => "call_target_uncertain",
+        3 => "overload_ambiguous",
+        4 => "union_ambiguous",
+        5 => "target_not_interned",
+        6 => "heritage_unresolved",
+        7 => "heritage_deferred_to_e3",
+        8 => "heritage_target_uncertain",
+        9 => "heritage_clause_partially_pending",
+        _ => "unspecified",
+    }
 }
 
 #[napi]
@@ -1356,5 +1420,277 @@ impl NativeStructuralStoreHandle {
             .iter()
             .map(|v| self.to_dep_output(v, &dicts))
             .collect())
+    }
+
+    /// Every visible `pending.sites` row owned by `owner_artifact_ordinal`
+    /// at `generation` (`StoreReader::pending_sites_by_owner`), for
+    /// `core:get_outline`'s additive `pending_sites` stream. Mirrors
+    /// `deps_by_owner`'s ordinal-in/rows-out shape exactly: the caller
+    /// (`packages/engine/src/native-query-snapshot-port.ts`) resolves an
+    /// artifact id/version to an ordinal via `dictionaries().artifacts`
+    /// first (same `findArtifactOrdinal` pattern `container_records_by_artifact_references`
+    /// already uses), then calls this. The actual row-mapping logic lives
+    /// in the plain (non-napi-`Result`) `pending_site_rows_for_owner`
+    /// below purely so it can be exercised by a `#[cfg(test)]` unit test
+    /// without linking the N-API host runtime -- see that function's doc
+    /// comment.
+    #[napi]
+    pub fn pending_sites_by_owner(
+        &self,
+        owner_artifact_ordinal: u32,
+        generation: u32,
+    ) -> Result<Vec<NativeOutputPendingSiteRow>> {
+        Ok(pending_site_rows_for_owner(
+            &self.reader,
+            owner_artifact_ordinal,
+            generation as u64,
+        ))
+    }
+}
+
+/// The row-mapping logic `pending_sites_by_owner` exposes over napi,
+/// factored out as a plain function returning a normal `Vec` (no
+/// `napi::Result`/`napi::Error` in its signature) so `#[cfg(test)]` unit
+/// tests below can call it directly: this crate has no `[lib]` target
+/// (`crate-type = ["cdylib"]` only, built for loading into a running
+/// Node.js process), and a standalone Rust test binary that instantiates
+/// `napi::Result<T>`'s `Drop`/error-reference glue fails to link (no
+/// `_napi_*` host symbols to resolve outside Node) even though the
+/// SUCCESS path never touches them at runtime -- the linker still has to
+/// resolve every symbol the compiled code statically references. Calling
+/// this function instead of `NativeStructuralStoreHandle::pending_sites_by_owner`
+/// (or `NativeStructuralStoreHandle::open`, whose own `Result<Self>` has
+/// the same problem) avoids ever instantiating that glue.
+fn pending_site_rows_for_owner(
+    reader: &StoreReader,
+    owner_artifact_ordinal: u32,
+    generation: u64,
+) -> Vec<NativeOutputPendingSiteRow> {
+    let dicts = reader.dictionaries();
+    reader
+        .pending_sites_by_owner(owner_artifact_ordinal, generation)
+        .iter()
+        .map(|view| {
+            let source_id = view.source_subject().and_then(|ordinal| {
+                dicts
+                    .subjects
+                    .get(ordinal as usize)
+                    .and_then(|record_id| reader.get_visible(record_id, generation))
+                    .map(|source_view| {
+                        String::from_utf8_lossy(source_view.identity_key()).into_owned()
+                    })
+            });
+            NativeOutputPendingSiteRow {
+                start: view.start(),
+                end: view.end(),
+                site_kind: pending_site_kind_text(view.site_kind()).to_string(),
+                reason: pending_reason_text(view.reason()).to_string(),
+                source_id,
+            }
+        })
+        .collect()
+}
+
+/// Napi-level `pending_sites_by_owner` coverage: ordinal-scoped filtering,
+/// `site_kind`/`reason` text mapping, and the `source_subject ->
+/// dicts.subjects[ordinal] -> get_visible -> identity_key` resolution
+/// chain (including "no source" and "wrong owner excluded"). Built with
+/// `urdira_structural_store`'s own public write API directly (this crate
+/// has no `[lib]` target -- `crate-type = ["cdylib"]` only -- so these are
+/// `#[cfg(test)]` unit tests in this module, not a separate `tests/*.rs`
+/// integration binary, which could not link against it).
+#[cfg(test)]
+mod pending_sites_by_owner_tests {
+    use super::{
+        Dictionaries, NONE_U16, NativeOutputPendingSiteRow, RecordRow, pending_site_rows_for_owner,
+    };
+    use sha2::{Digest, Sha256};
+    use urdira_structural_store::{
+        CATEGORY_ENTITY, PENDING_SITE_KIND_CALL, PENDING_SITE_KIND_IMPLEMENTS,
+        PENDING_SITE_KIND_INHERITS, PendingSiteRow, SegmentWriter, StoreReader,
+    };
+
+    fn digest_of(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "urdira-native-node-pending-sites-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn rows_by_start(rows: &mut [NativeOutputPendingSiteRow]) {
+        rows.sort_by_key(|row| row.start);
+    }
+
+    /// Builds a tiny two-artifact store with one confirmed "source" entity
+    /// and three pending sites (two owned by artifact ordinal 0, one by
+    /// ordinal 1), then verifies the full napi-level chain end to end.
+    #[test]
+    fn pending_sites_by_owner_resolves_source_identity_and_filters_by_owner() {
+        let dir = tmp_dir("pending-sites");
+        let generation: u32 = 1;
+        let source_record_id = digest_of(b"jsts:method:src/a.ts:10:foo");
+        let identity_key = b"jsts:method:src/a.ts:10:foo".to_vec();
+        let body = b"{}".to_vec();
+        let record_digest = digest_of(&body);
+        let identity_key_digest = digest_of(&identity_key);
+
+        let dicts = Dictionaries {
+            kinds: vec!["jsts:entity_declaration".to_string()],
+            universal_kinds: vec!["core:declaration".to_string()],
+            relation_kinds: vec!["call".to_string()],
+            names: vec!["foo".to_string()],
+            subjects: vec![source_record_id],
+            artifacts: vec![
+                ("artifact:a".to_string(), "artifact-version:a".to_string()),
+                ("artifact:b".to_string(), "artifact-version:b".to_string()),
+            ],
+            facet_names: Vec::new(),
+            subject_text: Vec::new(),
+        };
+
+        let source_row = RecordRow {
+            record_id: source_record_id,
+            owner_artifact: 0,
+            owner_version: 0,
+            valid_from: generation,
+            valid_to: 0,
+            category: CATEGORY_ENTITY,
+            kind_id: 0,
+            universal_kind_id: 0,
+            facets: 0,
+            span_artifact_version: 0,
+            span_start_byte: 0,
+            span_end_byte: 0,
+            span_start_line: 0,
+            span_end_line: 0,
+            identity_type: 0,
+            assignment_kind: 0,
+            name_id: 0,
+            identity_key,
+            record_digest,
+            body_digest: record_digest,
+            identity_id: identity_key_digest,
+            identity_key_digest,
+            previous_record_id: [0u8; 32],
+            source_subject: None,
+            target_subject: None,
+            relation_kind_id: NONE_U16,
+            body,
+        };
+
+        let pending_sites = vec![
+            PendingSiteRow {
+                owner_artifact: 0,
+                owner_version: 0,
+                valid_from: generation,
+                valid_to: 0,
+                start: 100,
+                end: 140,
+                start_line: 4,
+                end_line: 4,
+                site_kind: PENDING_SITE_KIND_CALL,
+                reason: 1, // call_deferred_to_e3
+                source_subject: Some(0),
+            },
+            PendingSiteRow {
+                owner_artifact: 0,
+                owner_version: 0,
+                valid_from: generation,
+                valid_to: 0,
+                start: 200,
+                end: 230,
+                start_line: 9,
+                end_line: 9,
+                site_kind: PENDING_SITE_KIND_INHERITS,
+                reason: 6, // heritage_unresolved
+                source_subject: None,
+            },
+            PendingSiteRow {
+                owner_artifact: 1,
+                owner_version: 0,
+                valid_from: generation,
+                valid_to: 0,
+                start: 5,
+                end: 9,
+                start_line: 0,
+                end_line: 0,
+                site_kind: PENDING_SITE_KIND_IMPLEMENTS,
+                reason: 8, // heritage_target_uncertain
+                source_subject: None,
+            },
+        ];
+
+        SegmentWriter::new()
+            .write_base_with_pending(
+                &dir,
+                &[source_row],
+                &[],
+                &dicts,
+                generation as u64,
+                &pending_sites,
+            )
+            .expect("write_base_with_pending");
+
+        // `StoreReader::open` directly (not `NativeStructuralStoreHandle::open`)
+        // and `pending_site_rows_for_owner` directly (not the `#[napi]`
+        // `pending_sites_by_owner` method that wraps it in `napi::Result`)
+        // -- see `pending_site_rows_for_owner`'s doc comment for why: this
+        // crate has no `[lib]` target, and a standalone test binary that
+        // instantiates `napi::Result`/`napi::Error` fails to link outside
+        // a running Node.js host.
+        let reader = StoreReader::open(&dir).expect("open");
+
+        // Artifact id/version -> ordinal, the same `dictionaries().artifacts`
+        // scan the TS caller (`findArtifactOrdinal`,
+        // `native-query-snapshot-port.ts`) performs before calling
+        // `pending_sites_by_owner`.
+        let dicts_out = reader.dictionaries();
+        let ordinal = dicts_out
+            .artifacts
+            .iter()
+            .position(|pair| pair.0 == "artifact:a" && pair.1 == "artifact-version:a")
+            .expect("artifact ordinal") as u32;
+        assert_eq!(ordinal, 0);
+
+        let mut rows: Vec<NativeOutputPendingSiteRow> =
+            pending_site_rows_for_owner(&reader, ordinal, generation as u64);
+        rows_by_start(&mut rows);
+        assert_eq!(
+            rows.len(),
+            2,
+            "only artifact 0's two sites, not artifact 1's"
+        );
+
+        assert_eq!(rows[0].start, 100);
+        assert_eq!(rows[0].end, 140);
+        assert_eq!(rows[0].site_kind, "call");
+        assert_eq!(rows[0].reason, "call_deferred_to_e3");
+        assert_eq!(
+            rows[0].source_id.as_deref(),
+            Some("jsts:method:src/a.ts:10:foo")
+        );
+
+        assert_eq!(rows[1].start, 200);
+        assert_eq!(rows[1].site_kind, "inherits");
+        assert_eq!(rows[1].reason, "heritage_unresolved");
+        assert_eq!(rows[1].source_id, None);
+
+        let other = pending_site_rows_for_owner(&reader, 1, generation as u64);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].site_kind, "implements");
+        assert_eq!(other[0].reason, "heritage_target_uncertain");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

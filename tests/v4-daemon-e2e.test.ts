@@ -447,24 +447,31 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
       expect(v4RelationKinds.has("jsts:relation_contains")).toBe(true);
       expect(v4RelationKinds.has("jsts:relation_references")).toBe(true);
 
-      // P2-2i (additive): this fixture's non-identifier-callee calls (e.g.
-      // a method call whose receiver v4's checker-free lane never attempts)
-      // now publish a `classification: "possible"` `jsts:relation_call` row
-      // instead of being silently dropped -- v3's own parity contract
-      // (`analyzer.ts`'s `relate("call", ..., "possible")`). Each one is
-      // paired with a `jsts:unresolved_call` diagnostic carrying a `reason`
-      // v4's Rust pipeline can attach without a checker (`registry-
-      // contribution.ts`'s `diagnosticPayload.reason` enum).
-      const v4PossibleCalls = v4Relations.filter((record) => record["kind"] === "jsts:relation_call" && (record["body"] as { classification?: string } | undefined)?.classification === "possible");
-      expect(v4PossibleCalls.length).toBeGreaterThan(0);
-      for (const record of v4PossibleCalls) expect(record["body"]).not.toHaveProperty("target_id");
-      const v4Diagnostics = await queryOneStream(v4Client, v4WorkspaceId, "core:find_records", { selector: { record_categories: ["diagnostic"] } }, "records");
-      const v4UnresolvedCallDiagnostics = v4Diagnostics.filter((record) => (record["body"] as { code?: string } | undefined)?.code === "jsts:unresolved_call");
-      expect(v4UnresolvedCallDiagnostics.length).toBe(v4PossibleCalls.length);
-      for (const record of v4UnresolvedCallDiagnostics) {
-        const reason = (record["body"] as { reason?: string } | undefined)?.reason;
-        expect(["call_deferred_to_e3", "call_target_uncertain"]).toContain(reason);
+      // A2 (pending.sites migration, additive): this fixture's non-
+      // identifier-callee calls (e.g. a method call whose receiver v4's
+      // checker-free lane never attempts) no longer publish ANY relation
+      // record at all when they have no resolved target -- that population
+      // moved out of `core:find_records` entirely, into the store's own
+      // `pending.sites` side table (consumed by the residual tsgo pass, not
+      // the query engine). So: every `jsts:relation_call` record this query
+      // DOES return must carry a real `target_id` (confirmed, or a P2-2j
+      // per-candidate `classification: "possible"` row for an overload/
+      // union receiver -- the only kind of `"possible"` row that can still
+      // exist as a record, and it always carries a `target_id` + `reason`).
+      // v4 still emits NO diagnostic-category records at all (the paired
+      // `jsts:unresolved_call` diagnostic was folded away 2026-09-04, before
+      // its own record population was migrated out too).
+      const v4CallRelations = v4Relations.filter((record) => record["kind"] === "jsts:relation_call");
+      for (const record of v4CallRelations) {
+        expect(record["body"]).toHaveProperty("target_id");
       }
+      const v4CandidateCalls = v4CallRelations.filter((record) => (record["body"] as { classification?: string } | undefined)?.classification === "possible");
+      for (const record of v4CandidateCalls) {
+        const reason = (record["body"] as { reason?: string } | undefined)?.reason;
+        expect(["overload_ambiguous", "union_ambiguous"]).toContain(reason);
+      }
+      const v4Diagnostics = await queryOneStream(v4Client, v4WorkspaceId, "core:find_records", { selector: { record_categories: ["diagnostic"] } }, "records");
+      expect(v4Diagnostics).toEqual([]);
 
       // `TaskStatus` (task.ts) IS referenced elsewhere in task.ts (the
       // `Task.status` field's type annotation) -- a real inbound edge this
@@ -716,15 +723,19 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
       const repositoryInterfaceEntityId = repositoryInterfaceDecl[0]!["entity_id"];
       expect(typeof repositoryInterfaceEntityId).toBe("string");
 
-      // --- Before the upgrade: `implements TaskRepository` is a `possible`
-      // `core:implements` row (no `target_id`), and `find_references` on
-      // the interface has no inbound heritage edge through it (adjacency
+      // --- Before the upgrade: `implements TaskRepository` has no target
+      // yet -- since A2 (pending.sites migration) that means it is not a
+      // relation RECORD at all any more (it lives in the store's own
+      // `pending.sites` side table, invisible to `core:find_records`), so
+      // the precondition this test can still observe through the query
+      // engine is simply "no CONFIRMED `core:implements` row for
+      // `InMemoryTaskRepository` exists yet". `find_references` on the
+      // interface has no inbound heritage edge through it either (adjacency
       // only ever indexes a RESOLVED target -- residual.rs's own module
-      // doc, "Store access without a body decoder":
-      // `target_subject().is_none()` for exactly this row). ---
+      // doc, "Store access without a body decoder"). ---
       const relationsBefore = await queryOneStream(client, workspaceId, "core:find_records", { selector: { record_categories: ["relation"] } }, "records");
-      const possibleImplementsBefore = relationsBefore.filter((record) => record["kind"] === "jsts:relation_implements" && (record["body"] as { classification?: string } | undefined)?.classification === "possible");
-      expect(possibleImplementsBefore.length).toBeGreaterThan(0);
+      const confirmedImplementsBefore = relationsBefore.filter((record) => record["kind"] === "jsts:relation_implements" && (record["body"] as { classification?: string; source_id?: string } | undefined)?.classification === "confirmed" && ((record["body"] as { source_id?: string } | undefined)?.source_id ?? "").includes("InMemoryTaskRepository"));
+      expect(confirmedImplementsBefore.length).toBe(0);
       const beforeResult = await queryFull(client, workspaceId, "core:find_references", { target: { subject_type: "entity", entity_id: repositoryInterfaceEntityId }, include_declarations: true });
       const referencesBefore = beforeResult.streams["references"]?.items ?? [];
       expect(referencesBefore.some((entry) => (entry.value as Record<string, unknown>)["kind"] === "jsts:relation_implements")).toBe(false);
@@ -776,4 +787,306 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
       await rm(workspaceRoot, { recursive: true, force: true });
     }
   }, 120_000);
+
+  /**
+   * C task (member entities at cold): `core:find_references` on a class
+   * METHOD entity must already return a confirmed caller right after the
+   * cold scan (`structural_ready`) -- `URDIRA_V4_RESIDUAL` is explicitly
+   * left UNSET here, so no residual pass is ever scheduled for this
+   * workspace, proving the COLD entity producer (not the residual pass) is
+   * what makes the target queryable. A purpose-built, self-contained
+   * fixture is used rather than extending the shared `task-planner` one:
+   * none of `task.ts`/`errors.ts`/`main.ts`'s own method-dispatch calls are
+   * typeflow-certain against a WORKSPACE class/interface member without
+   * also depending on the residual pass or a constructor-parameter
+   * property typeflow does not index (`main.ts`'s own `this.repository.*`
+   * calls resolve only via the real checker, see the residual-pass test
+   * above) -- so this test seeds a tiny file exercising typeflow's own
+   * "declared type parameter member call" rule instead (`urdira-jsts-
+   * syntax-worker::semantic_sites::tests::typeflow_resolves_a_declared_
+   * type_parameter_member_call`): `class Greeter { greet() {} }` +
+   * `function use(g: Greeter) { g.greet(...); }`.
+   */
+  it("core:find_references on a class method returns a confirmed caller right after the cold scan, before any residual pass", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-member-entity-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-member-entity-workspace-"));
+    await writeFile(
+      join(workspaceRoot, "greeter.ts"),
+      "export class Greeter {\n  greet(name: string): string {\n    return `hi ${name}`;\n  }\n}\n\nexport function use(g: Greeter): string {\n  return g.greet(\"world\");\n}\n",
+      "utf8",
+    );
+    const originalV4Flag = process.env["URDIRA_V4"];
+    const originalResidualFlag = process.env["URDIRA_V4_RESIDUAL"];
+    let runtime: DaemonRuntime | undefined;
+    const sessions = new Map<string, IndexingCoreProcessTransport>();
+    try {
+      process.env["URDIRA_V4"] = "1";
+      // Explicitly NOT "1": this test's whole point is that the assertion
+      // holds without a residual pass ever running.
+      delete process.env["URDIRA_V4_RESIDUAL"];
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-v4-daemon-e2e-member-entity",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        resolve_plugin_provider: async () => { throw new Error("resolve_plugin_provider must not be called for a v4 workspace."); },
+        resolve_workspace_scan_transport: async (workspace) => {
+          let transport = sessions.get(workspace.workspace_id);
+          if (transport === undefined) {
+            transport = createIndexingCoreProcessTransport({ command: workerPath!, request_timeout_ms: 120_000 });
+            sessions.set(workspace.workspace_id, transport);
+          }
+          return transport;
+        },
+        semantic_index: false,
+        reconciliation_sweep_interval_ms: 0,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+      const added = await client.call("core:workspace_add", { args: [workspaceRoot], confirmed: true });
+      expect(added.outcome).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+      await pollUntilStructuralReady(client, workspaceId);
+
+      // No residual (semantic_upgrade) generation has run for this
+      // workspace -- confirms the assertion below is genuinely a COLD-scan
+      // fact, not an artifact of a background pass this test forgot to
+      // wait out.
+      const statusResponse = await client.call("core:index_status", { workspace_ids: [workspaceId] });
+      expect(statusResponse.outcome).toBe("success");
+      const status = (statusResponse.payload as { readonly workspaces: ReadonlyArray<Record<string, unknown>> }).workspaces[0];
+      expect(status?.["calls_upgraded"]).not.toBe(true);
+
+      // The `greet` method entity -- a `jsts:entity_callable` record whose
+      // body carries kind word `"method"`, exactly the C task's own new
+      // cold entity producer output (`push_member_entities`).
+      const entities = await queryOneStream(client, workspaceId, "core:find_records", { selector: { record_categories: ["entity"] } }, "records");
+      const greetEntity = entities.find((record) => {
+        const body = record["body"] as Record<string, unknown> | undefined;
+        return record["kind"] === "jsts:entity_callable" && body?.["kind"] === "method" && body?.["name"] === "greet";
+      });
+      expect(greetEntity).toBeDefined();
+      expect(greetEntity!["identity_key"] as string).toMatch(/^jsts:method:greeter\.ts:\d+:greet$/);
+
+      const refs = await queryStreams(client, workspaceId, "core:find_references", { target: { subject_type: "entity", entity_id: greetEntity!["entity_id"] }, include_declarations: true });
+      const references = refs["references"]?.items ?? [];
+      const confirmedCallers = references.filter((entry) => {
+        const value = entry.value as Record<string, unknown>;
+        const body = value["body"] as { classification?: string } | undefined;
+        return value["kind"] === "jsts:relation_call" && body?.classification === "confirmed";
+      });
+      expect(confirmedCallers.length).toBeGreaterThan(0);
+    } finally {
+      if (originalV4Flag === undefined) delete process.env["URDIRA_V4"]; else process.env["URDIRA_V4"] = originalV4Flag;
+      if (originalResidualFlag === undefined) delete process.env["URDIRA_V4_RESIDUAL"]; else process.env["URDIRA_V4_RESIDUAL"] = originalResidualFlag;
+      await runtime?.stop().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  /**
+   * Parameter entities, "referenced-only" variant (owner-approved,
+   * 2026-09-04): `core:find_references` on a parameter entity must already
+   * return its uses right after the cold scan (`structural_ready`) --
+   * `URDIRA_V4_RESIDUAL` is explicitly left UNSET, same as the member-entity
+   * test just above, so this is provably a COLD-scan fact. Before this task,
+   * no entity was ever materialized for a parameter declaration at all, so
+   * the `core:references` row `name` -> `greet`'s `name` parameter already
+   * carried never interned a `target_subject` and `find_references` on that
+   * parameter returned nothing. A minimal inline fixture is used (the shared
+   * `task-planner` fixture is not altered): `export function greet(name:
+   * string) { return \`hello ${name}\`; }` -- `name` is referenced once in
+   * the template literal.
+   */
+  it("core:find_references on a parameter entity returns its uses right after the cold scan, before any residual pass", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-parameter-entity-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-parameter-entity-workspace-"));
+    await writeFile(
+      join(workspaceRoot, "greet.ts"),
+      "export function greet(name: string): string {\n  return `hello ${name}`;\n}\n",
+      "utf8",
+    );
+    const originalV4Flag = process.env["URDIRA_V4"];
+    const originalResidualFlag = process.env["URDIRA_V4_RESIDUAL"];
+    let runtime: DaemonRuntime | undefined;
+    const sessions = new Map<string, IndexingCoreProcessTransport>();
+    try {
+      process.env["URDIRA_V4"] = "1";
+      // Explicitly NOT "1": this test's whole point is that the assertion
+      // holds without a residual pass ever running.
+      delete process.env["URDIRA_V4_RESIDUAL"];
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-v4-daemon-e2e-parameter-entity",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        resolve_plugin_provider: async () => { throw new Error("resolve_plugin_provider must not be called for a v4 workspace."); },
+        resolve_workspace_scan_transport: async (workspace) => {
+          let transport = sessions.get(workspace.workspace_id);
+          if (transport === undefined) {
+            transport = createIndexingCoreProcessTransport({ command: workerPath!, request_timeout_ms: 120_000 });
+            sessions.set(workspace.workspace_id, transport);
+          }
+          return transport;
+        },
+        semantic_index: false,
+        reconciliation_sweep_interval_ms: 0,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+      const added = await client.call("core:workspace_add", { args: [workspaceRoot], confirmed: true });
+      expect(added.outcome).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+      await pollUntilStructuralReady(client, workspaceId);
+
+      // No residual (semantic_upgrade) generation has run for this
+      // workspace -- confirms the assertion below is genuinely a COLD-scan
+      // fact.
+      const statusResponse = await client.call("core:index_status", { workspace_ids: [workspaceId] });
+      expect(statusResponse.outcome).toBe("success");
+      const status = (statusResponse.payload as { readonly workspaces: ReadonlyArray<Record<string, unknown>> }).workspaces[0];
+      expect(status?.["calls_upgraded"]).not.toBe(true);
+
+      // The `name` parameter entity -- a `jsts:entity_parameter` record,
+      // this task's own new cold entity producer output.
+      const entities = await queryOneStream(client, workspaceId, "core:find_records", { selector: { record_categories: ["entity"] } }, "records");
+      const nameEntity = entities.find((record) => {
+        const body = record["body"] as Record<string, unknown> | undefined;
+        return record["kind"] === "jsts:entity_parameter" && body?.["name"] === "name";
+      });
+      expect(nameEntity).toBeDefined();
+      expect(nameEntity!["identity_key"] as string).toMatch(/^jsts:parameter:greet\.ts:\d+:name$/);
+
+      const refs = await queryStreams(client, workspaceId, "core:find_references", { target: { subject_type: "entity", entity_id: nameEntity!["entity_id"] }, include_declarations: true });
+      const references = refs["references"]?.items ?? [];
+      const confirmedReferences = references.filter((entry) => {
+        const value = entry.value as Record<string, unknown>;
+        const body = value["body"] as { classification?: string } | undefined;
+        return value["kind"] === "jsts:relation_references" && body?.classification === "confirmed";
+      });
+      expect(confirmedReferences.length).toBeGreaterThan(0);
+    } finally {
+      if (originalV4Flag === undefined) delete process.env["URDIRA_V4"]; else process.env["URDIRA_V4"] = originalV4Flag;
+      if (originalResidualFlag === undefined) delete process.env["URDIRA_V4_RESIDUAL"]; else process.env["URDIRA_V4_RESIDUAL"] = originalResidualFlag;
+      await runtime?.stop().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  /**
+   * External package/symbol entities task (2026-09-04): a bare/scoped
+   * import specifier that never resolves inside the workspace (`import {
+   * get } from "lodash"`) now materializes `jsts:external_module:lodash`/
+   * `jsts:external_symbol:lodash#get` entities at COLD scan time (no
+   * checker, no residual pass -- `URDIRA_V4_RESIDUAL` is explicitly left
+   * unset, same convention as the two tests just above), with a confirmed
+   * `core:references` row from every use site. Verifies the three concrete
+   * query-layer capabilities the task brief named: `core:find_references`
+   * on the external symbol lists its use sites, `core:expand_relations`
+   * outbound `core:import` from the importing module reaches the external
+   * module entity, and `core:resolve_symbol` finds the module entity by its
+   * bare name. A minimal inline fixture is used (the shared `task-planner`
+   * fixture is not touched): `import { get } from "lodash"; export function
+   * useGet(x) { return get(x); }` -- one import-site reference and one
+   * usage-site reference to `lodash#get`.
+   */
+  it("external package entities: find_references/expand_relations/resolve_symbol all reach the external module/symbol right after the cold scan", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-external-entity-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-external-entity-workspace-"));
+    await writeFile(
+      join(workspaceRoot, "uses-lodash.ts"),
+      "import { get } from \"lodash\";\n\nexport function useGet(x: unknown): unknown {\n  return get(x);\n}\n",
+      "utf8",
+    );
+    const originalV4Flag = process.env["URDIRA_V4"];
+    const originalResidualFlag = process.env["URDIRA_V4_RESIDUAL"];
+    let runtime: DaemonRuntime | undefined;
+    const sessions = new Map<string, IndexingCoreProcessTransport>();
+    try {
+      process.env["URDIRA_V4"] = "1";
+      delete process.env["URDIRA_V4_RESIDUAL"];
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-v4-daemon-e2e-external-entity",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        resolve_plugin_provider: async () => { throw new Error("resolve_plugin_provider must not be called for a v4 workspace."); },
+        resolve_workspace_scan_transport: async (workspace) => {
+          let transport = sessions.get(workspace.workspace_id);
+          if (transport === undefined) {
+            transport = createIndexingCoreProcessTransport({ command: workerPath!, request_timeout_ms: 120_000 });
+            sessions.set(workspace.workspace_id, transport);
+          }
+          return transport;
+        },
+        semantic_index: false,
+        reconciliation_sweep_interval_ms: 0,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+      const added = await client.call("core:workspace_add", { args: [workspaceRoot], confirmed: true });
+      expect(added.outcome).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+      await pollUntilStructuralReady(client, workspaceId);
+
+      const statusResponse = await client.call("core:index_status", { workspace_ids: [workspaceId] });
+      expect(statusResponse.outcome).toBe("success");
+      const status = (statusResponse.payload as { readonly workspaces: ReadonlyArray<Record<string, unknown>> }).workspaces[0];
+      expect(status?.["calls_upgraded"]).not.toBe(true);
+
+      const entities = await queryOneStream(client, workspaceId, "core:find_records", { selector: { record_categories: ["entity"] } }, "records");
+
+      const moduleEntity = entities.find((record) => record["identity_key"] === "jsts:module:uses-lodash.ts:0:uses-lodash.ts");
+      expect(moduleEntity).toBeDefined();
+
+      const externalModuleEntity = entities.find((record) => record["identity_key"] === "jsts:external_module:lodash");
+      expect(externalModuleEntity).toBeDefined();
+      expect(externalModuleEntity!["kind"]).toBe("jsts:entity_container");
+      const moduleBody = externalModuleEntity!["body"] as Record<string, unknown>;
+      expect(moduleBody["kind"]).toBe("external_module");
+      expect(moduleBody["name"]).toBe("lodash");
+
+      const externalSymbolEntity = entities.find((record) => record["identity_key"] === "jsts:external_symbol:lodash#get");
+      expect(externalSymbolEntity).toBeDefined();
+      const symbolBody = externalSymbolEntity!["body"] as Record<string, unknown>;
+      expect(symbolBody["kind"]).toBe("external_symbol");
+      expect(symbolBody["name"]).toBe("get");
+      expect(symbolBody["parent_id"]).toBe(externalModuleEntity!["identity_key"]);
+
+      // --- `core:find_references` on the external symbol lists its use
+      // sites: the import specifier's own binding site AND the `get(x)`
+      // call's callee identifier, both confirmed `core:references` rows
+      // from `uses-lodash.ts`. ---
+      const refs = await queryStreams(client, workspaceId, "core:find_references", {
+        target: { subject_type: "entity", entity_id: externalSymbolEntity!["entity_id"] },
+        include_declarations: true,
+      });
+      const references = refs["references"]?.items ?? [];
+      const confirmedReferences = references.filter((entry) => {
+        const value = entry.value as Record<string, unknown>;
+        const body = value["body"] as { classification?: string } | undefined;
+        return value["kind"] === "jsts:relation_references" && body?.classification === "confirmed";
+      });
+      expect(confirmedReferences.length).toBeGreaterThanOrEqual(2);
+
+      // --- `core:expand_relations` outbound `core:import` from the
+      // importing module reaches the external module entity. ---
+      const expandedImports = await queryOneStream(client, workspaceId, "core:expand_relations", {
+        subjects: [{ subject_type: "entity", entity_id: moduleEntity!["entity_id"] }],
+        direction: "outbound",
+        relations: { universal_kinds: ["core:import"] },
+      }, "subjects");
+      expect(expandedImports.some((reached) => reached["identity_key"] === "jsts:external_module:lodash")).toBe(true);
+
+      // --- `core:resolve_symbol` finds the external module entity by its
+      // bare name. ---
+      const resolved = await queryOneStream(client, workspaceId, "core:resolve_symbol", { reference: "lodash", resolution_scope: "workspace" }, "declarations");
+      expect(resolved.some((declaration) => declaration["identity_key"] === "jsts:external_module:lodash")).toBe(true);
+    } finally {
+      if (originalV4Flag === undefined) delete process.env["URDIRA_V4"]; else process.env["URDIRA_V4"] = originalV4Flag;
+      if (originalResidualFlag === undefined) delete process.env["URDIRA_V4_RESIDUAL"]; else process.env["URDIRA_V4_RESIDUAL"] = originalResidualFlag;
+      await runtime?.stop().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

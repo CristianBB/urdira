@@ -121,6 +121,7 @@ fn pascal_case_owner_file_single_site_does_not_produce_rpc_error() {
         root: VIRTUAL_ROOT.to_string(),
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
+        fetch_semantics: false,
     };
     let results = ResidualPass::run(&plan, 1, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed at the pass level");
@@ -178,6 +179,7 @@ fn unimported_owner_with_pending_sites_still_resolves() {
         root: VIRTUAL_ROOT.to_string(),
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
+        fetch_semantics: false,
     };
     let results = ResidualPass::run(&plan, 1, &pending_by_owner, fs2, &config)
         .expect("residual pass should succeed");
@@ -356,6 +358,7 @@ fn huge_single_owner_batch_of_ten_thousand_call_sites() {
         root: VIRTUAL_ROOT.to_string(),
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
+        fetch_semantics: false,
     };
     let results = ResidualPass::run(&plan, 1, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed at the pass level");
@@ -533,6 +536,7 @@ fn many_distinct_declarations_referenced_once_each() {
         root: VIRTUAL_ROOT.to_string(),
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
+        fetch_semantics: false,
     };
     let results = ResidualPass::run(&plan, 1, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed at the pass level");
@@ -652,6 +656,7 @@ trimPackageJson('frontend/editor-ui');\n\
         root: VIRTUAL_ROOT.to_string(),
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: options,
+        fetch_semantics: false,
     };
     let plan = WindowPlan::build(std::slice::from_ref(&owner), 512);
     let results = ResidualPass::run(&plan, 1, &pending_by_owner, fs, &config)

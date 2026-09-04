@@ -211,6 +211,33 @@ export interface CanonicalQuerySnapshotPort {
    * exact denominator.
    */
   readonly semantic_entity_scope_counts?: (scope: QueryScope) => Promise<{ readonly entity_count: number }>;
+  /**
+   * `core:get_outline`'s additive `pending_sites` stream (evidence doc
+   * 2026-09-04 §8): every visible `pending.sites` row
+   * (`crates/urdira-structural-store`) owned by one artifact -- the
+   * unresolved call/heritage sites `core:find_records`'s `possible`
+   * rows and `jsts:unresolved_call` diagnostics used to expose before
+   * that generation's fold, restored here as their own stream rather
+   * than as records (they carry no graph-edge value, per that doc's
+   * §1). `owner_artifact_version_id` narrows the ordinal lookup exactly
+   * like `findArtifactOrdinal` elsewhere in this file (`container_records_by_artifact_references`'s
+   * own pattern); `owner_artifact_id` alone still resolves when the
+   * version id does not (or cannot) narrow further. Optional: a
+   * v3/SQLite-backed port has no such table and simply omits this
+   * method, which `pendingSitesStreamForOutline` treats as "empty,"
+   * never an error -- the same convention every other optional
+   * pushdown capability in this interface uses.
+   */
+  readonly pending_sites_by_owner_artifact?: (scope: QueryScope, owner_artifact_id: string, owner_artifact_version_id: string) => Promise<readonly PendingSiteRow[]>;
+}
+
+/** One `pending_sites_by_owner_artifact` row -- see that method's doc comment. */
+export interface PendingSiteRow {
+  readonly start: number;
+  readonly end: number;
+  readonly site_kind: "call" | "inherits" | "implements";
+  readonly reason: string;
+  readonly source_id?: string;
 }
 
 export interface SemanticIndexStateSnapshot {
@@ -2174,7 +2201,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     return [...records.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
   }
 
-  private evaluateGraphOperation(operation: OperationInvocation, records: readonly CanonicalQueryRecord[], maps: IdentityMaps, capabilityStates: readonly SnapshotCapabilityStateEntry[]): OperationEvaluation | undefined {
+  private async evaluateGraphOperation(operation: OperationInvocation, records: readonly CanonicalQueryRecord[], maps: IdentityMaps, capabilityStates: readonly SnapshotCapabilityStateEntry[]): Promise<OperationEvaluation | undefined> {
     const args = object(operation.arguments);
     const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => result(streams, capabilityStates);
     if (operation.operation_id === "core:get_outline") {
@@ -2201,7 +2228,9 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         }
         frontier = next;
       }
-      return evaluated({ members: members.map((record) => item(record)) });
+      const inScopeIdentityKeys = new Set<string>([container.identity_key ?? container.record_id, ...members.map((record) => record.identity_key ?? record.record_id)]);
+      const pendingSites = await this.pendingSitesStreamForOutline(operation.scope, container, inScopeIdentityKeys);
+      return evaluated({ members: members.map((record) => item(record)), pending_sites: pendingSites });
     }
     if (operation.operation_id === "core:find_references") {
       const target = resolveSelectorsToRecords(args["target"] === undefined ? [] : [args["target"]], maps)[0];
@@ -2283,6 +2312,58 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       return evaluated({ paths: found.map((record) => item(record, relationClassification(record))) });
     }
     return undefined;
+  }
+
+  /**
+   * `core:get_outline`'s additive `pending_sites` stream (task brief:
+   * `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`
+   * §8 -- unresolved call/heritage sites used to be readable as `possible`
+   * records/`jsts:unresolved_call` diagnostics; both are gone, and this
+   * restores the capability without a new operation or record category).
+   * `container.universal_kind === "core:container"` is exactly the
+   * module/artifact-container test `resolveArtifactContainer`/
+   * `resolveSelectorToRecords`'s `subject_type: "artifact"` branch already
+   * use elsewhere in this file -- when true, every visible pending site of
+   * the owning artifact is in scope.
+   *
+   * For any other entity, "whose span lies inside the entity's span" (the
+   * task brief's own wording) turns out NOT to mean byte-range containment
+   * against `primary_source_span`: verified live against the task-planner
+   * fixture that an entity record's `primary_source_span` is its NAME
+   * token's span only (e.g. `InvalidTaskTransitionError` at bytes
+   * [183,209), 26 bytes for a 27-character identifier) -- never the
+   * declaration's full body range a `super(...)` call or `extends` clause
+   * deeper in that same declaration would fall inside. A pending site's
+   * REAL enclosing declaration is instead its already-resolved
+   * `source_id` (the same identity key `residual.rs`'s `source_subject ->
+   * ... -> identity_key` chain resolves), so scoping asks the same
+   * question `members` above just answered: is the site's enclosing
+   * entity the container itself, or one of the members this SAME call
+   * already listed (a class's own constructor/method entities are direct
+   * `core:contains` children of it, per §2.4's member-entity synthesis)?
+   * `callerInScopeIdentityKeys` is exactly `{container} ∪ members`, so
+   * this reuses the SAME containment BFS/`depth` semantics `members`
+   * already applied -- no separate unlimited-depth traversal, and no
+   * behavior beyond what `depth` already surfaced as in scope.
+   *
+   * Returns `[]` (never throws) when the port has no
+   * `pending_sites_by_owner_artifact` capability (a v3/SQLite-backed
+   * snapshot port) -- the same "absent capability degrades to empty,
+   * never an error" convention every other optional pushdown method in
+   * this file follows.
+   */
+  private async pendingSitesStreamForOutline(scope: QueryScope, container: CanonicalQueryRecord, inScopeIdentityKeys: ReadonlySet<string>): Promise<readonly QueryStreamItem[]> {
+    if (this.snapshots.pending_sites_by_owner_artifact === undefined) return [];
+    const rows = await this.snapshots.pending_sites_by_owner_artifact(scope, container.owner_artifact_id, container.owner_artifact_version_id);
+    if (rows.length === 0) return [];
+    const path = (await this.hydratePaths(scope, [container.owner_artifact_version_id])).get(container.owner_artifact_version_id) ?? (typeof container.body["path"] === "string" ? container.body["path"] : "");
+    const isModuleContainer = container.universal_kind === "core:container";
+    const scoped = isModuleContainer ? rows : rows.filter((row) => row.source_id !== undefined && inScopeIdentityKeys.has(row.source_id));
+    return scoped.map((row): QueryStreamItem => ({
+      value: { path, start: row.start, end: row.end, site_kind: row.site_kind, reason: row.reason, source_id: row.source_id ?? null },
+      stable_sort_key: `${path}\0${String(row.start).padStart(12, "0")}\0${String(row.end).padStart(12, "0")}\0${row.site_kind}`,
+      result_classification: "unclassified",
+    }));
   }
 
   private async tryGraphPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
@@ -3073,7 +3154,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => result(streams, capabilityStates);
     const maps = await cachedIdentityMaps(records);
     const args = object(boundOperation.arguments);
-    const graphEvaluation = this.evaluateGraphOperation(boundOperation, records, maps, capabilityStates);
+    const graphEvaluation = await this.evaluateGraphOperation(boundOperation, records, maps, capabilityStates);
     if (graphEvaluation !== undefined) return graphEvaluation;
     if (boundOperation.operation_id === "core:find_records") {
       return evaluated({ records: records.filter((record) => selected(record, args["selector"])).map((record) => item(record)) });

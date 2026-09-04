@@ -80,9 +80,21 @@ pub fn compact(dir: &Path, new_generation: u64) -> Result<SegmentSummary> {
         .into_iter()
         .map(|v| dep_view_to_row(&v))
         .collect();
+    let pending_sites: Vec<crate::row::PendingSiteRow> = reader
+        .iter_visible_pending_sites(new_generation)
+        .into_iter()
+        .map(|v| v.to_row())
+        .collect();
     let dicts = reader.dictionaries();
 
-    let summary = SegmentWriter::new().write_base(dir, &rows, &deps, &dicts, new_generation)?;
+    let summary = SegmentWriter::new().write_base_with_pending(
+        dir,
+        &rows,
+        &deps,
+        &dicts,
+        new_generation,
+        &pending_sites,
+    )?;
 
     let in_use = refcount::segments_in_use(dir)?;
     let mut old_names = vec![old_manifest.base.clone()];

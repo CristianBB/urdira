@@ -115,6 +115,26 @@ export interface NativeOutputDependencyRow {
   readonly dependencyRole: string;
 }
 
+/**
+ * One `pending.sites` row (`crates/urdira-structural-store`), shaped for
+ * `core:get_outline`'s additive `pending_sites` stream
+ * (`packages/engine/src/canonical-query-data-port.ts`,
+ * `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`
+ * §8). Deliberately omits `ownerArtifactId`/`ownerArtifactVersionId`:
+ * every row one `pendingSitesByOwner` call returns shares the SAME owner
+ * the caller already resolved to an ordinal.
+ */
+export interface NativeOutputPendingSiteRow {
+  readonly start: number;
+  readonly end: number;
+  /** `"call" | "inherits" | "implements"` (`structural_store_napi.rs`'s `pending_site_kind_text`). */
+  readonly siteKind: string;
+  /** The `PendingReasonCode` name (`structural_store_napi.rs`'s `pending_reason_text`; source of truth: `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`'s `PendingReasonCode`). */
+  readonly reason: string;
+  /** The enclosing entity's `identity_key` text, or `undefined` when the site's `source_subject` is absent or does not resolve at this generation. */
+  readonly sourceId?: string;
+}
+
 export interface NativeVisibleBatch {
   readonly rows: readonly NativeOutputRecordRow[];
   readonly nextCursor?: string;
@@ -193,6 +213,8 @@ export declare class NativeStructuralStoreHandle {
   iterVisibleDependencyDigests(generation: number, batchSize: number, afterKeyHex?: string): NativeDigestBatch;
   depsByOwner(ownerArtifactOrdinal: number, generation: number): readonly NativeOutputDependencyRow[];
   depsReverse(depArtifactOrdinal: number, generation: number): readonly NativeOutputDependencyRow[];
+  /** Every visible `pending.sites` row owned by `ownerArtifactOrdinal` at `generation` -- see `NativeOutputPendingSiteRow`'s doc comment. */
+  pendingSitesByOwner(ownerArtifactOrdinal: number, generation: number): readonly NativeOutputPendingSiteRow[];
 }
 
 export interface NativeStructuralStoreAddon {

@@ -48,6 +48,7 @@ use crate::client::{ClientError, TsgoClient};
 use crate::node::identifier_text_at;
 use crate::proto::{FileChanges, UpdateSnapshotParams};
 use crate::resolver::{PendingSite, ResidualResolver, Resolution, SiteKind};
+use crate::semantic_extras::{self, DiagnosticSite, TypedDeclarationSite};
 use crate::trivia::to_utf16;
 use crate::virtual_fs::{LayeredFs, OverlayFs, VirtualFs};
 
@@ -171,6 +172,17 @@ pub struct ResidualPassConfig {
     /// under one of these is classified `SiteOutcome::External` rather than
     /// `WorkspaceTarget`.
     pub lib_roots: Vec<String>,
+    /// Decision 28's "inferred types + compiler diagnostics" task: when
+    /// `true`, `run_lane` additionally calls `crate::semantic_extras::
+    /// fetch_exported_types`/`fetch_owner_diagnostics` for every root in
+    /// every window it opens, on the SAME snapshot the window's call/
+    /// heritage resolution just used (the task brief's own "same tsgo
+    /// snapshot" requirement) — populating `PassStats::types`/
+    /// `PassStats::diagnostics`. `false` (the setting every pre-existing
+    /// caller of this struct now sets explicitly) skips this work entirely,
+    /// so a caller that only wants call/heritage resolution (a bench, or a
+    /// test exercising just that half) pays no extra RPC cost.
+    pub fetch_semantics: bool,
 }
 
 #[derive(Debug)]
@@ -224,11 +236,32 @@ pub struct WindowStats {
     pub child_rss_kb: Option<u64>,
 }
 
+/// One typed declaration site, with the owner file it belongs to —
+/// `crate::semantic_extras::TypedDeclarationSite` plus the `owner_path` that
+/// module's per-file API leaves implicit in its own return type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferredTypeResult {
+    pub owner_path: String,
+    pub site: TypedDeclarationSite,
+}
+
+/// One compiler diagnostic, with the owner file it was reported for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticResult {
+    pub owner_path: String,
+    pub site: DiagnosticSite,
+}
+
 /// Aggregate stats for one `ResidualPass::run_instrumented` call: one
-/// `WindowStats` per window actually opened, across every lane.
+/// `WindowStats` per window actually opened, across every lane, plus —
+/// when `ResidualPassConfig::fetch_semantics` is `true` — every inferred
+/// type and compiler diagnostic the pass collected alongside its ordinary
+/// call/heritage resolution.
 #[derive(Debug, Clone, Default)]
 pub struct PassStats {
     pub windows: Vec<WindowStats>,
+    pub types: Vec<InferredTypeResult>,
+    pub diagnostics: Vec<DiagnosticResult>,
 }
 
 /// Runs a residual pass: resolves every pending site under `pending_by_owner`
@@ -285,7 +318,9 @@ impl ResidualPass {
                         .join()
                         .map_err(|_| ResidualPassError::LanePanicked { lane: lane_index })??;
                     all.extend(lane_sites);
-                    stats.windows.extend(lane_stats);
+                    stats.windows.extend(lane_stats.windows);
+                    stats.types.extend(lane_stats.types);
+                    stats.diagnostics.extend(lane_stats.diagnostics);
                 }
                 Ok((all, stats))
             },
@@ -300,6 +335,16 @@ impl ResidualPass {
             a.lane
                 .cmp(&b.lane)
                 .then(a.window_index.cmp(&b.window_index))
+        });
+        stats.types.sort_by(|a, b| {
+            a.owner_path
+                .cmp(&b.owner_path)
+                .then(a.site.name_start_utf16.cmp(&b.site.name_start_utf16))
+        });
+        stats.diagnostics.sort_by(|a, b| {
+            a.owner_path
+                .cmp(&b.owner_path)
+                .then(a.site.start.cmp(&b.site.start))
         });
         Ok((all, stats))
     }
@@ -332,9 +377,9 @@ fn run_lane(
     pending_by_owner: &BTreeMap<String, Vec<PendingSite>>,
     fs: Arc<dyn VirtualFs>,
     config: &ResidualPassConfig,
-) -> Result<(Vec<ResolvedSite>, Vec<WindowStats>), ResidualPassError> {
+) -> Result<(Vec<ResolvedSite>, PassStats), ResidualPassError> {
     let mut out = Vec::new();
-    let mut stats = Vec::new();
+    let mut stats = PassStats::default();
     if windows.is_empty() {
         return Ok((out, stats));
     }
@@ -402,7 +447,7 @@ fn run_lane(
                 &client,
                 Arc::clone(&layered_dyn),
                 snapshot.snapshot,
-                project,
+                project.clone(),
             );
             let resolutions = resolver.resolve(&window_sites);
             for (site, resolution) in window_sites.iter().zip(resolutions) {
@@ -410,7 +455,7 @@ fn run_lane(
             }
         }
 
-        stats.push(WindowStats {
+        stats.windows.push(WindowStats {
             lane: lane_index,
             window_index: window.index,
             roots: window.roots.len(),
@@ -418,6 +463,52 @@ fn run_lane(
             sites_resolved: window_sites.len(),
             child_rss_kb: sample_rss_kb(client.pid()),
         });
+
+        // Decision 28's "inferred types + compiler diagnostics" task: on
+        // the SAME snapshot this window just resolved its call/heritage
+        // sites against, additionally type every exported declaration (and
+        // exported class/interface member) and collect every compiler
+        // diagnostic, for EVERY root in the window — not just roots with a
+        // pending call/heritage site, since a file can have zero unresolved
+        // calls yet still have exported declarations needing a type (see
+        // `ResidualPassConfig::fetch_semantics`'s own doc comment).
+        if config.fetch_semantics {
+            for root in &window.roots {
+                let Ok(Some(owner_file)) =
+                    client.get_source_file(snapshot.snapshot, &project, root)
+                else {
+                    continue;
+                };
+                let Some(owner_text_bytes) = layered_dyn.read_file(root) else {
+                    continue;
+                };
+                let owner_text = to_utf16(&owner_text_bytes);
+                for site in semantic_extras::fetch_exported_types(
+                    &client,
+                    snapshot.snapshot,
+                    &project,
+                    root,
+                    &owner_file,
+                    &owner_text,
+                ) {
+                    stats.types.push(InferredTypeResult {
+                        owner_path: root.clone(),
+                        site,
+                    });
+                }
+                for site in semantic_extras::fetch_owner_diagnostics(
+                    &client,
+                    snapshot.snapshot,
+                    &project,
+                    root,
+                ) {
+                    stats.diagnostics.push(DiagnosticResult {
+                        owner_path: root.clone(),
+                        site,
+                    });
+                }
+            }
+        }
 
         if let Some(previous) = previous_snapshot {
             let _ = client.release(previous);

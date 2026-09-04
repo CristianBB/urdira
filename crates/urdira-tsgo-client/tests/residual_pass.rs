@@ -202,6 +202,7 @@ fn run_pass(lanes: usize) -> Vec<urdira_tsgo_client::residual_pass::ResolvedSite
         root: VIRTUAL_ROOT.to_string(),
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
+        fetch_semantics: false,
     };
     ResidualPass::run(&plan, lanes, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed")

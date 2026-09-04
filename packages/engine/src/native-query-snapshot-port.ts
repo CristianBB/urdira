@@ -30,6 +30,7 @@ import type {
   CanonicalQuerySnapshotPort,
   IndexedGraphEdge,
   LexicalSearchMatch,
+  PendingSiteRow,
   RecordColumnSelector,
   SemanticIndexStateSnapshot,
   SemanticVectorRow,
@@ -371,6 +372,33 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       }
     }
     return output;
+  }
+
+  /**
+   * `core:get_outline`'s additive `pending_sites` stream source: every
+   * visible `pending.sites` row (`crates/urdira-structural-store`) owned
+   * by the artifact `artifactId`/`artifactVersionId` identify. Resolves
+   * the ordinal exactly like `container_records_by_artifact_references`
+   * does (`findArtifactOrdinal`, same function), then calls the native
+   * handle's `pendingSitesByOwner` (mirrors `depsByOwner`'s ordinal-in/
+   * rows-out shape). An unresolvable artifact (never scanned, or a
+   * generation the store has not caught up to) returns `[]`, not an
+   * error -- `pendingSitesStreamForOutline`'s own documented convention.
+   */
+  async pending_sites_by_owner_artifact(scope: QueryScope, artifactId: string, artifactVersionId: string): Promise<readonly PendingSiteRow[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
+    const generation = await this.ensureGeneration(scope);
+    if (generation === undefined) return [];
+    const dicts = this.handle.dictionaries();
+    const ordinal = findArtifactOrdinal(dicts, artifactId, artifactVersionId);
+    if (ordinal === undefined) return [];
+    return this.handle.pendingSitesByOwner(ordinal, generation).map((row) => ({
+      start: row.start,
+      end: row.end,
+      site_kind: row.siteKind as "call" | "inherits" | "implements",
+      reason: row.reason,
+      ...(row.sourceId === undefined ? {} : { source_id: row.sourceId }),
+    }));
   }
 
   // --- everything else: delegate to the wrapped SQLite port (catalog,

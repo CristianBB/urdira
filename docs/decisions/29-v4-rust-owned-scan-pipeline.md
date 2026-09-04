@@ -429,3 +429,12 @@ be the corruption's cause (see "Open items").
     (`PendingCallSite`/`PendingHeritageSite` unused fields, P4-b-2 §4) —
     the final session's own workspace `clippy` run is reported clean (final
     §5), so this may already be resolved.
+
+## Amendment 2026-09-05 (see `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`)
+
+The cold pipeline materializes more than module-level declarations (members, referenced
+parameters, catch/rest bindings, ambient module namespaces, external package/symbol entities) and
+writes unresolved call/heritage sites to the `pending.sites` side table instead of relation
+records; the P1-D-h "classification mismatch repair" became a drop-to-pending-site rule
+(`target_not_interned`). Stage-4 numbers in this document predate that change; the current n8n
+composition and timings are in the evidence page above (§3, §5, §9, §10).

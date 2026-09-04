@@ -63,9 +63,13 @@
 //! already a plain metadata column on `RecordView` --
 //! - a relation row's own span/owner/kind (`span_start_byte`/
 //!   `span_end_byte`/`owner_artifact`/`universal_kind_id`),
-//! - whether it is `possible` (`target_subject().is_none()` -- a possible
-//!   row never has one, a confirmed row always does; see
-//!   `materialize.rs`'s subject-resolution pass),
+//! - whether it is a `possible` row THIS module still needs to attempt
+//!   (`target_subject().is_none()` -- see `collect()`'s own doc comment: a
+//!   confirmed row always has one, and so, since P2-2j, does a per-candidate
+//!   possible row for an overload/union receiver -- `target_subject().
+//!   is_none()` alone is "no target AND not yet upgradable any further",
+//!   which is exactly the population this module's own residual pass
+//!   exists to work on; see `materialize.rs`'s subject-resolution pass),
 //! - its calling entity's own id, via `source_subject()` -> `Dictionaries::
 //!   subjects[ordinal]` (the SOURCE record's `record_id` bytes, per that
 //!   field's own doc comment) -> `StoreReader::get` -> that record's
@@ -91,13 +95,15 @@ use sha2::{Digest, Sha256};
 
 use urdira_native_core::StructuralKernelRecordRef;
 use urdira_source_frontier::Frontier;
-use urdira_structural_store::reader::RecordView;
-use urdira_structural_store::row::{CATEGORY_ENTITY, CATEGORY_RELATION, Dictionaries, RecordRow};
-use urdira_structural_store::{SetKind, StoreReader, merkle};
+use urdira_structural_store::row::{
+    CATEGORY_DIAGNOSTIC, CATEGORY_ENTITY, CATEGORY_RELATION, Dictionaries, RecordRow,
+};
+use urdira_structural_store::{PendingSiteKey, SetKind, StoreReader, merkle};
 use urdira_tsgo_client::binary;
 use urdira_tsgo_client::entity_index::EntityIndex;
 use urdira_tsgo_client::residual_pass::{
-    ResidualPass, ResidualPassConfig, ResolvedSite, SiteOutcome, WindowPlan,
+    DiagnosticResult, InferredTypeResult, ResidualPass, ResidualPassConfig, ResolvedSite,
+    SiteOutcome, WindowPlan,
 };
 use urdira_tsgo_client::resolver::{PendingSite, SiteKind};
 use urdira_tsgo_client::virtual_fs::{MapFs, VirtualFs};
@@ -201,11 +207,14 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
         match run_once(&context, my_epoch) {
             Ok(Some(outcome)) => {
                 eprintln!(
-                    "[urdira-indexing-worker] v4 residual pass complete workspace={workspace_id} generation={} upgraded={} external={} unresolved={} total_ms={}",
+                    "[urdira-indexing-worker] v4 residual pass complete workspace={workspace_id} generation={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={} total_ms={}",
                     outcome.generation,
                     outcome.upgraded_sites,
                     outcome.external_sites,
                     outcome.unresolved_sites,
+                    outcome.inferred_type_entities,
+                    outcome.type_of_relations,
+                    outcome.diagnostics_emitted,
                     outcome.timings.total_ms,
                 );
                 if let Some(target) = event_target {
@@ -245,6 +254,14 @@ pub struct ResidualOutcome {
     pub upgraded_sites: u64,
     pub external_sites: u64,
     pub unresolved_sites: u64,
+    /// Decision 28's "inferred types + compiler diagnostics" task: newly
+    /// OPENED (not merely still-live) `jsts:entity_inferred_type` rows this
+    /// run.
+    pub inferred_type_entities: u64,
+    /// Newly opened `jsts:relation_type_of` rows this run.
+    pub type_of_relations: u64,
+    /// Newly opened `jsts:diagnostic` rows this run.
+    pub diagnostics_emitted: u64,
     pub timings: ScanTimings,
 }
 
@@ -318,6 +335,9 @@ fn run_once_with_quiet_period(
             upgraded_sites: 0,
             external_sites: 0,
             unresolved_sites: 0,
+            inferred_type_entities: 0,
+            type_of_relations: 0,
+            diagnostics_emitted: 0,
             timings: ScanClock::start().completed_timings(),
         }));
     }
@@ -427,10 +447,17 @@ fn run_once_with_quiet_period(
             "checkJs": true,
         }),
         lib_roots: vec![lib_root],
+        // Decision 28's "inferred types + compiler diagnostics" task: fetch
+        // `crate::semantic_extras` output for every window root, on the
+        // SAME snapshot/window this call already opens for call/heritage
+        // resolution -- see `ResidualPassConfig::fetch_semantics`'s own doc
+        // comment.
+        fetch_semantics: true,
     };
 
-    let resolved = ResidualPass::run(&plan, residual_lanes(), &pending_by_owner, fs, &config)
-        .map_err(|error| ScanError(format!("v4 residual: checker pass failed: {error}")))?;
+    let (resolved, pass_stats) =
+        ResidualPass::run_instrumented(&plan, residual_lanes(), &pending_by_owner, fs, &config)
+            .map_err(|error| ScanError(format!("v4 residual: checker pass failed: {error}")))?;
     clock.record_resolve(resolve_started.elapsed());
     let debug_enabled = std::env::var_os("URDIRA_V4_RESIDUAL_DEBUG").is_some();
     let site_dump_path = std::env::var("URDIRA_V4_RESIDUAL_SITE_DUMP").ok();
@@ -438,6 +465,9 @@ fn run_once_with_quiet_period(
         .then(|| ResidualDebug::new(site_dump_path.as_deref()));
     if let Some(debug) = debug.as_mut() {
         debug.record_pass(&resolved, &file_map);
+    }
+    if debug_enabled {
+        print_diagnostic_code_histogram(&pass_stats.diagnostics);
     }
 
     if current_epoch(&context.workspace_id) != my_epoch {
@@ -506,6 +536,24 @@ fn run_once_with_quiet_period(
     // (e.g. `this.repository.save(...)`) produce exactly one new entity
     // record, not 1,000 duplicates.
     let mut synthesized_member_entities: HashMap<(String, i32), [u8; 32]> = HashMap::new();
+    // A2 (pending.sites migration): closures for the `pending.sites` side
+    // table -- one entry per site this pass actually upgrades (see the
+    // `SiteOutcome::WorkspaceTarget` arm below). `External`/`Unresolved`
+    // outcomes never close a pending site: the site's own status has not
+    // changed (still genuinely pending), so it stays open for a future
+    // pass/edit to reconsider.
+    let mut pending_closures: Vec<(urdira_structural_store::PendingSiteKey, u32)> = Vec::new();
+    // The bit `FACET_ORDER` (`materialize.rs`) assigns `"core:indirect"` --
+    // computed once, the SAME way `dump_call_bodies` locates it (see that
+    // function's own doc comment). `dicts` (loaded before the checker pass
+    // ran) is safe to reuse here: `facet_names` reports the SAME full list
+    // every generation once written, so it cannot have drifted across the
+    // fresh `StoreReader::open` just above.
+    let indirect_bit = dicts
+        .facet_names
+        .iter()
+        .position(|name| name == "core:indirect")
+        .expect("FACET_ORDER (materialize.rs) always registers core:indirect");
 
     for site in &resolved {
         let Some(store_path) = site.owner_path.strip_prefix(&workspace_root) else {
@@ -521,13 +569,17 @@ fn run_once_with_quiet_period(
         let Some(meta) = collected.by_site.get(&key) else {
             continue;
         };
-        // Re-verify this exact possible row is still the live occurrence
-        // before touching it (see the fresh-`StoreReader` re-open above).
-        let Some(current) = store.get_visible(&meta.possible_record_id, publish_generation) else {
+        // Re-verify this exact pending site is still open before touching
+        // it (see the fresh-`StoreReader` re-open above): `None` means it
+        // was already closed by some other means since collection (a
+        // concurrent edit, or a previous iteration of this very loop for
+        // the SAME key -- `resolved` can in principle repeat a key if the
+        // checker pass itself ever did, though it should not).
+        if store
+            .pending_site(&meta.pending_key, publish_generation)
+            .is_none()
+        {
             continue;
-        };
-        if current.target_subject().is_some() {
-            continue; // already upgraded by some other means since collection
         }
 
         match &site.outcome {
@@ -616,7 +668,9 @@ fn run_once_with_quiet_period(
                     &target_id,
                     meta.relation_kind,
                     &target_record_id,
-                    &current,
+                    meta.owner_artifact,
+                    meta.owner_version,
+                    Some(meta.source_subject),
                     &store,
                     publish_generation,
                     new_generation_u32,
@@ -628,8 +682,29 @@ fn run_once_with_quiet_period(
                 )?;
                 match confirmed {
                     Some(confirmed) => {
-                        record_closures.push((meta.possible_record_id, new_generation_u32));
-                        closed_relation_keys.push(meta.possible_record_id);
+                        pending_closures.push((meta.pending_key, new_generation_u32));
+                        // A2: ALSO close every live candidate row (P2-2j,
+                        // `candidate_call_record` -- `classification:
+                        // "possible"` but a REAL `target_id`, carrying the
+                        // `core:indirect` facet) at this exact span: this
+                        // pass just independently confirmed a single real
+                        // workspace target for the site, which supersedes
+                        // whatever candidates existed for it (an overload/
+                        // union receiver's per-candidate guesses are no
+                        // longer the best evidence once the checker itself
+                        // has spoken). `by_owner` -> filter by span is a
+                        // small per-owner scan (this owner's own record
+                        // count, not the whole corpus).
+                        for candidate in store.by_owner(meta.owner_artifact, publish_generation) {
+                            if candidate.category() == CATEGORY_RELATION
+                                && candidate.span_start_byte() == site.start_utf16 as u32
+                                && candidate.span_end_byte() == site.end_utf16 as u32
+                                && (candidate.facets() & (1u64 << indirect_bit)) != 0
+                            {
+                                record_closures.push((candidate.record_id(), new_generation_u32));
+                                closed_relation_keys.push(candidate.record_id());
+                            }
+                        }
                         opened_records.push(confirmed);
                         upgraded += 1;
                         if let Some(debug) = debug.as_mut() {
@@ -645,34 +720,126 @@ fn run_once_with_quiet_period(
                 }
             }
             SiteOutcome::External { .. } => {
+                // A2: nothing to repair any more -- the site's own no-
+                // target relation record was already dropped at
+                // materialize time (`plan_relation_repair`), so there is no
+                // classification-mismatched row left to rewrite. The
+                // pending site stays open (see this loop's own doc comment
+                // on `pending_closures`).
                 external += 1;
-                repair_mismatched_row_if_needed(
-                    meta,
-                    &store_path,
-                    site.start_utf16,
-                    site.end_utf16,
-                    &current,
-                    &store,
-                    publish_generation,
-                    new_generation_u32,
-                    &mut kinds_dict,
-                    &mut universal_kinds_dict,
-                    &mut relation_kinds_dict,
-                    &mut names_dict,
-                    &mut opened_records,
-                    &mut record_closures,
-                    &mut closed_relation_keys,
-                    debug.as_mut(),
-                );
             }
             SiteOutcome::Unresolved { .. } => {
                 unresolved += 1;
-                repair_mismatched_row_if_needed(
-                    meta,
-                    &store_path,
-                    site.start_utf16,
-                    site.end_utf16,
-                    &current,
+            }
+        }
+    }
+
+    // Decision 28's "inferred types + compiler diagnostics" task: within
+    // the SAME residual pass run, for every owner `pass_stats.types`/
+    // `pass_stats.diagnostics` produced data for, (a) emit `jsts:
+    // entity_inferred_type` + `jsts:relation_type_of` for every typed
+    // declaration and (b) `jsts:diagnostic` for every compiler diagnostic,
+    // then (c) close every PREVIOUSLY live row of these three kinds for
+    // that owner whose identity is not among what was just (re)computed --
+    // these three kinds only ever exist inside an upgrade generation (never
+    // touched by `diff_owner`'s ordinary identity diff, which only runs for
+    // stage-1/2 kinds an edit-scan regenerates), so this pass is the only
+    // place that can ever close a stale one.
+    let mut inferred_type_entities = 0u64;
+    let mut type_of_relations = 0u64;
+    let mut diagnostics_emitted = 0u64;
+    {
+        let mut types_by_owner: BTreeMap<&str, Vec<&InferredTypeResult>> = BTreeMap::new();
+        for typed in &pass_stats.types {
+            types_by_owner
+                .entry(typed.owner_path.as_str())
+                .or_default()
+                .push(typed);
+        }
+        let mut diagnostics_by_owner: BTreeMap<&str, Vec<&DiagnosticResult>> = BTreeMap::new();
+        for diagnostic in &pass_stats.diagnostics {
+            diagnostics_by_owner
+                .entry(diagnostic.owner_path.as_str())
+                .or_default()
+                .push(diagnostic);
+        }
+        let mut touched_owners: std::collections::BTreeSet<&str> =
+            types_by_owner.keys().copied().collect();
+        touched_owners.extend(diagnostics_by_owner.keys().copied());
+
+        for virtual_owner in touched_owners {
+            let Some(stripped) = virtual_owner.strip_prefix(&workspace_root) else {
+                continue;
+            };
+            let store_path = stripped.trim_start_matches('/');
+            let real_path = if frontier.present.contains_key(store_path) {
+                store_path.to_string()
+            } else if let Some(real) = real_path_by_lower.get(&store_path.to_ascii_lowercase()) {
+                real.clone()
+            } else {
+                continue;
+            };
+            let Some(entry) = frontier.present.get(&real_path) else {
+                continue;
+            };
+            let Some(&owner_artifact) = artifact_ordinal_by_pair
+                .get(&(entry.artifact_id.clone(), entry.artifact_version_id.clone()))
+            else {
+                continue;
+            };
+            let owner_version = owner_artifact; // matches try_synthesize_member_entity's own convention.
+
+            let mut new_identities: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            for typed in types_by_owner.get(virtual_owner).into_iter().flatten() {
+                let site = &typed.site;
+                let existing_record_id = collected
+                    .entities
+                    .lookup(&real_path, site.name_start_utf16)
+                    .and_then(decode_hex32);
+                let entity_info: Option<([u8; 32], String)> = match existing_record_id {
+                    Some(id) => store.get_visible(&id, publish_generation).map(|view| {
+                        (
+                            id,
+                            String::from_utf8_lossy(view.identity_key()).into_owned(),
+                        )
+                    }),
+                    None => try_synthesize_member_entity(
+                        Some(&real_path),
+                        site.name_start_utf16,
+                        site.decl_start,
+                        site.decl_end,
+                        site.decl_kind,
+                        &real_path_by_lower,
+                        &frontier,
+                        &artifact_ordinal_by_pair,
+                        &file_map,
+                        &workspace_root,
+                        &store,
+                        publish_generation,
+                        new_generation_u32,
+                        &mut synthesized_member_entities,
+                        &mut opened_records,
+                        &mut kinds_dict,
+                        &mut universal_kinds_dict,
+                        &mut names_dict,
+                    ),
+                };
+                let Some((entity_record_id, entity_id)) = entity_info else {
+                    continue;
+                };
+
+                let Some(result) = build_inferred_type_rows(
+                    &entity_id,
+                    &entity_record_id,
+                    &site.display_name,
+                    &site.type_text,
+                    &real_path,
+                    site.decl_start,
+                    site.decl_end,
+                    owner_artifact,
+                    owner_version,
                     &store,
                     publish_generation,
                     new_generation_u32,
@@ -680,14 +847,92 @@ fn run_once_with_quiet_period(
                     &mut universal_kinds_dict,
                     &mut relation_kinds_dict,
                     &mut names_dict,
-                    &mut opened_records,
-                    &mut record_closures,
-                    &mut closed_relation_keys,
-                    debug.as_mut(),
-                );
+                    &mut subjects_dict,
+                )?
+                else {
+                    continue;
+                };
+                new_identities.insert(result.entity_identity.clone());
+                new_identities.insert(result.relation_identity.clone());
+                if let Some(row) = result.entity_row {
+                    opened_records.push(row);
+                    inferred_type_entities += 1;
+                }
+                if let Some(row) = result.relation_row {
+                    opened_records.push(row);
+                    type_of_relations += 1;
+                }
+            }
+
+            for (index, diagnostic) in diagnostics_by_owner
+                .get(virtual_owner)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let site = &diagnostic.site;
+                let Some((identity_key, row)) = build_diagnostic_row(
+                    &real_path,
+                    site.start,
+                    site.end,
+                    site.compiler_code,
+                    &site.message,
+                    index,
+                    owner_artifact,
+                    owner_version,
+                    &store,
+                    publish_generation,
+                    new_generation_u32,
+                    &mut kinds_dict,
+                    &mut universal_kinds_dict,
+                    &mut names_dict,
+                )?
+                else {
+                    continue;
+                };
+                new_identities.insert(identity_key);
+                if let Some(row) = row {
+                    opened_records.push(row);
+                    diagnostics_emitted += 1;
+                }
+            }
+
+            // Close every previously-live row of these three kinds for this
+            // owner whose identity is not among what this run just
+            // (re)computed -- an edit that removes an export, changes its
+            // type, or fixes a type error must not leave the old row
+            // visible forever (the task's own "never accumulate"
+            // requirement; see `n8n_residual_pass_repeat_run_has_no_duplicate_
+            // type_of` / the edit-then-reupgrade test in this file's own
+            // test module).
+            for candidate in store.by_owner(owner_artifact, publish_generation) {
+                if candidate.category() != CATEGORY_ENTITY
+                    && candidate.category() != CATEGORY_RELATION
+                    && candidate.category() != CATEGORY_DIAGNOSTIC
+                {
+                    continue;
+                }
+                let Some(kind) = dicts.kinds.get(candidate.kind_id() as usize) else {
+                    continue;
+                };
+                if kind != "jsts:entity_inferred_type"
+                    && kind != "jsts:relation_type_of"
+                    && kind != "jsts:diagnostic"
+                {
+                    continue;
+                }
+                let identity = String::from_utf8_lossy(candidate.identity_key()).into_owned();
+                if new_identities.contains(&identity) {
+                    continue;
+                }
+                record_closures.push((candidate.record_id(), new_generation_u32));
+                if candidate.category() == CATEGORY_RELATION {
+                    closed_relation_keys.push(candidate.record_id());
+                }
             }
         }
     }
+
     clock.record_materialize(materialize_started.elapsed());
     if debug_enabled && let Some(debug) = debug.as_ref() {
         debug.print();
@@ -704,12 +949,22 @@ fn run_once_with_quiet_period(
         );
     }
 
-    if opened_records.is_empty() {
+    // Decision 28's "inferred types + compiler diagnostics" task can close
+    // stale rows for an owner (an export/type/diagnostic that disappeared)
+    // WITHOUT opening any new row for that same owner this run -- unlike
+    // the pre-existing call/heritage path, where `record_closures` was
+    // always pushed in the same branch as an `opened_records` push. Guard
+    // on all three vectors, not just `opened_records`, so a run that only
+    // closes stale rows still publishes.
+    if opened_records.is_empty() && record_closures.is_empty() && pending_closures.is_empty() {
         return Ok(Some(ResidualOutcome {
             generation: publish_generation,
             upgraded_sites: 0,
             external_sites: external,
             unresolved_sites: unresolved,
+            inferred_type_entities: 0,
+            type_of_relations: 0,
+            diagnostics_emitted: 0,
             timings: clock.completed_timings(),
         }));
     }
@@ -722,6 +977,36 @@ fn run_once_with_quiet_period(
     let mut new_dicts = dicts.clone();
     new_dicts.names = names_dict.into_values();
     new_dicts.subjects = subjects_dict.into_values();
+    // A2 (pending.sites migration) bug fix: `kinds_dict`/`universal_kinds_
+    // dict`/`relation_kinds_dict` are seeded from `dicts` (`OrdinalDict::
+    // from_existing`, above) and `build_confirmed_row` interns into them on
+    // every upgrade, exactly like `names_dict`/`subjects_dict` -- but their
+    // interned values were never written back into `new_dicts` before this
+    // fix, so a kind/universal_kind/relation_kind string that this pass
+    // interns FOR THE FIRST TIME (a fresh ordinal, not already present in
+    // the base store) never made it into `dict_additions` at all: the
+    // delta segment's `dict.bin` never carried that ordinal's text, so a
+    // reader's `dicts.kinds[ordinal]`/`dicts.universal_kinds[ordinal]`
+    // lookup silently returned nothing (an out-of-bounds/empty string) for
+    // every record using it -- confirmed live: `tests/v4-daemon-e2e.test.ts`'s
+    // residual-pass test found a freshly-confirmed `core:implements` row
+    // with `kind: ""` and `universal_kind: ""` in its query-engine
+    // projection (right `classification`/`source_id`/`target_id`, empty
+    // kind text), making it invisible to any `kind === "jsts:relation_
+    // implements"` filter. This bug was DORMANT before A2: `possible_call_
+    // record`/`possible_heritage_record` used to materialize a REAL record
+    // for every no-target site at COLD-SCAN time, which always interned
+    // `"jsts:relation_call"`/`"jsts:relation_inherits"`/`"jsts:relation_
+    // implements"` into the base `dicts.kinds` regardless of whether
+    // anything ever confirmed -- so `kinds_dict.intern(...)` here always
+    // hit an EXISTING ordinal and this gap never mattered. Once no-target
+    // sites stopped being records at all, a fixture/corpus with zero
+    // COLD-confirmed calls/heritage of a given kind (this task-planner
+    // fixture has none) hits this for the first time on residual's first
+    // ever upgrade of that kind.
+    new_dicts.kinds = kinds_dict.into_values();
+    new_dicts.universal_kinds = universal_kinds_dict.into_values();
+    new_dicts.relation_kinds = relation_kinds_dict.into_values();
     new_dicts.subject_text = new_dicts
         .subjects
         .iter()
@@ -734,7 +1019,7 @@ fn run_once_with_quiet_period(
 
     let writer = urdira_structural_store::writer::SegmentWriter::new();
     let summary = writer
-        .write_delta_with_reader(
+        .write_delta_with_reader_and_pending(
             structural_root,
             &store,
             &opened_records,
@@ -743,6 +1028,12 @@ fn run_once_with_quiet_period(
             &[],
             &dict_additions,
             new_generation,
+            // A2 (pending.sites migration): this pass never OPENS a new
+            // pending site (it only ever closes one, on a successful
+            // upgrade -- see `pending_closures`, built in the materialize
+            // loop above); `&[]` is exactly right here, not a placeholder.
+            &[],
+            &pending_closures,
         )
         .map_err(|error| ScanError(format!("v4 residual: write_delta failed: {error}")))?;
     clock.record_write(write_started.elapsed());
@@ -830,6 +1121,9 @@ fn run_once_with_quiet_period(
         upgraded_sites: upgraded,
         external_sites: external,
         unresolved_sites: unresolved,
+        inferred_type_entities,
+        type_of_relations,
+        diagnostics_emitted,
         timings: clock.completed_timings(),
     }))
 }
@@ -882,19 +1176,22 @@ fn correlation_key(path: &str, start: i32, end: i32, kind: SiteKind) -> String {
     format!("{path}\u{0}{start}\u{0}{end}\u{0}{kind:?}")
 }
 
-/// One possible relation row this pass may upgrade.
+/// One `pending.sites` row this pass may upgrade -- A2 (pending.sites
+/// migration): replaces the pre-migration `possible_record_id`/
+/// `was_mismatched` shape (there is no possible RECORD any more to hold an
+/// id or a mismatch flag; `pending_key` addresses the store's own side
+/// table row instead, and there is nothing left to "repair": a confirmed-
+/// shaped relation whose target never interned is DROPPED at materialize
+/// time and synthesizes its OWN `target_not_interned` pending site --
+/// `materialize.rs`'s `plan_relation_repair` -- so every `PendingMeta` this
+/// module ever builds already represents a genuinely open site).
 struct PendingMeta {
-    possible_record_id: [u8; 32],
+    pending_key: PendingSiteKey,
+    owner_artifact: u32,
+    owner_version: u32,
     source_id: String,
+    source_subject: u32,
     relation_kind: &'static str,
-    /// See `collect()`'s own comment at `was_mismatched`'s computation:
-    /// `true` when this row's identity already claimed a resolved target
-    /// (`classification: "confirmed"` in its body, per
-    /// `is_classification_consistent`'s rule) despite `target_subject()`
-    /// being `None` at the store level. Drives the materialize loop's own
-    /// repair step for a site this pass's checker attempt could NOT
-    /// confirm.
-    was_mismatched: bool,
 }
 
 struct Collected {
@@ -903,10 +1200,30 @@ struct Collected {
     entities: EntityIndex,
 }
 
-/// One full pass over every visible record (see this module's doc comment,
-/// "Store access without a body decoder"): branches into either an entity-
-/// index entry or a possible-relation pending site, using only metadata
-/// columns, never `RecordView::body()`.
+/// A2 (pending.sites migration): pending sites now come straight from the
+/// store's own `pending.sites` table (`StoreReader::iter_visible_pending_
+/// sites`) instead of a full `iter_visible` scan filtered to `target_
+/// subject().is_none()` relations -- there is no such relation any more to
+/// filter for (see this module's own doc comment, "Store access without a
+/// body decoder", for why every field this function needs is still a plain
+/// metadata column, never a body decode). The entity index is UNCHANGED: it
+/// still needs a full `iter_visible` scan of every entity-category record
+/// (`entities.index` is still not a real table -- P2-2i deliverable 2's own
+/// remaining scope, unaffected by this task).
+///
+/// **Known regression versus the pre-migration `collect()`** (reported, not
+/// silently fixed): the old implementation recovered a call site's
+/// `source_id` from the relation record's own IDENTITY TEXT whenever
+/// `source_subject()` was `None` (P1-D-f's fix for the "call's enclosing
+/// scope is a class/interface member" gap -- v4's entity schema does not
+/// materialize members, so `source_subject` never interned for such a
+/// site). A `PendingSiteRow` carries no such text fallback -- only
+/// `source_subject: Option<u32>`, resolved by `materialize.rs` the exact
+/// same way a relation row's own endpoint resolves (this task's own brief).
+/// A pending site whose `source_subject` does not resolve is therefore
+/// SKIPPED here (never sent to the checker at all), same as it always was
+/// for a heritage site missing the (never-implemented) text fallback, but
+/// now ALSO true for a member-owner call site P1-D-f specifically fixed.
 fn collect(
     store: &StoreReader,
     dicts: &Dictionaries,
@@ -918,162 +1235,99 @@ fn collect(
     let mut entity_entries: Vec<(String, i32, String)> = Vec::new();
 
     for view in store.iter_visible(generation) {
-        match view.category() {
-            CATEGORY_ENTITY => {
-                let Some(path) = owner_path(view.owner_artifact()) else {
-                    continue;
-                };
-                entity_entries.push((
-                    path,
-                    view.span_start_byte() as i32,
-                    materialize::hex_encode(&view.record_id()),
-                ));
+        if view.category() == CATEGORY_ENTITY {
+            // Decision 28's "inferred types" task: a `jsts:entity_inferred_
+            // type` record deliberately carries the SAME `path`/`start`/
+            // `end` as the declaration it types (matching v3's own
+            // `semanticTypeRecords` recipe, verified byte-for-byte against
+            // the oracle -- see `build_inferred_type_rows`'s doc comment).
+            // For a class/interface member with no leading modifier
+            // keyword, that span's OWN start coincides EXACTLY with the
+            // member declaration's own name-identifier start (the key
+            // `EntityIndex` uses) -- e.g. `count = 0;`/`describe() {}`. If
+            // such an inferred-type entity were included here, it would
+            // collide with the very declaration it types in `EntityIndex`'s
+            // `(path, start)` key space, and (depending on iteration order)
+            // could WIN that slot -- corrupting every future lookup of the
+            // real declaration into pointing at its own inferred-type
+            // entity instead (confirmed live: `inferred_types_and_
+            // diagnostics_across_two_runs_and_an_edit`'s run 2 produced a
+            // `type_of` relation whose `source_id` was itself a `jsts:
+            // inferred-type:...` identity, not the declaration's, before
+            // this exclusion). An inferred-type entity is never a valid
+            // call/heritage TARGET or `type_of` SOURCE lookup result, so
+            // excluding it here is always correct, not merely a workaround.
+            let Some(kind) = dicts.kinds.get(view.kind_id() as usize) else {
+                continue;
+            };
+            if kind == "jsts:entity_inferred_type" {
+                continue;
             }
-            CATEGORY_RELATION => {
-                if view.target_subject().is_some() {
-                    continue; // already confirmed
-                }
-                let universal_kind = dicts
-                    .universal_kinds
-                    .get(view.universal_kind_id() as usize)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                let (site_kind, relation_kind): (SiteKind, &'static str) = match universal_kind {
-                    "core:call" => (SiteKind::Call, "call"),
-                    "core:inherits" => (SiteKind::Heritage, "inherits"),
-                    "core:implements" => (SiteKind::Heritage, "implements"),
-                    _ => continue,
-                };
-                let Some(path) = owner_path(view.owner_artifact()) else {
-                    continue;
-                };
-                let start = view.span_start_byte() as i32;
-                let end = view.span_end_byte() as i32;
-                let identity_str = String::from_utf8_lossy(view.identity_key()).into_owned();
-                // P1-D-g item 1: whether THIS row's own identity already
-                // claims a resolved target (`is_classification_consistent`'s
-                // own doc comment has the full rule) -- independent of
-                // whether `source_id` below can be recovered at all. A
-                // `call` relation whose identity does NOT end in the fixed
-                // `:unresolved` sentinel (`possible_call_record`'s own
-                // literal, `urdira_jsts_syntax_worker::semantic_sites`) but
-                // whose `target_subject()` is still `None` here (this match
-                // arm's own precondition) is exactly the "classification
-                // mismatch" population the evidence doc's item 1
-                // characterizes: `semantic_sites.rs` (out of this module's
-                // ownership) wrote `classification: "confirmed"` + a real
-                // `target_id` into `body` at creation time, but
-                // `materialize.rs`'s own subject-resolution pass (also out
-                // of ownership) never interned that target. Recorded here,
-                // metadata-only, so the materialize loop below can decide
-                // whether a failed re-resolution attempt must REPAIR this
-                // row (rewrite it to the canonical, self-consistent
-                // `possible` shape) rather than leave a permanently
-                // inconsistent ghost.
-                let was_mismatched =
-                    relation_kind == "call" && !identity_str.ends_with(":unresolved");
-                let source_id = view
-                    .source_subject()
-                    .and_then(|ordinal| dicts.subjects.get(ordinal as usize))
-                    .and_then(|record_id| store.get_visible(record_id, generation))
-                    .map(|source_view| {
-                        String::from_utf8_lossy(source_view.identity_key()).into_owned()
-                    })
-                    // P1-D-f: `source_subject()` is `None` whenever the
-                    // call's OWN enclosing scope is a class/interface member
-                    // (method/constructor/getter/setter) -- v4's entity
-                    // schema has no such entities at all (P1-D-d's dominant
-                    // root cause, §1 of that evidence doc), so the ordinary
-                    // subject-resolution pass this relation went through at
-                    // COLD-SCAN TIME could never have interned a source
-                    // subject for it either, symmetric to (but distinct
-                    // from) the already-fixed TARGET-side gap
-                    // `try_synthesize_member_entity` closes below. Before
-                    // this fallback, EVERY such call site was silently
-                    // dropped right here, before ever becoming a
-                    // `PendingSite` -- never reaching the checker at all, no
-                    // matter how resolvable its target was (confirmed live,
-                    // P1-D-f's own parity diff: sites like `docker-
-                    // config.mjs`'s `determine` method calling its own
-                    // `sanitizeBranch` method, an entirely ordinary in-file
-                    // call, were invisible to `ResidualDebug`'s own per-site
-                    // dump even though the possible relation row plainly
-                    // existed). Recovered here from the relation's OWN
-                    // `identity_key()` metadata column (never `body()` --
-                    // this module's own "no body decode" invariant, this
-                    // doc comment's own header, stays intact): a possible
-                    // `core:call` relation's identity is always exactly
-                    // `jsts:call:{path}:{start}:{end}:{source_id}:unresolved`
-                    // (`urdira_jsts_syntax_worker::semantic_sites`'s own
-                    // `proposal_relation_identity`-shaped literal, confirmed
-                    // against that crate's source), so the embedded
-                    // `source_id` -- itself a compound `jsts:{kind}:...`
-                    // string that may contain its own colons -- is
-                    // recoverable by stripping the ALREADY-KNOWN
-                    // `path`/`start`/`end` prefix and the fixed
-                    // `:unresolved` suffix, no canonical/body decode
-                    // required. Heritage relations (`inherits`/`implements`)
-                    // are NOT covered (a much smaller population, ~1,900
-                    // sites total on this corpus, and their own identity
-                    // literal was not independently confirmed this
-                    // session) -- unchanged, still skipped on a
-                    // `source_subject` miss.
-                    // P1-D-g: generalized beyond the `:unresolved`-only
-                    // shape to ALSO cover the classification-mismatch case
-                    // above (`was_mismatched`): there, `rest` is
-                    // `{source_id}:{target_id}`, both 5-colon-field
-                    // `jsts:{kind}:{path}:{start}:{name}` compound ids
-                    // (`declaration_id`/`stable_entity_id`'s own shared
-                    // recipe, verified against both crates' source) rather
-                    // than a single `{source_id}:unresolved`. Splitting
-                    // unambiguously requires a known FIELD COUNT, not a
-                    // delimiter (both halves may themselves contain `:` in
-                    // their own `path` segment in principle, though not in
-                    // practice for a real filesystem path -- the same
-                    // assumption the exact-string prefix strip just above
-                    // already relies on): a genuinely 10-field remainder
-                    // splits 5-and-5; anything else is left unrecovered
-                    // (best-effort, matches this fallback's own existing
-                    // "silently drop, do not fabricate" precedent) rather
-                    // than guessed.
-                    .or_else(|| {
-                        if relation_kind != "call" {
-                            return None;
-                        }
-                        let prefix = format!("jsts:call:{path}:{start}:{end}:");
-                        let rest = identity_str.strip_prefix(prefix.as_str())?;
-                        if let Some(source) = rest.strip_suffix(":unresolved") {
-                            return Some(source.to_string());
-                        }
-                        let tokens: Vec<&str> = rest.split(':').collect();
-                        (tokens.len() == 10).then(|| tokens[..5].join(":"))
-                    });
-                let Some(source_id) = source_id else {
-                    continue;
-                };
-                let key = correlation_key(&path, start, end, site_kind);
-                by_site.insert(
-                    key,
-                    PendingMeta {
-                        possible_record_id: view.record_id(),
-                        source_id,
-                        relation_kind,
-                        was_mismatched,
-                    },
-                );
-                pending_by_owner
-                    .entry(path.clone())
-                    .or_default()
-                    .push(PendingSite {
-                        owner_path: path,
-                        start,
-                        end,
-                        kind: site_kind,
-                        reason: relation_kind.to_string(),
-                    });
-            }
-            _ => {}
+            let Some(path) = owner_path(view.owner_artifact()) else {
+                continue;
+            };
+            entity_entries.push((
+                path,
+                view.span_start_byte() as i32,
+                materialize::hex_encode(&view.record_id()),
+            ));
         }
+    }
+
+    for view in store.iter_visible_pending_sites(generation) {
+        let (site_kind, relation_kind): (SiteKind, &'static str) = match view.site_kind() {
+            urdira_structural_store::PENDING_SITE_KIND_CALL => (SiteKind::Call, "call"),
+            urdira_structural_store::PENDING_SITE_KIND_INHERITS => (SiteKind::Heritage, "inherits"),
+            urdira_structural_store::PENDING_SITE_KIND_IMPLEMENTS => {
+                (SiteKind::Heritage, "implements")
+            }
+            _ => continue,
+        };
+        let Some(path) = owner_path(view.owner_artifact()) else {
+            continue;
+        };
+        let start = view.start() as i32;
+        let end = view.end() as i32;
+        // `target_not_interned` sites are included deliberately (task
+        // brief): they are real call/heritage sites tsgo may still resolve
+        // -- the only reason their OWN relation record was dropped at
+        // materialize time is that v4's cold entity producer does not
+        // materialize class/interface MEMBERS yet, an orthogonal, already-
+        // documented gap (`try_synthesize_member_entity`'s own doc comment
+        // handles exactly this on the TARGET side).
+        let Some(source_subject) = view.source_subject() else {
+            continue;
+        };
+        let Some(source_id) = dicts
+            .subjects
+            .get(source_subject as usize)
+            .and_then(|record_id| store.get_visible(record_id, generation))
+            .map(|source_view| String::from_utf8_lossy(source_view.identity_key()).into_owned())
+        else {
+            continue;
+        };
+        let key = correlation_key(&path, start, end, site_kind);
+        by_site.insert(
+            key,
+            PendingMeta {
+                pending_key: view.key(),
+                owner_artifact: view.owner_artifact(),
+                owner_version: view.owner_version(),
+                source_id,
+                source_subject,
+                relation_kind,
+            },
+        );
+        pending_by_owner
+            .entry(path.clone())
+            .or_default()
+            .push(PendingSite {
+                owner_path: path,
+                start,
+                end,
+                kind: site_kind,
+                reason: relation_kind.to_string(),
+            });
     }
 
     Collected {
@@ -1452,7 +1706,9 @@ fn build_confirmed_row(
     target_id: &str,
     relation_kind: &'static str,
     target_record_id: &[u8; 32],
-    predecessor: &RecordView,
+    owner_artifact: u32,
+    owner_version: u32,
+    source_subject: Option<u32>,
     store: &StoreReader,
     generation: u64,
     new_generation: u32,
@@ -1519,41 +1775,30 @@ fn build_confirmed_row(
     };
 
     let identity_key_digest = identity_key_digest_bytes(&identity_key);
-    // P1-D-g: the dominant cause of `confirmed_row_build_failed` (see the
-    // evidence doc's own §2 -- 15,590 rows, flat across every prior session)
-    // is NOT a genuine identity collision between two different sites: it is
-    // this exact confirmed identity ALREADY being live as `predecessor`
-    // itself. This happens for a "classification mismatch" possible row
-    // (`is_classification_consistent`'s own doc comment): `semantic_sites.rs`
-    // (E1-E3 typeflow, out of this module's ownership) already wrote a
-    // relation row whose identity embeds the SAME resolved target this
-    // checker pass just independently re-derived, with `classification:
-    // "confirmed"` in its body -- but `materialize.rs`'s own subject-
-    // resolution pass (also out of this module's ownership) never interned
-    // that target into `target_subject`, so the row is still `possible` at
-    // the store level and was collected as a pending site. When the checker
-    // resolves it to the SAME target typeflow already believed (the common
-    // case -- typeflow is usually right), the freshly-computed confirmed
-    // identity is byte-for-byte identical to `predecessor`'s own identity,
-    // so `by_identity_last` finds `predecessor` itself and the OLD "already
-    // live somewhere" guard bailed out here, incorrectly treating "the exact
-    // row I am about to supersede" as if it were a different, colliding row.
-    // The fix: only fail closed when a DIFFERENT record occupies this
-    // identity (`last.record_id() != predecessor.record_id()`) -- when it is
-    // `predecessor` itself, this is not a collision at all, just the normal
-    // supersede-and-chain case one arm below.
+    // A2 (pending.sites migration): the OLD "fail closed unless the live
+    // occupant is `predecessor` itself" guard existed only because a
+    // classification-mismatched POSSIBLE row (a relation record with a
+    // confirmed-shaped identity but no interned `target_subject`) used to
+    // be the exact same record as `predecessor` -- that population no
+    // longer exists as a RECORD at all (`materialize.rs`'s `plan_relation_
+    // repair` drops it and emits a `pending.sites` row instead), so there is
+    // no `predecessor` to compare against any more. What CAN legitimately
+    // occupy this identity today: (a) nothing (first confirmation, `None`
+    // below); (b) a PRIOR generation's own confirmed row for the exact same
+    // site+target (a second residual pass re-deriving the same answer --
+    // correctly chained off, decision 11's supersede-and-chain case); (c) a
+    // live P2-2j CANDIDATE row for this exact `(source, target)` pair (an
+    // overload/union receiver's own per-candidate guess that happens to
+    // agree with what the checker just confirmed) -- the caller closes
+    // every candidate row at this SAME SPAN right after this call succeeds
+    // (see the materialize loop's own comment), so chaining off it here is
+    // exactly the correct "confirmed supersedes candidate" behavior, not a
+    // collision. Always chain when found; there is no case left where a
+    // DIFFERENT, unrelated row could legitimately occupy a content-derived
+    // identity that embeds its own exact source span.
     let (record_id, record_digest, previous_record_id) =
         match store.by_identity_last(&identity_key_digest) {
-            Some(last)
-                if last.is_visible(generation) && last.record_id() != predecessor.record_id() =>
-            {
-                // A genuinely DIFFERENT row already occupies this exact
-                // identity -- not expected for a content-derived identity
-                // that embeds its own exact source span, but fail closed
-                // rather than risk a duplicate.
-                return Ok(None);
-            }
-            Some(last) => {
+            Some(last) if last.is_visible(generation) => {
                 let predecessor_id = last.record_id();
                 (
                     diff::chained_record_id(&kernel_row.record_digest, &predecessor_id),
@@ -1561,7 +1806,7 @@ fn build_confirmed_row(
                     predecessor_id,
                 )
             }
-            None => (kernel_row.record_id, kernel_row.record_digest, [0u8; 32]),
+            _ => (kernel_row.record_id, kernel_row.record_digest, [0u8; 32]),
         };
 
     let kind_id = u16::try_from(kinds_dict.intern(&kind)).unwrap_or(u16::MAX);
@@ -1570,20 +1815,19 @@ fn build_confirmed_row(
     let relation_kind_id =
         u16::try_from(relation_kinds_dict.intern(&universal_kind)).unwrap_or(u16::MAX);
     let name_id = names_dict.intern(&materialize::identity_key_name(&identity_key).to_owned());
-    let source_subject = predecessor.source_subject();
     let target_subject = Some(subjects_dict.intern(target_record_id));
 
     Ok(Some(RecordRow {
         record_id,
-        owner_artifact: predecessor.owner_artifact(),
-        owner_version: predecessor.owner_version(),
+        owner_artifact,
+        owner_version,
         valid_from: new_generation,
         valid_to: 0,
         category: CATEGORY_RELATION,
         kind_id,
         universal_kind_id,
         facets: materialize::facets_bitmask(&kernel_row.facets),
-        span_artifact_version: predecessor.owner_artifact(),
+        span_artifact_version: owner_artifact,
         span_start_byte: kernel_row.span_start,
         span_end_byte: kernel_row.span_end,
         span_start_line: 0,
@@ -1604,39 +1848,406 @@ fn build_confirmed_row(
     }))
 }
 
-/// P1-D-g item 1's own correctness rule, in its most reducible form: a
-/// `core:call`/`core:inherits`/`core:implements` relation row's identity
-/// already embeds whether ITS OWN producer believed the target resolved
-/// (any real `target_id` suffix) or not (the fixed `:unresolved` sentinel
-/// `possible_call_record`/`heritage_proposed_record` always use for a
-/// genuinely possible row, `urdira_jsts_syntax_worker::semantic_sites`,
-/// confirmed against that crate's source) -- and that MUST agree with the
-/// store's own, independently-derived `target_subject().is_some()`. `false`
-/// here is the exact "classification mismatch" signature this task exists
-/// to close: a row whose body says `classification: "confirmed"` (implied
-/// by a non-`:unresolved` identity) but whose target never actually got
-/// interned by `materialize.rs`'s own subject-resolution pass (out of this
-/// module's ownership -- see the evidence doc for why this cannot be fixed
-/// at the producer/materialize layer this session), or -- the inverse,
-/// unexpected in practice but checked anyway rather than assumed away -- a
-/// row whose identity claims NO target but the store somehow resolved one.
-/// Pure and metadata-only: no `@urdira/canonical` body decode needed, since
-/// every producer this codebase has (`semantic_sites.rs`'s two builders,
-/// `build_confirmed_row` above) always writes `body.classification`
-/// consistently with its OWN identity's `{target|unresolved}` suffix at
-/// creation time -- the bug this rule catches is exclusively a later,
-/// store-level divergence from what the identity already promised.
-fn is_classification_consistent(identity_key: &str, target_subject_is_some: bool) -> bool {
-    identity_key.ends_with(":unresolved") != target_subject_is_some
+/// Decision 28's "inferred types + compiler diagnostics" task:
+/// `${JAVASCRIPT_TYPESCRIPT_NAMESPACE}:inferred-type:${entity.id}:${canonicalSha256(entity.type)
+/// .slice("sha256:".length)}` (`fact-delta.ts`'s `semanticTypeRecords`) --
+/// `canonicalSha256(value)` is `sha256:` + hex(sha256(canonicalJson(value))),
+/// and `canonicalJson` of a plain JS string is exactly `JSON.stringify`
+/// (`packages/plugin-sdk/src/canonical.ts`'s `encode`, the `string` arm).
+/// `serde_json::to_string` of a `&str` produces the identical escaping
+/// (`"`, `\`, and control characters below `0x20`; every other byte,
+/// ASCII or not, passed through verbatim) for every type string this task
+/// verified against the retained v3 oracle (see this task's own report for
+/// the byte-for-byte sample) -- the one theoretical divergence (a lone
+/// UTF-16 surrogate in a type name, which V8's `JSON.stringify` escapes
+/// specially and `serde_json` cannot even represent in a Rust `String`) is
+/// not expected in any real TypeScript type text and is not observed on
+/// the oracle sample.
+fn type_identity_hash_hex(type_text: &str) -> String {
+    use std::fmt::Write as _;
+    let canonical =
+        serde_json::to_string(type_text).expect("a &str always serializes to a JSON string");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
-/// Store-wide scan (P1-D-g's own invariant, deliverable 1): counts every
-/// visible `core:call`/`core:inherits`/`core:implements` relation row where
-/// [`is_classification_consistent`] returns `false`. Metadata-only (no body
-/// decode), so this runs cheaply even at n8n scale and can be called both
-/// before and after a residual pass to measure how much of the population
-/// this pass's own repair step ( see `repair_mismatched_row_if_needed`)
-/// actually closes.
+/// Shared "open a fresh row, or reuse the already-live one" decision every
+/// kernel-canonicalized row this module builds needs (`build_confirmed_row`/
+/// `try_synthesize_member_entity` each inlined their own copy before this
+/// task; this is the SAME logic, factored out because the inferred-type/
+/// diagnostic producers below need it applied independently to several rows
+/// per declaration/diagnostic within one owner). Returns the row's final
+/// `record_id` always, and `Some(RecordRow)` only when a NEW row must be
+/// opened this generation (already-live-and-unchanged returns `None` for
+/// the row half, so the caller's `opened_records` never grows for a
+/// declaration whose type text did not change between two residual runs --
+/// the task's own "never accumulate" requirement).
+#[allow(clippy::too_many_arguments)]
+fn finalize_kernel_row(
+    kernel_row: urdira_native_core::StructuralKernelRow,
+    identity_key: &str,
+    category: u8,
+    owner_artifact: u32,
+    owner_version: u32,
+    new_generation: u32,
+    store: &StoreReader,
+    generation: u64,
+    kind_id: u16,
+    universal_kind_id: u16,
+    relation_kind_id: u16,
+    name_id: u32,
+    source_subject: Option<u32>,
+    target_subject: Option<u32>,
+) -> ([u8; 32], Option<RecordRow>) {
+    let identity_key_digest = identity_key_digest_bytes(identity_key);
+    if let Some(last) = store.by_identity_last(&identity_key_digest)
+        && last.is_visible(generation)
+    {
+        return (last.record_id(), None);
+    }
+    let (record_id, record_digest, previous_record_id) =
+        match store.by_identity_last(&identity_key_digest) {
+            Some(last) => {
+                let predecessor_id = last.record_id();
+                (
+                    diff::chained_record_id(&kernel_row.record_digest, &predecessor_id),
+                    kernel_row.record_digest,
+                    predecessor_id,
+                )
+            }
+            None => (kernel_row.record_id, kernel_row.record_digest, [0u8; 32]),
+        };
+    let row = RecordRow {
+        record_id,
+        owner_artifact,
+        owner_version,
+        valid_from: new_generation,
+        valid_to: 0,
+        category,
+        kind_id,
+        universal_kind_id,
+        facets: materialize::facets_bitmask(&kernel_row.facets),
+        span_artifact_version: owner_artifact,
+        span_start_byte: kernel_row.span_start,
+        span_end_byte: kernel_row.span_end,
+        span_start_line: 0,
+        span_end_line: 0,
+        identity_type: 1,
+        assignment_kind: 0,
+        name_id,
+        identity_key: kernel_row.identity_key.into_bytes(),
+        record_digest,
+        body_digest: kernel_row.body_digest,
+        identity_id: kernel_row.identity_id,
+        identity_key_digest: kernel_row.identity_key_digest,
+        previous_record_id,
+        source_subject,
+        target_subject,
+        relation_kind_id,
+        body: kernel_row.body,
+    };
+    (record_id, Some(row))
+}
+
+/// Result of [`build_inferred_type_rows`]: the entity/relation identities
+/// (always computed, needed by the caller's own close-stale-rows diff even
+/// when both rows below are `None` because they are already live) plus
+/// whichever of the two rows must actually be opened this generation.
+struct InferredTypeRowsResult {
+    entity_identity: String,
+    relation_identity: String,
+    entity_row: Option<RecordRow>,
+    relation_row: Option<RecordRow>,
+}
+
+/// Builds the `jsts:entity_inferred_type` + `jsts:relation_type_of` pair for
+/// one typed declaration, byte-for-byte matching `fact-delta.ts`'s
+/// `semanticTypeRecords` recipe (verified against a live v3 oracle row --
+/// see this task's own report). `entity_id`/`entity_record_id` are the
+/// ALREADY-TYPED declaration's own entity identity/record id (an existing
+/// store entity, or one this same pass just synthesized via
+/// `try_synthesize_member_entity`); `display_name` is `crate::
+/// semantic_extras::TypedDeclarationSite::display_name` (`analyzer.ts`'s
+/// `entity.qualified_name ?? entity.name`).
+#[allow(clippy::too_many_arguments)]
+fn build_inferred_type_rows(
+    entity_id: &str,
+    entity_record_id: &[u8; 32],
+    display_name: &str,
+    type_text: &str,
+    path: &str,
+    start: i32,
+    end: i32,
+    owner_artifact: u32,
+    owner_version: u32,
+    store: &StoreReader,
+    generation: u64,
+    new_generation: u32,
+    kinds_dict: &mut OrdinalDict<String>,
+    universal_kinds_dict: &mut OrdinalDict<String>,
+    relation_kinds_dict: &mut OrdinalDict<String>,
+    names_dict: &mut OrdinalDict<String>,
+    subjects_dict: &mut OrdinalDict<[u8; 32]>,
+) -> Result<Option<InferredTypeRowsResult>, ScanError> {
+    let type_hash = type_identity_hash_hex(type_text);
+    let entity_identity = format!("jsts:inferred-type:{entity_id}:{type_hash}");
+    let relation_identity = format!("jsts:type-of:{entity_id}:{entity_identity}");
+
+    // v3's own `analysis.language` field is workspace/project-wide, not
+    // per-file (confirmed live against the oracle: a `.mjs` file's own
+    // `jsts:entity_inferred_type` row still carries `language:
+    // "typescript"`) -- hardcoded here to match, not derived from the
+    // owner's own extension.
+    let mut entity_body = serde_json::Map::new();
+    entity_body.insert(
+        "name".into(),
+        serde_json::Value::String(format!("inferred type of {display_name}")),
+    );
+    entity_body.insert(
+        "kind".into(),
+        serde_json::Value::String("inferred_type".into()),
+    );
+    entity_body.insert("type".into(), serde_json::Value::String(type_text.into()));
+    entity_body.insert(
+        "language".into(),
+        serde_json::Value::String("typescript".into()),
+    );
+    entity_body.insert("path".into(), serde_json::Value::String(path.into()));
+    entity_body.insert("start".into(), serde_json::Value::from(start));
+    entity_body.insert("end".into(), serde_json::Value::from(end));
+    let entity_body = serde_json::Value::Object(entity_body);
+    let entity_facets = canonical_json(&serde_json::json!([]));
+    let span = canonical_span(path, start, end);
+    let evidence = canonical_evidence(path, start, end);
+    let entity_key = StructuralKernelRecordRef {
+        proposal_record_key: &proposal_record_key(&entity_identity),
+        category: "entity",
+        kind: "jsts:entity_inferred_type",
+        universal_kind: "core:type",
+        facets: &entity_facets,
+        schema_version: 1,
+        source_span: &span,
+        identity_key: &entity_identity,
+        body: &entity_body,
+        evidence_references: &evidence,
+    };
+
+    let relation_body = serde_json::json!({
+        "source_id": entity_id,
+        "target_id": entity_identity,
+        "classification": "confirmed",
+        "path": path,
+        "start": start,
+        "end": end,
+    });
+    let relation_facets = canonical_json(&serde_json::json!(["core:reference_relation"]));
+    let relation_key = StructuralKernelRecordRef {
+        proposal_record_key: &proposal_record_key(&relation_identity),
+        category: "relation",
+        kind: "jsts:relation_type_of",
+        universal_kind: "core:type_of",
+        facets: &relation_facets,
+        schema_version: 1,
+        source_span: &span,
+        identity_key: &relation_identity,
+        body: &relation_body,
+        evidence_references: &evidence,
+    };
+
+    let mut batches = materialize::kernel_rows_batches(&[entity_key, relation_key])?;
+    let Some(kernel_rows) = batches.pop() else {
+        return Ok(None);
+    };
+    let mut rows = kernel_rows.rows.into_iter();
+    let (Some(entity_kernel), Some(relation_kernel)) = (rows.next(), rows.next()) else {
+        return Ok(None);
+    };
+
+    let entity_kind = "jsts:entity_inferred_type".to_string();
+    let entity_universal_kind = "core:type".to_string();
+    let entity_kind_id = u16::try_from(kinds_dict.intern(&entity_kind)).unwrap_or(u16::MAX);
+    let entity_universal_kind_id =
+        u16::try_from(universal_kinds_dict.intern(&entity_universal_kind)).unwrap_or(u16::MAX);
+    let entity_name_id =
+        names_dict.intern(&materialize::identity_key_name(&entity_identity).to_owned());
+    let (entity_record_id_final, entity_row) = finalize_kernel_row(
+        entity_kernel,
+        &entity_identity,
+        CATEGORY_ENTITY,
+        owner_artifact,
+        owner_version,
+        new_generation,
+        store,
+        generation,
+        entity_kind_id,
+        entity_universal_kind_id,
+        0,
+        entity_name_id,
+        None,
+        None,
+    );
+
+    let target_subject = Some(subjects_dict.intern(&entity_record_id_final));
+    let source_subject = Some(subjects_dict.intern(entity_record_id));
+
+    let relation_kind = "jsts:relation_type_of".to_string();
+    let relation_universal_kind = "core:type_of".to_string();
+    let relation_kind_id = u16::try_from(kinds_dict.intern(&relation_kind)).unwrap_or(u16::MAX);
+    let relation_universal_kind_id =
+        u16::try_from(universal_kinds_dict.intern(&relation_universal_kind)).unwrap_or(u16::MAX);
+    let relation_relation_kind_id =
+        u16::try_from(relation_kinds_dict.intern(&relation_universal_kind)).unwrap_or(u16::MAX);
+    let relation_name_id =
+        names_dict.intern(&materialize::identity_key_name(&relation_identity).to_owned());
+    let (_relation_record_id, relation_row) = finalize_kernel_row(
+        relation_kernel,
+        &relation_identity,
+        CATEGORY_RELATION,
+        owner_artifact,
+        owner_version,
+        new_generation,
+        store,
+        generation,
+        relation_kind_id,
+        relation_universal_kind_id,
+        relation_relation_kind_id,
+        relation_name_id,
+        source_subject,
+        target_subject,
+    );
+
+    Ok(Some(InferredTypeRowsResult {
+        entity_identity,
+        relation_identity,
+        entity_row,
+        relation_row,
+    }))
+}
+
+/// Builds one `jsts:diagnostic` row (`code: "jsts:compiler_diagnostic"`),
+/// byte-for-byte matching `fact-delta.ts`'s `proposalDiagnosticRecord`
+/// recipe: identity `jsts:diagnostic:{path}:{start}:jsts:compiler_diagnostic:
+/// {index}`, body `{code, compiler_code, message, path, start, end}`. Since
+/// v4 has no OTHER diagnostic producer any more (P2-2i folded `jsts:
+/// unresolved_call` into the `possible` relation body itself -- see this
+/// module's own doc comment / decision 28's evidence page), `index` is
+/// simply this owner's own compiler-diagnostic sequence number (0, 1, 2,
+/// ...) -- exactly what v3's own per-file `diagnosticIndex` counter would
+/// produce for a file whose ONLY diagnostic kind is `jsts:compiler_diagnostic`
+/// (true for every v4 owner, since v4 never produces `jsts:unresolved_call`/
+/// `jsts:dynamic_runtime_code` diagnostics), so this is not merely
+/// "close enough" but the identical sequence v3 would assign.
+#[allow(clippy::too_many_arguments)]
+fn build_diagnostic_row(
+    path: &str,
+    start: i32,
+    end: i32,
+    compiler_code: u32,
+    message: &str,
+    index: usize,
+    owner_artifact: u32,
+    owner_version: u32,
+    store: &StoreReader,
+    generation: u64,
+    new_generation: u32,
+    kinds_dict: &mut OrdinalDict<String>,
+    universal_kinds_dict: &mut OrdinalDict<String>,
+    names_dict: &mut OrdinalDict<String>,
+) -> Result<Option<(String, Option<RecordRow>)>, ScanError> {
+    let identity_key = format!("jsts:diagnostic:{path}:{start}:jsts:compiler_diagnostic:{index}");
+    let body = serde_json::json!({
+        "code": "jsts:compiler_diagnostic",
+        "compiler_code": compiler_code,
+        "message": message,
+        "path": path,
+        "start": start,
+        "end": end,
+    });
+    let facets = canonical_json(&serde_json::json!([]));
+    let span = canonical_span(path, start, end);
+    let evidence = canonical_evidence(path, start, end);
+    let record_key = StructuralKernelRecordRef {
+        proposal_record_key: &proposal_record_key(&identity_key),
+        category: "diagnostic",
+        kind: "jsts:diagnostic",
+        universal_kind: "core:construct",
+        facets: &facets,
+        schema_version: 1,
+        source_span: &span,
+        identity_key: &identity_key,
+        body: &body,
+        evidence_references: &evidence,
+    };
+    let mut batches = materialize::kernel_rows_batches(std::slice::from_ref(&record_key))?;
+    let Some(kernel_rows) = batches.pop() else {
+        return Ok(None);
+    };
+    let Some(kernel_row) = kernel_rows.rows.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let kind = "jsts:diagnostic".to_string();
+    let universal_kind = "core:construct".to_string();
+    let kind_id = u16::try_from(kinds_dict.intern(&kind)).unwrap_or(u16::MAX);
+    let universal_kind_id =
+        u16::try_from(universal_kinds_dict.intern(&universal_kind)).unwrap_or(u16::MAX);
+    let name_id = names_dict.intern(&materialize::identity_key_name(&identity_key).to_owned());
+
+    let (_record_id, row) = finalize_kernel_row(
+        kernel_row,
+        &identity_key,
+        CATEGORY_DIAGNOSTIC,
+        owner_artifact,
+        owner_version,
+        new_generation,
+        store,
+        generation,
+        kind_id,
+        universal_kind_id,
+        0,
+        name_id,
+        None,
+        None,
+    );
+    Ok(Some((identity_key, row)))
+}
+
+/// A2 (pending.sites migration): the invariant this module's diagnostic
+/// tooling checks, REDEFINED from P1-D-g's original identity-text-vs-
+/// `target_subject` rule (`is_classification_consistent`'s pre-A2 form,
+/// preserved in this doc comment's own git history) to the simpler
+/// invariant this migration establishes: after A2, NO visible `core:call`/
+/// `core:inherits`/`core:implements` relation record may exist without a
+/// resolved `target_subject` at all -- a no-target relation record cannot
+/// be PRODUCED any more (`analyze.rs` never adds one to `owner.records`),
+/// and a confirmed-shaped-but-uninterned one is DROPPED at materialize time
+/// (`materialize.rs`'s `plan_relation_repair`) rather than published
+/// inconsistently. `is_classification_consistent` therefore now IS simply
+/// `target_subject_is_some` -- kept as its own named predicate (rather than
+/// inlined at each call site) purely so `count_classification_mismatches`'s
+/// intent stays self-documenting, and so a future regression shows up as a
+/// one-line diff here instead of a scattered inline check. The choice made
+/// for this task's own "delete vs. keep as invariant" question: KEPT, as an
+/// invariant (not deleted) -- both this predicate and `count_classification_
+/// mismatches` still have real callers (the n8n debug histogram test, the
+/// `dump_remaining_classification_mismatches` diagnostic, and this module's
+/// own unit tests), and a permanent "prove it never regresses" check is
+/// strictly more valuable now that the underlying bug class this task fixes
+/// is exactly "a relation record without a target somehow existing".
+fn is_classification_consistent(target_subject_is_some: bool) -> bool {
+    target_subject_is_some
+}
+
+/// Store-wide scan: counts every visible `core:call`/`core:inherits`/
+/// `core:implements` relation row where [`is_classification_consistent`]
+/// returns `false` -- after A2, this should always be exactly zero (see
+/// that function's own doc comment for why). Metadata-only (no body
+/// decode), so this runs cheaply even at n8n scale.
 fn count_classification_mismatches(
     store: &StoreReader,
     dicts: &Dictionaries,
@@ -1658,204 +2269,11 @@ fn count_classification_mismatches(
         ) {
             continue;
         }
-        let identity = String::from_utf8_lossy(view.identity_key());
-        if !is_classification_consistent(&identity, view.target_subject().is_some()) {
+        if !is_classification_consistent(view.target_subject().is_some()) {
             mismatches += 1;
         }
     }
     mismatches
-}
-
-/// P1-D-g item 1's repair step: called from the materialize loop for every
-/// `External`/`Unresolved` outcome. A no-op unless `meta.was_mismatched`
-/// (the site's OWN pre-existing possible row already claimed a resolved
-/// target this pass's checker attempt could NOT confirm) -- in that case,
-/// republishes the site under the CANONICAL, self-consistent "possible"
-/// identity (closing the old, inconsistent one) rather than leaving a
-/// permanently mislabeled ghost that both the query layer
-/// (`packages/engine/src/canonical-query-data-port.ts`'s own
-/// `relationClassification`, which trusts `body.classification` with no way
-/// to cross-check it against the store) and `completeness_report` would
-/// otherwise keep reporting as "confirmed" forever. Only `core:call` rows
-/// are corrected (`meta.was_mismatched` is only ever `true` for those, per
-/// `collect()`'s own scoping) -- heritage relations are left as they were
-/// before this session, unchanged. Never destructive: the corrected row is
-/// itself an ordinary genuinely-possible row, fully eligible for a FUTURE
-/// residual pass to upgrade normally if a later attempt succeeds.
-#[allow(clippy::too_many_arguments)]
-fn repair_mismatched_row_if_needed(
-    meta: &PendingMeta,
-    store_path: &str,
-    start: i32,
-    end: i32,
-    predecessor: &RecordView,
-    store: &StoreReader,
-    generation: u64,
-    new_generation: u32,
-    kinds_dict: &mut OrdinalDict<String>,
-    universal_kinds_dict: &mut OrdinalDict<String>,
-    relation_kinds_dict: &mut OrdinalDict<String>,
-    names_dict: &mut OrdinalDict<String>,
-    opened_records: &mut Vec<RecordRow>,
-    record_closures: &mut Vec<([u8; 32], u32)>,
-    closed_relation_keys: &mut Vec<[u8; 32]>,
-    debug: Option<&mut ResidualDebug>,
-) {
-    if !meta.was_mismatched {
-        return;
-    }
-    let corrected = build_corrected_possible_row(
-        store_path,
-        start,
-        end,
-        &meta.source_id,
-        predecessor,
-        store,
-        generation,
-        new_generation,
-        kinds_dict,
-        universal_kinds_dict,
-        relation_kinds_dict,
-        names_dict,
-    );
-    if let Ok(Some(corrected)) = corrected {
-        record_closures.push((meta.possible_record_id, new_generation));
-        closed_relation_keys.push(meta.possible_record_id);
-        opened_records.push(corrected);
-        if let Some(debug) = debug {
-            debug.record_bucket("classification_mismatch_repaired");
-        }
-    }
-}
-
-/// Republishes a classification-mismatched `core:call` possible row (see
-/// [`is_classification_consistent`]) as a NEW row under the CANONICAL
-/// "possible" identity -- `possible_call_record`'s own
-/// `jsts:call:{path}:{start}:{end}:{source_id}:unresolved` recipe
-/// (`urdira_jsts_syntax_worker::semantic_sites`, reimplemented here for the
-/// same crate-isolation reason `delta.rs`/`publish.rs` already document for
-/// their own copies of shared recipes), closing the old, inconsistent row.
-/// Only ever called from [`repair_mismatched_row_if_needed`], itself only
-/// reached when this pass's OWN checker attempt could not confirm a
-/// workspace target for a site whose identity already (wrongly) claimed
-/// one. `Ok(None)` if this exact "possible" identity is somehow already
-/// live elsewhere (defensive, mirrors `build_confirmed_row`'s own fail-
-/// closed precedent) -- the caller simply leaves the old row untouched in
-/// that case rather than risk a duplicate.
-#[allow(clippy::too_many_arguments)]
-fn build_corrected_possible_row(
-    path: &str,
-    start: i32,
-    end: i32,
-    source_id: &str,
-    predecessor: &RecordView,
-    store: &StoreReader,
-    generation: u64,
-    new_generation: u32,
-    kinds_dict: &mut OrdinalDict<String>,
-    universal_kinds_dict: &mut OrdinalDict<String>,
-    relation_kinds_dict: &mut OrdinalDict<String>,
-    names_dict: &mut OrdinalDict<String>,
-) -> Result<Option<RecordRow>, ScanError> {
-    let identity_key = format!("jsts:call:{path}:{start}:{end}:{source_id}:unresolved");
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(source_id.to_string()),
-    );
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("possible".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_string()));
-    body.insert("start".into(), serde_json::Value::from(start));
-    body.insert("end".into(), serde_json::Value::from(end));
-    let body = serde_json::Value::Object(body);
-
-    let facets = canonical_json(&serde_json::json!([
-        "core:reference_relation",
-        "core:indirect"
-    ]));
-    let source_span = canonical_span(path, start, end);
-    let evidence_references = canonical_evidence(path, start, end);
-    let kind = "jsts:relation_call".to_string();
-    let universal_kind = "core:call".to_string();
-    let record_key = StructuralKernelRecordRef {
-        proposal_record_key: &proposal_record_key(&identity_key),
-        category: "relation",
-        kind: &kind,
-        universal_kind: &universal_kind,
-        facets: &facets,
-        schema_version: 1,
-        source_span: &source_span,
-        identity_key: &identity_key,
-        body: &body,
-        evidence_references: &evidence_references,
-    };
-
-    let mut batches = materialize::kernel_rows_batches(std::slice::from_ref(&record_key))?;
-    let Some(kernel_rows) = batches.pop() else {
-        return Ok(None);
-    };
-    let Some(kernel_row) = kernel_rows.rows.into_iter().next() else {
-        return Ok(None);
-    };
-
-    let identity_key_digest = identity_key_digest_bytes(&identity_key);
-    let (record_id, record_digest, previous_record_id) =
-        match store.by_identity_last(&identity_key_digest) {
-            Some(last)
-                if last.is_visible(generation) && last.record_id() != predecessor.record_id() =>
-            {
-                return Ok(None);
-            }
-            Some(last) => {
-                let predecessor_id = last.record_id();
-                (
-                    diff::chained_record_id(&kernel_row.record_digest, &predecessor_id),
-                    kernel_row.record_digest,
-                    predecessor_id,
-                )
-            }
-            None => (kernel_row.record_id, kernel_row.record_digest, [0u8; 32]),
-        };
-
-    let kind_id = u16::try_from(kinds_dict.intern(&kind)).unwrap_or(u16::MAX);
-    let universal_kind_id =
-        u16::try_from(universal_kinds_dict.intern(&universal_kind)).unwrap_or(u16::MAX);
-    let relation_kind_id =
-        u16::try_from(relation_kinds_dict.intern(&universal_kind)).unwrap_or(u16::MAX);
-    let name_id = names_dict.intern(&materialize::identity_key_name(&identity_key).to_owned());
-
-    Ok(Some(RecordRow {
-        record_id,
-        owner_artifact: predecessor.owner_artifact(),
-        owner_version: predecessor.owner_version(),
-        valid_from: new_generation,
-        valid_to: 0,
-        category: CATEGORY_RELATION,
-        kind_id,
-        universal_kind_id,
-        facets: materialize::facets_bitmask(&kernel_row.facets),
-        span_artifact_version: predecessor.owner_artifact(),
-        span_start_byte: kernel_row.span_start,
-        span_end_byte: kernel_row.span_end,
-        span_start_line: 0,
-        span_end_line: 0,
-        identity_type: 1,
-        assignment_kind: 0,
-        name_id,
-        identity_key: kernel_row.identity_key.into_bytes(),
-        record_digest,
-        body_digest: kernel_row.body_digest,
-        identity_id: kernel_row.identity_id,
-        identity_key_digest: kernel_row.identity_key_digest,
-        previous_record_id,
-        source_subject: predecessor.source_subject(),
-        target_subject: None,
-        relation_kind_id,
-        body: kernel_row.body,
-    }))
 }
 
 /// P1-D-d deliverable 1: an opt-in (`URDIRA_V4_RESIDUAL_DEBUG=1`) reason
@@ -1894,6 +2312,71 @@ fn build_corrected_possible_row(
 ///   names is no longer visible at `publish_generation` (a concurrent
 ///   edit raced the pass; expected to be rare, not a bug in itself).
 /// - `external_lib` -- resolved to a `lib.*.d.ts` global.
+///
+/// Follow-up to the "inferred types + compiler diagnostics" task: prints,
+/// gated behind `URDIRA_V4_RESIDUAL_DEBUG`, (1) the top 15 `compiler_code`
+/// values across every `DiagnosticSite` this pass just collected (count +
+/// one sample message each), and (2) how many `(owner_path, start, end,
+/// compiler_code)` groups appear MORE THAN ONCE across the three
+/// concatenated sources (`getSyntacticDiagnostics`/`getBindDiagnostics`/
+/// `getSemanticDiagnostics`) -- a direct measurement of whether the three
+/// sources genuinely overlap for the same reported error, which was the
+/// leading hypothesis for v4's diagnostic count coming out several times
+/// v3's own ~60k. Deliberately does NOT deduplicate the actual output
+/// (`build_diagnostic_row`'s own per-owner sequential `index` is
+/// unaffected by this function) -- v3's own `analyzer.ts` recipe
+/// (`[...syntactic, ...bind, ...semantic]`, `~1401`) concatenates the three
+/// sources WITHOUT deduplicating either, so removing overlap here would
+/// make v4 diverge FROM v3, not match it more closely; this is a
+/// measurement tool, not a filter.
+fn print_diagnostic_code_histogram(
+    diagnostics: &[urdira_tsgo_client::residual_pass::DiagnosticResult],
+) {
+    use std::collections::HashMap;
+    let mut by_code: HashMap<u32, (u64, String)> = HashMap::new();
+    let mut by_site: HashMap<(String, i32, i32, u32), u64> = HashMap::new();
+    for entry in diagnostics {
+        let code = entry.site.compiler_code;
+        let bucket = by_code
+            .entry(code)
+            .or_insert((0, entry.site.message.clone()));
+        bucket.0 += 1;
+        *by_site
+            .entry((
+                entry.owner_path.clone(),
+                entry.site.start,
+                entry.site.end,
+                code,
+            ))
+            .or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(u32, u64, String)> = by_code
+        .into_iter()
+        .map(|(code, (count, sample))| (code, count, sample))
+        .collect();
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    eprintln!(
+        "[urdira-indexing-worker] v4 residual debug: diagnostic total={} distinct_codes={}",
+        diagnostics.len(),
+        ranked.len(),
+    );
+    for (code, count, sample) in ranked.iter().take(15) {
+        let truncated: String = sample.chars().take(160).collect();
+        eprintln!(
+            "[urdira-indexing-worker] v4 residual debug: diagnostic_code TS{code} count={count} sample={truncated:?}"
+        );
+    }
+    let duplicate_groups = by_site.values().filter(|&&count| count > 1).count();
+    let duplicate_extra_rows: u64 = by_site
+        .values()
+        .filter(|&&count| count > 1)
+        .map(|&count| count - 1)
+        .sum();
+    eprintln!(
+        "[urdira-indexing-worker] v4 residual debug: diagnostic (owner,start,end,code) groups with >1 occurrence across the 3 sources: {duplicate_groups} groups, {duplicate_extra_rows} extra rows beyond the first"
+    );
+}
+
 struct ResidualDebug {
     counts: BTreeMap<&'static str, u64>,
     /// Per-bucket, not one global FIFO -- a corpus-scale run's alphabetical
@@ -2209,45 +2692,22 @@ mod tests {
         assert_eq!(key, proposal_record_key("jsts:call:a.ts:1:2:src:dst"));
     }
 
-    // P1-D-g item 1: `is_classification_consistent` is the pure predicate
-    // the store-wide invariant (`count_classification_mismatches`) and the
-    // repair step (`repair_mismatched_row_if_needed`) both build on --
-    // exercised directly here with plain string/bool inputs, no store or
-    // fixture needed.
+    // A2 (pending.sites migration): `is_classification_consistent` is now
+    // simply `target_subject_is_some` -- exercised directly here with a
+    // plain bool input, no store or fixture needed. Kept as its own test
+    // (not folded into a single trivial assertion) so a future regression
+    // of the predicate's OWN definition still shows up as a named test
+    // failure.
     #[test]
-    fn classification_consistent_for_a_genuinely_possible_identity() {
-        assert!(is_classification_consistent(
-            "jsts:call:a.ts:1:2:src:unresolved",
-            false,
-        ));
+    fn classification_consistent_when_target_subject_is_some() {
+        assert!(is_classification_consistent(true));
     }
 
     #[test]
-    fn classification_consistent_for_a_genuinely_confirmed_identity() {
-        assert!(is_classification_consistent(
-            "jsts:call:a.ts:1:2:src:jsts:function:a.ts:10:foo",
-            true,
-        ));
-    }
-
-    #[test]
-    fn classification_inconsistent_when_identity_claims_a_target_but_store_has_none() {
-        // The exact P1-D-g bug signature: `semantic_sites.rs` wrote a
-        // resolved-looking identity (`classification: "confirmed"` implied),
-        // but `target_subject()` never got interned.
-        assert!(!is_classification_consistent(
-            "jsts:call:a.ts:1:2:src:jsts:function:a.ts:10:foo",
-            false,
-        ));
-    }
-
-    #[test]
-    fn classification_inconsistent_when_identity_is_unresolved_but_store_has_a_target() {
-        // The inverse, unexpected in practice but not assumed away.
-        assert!(!is_classification_consistent(
-            "jsts:call:a.ts:1:2:src:unresolved",
-            true,
-        ));
+    fn classification_inconsistent_when_target_subject_is_none() {
+        // A2's own invariant: after this migration, no visible relation
+        // record may exist without a resolved `target_subject` at all.
+        assert!(!is_classification_consistent(false));
     }
 
     static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2466,6 +2926,470 @@ mod tests {
             identity_key.contains(":jsts:"),
             "a confirmed row's identity_key must embed a real target entity id, not a bare span: {identity_key}"
         );
+
+        // A2 (pending.sites migration): exactly the sites this pass
+        // actually upgraded must have their pending key CLOSED (`store.
+        // pending_site(&key, gen)` is `None`) -- an `External`/`Unresolved`
+        // site's key must stay OPEN (this loop's own count, over EVERY
+        // collected site, must land exactly on `upgraded_sites`, not more
+        // and not less).
+        let indirect_bit = dicts
+            .facet_names
+            .iter()
+            .position(|name| name == "core:indirect");
+        let mut closed_pending_count = 0u64;
+        for meta in collected.by_site.values() {
+            let still_pending = store_after
+                .pending_site(&meta.pending_key, outcome.generation)
+                .is_some();
+            if !still_pending {
+                closed_pending_count += 1;
+            }
+        }
+        assert_eq!(
+            closed_pending_count, outcome.upgraded_sites,
+            "exactly the upgraded sites' pending keys must be closed, no more and no fewer"
+        );
+        // Any P2-2j candidate row (`core:indirect` facet) at the SAME span
+        // as a freshly-confirmed row must now be closed too (see the
+        // materialize loop's own comment on why superseding a candidate is
+        // correct once the checker independently confirms a single real
+        // target for that site). This fixture may have zero candidate rows
+        // at all (P2-2j is scoped to overload/union receivers, not
+        // exercised by every fixture) -- the loop below is a real check
+        // when one exists, a no-op otherwise.
+        if let Some(indirect_bit) = indirect_bit {
+            for &confirmed_id in &confirmed_rows {
+                let Some(confirmed) = store_after.get_visible(&confirmed_id, outcome.generation)
+                else {
+                    continue;
+                };
+                for row in store_after.by_owner(confirmed.owner_artifact(), outcome.generation) {
+                    if row.category() == CATEGORY_RELATION
+                        && row.record_id() != confirmed.record_id()
+                        && row.span_start_byte() == confirmed.span_start_byte()
+                        && row.span_end_byte() == confirmed.span_end_byte()
+                        && (row.facets() & (1u64 << indirect_bit)) != 0
+                    {
+                        panic!(
+                            "a live P2-2j candidate row still exists at a span this pass just confirmed: {:?}",
+                            row.record_id()
+                        );
+                    }
+                }
+            }
+        }
+
+        // C task (member entities at cold): `try_synthesize_member_entity`
+        // must find a class/interface member the cold entity producer
+        // already materialized through `collected.entities` (this test's
+        // own `collect()` call, above) and REUSE it, never synthesize a
+        // second copy -- verified two ways over the WHOLE store at the
+        // upgrade generation (not just the sites this test happened to
+        // walk): (1) no entity identity is visible twice (`entity_records_
+        // by_identity` below groups every visible entity by its own
+        // `identity_key` and asserts every group has exactly one member --
+        // a synthesized duplicate of an already-cold entity would show up
+        // as a SECOND live record under the same identity), and (2) at
+        // least one confirmed call/heritage row's TARGET is a member entity
+        // whose own `valid_from` is the COLD generation, not this upgrade's
+        // -- proof the target this pass wired up is the entity `push_
+        // member_entities` created at generation 1, not a fresh synthesis.
+        let mut entity_records_by_identity: HashMap<Vec<u8>, u32> = HashMap::new();
+        for view in store_after.iter_visible(outcome.generation) {
+            if view.category() == CATEGORY_ENTITY {
+                *entity_records_by_identity
+                    .entry(view.identity_key().to_vec())
+                    .or_insert(0) += 1;
+            }
+        }
+        for (identity, count) in &entity_records_by_identity {
+            assert_eq!(
+                *count,
+                1,
+                "entity identity {:?} is visible {count} times after the upgrade -- a duplicate member entity was synthesized alongside the cold one",
+                String::from_utf8_lossy(identity),
+            );
+        }
+
+        let member_kind_words = ["method", "constructor", "getter", "setter", "property"];
+        let mut found_cold_member_target = false;
+        for &confirmed_id in &confirmed_rows {
+            let Some(confirmed) = store_after.get_visible(&confirmed_id, outcome.generation) else {
+                continue;
+            };
+            let Some(target_subject) = confirmed.target_subject() else {
+                continue;
+            };
+            let Some(target_record_id) = dicts.subjects.get(target_subject as usize) else {
+                continue;
+            };
+            let Some(target_view) = store_after.get_visible(target_record_id, outcome.generation)
+            else {
+                continue;
+            };
+            let target_identity = String::from_utf8_lossy(target_view.identity_key()).into_owned();
+            let is_member = member_kind_words
+                .iter()
+                .any(|word| target_identity.starts_with(&format!("jsts:{word}:")));
+            if is_member && target_view.valid_from() == base_generation as u32 {
+                found_cold_member_target = true;
+                eprintln!(
+                    "[test] residual upgrade reused a cold-emitted member entity: {target_identity}"
+                );
+                break;
+            }
+        }
+        assert!(
+            found_cold_member_target,
+            "expected at least one confirmed row after the upgrade whose target is a member entity materialized at the COLD generation (reused, not synthesized) -- the fixture's `this.repository.create(...)`-style interface method dispatch call is expected to exercise exactly this path"
+        );
+    }
+
+    /// Decision 28's "inferred types + compiler diagnostics" task, point 3
+    /// ("Incrementality"): a tiny, self-contained fixture (not the shared
+    /// task-planner one) with an exported function, an exported class with
+    /// a method, and a deliberate type error. Verifies, across THREE
+    /// residual runs against the SAME cold scan (no edit between run 1 and
+    /// run 2, one edit before run 3):
+    /// - Run 1 produces `jsts:entity_inferred_type` + `jsts:relation_type_of`
+    ///   rows for the exported declarations (never for the unexported one),
+    ///   and a `jsts:diagnostic` row carrying the real TS2322 compiler code,
+    ///   with the exact identity recipe this task's report documents.
+    /// - Run 2 (no source change) opens NO new rows for the SAME entity --
+    ///   "never accumulate": exactly one visible `jsts:relation_type_of` per
+    ///   entity after two consecutive runs.
+    /// - An edit that changes `add`'s own parameter types (changing its
+    ///   inferred type text) followed by an incremental scan: the OLD
+    ///   `type_of` identity is ALREADY closed right after the edit-scan
+    ///   itself (`diff_owner`'s owner-wide diff sees it, confirmed live --
+    ///   see the assertion's own comment), then run 3 re-adds a fresh one,
+    ///   and there is still exactly one live `type_of` for `add`.
+    #[test]
+    fn inferred_types_and_diagnostics_across_two_runs_and_an_edit() {
+        let Some(tsgo) = binary::discover(&fixture_root_repo()).ok() else {
+            eprintln!("skipping: tsgo binary not discoverable");
+            return;
+        };
+        drop(tsgo);
+
+        let scratch = scratch_dir("inferred-types");
+        let workspace_root = scratch.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let owner_relative = "a.ts";
+        let owner_absolute = workspace_root.join(owner_relative);
+        // The `[1, 2].map((n) => n)` call is deliberate: it is the SAME
+        // "guaranteed pending call site" shape `tests/residual_pass.rs`
+        // uses (a lib.d.ts `Array.prototype` method E1-E3/typeflow cannot
+        // resolve without a real checker) -- without at least one pending
+        // call/heritage site, `collect()` returns an empty
+        // `pending_by_owner` and `run_once_with_quiet_period` bails out
+        // BEFORE ever reaching the checker pass at all (this module's own
+        // early-return doc comment), so the inferred-type/diagnostic half
+        // this test exercises would never run either.
+        let before_text = "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nfunction helper(): string {\n  return \"not exported\";\n}\n\nexport class Widget {\n  count = 0;\n  describe(): string {\n    return `widget ${this.count}`;\n  }\n}\n\nconst bad: number = \"nope\";\n\n[1, 2].map((n) => n);\n";
+        std::fs::write(&owner_absolute, before_text).expect("write fixture file");
+        std::fs::write(workspace_root.join("package.json"), r#"{"type":"module"}"#)
+            .expect("write package.json");
+        std::fs::write(
+            workspace_root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"module":"ESNext","moduleResolution":"Bundler","target":"ES2022","strict":false,"skipLibCheck":true,"allowJs":true,"checkJs":true}}"#,
+        )
+        .expect("write tsconfig.json");
+
+        let database_path = scratch.join("workspace.sqlite");
+        let structural_root = scratch.join("structural");
+        let cas_root = scratch.join("cas");
+        let workspace_id = "workspace:v4-inferred-types-test".to_string();
+
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = WorkerState::default();
+        let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+
+        let cold_request = scan::ScanRequest {
+            request_id: "request:v4-inferred-types-cold".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: ScanScope::Full,
+            registry_snapshot_id: "registry:v4-inferred-types-test".to_string(),
+            configuration_revision_id: "configuration:v4-inferred-types-test".to_string(),
+            resolution_lock_id: "resolution:v4-inferred-types-test".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let cold_event = scan::run_with_residual(
+            cold_request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("cold scan succeeds");
+        let base_generation = match cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+
+        let context = ResidualContext {
+            request_id: "request:v4-inferred-types-upgrade".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            registry_snapshot_id: "registry:v4-inferred-types-test".to_string(),
+            configuration_revision_id: "configuration:v4-inferred-types-test".to_string(),
+            resolution_lock_id: "resolution:v4-inferred-types-test".to_string(),
+        };
+
+        // --- Run 1 ---
+        let outcome1 = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
+            .expect("residual pass does not error")
+            .expect("fixture has pending work (a deliberate type error, if nothing else)");
+        eprintln!(
+            "[test] run1 inferred_type_entities={} type_of_relations={} diagnostics_emitted={} generation={}",
+            outcome1.inferred_type_entities,
+            outcome1.type_of_relations,
+            outcome1.diagnostics_emitted,
+            outcome1.generation,
+        );
+        assert!(
+            outcome1.generation > base_generation,
+            "the residual pass must publish a new generation above the cold one"
+        );
+        assert!(
+            outcome1.inferred_type_entities > 0,
+            "expected at least one inferred-type entity after run 1"
+        );
+        assert_eq!(
+            outcome1.inferred_type_entities, outcome1.type_of_relations,
+            "every inferred-type entity has exactly one paired type_of relation"
+        );
+        assert!(
+            outcome1.diagnostics_emitted > 0,
+            "expected the deliberate `const bad: number = \"nope\"` to produce a compiler diagnostic"
+        );
+
+        let store1 = StoreReader::open(&structural_root).expect("store opens after run 1");
+        let dicts1 = store1.dictionaries();
+        let kind_of = |view: &urdira_structural_store::RecordView| -> Option<&str> {
+            dicts1
+                .kinds
+                .get(view.kind_id() as usize)
+                .map(String::as_str)
+        };
+        let mut inferred_type_identities: Vec<String> = Vec::new();
+        let mut type_of_identities: Vec<String> = Vec::new();
+        let mut add_type_of_identity: Option<String> = None;
+        let mut diagnostic_ts2322_found = false;
+        for view in store1.iter_visible(outcome1.generation) {
+            let Some(kind) = kind_of(&view) else { continue };
+            let identity = String::from_utf8_lossy(view.identity_key()).into_owned();
+            match kind {
+                "jsts:entity_inferred_type" => {
+                    // Byte-for-byte identity recipe check.
+                    assert!(identity.starts_with("jsts:inferred-type:jsts:"));
+                    // Never for the unexported `helper` function.
+                    assert!(
+                        !identity.contains(":helper:"),
+                        "unexported `helper` must never get an inferred-type entity: {identity}"
+                    );
+                    inferred_type_identities.push(identity);
+                }
+                "jsts:relation_type_of" => {
+                    assert!(identity.starts_with("jsts:type-of:jsts:"));
+                    if identity.contains(":add:") {
+                        add_type_of_identity = Some(identity.clone());
+                    }
+                    type_of_identities.push(identity);
+                }
+                "jsts:diagnostic" => {
+                    // This loop does not decode the body (this module's own
+                    // "no body decoder" constraint -- see the module doc),
+                    // so it cannot itself read the diagnostic's own
+                    // `compiler_code` field back out; it only confirms a
+                    // `jsts:diagnostic` row is visible at all. The TS2322
+                    // code itself is confirmed separately, via `outcome1.
+                    // diagnostics_emitted > 0` above (a real compiler
+                    // diagnostic was newly opened this run) plus the tsgo-
+                    // client-level `deliberate_type_error_produces_a_
+                    // compiler_diagnostic` test, which DOES assert
+                    // `compiler_code == 2322` directly against the live RPC
+                    // response before any store encoding happens.
+                    diagnostic_ts2322_found = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !inferred_type_identities.is_empty(),
+            "expected visible jsts:entity_inferred_type rows"
+        );
+        assert!(
+            diagnostic_ts2322_found,
+            "expected at least one visible jsts:diagnostic row"
+        );
+        let add_type_of_identity =
+            add_type_of_identity.expect("expected a type_of relation for the exported `add`");
+
+        // --- Run 2 (no source change): idempotent, never accumulates. ---
+        let outcome2 = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
+            .expect("residual pass does not error")
+            .expect("fixture still has the deliberate type error to re-diagnose, or nothing new -- either way an outcome");
+        eprintln!(
+            "[test] run2 inferred_type_entities={} type_of_relations={} diagnostics_emitted={} generation={}",
+            outcome2.inferred_type_entities,
+            outcome2.type_of_relations,
+            outcome2.diagnostics_emitted,
+            outcome2.generation,
+        );
+        let store2 = StoreReader::open(&structural_root).expect("store opens after run 2");
+        let live_type_of_after_run2: Vec<String> = store2
+            .iter_visible(outcome2.generation)
+            .filter(|view| kind_of_at(&dicts1, view) == Some("jsts:relation_type_of"))
+            .map(|view| String::from_utf8_lossy(view.identity_key()).into_owned())
+            .collect();
+        for identity in &type_of_identities {
+            if !live_type_of_after_run2.contains(identity) {
+                eprintln!("[test] run1-only (closed by run2): {identity}");
+            }
+        }
+        for identity in &live_type_of_after_run2 {
+            if !type_of_identities.contains(identity) {
+                eprintln!("[test] run2-only (newly opened): {identity}");
+            }
+        }
+        assert_eq!(
+            live_type_of_after_run2.len(),
+            type_of_identities.len(),
+            "run 2 (no source change) must not accumulate duplicate type_of rows: {live_type_of_after_run2:?} vs {type_of_identities:?}"
+        );
+        assert!(
+            live_type_of_after_run2.contains(&add_type_of_identity),
+            "the SAME `add` type_of identity must still be the live one after an unchanged run 2"
+        );
+
+        // --- Edit `add`'s signature (changes its inferred type), then an
+        // incremental scan, then run 3. ---
+        let after_text = before_text.replacen(
+            "export function add(a: number, b: number): number {\n  return a + b;\n}",
+            "export function add(a: string, b: string): string {\n  return a + b;\n}",
+            1,
+        );
+        assert_ne!(
+            before_text, after_text,
+            "the edit must actually change the text"
+        );
+        std::fs::write(&owner_absolute, &after_text).expect("write edited fixture file");
+
+        let edit_request = scan::ScanRequest {
+            request_id: "request:v4-inferred-types-edit".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: ScanScope::Changed {
+                paths: vec![urdira_worker_protocol::ChangedPath {
+                    path: owner_relative.to_string(),
+                    kind: urdira_worker_protocol::ChangeKind::Modified,
+                }],
+            },
+            registry_snapshot_id: "registry:v4-inferred-types-test".to_string(),
+            configuration_revision_id: "configuration:v4-inferred-types-test".to_string(),
+            resolution_lock_id: "resolution:v4-inferred-types-test".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let edit_event = scan::run_with_residual(
+            edit_request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("incremental edit scan succeeds");
+        let edit_generation = match edit_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+        assert!(edit_generation > outcome2.generation);
+
+        // `diff_owner`'s ordinary identity diff (`delta.rs`, out of this
+        // task's file ownership) actually diffs an edited owner's FULL
+        // previous record set (`store_reader.by_owner(ordinal, prev_
+        // generation)`, every category/kind, not just the stage-1/2 kinds
+        // the edit-scan's own fresh analysis regenerates) against the
+        // fresh set -- so a stage-3-only row like this pass's own `jsts:
+        // relation_type_of` is ALREADY unmatched-and-closed by the
+        // edit-scan itself, confirmed live here (verified BEFORE trusting
+        // it: an earlier version of this test asserted the opposite and
+        // failed against the real pipeline). This is case (a) of the task
+        // brief's own "if the identity diff cannot see them" conditional --
+        // the residual pass's OWN by_owner+kind-filter closing (this
+        // module's `record_closures` loop) is still real and necessary
+        // for the OTHER case (a later residual run re-typing an owner with
+        // no accompanying edit-scan in between, exercised by run 2 above),
+        // just not the one this particular edit exercises.
+        let store_after_edit =
+            StoreReader::open(&structural_root).expect("store opens after edit scan");
+        let stale_still_visible = store_after_edit.iter_visible(edit_generation).any(|view| {
+            kind_of_at(&dicts1, &view) == Some("jsts:relation_type_of")
+                && String::from_utf8_lossy(view.identity_key()) == add_type_of_identity
+        });
+        assert!(
+            !stale_still_visible,
+            "the edit-scan's own owner-wide diff_owner should already close the stale type_of row for the edited owner"
+        );
+
+        let outcome3 = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
+            .expect("residual pass does not error")
+            .expect("edited fixture still has pending/typed work");
+        eprintln!(
+            "[test] run3 inferred_type_entities={} type_of_relations={} diagnostics_emitted={} generation={}",
+            outcome3.inferred_type_entities,
+            outcome3.type_of_relations,
+            outcome3.diagnostics_emitted,
+            outcome3.generation,
+        );
+
+        let store3 = StoreReader::open(&structural_root).expect("store opens after run 3");
+        let live_type_of_after_run3: Vec<String> = store3
+            .iter_visible(outcome3.generation)
+            .filter(|view| kind_of_at(&dicts1, view) == Some("jsts:relation_type_of"))
+            .map(|view| String::from_utf8_lossy(view.identity_key()).into_owned())
+            .collect();
+        assert!(
+            !live_type_of_after_run3.contains(&add_type_of_identity),
+            "the OLD (pre-edit) type_of identity for `add` must be closed after run 3: {live_type_of_after_run3:?}"
+        );
+        let new_add_type_of: Vec<&String> = live_type_of_after_run3
+            .iter()
+            .filter(|identity| identity.contains(":add:"))
+            .collect();
+        assert_eq!(
+            new_add_type_of.len(),
+            1,
+            "exactly one live type_of for `add` after the edit + run 3 -- never accumulate: {live_type_of_after_run3:?}"
+        );
+    }
+
+    fn kind_of_at<'a>(
+        dicts: &'a Dictionaries,
+        view: &urdira_structural_store::RecordView,
+    ) -> Option<&'a str> {
+        dicts.kinds.get(view.kind_id() as usize).map(String::as_str)
+    }
+
+    fn fixture_root_repo() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
     }
 
     /// P1-D-d deliverable 1: cold-scans a real n8n corpus copy, then runs
@@ -2567,13 +3491,78 @@ mod tests {
             .expect("residual pass does not error")
             .expect("n8n corpus has pending sites");
         eprintln!(
-            "[n8n_residual_pass_debug_histogram] residual pass wall={:.3}s total_ms={} upgraded={} external={} unresolved={}",
+            "[n8n_residual_pass_debug_histogram] residual pass wall={:.3}s total_ms={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={}",
             residual_started.elapsed().as_secs_f64(),
             outcome.timings.total_ms,
             outcome.upgraded_sites,
             outcome.external_sites,
             outcome.unresolved_sites,
+            outcome.inferred_type_entities,
+            outcome.type_of_relations,
+            outcome.diagnostics_emitted,
         );
+
+        // Decision 28's "inferred types" task, gate section: "sample of 200
+        // type strings identical to v3" -- without a Rust body decoder (this
+        // module's own constraint), this is checked by IDENTITY, not text:
+        // a v3 `jsts:entity_inferred_type` row's own identity_key already
+        // IS `jsts:inferred-type:{entity_id}:{sha256hex(canonical(type))}`
+        // (verified byte-for-byte against a live oracle row this task's own
+        // report documents) -- so if v4 independently computed the exact
+        // same type text for the exact same entity, its OWN identity_key
+        // string is byte-identical to v3's. Sampling v3's identities and
+        // checking membership in v4's own live set is therefore an exact
+        // (not approximate) "same type text" check, with no decode needed.
+        // Opt-in via `URDIRA_V4_N8N_ORACLE_SQLITE=<path to the retained v3
+        // oracle sqlite>` -- skipped (not failed) when unset, since this
+        // retained oracle is a large (multi-GB), machine-local artifact not
+        // every environment running this test will have.
+        if let Ok(oracle_path) = std::env::var("URDIRA_V4_N8N_ORACLE_SQLITE") {
+            let sample_size: usize = std::env::var("URDIRA_V4_N8N_ORACLE_SAMPLE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(200);
+            match sample_v3_inferred_type_identities(Path::new(&oracle_path), sample_size) {
+                Ok(v3_sample) if !v3_sample.is_empty() => {
+                    let store_after =
+                        StoreReader::open(&structural_root).expect("store reopens for sampling");
+                    let dicts_after = store_after.dictionaries();
+                    let mut v4_live_identities: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for view in store_after.iter_visible(outcome.generation) {
+                        if view.category() != CATEGORY_ENTITY {
+                            continue;
+                        }
+                        let Some(kind) = dicts_after.kinds.get(view.kind_id() as usize) else {
+                            continue;
+                        };
+                        if kind == "jsts:entity_inferred_type" {
+                            v4_live_identities
+                                .insert(String::from_utf8_lossy(view.identity_key()).into_owned());
+                        }
+                    }
+                    let matched = v3_sample
+                        .iter()
+                        .filter(|identity| v4_live_identities.contains(*identity))
+                        .count();
+                    eprintln!(
+                        "[n8n_residual_pass_debug_histogram] type-text sample: {matched}/{} v3 jsts:entity_inferred_type identities also live in v4 (byte-identical type text, by identity match)",
+                        v3_sample.len(),
+                    );
+                }
+                Ok(_) => eprintln!(
+                    "[n8n_residual_pass_debug_histogram] oracle sample: v3 oracle has zero jsts:entity_inferred_type rows -- nothing to sample"
+                ),
+                Err(error) => {
+                    eprintln!("[n8n_residual_pass_debug_histogram] oracle sample skipped: {error}")
+                }
+            }
+        } else {
+            eprintln!(
+                "[n8n_residual_pass_debug_histogram] set URDIRA_V4_N8N_ORACLE_SQLITE=<path> to also sample 200 v3 jsts:entity_inferred_type rows and check type-text identity against v4"
+            );
+        }
+
         print_confirmed_possible_histogram("AFTER", &structural_root, outcome.generation);
         let after_mismatches =
             print_classification_mismatch_count("AFTER", &structural_root, outcome.generation);
@@ -2596,10 +3585,76 @@ mod tests {
         // Never enabled unless the caller opts in (this test's existing
         // `URDIRA_V4_N8N_*` env vars are unaffected either way).
         if let Ok(path) = std::env::var("URDIRA_V4_CALL_BODY_DUMP_COLD") {
-            dump_call_bodies(&structural_root, base_generation, Path::new(&path));
+            dump_call_bodies(
+                &structural_root,
+                &database_path,
+                &context.workspace_id,
+                base_generation,
+                Path::new(&path),
+            );
         }
         if let Ok(path) = std::env::var("URDIRA_V4_CALL_BODY_DUMP_AFTER") {
-            dump_call_bodies(&structural_root, outcome.generation, Path::new(&path));
+            dump_call_bodies(
+                &structural_root,
+                &database_path,
+                &context.workspace_id,
+                outcome.generation,
+                Path::new(&path),
+            );
+        }
+    }
+
+    /// Decision 28's "inferred types" task, gate section: dumps `core:call`
+    /// bodies for `scripts/v4-call-parity-diff.mjs` from an ALREADY-scanned
+    /// n8n store (produced by a prior `n8n_residual_pass_debug_histogram`
+    /// run against the same `URDIRA_V4_N8N_DATA`), without repeating the
+    /// expensive cold-scan + residual pass -- this is purely a cheap
+    /// read-and-dump over an existing store, so the "must still show 0
+    /// `v4_confirmed_different_target` after the residual" gate can be
+    /// checked without a second full n8n run. `URDIRA_V4_N8N_DATA=<same
+    /// data root the histogram test used>` and `URDIRA_V4_CALL_BODY_DUMP_
+    /// AFTER=<out path>` (cold dump via `URDIRA_V4_CALL_BODY_DUMP_COLD` is
+    /// optional). Cold generation is assumed to be 1 (always true for the
+    /// histogram test's own `ScanScope::Full` cold scan of an empty
+    /// workspace); the "after" generation is read directly from the store's
+    /// own current generation.
+    #[test]
+    #[ignore]
+    fn n8n_dump_call_bodies_from_existing_store() {
+        let Ok(data_root) = std::env::var("URDIRA_V4_N8N_DATA") else {
+            eprintln!("set URDIRA_V4_N8N_DATA=<existing data root> to run this diagnostic");
+            return;
+        };
+        let data_root = PathBuf::from(&data_root);
+        let database_path = data_root.join("workspace.sqlite");
+        let structural_root = data_root.join("structural");
+        let workspace_id = "workspace:n8n-residual-debug";
+
+        let store = StoreReader::open(&structural_root).expect("existing store opens");
+        let after_generation = store.generation();
+        drop(store);
+        eprintln!(
+            "[n8n_dump_call_bodies_from_existing_store] structural_root={} after_generation={after_generation}",
+            structural_root.display(),
+        );
+
+        if let Ok(path) = std::env::var("URDIRA_V4_CALL_BODY_DUMP_COLD") {
+            dump_call_bodies(
+                &structural_root,
+                &database_path,
+                workspace_id,
+                1,
+                Path::new(&path),
+            );
+        }
+        if let Ok(path) = std::env::var("URDIRA_V4_CALL_BODY_DUMP_AFTER") {
+            dump_call_bodies(
+                &structural_root,
+                &database_path,
+                workspace_id,
+                after_generation,
+                Path::new(&path),
+            );
         }
     }
 
@@ -2624,33 +3679,121 @@ mod tests {
     ///   repeated row_count times: u8 confirmed_flag, u32 body_len, then
     ///   that many raw bytes.
     ///
-    /// `confirmed_flag` is `view.target_subject().is_some()` -- the SAME
-    /// store-level, metadata-only signal `print_confirmed_possible_
-    /// histogram` above already treats as the one authoritative confirmed/
-    /// possible split (P1-D-d's own doc comment: "a possible row never
-    /// resolves a target, a confirmed row always does"), NOT the body's own
-    /// `classification` field. This distinction is load-bearing, confirmed
-    /// live this session: decoding this exact dump's bodies in Node and
-    /// splitting by `classification === "confirmed"` instead gives
-    /// 146,774 -- 29,033 MORE than this method's 117,741 -- for a
-    /// generation where `print_confirmed_possible_histogram` independently
-    /// reports 117,741 confirmed `core:call` rows via `target_subject()`.
-    /// The two numbers are NOT interchangeable: some rows carry a
-    /// `classification: "confirmed"` + a `target_id` string in their body
-    /// (written once, at the row's OWN creation time) whose `target_subject`
-    /// ordinal never actually resolved in this store (`materialize.rs`'s own
-    /// subject-interning step, entirely outside this dump's or the residual
-    /// pass's control) -- a real, pre-existing v4-internal inconsistency
-    /// between the body's self-reported classification and the store's own
-    /// resolved-subject bookkeeping, out of scope to fix here (v4/
-    /// materialize.rs is the other agent's owned file this session), but
-    /// dangerous to paper over silently in a parity-diff tool whose whole
-    /// point is counting "confirmed" correctly -- hence carrying the
-    /// authoritative flag explicitly rather than asking the diff script to
-    /// re-derive it from a decode.
-    fn dump_call_bodies(structural_root: &Path, generation: u64, out_path: &Path) {
+    /// `confirmed_flag` is `view.target_subject().is_some() && !"core:
+    /// indirect"` (see this function's own body for the exact bit-test) --
+    /// NOT the body's own `classification` field, and (P2-2j) NOT plain
+    /// `target_subject().is_some()` alone any more either: a per-candidate
+    /// row for an overload/union receiver (`urdira_jsts_syntax_worker::
+    /// semantic_sites::candidate_call_record`) carries a resolved
+    /// `target_subject` (it has a real `target_id`) but is `classification:
+    /// "possible"` and always carries the `"core:indirect"` facet, same as
+    /// every other possible row -- without the facet test, such a row would
+    /// be miscounted as confirmed here even though it is never promoted to
+    /// `classification: "confirmed"` anywhere in the pipeline. This
+    /// distinction is load-bearing, confirmed live this session: decoding
+    /// this exact dump's bodies in Node and splitting by `classification ===
+    /// "confirmed"` instead gives 146,774 -- 29,033 MORE than this method's
+    /// 117,741 -- for a generation where `print_confirmed_possible_
+    /// histogram` independently reports 117,741 confirmed `core:call` rows
+    /// via the SAME store-level signal. The two numbers are NOT
+    /// interchangeable: some rows carry a `classification: "confirmed"` + a
+    /// `target_id` string in their body (written once, at the row's OWN
+    /// creation time) whose `target_subject` ordinal never actually resolved
+    /// in this store (`materialize.rs`'s own subject-interning step,
+    /// entirely outside this dump's or the residual pass's control) -- a
+    /// real, pre-existing v4-internal inconsistency between the body's
+    /// self-reported classification and the store's own resolved-subject
+    /// bookkeeping, out of scope to fix here (v4/materialize.rs is the other
+    /// agent's owned file this session), but dangerous to paper over
+    /// silently in a parity-diff tool whose whole point is counting
+    /// "confirmed" correctly -- hence carrying the authoritative flag
+    /// explicitly rather than asking the diff script to re-derive it from a
+    /// decode. `print_confirmed_possible_histogram` itself was NOT updated
+    /// with the same facet test this session (out of this task's explicit
+    /// file-scope) -- it is a `#[cfg(test)]`-only diagnostic print, not an
+    /// assertion, but a future reader should know its confirmed count will
+    /// overcount by the live candidate-row population once one exists.
+    /// A2 (pending.sites migration) addendum: a no-target `core:call` site
+    /// is no longer a RECORD at all (see this module's own module doc), so
+    /// this dump ALSO synthesizes one `(confirmed=false, body)` entry per
+    /// visible pending site of kind `Call` -- a canonical-encoded body in
+    /// EXACTLY the shape `possible_call_record` used to emit (`{source_id,
+    /// classification: "possible", path, start, end}`, no `target_id`),
+    /// built through the SAME `materialize::kernel_rows_batches` kernel
+    /// every other body in this dump goes through, so `scripts/v4-call-
+    /// parity-diff.mjs`'s `decodeCanonical` call sees byte-for-byte the same
+    /// population it always did -- this dump's own wire FORMAT (`u32 row_
+    /// count` + repeated `u8 confirmed_flag, u32 body_len, bytes`) is
+    /// unchanged, only the SOURCE of a "possible, no target" row moved from
+    /// a relation record to a `pending.sites` row. `database_path`/
+    /// `workspace_id` are needed (new parameters) purely to resolve each
+    /// pending site's own `owner_artifact` ordinal back to a path, the same
+    /// way `run_once_with_quiet_period` above already does.
+    /// Reads up to `sample_size` `jsts:entity_inferred_type` identity_key
+    /// strings from a retained v3 oracle SQLite DB (opened read-only,
+    /// `?mode=ro`), via `identity_assignments` joined to `record_occurrences`
+    /// filtered to that kind and `valid_to_generation IS NULL` (still live).
+    /// Not ordered randomly (`LIMIT` alone, deterministic) -- a real,
+    /// reproducible sample is more useful for this diagnostic than a fresh
+    /// random one on every run, and avoids `ORDER BY random()`'s full-table
+    /// sort cost on a table with tens of thousands of rows.
+    fn sample_v3_inferred_type_identities(
+        oracle_path: &Path,
+        sample_size: usize,
+    ) -> Result<Vec<String>, String> {
+        let uri = format!("file:{}?mode=ro", oracle_path.display());
+        let conn = rusqlite::Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| format!("opening oracle sqlite failed: {e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))
+            .map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT ia.identity_key FROM identity_assignments ia \
+                 JOIN record_occurrences ro ON ro.record_id = ia.record_id \
+                 WHERE ro.kind = 'jsts:entity_inferred_type' AND ro.valid_to_generation IS NULL \
+                 LIMIT ?1",
+            )
+            .map_err(|e| format!("preparing oracle query failed: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![sample_size as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| format!("querying oracle rows failed: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("reading oracle row failed: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    fn dump_call_bodies(
+        structural_root: &Path,
+        database_path: &Path,
+        workspace_id: &str,
+        generation: u64,
+        out_path: &Path,
+    ) {
         let store = StoreReader::open(structural_root).expect("store reopens for call body dump");
         let dicts = store.dictionaries();
+        // P2-2j: `target_subject().is_some()` ALONE is no longer a correct
+        // confirmed test -- a candidate row (`urdira_jsts_syntax_worker::
+        // semantic_sites::candidate_call_record`, an overload/union
+        // receiver's per-candidate `possible` row) also carries a resolved
+        // `target_subject`, but is `classification: "possible"` and carries
+        // the `"core:indirect"` facet, same as every other possible row
+        // (`materialize.rs`'s `FACET_ORDER`/`facets_bitmask` assign it a
+        // fixed bit position, mirrored in `Dictionaries::facet_names` at the
+        // same ordinal -- see that struct's own doc comment in `row.rs`).
+        // A row is genuinely CONFIRMED only when it has a resolved target
+        // AND does NOT carry that facet.
+        let indirect_bit = dicts
+            .facet_names
+            .iter()
+            .position(|name| name == "core:indirect")
+            .expect("FACET_ORDER (materialize.rs) always registers core:indirect");
         let mut rows: Vec<(bool, Vec<u8>)> = Vec::new();
         for view in store.iter_visible(generation) {
             if view.category() != CATEGORY_RELATION {
@@ -2664,8 +3807,101 @@ mod tests {
             if universal_kind != "core:call" {
                 continue;
             }
-            rows.push((view.target_subject().is_some(), view.body().to_vec()));
+            let confirmed =
+                view.target_subject().is_some() && (view.facets() & (1u64 << indirect_bit)) == 0;
+            rows.push((confirmed, view.body().to_vec()));
         }
+
+        // A2: pending call sites, synthesized as "possible without target".
+        let conn = catalog::open_and_ensure_schema(database_path)
+            .expect("catalog opens for call body dump");
+        let frontier =
+            Frontier::load(&conn, workspace_id).expect("frontier loads for call body dump");
+        drop(conn);
+        let mut path_by_pair: HashMap<(String, String), String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            path_by_pair.insert(
+                (entry.artifact_id.clone(), entry.artifact_version_id.clone()),
+                path.clone(),
+            );
+        }
+        let owner_path = |ordinal: u32| -> Option<String> {
+            dicts
+                .artifacts
+                .get(ordinal as usize)
+                .and_then(|pair| path_by_pair.get(pair))
+                .cloned()
+        };
+        let mut pending_dumped = 0u64;
+        for view in store.iter_visible_pending_sites(generation) {
+            if view.site_kind() != urdira_structural_store::PENDING_SITE_KIND_CALL {
+                continue;
+            }
+            let Some(path) = owner_path(view.owner_artifact()) else {
+                continue;
+            };
+            let Some(source_id) = view
+                .source_subject()
+                .and_then(|ordinal| dicts.subjects.get(ordinal as usize))
+                .and_then(|record_id| store.get_visible(record_id, generation))
+                .map(|source_view| {
+                    String::from_utf8_lossy(source_view.identity_key()).into_owned()
+                })
+            else {
+                continue;
+            };
+            let start = view.start();
+            let end = view.end();
+            let identity_key = format!("jsts:call:{path}:{start}:{end}:{source_id}:unresolved");
+            let body_value = serde_json::json!({
+                "source_id": source_id,
+                "classification": "possible",
+                "path": path,
+                "start": start,
+                "end": end,
+            });
+            let facets_str = serde_json::to_string(&serde_json::json!([
+                "core:reference_relation",
+                "core:indirect"
+            ]))
+            .expect("json serializes");
+            let source_span_str = serde_json::to_string(
+                &serde_json::json!({"path": path, "start": start, "end": end}),
+            )
+            .expect("json serializes");
+            let evidence_str = serde_json::to_string(&serde_json::json!([
+                {"path": path, "start": start, "end": end}
+            ]))
+            .expect("json serializes");
+            let dump_proposal_key = format!("dump-only:{identity_key}");
+            let record_key = StructuralKernelRecordRef {
+                proposal_record_key: &dump_proposal_key,
+                category: "relation",
+                kind: "jsts:relation_call",
+                universal_kind: "core:call",
+                facets: &facets_str,
+                schema_version: 1,
+                source_span: &source_span_str,
+                identity_key: &identity_key,
+                body: &body_value,
+                evidence_references: &evidence_str,
+            };
+            let Ok(mut batches) =
+                materialize::kernel_rows_batches(std::slice::from_ref(&record_key))
+            else {
+                continue;
+            };
+            let Some(kernel_rows) = batches.pop() else {
+                continue;
+            };
+            let Some(kernel_row) = kernel_rows.rows.into_iter().next() else {
+                continue;
+            };
+            rows.push((false, kernel_row.body));
+            pending_dumped += 1;
+        }
+        eprintln!("[dump_call_bodies] pending call sites dumped as possible: {pending_dumped}");
+
         use std::io::Write;
         let file = std::fs::File::create(out_path)
             .unwrap_or_else(|error| panic!("create call body dump {out_path:?}: {error}"));
@@ -2792,7 +4028,7 @@ mod tests {
                 continue;
             }
             let identity = String::from_utf8_lossy(view.identity_key()).into_owned();
-            if !is_classification_consistent(&identity, view.target_subject().is_some()) {
+            if !is_classification_consistent(view.target_subject().is_some()) {
                 let owner_pair = dicts.artifacts.get(view.owner_artifact() as usize);
                 eprintln!(
                     "MISMATCH universal_kind={universal_kind} target_subject={:?} \

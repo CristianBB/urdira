@@ -10,7 +10,7 @@ use crate::dict::{read_dict_body, read_subjects_body};
 use crate::error::{Result, store_err};
 use crate::layout::*;
 use crate::manifest::Manifest;
-use crate::row::{Dictionaries, NONE_U32};
+use crate::row::{Dictionaries, NONE_U32, PendingSiteKey, PendingSiteRow};
 use crate::segment_io::*;
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -95,6 +95,23 @@ pub(crate) struct Segment {
     pub deps_reverse: SectionSource,
     pub n: usize,
     pub deps_n: usize,
+    /// `pending.sites` -- OPTIONAL: `None` for a segment written before
+    /// this table existed, or a base/delta with zero pending rows (the
+    /// same empty-skip convention `dict.bin`/`subjects.keys` already use).
+    /// `None` and `Some(empty)` never both occur -- an empty section is
+    /// simply never written (see `writer::write_pending_sites_file`/
+    /// `build_delta_sections`), so `pending_n == 0` always implies `pending
+    /// .is_none()`.
+    pub pending: Option<SectionSource>,
+    pub pending_n: usize,
+    /// `closures.pending` -- OPTIONAL, delta-only (a base carries none, by
+    /// construction, same as `closures.records`/`closures.deps`). Kept as
+    /// a raw section (unlike `record_closures`/`dep_closures`, which are
+    /// pre-parsed into one store-wide `HashMap` and never re-read) purely
+    /// so [`StoreReader::verify_all`] has real bytes with a real `xxh3` to
+    /// check -- the merged `pending_closures` map below already services
+    /// every query path.
+    pub closures_pending: Option<SectionSource>,
     /// This segment's own inline `valid_from`/`valid_to` (nonzero only),
     /// sorted ascending, for the O(log n) `visible_count` term.
     pub valid_from_sorted: Vec<u32>,
@@ -103,6 +120,11 @@ pub(crate) struct Segment {
     pub deps_valid_to_sorted: Vec<u32>,
     pub record_closures: Arc<HashMap<[u8; 32], u32>>,
     pub dep_closures: Arc<HashMap<[u8; 32], u32>>,
+    /// Merged across every delta's `closures.pending` (see
+    /// `StoreInner::load`) -- every segment holds the SAME `Arc` to this
+    /// one store-wide map, exactly the pattern `record_closures`/`dep_
+    /// closures` already establish.
+    pub pending_closures: Arc<HashMap<PendingSiteKey, u32>>,
 }
 
 fn open_data(dir: &Path, name: &str) -> Result<Mmap> {
@@ -114,6 +136,7 @@ impl Segment {
         loc: &OpenedLocation,
         record_closures: Arc<HashMap<[u8; 32], u32>>,
         dep_closures: Arc<HashMap<[u8; 32], u32>>,
+        pending_closures: Arc<HashMap<PendingSiteKey, u32>>,
     ) -> Result<Self> {
         // Uniform accessor over both `OpenedLocation` variants: a base
         // directory opens one mmap per logical file (unchanged); a delta
@@ -138,6 +161,34 @@ impl Segment {
                 }
             }
         };
+        // Same as `section` above but OPTIONAL: `pending.sites`/`closures.
+        // pending` may legitimately be absent (see `Segment::pending`'s own
+        // doc comment) -- mirrors `optional_section_bytes` (used at the
+        // `StoreInner::load` level for `dict.bin`/`subjects.keys`/`closures
+        // .records`/`closures.deps`) but returns a zero-copy `SectionSource`
+        // instead of an owned `Vec<u8>`, since this one is kept for the
+        // lifetime of the segment rather than parsed once and discarded.
+        let optional_section =
+            |dir_file_name: &str, id: SectionId| -> Result<Option<SectionSource>> {
+                match loc {
+                    OpenedLocation::Dir(dir) => {
+                        let path = dir.join(dir_file_name);
+                        if !path.exists() {
+                            return Ok(None);
+                        }
+                        Ok(Some(SectionSource::File(open_data(dir, dir_file_name)?)))
+                    }
+                    OpenedLocation::Container { mmap, ranges, .. } => {
+                        Ok(ranges
+                            .get(&id)
+                            .map(|&(start, end)| SectionSource::Container {
+                                mmap: Arc::clone(mmap),
+                                start,
+                                end,
+                            }))
+                    }
+                }
+            };
 
         let keys = section("records.keys", SectionId::RecordsKeys)?;
         let (keys_header, _) = header_and_data(&keys)?;
@@ -157,6 +208,12 @@ impl Segment {
         let deps_n = deps_header.row_count as usize;
         let deps_meta = section("deps.meta", SectionId::DepsMeta)?;
         let deps_reverse = section("deps.reverse", SectionId::DepsReverse)?;
+        let pending = optional_section("pending.sites", SectionId::PendingSites)?;
+        let pending_n = match &pending {
+            Some(src) => header_and_data(src)?.0.row_count as usize,
+            None => 0,
+        };
+        let closures_pending = optional_section("closures.pending", SectionId::ClosuresPending)?;
 
         let meta_data = &meta[HEADER_LEN..];
         let mut valid_from_sorted = Vec::with_capacity(n);
@@ -205,12 +262,16 @@ impl Segment {
             deps_reverse,
             n,
             deps_n,
+            pending,
+            pending_n,
+            closures_pending,
             valid_from_sorted,
             valid_to_sorted,
             deps_valid_from_sorted,
             deps_valid_to_sorted,
             record_closures,
             dep_closures,
+            pending_closures,
         })
     }
 
@@ -260,6 +321,35 @@ impl Segment {
         }
         let key = self.deps_key_at(ordinal);
         self.dep_closures
+            .get(&key)
+            .copied()
+            .unwrap_or(inline_valid_to)
+    }
+
+    pub fn pending_row(&self, ordinal: usize) -> &[u8] {
+        let d = &self
+            .pending
+            .as_ref()
+            .expect("pending_row: no pending section")[HEADER_LEN..];
+        &d[ordinal * PENDING_SITE_STRIDE..(ordinal + 1) * PENDING_SITE_STRIDE]
+    }
+
+    pub fn pending_key_at(&self, ordinal: usize) -> PendingSiteKey {
+        pending_site_key_at(
+            &self
+                .pending
+                .as_ref()
+                .expect("pending_key_at: no pending section")[HEADER_LEN..],
+            ordinal,
+        )
+    }
+
+    pub fn pending_effective_valid_to(&self, ordinal: usize, inline_valid_to: u32) -> u32 {
+        if self.pending_closures.is_empty() {
+            return inline_valid_to;
+        }
+        let key = self.pending_key_at(ordinal);
+        self.pending_closures
             .get(&key)
             .copied()
             .unwrap_or(inline_valid_to)
@@ -446,6 +536,84 @@ impl DependencyView {
     }
 }
 
+/// A live handle onto one `pending.sites` row. Mirrors [`DependencyView`]
+/// field-for-field.
+#[derive(Clone)]
+pub struct PendingSiteView {
+    pub(crate) segment: Arc<Segment>,
+    pub(crate) ordinal: usize,
+}
+
+impl PendingSiteView {
+    fn meta(&self) -> &[u8] {
+        self.segment.pending_row(self.ordinal)
+    }
+    pub fn owner_artifact(&self) -> u32 {
+        u32le(self.meta(), pending_sites::OWNER_ARTIFACT)
+    }
+    pub fn owner_version(&self) -> u32 {
+        u32le(self.meta(), pending_sites::OWNER_VERSION)
+    }
+    pub fn valid_from(&self) -> u32 {
+        u32le(self.meta(), pending_sites::VALID_FROM)
+    }
+    pub fn valid_to_raw(&self) -> u32 {
+        u32le(self.meta(), pending_sites::VALID_TO)
+    }
+    pub fn valid_to_effective(&self) -> u32 {
+        self.segment
+            .pending_effective_valid_to(self.ordinal, self.valid_to_raw())
+    }
+    pub fn is_visible(&self, generation: u64) -> bool {
+        let vf = self.valid_from() as u64;
+        if vf > generation {
+            return false;
+        }
+        let vt = self.valid_to_effective();
+        vt == 0 || (vt as u64) > generation
+    }
+    pub fn start(&self) -> u32 {
+        u32le(self.meta(), pending_sites::START)
+    }
+    pub fn end(&self) -> u32 {
+        u32le(self.meta(), pending_sites::END)
+    }
+    pub fn start_line(&self) -> u32 {
+        u32le(self.meta(), pending_sites::START_LINE)
+    }
+    pub fn end_line(&self) -> u32 {
+        u32le(self.meta(), pending_sites::END_LINE)
+    }
+    pub fn site_kind(&self) -> u8 {
+        self.meta()[pending_sites::SITE_KIND]
+    }
+    pub fn reason(&self) -> u8 {
+        self.meta()[pending_sites::REASON]
+    }
+    pub fn source_subject(&self) -> Option<u32> {
+        let v = u32le(self.meta(), pending_sites::SOURCE_SUBJECT);
+        (v != NONE_U32).then_some(v)
+    }
+    pub fn key(&self) -> PendingSiteKey {
+        self.segment.pending_key_at(self.ordinal)
+    }
+    pub fn to_row(&self) -> PendingSiteRow {
+        PendingSiteRow {
+            owner_artifact: self.owner_artifact(),
+            owner_version: self.owner_version(),
+            valid_from: self.valid_from(),
+            valid_to: self.valid_to_effective(),
+            start: self.start(),
+            end: self.end(),
+            start_line: self.start_line(),
+            end_line: self.end_line(),
+            site_kind: self.site_kind(),
+            reason: self.reason(),
+            source_subject: self.source_subject(),
+        }
+    }
+}
+
 /// One opened or closed row reported by [`StoreReader::changed_between`].
 pub enum ChangeEntry {
     Opened(RecordView),
@@ -544,6 +712,30 @@ fn load_closures(bytes: Option<Vec<u8>>) -> Result<Vec<([u8; 32], u32)>> {
     Ok(out)
 }
 
+/// Same shape as [`load_closures`] but over `closures.pending`'s 20-byte
+/// entries (inline identity fields, not a 32-byte digest key -- see
+/// [`crate::layout::PENDING_CLOSURE_STRIDE`]'s own doc comment).
+fn load_pending_closures(bytes: Option<Vec<u8>>) -> Result<Vec<(PendingSiteKey, u32)>> {
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
+    };
+    let (_, data) = header_and_data(&bytes)?;
+    let n = data.len() / PENDING_CLOSURE_STRIDE;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let row = &data[i * PENDING_CLOSURE_STRIDE..(i + 1) * PENDING_CLOSURE_STRIDE];
+        let key = PendingSiteKey {
+            owner_artifact: u32le(row, pending_closure::OWNER_ARTIFACT),
+            start: u32le(row, pending_closure::START),
+            end: u32le(row, pending_closure::END),
+            site_kind: row[pending_closure::SITE_KIND],
+        };
+        let vt = u32le(row, pending_closure::VALID_TO);
+        out.push((key, vt));
+    }
+    Ok(out)
+}
+
 impl StoreInner {
     pub fn load(dir: &Path) -> Result<Self> {
         let manifest_path = dir.join("MANIFEST");
@@ -573,6 +765,7 @@ impl StoreInner {
         // is just an optimization, not a correctness requirement.
         let mut record_closures = HashMap::new();
         let mut dep_closures = HashMap::new();
+        let mut pending_closures = HashMap::new();
         for loc in locations.iter().skip(1) {
             let records_bytes =
                 optional_section_bytes(loc, "closures.records", SectionId::ClosuresRecords)?;
@@ -583,9 +776,15 @@ impl StoreInner {
             for (k, v) in load_closures(deps_bytes)? {
                 dep_closures.insert(k, v);
             }
+            let pending_bytes =
+                optional_section_bytes(loc, "closures.pending", SectionId::ClosuresPending)?;
+            for (k, v) in load_pending_closures(pending_bytes)? {
+                pending_closures.insert(k, v);
+            }
         }
         let record_closures = Arc::new(record_closures);
         let dep_closures = Arc::new(dep_closures);
+        let pending_closures = Arc::new(pending_closures);
 
         let mut dicts = Dictionaries::default();
         let mut subjects: Vec<[u8; 32]> = Vec::new();
@@ -602,6 +801,7 @@ impl StoreInner {
                 loc,
                 Arc::clone(&record_closures),
                 Arc::clone(&dep_closures),
+                Arc::clone(&pending_closures),
             )?));
         }
         dicts.subjects = subjects;
@@ -1010,6 +1210,91 @@ impl StoreReader {
         out
     }
 
+    /// Visible pending sites for one owner, in `(owner, start, end, kind)`
+    /// order. `owner_artifact` is `pending.sites`' PRIMARY sort key, so
+    /// this is a direct binary-search range per segment -- no secondary
+    /// index file is needed (unlike `records.by_owner`, a real secondary
+    /// index over a table primarily sorted by `record_id`).
+    pub fn pending_sites_by_owner(
+        &self,
+        owner_artifact: u32,
+        generation: u64,
+    ) -> Vec<PendingSiteView> {
+        let inner = self.snapshot();
+        let mut out = Vec::new();
+        for seg in &inner.segments {
+            let Some(pending) = &seg.pending else {
+                continue;
+            };
+            let data = &pending[HEADER_LEN..];
+            let (lo, hi) = pending_site_owner_range(data, owner_artifact);
+            for ord in lo..hi {
+                let view = PendingSiteView {
+                    segment: Arc::clone(seg),
+                    ordinal: ord,
+                };
+                if view.is_visible(generation) {
+                    out.push(view);
+                }
+            }
+        }
+        out.sort_by_key(|v| v.key());
+        out
+    }
+
+    /// Every visible pending site across every segment, in `(owner, start,
+    /// end, kind)` order.
+    pub fn iter_visible_pending_sites(&self, generation: u64) -> Vec<PendingSiteView> {
+        let inner = self.snapshot();
+        let mut out = Vec::new();
+        for seg in &inner.segments {
+            for ord in 0..seg.pending_n {
+                let view = PendingSiteView {
+                    segment: Arc::clone(seg),
+                    ordinal: ord,
+                };
+                if view.is_visible(generation) {
+                    out.push(view);
+                }
+            }
+        }
+        out.sort_by_key(|v| v.key());
+        out
+    }
+
+    /// Count of pending sites visible at `generation`. A plain scan (the
+    /// table is orders of magnitude smaller than `records`/`deps`, so this
+    /// does not need `visible_count`'s O(log n) sorted-array machinery).
+    pub fn pending_sites_visible_count(&self, generation: u64) -> u64 {
+        self.iter_visible_pending_sites(generation).len() as u64
+    }
+
+    /// The visible row for `key` at `generation`, if any. A key may occur
+    /// in several segments across generations (closed in one, reopened in
+    /// a later one) -- this returns whichever occurrence is visible at
+    /// `generation` (at most one, since a key closes at most once per
+    /// segment and `is_visible` is generation-exact).
+    pub fn pending_site(&self, key: &PendingSiteKey, generation: u64) -> Option<PendingSiteView> {
+        let inner = self.snapshot();
+        for seg in &inner.segments {
+            let Some(pending) = &seg.pending else {
+                continue;
+            };
+            let data = &pending[HEADER_LEN..];
+            let (lo, hi) = pending_site_key_range(data, key);
+            for ord in lo..hi {
+                let view = PendingSiteView {
+                    segment: Arc::clone(seg),
+                    ordinal: ord,
+                };
+                if view.is_visible(generation) {
+                    return Some(view);
+                }
+            }
+        }
+        None
+    }
+
     /// Visible `(record_id, record_digest)` pairs whose `record_id` falls
     /// in the given merkle bucket -- used by the delta writer to answer
     /// `BucketedMerkleSet::update`'s `bucket_entries` callback. Records
@@ -1183,6 +1468,16 @@ impl StoreReader {
                 ("deps.reverse", &seg.deps_reverse),
             ] {
                 verify_xxh3(section, name)?;
+            }
+            // `pending.sites`/`closures.pending` are OPTIONAL (absent for
+            // a pre-existing segment or one with nothing to report), so
+            // they're checked separately from the fixed mandatory list
+            // above rather than folded into it.
+            if let Some(pending) = &seg.pending {
+                verify_xxh3(pending, "pending.sites")?;
+            }
+            if let Some(closures_pending) = &seg.closures_pending {
+                verify_xxh3(closures_pending, "closures.pending")?;
             }
         }
         Ok(())

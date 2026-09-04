@@ -5,12 +5,14 @@
 
 use crate::container::{self, EncodedSection, SectionId};
 use crate::dict;
-use crate::error::Result;
+use crate::error::{Result, store_err};
 use crate::layout::*;
 use crate::manifest::{Manifest, ManifestFileEntry, fsync_segment_dir};
 use crate::merkle;
 use crate::reader::StoreReader;
-use crate::row::{DependencyRow, Dictionaries, NONE_U32, RecordRow};
+use crate::row::{
+    DependencyRow, Dictionaries, NONE_U32, PendingSiteKey, PendingSiteRow, RecordRow,
+};
 use crate::segment_io::*;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -60,6 +62,22 @@ impl SegmentWriter {
         dicts: &Dictionaries,
         generation: u64,
     ) -> Result<SegmentSummary> {
+        self.write_base_with_pending(dir, rows, deps, dicts, generation, &[])
+    }
+
+    /// Additive sibling of [`Self::write_base`] that also writes `pending.
+    /// sites` (skipped entirely when `pending_sites` is empty, so this is
+    /// byte-for-byte what `write_base` itself produces when called with
+    /// an empty slice -- `write_base` is now a thin wrapper over this).
+    pub fn write_base_with_pending(
+        &self,
+        dir: &Path,
+        rows: &[RecordRow],
+        deps: &[DependencyRow],
+        dicts: &Dictionaries,
+        generation: u64,
+        pending_sites: &[PendingSiteRow],
+    ) -> Result<SegmentSummary> {
         let t0 = Instant::now();
         std::fs::create_dir_all(dir)?;
         let base_name = format!("base-{generation}");
@@ -103,6 +121,9 @@ impl SegmentWriter {
         files.extend(deps_result);
 
         write_dict_files(&base_dir, dicts, generation, &mut files)?;
+
+        let pending_result = write_pending_sites_file(&base_dir, pending_sites, generation)?;
+        files.extend(pending_result);
 
         let record_entries = merkle::record_entries(rows, generation);
         let dep_entries = merkle::dependency_entries(deps, generation);
@@ -170,6 +191,22 @@ impl SegmentWriter {
         dicts: &Dictionaries,
         generation: u64,
     ) -> Result<SegmentSummary> {
+        self.write_base_partitioned_with_pending(dir, partitions, deps, dicts, generation, &[])
+    }
+
+    /// Additive sibling of [`Self::write_base_partitioned`], same relation
+    /// to it as [`Self::write_base_with_pending`] has to [`Self::
+    /// write_base`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_base_partitioned_with_pending(
+        &self,
+        dir: &Path,
+        partitions: &[Vec<RecordRow>],
+        deps: &[DependencyRow],
+        dicts: &Dictionaries,
+        generation: u64,
+        pending_sites: &[PendingSiteRow],
+    ) -> Result<SegmentSummary> {
         // P2-2l item 4: per-phase timing, gated behind the same `URDIRA_
         // DEBUG_TIMING` env var `write_delta_with_reader` already uses --
         // this task's own brief asks to profile this function's per-file
@@ -233,6 +270,9 @@ impl SegmentWriter {
         let dicts_started = Instant::now();
         write_dict_files(&base_dir, dicts, generation, &mut files)?;
         let dicts_elapsed = dicts_started.elapsed();
+
+        let pending_result = write_pending_sites_file(&base_dir, pending_sites, generation)?;
+        files.extend(pending_result);
 
         let merkle_build_started = Instant::now();
         let records_set = merkle::build(&record_entries)?;
@@ -321,8 +361,36 @@ impl SegmentWriter {
         dict_additions: &Dictionaries,
         generation: u64,
     ) -> Result<SegmentSummary> {
+        self.write_delta_with_pending(
+            dir,
+            opened_rows,
+            closures,
+            deps_opened,
+            deps_closures,
+            dict_additions,
+            generation,
+            &[],
+            &[],
+        )
+    }
+
+    /// Additive sibling of [`Self::write_delta`], same relation to it as
+    /// [`Self::write_base_with_pending`] has to [`Self::write_base`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_delta_with_pending(
+        &self,
+        dir: &Path,
+        opened_rows: &[RecordRow],
+        closures: &[([u8; 32], u32)],
+        deps_opened: &[DependencyRow],
+        deps_closures: &[([u8; 32], u32)],
+        dict_additions: &Dictionaries,
+        generation: u64,
+        pending_opened: &[PendingSiteRow],
+        pending_closures: &[(PendingSiteKey, u32)],
+    ) -> Result<SegmentSummary> {
         let current_reader = StoreReader::open(dir)?;
-        self.write_delta_with_reader(
+        self.write_delta_with_reader_and_pending(
             dir,
             &current_reader,
             opened_rows,
@@ -331,6 +399,8 @@ impl SegmentWriter {
             deps_closures,
             dict_additions,
             generation,
+            pending_opened,
+            pending_closures,
         )
     }
 
@@ -360,6 +430,39 @@ impl SegmentWriter {
         deps_closures: &[([u8; 32], u32)],
         dict_additions: &Dictionaries,
         generation: u64,
+    ) -> Result<SegmentSummary> {
+        self.write_delta_with_reader_and_pending(
+            dir,
+            current_reader,
+            opened_rows,
+            closures,
+            deps_opened,
+            deps_closures,
+            dict_additions,
+            generation,
+            &[],
+            &[],
+        )
+    }
+
+    /// Additive sibling of [`Self::write_delta_with_reader`], same
+    /// relation to it as [`Self::write_delta_with_pending`] has to
+    /// [`Self::write_delta`]. Every other `write_delta*` entry point above
+    /// funnels into this one -- this is the ONLY place delta section
+    /// bytes are actually built ([`build_delta_sections`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_delta_with_reader_and_pending(
+        &self,
+        dir: &Path,
+        current_reader: &StoreReader,
+        opened_rows: &[RecordRow],
+        closures: &[([u8; 32], u32)],
+        deps_opened: &[DependencyRow],
+        deps_closures: &[([u8; 32], u32)],
+        dict_additions: &Dictionaries,
+        generation: u64,
+        pending_opened: &[PendingSiteRow],
+        pending_closures: &[(PendingSiteKey, u32)],
     ) -> Result<SegmentSummary> {
         let t0 = Instant::now();
         // P3-3 item 4 / P3-6 item 1: sub-timers for `write_delta_with_
@@ -393,7 +496,9 @@ impl SegmentWriter {
             deps_closures,
             dict_additions,
             generation,
-        );
+            pending_opened,
+            pending_closures,
+        )?;
         let t_segment_files = t0.elapsed();
         // Kept as a separate checkpoint (was "closures" pre-P3-6, now
         // measures nothing extra -- closures are built as part of the one
@@ -670,6 +775,112 @@ fn compute_order(rows: &[RecordRow]) -> Vec<u32> {
     order
 }
 
+/// Sorts `rows` by `.key()` (== on-disk order, `(owner_artifact, start,
+/// end, site_kind)`) and rejects a duplicate key within this ONE segment
+/// (the row model's own invariant -- a base or a single delta must never
+/// carry two rows with the same identity). Cross-segment/cross-generation
+/// repetition of the same key is expected and handled by the reader
+/// (closures + newest-segment-wins), not rejected here.
+fn compute_pending_order(rows: &[PendingSiteRow]) -> Result<Vec<u32>> {
+    let n = rows.len();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_unstable_by_key(|&i| rows[i as usize].key());
+    for w in order.windows(2) {
+        let a = &rows[w[0] as usize];
+        let b = &rows[w[1] as usize];
+        if a.key() == b.key() {
+            return Err(store_err!(
+                "duplicate pending site key (owner_artifact={}, start={}, end={}, site_kind={}) within one segment",
+                a.owner_artifact,
+                a.start,
+                a.end,
+                a.site_kind
+            ));
+        }
+    }
+    Ok(order)
+}
+
+fn encode_pending_site_row(buf: &mut [u8], row: &PendingSiteRow) {
+    put_u32le(buf, pending_sites::OWNER_ARTIFACT, row.owner_artifact);
+    put_u32le(buf, pending_sites::OWNER_VERSION, row.owner_version);
+    put_u32le(buf, pending_sites::VALID_FROM, row.valid_from);
+    put_u32le(buf, pending_sites::VALID_TO, row.valid_to);
+    put_u32le(buf, pending_sites::START, row.start);
+    put_u32le(buf, pending_sites::END, row.end);
+    put_u32le(buf, pending_sites::START_LINE, row.start_line);
+    put_u32le(buf, pending_sites::END_LINE, row.end_line);
+    buf[pending_sites::SITE_KIND] = row.site_kind;
+    buf[pending_sites::REASON] = row.reason;
+    put_u32le(
+        buf,
+        pending_sites::SOURCE_SUBJECT,
+        row.source_subject.unwrap_or(NONE_U32),
+    );
+}
+
+/// Sorts (rejecting duplicate keys), then encodes `rows` as one `pending.
+/// sites` body -- shared by the base writer (below) and the delta path's
+/// [`build_delta_sections`], so the byte layout is defined in exactly one
+/// place.
+fn encode_pending_sites_body(rows: &[PendingSiteRow]) -> Result<(Vec<u8>, usize)> {
+    let order = compute_pending_order(rows)?;
+    let n = order.len();
+    let mut body = vec![0u8; n * PENDING_SITE_STRIDE];
+    for (k, &i) in order.iter().enumerate() {
+        let row = &rows[i as usize];
+        let buf = &mut body[k * PENDING_SITE_STRIDE..(k + 1) * PENDING_SITE_STRIDE];
+        encode_pending_site_row(buf, row);
+    }
+    Ok((body, n))
+}
+
+/// Sorts `closures` by key (the on-disk order `closures.pending` uses --
+/// same convention `closures.records`/`closures.deps` already establish
+/// for their own 36-byte entries) and encodes them as one `closures.
+/// pending` body.
+fn encode_pending_closures_body(closures: &[(PendingSiteKey, u32)]) -> Vec<u8> {
+    let mut sorted = closures.to_vec();
+    sorted.sort_unstable_by_key(|(k, _)| *k);
+    let mut body = vec![0u8; sorted.len() * PENDING_CLOSURE_STRIDE];
+    for (k, (key, valid_to)) in sorted.iter().enumerate() {
+        let buf = &mut body[k * PENDING_CLOSURE_STRIDE..(k + 1) * PENDING_CLOSURE_STRIDE];
+        put_u32le(buf, pending_closure::OWNER_ARTIFACT, key.owner_artifact);
+        put_u32le(buf, pending_closure::START, key.start);
+        put_u32le(buf, pending_closure::END, key.end);
+        buf[pending_closure::SITE_KIND] = key.site_kind;
+        put_u32le(buf, pending_closure::VALID_TO, *valid_to);
+    }
+    body
+}
+
+/// Writes `pending.sites` for a BASE segment, skipping the file entirely
+/// when `pending_sites` is empty (the same optional-file convention
+/// `write_dict_files` already uses for `dict.bin`/`subjects.keys`) --
+/// required so a pre-existing base directory with no pending rows at all
+/// reads back identically to one written by code that has never heard of
+/// this table.
+fn write_pending_sites_file(
+    dir: &Path,
+    pending_sites: &[PendingSiteRow],
+    generation: u64,
+) -> Result<BTreeMap<String, (u64, u64)>> {
+    let mut out = BTreeMap::new();
+    if pending_sites.is_empty() {
+        return Ok(out);
+    }
+    let (body, n) = encode_pending_sites_body(pending_sites)?;
+    let (bytes, xxh3) = write_framed_file(
+        &dir.join("pending.sites"),
+        TableId::PendingSites,
+        generation,
+        n as u64,
+        &body,
+    )?;
+    out.insert("pending.sites".to_string(), (bytes, xxh3));
+    Ok(out)
+}
+
 /// P3-6 item 1: builds every logical section a delta generation carries as
 /// an in-memory blob (`container::EncodedSection`), skipping the ones that
 /// would be empty (mirrors P3-3 item 4's existing skip rule for closures/
@@ -694,7 +905,9 @@ fn build_delta_sections(
     deps_closures: &[([u8; 32], u32)],
     dict_additions: &Dictionaries,
     generation: u64,
-) -> Vec<EncodedSection> {
+    pending_opened: &[PendingSiteRow],
+    pending_closures: &[(PendingSiteKey, u32)],
+) -> Result<Vec<EncodedSection>> {
     let mut sections: Vec<EncodedSection> = Vec::with_capacity(18);
 
     // -- records.keys/meta/digests/body/ident --
@@ -1038,7 +1251,29 @@ fn build_delta_sections(
         ));
     }
 
-    sections
+    // -- pending.sites / closures.pending -- same empty-skip rule.
+    if !pending_opened.is_empty() {
+        let (body, n) = encode_pending_sites_body(pending_opened)?;
+        sections.push((
+            SectionId::PendingSites,
+            encode_framed(TableId::PendingSites, generation, n as u64, &body).0,
+        ));
+    }
+    if !pending_closures.is_empty() {
+        let body = encode_pending_closures_body(pending_closures);
+        sections.push((
+            SectionId::ClosuresPending,
+            encode_framed(
+                TableId::PendingSites,
+                generation,
+                pending_closures.len() as u64,
+                &body,
+            )
+            .0,
+        ));
+    }
+
+    Ok(sections)
 }
 
 fn write_deps_files(

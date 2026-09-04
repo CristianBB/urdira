@@ -32,7 +32,7 @@
 
 use crate::error::{Result, store_err};
 use crate::layout::*;
-use crate::row::{NONE_U32, RecordRow};
+use crate::row::{NONE_U32, PendingSiteKey, RecordRow};
 use crate::xxh;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -1250,6 +1250,51 @@ pub fn deps_reverse_range(arr: &[u8], dep_artifact: u32) -> (usize, usize) {
 
 pub fn deps_reverse_ordinal_at(arr: &[u8], i: usize) -> u32 {
     u32le(arr, i * DEPS_REVERSE_STRIDE + 4)
+}
+
+/// Range over `pending.sites`' sorted `(owner_artifact, start, end,
+/// site_kind)` array, by `owner_artifact` alone. Since `owner_artifact` is
+/// the PRIMARY sort key (not a secondary index the way `records.by_owner`
+/// is over `records.*`), every row for one owner is already a contiguous
+/// range in the base array itself -- no separate index file is needed.
+pub fn pending_site_owner_range(arr: &[u8], owner_artifact: u32) -> (usize, usize) {
+    let n = arr.len() / PENDING_SITE_STRIDE;
+    let key_of = |i: usize| u32le(arr, i * PENDING_SITE_STRIDE + pending_sites::OWNER_ARTIFACT);
+    let lo = lower_bound(n, |i| key_of(i).cmp(&owner_artifact));
+    let hi = upper_bound(n, |i| key_of(i).cmp(&owner_artifact));
+    (lo, hi)
+}
+
+/// Range over `pending.sites` by the FULL identity key `(owner_artifact,
+/// start, end, site_kind)` -- at most one row per segment (duplicate keys
+/// within one segment are rejected at write time), but returns a range
+/// rather than an `Option<usize>` so callers can use the same `lo..hi`
+/// idiom every other range lookup in this module uses.
+pub fn pending_site_key_range(arr: &[u8], key: &PendingSiteKey) -> (usize, usize) {
+    let n = arr.len() / PENDING_SITE_STRIDE;
+    let key_of = |i: usize| -> (u32, u32, u32, u8) {
+        let base = i * PENDING_SITE_STRIDE;
+        (
+            u32le(arr, base + pending_sites::OWNER_ARTIFACT),
+            u32le(arr, base + pending_sites::START),
+            u32le(arr, base + pending_sites::END),
+            arr[base + pending_sites::SITE_KIND],
+        )
+    };
+    let target = (key.owner_artifact, key.start, key.end, key.site_kind);
+    let lo = lower_bound(n, |i| key_of(i).cmp(&target));
+    let hi = upper_bound(n, |i| key_of(i).cmp(&target));
+    (lo, hi)
+}
+
+pub fn pending_site_key_at(arr: &[u8], i: usize) -> PendingSiteKey {
+    let base = i * PENDING_SITE_STRIDE;
+    PendingSiteKey {
+        owner_artifact: u32le(arr, base + pending_sites::OWNER_ARTIFACT),
+        start: u32le(arr, base + pending_sites::START),
+        end: u32le(arr, base + pending_sites::END),
+        site_kind: arr[base + pending_sites::SITE_KIND],
+    }
 }
 
 /// P3-6: one segment "file" as seen by [`crate::reader::Segment`] --

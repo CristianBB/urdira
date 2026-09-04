@@ -45,9 +45,12 @@
 //! E2b (injecting these `paths` into the residual tsgo project) is explicitly
 //! out of scope here too -- see the design doc's own E2b note.
 
-use crate::{EntityKind, SyntaxExportBinding, SyntaxFileResult};
+use crate::{
+    AmbientModuleDeclaration, AmbientModuleMember, EntityKind, SyntaxExportBinding,
+    SyntaxFileResult,
+};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// One resolution-relevant workspace asset handed to the syntax worker
 /// alongside its JS/TS sources: `package.json`, `tsconfig.json`/
@@ -1026,13 +1029,24 @@ pub enum ExportResolution {
 
 /// Close an import -> export -> declaration chain (E2, F5 hybrid design):
 /// given the project's full `files` map (already resolved by lane 1, so
-/// every `DirectImport`/`SyntaxExportBinding` with a source specifier
-/// already carries its `target_path`), find the single declaration
-/// `name` resolves to when exported from `path`, following named
-/// re-exports (`export { a } from "./x"`) transitively. Cycle-guarded and
-/// depth-capped; `export *` is never attempted (see this module's doc
-/// comment) -- a name only reachable through one always reports
-/// `Unresolved`, never a guess.
+/// every `DirectImport`/`SyntaxExportBinding`/`ExportStarSpecifier` with a
+/// source specifier already carries its `target_path`), find the single
+/// declaration `name` resolves to when exported from `path`, following
+/// named re-exports (`export { a } from "./x"`, transitively -- already
+/// bounded/cycle-guarded before this task) AND, since the 2026-09-04
+/// references-parity task (bucket 2), bare `export * from "./x"` barrels
+/// (`ExportStarSpecifier`, tried ONLY when `name` matches no direct
+/// declaration and no named re-export in `path` itself -- see `resolve_
+/// named_export_inner`'s own body). A star barrel never guesses: `name` is
+/// resolved through EVERY one of `path`'s own `export_star_specifiers`
+/// targets, and the result is only ever `Resolved`/`Namespace`/`Ambiguous`
+/// when EXACTLY ONE of those targets provides `name` at all (mirroring real
+/// ESM's own "ambiguous export" restriction for two `export *` sources
+/// providing the same name) -- two or more providing candidates, or a
+/// candidate that is itself ambiguous, degrade to `Unresolved` rather than
+/// pick one. Cycle-guarded and depth-capped (`MAX_EXPORT_RESOLUTION_DEPTH`,
+/// shared across the named-reexport and star-barrel chains alike, via the
+/// same `visiting`/`depth` threaded through every recursive call).
 pub fn resolve_named_export(
     files: &BTreeMap<String, SyntaxFileResult>,
     path: &str,
@@ -1073,7 +1087,7 @@ fn resolve_named_export_inner(
         return resolve_direct_export(file, &direct);
     }
     match reexport.as_slice() {
-        [] => ExportResolution::Unresolved,
+        [] => resolve_via_export_star(files, file, name, visiting, depth),
         [binding] if binding.local_name == crate::NAMESPACE_REEXPORT_LOCAL_NAME => {
             // P1-B: `export * as X from "spec"` -- `X` names the WHOLE
             // re-exported module, never a single symbol to chase further
@@ -1098,6 +1112,44 @@ fn resolve_named_export_inner(
             ),
             None => ExportResolution::Unresolved,
         },
+        _ => ExportResolution::Ambiguous,
+    }
+}
+
+/// 2026-09-04 references-parity task, bucket 2: `name` matched no direct
+/// declaration and no named re-export in `file` itself -- the LAST chance is
+/// one of `file`'s own bare `export * from "./x"` barrels re-exporting it.
+/// Tries `name` against EVERY star target (each a fresh, independent
+/// `resolve_named_export_inner` call sharing the SAME `visiting`/`depth`
+/// cycle guard as the caller, so a star cycle -- `a.ts` doing `export * from
+/// "./b"` while `b.ts` does `export * from "./a"` -- terminates exactly like
+/// a named-reexport cycle already does), and only trusts the result when
+/// EXACTLY ONE target actually provides `name` (a non-`Unresolved` outcome).
+/// Zero providing targets stays `Unresolved`; two or more (even if some
+/// individually resolve to the SAME declaration through separate paths, or
+/// one is itself only `Ambiguous`) degrade to `Ambiguous` -- never a guess
+/// at which star source "wins", matching real ESM's own restriction against
+/// two `export *` sources providing the same name.
+fn resolve_via_export_star(
+    files: &BTreeMap<String, SyntaxFileResult>,
+    file: &SyntaxFileResult,
+    name: &str,
+    visiting: &mut BTreeSet<(String, String)>,
+    depth: u8,
+) -> ExportResolution {
+    let mut providing: Vec<ExportResolution> = Vec::new();
+    for star in &file.export_star_specifiers {
+        let Some(target_path) = &star.target_path else {
+            continue;
+        };
+        let outcome = resolve_named_export_inner(files, target_path, name, visiting, depth + 1);
+        if outcome != ExportResolution::Unresolved {
+            providing.push(outcome);
+        }
+    }
+    match providing.len() {
+        0 => ExportResolution::Unresolved,
+        1 => providing.into_iter().next().expect("checked len"),
         _ => ExportResolution::Ambiguous,
     }
 }
@@ -1130,6 +1182,366 @@ fn resolve_direct_export(
         1 => ExportResolution::Resolved(resolved_ids.into_iter().next().expect("checked len")),
         _ => ExportResolution::Ambiguous,
     }
+}
+
+/// Ambient module resolution task (2026-09-04): the workspace-wide index of
+/// every `declare module "specifier" { ... }` block any file declares,
+/// keyed by `specifier` -- built fresh from the project's current `files`
+/// map (see `SyntaxWorkerState::analyze`'s own doc comment for why this is
+/// deliberately NOT incrementally maintained: ambient declarations are rare
+/// enough that a full rebuild is cheap). Consulted at TWO different
+/// granularities: `unique_namespace_entity`/`has_any_declaration` for the
+/// MODULE-EDGE level (`lib.rs`'s `jsts:relation_import`/`export` target,
+/// which only cares "does exactly one file declare this specifier", never
+/// which name is imported), and `resolve_export` for the NAME level
+/// (`semantic_sites.rs`'s reference resolution, which also needs to know
+/// which declaration a specific imported name/default/namespace-value
+/// resolves to inside that one declaring file's block).
+///
+/// **Wildcard patterns** (found live against the n8n corpus: `declare
+/// module '~icons/*' { ... }`, a common virtual-asset-module convention --
+/// TypeScript's own ambient module wildcard syntax, ONE `*` standing for
+/// any run of characters, slashes included, e.g. `~icons/*` matches
+/// `~icons/lucide/message-square`): a declared specifier containing
+/// exactly one `*` is indexed SEPARATELY (`patterns`, never mixed into
+/// `by_specifier`'s exact-match map) and consulted only after an exact
+/// match misses. When several patterns match the same lookup specifier,
+/// TypeScript itself picks the one with the LONGEST prefix before the `*`
+/// (the identical precedence rule `tsconfig.json`'s own `compilerOptions.
+/// paths` wildcard resolution uses) -- mirrored by `matching_patterns`
+/// below; a genuine tie (two patterns with an equally long prefix) is
+/// workspace-ambiguous, same "never guess" treatment as two files
+/// declaring the identical literal specifier.
+#[derive(Debug, Default)]
+pub struct AmbientModuleIndex {
+    by_specifier: HashMap<String, Vec<(String, AmbientModuleDeclaration)>>,
+    /// `(pattern_specifier, declaring_path, declaration)` -- every declared
+    /// specifier containing EXACTLY one `*`. A pattern with zero or more
+    /// than one `*` is not TypeScript's wildcard syntax at all (TS only
+    /// ever recognizes a SINGLE `*`); such a specifier is only ever reached
+    /// through `by_specifier`'s literal-text match, same as before this
+    /// wildcard support existed.
+    patterns: Vec<(String, String, AmbientModuleDeclaration)>,
+}
+
+impl AmbientModuleIndex {
+    /// Owner-flagged follow-up (2026-09-04): a `declare module` block whose
+    /// OWN FILE has top-level `import`/`export` syntax is a MODULE
+    /// AUGMENTATION (`AmbientModuleDeclaration::is_augmentation`), not a
+    /// genuine ambient module declaration -- it EXTENDS an existing
+    /// external package's type surface (e.g. `declare module "vue" {
+    /// interface ComponentCustomProperties {...} }`) and must never enter
+    /// this index (skipped entirely, both from the exact-match map and
+    /// from `patterns` -- "ignored for resolution", not merely
+    /// deprioritized). Set `URDIRA_V4_DEBUG_AMBIENT_MODULES=1` to print how
+    /// many of each this call saw, split further by exact-vs-wildcard
+    /// specifier shape.
+    pub fn rebuild(files: &BTreeMap<String, SyntaxFileResult>) -> Self {
+        let mut by_specifier: HashMap<String, Vec<(String, AmbientModuleDeclaration)>> =
+            HashMap::new();
+        let mut patterns: Vec<(String, String, AmbientModuleDeclaration)> = Vec::new();
+        let mut script_count = 0u64;
+        let mut augmentation_count = 0u64;
+        for (path, file) in files {
+            for declaration in &file.ambient_modules {
+                if declaration.is_augmentation {
+                    augmentation_count += 1;
+                    continue;
+                }
+                script_count += 1;
+                if declaration.specifier.matches('*').count() == 1 {
+                    patterns.push((
+                        declaration.specifier.clone(),
+                        path.clone(),
+                        declaration.clone(),
+                    ));
+                }
+                by_specifier
+                    .entry(declaration.specifier.clone())
+                    .or_default()
+                    .push((path.clone(), declaration.clone()));
+            }
+        }
+        if std::env::var_os("URDIRA_V4_DEBUG_AMBIENT_MODULES").is_some() {
+            eprintln!(
+                "[AmbientModuleIndex::rebuild] script_declarations={script_count} (exact_specifiers={} wildcard_specifiers={}) module_augmentations_ignored={augmentation_count}",
+                by_specifier.len(),
+                patterns.len(),
+            );
+        }
+        Self {
+            by_specifier,
+            patterns,
+        }
+    }
+
+    /// Every `(declaring_path, declaration)` a lookup `specifier` resolves
+    /// to: an EXACT `by_specifier` match when one exists (a literal
+    /// specifier always wins over a wildcard pattern, matching TypeScript's
+    /// own precedence), otherwise every `patterns` entry whose prefix/
+    /// suffix match `specifier` AND whose prefix is the LONGEST among all
+    /// matching patterns (TS's own tie-break rule) -- more than one pattern
+    /// tied at that same longest prefix length is returned as multiple
+    /// entries too, so every caller's existing "more than one declaration"
+    /// ambiguity handling covers this case for free, no separate branch
+    /// needed.
+    fn declarations_for(&self, specifier: &str) -> Vec<(&str, &AmbientModuleDeclaration)> {
+        if let Some(exact) = self.by_specifier.get(specifier)
+            && !exact.is_empty()
+        {
+            return exact
+                .iter()
+                .map(|(path, declaration)| (path.as_str(), declaration))
+                .collect();
+        }
+        let mut best_prefix_len: Option<usize> = None;
+        let mut matches: Vec<(&str, &AmbientModuleDeclaration)> = Vec::new();
+        for (pattern, path, declaration) in &self.patterns {
+            let Some(prefix_len) = wildcard_prefix_match(pattern, specifier) else {
+                continue;
+            };
+            match best_prefix_len {
+                Some(best) if prefix_len < best => continue,
+                Some(best) if prefix_len > best => {
+                    best_prefix_len = Some(prefix_len);
+                    matches.clear();
+                }
+                _ => {
+                    best_prefix_len = Some(prefix_len);
+                }
+            }
+            matches.push((path.as_str(), declaration));
+        }
+        matches
+    }
+
+    /// The MODULE-EDGE target for a bare specifier's `jsts:relation_
+    /// import`/`export` row (fix item 2): `Some(id)` only when EXACTLY ONE
+    /// workspace file declares `declare module "specifier"` -- regardless
+    /// of whether that block is bodyful or the bodyless shorthand (a
+    /// module-to-module EDGE targets the block itself either way; it is
+    /// only NAME-level resolution, `resolve_export` below, that treats a
+    /// shorthand block as never providing a nameable declaration). Two or
+    /// more declaring files is workspace-ambiguous -- `None`, same as zero
+    /// (the caller distinguishes the two via `has_any_declaration`).
+    pub fn unique_namespace_entity(&self, specifier: &str) -> Option<String> {
+        match self.declarations_for(specifier).as_slice() {
+            [(_, declaration)] => Some(declaration.namespace_entity_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether ANY workspace file declares `declare module "specifier"`
+    /// (a literal match, or the longest-prefix wildcard match(es) --
+    /// `declarations_for`'s own doc comment) -- distinguishes "workspace-
+    /// ambiguous, several declaring files" (stay `Possible`/pending, never
+    /// external) from "no ambient declaration at all" (fall through to
+    /// `classify_external_specifier`).
+    pub fn has_any_declaration(&self, specifier: &str) -> bool {
+        !self.declarations_for(specifier).is_empty()
+    }
+
+    /// NAME-level resolution (fix items 2-3): what does `name` (an ordinary
+    /// imported name, `"default"` for a default import, or `"*"` for a
+    /// namespace import's own binding used as a value) resolve to when
+    /// imported from `specifier`? See the module doc comment for the exact
+    /// contract; the short version is "resolve with certainty, or stay
+    /// pending -- NEVER fall through to an external entity once `specifier`
+    /// is known to be ambiently declared somewhere in this workspace".
+    pub fn resolve_export(&self, specifier: &str, name: &str) -> AmbientResolution {
+        let declarations = self.declarations_for(specifier);
+        if declarations.is_empty() {
+            return AmbientResolution::NoDeclaration;
+        }
+        let [(_, declaration)] = declarations.as_slice() else {
+            // Fix item 2: several files declare the SAME specifier --
+            // workspace-ambiguous, never a guess at which one a real
+            // TypeScript checker would even accept (declaration merging
+            // across files for the SAME string-literal module name is
+            // legal, but which member "wins" a name collision is not
+            // something to reconstruct heuristically here).
+            return AmbientResolution::Ambiguous;
+        };
+        // Fix item 3: a bodyless `declare module "specifier";` types the
+        // whole module as `any` to the checker -- there is no declaration
+        // for a named/default/namespace-value import to resolve to, so
+        // TypeScript itself never provides a confirmed reference here.
+        // Mirrored the same way: stay pending, NEVER promote to external
+        // (the specifier IS ambiently declared -- just not usefully).
+        if !declaration.bodyful {
+            return AmbientResolution::Ambiguous;
+        }
+        match name {
+            "*" => AmbientResolution::Resolved(declaration.namespace_entity_id.clone()),
+            "default" => declaration
+                .default_member
+                .as_ref()
+                .map(|member| AmbientResolution::Resolved(member.entity_id.clone()))
+                .unwrap_or(AmbientResolution::Ambiguous),
+            _ => {
+                let matches: Vec<&AmbientModuleMember> = declaration
+                    .members
+                    .iter()
+                    .filter(|member| member.name == name)
+                    .collect();
+                match matches.as_slice() {
+                    [single] => AmbientResolution::Resolved(single.entity_id.clone()),
+                    _ => AmbientResolution::Ambiguous,
+                }
+            }
+        }
+    }
+}
+
+/// TypeScript's ambient module wildcard match: `pattern` (containing
+/// exactly one `*`, the only shape callers ever pass -- see `AmbientModule
+/// Index::rebuild`'s own filter) matches `specifier` when `specifier`
+/// starts with the text before `*` and ends with the text after it, with
+/// enough length left over for the `*` to stand for something (`>= 0`
+/// characters is enough per TypeScript's own rule -- `declare module
+/// "*.css"` matches the literal specifier `".css"` too). Returns the
+/// PREFIX length on a match (for `declarations_for`'s longest-prefix
+/// precedence), `None` otherwise.
+fn wildcard_prefix_match(pattern: &str, specifier: &str) -> Option<usize> {
+    let star = pattern.find('*')?;
+    let prefix = &pattern[..star];
+    let suffix = &pattern[star + 1..];
+    if specifier.len() >= prefix.len() + suffix.len()
+        && specifier.starts_with(prefix)
+        && specifier.ends_with(suffix)
+    {
+        Some(prefix.len())
+    } else {
+        None
+    }
+}
+
+/// Outcome of [`AmbientModuleIndex::resolve_export`] -- see that method's
+/// own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmbientResolution {
+    /// No workspace file declares `declare module "specifier"` at all --
+    /// the caller should fall through to `classify_external_specifier`.
+    NoDeclaration,
+    /// `specifier` IS ambiently declared somewhere in the workspace, but
+    /// `name` does not resolve with certainty this way (several declaring
+    /// files, a bodyless declaration, an unexported/absent/ambiguous
+    /// member, ...) -- the caller MUST stay pending, never external.
+    Ambiguous,
+    Resolved(String),
+}
+
+/// Node.js core module names (2026, the well-established list -- a builtin
+/// this list misses is not mis-classified as something else, it just stays
+/// an ordinary bare package specifier for identity purposes: only the
+/// `node:`-normalization in [`classify_external_specifier`] is skipped for
+/// it, external-entity classification itself is unaffected).
+const NODE_BUILTIN_MODULES: &[&str] = &[
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "timers",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// External package/symbol entities task (2026-09-04): classifies an
+/// IMPORT/EXPORT specifier that `WorkspaceResolver::resolve` already tried
+/// and failed to resolve inside the workspace (`target_path.is_none()`) as
+/// either a genuine external package/builtin specifier -- worth an
+/// `external_module`/`external_symbol` entity -- or a relative/absolute
+/// specifier that simply failed to resolve inside the workspace (a real
+/// resolution gap: a broken path, a file outside the source frontier).
+///
+/// **The rule** (owner-approved, no checker involved, deliberately
+/// conservative): a specifier starting with `.` (`./x`, `../x`) or `/` (an
+/// absolute path) is NEVER external, regardless of why it failed to
+/// resolve -- it named a real (or intended) file inside this workspace, and
+/// inventing an external entity for it would misrepresent a resolution gap
+/// as a real third-party dependency. An empty specifier (never valid
+/// syntax, defensive only) is excluded the same way. Everything else --
+/// a bare specifier (`lodash`), a scoped specifier (`@scope/name`), either
+/// with a subpath (`lodash/get`, `@scope/name/sub`), or an explicit
+/// `node:`-prefixed builtin -- is external.
+///
+/// **Identity normalization**: returns the CANONICAL specifier string to
+/// build `external_module_id`/`external_symbol_id` from. A bare Node
+/// builtin (`fs`) and its explicit `node:`-prefixed form (`node:fs`) name
+/// the SAME entity (`jsts:external_module:node:fs`) -- both normalize to
+/// the `node:`-prefixed form. Every other specifier (including a subpath
+/// of a builtin that is not itself an exact builtin name, e.g. bare
+/// `fs/promises` without the `node:` prefix -- a documented, low-volume
+/// gap: it is still classified external, just not normalized) is returned
+/// AS-IS, full subpath included: two different subpaths of the same
+/// package (`@langchain/core` vs `@langchain/core/messages`) are two
+/// different external module entities, mirroring how two different
+/// workspace files are two different module entities.
+pub fn classify_external_specifier(specifier: &str) -> Option<String> {
+    if specifier.is_empty() || specifier.starts_with('.') || specifier.starts_with('/') {
+        return None;
+    }
+    if let Some(builtin) = specifier.strip_prefix("node:") {
+        return Some(format!("node:{builtin}"));
+    }
+    if NODE_BUILTIN_MODULES.contains(&specifier) {
+        return Some(format!("node:{specifier}"));
+    }
+    Some(specifier.to_owned())
+}
+
+/// `jsts:external_module:{specifier}` -- `specifier` is the CANONICAL
+/// specifier ([`classify_external_specifier`]'s return value), full subpath
+/// included. A pure function of the specifier alone (never the importing
+/// file), so every importer of the same specifier proposes a byte-identical
+/// entity id -- see `urdira-indexing-worker::v4::analyze::run_scoped`'s
+/// cross-owner dedup pass for why that is load-bearing.
+pub fn external_module_id(specifier: &str) -> String {
+    format!("jsts:external_module:{specifier}")
+}
+
+/// `jsts:external_symbol:{specifier}#{imported_name}` -- `imported_name` is
+/// `"default"` for a default import/export, `"*"` for a namespace import's
+/// own binding used as a value, or the plain imported/member name
+/// otherwise. Also a pure function of its two inputs, for the same
+/// cross-owner-dedup reason as [`external_module_id`].
+pub fn external_symbol_id(specifier: &str, imported_name: &str) -> String {
+    format!("jsts:external_symbol:{specifier}#{imported_name}")
 }
 
 #[cfg(test)]
@@ -1471,7 +1883,7 @@ mod tests {
 
     fn entity(kind: EntityKind, path: &str, start: u32, name: &str) -> crate::SyntaxEntity {
         crate::SyntaxEntity {
-            id: format!("jsts:{}:{path}:{start}:{name}", entity_kind_name(kind)),
+            id: format!("jsts:{}:{path}:{start}:{name}", kind.identity_name()),
             name: name.to_owned(),
             kind,
             universal_kind: crate::UniversalKind::Value,
@@ -1481,18 +1893,6 @@ mod tests {
             parent_id: None,
             qualified_name: None,
             is_test: None,
-        }
-    }
-
-    fn entity_kind_name(kind: EntityKind) -> &'static str {
-        match kind {
-            EntityKind::Module => "module",
-            EntityKind::Function => "function",
-            EntityKind::Class => "class",
-            EntityKind::Interface => "interface",
-            EntityKind::Type => "type",
-            EntityKind::Enum => "enum",
-            EntityKind::Variable => "variable",
         }
     }
 
@@ -1515,6 +1915,20 @@ mod tests {
         entities: Vec<crate::SyntaxEntity>,
         export_bindings: Vec<SyntaxExportBinding>,
     ) -> SyntaxFileResult {
+        file_with_star(path, entities, export_bindings, Vec::new())
+    }
+
+    /// 2026-09-04 references-parity task, bucket 2: same as `file` above,
+    /// with an explicit `export_star_specifiers` list -- kept as a separate
+    /// helper (rather than widening `file`'s own signature) so every
+    /// PRE-EXISTING `file(...)` call site in this test module stays
+    /// untouched.
+    fn file_with_star(
+        path: &str,
+        entities: Vec<crate::SyntaxEntity>,
+        export_bindings: Vec<SyntaxExportBinding>,
+        export_star_specifiers: Vec<crate::ExportStarSpecifier>,
+    ) -> SyntaxFileResult {
         SyntaxFileResult {
             path: path.to_owned(),
             content_digest: "sha256:0".to_owned(),
@@ -1527,6 +1941,71 @@ mod tests {
             relations: Vec::new(),
             diagnostics: Vec::new(),
             export_bindings,
+            export_star_specifiers,
+            ambient_modules: Vec::new(),
+        }
+    }
+
+    /// Ambient module resolution task (2026-09-04): same as `file` above,
+    /// with an explicit `ambient_modules` list -- kept as a separate helper
+    /// (rather than widening `file`'s own signature) for the same reason
+    /// `file_with_star` is.
+    fn file_with_ambient(
+        path: &str,
+        ambient_modules: Vec<crate::AmbientModuleDeclaration>,
+    ) -> SyntaxFileResult {
+        let mut result = file_with_star(path, Vec::new(), Vec::new(), Vec::new());
+        result.ambient_modules = ambient_modules;
+        result
+    }
+
+    fn ambient_declaration(
+        specifier: &str,
+        path: &str,
+        identity_start: u32,
+        bodyful: bool,
+        members: Vec<(&str, EntityKind, u32)>,
+        default_member: Option<(&str, EntityKind, u32)>,
+    ) -> crate::AmbientModuleDeclaration {
+        crate::AmbientModuleDeclaration {
+            specifier: specifier.to_owned(),
+            bodyful,
+            // Script-level by default -- augmentation tests flip this on
+            // the returned value (`is_augmentation = true`) rather than
+            // widening this helper's signature for every pre-existing
+            // call site.
+            is_augmentation: false,
+            namespace_entity_id: format!("jsts:namespace:{path}:{identity_start}:{specifier}"),
+            members: members
+                .into_iter()
+                .map(|(name, kind, start)| crate::AmbientModuleMember {
+                    name: name.to_owned(),
+                    entity_id: format!("jsts:{}:{path}:{start}:{name}", kind_word(kind)),
+                })
+                .collect(),
+            default_member: default_member.map(|(name, kind, start)| crate::AmbientModuleMember {
+                name: name.to_owned(),
+                entity_id: format!("jsts:{}:{path}:{start}:{name}", kind_word(kind)),
+            }),
+        }
+    }
+
+    fn kind_word(kind: EntityKind) -> &'static str {
+        match kind {
+            EntityKind::Function => "function",
+            EntityKind::Class => "class",
+            EntityKind::Interface => "interface",
+            EntityKind::Type => "type",
+            EntityKind::Enum => "enum",
+            EntityKind::Variable => "variable",
+            other => panic!("unhandled entity kind in test helper: {other:?}"),
+        }
+    }
+
+    fn star(specifier: &str, target_path: Option<&str>) -> crate::ExportStarSpecifier {
+        crate::ExportStarSpecifier {
+            specifier: specifier.to_owned(),
+            target_path: target_path.map(str::to_owned),
         }
     }
 
@@ -1727,6 +2206,193 @@ mod tests {
         );
     }
 
+    // 2026-09-04 references-parity task, bucket 2: `export * from "./x"`
+    // barrel chasing (`resolve_via_export_star`).
+
+    #[test]
+    fn resolve_named_export_follows_single_star_barrel() {
+        // `packages/.../index.ts` doing `export { X } from "../services"`
+        // where `services/index.ts` itself does `export * from
+        // "./credential-resolver-registry.service"` -- the exact shape this
+        // task's evidence doc found live in the n8n corpus for the
+        // `import_binding`/`re_export_binding` buckets.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "src/impl.ts".to_owned(),
+            file(
+                "src/impl.ts",
+                vec![entity(EntityKind::Class, "src/impl.ts", 10, "Widget")],
+                vec![binding("Widget", "Widget", None, None)],
+            ),
+        );
+        files.insert(
+            "src/index.ts".to_owned(),
+            file_with_star(
+                "src/index.ts",
+                vec![],
+                vec![],
+                vec![star("./impl", Some("src/impl.ts"))],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "src/index.ts", "Widget"),
+            ExportResolution::Resolved("jsts:class:src/impl.ts:10:Widget".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_named_export_star_barrel_only_used_when_direct_lookup_misses() {
+        // A name matching a DIRECT/named-reexport binding in the barrel
+        // itself must win over anything a star target might also provide --
+        // `resolve_via_export_star` is only ever consulted when `matching`
+        // is empty for `name` in `file` itself (see `resolve_named_export_
+        // inner`'s own `[] => resolve_via_export_star(...)` arm).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "src/star-target.ts".to_owned(),
+            file(
+                "src/star-target.ts",
+                vec![entity(EntityKind::Function, "src/star-target.ts", 1, "f")],
+                vec![binding("f", "f", None, None)],
+            ),
+        );
+        files.insert(
+            "src/index.ts".to_owned(),
+            file_with_star(
+                "src/index.ts",
+                vec![entity(EntityKind::Function, "src/index.ts", 50, "f")],
+                vec![binding("f", "f", None, None)],
+                vec![star("./star-target", Some("src/star-target.ts"))],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "src/index.ts", "f"),
+            ExportResolution::Resolved("jsts:function:src/index.ts:50:f".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_named_export_two_star_barrels_providing_same_name_stays_pending() {
+        // Two DIFFERENT `export * from` targets both provide `helper` --
+        // real ESM itself treats this as an error (an ambiguous export), so
+        // this resolver must never guess which one wins.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "src/a.ts".to_owned(),
+            file(
+                "src/a.ts",
+                vec![entity(EntityKind::Function, "src/a.ts", 1, "helper")],
+                vec![binding("helper", "helper", None, None)],
+            ),
+        );
+        files.insert(
+            "src/b.ts".to_owned(),
+            file(
+                "src/b.ts",
+                vec![entity(EntityKind::Function, "src/b.ts", 1, "helper")],
+                vec![binding("helper", "helper", None, None)],
+            ),
+        );
+        files.insert(
+            "src/index.ts".to_owned(),
+            file_with_star(
+                "src/index.ts",
+                vec![],
+                vec![],
+                vec![star("./a", Some("src/a.ts")), star("./b", Some("src/b.ts"))],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "src/index.ts", "helper"),
+            ExportResolution::Ambiguous
+        );
+    }
+
+    #[test]
+    fn resolve_named_export_star_barrel_name_not_found_anywhere_stays_pending() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "src/a.ts".to_owned(),
+            file(
+                "src/a.ts",
+                vec![entity(EntityKind::Function, "src/a.ts", 1, "other")],
+                vec![binding("other", "other", None, None)],
+            ),
+        );
+        files.insert(
+            "src/index.ts".to_owned(),
+            file_with_star(
+                "src/index.ts",
+                vec![],
+                vec![],
+                vec![star("./a", Some("src/a.ts"))],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "src/index.ts", "missing"),
+            ExportResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn resolve_named_export_star_barrel_unresolved_specifier_stays_pending() {
+        // `star.target_path` is `None` (the specifier never resolved inside
+        // the workspace, e.g. an external package) -- skipped, not a panic,
+        // and contributes no candidate.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "src/index.ts".to_owned(),
+            file_with_star("src/index.ts", vec![], vec![], vec![star("some-pkg", None)]),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "src/index.ts", "anything"),
+            ExportResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn resolve_named_export_star_chain_longer_than_depth_bound_stays_pending() {
+        // A straight-line chain of `export * from` hops, ONE PER FILE:
+        // `f0.ts` exports `target` directly; `f1.ts` star-re-exports
+        // `f0.ts`; `f2.ts` star-re-exports `f1.ts`; ... `f8.ts`
+        // star-re-exports `f7.ts`. Each hop costs one `depth` unit (`resolve_
+        // via_export_star` recurses with `depth + 1`, same accounting as the
+        // named-reexport chain), and `resolve_named_export_inner`'s own
+        // guard rejects at `depth >= MAX_EXPORT_RESOLUTION_DEPTH` (8) BEFORE
+        // looking at that node's own bindings. Resolving `target` from
+        // `f8.ts` needs `f0` to be reached at `depth == 8` (one too many --
+        // the guard fires), so it must stay `Unresolved` -- never silently
+        // truncate to a WRONG (but reachable-within-bound) answer. Resolving
+        // from `f7.ts` needs `f0` reached at `depth == 7` (within bound) and
+        // DOES resolve, proving the failure above is the depth bound itself,
+        // not a mistake in the fixture.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "f0.ts".to_owned(),
+            file(
+                "f0.ts",
+                vec![entity(EntityKind::Function, "f0.ts", 1, "target")],
+                vec![binding("target", "target", None, None)],
+            ),
+        );
+        for hop in 1..=8u32 {
+            let path = format!("f{hop}.ts");
+            let prior = format!("f{}.ts", hop - 1);
+            files.insert(
+                path.clone(),
+                file_with_star(&path, vec![], vec![], vec![star("./prior", Some(&prior))]),
+            );
+        }
+        assert_eq!(
+            resolve_named_export(&files, "f8.ts", "target"),
+            ExportResolution::Unresolved
+        );
+        assert_eq!(
+            resolve_named_export(&files, "f7.ts", "target"),
+            ExportResolution::Resolved("jsts:function:f0.ts:1:target".to_owned())
+        );
+    }
+
     #[test]
     fn scoped_bare_specifier_splits_name_and_subpath() {
         assert_eq!(
@@ -1738,5 +2404,435 @@ mod tests {
             Some(("lodash".to_owned(), None))
         );
         assert_eq!(split_bare_specifier("./relative"), None);
+    }
+
+    #[test]
+    fn classify_external_specifier_accepts_bare_scoped_and_subpath_packages() {
+        assert_eq!(
+            classify_external_specifier("lodash"),
+            Some("lodash".to_owned())
+        );
+        assert_eq!(
+            classify_external_specifier("lodash/get"),
+            Some("lodash/get".to_owned())
+        );
+        assert_eq!(
+            classify_external_specifier("@langchain/core"),
+            Some("@langchain/core".to_owned())
+        );
+        assert_eq!(
+            classify_external_specifier("@langchain/core/messages"),
+            Some("@langchain/core/messages".to_owned())
+        );
+    }
+
+    #[test]
+    fn classify_external_specifier_normalizes_node_builtins() {
+        assert_eq!(
+            classify_external_specifier("fs"),
+            Some("node:fs".to_owned())
+        );
+        assert_eq!(
+            classify_external_specifier("node:fs"),
+            Some("node:fs".to_owned())
+        );
+        assert_eq!(
+            classify_external_specifier("path"),
+            Some("node:path".to_owned())
+        );
+        // A subpath of a builtin without an explicit `node:` prefix is a
+        // documented gap: still external, just not normalized (see this
+        // function's own doc comment).
+        assert_eq!(
+            classify_external_specifier("fs/promises"),
+            Some("fs/promises".to_owned())
+        );
+        assert_eq!(
+            classify_external_specifier("node:fs/promises"),
+            Some("node:fs/promises".to_owned())
+        );
+    }
+
+    #[test]
+    fn classify_external_specifier_excludes_relative_and_absolute() {
+        assert_eq!(classify_external_specifier("./sibling"), None);
+        assert_eq!(classify_external_specifier("../parent"), None);
+        assert_eq!(classify_external_specifier("/abs/path"), None);
+        assert_eq!(classify_external_specifier(""), None);
+    }
+
+    #[test]
+    fn external_id_recipes_are_pure_and_deterministic() {
+        assert_eq!(
+            external_module_id("@langchain/core/messages"),
+            "jsts:external_module:@langchain/core/messages"
+        );
+        assert_eq!(
+            external_symbol_id("lodash", "get"),
+            "jsts:external_symbol:lodash#get"
+        );
+        assert_eq!(
+            external_symbol_id("express", "default"),
+            "jsts:external_symbol:express#default"
+        );
+        assert_eq!(
+            external_symbol_id("lodash", "*"),
+            "jsts:external_symbol:lodash#*"
+        );
+    }
+
+    // -- Ambient module resolution task (2026-09-04) ---------------------
+
+    #[test]
+    fn ambient_named_export_resolves_to_the_inner_declaration() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "plugins.d.ts".to_owned(),
+            file_with_ambient(
+                "plugins.d.ts",
+                vec![ambient_declaration(
+                    "eslint-plugin-lodash",
+                    "plugins.d.ts",
+                    10,
+                    true,
+                    vec![("configure", EntityKind::Function, 40)],
+                    None,
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("eslint-plugin-lodash", "configure"),
+            AmbientResolution::Resolved("jsts:function:plugins.d.ts:40:configure".to_owned())
+        );
+        assert_eq!(
+            index.unique_namespace_entity("eslint-plugin-lodash"),
+            Some("jsts:namespace:plugins.d.ts:10:eslint-plugin-lodash".to_owned())
+        );
+        assert!(index.has_any_declaration("eslint-plugin-lodash"));
+    }
+
+    #[test]
+    fn ambient_default_export_resolves_to_the_inner_declaration() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "plugins.d.ts".to_owned(),
+            file_with_ambient(
+                "plugins.d.ts",
+                vec![ambient_declaration(
+                    "my-widget",
+                    "plugins.d.ts",
+                    10,
+                    true,
+                    vec![],
+                    Some(("Widget", EntityKind::Class, 50)),
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("my-widget", "default"),
+            AmbientResolution::Resolved("jsts:class:plugins.d.ts:50:Widget".to_owned())
+        );
+    }
+
+    #[test]
+    fn ambient_namespace_value_import_resolves_to_the_block_entity() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "plugins.d.ts".to_owned(),
+            file_with_ambient(
+                "plugins.d.ts",
+                vec![ambient_declaration(
+                    "my-widget",
+                    "plugins.d.ts",
+                    10,
+                    true,
+                    vec![("Widget", EntityKind::Class, 50)],
+                    None,
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("my-widget", "*"),
+            AmbientResolution::Resolved("jsts:namespace:plugins.d.ts:10:my-widget".to_owned())
+        );
+    }
+
+    #[test]
+    fn ambient_shorthand_declaration_stays_ambiguous_never_external() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "globals.d.ts".to_owned(),
+            file_with_ambient(
+                "globals.d.ts",
+                vec![ambient_declaration(
+                    "*.css",
+                    "globals.d.ts",
+                    5,
+                    false,
+                    vec![],
+                    None,
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("*.css", "default"),
+            AmbientResolution::Ambiguous
+        );
+        // A shorthand block still has NO usable module-edge target either
+        // (fix item 2's "namespace entity id" rule applies to relations,
+        // not name resolution -- but this index reports `unique_namespace_
+        // entity` for it regardless, matching v3's own `addEntity`, which
+        // gives the `TSModuleDeclaration` node an entity even bodyless; it
+        // is only `resolve_export`'s NAME-level answer that stays pending).
+        assert_eq!(
+            index.unique_namespace_entity("*.css"),
+            Some("jsts:namespace:globals.d.ts:5:*.css".to_owned())
+        );
+    }
+
+    #[test]
+    fn ambient_declared_by_two_files_stays_ambiguous_never_external() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.d.ts".to_owned(),
+            file_with_ambient(
+                "a.d.ts",
+                vec![ambient_declaration(
+                    "shared-pkg",
+                    "a.d.ts",
+                    1,
+                    true,
+                    vec![("thing", EntityKind::Function, 20)],
+                    None,
+                )],
+            ),
+        );
+        files.insert(
+            "b.d.ts".to_owned(),
+            file_with_ambient(
+                "b.d.ts",
+                vec![ambient_declaration(
+                    "shared-pkg",
+                    "b.d.ts",
+                    1,
+                    true,
+                    vec![("thing", EntityKind::Function, 20)],
+                    None,
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("shared-pkg", "thing"),
+            AmbientResolution::Ambiguous
+        );
+        assert_eq!(index.unique_namespace_entity("shared-pkg"), None);
+        assert!(index.has_any_declaration("shared-pkg"));
+    }
+
+    /// n8n corpus regression: `declare module '~icons/*' { const component:
+    /// T; export default component; }` -- ALL 649 remaining
+    /// `v4_different_target` rows after the exact-match fix traced back to
+    /// this ONE wildcard declaration.
+    #[test]
+    fn wildcard_ambient_declaration_matches_any_specifier_sharing_its_prefix() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "env.d.ts".to_owned(),
+            file_with_ambient(
+                "env.d.ts",
+                vec![ambient_declaration(
+                    "~icons/*",
+                    "env.d.ts",
+                    20,
+                    true,
+                    vec![],
+                    Some(("component", EntityKind::Variable, 60)),
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("~icons/lucide/message-square", "default"),
+            AmbientResolution::Resolved("jsts:variable:env.d.ts:60:component".to_owned())
+        );
+        assert_eq!(
+            index.unique_namespace_entity("~icons/lucide/message-square"),
+            Some("jsts:namespace:env.d.ts:20:~icons/*".to_owned())
+        );
+        // A specifier that does NOT share the pattern's prefix is untouched.
+        assert_eq!(
+            index.resolve_export("lodash", "default"),
+            AmbientResolution::NoDeclaration
+        );
+    }
+
+    #[test]
+    fn a_literal_declaration_takes_precedence_over_a_wildcard_for_the_same_specifier() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "env.d.ts".to_owned(),
+            file_with_ambient(
+                "env.d.ts",
+                vec![ambient_declaration(
+                    "~icons/*",
+                    "env.d.ts",
+                    20,
+                    true,
+                    vec![],
+                    Some(("component", EntityKind::Variable, 60)),
+                )],
+            ),
+        );
+        files.insert(
+            "exact.d.ts".to_owned(),
+            file_with_ambient(
+                "exact.d.ts",
+                vec![ambient_declaration(
+                    "~icons/lucide/message-square",
+                    "exact.d.ts",
+                    5,
+                    true,
+                    vec![("specificThing", EntityKind::Function, 40)],
+                    None,
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("~icons/lucide/message-square", "specificThing"),
+            AmbientResolution::Resolved("jsts:function:exact.d.ts:40:specificThing".to_owned())
+        );
+    }
+
+    #[test]
+    fn two_wildcard_patterns_tied_at_the_same_prefix_length_stay_ambiguous() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.d.ts".to_owned(),
+            file_with_ambient(
+                "a.d.ts",
+                vec![ambient_declaration(
+                    "~icons/*",
+                    "a.d.ts",
+                    1,
+                    true,
+                    vec![],
+                    Some(("thing", EntityKind::Variable, 10)),
+                )],
+            ),
+        );
+        files.insert(
+            "b.d.ts".to_owned(),
+            file_with_ambient(
+                "b.d.ts",
+                vec![ambient_declaration(
+                    "~icons/*",
+                    "b.d.ts",
+                    1,
+                    true,
+                    vec![],
+                    Some(("thing", EntityKind::Variable, 10)),
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("~icons/lucide/message-square", "default"),
+            AmbientResolution::Ambiguous
+        );
+    }
+
+    #[test]
+    fn specifier_with_no_ambient_declaration_reports_no_declaration() {
+        let files: BTreeMap<String, SyntaxFileResult> = BTreeMap::new();
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("lodash", "get"),
+            AmbientResolution::NoDeclaration
+        );
+        assert!(!index.has_any_declaration("lodash"));
+        assert_eq!(index.unique_namespace_entity("lodash"), None);
+    }
+
+    /// Owner-flagged follow-up (2026-09-04): a MODULE AUGMENTATION
+    /// (`declare module "vue" { ... }` inside a file that itself has
+    /// top-level `import`/`export` syntax) must be ignored for resolution
+    /// entirely -- it never enters the index, so `vue` stays externally
+    /// classified (never "workspace-ambiguous"/pending) for every real
+    /// importer.
+    #[test]
+    fn module_augmentation_is_ignored_for_resolution() {
+        let mut files = BTreeMap::new();
+        let mut augmentation = file_with_ambient(
+            "vue-augmentation.d.ts",
+            vec![ambient_declaration(
+                "vue",
+                "vue-augmentation.d.ts",
+                10,
+                true,
+                vec![("ComponentCustomProperties", EntityKind::Interface, 30)],
+                None,
+            )],
+        );
+        augmentation.ambient_modules[0].is_augmentation = true;
+        files.insert("vue-augmentation.d.ts".to_owned(), augmentation);
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("vue", "ComponentCustomProperties"),
+            AmbientResolution::NoDeclaration,
+            "an augmentation must never make `vue` resolve ambiently"
+        );
+        assert!(
+            !index.has_any_declaration("vue"),
+            "an augmentation must be invisible to has_any_declaration too, \
+             so `vue` still falls through to classify_external_specifier \
+             instead of becoming workspace-ambiguous"
+        );
+        assert_eq!(index.unique_namespace_entity("vue"), None);
+    }
+
+    /// A genuine script-level ambient declaration for the SAME specifier a
+    /// DIFFERENT file merely augments must still resolve normally -- the
+    /// augmentation is invisible, not merely deprioritized.
+    #[test]
+    fn a_script_declaration_resolves_even_when_another_file_only_augments_the_same_specifier() {
+        let mut files = BTreeMap::new();
+        let mut augmentation = file_with_ambient(
+            "vue-augmentation.d.ts",
+            vec![ambient_declaration(
+                "my-lib",
+                "vue-augmentation.d.ts",
+                10,
+                true,
+                vec![("Extra", EntityKind::Interface, 30)],
+                None,
+            )],
+        );
+        augmentation.ambient_modules[0].is_augmentation = true;
+        files.insert("vue-augmentation.d.ts".to_owned(), augmentation);
+        files.insert(
+            "shim.d.ts".to_owned(),
+            file_with_ambient(
+                "shim.d.ts",
+                vec![ambient_declaration(
+                    "my-lib",
+                    "shim.d.ts",
+                    5,
+                    true,
+                    vec![("thing", EntityKind::Function, 20)],
+                    None,
+                )],
+            ),
+        );
+        let index = AmbientModuleIndex::rebuild(&files);
+        assert_eq!(
+            index.resolve_export("my-lib", "thing"),
+            AmbientResolution::Resolved("jsts:function:shim.d.ts:20:thing".to_owned())
+        );
     }
 }

@@ -34,6 +34,12 @@
 //! - [`entity_index`] — [`entity_index::EntityIndex`], mapping a
 //!   `WorkspaceTarget` back to a caller-supplied entity id by exact
 //!   `(path, name_identifier_start)`.
+//! - [`semantic_extras`] — decision 28's "inferred types + compiler
+//!   diagnostics" task: [`semantic_extras::fetch_exported_types`] mirrors
+//!   `analyzer.ts`'s exported-declaration `typeOf`, and
+//!   [`semantic_extras::fetch_owner_diagnostics`] mirrors its three-source
+//!   compiler-diagnostic concatenation, both scoped to one owner file on an
+//!   already-open snapshot.
 //!
 //! `crate::virtual_fs::LayeredFs`/`OverlayFs` (still in [`virtual_fs`],
 //! since they implement that module's own trait) are what make P1-D-b's
@@ -42,10 +48,14 @@
 //!
 //! # What is deliberately out of scope
 //!
-//! This crate does not implement diagnostics (syntactic, semantic, or
-//! otherwise), emit, completions, or most of the `Checker`'s type-level
-//! surface (only `getTypeAtLocations`/`typeToString` are wired, and only
-//! because the task brief asked for them as optional). It also does not
+//! This crate implements only what its two consuming tasks needed:
+//! call/heritage target resolution ([`resolver`]) and, since decision 28's
+//! "inferred types + compiler diagnostics" task, exported-declaration typing
+//! and the three-source (`getSyntacticDiagnostics`/`getBindDiagnostics`/
+//! `getSemanticDiagnostics`) compiler-diagnostic surface ([`semantic_extras`]).
+//! It does not implement suggestion/declaration-emit diagnostics, emit,
+//! completions, or most of the `Checker`'s type-level surface beyond
+//! `getTypeAtLocations`/`typeToString`/`getExportsOfModule`. It also does not
 //! implement the sync (msgpack) channel — only the async JSON-RPC one.
 //!
 //! # Versioning risk
@@ -72,6 +82,7 @@ pub mod proto;
 pub mod residual_pass;
 pub mod resolver;
 pub mod rpc;
+pub mod semantic_extras;
 pub mod trivia;
 pub mod virtual_fs;
 
@@ -80,8 +91,9 @@ pub use client::{ClientError, TsgoClient};
 pub use entity_index::EntityIndex;
 pub use node::{NodeHandle, RemoteSourceFile};
 pub use residual_pass::{
-    PassStats, ResidualPass, ResidualPassConfig, ResidualPassError, ResolvedSite, SiteOutcome,
-    Window, WindowPlan, WindowStats,
+    DiagnosticResult, InferredTypeResult, PassStats, ResidualPass, ResidualPassConfig,
+    ResidualPassError, ResolvedSite, SiteOutcome, Window, WindowPlan, WindowStats,
 };
 pub use resolver::{PendingSite, ResidualResolver, Resolution, ResolvedDeclaration, SiteKind};
+pub use semantic_extras::{DiagnosticSite, TypedDeclarationSite};
 pub use virtual_fs::{LayeredFs, MapFs, OverlayFs, VirtualFs};

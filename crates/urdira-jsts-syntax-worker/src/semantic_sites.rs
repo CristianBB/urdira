@@ -41,27 +41,29 @@ use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast::Comment;
 use oxc_ast::ast::{
-    BindingPattern, CallExpression, ChainElement, Class, ClassType, ComputedMemberExpression,
-    ExportSpecifier, Expression, FormalParameter, Function, FunctionType, IdentifierReference,
+    ArrowFunctionExpression, BindingPattern, CallExpression, CatchParameter, ChainElement, Class,
+    ClassType, ComputedMemberExpression, ExportNamedDeclaration, ExportSpecifier, Expression,
+    FormalParameter, FormalParameterRest, Function, FunctionType, IdentifierReference,
     ImportDeclaration, ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier,
-    ImportSpecifier, MethodDefinition, MethodDefinitionKind, ModuleExportName, ObjectPattern,
-    ObjectProperty, PropertyDefinition, PropertyKey, PropertyKind, StaticMemberExpression,
-    TSEnumDeclaration, TSInterfaceDeclaration, TSMethodSignature, TSMethodSignatureKind,
-    TSModuleDeclaration, TSQualifiedName, TSSignature, TSType, TSTypeAliasDeclaration,
-    TSTypeAnnotation, TSTypeName, TSTypePredicate, TSTypePredicateName, TSTypeQueryExprName,
-    ThisExpression, VariableDeclarator,
+    ImportOrExportKind, ImportSpecifier, MethodDefinition, MethodDefinitionKind, ModuleExportName,
+    ObjectPattern, ObjectProperty, PropertyDefinition, PropertyKey, PropertyKind,
+    StaticMemberExpression, TSEnumDeclaration, TSInterfaceDeclaration, TSMethodSignature,
+    TSMethodSignatureKind, TSModuleDeclaration, TSQualifiedName, TSSignature, TSType,
+    TSTypeAliasDeclaration, TSTypeAnnotation, TSTypeName, TSTypePredicate, TSTypePredicateName,
+    TSTypeQueryExprName, ThisExpression, VariableDeclaration, VariableDeclarator,
 };
 use oxc_ast_visit::{
     Visit,
     utf8_to_utf16::Utf8ToUtf16,
     walk::{
-        walk_call_expression, walk_class, walk_export_specifier, walk_formal_parameter,
-        walk_function, walk_import_declaration, walk_import_default_specifier,
-        walk_import_expression, walk_import_namespace_specifier, walk_import_specifier,
-        walk_object_property, walk_property_definition, walk_static_member_expression,
-        walk_ts_enum_declaration, walk_ts_interface_declaration, walk_ts_method_signature,
-        walk_ts_module_declaration, walk_ts_qualified_name, walk_ts_type_alias_declaration,
-        walk_ts_type_predicate, walk_variable_declarator,
+        walk_arrow_function_expression, walk_call_expression, walk_catch_parameter, walk_class,
+        walk_export_named_declaration, walk_export_specifier, walk_formal_parameter,
+        walk_formal_parameter_rest, walk_function, walk_import_declaration,
+        walk_import_default_specifier, walk_import_expression, walk_import_namespace_specifier,
+        walk_import_specifier, walk_object_property, walk_property_definition,
+        walk_static_member_expression, walk_ts_enum_declaration, walk_ts_interface_declaration,
+        walk_ts_method_signature, walk_ts_module_declaration, walk_ts_qualified_name,
+        walk_ts_type_alias_declaration, walk_ts_type_predicate, walk_variable_declarator,
     },
 };
 use oxc_parser::Parser;
@@ -127,31 +129,92 @@ pub struct OwnerSemantics {
     /// `urdira-jsts-typeflow` for the exact scope. Empty whenever
     /// `URDIRA_JSTS_TYPEFLOW` is off.
     pub typeflow_heritage_rows: Vec<ProposedRecord>,
-    /// P2-2i: v4 parity fix for the gap decision 28 documents -- v3's
-    /// checker-backed `relate()` always publishes a `classification:
-    /// "possible"` `core:call` row (plus a paired `jsts:unresolved_call`
-    /// diagnostic) for a call site with no resolved declaration; v4's
-    /// checker-free pipeline published nothing at all for such a site
-    /// before this field existed. One `possible` relation record
-    /// immediately followed by its paired diagnostic record, per pending
-    /// call site (see `possible_call_record`/`unresolved_call_diagnostic_
-    /// record`'s doc comments for the exact body shapes -- built
-    /// byte-for-byte to the shape `fact-delta.ts`'s `proposalRelationRecord`/
-    /// `proposalDiagnosticRecord` produce for the checker-resolved
-    /// equivalent, plus a new `reason` field on the diagnostic that v3
-    /// never carried). Empty whenever this owner had no pending call site
-    /// (or none with a resolvable `source_id` -- `current_owner()` always
-    /// succeeds, so in practice this is simply "no pending call sites").
-    pub possible_call_rows: Vec<ProposedRecord>,
-    /// P2-2i: same parity fix as `possible_call_rows`, for heritage clauses
-    /// (`core:inherits`/`core:implements`, `classification: "possible"`).
-    /// No paired diagnostic (v3 never emits one for a heritage clause
-    /// either). Excludes a clause whose enclosing declaration has no entity
-    /// of its own (an anonymous class -- see `finish_heritage_clause`'s doc
-    /// comment), the one case where no `source_id` exists to build a row
-    /// from; that clause's site stays in `pending_sites` with no possible
-    /// row, same gap v3's own `entityForDeclaration` would hit.
-    pub possible_heritage_rows: Vec<ProposedRecord>,
+    /// P2-2i/A2 (pending.sites migration, 2026-09-04): every no-target
+    /// call/heritage site the E1a-E3 hybrid lane and typeflow could not
+    /// resolve -- v3's checker-backed `relate()` always publishes a
+    /// `classification: "possible"` `core:call`/`core:inherits`/
+    /// `core:implements` row with no `target_id` for such a site; v4 used
+    /// to mirror that shape as a full `ProposedRecord` too (2026-09-04's
+    /// P2-2i), but the store's own `pending.sites` side table (`urdira-
+    /// structural-store`'s `PendingSiteRow`) now carries this population
+    /// instead: a compact, non-record row the residual tsgo pass consumes
+    /// directly (`crate::v4::residual::collect`, in the indexing-worker
+    /// crate), so the RECORDS table (and every root/count derived from it)
+    /// carries no relation row without a `target_id` any more. One
+    /// [`PendingSiteProposal`] per pending call site (`reason` as-is, from
+    /// `PendingCallSite`) or pending heritage site (`reason` from
+    /// `PendingHeritageSite`, reinstated for this migration -- see that
+    /// struct's own doc comment). Excludes an anonymous class's heritage
+    /// clause (no `source_id` to attribute it to -- `finish_heritage_
+    /// clause`'s doc comment), same gap v3's own `entityForDeclaration`
+    /// would hit: that site simply stays in `pending_sites` (the checker-
+    /// dispatch listing) with no proposal here either. Empty whenever this
+    /// owner had no pending call/heritage site.
+    pub pending_site_rows: Vec<PendingSiteProposal>,
+    /// P2-2j: one per-candidate `possible` `core:call` row -- carrying a
+    /// REAL `target_id`, unlike a plain no-target `pending_site_rows` entry
+    /// -- for a call site whose typeflow receiver resolved to MULTIPLE
+    /// plausible declarations (an overloaded member, `urdira_jsts_typeflow::
+    /// MemberLookup::Many`, reason `overload_ambiguous`; or a union-typed
+    /// receiver, `MemberLookup::UnionCandidates`, reason `union_ambiguous`).
+    /// These are the ONLY `possible` rows the query engine can actually
+    /// traverse (`core:find_references`/`core:find_paths`/`core:expand_
+    /// relations` return a `possible` row classified only when it carries a
+    /// `target_id` -- a no-target possible row is query-invisible, and since
+    /// A2 there is no such RECORD any more at all: it is a `pending.sites`
+    /// row instead). The SAME site ALSO still contributes its ordinary
+    /// no-target entry to `pending_site_rows` (now with the candidate
+    /// reason) AND stays a `pending_sites` entry, so a later residual tsgo
+    /// pass can upgrade it
+    /// to one CONFIRMED row -- see `CandidateCallRow`'s own doc comment for
+    /// why both rows coexist. **Never** produces a `classification:
+    /// "confirmed"` row: a union/overload receiver is a genuine ambiguity
+    /// in this round, never promoted to a single target even when every
+    /// candidate agrees (this crate's zero-wrong-target discipline). Empty
+    /// in oracle mode (`URDIRA_JSTS_TYPEFLOW_ORACLE=1` folds a `Candidates`
+    /// outcome into the same plain-pending path `Unresolved` already takes,
+    /// deliberately -- see `visit_call_expression`'s own doc comment).
+    pub candidate_call_rows: Vec<ProposedRecord>,
+    /// Parameter entities, "referenced-only" variant (owner-approved,
+    /// 2026-09-04): one `jsts:entity_parameter` `ProposedRecord` per
+    /// identifier-pattern parameter declaration that received AT LEAST ONE
+    /// resolved `reference_rows` entry whose target is that parameter
+    /// (`DeclKind::Parameter`, `resolve_identifier_reference`) -- NOT every
+    /// parameter, unlike every other entity producer. Destructured/rest
+    /// parameters are never candidates (`classify_symbol_declaration`
+    /// already never resolves a reference to one). `id` is byte-identical to
+    /// the `target_id` `reference_rows` already carries for it (`jsts:
+    /// parameter:{path}:{nameStart}:{name}`), so materializing this record
+    /// makes that reference's `target_subject` intern where before it
+    /// dangled. See `ParameterDeclarationFact`/`ParamOwner` (this module) for
+    /// how the declaration facts (span, enclosing entity) are captured
+    /// independently of whether the parameter turns out referenced, and
+    /// `parameter_entity_record`'s own doc comment for the `parent_id`
+    /// resolution rule (function declaration / class-or-interface member
+    /// entity emitted today / variable-bound arrow-or-function-expression /
+    /// module fallback).
+    pub parameter_entity_rows: Vec<ProposedRecord>,
+    /// One `core:contains` `ProposedRecord` per `parameter_entity_rows`
+    /// entry, parent (per that entry's own `parent_id` resolution) ->
+    /// parameter, in the same order. Kept as a separate bucket purely for
+    /// orchestrator-census symmetry with `parameter_entity_rows`, same
+    /// reasoning as `typeflow_call_rows`/`typeflow_heritage_rows` being
+    /// split from `call_rows`/`heritage_rows`.
+    pub parameter_contains_rows: Vec<ProposedRecord>,
+    /// External package/symbol entities task (2026-09-04): one `jsts:
+    /// external_module`/`jsts:external_symbol` `ProposedRecord` per DISTINCT
+    /// external identity this owner's import/re-export/namespace-member
+    /// bindings resolved to (deduped within this owner -- see `SemanticWalker
+    /// ::finish`'s own conversion loop; the CROSS-owner case is handled by
+    /// `urdira-indexing-worker::v4::analyze::run_scoped`). See `docs/
+    /// evidence/2026-09-04-v4-external-entities.md`.
+    pub external_entity_rows: Vec<ProposedRecord>,
+    /// One `core:contains` `ProposedRecord` per external binding/member-read
+    /// OCCURRENCE (module -> symbol), NOT deduped the way `external_entity_
+    /// rows` is -- a relation's identity already varies per occurrence
+    /// (`(path, start, end, source_id, target_id)`), same precedent as
+    /// `core:import`/`core:call` rows.
+    pub external_contains_rows: Vec<ProposedRecord>,
     /// P0-S2 prototype (typeflow), `URDIRA_JSTS_TYPEFLOW_ORACLE=1` only:
     /// every site typeflow resolved WITHOUT removing it from
     /// `pending_sites`, so the orchestrator can compare typeflow's guess
@@ -233,6 +296,105 @@ pub struct SemanticSite {
     pub reason: Option<String>,
 }
 
+/// Kind of an unresolved call/heritage site awaiting the residual pass --
+/// this crate's own copy of `urdira_structural_store::row::PENDING_SITE_
+/// KIND_*` (that crate is not a dependency of this one; `crate::v4::
+/// materialize`, in `urdira-indexing-worker`, is the single place that maps
+/// this to the store's numeric constant).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingSiteKind {
+    Call,
+    Inherits,
+    Implements,
+}
+
+/// One no-target call/heritage site the E1a-E3 hybrid lane and typeflow
+/// could not resolve -- the store-bound (`urdira_structural_store::row::
+/// PendingSiteRow`) counterpart of what used to be a full `possible`
+/// `ProposedRecord` with no `target_id` (see `OwnerSemantics::pending_site_
+/// rows`'s own doc comment for the full migration rationale). `source_id`
+/// is the declaration id text; `crate::v4::materialize` resolves it to a
+/// `Dictionaries::subjects` ordinal the SAME way a relation record's own
+/// `source_id` resolves (`resolve_subject_key` -> `subjects.intern`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingSiteProposal {
+    pub start: u32,
+    pub end: u32,
+    pub site_kind: PendingSiteKind,
+    pub reason: &'static str,
+    pub source_id: String,
+}
+
+/// Stable, append-only numeric reason codes for a `PendingSiteRow.reason`
+/// byte (`urdira_structural_store::row::PendingSiteRow`'s `reason` field --
+/// an opaque `u8` the store itself never interprets, per that struct's own
+/// doc comment). **ON-DISK CONTRACT**: once a code is assigned here it is
+/// PERMANENT -- a future reason gets the next free number, never a reused
+/// or renumbered one. `from_reason` maps an unknown string to `Unspecified`
+/// (never panics); `to_reason` is the inverse, for anything that needs to
+/// render a code back to text (diagnostics, dumps).
+///
+/// | code | reason string | producer |
+/// |---:|---|---|
+/// | 0 | *(unspecified)* | any string this table does not recognize |
+/// | 1 | `call_deferred_to_e3` | this crate, `PendingCallSite` |
+/// | 2 | `call_target_uncertain` | this crate, `PendingCallSite` |
+/// | 3 | `overload_ambiguous` | this crate, `PendingCallSite`/`CandidateCallRow` |
+/// | 4 | `union_ambiguous` | this crate, `PendingCallSite`/`CandidateCallRow` |
+/// | 5 | `target_not_interned` | `urdira-indexing-worker`'s `v4::materialize` (a confirmed-shaped relation whose target never interned) |
+/// | 6 | `heritage_unresolved` | reserved fallback for a heritage site with no more specific reason available (see `PendingSiteProposal`'s own construction site in `finish`) |
+/// | 7 | `heritage_deferred_to_e3` | this crate, `PendingHeritageSite` |
+/// | 8 | `heritage_target_uncertain` | this crate, `PendingHeritageSite` |
+/// | 9 | `heritage_clause_partially_pending` | this crate, `PendingHeritageSite` |
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingReasonCode {
+    Unspecified = 0,
+    CallDeferredToE3 = 1,
+    CallTargetUncertain = 2,
+    OverloadAmbiguous = 3,
+    UnionAmbiguous = 4,
+    TargetNotInterned = 5,
+    HeritageUnresolved = 6,
+    HeritageDeferredToE3 = 7,
+    HeritageTargetUncertain = 8,
+    HeritageClausePartiallyPending = 9,
+}
+
+impl PendingReasonCode {
+    pub fn from_reason(reason: &str) -> u8 {
+        let code = match reason {
+            REASON_CALL_DEFERRED => Self::CallDeferredToE3,
+            REASON_CALL_TARGET_UNCERTAIN => Self::CallTargetUncertain,
+            REASON_OVERLOAD_AMBIGUOUS => Self::OverloadAmbiguous,
+            REASON_UNION_AMBIGUOUS => Self::UnionAmbiguous,
+            REASON_TARGET_NOT_INTERNED => Self::TargetNotInterned,
+            REASON_HERITAGE_UNRESOLVED => Self::HeritageUnresolved,
+            REASON_HERITAGE_DEFERRED => Self::HeritageDeferredToE3,
+            REASON_HERITAGE_TARGET_UNCERTAIN => Self::HeritageTargetUncertain,
+            REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING => Self::HeritageClausePartiallyPending,
+            _ => Self::Unspecified,
+        };
+        code as u8
+    }
+
+    pub fn to_reason(code: u8) -> &'static str {
+        match code {
+            1 => REASON_CALL_DEFERRED,
+            2 => REASON_CALL_TARGET_UNCERTAIN,
+            3 => REASON_OVERLOAD_AMBIGUOUS,
+            4 => REASON_UNION_AMBIGUOUS,
+            5 => REASON_TARGET_NOT_INTERNED,
+            6 => REASON_HERITAGE_UNRESOLVED,
+            7 => REASON_HERITAGE_DEFERRED,
+            8 => REASON_HERITAGE_TARGET_UNCERTAIN,
+            9 => REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING,
+            _ => "unspecified",
+        }
+    }
+}
+
 /// One typeflow guess recorded under `URDIRA_JSTS_TYPEFLOW_ORACLE=1` (see
 /// `OwnerSemantics::typeflow_oracle_hits`'s doc comment). `edge_kind` is
 /// `"call"`, `"inherits"`, or `"implements"` -- matches the `universal_kind`
@@ -264,6 +426,41 @@ pub struct TypeflowPendingShape {
     pub start: u32,
     pub end: u32,
     pub shape: &'static str,
+}
+
+/// Ambient module resolution task (2026-09-04) follow-up, owner-flagged
+/// review: a process-wide counter of every `AmbientResolution::Ambiguous`
+/// outcome (`resolve_named_binding_via_specifier`/`resolve_external_
+/// namespace_member`) whose specifier WOULD have resolved externally with
+/// certainty had no ambient declaration existed for it at all (`resolver::
+/// classify_external_specifier(specifier).is_some()`) -- i.e. a reference
+/// this task's own fix correctly demotes from "confirmed external" to
+/// "pending" (several script-level files declaring the identical specifier,
+/// or a bodyless shorthand declaration -- see `resolver::AmbientResolution`'s
+/// own doc comment for why neither case may guess). Distinguishes a real,
+/// intentional reduction in v4's own confirmed-reference count from a mere
+/// external-to-ambient TARGET SWAP (same site, still confirmed, just a
+/// different `target_id` -- swaps never touch this counter). `Relaxed`
+/// ordering is enough: this is a diagnostic aggregate, not a correctness
+/// gate. Read via `ambiguous_ambient_would_be_external_count`, reset via
+/// `reset_ambiguous_ambient_would_be_external_count` (both `pub` so the
+/// orchestrator, `urdira-indexing-worker::v4::analyze`, can report the
+/// total once per scan without this module needing its own "end of scan"
+/// hook).
+static AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// See [`AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL`]'s own doc comment.
+pub fn ambiguous_ambient_would_be_external_count() -> u64 {
+    AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// See [`AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL`]'s own doc comment. Call
+/// before a scan whose own count is wanted in isolation (this counter is
+/// process-wide and otherwise accumulates across every scan in the same
+/// process, same as any other process-global diagnostic counter would).
+pub fn reset_ambiguous_ambient_would_be_external_count() {
+    AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Pending reasons. These are the exhaustive set of reasons E1a can attach
@@ -301,6 +498,44 @@ const REASON_CALL_TARGET_UNCERTAIN: &str = "call_target_uncertain";
 /// `REASON_HERITAGE_DEFERRED`'s sibling reasoning. Same non-branching
 /// wire contract as `REASON_CALL_TARGET_UNCERTAIN`.
 const REASON_HERITAGE_TARGET_UNCERTAIN: &str = "heritage_target_uncertain";
+/// P2-2j: `resolve_call_target_typeflow`'s `StaticMemberExpression` branch
+/// resolved the receiver to a SINGLE known entity, but `ProgramIndex::
+/// members` found the requested member declared MORE THAN ONCE on that one
+/// container (`urdira_jsts_typeflow::MemberLookup::Many` -- TypeScript
+/// overload signatures plus their implementation, or any other duplicate
+/// declaration this crate does not disambiguate). Distinct from `REASON_
+/// UNION_AMBIGUOUS` (a union of DIFFERENT container types, never a single
+/// container's own overload set). The site stays `checker_pending` with
+/// this reason AND gets one `CandidateCallRow` per overload -- see
+/// `OwnerSemantics::candidate_call_rows`'s doc comment.
+const REASON_OVERLOAD_AMBIGUOUS: &str = "overload_ambiguous";
+/// P2-2j: `resolve_call_target_typeflow`'s `StaticMemberExpression` branch
+/// resolved the receiver to a UNION of known entities (`a: A | B; a.run()`)
+/// and `ProgramIndex::members_of_union` found at least one candidate on
+/// every constituent (`urdira_jsts_typeflow::MemberLookup::UnionCandidates`)
+/// -- see `REASON_OVERLOAD_AMBIGUOUS`'s doc comment for how this differs
+/// from an overloaded SINGLE container. Never produced for a union where
+/// even one constituent lacks the member entirely (that stays plain
+/// pending with no candidates -- `MemberLookup::None`, never a guess).
+const REASON_UNION_AMBIGUOUS: &str = "union_ambiguous";
+/// A2 (pending.sites migration): fallback reason for a `PendingSiteProposal`
+/// built from a [`PendingHeritageSite`] whose own `reason` field cannot be
+/// recovered for some future reason -- not reached by any code path today
+/// (`PendingHeritageSite.reason` is always populated at every one of its
+/// three construction sites in `resolve_super_class`/`finish_heritage_
+/// clause`, see those functions' own bodies), kept `pub` per [`PendingReasonCode`]'s
+/// own reserved-code-6 table entry and as a defensive default for a future
+/// heritage construction site that forgets to set `reason`.
+pub const REASON_HERITAGE_UNRESOLVED: &str = "heritage_unresolved";
+/// A2 (pending.sites migration): the reason `urdira-indexing-worker`'s
+/// `v4::materialize` module attaches to a `PendingSiteRow` it synthesizes
+/// for a relation record whose identity claimed a resolved target that
+/// never interned into `target_subject` (a confirmed-shaped call/heritage
+/// row the cold producer could not attach a live entity to -- see
+/// `PendingReasonCode`'s own doc table, code 5). This crate never produces
+/// this reason itself; the constant lives here so `materialize.rs` does not
+/// have to hardcode the string a second time.
+pub const REASON_TARGET_NOT_INTERNED: &str = "target_not_interned";
 /// Found live against the n8n corpus (E3 gate 3, 2.000-owner determinism
 /// run): a multi-type heritage clause (`implements A, B` / `interface I
 /// extends A, B`) is ONE syntactic `ts.HeritageClause` node on the checker
@@ -457,6 +692,28 @@ fn declaration_id(kind: DeclKind, path: &str, start: u32, name: &str) -> String 
     format!("jsts:{}:{path}:{start}:{name}", kind.identity_name())
 }
 
+/// 2026-09-04 references-parity task, bucket 3: `parameters.items`'s own
+/// identifier-pattern names, with the binding identifier's own span (`name`,
+/// `start`, `end`) -- feeds `predicate_param_stack`. A destructured/rest
+/// (`FormalParameters::rest` is a SEPARATE field, never in `items` at all)
+/// parameter contributes nothing, matching `classify_symbol_declaration`'s
+/// own conservative `None` for those shapes (a type predicate can only ever
+/// repeat a SIMPLE parameter's name, per TypeScript's own grammar -- `x is
+/// Foo` requires `x` to be an identifier, never a pattern).
+fn identifier_pattern_params<'a>(items: &[FormalParameter<'a>]) -> Vec<(String, u32, u32)> {
+    items
+        .iter()
+        .filter_map(|item| match &item.pattern {
+            BindingPattern::BindingIdentifier(ident) => Some((
+                ident.name.as_str().to_owned(),
+                ident.span.start,
+                ident.span.end,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The `(start, name)` an identity-bearing `PropertyKey` contributes, when it
 /// has one at all -- shared by `visit_method_definition`,
 /// `visit_object_property`, and `visit_ts_method_signature`, all of which
@@ -493,6 +750,32 @@ fn property_key_name<'a>(key: &PropertyKey<'a>) -> Option<(u32, String)> {
     }
 }
 
+/// P2-2j: whether `ty` is one of the constituent shapes a union receiver
+/// drops silently rather than treating as a real member-lookup candidate --
+/// mirrors `urdira_jsts_typeflow::is_dropped_union_constituent` exactly
+/// (that crate's own private helper; duplicated here rather than shared,
+/// since the two crates each parse with their own separate oxc allocator --
+/// see this file's own `TypeflowValue`/`urdira_jsts_typeflow::RawTypeRef`
+/// doc comments for why the two type-shape enums are parallel, not shared).
+/// `null`/`undefined` (TypeScript's own nullability convention) and a
+/// literal/primitive keyword type are dropped; every other constituent
+/// (including `any`/`unknown`/`void`/`never`/`object`) is classified
+/// normally and, if unclassifiable, contaminates the whole union via the
+/// caller's own `TSUnionType` arm.
+fn is_dropped_union_constituent(ty: &TSType) -> bool {
+    matches!(
+        ty,
+        TSType::TSNullKeyword(_)
+            | TSType::TSUndefinedKeyword(_)
+            | TSType::TSLiteralType(_)
+            | TSType::TSStringKeyword(_)
+            | TSType::TSNumberKeyword(_)
+            | TSType::TSBooleanKeyword(_)
+            | TSType::TSBigIntKeyword(_)
+            | TSType::TSSymbolKeyword(_)
+    )
+}
+
 /// Classify a resolved symbol's declaration into one of the identity kinds
 /// that `analyzer.ts` would also assign an entity to, or `None` when the
 /// checker's own `entityForDeclaration` would likewise return `undefined`
@@ -523,6 +806,42 @@ fn classify_symbol_declaration(
         }
         AstKind::FormalParameter(param) => {
             matches!(&param.pattern, BindingPattern::BindingIdentifier(_))
+                .then_some(DeclKind::Parameter)
+        }
+        // 2026-09-04 references-parity task, bucket 1
+        // (`unsupported_declaration_kind`, 92% of the bucket): a catch
+        // clause's own simple identifier binding (`catch (error) {}`).
+        // `CatchParameter::bind` (oxc_semantic) registers the symbol's
+        // declaration node as `AstKind::CatchParameter` itself (verified
+        // against `oxc_semantic`'s `visit_catch_parameter`: `enter_node`
+        // sets `current_node_id` to the `CatchParameter` node before
+        // `param.bind(self)` runs) -- never `AstKind::VariableDeclarator`,
+        // even though v3's `analyzer.ts` (`addEntity`'s `isVariableDeclaration`
+        // branch) treats it exactly like an ordinary `variable`. A
+        // destructured catch binding (`catch ({ message }) {}`) stays
+        // `None` here, same conservative rule as every other pattern kind.
+        AstKind::CatchParameter(param) => {
+            matches!(&param.pattern, BindingPattern::BindingIdentifier(_))
+                .then_some(DeclKind::Variable)
+        }
+        // 2026-09-04 references-parity task, bucket 1 (~4.5% of the
+        // bucket): a rest parameter (`...args`). oxc gives a rest
+        // parameter its OWN node kind, `FormalParameterRest` (a SIBLING of
+        // `FormalParameters::items`, not a `FormalParameter` wrapping a
+        // `BindingPattern::BindingRestElement` the way a destructured rest
+        // element inside an object/array pattern is) -- confirmed against
+        // `oxc_semantic::binder`'s `impl Binder for FormalParameterRest`
+        // and `visit_formal_parameter_rest`'s own `AstKind::
+        // FormalParameterRest(...)` `enter_node`. v3 treats it as an
+        // ordinary `isParameterDeclaration` -- kind `parameter`, matching
+        // `visit_formal_parameter`'s own `FormalParameter` arm above byte
+        // for byte, just reached through the sibling node. A destructured
+        // rest element (`...{ a }`, `...[a]]` -- not valid JS syntax for a
+        // FUNCTION rest parameter, but the pattern shape check stays for
+        // defensive parity with the ordinary-parameter arm above) stays
+        // `None`.
+        AstKind::FormalParameterRest(rest) => {
+            matches!(&rest.rest.argument, BindingPattern::BindingIdentifier(_))
                 .then_some(DeclKind::Parameter)
         }
         _ => None,
@@ -563,6 +882,37 @@ struct ReferenceRow {
     cross_file: bool,
 }
 
+/// External package/symbol entities task (2026-09-04): one external
+/// binding/member-read occurrence recorded by `SemanticWalker::emit_
+/// external_use`. `specifier` is already canonicalized (`classify_external_
+/// specifier`'s return value); `name` is the imported/exported/member name
+/// (`"default"`/`"*"` included). `start`/`end` are this OCCURRENCE's own
+/// site span (the binding's local-name span for an import/re-export, the
+/// member name's span for a namespace member read) -- the `core:contains`
+/// row's own span, not the entity's (entities have no real span, see
+/// `crate::external_module_entity`'s doc comment).
+struct ExternalSymbolUse {
+    specifier: String,
+    name: String,
+    is_type: bool,
+    start: u32,
+    end: u32,
+    /// Measurement-only (2026-09-04 n8n before/after count, gated behind
+    /// `URDIRA_V4_DEBUG_EXTERNAL_ENTITIES` in `finish()` below): which
+    /// PRE-this-task pending reason this occurrence would have carried.
+    /// `true` for `resolve_named_binding_via_specifier`'s external branch
+    /// (import/re-export bindings, `visit_import_namespace_specifier`'s own
+    /// value-usage) -- unconditionally `Pending(REASON_IMPORT_BINDING)`
+    /// before this task; `false` for `visit_static_member_expression`'s
+    /// external namespace-member-read branch -- unconditionally
+    /// `Pending(REASON_MEMBER_ACCESS)` before this task. Never read by
+    /// production code paths (no query-layer/store consumer), purely so the
+    /// n8n before/after report can state, from a SINGLE run of the current
+    /// (fixed) code, exactly how many now-confirmed rows used to carry each
+    /// reason -- see this task's evidence doc.
+    was_import_binding: bool,
+}
+
 /// One `core:call` row (E3, T1): unlike `ReferenceRow`, there is no
 /// self-reference guard here -- the checker's own `relate("call", ...)` in
 /// `analyzer.ts` never excludes `source_id == target_id` (a recursive call's
@@ -592,9 +942,8 @@ struct HeritageRow {
 /// P2-2i: one CALL site neither E1-E3 nor typeflow could resolve, still
 /// carrying the enclosing entity (`source_id`, always present -- `current_
 /// owner()` never returns `None`, see its own doc comment) and the reason
-/// E1a/E3 already attached to it. Turned into a `possible` `core:call` row
-/// plus a `jsts:unresolved_call` diagnostic by `unresolved_call_diagnostic`/
-/// `possible_call_record` in `finish`.
+/// E1a/E3 already attached to it. Turned into a [`PendingSiteProposal`]
+/// (`site_kind: Call`, carrying this site's own `reason`) in `finish`.
 struct PendingCallSite {
     start: u32,
     end: u32,
@@ -604,12 +953,59 @@ struct PendingCallSite {
 
 /// P2-2i: one heritage clause entry that stayed `checker_pending` with a
 /// real enclosing declaration to attribute it to. `relation_kind` is
-/// `"inherits"` or `"implements"`, same convention as `HeritageRow`.
+/// `"inherits"` or `"implements"`, same convention as `HeritageRow`. `reason`
+/// (A2, pending.sites migration: reinstated after P2-2i's own session
+/// removed it as dead code, since a `possible` heritage row never carried
+/// one -- a `PendingSiteRow` does, see `PendingSiteProposal`'s doc comment)
+/// is whichever reason was already in scope at this site's own `push_site`
+/// call (`REASON_HERITAGE_DEFERRED`, `REASON_HERITAGE_TARGET_UNCERTAIN`, or
+/// `REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING`).
 struct PendingHeritageSite {
     start: u32,
     end: u32,
     source_id: String,
     relation_kind: &'static str,
+    reason: &'static str,
+}
+
+/// P2-2j: one per-candidate `possible` `core:call` row for a call site whose
+/// typeflow receiver resolved to MULTIPLE plausible declarations -- an
+/// overloaded member (`MemberLookup::Many`, `REASON_OVERLOAD_AMBIGUOUS`) or
+/// a union-typed receiver (`MemberLookup::UnionCandidates`, `REASON_UNION_
+/// AMBIGUOUS`). Unlike `PendingCallSite` (no target at all), each row here
+/// carries its OWN `target_id` -- one candidate, one row -- so the query
+/// engine can actually traverse it: `core:find_references`/`core:find_
+/// paths`/`core:expand_relations` only ever return `possible` rows that
+/// carry a `target_id` (a no-target possible row is query-invisible by
+/// construction). The SAME call site also stays a `PendingCallSite` with
+/// the SAME `reason` (see `visit_call_expression`'s `Candidates` arm), so a
+/// later residual tsgo pass can still upgrade it to one CONFIRMED row.
+/// Turned into a `possible` (never `confirmed`) `core:call` row by
+/// `candidate_call_record` in `finish`.
+struct CandidateCallRow {
+    start: u32,
+    end: u32,
+    source_id: String,
+    target_id: String,
+    reason: &'static str,
+}
+
+/// Outcome of `SemanticWalker::resolve_call_target_typeflow`. `Candidates`
+/// is P2-2j: the receiver resolved, but the member lookup itself was
+/// genuinely ambiguous (an overload set on one container, or a union of
+/// several containers) -- one `CandidateCallRow` per target is still worth
+/// publishing (each carries its OWN `target_id`), but this is deliberately
+/// NEVER a `Resolved` -- see `REASON_OVERLOAD_AMBIGUOUS`/`REASON_UNION_
+/// AMBIGUOUS`'s own doc comments and this crate's zero-wrong-target
+/// discipline: a union/overload receiver never promotes to a confirmed
+/// target in this round, even when every candidate agrees.
+enum TypeflowCallResolution {
+    Resolved(String, &'static str),
+    Candidates {
+        targets: Vec<String>,
+        reason: &'static str,
+    },
+    Unresolved,
 }
 
 /// P1-A: the resolved static type of an expression this walker's typeflow
@@ -654,6 +1050,18 @@ enum TypeflowValue {
     /// interface/class always switches to `Entity`, backed by the real
     /// cross-file index, from then on).
     Inline(Vec<(String, TypeflowValue)>),
+    /// P2-2j: a TypeScript union type used as a member-access receiver
+    /// (`a: A | B; a.run()`) -- see `urdira_jsts_typeflow::RawTypeRef::
+    /// Union`'s doc comment for the exact construction rules (`type_ref_of_
+    /// ts_type`'s `TSUnionType` arm mirrors them locally: drop null/
+    /// undefined/literal/primitive constituents, contaminate to `None` on
+    /// any other unclassified remaining constituent, dedupe, collapse a
+    /// single survivor). `resolve_type_ref_relative` produces this from a
+    /// cross-file `ResolvedTypeRef::Union` the same way it produces every
+    /// other wrapper. Consumed by `as_entities` (never `as_entity`, which
+    /// stays `None` for a `Union` -- see its own doc comment) and routed to
+    /// `ProgramIndex::members_of_union` by `resolve_call_target_typeflow`.
+    Union(Vec<TypeflowValue>),
 }
 
 /// P0-S2 typeflow: see `SemanticWalker::class_stack`'s doc comment.
@@ -672,6 +1080,18 @@ type HeritageClauseEntry = (u32, u32, Result<(String, String), &'static str>);
 enum ReferenceResolution {
     Resolved { target_id: String, cross_file: bool },
     Pending(&'static str),
+}
+
+/// Ambient module resolution task (2026-09-04): `resolve_external_
+/// namespace_member`'s outcome -- see that method's own doc comment.
+enum NamespaceMemberResolution {
+    /// A genuine external package/builtin member read: `emit_external_use`
+    /// still needs to fire (canonical specifier, resolved `target_id`).
+    External(String, String),
+    /// Resolved through a workspace `declare module` block instead: the
+    /// target already exists, published by the DECLARING file's own
+    /// producers -- no `emit_external_use` side effect.
+    Ambient(String),
 }
 
 /// Everything `analyze_owner_semantics_with_context` needs to close an
@@ -709,6 +1129,50 @@ pub struct HybridResolutionContext<'a> {
     /// independently resolves it and the orchestrator can compare the two
     /// answers. Ignored when `typeflow_index` is `None`.
     pub typeflow_oracle: bool,
+    /// Ambient module resolution task (2026-09-04): the workspace-wide
+    /// index of every `declare module "specifier" { ... }` block any file
+    /// in `files` declares, built ONCE by the caller (`urdira-indexing-
+    /// worker::v4::analyze::run_scoped`) from that SAME `files` snapshot,
+    /// rather than re-scanned per lookup -- consulted by `resolve_named_
+    /// binding_via_specifier`'s external branch, `visit_import_namespace_
+    /// specifier`, and `resolve_external_namespace_member` BEFORE
+    /// `resolver::classify_external_specifier` gets a turn (fix item 2: an
+    /// ambiently-declared specifier's import/reference targets the
+    /// declaration inside that block, never a synthetic external entity).
+    pub ambient_index: &'a resolver::AmbientModuleIndex,
+}
+
+/// Parameter entities, "referenced-only" variant: the enclosing declaration
+/// a `FormalParameter` should attribute `parent_id`/`qualified_name` to,
+/// carried on `param_owner_stack`/`pending_function_owner`. `entity_id` is
+/// the SAME id lib.rs's own entity producer for that declaration already
+/// uses (`stable_entity_id`/`declaration_id`, byte-identical formula), so a
+/// parameter's `parent_id` never dangles: it either names one of those
+/// already-emitted entities, or (a bare `None` in the surrounding
+/// `Option<ParamOwner>`) the code building the fact substitutes the module
+/// entity itself, which is unconditionally emitted for every file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParamOwner {
+    entity_id: String,
+    qualified_name: String,
+}
+
+/// Parameter entities, "referenced-only" variant: the declaration facts one
+/// identifier-pattern `FormalParameter` contributes, recorded by
+/// `visit_formal_parameter` regardless of whether it turns out referenced.
+/// `start`/`end` are the parameter's own BINDING IDENTIFIER span (`ident.
+/// span`, matching every other entity's "name span" convention -- e.g.
+/// `push_entity`'s `identifier.span` -- never the whole `FormalParameter`
+/// span, which would also cover a type annotation/decorators/accessibility
+/// modifier/default value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParameterDeclarationFact {
+    entity_id: String,
+    name: String,
+    start: u32,
+    end: u32,
+    parent_id: String,
+    qualified_name: String,
 }
 
 struct SemanticWalker<'a, 'ctx, 'r> {
@@ -740,7 +1204,7 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// pipeline must now speak for itself, mirroring `analyzer.ts`'s own
     /// `relate("call", relationSource, undefined, node, "possible")` +
     /// paired `jsts:unresolved_call` diagnostic. See `OwnerSemantics::
-    /// possible_call_rows`'s doc comment for the exact contract.
+    /// pending_site_rows`'s doc comment for the exact contract.
     pending_call_sites: Vec<PendingCallSite>,
     /// P2-2i: every heritage clause entry that stayed `checker_pending` with
     /// a real enclosing declaration to attribute it to (`self_id` present --
@@ -749,6 +1213,13 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// `relate("inherits"|"implements", relationSource, undefined, type,
     /// "possible")`.
     pending_heritage_sites: Vec<PendingHeritageSite>,
+    /// P2-2j: every per-candidate `possible` `core:call` row produced for a
+    /// call site whose typeflow receiver was genuinely ambiguous (an
+    /// overload set or a union). See `CandidateCallRow`'s and `OwnerSemantics
+    /// ::candidate_call_rows`'s own doc comments. Never populated in oracle
+    /// mode (`visit_call_expression`'s `Candidates` arm is only reached
+    /// outside that mode).
+    candidate_call_rows: Vec<CandidateCallRow>,
     /// `URDIRA_JSTS_TYPEFLOW_ORACLE=1` only. See `OwnerSemantics::
     /// typeflow_oracle_hits`'s doc comment.
     typeflow_oracle_hits: Vec<TypeflowOracleHit>,
@@ -769,6 +1240,113 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// a static method/property initializer from an instance one. Empty
     /// (defaults to instance, `false`) outside any member body.
     static_context: Vec<bool>,
+    /// Parameter entities, "referenced-only" variant: the nearest enclosing
+    /// declaration a `FormalParameter` directly inside it should attribute
+    /// `parent_id` to, innermost last -- `None` when that nearest enclosing
+    /// callable has no entity of its own (an anonymous callback, an object-
+    /// literal shorthand method, a nested class's member, a non-first
+    /// declarator's arrow/function-expression init -- see
+    /// `parameter_entity_record`'s doc comment for the full rule). Pushed
+    /// exactly once per `Function`/`ArrowFunctionExpression` node reached
+    /// through `self.visit_function`/`self.visit_arrow_function_expression`
+    /// (never through `visit_method_definition`'s own deliberate `walk_
+    /// function` bypass, which brackets this stack directly instead -- see
+    /// that override's own comment). Read only by `visit_formal_parameter`.
+    param_owner_stack: Vec<Option<ParamOwner>>,
+    /// A one-shot hint for the VERY NEXT `Function`/`ArrowFunctionExpression`
+    /// node `self.visit_function`/`self.visit_arrow_function_expression`
+    /// reaches, set by `visit_variable_declarator` (a variable-bound arrow/
+    /// function-expression owns its params under the VARIABLE's own entity,
+    /// never a fresh anonymous frame) and by `visit_object_property` (an
+    /// object-literal shorthand method has no entity of its own -- typeflow's
+    /// `member_declarations` never enumerates object literals -- so this is
+    /// set to `Some(None)` there to positively override rather than risk an
+    /// unrelated OUTER hint leaking in). `Some(owner)` is drained by exactly
+    /// one `.take()` at the top of both overrides, regardless of which
+    /// branch they end up taking, so a hint can never survive past the one
+    /// node it was set for. `None` (the default) means "decide normally"
+    /// (a named function declaration owns itself; anything else falls back
+    /// to the module).
+    pending_function_owner: Option<Option<ParamOwner>>,
+    /// Whether the `VariableDeclarator` `visit_variable_declarator` is
+    /// currently walking is the FIRST declarator of its own
+    /// `VariableDeclaration` -- lane 1's plain entity pass (`lib.rs`'s
+    /// `SyntaxCollector::visit_variable_declaration`) only ever creates a
+    /// `core:value` entity for `declaration.declarations.first()`, so `const
+    /// a = 1, f = () => a;`'s `f` gets NO variable entity even though
+    /// `classify_symbol_declaration` still resolves references to it as
+    /// `DeclKind::Variable`. Set by the `visit_variable_declaration`
+    /// override just below (one assignment per declarator, immediately
+    /// before visiting it), consulted by `visit_variable_declarator` when
+    /// deciding whether a directly-init'd arrow/function-expression's own
+    /// params get the variable's id or fall back to the module.
+    declarator_owns_entity: bool,
+    /// Parameter entities, "referenced-only" variant: every identifier-
+    /// pattern parameter declaration this walk has seen, keyed by its own
+    /// entity id (`jsts:parameter:{path}:{nameStart}:{name}`, byte-identical
+    /// to the `target_id` a resolved reference to it carries) -- recorded
+    /// UNCONDITIONALLY in `visit_formal_parameter`, before it is known
+    /// whether the parameter is ever referenced (`finish` filters this map
+    /// down to `referenced_parameter_targets` at the end). A `BTreeMap` so a
+    /// later "same id twice" bug (there should never be one -- each
+    /// `nameStart` is a unique byte offset) would silently keep the LAST
+    /// write rather than panic; never observed live.
+    parameter_declarations: BTreeMap<String, ParameterDeclarationFact>,
+    /// Parameter entities, "referenced-only" variant: `entity_id -> qualified
+    /// name` for every class/interface member `push_member_entities`
+    /// (lib.rs) actually emits an entity for -- see `analyze_owner_semantics
+    /// _with_context`'s own construction comment for why this is sourced
+    /// from `urdira_jsts_typeflow::member_declarations` directly rather than
+    /// re-derived. Consulted by `visit_method_definition`/`visit_object_
+    /// property`/`visit_ts_method_signature` to decide each member's own
+    /// `param_owner_stack` frame.
+    member_qualified_names: BTreeMap<String, String>,
+    /// Parameter entities, "referenced-only" variant: the `target_id` of
+    /// every resolved reference (`visit_identifier_reference`'s `Resolved`
+    /// arm) whose target is a parameter (`target_id` starts with
+    /// `"jsts:parameter:"`) -- a `BTreeSet` both to dedupe (a parameter
+    /// referenced twice must still get exactly one entity) and to give
+    /// `finish`'s emission order a deterministic, dependency-free sort (by
+    /// id, which already sorts by path/nameStart/name).
+    referenced_parameter_targets: BTreeSet<String>,
+    /// 2026-09-04 references-parity task, bucket 1: same declaration-fact
+    /// shape and "referenced-only" lifecycle as `parameter_declarations`
+    /// (`ParameterDeclarationFact` is reused verbatim -- nothing about its
+    /// fields is parameter-specific), for a catch clause's own simple
+    /// identifier binding (`catch (error) {}`, `DeclKind::Variable`, v3's
+    /// `isVariableDeclaration` treatment). Recorded unconditionally by
+    /// `visit_catch_parameter`; `finish` filters this down to `referenced_
+    /// catch_targets` and materializes each survivor through the SAME
+    /// `OwnerSemantics::parameter_entity_rows`/`parameter_contains_rows`
+    /// output buckets the parameter producer already uses (a shared,
+    /// kind-agnostic sink -- see `catch_variable_entity_record`'s own doc
+    /// comment).
+    catch_declarations: BTreeMap<String, ParameterDeclarationFact>,
+    /// 2026-09-04 references-parity task, bucket 1: the `target_id` of
+    /// every resolved reference whose target is a catch binding (`target_id`
+    /// starts with `"jsts:variable:"` -- see `visit_identifier_reference`'s
+    /// `Resolved` arm). Broader than "catch bindings only" by construction
+    /// (any `DeclKind::Variable` target matches the prefix, including an
+    /// ordinary variable that already has its own unconditional entity from
+    /// lib.rs's `SyntaxCollector`) -- harmless: `finish`'s `filter_map`
+    /// against `catch_declarations` silently drops every id that is not
+    /// actually a recorded catch binding, the same safe-miss pattern
+    /// `parameter_declarations`' own filter_map already relies on for a
+    /// parameter PROPERTY's id.
+    referenced_catch_targets: BTreeSet<String>,
+    /// 2026-09-04 references-parity task, bucket 3
+    /// (`type_predicate_parameter`): the innermost enclosing callable
+    /// signature's own identifier-pattern parameter names (`name`, binding
+    /// identifier `start`, `end`), pushed by `visit_function`/`visit_arrow_
+    /// function_expression`/`visit_method_definition`/`visit_ts_method_
+    /// signature` immediately before walking that signature's own body/
+    /// return-type (so it is still on top while a `TSTypePredicate` in that
+    /// SAME signature's return type is visited), popped right after. Pushed
+    /// unconditionally (an empty `Vec` counts as a real frame) so nested
+    /// callables never leak an OUTER signature's parameters in --
+    /// `.last()` always names the truly innermost one. See `visit_ts_type_
+    /// predicate`'s own doc comment for the resolution rule.
+    predicate_param_stack: Vec<Vec<(String, u32, u32)>>,
     /// P0-S2/P1-A typeflow: every local variable/parameter this walk has
     /// typed, through a declared type annotation OR (P1-A, rule (b))
     /// recursively through its own initializer expression when unannotated
@@ -806,6 +1384,39 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// Import declarations are always module-top-level with no nesting, so
     /// a single `Option` (not a stack) suffices.
     current_import_source: Option<String>,
+    /// 2026-09-04 references-parity task, Phase B bucket 1: the enclosing
+    /// `ExportNamedDeclaration`'s own `source` specifier text while walking
+    /// its specifiers (`export { a } from "HERE"`), `None` when the
+    /// current `ExportNamedDeclaration` has no `source` (the sourceless
+    /// `export { a, b as c }` form) or none is being walked at all.
+    /// `resolve_export_source_binding` consults this the same way
+    /// `resolve_import_binding` consults `current_import_source` --
+    /// deliberately a SEPARATE field rather than reusing `current_import_
+    /// source`: an export specifier can be walked while an outer import
+    /// declaration's source is unrelated (not true in practice, since
+    /// neither form nests, but keeping the two fields distinct removes any
+    /// doubt and mirrors `visit_import_declaration`'s own save/restore
+    /// exactly). Export declarations never nest either, so a single
+    /// `Option` (not a stack) suffices here too.
+    current_export_source: Option<String>,
+    /// External package/symbol entities task: whether the `ImportDeclaration`
+    /// currently being walked is `import type { ... } from "m"` (whole-
+    /// declaration type-only). Save/restore, same shape as `current_import_
+    /// source`. A per-specifier `import { type Foo } from "m"` is detected
+    /// separately, from `ImportSpecifier::import_kind` itself, at the
+    /// specifier visit site.
+    current_import_type_only: bool,
+    /// Same as `current_import_type_only`, for `export type { ... } from
+    /// "m"` (`ExportNamedDeclaration::export_kind`).
+    current_export_type_only: bool,
+    /// External package/symbol entities task: every external binding/
+    /// member-read this walk resolved, in visitation order -- converted into
+    /// `OwnerSemantics::external_entity_rows`/`external_contains_rows` once,
+    /// in `finish()` (same "collect raw facts during the walk, build
+    /// `ProposedRecord`s once at the end" shape `parameter_entity_rows`
+    /// already uses). See `emit_external_use`'s own doc comment for what
+    /// pushes into this.
+    external_uses: Vec<ExternalSymbolUse>,
     /// Every import-bound symbol this walk has resolved (or given up on) so
     /// far, keyed by oxc's `SymbolId` for the specifier's local binding.
     /// Populated as `visit_import_specifier` is reached; consulted by
@@ -858,6 +1469,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         nodes: &'ctx AstNodes<'a>,
         jsdoc_typed_file: bool,
         ctx: &'r HybridResolutionContext<'r>,
+        member_qualified_names: BTreeMap<String, String>,
     ) -> Self {
         let module_id = format!("jsts:module:{path}:0:{path}");
         let is_test_source = ctx
@@ -884,15 +1496,29 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             typeflow_heritage_rows: Vec::new(),
             pending_call_sites: Vec::new(),
             pending_heritage_sites: Vec::new(),
+            candidate_call_rows: Vec::new(),
             typeflow_oracle_hits: Vec::new(),
             typeflow_pending_call_shapes: Vec::new(),
             class_stack: Vec::new(),
             static_context: Vec::new(),
+            param_owner_stack: Vec::new(),
+            pending_function_owner: None,
+            declarator_owns_entity: false,
+            parameter_declarations: BTreeMap::new(),
+            referenced_parameter_targets: BTreeSet::new(),
+            catch_declarations: BTreeMap::new(),
+            referenced_catch_targets: BTreeSet::new(),
+            predicate_param_stack: Vec::new(),
+            member_qualified_names,
             local_types: HashMap::new(),
             destructured_member_entities: HashMap::new(),
             jsdoc_typed_file,
             ctx,
             current_import_source: None,
+            current_export_source: None,
+            current_import_type_only: false,
+            current_export_type_only: false,
+            external_uses: Vec::new(),
             import_bindings: HashMap::new(),
             namespace_import_specifiers: HashMap::new(),
             namespace_reexport_targets: HashMap::new(),
@@ -906,30 +1532,155 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// in the chain (no enclosing import context, specifier does not
     /// resolve to a captured file, name not found or ambiguous once there)
     /// degrades to `Pending(REASON_IMPORT_BINDING)` -- never a guess.
-    fn resolve_import_binding(&self, imported_name: &str) -> ReferenceResolution {
+    ///
+    /// `is_type`/`start`/`end` (external package/symbol entities task): only
+    /// consulted for the external-specifier branch (an internal, workspace-
+    /// resolved binding's `target_id` already carries its own `EntityKind`/
+    /// `core:type` via `classify_symbol_declaration`, so `is_type` is a
+    /// no-op there) -- `is_type` is whether THIS binding is `import type`/
+    /// `import { type X }`; `start`/`end` are this binding's own site span,
+    /// used as the `core:contains` occurrence span `emit_external_use`
+    /// records.
+    fn resolve_import_binding(
+        &mut self,
+        imported_name: &str,
+        is_type: bool,
+        start: u32,
+        end: u32,
+    ) -> ReferenceResolution {
+        let source_specifier = self.current_import_source.clone();
+        self.resolve_named_binding_via_specifier(
+            source_specifier.as_deref(),
+            imported_name,
+            REASON_IMPORT_BINDING,
+            is_type,
+            start,
+            end,
+        )
+    }
+
+    /// 2026-09-04 references-parity task, Phase B bucket 1: the `re_export_
+    /// binding` sibling of `resolve_import_binding`, for `local`'s own
+    /// position in a WITH-SOURCE export specifier (`export { a } from
+    /// "./x"`, `export { a as b } from "./x"` -- `local`("a") is bound by
+    /// the OTHER module's own export table, exactly the same shape an
+    /// import specifier's `imported` name is, just reached through
+    /// `current_export_source` instead of `current_import_source`; see
+    /// `visit_export_named_declaration`'s doc comment for why that separate
+    /// field exists at all). Before this fix, EVERY re-export specifier
+    /// site was unconditionally `Pending(REASON_RE_EXPORT_BINDING)` --
+    /// zero attempt, not merely a doubtful case -- found live against the
+    /// n8n corpus: 3,528 v3-confirmed reference sites, entirely barrel
+    /// files (`packages/@n8n/agents/src/{index,evals/index}.ts`) doing
+    /// `export { helpfulness } from "./evals/helpfulness"`-style plain
+    /// named re-exports.
+    fn resolve_export_source_binding(
+        &mut self,
+        name: &str,
+        is_type: bool,
+        start: u32,
+        end: u32,
+    ) -> ReferenceResolution {
+        let source_specifier = self.current_export_source.clone();
+        self.resolve_named_binding_via_specifier(
+            source_specifier.as_deref(),
+            name,
+            REASON_RE_EXPORT_BINDING,
+            is_type,
+            start,
+            end,
+        )
+    }
+
+    /// Shared chain both `resolve_import_binding` and `resolve_export_
+    /// source_binding` close: `source_specifier` resolved through the
+    /// workspace resolver, then `name` resolved through the target
+    /// module's export table (chasing named re-exports transitively).
+    /// `pending_reason` is the caller's own reason token, attached to
+    /// every degrade-to-pending outcome so the two call sites stay
+    /// distinguishable downstream exactly like they were before this
+    /// shared helper existed.
+    fn resolve_named_binding_via_specifier(
+        &mut self,
+        source_specifier: Option<&str>,
+        name: &str,
+        pending_reason: &'static str,
+        is_type: bool,
+        start: u32,
+        end: u32,
+    ) -> ReferenceResolution {
         if self.jsdoc_typed_file {
             return ReferenceResolution::Pending(REASON_JSDOC_TYPED_FILE);
         }
-        let Some(source_specifier) = &self.current_import_source else {
-            return ReferenceResolution::Pending(REASON_IMPORT_BINDING);
+        let Some(source_specifier) = source_specifier else {
+            return ReferenceResolution::Pending(pending_reason);
         };
         let Some(target_path) =
             self.ctx
                 .resolver
                 .resolve(&self.path, source_specifier, self.ctx.available)
         else {
-            return ReferenceResolution::Pending(REASON_IMPORT_BINDING);
+            // Ambient module resolution task (2026-09-04), fix item 2: a
+            // workspace `declare module "source_specifier" { ... }` block
+            // gets first refusal, BEFORE the external-entity classification
+            // below -- see `resolver::AmbientModuleIndex::resolve_export`'s
+            // own doc comment for the exact contract (resolve with
+            // certainty, stay pending, or fall through to external -- NEVER
+            // fabricate an external entity for a specifier proven to be
+            // ambiently declared somewhere in this workspace).
+            match self
+                .ctx
+                .ambient_index
+                .resolve_export(source_specifier, name)
+            {
+                resolver::AmbientResolution::Resolved(target_id) => {
+                    return ReferenceResolution::Resolved {
+                        target_id,
+                        cross_file: true,
+                    };
+                }
+                resolver::AmbientResolution::Ambiguous => {
+                    if resolver::classify_external_specifier(source_specifier).is_some() {
+                        AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return ReferenceResolution::Pending(pending_reason);
+                }
+                resolver::AmbientResolution::NoDeclaration => {}
+            }
+            // External package/symbol entities task (2026-09-04, item 2):
+            // the SAME resolution the import lane (`finish_import_
+            // relations`, lib.rs) uses for its own module-level target_id --
+            // reused here verbatim (never re-attempted) so a workspace
+            // specifier that simply failed to resolve NEVER gets promoted to
+            // "external" (see `classify_external_specifier`'s own doc
+            // comment for the exact rule). A genuine external specifier
+            // resolves this binding WITH CERTAINTY -- the specifier text
+            // itself proves it -- to `jsts:external_symbol:{specifier}#
+            // {name}`, `cross_file: true` (it lives outside `self.path` by
+            // construction), and records the occurrence for `finish()` to
+            // materialize the entity/contains rows from.
+            return match resolver::classify_external_specifier(source_specifier) {
+                Some(canonical) => {
+                    self.emit_external_use(&canonical, name, is_type, start, end, true);
+                    ReferenceResolution::Resolved {
+                        target_id: resolver::external_symbol_id(&canonical, name),
+                        cross_file: true,
+                    }
+                }
+                None => ReferenceResolution::Pending(pending_reason),
+            };
         };
-        match resolver::resolve_named_export(self.ctx.files, &target_path, imported_name) {
+        match resolver::resolve_named_export(self.ctx.files, &target_path, name) {
             resolver::ExportResolution::Resolved(target_id) => {
-                // The declaration was reached through an import specifier,
-                // possibly after chasing one or more named re-exports
-                // (`resolve_named_export`): it lives outside `self.path` in
-                // every non-pathological case (a file re-exporting a name
-                // back to itself through another module is not a pattern
-                // real code hits in practice, and is not worth a full
-                // target-path plumb-through to rule out here -- see
-                // `ReferenceRow::cross_file`'s doc comment).
+                // The declaration was reached through an import/re-export
+                // specifier, possibly after chasing one or more named
+                // re-exports (`resolve_named_export`): it lives outside
+                // `self.path` in every non-pathological case (a file
+                // re-exporting a name back to itself through another module
+                // is not a pattern real code hits in practice, and is not
+                // worth a full target-path plumb-through to rule out here
+                // -- see `ReferenceRow::cross_file`'s doc comment).
                 ReferenceResolution::Resolved {
                     target_id,
                     cross_file: true,
@@ -944,9 +1695,102 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             resolver::ExportResolution::Namespace(_)
             | resolver::ExportResolution::Ambiguous
             | resolver::ExportResolution::Unresolved => {
-                ReferenceResolution::Pending(REASON_IMPORT_BINDING)
+                ReferenceResolution::Pending(pending_reason)
             }
         }
+    }
+
+    /// External package/symbol entities task: records one external
+    /// binding/member-read occurrence -- `finish()` converts the full list
+    /// into `OwnerSemantics::external_entity_rows` (deduped by identity)
+    /// and `external_contains_rows` (one row per occurrence, undeduped).
+    /// Called from every site that resolves an identifier/member to an
+    /// external symbol: `resolve_named_binding_via_specifier` (named/
+    /// default import, named re-export), `visit_import_namespace_specifier`
+    /// (a namespace import's own binding used as a value), and `visit_
+    /// static_member_expression` (a namespace-bound identifier's member
+    /// read, `ns.member`).
+    fn emit_external_use(
+        &mut self,
+        specifier: &str,
+        name: &str,
+        is_type: bool,
+        start: u32,
+        end: u32,
+        was_import_binding: bool,
+    ) {
+        self.external_uses.push(ExternalSymbolUse {
+            specifier: specifier.to_owned(),
+            name: name.to_owned(),
+            is_type,
+            start,
+            end,
+            was_import_binding,
+        });
+    }
+
+    /// External package/symbol entities task (item 2, namespace member
+    /// reads): `object.member_name` where `object` is a plain identifier
+    /// bound by `import * as object from "specifier"` and `specifier` is
+    /// EXTERNAL (never resolves inside the workspace) -- mirrors `resolve_
+    /// namespace_member`'s own identifier/`namespace_import_specifiers`
+    /// lookup shape exactly, but for the external case: `namespace_reexport_
+    /// targets` (a NAMED import that itself resolved to a namespace
+    /// re-export) is never consulted here, since its values are already-
+    /// resolved WORKSPACE paths by construction -- an external specifier
+    /// never reaches that map at all (`register_namespace_reexport` only
+    /// populates it via `resolve_named_export`, a workspace-only chain).
+    /// Returns `Ambient` (fix item 2, 2026-09-04: no `emit_external_use`
+    /// side effect -- the target already exists, published by the
+    /// DECLARING file's own producers) or `External` (canonical specifier
+    /// and resolved `target_id`, caller emits the external use), or `None`
+    /// for anything but a plain-identifier, workspace-unresolved namespace-
+    /// bound member read.
+    fn resolve_external_namespace_member(
+        &self,
+        object: &Expression<'a>,
+        member_name: &str,
+    ) -> Option<NamespaceMemberResolution> {
+        let Expression::Identifier(ident) = object else {
+            return None;
+        };
+        let reference_id = ident.reference_id.get()?;
+        let reference = self.scoping.get_reference(reference_id);
+        let symbol_id = reference.symbol_id()?;
+        let specifier = self.namespace_import_specifiers.get(&symbol_id)?;
+        if self
+            .ctx
+            .resolver
+            .resolve(&self.path, specifier, self.ctx.available)
+            .is_some()
+        {
+            // Resolves inside the workspace: `resolve_namespace_member` (the
+            // internal-target sibling of this function) owns this case.
+            return None;
+        }
+        // Ambient module resolution task (2026-09-04), fix item 2: same
+        // first-refusal order as every other specifier-keyed resolution in
+        // this file.
+        match self
+            .ctx
+            .ambient_index
+            .resolve_export(specifier, member_name)
+        {
+            resolver::AmbientResolution::Resolved(target_id) => {
+                return Some(NamespaceMemberResolution::Ambient(target_id));
+            }
+            resolver::AmbientResolution::Ambiguous => {
+                if resolver::classify_external_specifier(specifier).is_some() {
+                    AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return None;
+            }
+            resolver::AmbientResolution::NoDeclaration => {}
+        }
+        let canonical = resolver::classify_external_specifier(specifier)?;
+        let target_id = resolver::external_symbol_id(&canonical, member_name);
+        Some(NamespaceMemberResolution::External(canonical, target_id))
     }
 
     /// P1-B: `evals` in `import { evals } from "../../index"` where
@@ -1325,6 +2169,29 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                     .collect();
                 Some(TypeflowValue::Inline(members))
             }
+            // P2-2j: `A | B` -- mirrors `urdira_jsts_typeflow::raw_type_ref_
+            // of_ts_type`'s own `TSUnionType` arm exactly (drop null/
+            // undefined/literal/primitive constituents, contaminate to
+            // `None` on any other unclassified remaining constituent,
+            // dedupe, collapse a single survivor) -- see that crate's
+            // `RawTypeRef::Union` doc comment for the full rationale.
+            TSType::TSUnionType(union) => {
+                let mut constituents: Vec<TypeflowValue> = Vec::new();
+                for member in &union.types {
+                    if is_dropped_union_constituent(member) {
+                        continue;
+                    }
+                    let value = self.type_ref_of_ts_type(member)?;
+                    if !constituents.contains(&value) {
+                        constituents.push(value);
+                    }
+                }
+                match constituents.len() {
+                    0 => None,
+                    1 => constituents.into_iter().next(),
+                    _ => Some(TypeflowValue::Union(constituents)),
+                }
+            }
             _ => None,
         }
     }
@@ -1396,6 +2263,16 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                     Self::resolve_type_ref_relative(inner, this_context)?,
                 )))
             }
+            // P2-2j: resolve every constituent relative to the SAME
+            // receiver context, or none at all -- see `TypeflowValue::
+            // Union`'s doc comment.
+            urdira_jsts_typeflow::ResolvedTypeRef::Union(items) => {
+                let mut resolved = Vec::with_capacity(items.len());
+                for item in items {
+                    resolved.push(Self::resolve_type_ref_relative(item, this_context)?);
+                }
+                Some(TypeflowValue::Union(resolved))
+            }
         }
     }
 
@@ -1411,6 +2288,54 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 entity_id,
                 is_static,
             } => Some((entity_id.clone(), *is_static)),
+            // P2-2j: a `Union` is never a SINGLE entity by construction --
+            // conservative and intended, same as every other wrapper below;
+            // `as_entities` is the sibling helper that handles a `Union`
+            // receiver instead (used ONLY by the call-target resolver's own
+            // union branch -- every other caller of `as_entity` stays
+            // conservative for a union receiver used in a further chain
+            // position, e.g. `(a as A | B).method().further()`, which is
+            // out of this round's scope).
+            TypeflowValue::ArrayOf(_)
+            | TypeflowValue::PromiseOf(_)
+            | TypeflowValue::RecordOf(_)
+            | TypeflowValue::Inline(_)
+            | TypeflowValue::Union(_) => None,
+        }
+    }
+
+    /// P2-2j: the entity id(s) `value` denotes, generalizing `as_entity` to
+    /// also accept a `TypeflowValue::Union` receiver (`a: A | B`) -- returns
+    /// EVERY constituent's own entity id, all sharing the SAME `is_static`
+    /// (a well-typed union's own constituents are never independently
+    /// static/instance -- TypeScript itself would reject mixing a class
+    /// used statically with an instance type in the same union). A plain
+    /// `Entity` yields a one-element list, so a caller can go through this
+    /// ONE path uniformly for both the ordinary and union cases. `None`
+    /// (never a guess) when ANY constituent of a `Union` is not itself a
+    /// plain entity (a nested `ArrayOf`/`Inline`/... constituent, out of
+    /// scope this round), or for any other non-entity `TypeflowValue` shape
+    /// (same as `as_entity`).
+    fn as_entities(value: &TypeflowValue) -> Option<(Vec<String>, bool)> {
+        match value {
+            TypeflowValue::Entity { .. } => {
+                let (entity_id, is_static) = Self::as_entity(value)?;
+                Some((vec![entity_id], is_static))
+            }
+            TypeflowValue::Union(items) => {
+                let mut ids = Vec::with_capacity(items.len());
+                let mut union_is_static: Option<bool> = None;
+                for item in items {
+                    let (entity_id, is_static) = Self::as_entity(item)?;
+                    match union_is_static {
+                        Some(existing) if existing != is_static => return None,
+                        Some(_) => {}
+                        None => union_is_static = Some(is_static),
+                    }
+                    ids.push(entity_id);
+                }
+                Some((ids, union_is_static.unwrap_or(false)))
+            }
             TypeflowValue::ArrayOf(_)
             | TypeflowValue::PromiseOf(_)
             | TypeflowValue::RecordOf(_)
@@ -1643,9 +2568,14 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // to `V` the same way an array element access does -- the key
             // expression's own value is never inspected, matching `ArrayOf`.
             TypeflowValue::RecordOf(inner) => Some((*inner, "record_element")),
+            // P2-2j: a computed access on a union receiver (`(a as A | B)
+            // [i]`) is not attempted -- conservative and intended, same as
+            // `Entity`/`PromiseOf`/`Inline` below (none of those are an
+            // array/record shape to unwrap an element type from either).
             TypeflowValue::Entity { .. }
             | TypeflowValue::PromiseOf(_)
-            | TypeflowValue::Inline(_) => None,
+            | TypeflowValue::Inline(_)
+            | TypeflowValue::Union(_) => None,
         }
     }
 
@@ -1893,16 +2823,64 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     }
 
     /// P0-S2/P1-A typeflow (widens E3's T1 to member-access/`this`/`super`/
-    /// chained-call calls): `Some(target_id)` only when the callee is
-    /// `<base>.<member>` AND `type_of_expression` resolves `<base>` to a
-    /// concrete entity AND `ProgramIndex::members` finds EXACTLY ONE
-    /// matching member -- a union (`MemberLookup::Many`) or a miss stays
-    /// pending, never a guess.
-    fn resolve_call_target_typeflow(
-        &self,
-        expr: &CallExpression<'a>,
-    ) -> Option<(String, &'static str)> {
+    /// chained-call calls): `Resolved(target_id, rule)` only when the callee
+    /// is `<base>.<member>` AND `type_of_expression` resolves `<base>` to a
+    /// concrete entity (or, P2-2j, a UNION of entities) AND the member
+    /// lookup finds EXACTLY ONE matching member -- an overloaded member
+    /// (`MemberLookup::Many`) or a union receiver with at least one
+    /// candidate on every constituent (`MemberLookup::UnionCandidates`)
+    /// produces `Candidates` instead; a miss (either lookup's own `None`)
+    /// or anything this function does not attempt produces `Unresolved` --
+    /// never a guess.
+    /// P0-S2/P1-A typeflow, member READS (2026-09-04 references-parity
+    /// task; widens `resolve_call_target_typeflow`'s callee-only scope to
+    /// EVERY `<base>.<member>` position): `Some(target_id)` only when the
+    /// object's own type resolves to a SINGLE concrete entity
+    /// (`type_of_expression` + `Self::as_entity` -- `this`/`super` included,
+    /// resolved from `class_stack` same as everywhere else) AND
+    /// `ProgramIndex::members` finds EXACTLY ONE matching member
+    /// (`MemberLookup::One`). A union receiver (`as_entity` already returns
+    /// `None` for `TypeflowValue::Union`), an overloaded member (`Many`), or
+    /// a miss (`None`) all stay `None` here -- unlike the call lane, a
+    /// member READ never gets a `possible`-with-candidates row: this crate's
+    /// zero-wrong-target discipline means "ambiguous" and "unresolved"
+    /// collapse to the exact same (silent, still-pending) outcome for a
+    /// reference, since only a fully-`Resolved` lookup ever publishes a
+    /// `core:references` row at all.
+    ///
+    /// No special-casing for a call callee (`obj.method()`) or an
+    /// assignment target (`this.x = 1`) -- verified live against v3's own
+    /// `analyzer.ts` `walk`: `isIdentifier(node)` fires through the
+    /// UNCONDITIONAL `node.forEachChild(walk)` recursion for every
+    /// property-access name, regardless of surrounding position. Neither a
+    /// call's callee nor an assignment's LHS carries any exclusion of its
+    /// own there -- `isDeclarationName` only ever excludes an actual
+    /// DECLARATION's own name node (`declared !== undefined` requires the
+    /// PARENT to itself be a registered entity, which a
+    /// `PropertyAccessExpression` never is). v3 therefore emits a
+    /// `core:references` row for `method` in `obj.method()` in ADDITION to
+    /// the separate `core:call` row for the whole call expression -- mirrored
+    /// here by simply never special-casing the callee position at all:
+    /// `visit_call_expression`'s own call-target resolution and this
+    /// member-read resolution independently visit the SAME
+    /// `StaticMemberExpression` node (the callee) and each publish their
+    /// own relation kind, exactly like the checker does.
+    fn resolve_static_member_reference(&self, expr: &StaticMemberExpression<'a>) -> Option<String> {
         let index = self.ctx.typeflow_index?;
+        let (base_value, _rule) = self.type_of_expression(&expr.object)?;
+        let (base_entity, is_static) = Self::as_entity(&base_value)?;
+        match index.members(&base_entity, expr.property.name.as_str(), is_static) {
+            urdira_jsts_typeflow::MemberLookup::One(target) => Some(target),
+            urdira_jsts_typeflow::MemberLookup::None
+            | urdira_jsts_typeflow::MemberLookup::Many(_)
+            | urdira_jsts_typeflow::MemberLookup::UnionCandidates(_) => None,
+        }
+    }
+
+    fn resolve_call_target_typeflow(&self, expr: &CallExpression<'a>) -> TypeflowCallResolution {
+        let Some(index) = self.ctx.typeflow_index else {
+            return TypeflowCallResolution::Unresolved;
+        };
         // P1-C: a BARE call to a destructured-METHOD identifier (`await
         // dropColumns(...)`, no further chaining) -- see `destructured_
         // member_entities`'s own doc comment for why this needs a
@@ -1914,30 +2892,76 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         // (already-tried, already-failed by the time this function runs)
         // identifier resolution.
         if let Expression::Identifier(ident) = &expr.callee {
-            let reference_id = ident.reference_id.get()?;
-            let reference = self.scoping.get_reference(reference_id);
-            let symbol_id = reference.symbol_id()?;
-            let target_id = self.destructured_member_entities.get(&symbol_id)?.clone();
-            return Some((target_id, "destructured_method_call"));
+            let target_id = ident.reference_id.get().and_then(|reference_id| {
+                let reference = self.scoping.get_reference(reference_id);
+                let symbol_id = reference.symbol_id()?;
+                self.destructured_member_entities.get(&symbol_id).cloned()
+            });
+            return match target_id {
+                Some(target_id) => {
+                    TypeflowCallResolution::Resolved(target_id, "destructured_method_call")
+                }
+                None => TypeflowCallResolution::Unresolved,
+            };
         }
         let Expression::StaticMemberExpression(member) = &expr.callee else {
-            return None;
+            return TypeflowCallResolution::Unresolved;
         };
-        if let Some((base_value, rule)) = self.type_of_expression(&member.object)
-            && let Some((base_entity, is_static)) = Self::as_entity(&base_value)
-            && let urdira_jsts_typeflow::MemberLookup::One(target) =
-                index.members(&base_entity, member.property.name.as_str(), is_static)
-        {
-            return Some((target, rule));
+        if let Some((base_value, rule)) = self.type_of_expression(&member.object) {
+            match &base_value {
+                // P2-2j: a union receiver routes to `members_of_union` --
+                // NEVER to `members`, and NEVER produces `Resolved` (see
+                // `MemberLookup::UnionCandidates`'s own doc comment: a
+                // union receiver is a genuine ambiguity, not a confirmed
+                // target, even when every constituent agrees).
+                TypeflowValue::Union(_) => {
+                    if let Some((entity_ids, is_static)) = Self::as_entities(&base_value)
+                        && let urdira_jsts_typeflow::MemberLookup::UnionCandidates(targets) = index
+                            .members_of_union(&entity_ids, member.property.name.as_str(), is_static)
+                    {
+                        return TypeflowCallResolution::Candidates {
+                            targets,
+                            reason: REASON_UNION_AMBIGUOUS,
+                        };
+                    }
+                }
+                _ => {
+                    if let Some((base_entity, is_static)) = Self::as_entity(&base_value) {
+                        match index.members(&base_entity, member.property.name.as_str(), is_static)
+                        {
+                            urdira_jsts_typeflow::MemberLookup::One(target) => {
+                                return TypeflowCallResolution::Resolved(target, rule);
+                            }
+                            urdira_jsts_typeflow::MemberLookup::Many(targets) => {
+                                return TypeflowCallResolution::Candidates {
+                                    targets,
+                                    reason: REASON_OVERLOAD_AMBIGUOUS,
+                                };
+                            }
+                            // `members()` (single-entity) never actually
+                            // produces `UnionCandidates` -- only `members_
+                            // of_union` (the branch above) does.
+                            urdira_jsts_typeflow::MemberLookup::None
+                            | urdira_jsts_typeflow::MemberLookup::UnionCandidates(_) => {}
+                        }
+                    }
+                }
+            }
         }
         // P1-A (rule (f)): `ns.fn(...)` as the call ITSELF (not merely a
         // chain receiver) -- see `resolve_namespace_member`'s doc comment.
         // Restricted to `Function` (never `Class`/`Method`/...) to match
         // `resolve_call_target`'s own T1 scope exactly.
-        let target_id =
-            self.resolve_namespace_member(&member.object, member.property.name.as_str())?;
-        target_id_kind_is_one_of(&target_id, &[DeclKind::Function])
-            .then_some((target_id, "namespace_member_call"))
+        let Some(target_id) =
+            self.resolve_namespace_member(&member.object, member.property.name.as_str())
+        else {
+            return TypeflowCallResolution::Unresolved;
+        };
+        if target_id_kind_is_one_of(&target_id, &[DeclKind::Function]) {
+            TypeflowCallResolution::Resolved(target_id, "namespace_member_call")
+        } else {
+            TypeflowCallResolution::Unresolved
+        }
     }
 
     /// P1-A census classifier (diagnostic only): the shape of a non-
@@ -2173,6 +3197,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                     end: span.end,
                     source_id: source_id.to_owned(),
                     relation_kind: "inherits",
+                    reason,
                 });
             }
             (Some(source_id), Some(target_id)) => {
@@ -2205,6 +3230,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                         end: span.end,
                         source_id: source_id.to_owned(),
                         relation_kind: "inherits",
+                        reason,
                     });
                 }
             }
@@ -2263,6 +3289,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                         end,
                         source_id: source_id.to_owned(),
                         relation_kind,
+                        reason,
                     });
                 }
             }
@@ -2364,6 +3391,18 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 &right.source_id,
             ))
         });
+        // P2-2j: same deterministic-order rationale as `pending_call_sites`
+        // above, keyed the same way `call_rows`/`heritage_rows` are
+        // (start, end, source_id, target_id) since every candidate row
+        // carries a real target.
+        self.candidate_call_rows.sort_by(|left, right| {
+            (left.start, left.end, &left.source_id, &left.target_id).cmp(&(
+                right.start,
+                right.end,
+                &right.source_id,
+                &right.target_id,
+            ))
+        });
         let sites_digest = compute_sites_digest(&self.sites);
         let pending_sites = self
             .sites
@@ -2414,26 +3453,163 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .iter()
             .map(|row| heritage_proposed_record(&self.path, row))
             .collect();
-        // P2-2i: one `possible` `core:call` row immediately followed by its
-        // paired `jsts:unresolved_call` diagnostic, per `PendingCallSite`, in
-        // sorted order -- see `possible_call_rows`'s own doc comment for why
-        // the two live in one field.
-        let possible_call_rows = self
+        // A2 (pending.sites migration): one `PendingSiteProposal` per
+        // `PendingCallSite` (reason as-is) then per `PendingHeritageSite`
+        // (reason as recorded at its own `push_site` call), in sorted
+        // order -- see `OwnerSemantics::pending_site_rows`'s own doc
+        // comment. Replaces the P2-2i `possible_call_rows`/
+        // `possible_heritage_rows` full `ProposedRecord` builders.
+        let pending_site_rows = self
             .pending_call_sites
             .iter()
-            .enumerate()
-            .flat_map(|(index, site)| {
-                [
-                    possible_call_record(&self.path, site),
-                    unresolved_call_diagnostic_record(&self.path, site, index),
-                ]
+            .map(|site| PendingSiteProposal {
+                start: site.start,
+                end: site.end,
+                site_kind: PendingSiteKind::Call,
+                reason: site.reason,
+                source_id: site.source_id.clone(),
             })
+            .chain(
+                self.pending_heritage_sites
+                    .iter()
+                    .map(|site| PendingSiteProposal {
+                        start: site.start,
+                        end: site.end,
+                        site_kind: match site.relation_kind {
+                            "implements" => PendingSiteKind::Implements,
+                            _ => PendingSiteKind::Inherits,
+                        },
+                        reason: site.reason,
+                        source_id: site.source_id.clone(),
+                    }),
+            )
             .collect();
-        let possible_heritage_rows = self
-            .pending_heritage_sites
+        // P2-2j: one `possible` `core:call` row PER CANDIDATE (own
+        // `target_id` each), in sorted order -- see `CandidateCallRow`'s and
+        // `OwnerSemantics::candidate_call_rows`'s own doc comments.
+        let candidate_call_rows = self
+            .candidate_call_rows
             .iter()
-            .map(|site| possible_heritage_record(&self.path, site))
+            .map(|row| candidate_call_record(&self.path, row))
             .collect();
+        // Parameter entities, "referenced-only" variant: `referenced_
+        // parameter_targets` is already sorted (a `BTreeSet`, keyed by the
+        // SAME id `parameter_declarations` is keyed by), so iterating it
+        // directly gives deterministic, dependency-free order for both
+        // buckets below -- no separate sort needed, unlike `reference_rows`/
+        // `call_rows`/etc. above (plain `Vec`s, populated in AST visitation
+        // order). Every target here was inserted from a `target_id` this
+        // SAME walk's `resolve_identifier_reference`/`resolve_static_member_
+        // reference` built with `declaration_id(DeclKind::Parameter, ...)`,
+        // which is exactly the id `visit_formal_parameter` records a fact
+        // under for every ORDINARY (non-property) identifier-pattern
+        // parameter this walk sees. A PARAMETER PROPERTY's target id is
+        // never a key here (`visit_formal_parameter` deliberately skips
+        // recording one, see its own doc comment: `urdira_jsts_typeflow::
+        // member_declarations`/`push_member_entities` already materialize
+        // it unconditionally) -- `filter_map` below silently skips those
+        // rather than double-materializing the same declaration a second
+        // time from this "referenced-only" bucket.
+        let language = crate::language_for_path(&self.path)
+            .map(|(language, _)| language)
+            .unwrap_or(crate::Language::Javascript);
+        // 2026-09-04 references-parity task, bucket 1: catch-clause bindings
+        // materialize through the SAME two output buckets as parameters
+        // (`OwnerSemantics::parameter_entity_rows`/`parameter_contains_rows`
+        // -- see `catch_declarations`'s own doc comment for why sharing the
+        // sink is safe), chained after the parameter rows so parameter
+        // ordering is unaffected for anything that only cares about that
+        // population.
+        let parameter_entity_rows = self
+            .referenced_parameter_targets
+            .iter()
+            .filter_map(|target_id| {
+                let fact = self.parameter_declarations.get(target_id)?;
+                Some(parameter_entity_record(&self.path, language, fact))
+            })
+            .chain(
+                self.referenced_catch_targets
+                    .iter()
+                    .filter_map(|target_id| {
+                        let fact = self.catch_declarations.get(target_id)?;
+                        Some(catch_variable_entity_record(&self.path, language, fact))
+                    }),
+            )
+            .collect();
+        let parameter_contains_rows = self
+            .referenced_parameter_targets
+            .iter()
+            .filter_map(|target_id| {
+                let fact = self.parameter_declarations.get(target_id)?;
+                Some(parameter_contains_record(&self.path, fact))
+            })
+            .chain(
+                self.referenced_catch_targets
+                    .iter()
+                    .filter_map(|target_id| {
+                        let fact = self.catch_declarations.get(target_id)?;
+                        Some(catch_variable_contains_record(&self.path, fact))
+                    }),
+            )
+            .collect();
+        // External package/symbol entities task: `external_uses` (visitation
+        // order, possibly repeating the same `(specifier, name)` many times
+        // -- once per import/re-export/member-read occurrence) collapses
+        // into ONE entity row per distinct identity here (deduped within
+        // THIS owner; `urdira-indexing-worker::v4::analyze::run_scoped`'s
+        // cross-owner pass is the authoritative backstop for the case where
+        // ANOTHER owner also imports the same specifier), plus one `core:
+        // contains` row per occurrence (never deduped -- see `OwnerSemantics
+        // ::external_contains_rows`'s own doc comment).
+        let mut external_ids_seen: BTreeSet<String> = BTreeSet::new();
+        let mut external_entity_rows: Vec<ProposedRecord> = Vec::new();
+        let mut external_contains_rows: Vec<ProposedRecord> = Vec::new();
+        for use_ in &self.external_uses {
+            let module_entity = crate::external_module_entity(&use_.specifier);
+            if external_ids_seen.insert(module_entity.id.clone()) {
+                external_entity_rows.push(crate::proposal_entity_record(&module_entity, language));
+            }
+            let symbol_entity =
+                crate::external_symbol_entity(&use_.specifier, &use_.name, use_.is_type);
+            if external_ids_seen.insert(symbol_entity.id.clone()) {
+                external_entity_rows.push(crate::proposal_entity_record(&symbol_entity, language));
+            }
+            let contains = crate::external_contains_relation(
+                &use_.specifier,
+                &use_.name,
+                &self.path,
+                use_.start,
+                use_.end,
+            );
+            external_contains_rows.push(crate::proposal_relation_record(&contains));
+        }
+        // Measurement-only (2026-09-04 n8n before/after report), gated
+        // behind an env var an operator must deliberately set -- never on by
+        // default. Prints this owner's occurrence count split by which
+        // PRE-this-task pending reason it would have carried (see
+        // `ExternalSymbolUse::was_import_binding`'s own doc comment): sum
+        // the `import_binding=` figures across every owner (`grep
+        // 'external-uses-by-reason' | awk` over stderr) for "how many
+        // previously-`Pending(REASON_IMPORT_BINDING)` sites this run
+        // confirmed externally" -- computed from a SINGLE run of the
+        // current (fixed) code, no old binary needed, since every
+        // occurrence recorded here is BY CONSTRUCTION one this task's own
+        // new branch resolved that would otherwise have stayed pending
+        // with the reason `was_import_binding` names.
+        if !self.external_uses.is_empty()
+            && std::env::var_os("URDIRA_V4_DEBUG_EXTERNAL_ENTITIES").is_some()
+        {
+            let import_binding_count = self
+                .external_uses
+                .iter()
+                .filter(|use_| use_.was_import_binding)
+                .count();
+            let member_access_count = self.external_uses.len() - import_binding_count;
+            eprintln!(
+                "external-uses-by-reason path={} import_binding={import_binding_count} member_access={member_access_count}",
+                self.path
+            );
+        }
         OwnerSemantics {
             reference_rows,
             covers_rows,
@@ -2441,8 +3617,12 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             heritage_rows,
             typeflow_call_rows,
             typeflow_heritage_rows,
-            possible_call_rows,
-            possible_heritage_rows,
+            pending_site_rows,
+            candidate_call_rows,
+            parameter_entity_rows,
+            parameter_contains_rows,
+            external_entity_rows,
+            external_contains_rows,
             typeflow_oracle_hits: self.typeflow_oracle_hits,
             typeflow_pending_call_shapes: self.typeflow_pending_call_shapes,
             pending_sites,
@@ -2665,34 +3845,48 @@ fn heritage_proposed_record(path: &str, row: &HeritageRow) -> ProposedRecord {
     }
 }
 
-/// `core:call` proposed record, `classification: "possible"`, for one
-/// `PendingCallSite` -- byte-for-byte identical, for the equivalent
-/// checker-resolved case, to the record `fact-delta.ts`'s
-/// `proposalRelationRecord` produces from `analyzer.ts`'s `relate("call",
-/// relationSource, undefined, node, "possible")`: identity_key
-/// `jsts:call:{path}:{start}:{end}:{source_id}:unresolved` (mirrors
-/// `target?.id ?? "unresolved"` with `target` always `undefined` here), NO
-/// `target_id` key in `body` at all (`...(target === undefined ? {} :
-/// { target_id: target.id })`), facets gain `"core:indirect"`
-/// (`fact-delta.ts`'s `relation.classification === "possible" ?
-/// ["core:indirect"] : []`).
-fn possible_call_record(path: &str, site: &PendingCallSite) -> ProposedRecord {
+/// `core:call` proposed record, `classification: "possible"`, carrying a
+/// REAL `target_id` -- P2-2j, see `CandidateCallRow`'s and `OwnerSemantics::
+/// candidate_call_rows`'s own doc comments for the exact contract this
+/// closes (a "possible" row the query engine can actually traverse). The
+/// identity recipe matches `call_proposed_record`'s CONFIRMED recipe
+/// exactly (`jsts:call:{path}:{start}:{end}:{source_id}:{target_id}`),
+/// NEVER the `:unresolved` shape a no-target site's own `PendingSiteProposal`
+/// carries (A2, pending.sites migration -- see `OwnerSemantics::pending_
+/// site_rows`'s doc comment) -- two different candidates for the SAME site
+/// must get two DIFFERENT identities, which only the target-bearing recipe
+/// provides. `facets` gain `"core:indirect"` even though a `target_id` is
+/// present -- this is v3's own possible-classification convention and the
+/// exact bit a later residual pass keys on to find candidate rows
+/// generically, by metadata, without decoding a body (see `crate::v4::
+/// residual`'s `dump_call_bodies`/`collect` doc comments for how the
+/// store-level `target_subject().is_some() && !core:indirect` confirmed
+/// test stays correct with this row shape live).
+fn candidate_call_record(path: &str, row: &CandidateCallRow) -> ProposedRecord {
     let identity_key = format!(
-        "jsts:call:{path}:{}:{}:{}:unresolved",
-        site.start, site.end, site.source_id
+        "jsts:call:{path}:{}:{}:{}:{}",
+        row.start, row.end, row.source_id, row.target_id
     );
     let mut body = serde_json::Map::new();
     body.insert(
         "source_id".into(),
-        serde_json::Value::String(site.source_id.clone()),
+        serde_json::Value::String(row.source_id.clone()),
+    );
+    body.insert(
+        "target_id".into(),
+        serde_json::Value::String(row.target_id.clone()),
     );
     body.insert(
         "classification".into(),
         serde_json::Value::String("possible".into()),
     );
     body.insert("path".into(), serde_json::Value::String(path.to_owned()));
-    body.insert("start".into(), serde_json::Value::from(site.start));
-    body.insert("end".into(), serde_json::Value::from(site.end));
+    body.insert("start".into(), serde_json::Value::from(row.start));
+    body.insert("end".into(), serde_json::Value::from(row.end));
+    body.insert(
+        "reason".into(),
+        serde_json::Value::String(row.reason.to_owned()),
+    );
     let facets = serde_json::json!(["core:reference_relation", "core:indirect"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
@@ -2702,118 +3896,131 @@ fn possible_call_record(path: &str, site: &PendingCallSite) -> ProposedRecord {
         facets_list: facets_list_from_value(&facets),
         facets: canonical_json(&facets),
         schema_version: 1,
-        source_span: canonical_span(path, site.start, site.end),
+        source_span: canonical_span(path, row.start, row.end),
         identity_key,
         body: serde_json::Value::Object(body),
-        evidence_references: canonical_evidence(path, site.start, site.end),
+        evidence_references: canonical_evidence(path, row.start, row.end),
     }
 }
 
-/// `jsts:unresolved_call` diagnostic proposed record, paired 1:1 with
-/// `possible_call_record` for the same `PendingCallSite` -- v3's own
-/// `diagnostics.push({ code: "jsts:unresolved_call", message: "...", path,
-/// start, end })` in `analyzer.ts`, plus a NEW `reason` field (this task's
-/// own extension: v3 never carried one, since a human/agent reading the
-/// diagnostic could cross-reference the checker's own richer context; v4
-/// has no checker, so the pending site's own reason is the only signal
-/// available and is surfaced here instead of silently lost -- registered
-/// in `registry-contribution.ts`'s `diagnosticPayload`).
+/// Parameter entities, "referenced-only" variant: the `jsts:entity_
+/// parameter` `ProposedRecord` for one [`ParameterDeclarationFact`] that
+/// received at least one resolved reference. Reuses `crate::proposal_entity_
+/// record` (lib.rs's own entity-record builder, private but visible to this
+/// descendant module) rather than duplicating its facets/body-shape logic --
+/// the SAME rules every other entity kind already gets (facets gain `"core:
+/// member"` whenever `parent_id` is `Some`, which for a parameter is always:
+/// `fact.parent_id` is either a real callable/member/variable entity id or
+/// the module id, `visit_formal_parameter`'s own fallback, never absent).
 ///
-/// v3 only emits this diagnostic when the checker found NO declaration at
-/// all (`target === undefined && !declarationWasResolved`); v4 has no
-/// checker to draw that finer distinction -- a `PendingCallSite` is BY
-/// CONSTRUCTION a call Rust never resolved to any declaration (E1-E3 and
-/// typeflow both gave up), so v4 emits this diagnostic for every pending
-/// call site unconditionally. This is a documented simplification (see
-/// this task's evidence doc), not a behavioral claim that every such site
-/// would ALSO fail a real checker's own resolution.
-///
-/// `index` disambiguates identity keys the same way `fact-delta.ts`'s
-/// `proposalDiagnosticRecord`'s own `index` parameter does for v3 (both are
-/// simply "this diagnostic's position in a same-shaped list for this
-/// owner", not required to match v3's own numbering, which spans every
-/// diagnostic kind, not just this one).
-fn unresolved_call_diagnostic_record(
+/// `parent_id` resolution rule (the "enclosing callable's entity id when
+/// that callable has one" contract, owner-approved 2026-09-04): a NAMED
+/// function declaration (`visit_function`'s `pushed` branch) -- a class OR
+/// interface method/constructor/getter/setter/property signature whose
+/// container is module-level and named, i.e. one `push_member_entities`
+/// (lib.rs) actually emits an entity for TODAY (`member_qualified_names`,
+/// built from `urdira_jsts_typeflow::member_declarations` directly) -- or a
+/// variable-bound arrow/function-expression that is the FIRST declarator of
+/// its own `VariableDeclaration` with an identifier binding (the one case
+/// `lib.rs`'s plain entity pass actually emits a `core:value` entity for).
+/// Every other enclosing shape -- an anonymous callback, an object-literal
+/// shorthand method (never in `member_declarations`), a NESTED or ANONYMOUS
+/// class/interface's own member, a non-first declarator's arrow/function-
+/// expression -- falls back to the OWNER's own module entity, exactly like
+/// `push_entity`'s own module-parented entities.
+fn parameter_entity_record(
     path: &str,
-    site: &PendingCallSite,
-    index: usize,
+    language: crate::Language,
+    fact: &ParameterDeclarationFact,
 ) -> ProposedRecord {
-    let key = format!(
-        "jsts:diagnostic:{path}:{}:jsts:unresolved_call:{index}",
-        site.start
-    );
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "code".into(),
-        serde_json::Value::String("jsts:unresolved_call".into()),
-    );
-    body.insert(
-        "message".into(),
-        serde_json::Value::String(
-            "The TypeScript checker could not establish a unique call target.".into(),
-        ),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
-    body.insert("start".into(), serde_json::Value::from(site.start));
-    body.insert("end".into(), serde_json::Value::from(site.end));
-    body.insert(
-        "reason".into(),
-        serde_json::Value::String(site.reason.to_owned()),
-    );
-    let facets = serde_json::json!([]);
-    ProposedRecord {
-        proposal_record_key: proposal_record_key(&key),
-        category: "diagnostic",
-        kind: "jsts:diagnostic".to_owned(),
-        universal_kind: "core:construct".to_owned(),
-        facets_list: facets_list_from_value(&facets),
-        facets: canonical_json(&facets),
-        schema_version: 1,
-        source_span: canonical_span(path, site.start, site.end),
-        identity_key: key,
-        body: serde_json::Value::Object(body),
-        evidence_references: canonical_evidence(path, site.start, site.end),
-    }
+    let entity = crate::SyntaxEntity {
+        id: fact.entity_id.clone(),
+        name: fact.name.clone(),
+        kind: crate::EntityKind::Parameter,
+        universal_kind: crate::UniversalKind::Parameter,
+        path: path.to_owned(),
+        start: fact.start,
+        end: fact.end,
+        parent_id: Some(fact.parent_id.clone()),
+        qualified_name: Some(fact.qualified_name.clone()),
+        is_test: None,
+    };
+    crate::proposal_entity_record(&entity, language)
 }
 
-/// `core:inherits`/`core:implements` proposed record, `classification:
-/// "possible"`, for one `PendingHeritageSite` -- mirrors `possible_call_
-/// record` above for the heritage case (`analyzer.ts`'s own
-/// `relate("inherits"|"implements", relationSource, undefined, type,
-/// "possible")`). No paired diagnostic: v3 never emits one for a heritage
-/// clause either (only the call branch of `visit` in `analyzer.ts` ever
-/// pushes to `diagnostics`).
-fn possible_heritage_record(path: &str, site: &PendingHeritageSite) -> ProposedRecord {
-    let identity_key = format!(
-        "jsts:{}:{path}:{}:{}:{}:unresolved",
-        site.relation_kind, site.start, site.end, site.source_id
+/// Parameter entities, "referenced-only" variant: the `core:contains`
+/// `ProposedRecord` for `fact`'s parent -> parameter edge. Id format matches
+/// `SyntaxCollector::push_relation`'s own recipe exactly (`jsts:{kind}:
+/// {path}:{start}:{end}:{source_id}:{target_id}`), so a parameter's
+/// `contains` row is indistinguishable, by shape, from one `push_member_
+/// entities` (lib.rs) would have produced had it been the one materializing
+/// this row.
+fn parameter_contains_record(path: &str, fact: &ParameterDeclarationFact) -> ProposedRecord {
+    let id = format!(
+        "jsts:contains:{path}:{}:{}:{}:{}",
+        fact.start, fact.end, fact.parent_id, fact.entity_id
     );
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(site.source_id.clone()),
+    let relation = crate::SyntaxRelation {
+        id,
+        kind: crate::RelationKind::Contains,
+        source_id: fact.parent_id.clone(),
+        target_id: Some(fact.entity_id.clone()),
+        path: path.to_owned(),
+        start: fact.start,
+        end: fact.end,
+        classification: crate::RelationClassification::Confirmed,
+    };
+    crate::proposal_relation_record(&relation)
+}
+
+/// 2026-09-04 references-parity task, bucket 1: the `core:value` (`jsts:
+/// entity_variable`) `ProposedRecord` for one catch-clause binding fact that
+/// received at least one resolved reference -- the `DeclKind::Variable`
+/// sibling of `parameter_entity_record`, same `parent_id` resolution rule
+/// (`fact.parent_id` is either a real enclosing callable/member/variable
+/// entity id or the module id, `visit_catch_parameter`'s own fallback,
+/// mirroring `visit_formal_parameter`'s), same reuse of `crate::proposal_
+/// entity_record`. Only `kind`/`universal_kind` differ from the parameter
+/// builder.
+fn catch_variable_entity_record(
+    path: &str,
+    language: crate::Language,
+    fact: &ParameterDeclarationFact,
+) -> ProposedRecord {
+    let entity = crate::SyntaxEntity {
+        id: fact.entity_id.clone(),
+        name: fact.name.clone(),
+        kind: crate::EntityKind::Variable,
+        universal_kind: crate::UniversalKind::Value,
+        path: path.to_owned(),
+        start: fact.start,
+        end: fact.end,
+        parent_id: Some(fact.parent_id.clone()),
+        qualified_name: Some(fact.qualified_name.clone()),
+        is_test: None,
+    };
+    crate::proposal_entity_record(&entity, language)
+}
+
+/// 2026-09-04 references-parity task, bucket 1: the `core:contains`
+/// `ProposedRecord` for one catch-clause binding fact's parent -> variable
+/// edge -- byte-identical shape to `parameter_contains_record`.
+fn catch_variable_contains_record(path: &str, fact: &ParameterDeclarationFact) -> ProposedRecord {
+    let id = format!(
+        "jsts:contains:{path}:{}:{}:{}:{}",
+        fact.start, fact.end, fact.parent_id, fact.entity_id
     );
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("possible".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
-    body.insert("start".into(), serde_json::Value::from(site.start));
-    body.insert("end".into(), serde_json::Value::from(site.end));
-    let facets = serde_json::json!(["core:reference_relation", "core:indirect"]);
-    ProposedRecord {
-        proposal_record_key: proposal_record_key(&identity_key),
-        category: "relation",
-        kind: format!("jsts:relation_{}", site.relation_kind),
-        universal_kind: format!("core:{}", site.relation_kind),
-        facets_list: facets_list_from_value(&facets),
-        facets: canonical_json(&facets),
-        schema_version: 1,
-        source_span: canonical_span(path, site.start, site.end),
-        identity_key,
-        body: serde_json::Value::Object(body),
-        evidence_references: canonical_evidence(path, site.start, site.end),
-    }
+    let relation = crate::SyntaxRelation {
+        id,
+        kind: crate::RelationKind::Contains,
+        source_id: fact.parent_id.clone(),
+        target_id: Some(fact.entity_id.clone()),
+        path: path.to_owned(),
+        start: fact.start,
+        end: fact.end,
+        classification: crate::RelationClassification::Confirmed,
+    };
+    crate::proposal_relation_record(&relation)
 }
 
 impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
@@ -2839,6 +4046,28 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 // `relationSource.id !== target.id` guard in `relate` --
                 // so mirror that here even though Rust proved the target.
                 if source_id != target_id {
+                    // Parameter entities, "referenced-only" variant: record
+                    // the target BEFORE moving `target_id` into `ReferenceRow`
+                    // below. `DeclKind::Parameter`'s own `identity_name`
+                    // ("parameter") is the second `:`-delimited segment of
+                    // its target id (`declaration_id`'s own recipe,
+                    // `jsts:parameter:{path}:{nameStart}:{name}`) -- checking
+                    // the prefix directly here (rather than re-parsing it
+                    // through `target_id_kind_name`) keeps this hot path a
+                    // single `starts_with`.
+                    if target_id.starts_with("jsts:parameter:") {
+                        self.referenced_parameter_targets.insert(target_id.clone());
+                    }
+                    // 2026-09-04 references-parity task, bucket 1: same
+                    // "referenced-only" recording for a catch-clause
+                    // binding target (`DeclKind::Variable`'s own
+                    // `"jsts:variable:"` prefix) -- see `referenced_catch_
+                    // targets`'s own doc comment for why matching an
+                    // ordinary (non-catch) variable target here too is
+                    // harmless.
+                    if target_id.starts_with("jsts:variable:") {
+                        self.referenced_catch_targets.insert(target_id.clone());
+                    }
                     self.reference_rows.push(ReferenceRow {
                         start,
                         end,
@@ -2901,9 +4130,24 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             ModuleExportName::IdentifierName(name) => Some(name.name.as_str().to_owned()),
             ModuleExportName::IdentifierReference(_) | ModuleExportName::StringLiteral(_) => None,
         };
+        // External package/symbol entities task: `import { type Foo }` is
+        // type-only per-specifier even inside a value-mode declaration;
+        // `import type { Foo }` makes EVERY specifier type-only regardless
+        // of its own `import_kind` (oxc always reports `Value` for a
+        // specifier under a type-only declaration -- the declaration-level
+        // flag is the authority there).
+        let is_type =
+            self.current_import_type_only || specifier.import_kind == ImportOrExportKind::Type;
         let resolution = imported_name
             .as_deref()
-            .map(|name| self.resolve_import_binding(name))
+            .map(|name| {
+                self.resolve_import_binding(
+                    name,
+                    is_type,
+                    specifier.local.span.start,
+                    specifier.local.span.end,
+                )
+            })
             .unwrap_or(ReferenceResolution::Pending(REASON_IMPORT_BINDING));
         self.site_import_binding(
             specifier.local.span.start,
@@ -2949,34 +4193,138 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         let previous = self
             .current_import_source
             .replace(declaration.source.value.as_str().to_owned());
+        let previous_type_only = self.current_import_type_only;
+        self.current_import_type_only = declaration.import_kind == ImportOrExportKind::Type;
         walk_import_declaration(self, declaration);
         self.current_import_source = previous;
+        self.current_import_type_only = previous_type_only;
     }
 
     /// See `visit_import_specifier`: `local` in `import local from "m"`.
+    ///
+    /// 2026-09-04 references-parity task, Phase B bucket 1: until this fix,
+    /// a default import's binding site NEVER attempted resolution at all
+    /// (unconditionally `checker_pending`, and -- unlike a named import's
+    /// `import_bindings.insert` in `visit_import_specifier` -- never
+    /// inserted into `import_bindings` either, so every LATER use of the
+    /// bound identifier elsewhere in the file fell into `resolve_
+    /// identifier_reference`'s `unwrap_or(Pending(REASON_IMPORT_BINDING))`
+    /// fallback too). Now resolved through the exact same `resolve_import_
+    /// binding` chain a named import's `imported` name goes through, with
+    /// the exported name fixed to `"default"` -- `lib.rs`'s new `visit_
+    /// export_default_declaration` is what makes that lookup succeed for a
+    /// nameable default export (see that function's own doc comment for
+    /// the live n8n sample this closes: `import buildTrivyBlocks from
+    /// "./build-trivy-blocks.mjs"`). An anonymous/non-nameable default
+    /// export (no matching `export_bindings` entry) still degrades to
+    /// `Pending(REASON_IMPORT_BINDING)` exactly like before -- never a
+    /// guess.
     fn visit_import_default_specifier(&mut self, specifier: &ImportDefaultSpecifier<'a>) {
-        self.push_site(
-            SiteKind::IdentifierRef,
+        let resolution = self.resolve_import_binding(
+            "default",
+            self.current_import_type_only,
             specifier.local.span.start,
             specifier.local.span.end,
-            SiteDisposition::CheckerPending,
-            Some(self.identifier_pending_reason(REASON_IMPORT_BINDING)),
         );
+        self.site_import_binding(
+            specifier.local.span.start,
+            specifier.local.span.end,
+            &resolution,
+        );
+        if let Some(symbol_id) = specifier.local.symbol_id.get() {
+            self.import_bindings.insert(symbol_id, resolution);
+        }
         walk_import_default_specifier(self, specifier);
     }
 
     /// See `visit_import_specifier`: `local` in `import * as local from "m"`.
+    ///
+    /// External package/symbol entities task (item 2): unlike a named/
+    /// default import, a namespace import's own binding used AS A VALUE
+    /// (`import * as _ from "lodash"; foo(_)`, not a `_.member` access --
+    /// see `visit_static_member_expression`/`resolve_external_namespace_
+    /// member` for that case) now resolves, with certainty, to `jsts:
+    /// external_symbol:{specifier}#*` when `specifier` is external -- the
+    /// SAME `#*` sentinel name `external_symbol_id` uses for every
+    /// namespace binding, matching how a default import always resolves to
+    /// `#default`. A workspace-resolved namespace import is UNCHANGED
+    /// (stays `checker_pending`: there is no single declaration a namespace
+    /// binding used as a bare value resolves to, internal or external,
+    /// except in the external case, where the "declaration" is simply the
+    /// external module's own symbol table entry for `*`).
     fn visit_import_namespace_specifier(&mut self, specifier: &ImportNamespaceSpecifier<'a>) {
-        self.push_site(
-            SiteKind::IdentifierRef,
+        let is_type = self.current_import_type_only;
+        let unresolved_source = self.current_import_source.as_deref().filter(|source| {
+            self.ctx
+                .resolver
+                .resolve(&self.path, source, self.ctx.available)
+                .is_none()
+        });
+        // Ambient module resolution task (2026-09-04), fix item 2: same
+        // first-refusal order as `resolve_named_binding_via_specifier` --
+        // `import * as ns from "specifier"`'s own binding, used as a bare
+        // VALUE (not a `ns.member` access, see `resolve_external_namespace_
+        // member` for that), resolves to the ambient block's own namespace
+        // entity when `specifier` is uniquely ambiently declared.
+        let ambient = unresolved_source.and_then(|source| {
+            match self.ctx.ambient_index.resolve_export(source, "*") {
+                resolver::AmbientResolution::Resolved(target_id) => Some(target_id),
+                _ => None,
+            }
+        });
+        // `source` ambiently declared but NOT uniquely resolved (several
+        // declaring files, or a shorthand block) stays pending here too --
+        // `has_any_declaration` gates the external fallback exactly like
+        // `resolve_named_binding_via_specifier`'s own `Ambiguous` arm does.
+        let external = match ambient {
+            Some(_) => None,
+            None => unresolved_source.and_then(|source| {
+                if self.ctx.ambient_index.has_any_declaration(source) {
+                    if resolver::classify_external_specifier(source).is_some() {
+                        AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    None
+                } else {
+                    resolver::classify_external_specifier(source)
+                }
+            }),
+        };
+        let resolution = if let Some(target_id) = ambient {
+            ReferenceResolution::Resolved {
+                target_id,
+                cross_file: true,
+            }
+        } else if let Some(canonical) = external {
+            self.emit_external_use(
+                &canonical,
+                "*",
+                is_type,
+                specifier.local.span.start,
+                specifier.local.span.end,
+                true,
+            );
+            ReferenceResolution::Resolved {
+                target_id: resolver::external_symbol_id(&canonical, "*"),
+                cross_file: true,
+            }
+        } else {
+            ReferenceResolution::Pending(REASON_IMPORT_BINDING)
+        };
+        self.site_import_binding(
             specifier.local.span.start,
             specifier.local.span.end,
-            SiteDisposition::CheckerPending,
-            Some(self.identifier_pending_reason(REASON_IMPORT_BINDING)),
+            &resolution,
         );
+        if let Some(symbol_id) = specifier.local.symbol_id.get() {
+            self.import_bindings.insert(symbol_id, resolution);
+        }
         // P1-A (rule (f)): record `ns`'s own specifier for `resolve_
-        // namespace_member`'s later `ns.member(...)` lookups -- see
-        // `namespace_import_specifiers`'s doc comment.
+        // namespace_member`/`resolve_external_namespace_member`'s later
+        // `ns.member(...)`/`ns.member` lookups -- see `namespace_import_
+        // specifiers`'s doc comment. Recorded regardless of internal/
+        // external (both consult this same map, each trying its own
+        // resolution and leaving the site pending if neither succeeds).
         if let (Some(symbol_id), Some(source)) =
             (specifier.local.symbol_id.get(), &self.current_import_source)
         {
@@ -2984,6 +4332,27 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 .insert(symbol_id, source.clone());
         }
         walk_import_namespace_specifier(self, specifier);
+    }
+
+    /// 2026-09-04 references-parity task, Phase B bucket 1: captures the
+    /// enclosing declaration's own `source` specifier text (`"./x"` in
+    /// `export { a } from "./x"`, `None` for the sourceless `export { a, b
+    /// as c }` form) for `visit_export_specifier`'s `local` position to
+    /// resolve against, the same save/restore pattern `visit_import_
+    /// declaration` already uses for `current_import_source`. Export
+    /// declarations never nest, so a simple save/restore (not a stack) is
+    /// exact here too.
+    fn visit_export_named_declaration(&mut self, declaration: &ExportNamedDeclaration<'a>) {
+        let previous = self.current_export_source.take();
+        self.current_export_source = declaration
+            .source
+            .as_ref()
+            .map(|source| source.value.as_str().to_owned());
+        let previous_type_only = self.current_export_type_only;
+        self.current_export_type_only = declaration.export_kind == ImportOrExportKind::Type;
+        walk_export_named_declaration(self, declaration);
+        self.current_export_source = previous;
+        self.current_export_type_only = previous_type_only;
     }
 
     /// `export { correctness } from "./correctness"` -- see
@@ -3013,39 +4382,148 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// `IdentifierReference` site, and double-siting that position would
     /// make the checker re-resolve and re-emit a row Rust already published
     /// -- an identity_key collision under strict merge.
+    ///
+    /// 2026-09-04 references-parity task, Phase B bucket 1: BOTH positions
+    /// now attempt resolution instead of unconditionally staying pending --
+    /// `local` (with-source form only, per the AST-shape test above) via
+    /// `resolve_export_source_binding` (`current_export_source` +
+    /// `resolve_named_export`, the exact same chain a named import's
+    /// `imported` name already used); `exported`, whichever form it
+    /// belongs to, via WHATEVER `local` in that same specifier resolves to
+    /// -- the with-source form's own just-computed resolution (`exported`
+    /// is a plain ALIAS of the same target, not a second lookup), or, for
+    /// the sourceless form, `local`'s own `IdentifierReference` re-resolved
+    /// through the ordinary local-symbol chain (`resolve_identifier_
+    /// reference`, the SAME resolution the default walk's own `visit_
+    /// identifier_reference` call on that exact node already computes
+    /// independently -- redundant but cheap, and avoids threading a
+    /// separate "last local resolution" field through the walker for one
+    /// caller). A `ModuleExportName::StringLiteral` position (either side)
+    /// is never attempted, matching the pre-existing scope note below.
     fn visit_export_specifier(&mut self, specifier: &ExportSpecifier<'a>) {
         let local_span = specifier.local.span();
-        if let ModuleExportName::IdentifierName(name) = &specifier.local {
-            self.push_site(
-                SiteKind::IdentifierRef,
-                name.span.start,
-                name.span.end,
-                SiteDisposition::CheckerPending,
-                Some(self.identifier_pending_reason(REASON_RE_EXPORT_BINDING)),
-            );
-        }
+        let local_resolution = match &specifier.local {
+            ModuleExportName::IdentifierName(name) => {
+                let is_type = self.current_export_type_only
+                    || specifier.export_kind == ImportOrExportKind::Type;
+                let resolution = self.resolve_export_source_binding(
+                    name.name.as_str(),
+                    is_type,
+                    name.span.start,
+                    name.span.end,
+                );
+                self.site_import_binding(name.span.start, name.span.end, &resolution);
+                Some(resolution)
+            }
+            // Sourceless `export { foo }`: `local` is an ordinary
+            // `IdentifierReference`, already sited/resolved by the default
+            // walk's own `visit_identifier_reference` call -- nothing to do
+            // here, `exported`'s own arm below re-derives the same
+            // resolution for its own (different) span.
+            ModuleExportName::IdentifierReference(_) | ModuleExportName::StringLiteral(_) => None,
+        };
         if let ModuleExportName::IdentifierName(name) = &specifier.exported
             && name.span != local_span
         {
-            self.push_site(
-                SiteKind::IdentifierRef,
-                name.span.start,
-                name.span.end,
-                SiteDisposition::CheckerPending,
-                Some(self.identifier_pending_reason(REASON_RE_EXPORT_BINDING)),
-            );
+            let exported_resolution = match (&local_resolution, &specifier.local) {
+                (Some(resolution), _) => resolution.clone(),
+                (None, ModuleExportName::IdentifierReference(local_ident)) => {
+                    self.resolve_identifier_reference(local_ident)
+                }
+                (None, _) => ReferenceResolution::Pending(REASON_RE_EXPORT_BINDING),
+            };
+            self.site_import_binding(name.span.start, name.span.end, &exported_resolution);
         }
         walk_export_specifier(self, specifier);
     }
 
     fn visit_static_member_expression(&mut self, expr: &StaticMemberExpression<'a>) {
-        self.push_site(
-            SiteKind::IdentifierRef,
-            expr.property.span.start,
-            expr.property.span.end,
-            SiteDisposition::CheckerPending,
-            Some(self.identifier_pending_reason(REASON_MEMBER_ACCESS)),
-        );
+        let start = expr.property.span.start;
+        let end = expr.property.span.end;
+        // 2026-09-04 references-parity task: attempt typeflow resolution
+        // BEFORE falling back to the pending site -- see `resolve_static_
+        // member_reference`'s own doc comment for why every position
+        // (read, call callee, assignment target) is attempted uniformly,
+        // and why `jsdoc_typed_file` still wins over a would-be resolution
+        // (the safe-partition rule applies here exactly like every other
+        // identifier-kind site in this file: a JSDoc-typed file's own
+        // typeflow index input is unreliable, so it stays pending too).
+        let resolved = if self.jsdoc_typed_file {
+            None
+        } else {
+            self.resolve_static_member_reference(expr)
+        };
+        // External package/symbol entities task (item 2): when typeflow
+        // could not resolve this member read (`resolved` is `None`), try
+        // ONE more thing before falling back to the pending site -- is the
+        // receiver a plain identifier bound by an EXTERNAL `import * as ns`
+        // (`_.get` in `import * as _ from "lodash"; _.get(...)`)? A static
+        // property name only (`expr.property` is always a plain
+        // `IdentifierName` for a `StaticMemberExpression` -- a computed
+        // access `ns[expr]` is a different AST node, `ComputedMemberExpression`,
+        // not reachable here at all). Emits the symbol entity when found
+        // (see `emit_external_use`'s own doc comment).
+        let external = if resolved.is_some() || self.jsdoc_typed_file {
+            None
+        } else {
+            self.resolve_external_namespace_member(&expr.object, expr.property.name.as_str())
+        };
+        if let Some(NamespaceMemberResolution::External(canonical, _)) = &external {
+            self.emit_external_use(
+                canonical,
+                expr.property.name.as_str(),
+                false,
+                start,
+                end,
+                false,
+            );
+        }
+        let external_target_id = external.map(|resolution| match resolution {
+            NamespaceMemberResolution::External(_, target_id)
+            | NamespaceMemberResolution::Ambient(target_id) => target_id,
+        });
+        match resolved.or(external_target_id) {
+            Some(target_id) => {
+                self.push_site(
+                    SiteKind::IdentifierRef,
+                    start,
+                    end,
+                    SiteDisposition::RustResolved,
+                    None,
+                );
+                let source_id = self.current_owner();
+                // Same self-reference guard as `visit_identifier_reference`
+                // (mirrors the checker's own `relationSource.id !==
+                // target.id` in `analyzer.ts`'s `relate`): a member
+                // referencing itself from within its own body (rare, but
+                // possible for a recursive getter) is not published.
+                if source_id != target_id {
+                    self.reference_rows.push(ReferenceRow {
+                        start,
+                        end,
+                        source_id,
+                        target_id,
+                        // Typeflow-resolved rows never track cross-file-ness
+                        // -- same precedent as `typeflow_call_rows`/`CallRow`
+                        // (no `cross_file` field at all): `ProgramIndex` is
+                        // corpus-wide, so a member's declaring file can
+                        // differ from this owner's, but this round does not
+                        // extend `core:covers` derivation to typeflow-
+                        // resolved member reads.
+                        cross_file: false,
+                    });
+                }
+            }
+            None => {
+                self.push_site(
+                    SiteKind::IdentifierRef,
+                    start,
+                    end,
+                    SiteDisposition::CheckerPending,
+                    Some(self.identifier_pending_reason(REASON_MEMBER_ACCESS)),
+                );
+            }
+        }
         walk_static_member_expression(self, expr);
     }
 
@@ -3066,15 +4544,71 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// see `REASON_TYPE_PREDICATE_PARAMETER`'s doc comment for why oxc gives
     /// it no `IdentifierReference` at all. `this is Foo` predicates
     /// (`TSTypePredicateName::This`) have no identifier and are left alone.
+    ///
+    /// 2026-09-04 references-parity task, bucket 3: manually bind `name`
+    /// against `predicate_param_stack.last()` (the predicate's OWN
+    /// enclosing signature's parameters -- never an outer one, by
+    /// construction: the stack frame is pushed/popped bracketing exactly
+    /// that signature's own walk). A match resolves and sites exactly like
+    /// `visit_identifier_reference`'s `Resolved` arm (own `core:references`
+    /// row, `referenced_parameter_targets` bookkeeping so the parameter
+    /// entity materializes even when the predicate is its ONLY reference);
+    /// no match (the name is not among this signature's own simple
+    /// parameters -- should not happen for valid TS, but never assumed)
+    /// keeps today's `checker_pending` fallback, same reason as before this
+    /// fix. Gated on `jsdoc_typed_file` up front, matching every other
+    /// hand-rolled resolution in this file (this one does not go through
+    /// `resolve_identifier_reference`, which is where that gate normally
+    /// lives).
     fn visit_ts_type_predicate(&mut self, predicate: &TSTypePredicate<'a>) {
         if let TSTypePredicateName::Identifier(name) = &predicate.parameter_name {
-            self.push_site(
-                SiteKind::IdentifierRef,
-                name.span.start,
-                name.span.end,
-                SiteDisposition::CheckerPending,
-                Some(self.identifier_pending_reason(REASON_TYPE_PREDICATE_PARAMETER)),
-            );
+            let matched: Option<u32> = if self.jsdoc_typed_file {
+                None
+            } else {
+                self.predicate_param_stack.last().and_then(|params| {
+                    params
+                        .iter()
+                        .find(|(param_name, ..)| param_name == name.name.as_str())
+                        .map(|(_, start, _)| *start)
+                })
+            };
+            match matched {
+                Some(param_start) => {
+                    let target_id = declaration_id(
+                        DeclKind::Parameter,
+                        &self.path,
+                        param_start,
+                        name.name.as_str(),
+                    );
+                    self.push_site(
+                        SiteKind::IdentifierRef,
+                        name.span.start,
+                        name.span.end,
+                        SiteDisposition::RustResolved,
+                        None,
+                    );
+                    let source_id = self.current_owner();
+                    if source_id != target_id {
+                        self.referenced_parameter_targets.insert(target_id.clone());
+                        self.reference_rows.push(ReferenceRow {
+                            start: name.span.start,
+                            end: name.span.end,
+                            source_id,
+                            target_id,
+                            cross_file: false,
+                        });
+                    }
+                }
+                None => {
+                    self.push_site(
+                        SiteKind::IdentifierRef,
+                        name.span.start,
+                        name.span.end,
+                        SiteDisposition::CheckerPending,
+                        Some(self.identifier_pending_reason(REASON_TYPE_PREDICATE_PARAMETER)),
+                    );
+                }
+            }
         }
         walk_ts_type_predicate(self, predicate);
     }
@@ -3132,61 +4666,108 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                     self.typeflow_pending_call_shapes
                         .push(TypeflowPendingShape { start, end, shape });
                 }
-                match self.resolve_call_target_typeflow(expr) {
-                    Some((target_id, rule)) if self.ctx.typeflow_oracle => {
-                        let source_id = self.current_owner();
+                let resolution = self.resolve_call_target_typeflow(expr);
+                if self.ctx.typeflow_oracle {
+                    // P2-2j: oracle mode compares a SINGLE typeflow guess
+                    // against the checker's own independent answer for the
+                    // same site -- a `Candidates` outcome is not a single
+                    // guess to compare, so it is deliberately folded into
+                    // the SAME plain-pending path `Unresolved` already
+                    // takes here (no oracle hit, no candidate rows) rather
+                    // than inventing oracle semantics for a set. This whole
+                    // feature stays orthogonal to the research-only oracle
+                    // flag.
+                    if let TypeflowCallResolution::Resolved(target_id, rule) = &resolution {
                         self.typeflow_oracle_hits.push(TypeflowOracleHit {
                             start,
                             end,
                             edge_kind: "call",
                             rule,
-                            source_id: source_id.clone(),
-                            target_id,
-                        });
-                        self.push_site(
-                            SiteKind::Call,
-                            start,
-                            end,
-                            SiteDisposition::CheckerPending,
-                            Some(reason),
-                        );
-                        self.pending_call_sites.push(PendingCallSite {
-                            start,
-                            end,
-                            source_id,
-                            reason,
-                        });
-                    }
-                    Some((target_id, _rule)) => {
-                        self.push_site(
-                            SiteKind::Call,
-                            start,
-                            end,
-                            SiteDisposition::RustResolved,
-                            None,
-                        );
-                        let source_id = self.current_owner();
-                        self.typeflow_call_rows.push(CallRow {
-                            start,
-                            end,
-                            source_id,
-                            target_id,
-                        });
-                    }
-                    None => {
-                        self.push_site(
-                            SiteKind::Call,
-                            start,
-                            end,
-                            SiteDisposition::CheckerPending,
-                            Some(reason),
-                        );
-                        self.pending_call_sites.push(PendingCallSite {
-                            start,
-                            end,
                             source_id: self.current_owner(),
-                            reason,
+                            target_id: target_id.clone(),
                         });
+                    }
+                    self.push_site(
+                        SiteKind::Call,
+                        start,
+                        end,
+                        SiteDisposition::CheckerPending,
+                        Some(reason),
+                    );
+                    self.pending_call_sites.push(PendingCallSite {
+                        start,
+                        end,
+                        source_id: self.current_owner(),
+                        reason,
+                    });
+                } else {
+                    match resolution {
+                        TypeflowCallResolution::Resolved(target_id, _rule) => {
+                            self.push_site(
+                                SiteKind::Call,
+                                start,
+                                end,
+                                SiteDisposition::RustResolved,
+                                None,
+                            );
+                            let source_id = self.current_owner();
+                            self.typeflow_call_rows.push(CallRow {
+                                start,
+                                end,
+                                source_id,
+                                target_id,
+                            });
+                        }
+                        // P2-2j: the site stays PENDING (with the candidate
+                        // reason -- exactly like an `Unresolved` site, just
+                        // a different reason) AND gets one `CandidateCallRow`
+                        // per candidate, so the residual pass can still
+                        // upgrade it to a single confirmed row later while
+                        // the query engine can already traverse each
+                        // candidate today.
+                        TypeflowCallResolution::Candidates {
+                            targets,
+                            reason: candidate_reason,
+                        } => {
+                            self.push_site(
+                                SiteKind::Call,
+                                start,
+                                end,
+                                SiteDisposition::CheckerPending,
+                                Some(candidate_reason),
+                            );
+                            let source_id = self.current_owner();
+                            self.pending_call_sites.push(PendingCallSite {
+                                start,
+                                end,
+                                source_id: source_id.clone(),
+                                reason: candidate_reason,
+                            });
+                            for target_id in targets {
+                                self.candidate_call_rows.push(CandidateCallRow {
+                                    start,
+                                    end,
+                                    source_id: source_id.clone(),
+                                    target_id,
+                                    reason: candidate_reason,
+                                });
+                            }
+                        }
+                        TypeflowCallResolution::Unresolved => {
+                            self.push_site(
+                                SiteKind::Call,
+                                start,
+                                end,
+                                SiteDisposition::CheckerPending,
+                                Some(reason),
+                            );
+                            self.pending_call_sites.push(PendingCallSite {
+                                start,
+                                end,
+                                source_id: self.current_owner(),
+                                reason,
+                            });
+                        }
                     }
                 }
             }
@@ -3302,11 +4883,22 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     }
 
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        // Parameter entities, "referenced-only" variant: drain the one-shot
+        // hint UNCONDITIONALLY, before deciding `pushed` below -- a hint can
+        // only ever be set for a node reached through `declarator.init`/
+        // `prop.value`, both syntactically `FunctionExpression`/
+        // `ArrowFunctionExpression` NEVER a `FunctionDeclaration`, so it can
+        // never actually collide with the `pushed` branch; draining it here
+        // regardless is just the same "never let a hint survive past the
+        // node it was set for" discipline `pending_function_owner`'s own doc
+        // comment describes, applied uniformly instead of only in the branch
+        // that happens to need it today.
+        let pending_owner = self.pending_function_owner.take().flatten();
         let pushed = matches!(
             function.r#type,
             FunctionType::FunctionDeclaration | FunctionType::TSDeclareFunction
         ) && function.id.is_some();
-        if pushed {
+        let owner = if pushed {
             let ident = function.id.as_ref().expect("checked above");
             let id = declaration_id(
                 DeclKind::Function,
@@ -3314,7 +4906,7 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 ident.span.start,
                 ident.name.as_str(),
             );
-            self.callable_stack.push(id);
+            self.callable_stack.push(id.clone());
             self.push_site(
                 SiteKind::TypedDecl,
                 function.span.start,
@@ -3322,7 +4914,24 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 SiteDisposition::CheckerPending,
                 Some(REASON_TYPE_INFERENCE_REQUIRED),
             );
-        }
+            Some(ParamOwner {
+                qualified_name: format!("{}.{}", self.path, ident.name.as_str()),
+                entity_id: id,
+            })
+        } else {
+            // Not a named function DECLARATION: either a variable-bound
+            // arrow/function-expression (`pending_owner` carries the
+            // variable's own `ParamOwner`, set by `visit_variable_
+            // declarator` right before this call), or a genuinely anonymous
+            // one (a callback argument, an IIFE, a named function EXPRESSION
+            // not bound to anything, ...) -- `pending_owner` is `None` in
+            // every one of those, which is exactly the "falls back to the
+            // module" rule `parameter_entity_record` documents.
+            pending_owner
+        };
+        self.param_owner_stack.push(owner);
+        self.predicate_param_stack
+            .push(identifier_pattern_params(&function.params.items));
         // P1-A (rule (e)): a `function`/`function expression` REBINDS
         // `this` -- unlike an arrow function (which oxc never routes
         // through `visit_function` at all: `ArrowFunctionExpression` is its
@@ -3343,9 +4952,30 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         });
         walk_function(self, function, flags);
         self.class_stack.pop();
+        self.param_owner_stack.pop();
+        self.predicate_param_stack.pop();
         if pushed {
             self.callable_stack.pop();
         }
+    }
+
+    /// Parameter entities, "referenced-only" variant: an arrow function
+    /// never rebinds `this`/`super` (unlike `visit_function` above, this
+    /// override deliberately does NOT touch `class_stack`) and is never a
+    /// `callable_stack` owner either (`current_owner`'s doc comment: a
+    /// reference inside an arrow body attributes to whatever lexically
+    /// encloses it, exactly like the checker's own `ownerAt`) -- but its
+    /// PARAMETERS still need an owner frame, drained from the same one-shot
+    /// hint `visit_function` drains (`None` for a bare, unbound arrow, e.g.
+    /// an inline `arr.map(x => x + 1)` callback -- the module fallback).
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        let owner = self.pending_function_owner.take().flatten();
+        self.param_owner_stack.push(owner);
+        self.predicate_param_stack
+            .push(identifier_pattern_params(&arrow.params.items));
+        walk_arrow_function_expression(self, arrow);
+        self.predicate_param_stack.pop();
+        self.param_owner_stack.pop();
     }
 
     fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
@@ -3366,7 +4996,27 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 MethodDefinitionKind::Set => DeclKind::Setter,
             };
             let id = declaration_id(kind, &self.path, key_start, &key_name);
-            self.callable_stack.push(id);
+            self.callable_stack.push(id.clone());
+            // Parameter entities, "referenced-only" variant: this call
+            // bypasses `self.visit_function` below (see that call's own
+            // comment), so unlike every OTHER `Function`/`ArrowFunction
+            // Expression` node, `param_owner_stack` must be bracketed
+            // directly here rather than through `pending_function_owner` --
+            // same reasoning as the `callable_stack` push just above.
+            // `member_qualified_names.get(&id)` is `None` for a method
+            // whose class/interface is nested or anonymous (`member_
+            // declarations` never enumerates one) -- correctly falls back
+            // to the module for this method's own parameters, no dangling
+            // `parent_id`.
+            let owner = self
+                .member_qualified_names
+                .get(&id)
+                .cloned()
+                .map(|qualified_name| ParamOwner {
+                    entity_id: id,
+                    qualified_name,
+                });
+            self.param_owner_stack.push(owner);
             self.push_site(
                 SiteKind::TypedDecl,
                 method.span.start,
@@ -3406,10 +5056,20 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             MethodDefinitionKind::Constructor => ScopeFlags::Function | ScopeFlags::Constructor,
             MethodDefinitionKind::Method => ScopeFlags::Function,
         };
+        // Type-predicate parameter fix: `walk_function` above bypasses
+        // `self.visit_function`, so its own `predicate_param_stack` push
+        // never fires for a method's `.value` either -- bracket it directly
+        // here, unconditionally (same "always push a frame, even empty"
+        // discipline as everywhere else `predicate_param_stack` is
+        // maintained), so `isFoo(x: unknown): x is Foo {}` resolves.
+        self.predicate_param_stack
+            .push(identifier_pattern_params(&method.value.params.items));
         walk_function(self, &method.value, flags);
+        self.predicate_param_stack.pop();
         self.static_context.pop();
         if pushed {
             self.callable_stack.pop();
+            self.param_owner_stack.pop();
         }
     }
 
@@ -3451,6 +5111,22 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 );
             })
             .is_some();
+        // Parameter entities, "referenced-only" variant: `prop.value`, when
+        // it is a `Function`/`ArrowFunctionExpression` (a shorthand method's
+        // OWN value, or a plain `{ onClick: () => {} }`-style property whose
+        // value happens to be one), routes through `self.visit_function`/
+        // `self.visit_arrow_function_expression` below via the default
+        // `walk_object_property` (unlike `visit_method_definition`, this
+        // override does not bypass it) -- so, UNLIKE the `callable_stack`
+        // push above, the frame must go through the one-shot hint, not a
+        // direct `param_owner_stack` push here (that would double-push
+        // against the one `visit_function`/`visit_arrow_function_expression`
+        // itself performs). `member_declarations` never enumerates object
+        // literals, so an object-literal method (or property) never gets a
+        // `parent_id` of its own -- `Some(None)` explicitly, in EVERY case
+        // (not just when `pushed`), so a stale OUTER hint can never leak
+        // into either shape.
+        self.pending_function_owner = Some(None);
         walk_object_property(self, prop);
         if pushed {
             self.callable_stack.pop();
@@ -3490,9 +5166,33 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         } else {
             false
         };
+        // Type-predicate parameter fix: bracket this signature's own
+        // parameter list so a predicate in its `return_type` (`isFoo(x:
+        // unknown): x is Foo` on an interface/type-literal member) can
+        // resolve `x` -- pushed unconditionally, matching `predicate_param_
+        // stack`'s own "always a frame, even when unnamed/unpushed as a
+        // callable owner" discipline.
+        self.predicate_param_stack
+            .push(identifier_pattern_params(&signature.params.items));
         walk_ts_method_signature(self, signature);
+        self.predicate_param_stack.pop();
         if pushed {
             self.callable_stack.pop();
+        }
+    }
+
+    /// Parameter entities, "referenced-only" variant: sets `declarator_owns_
+    /// entity` per declarator (index `0` only) before visiting it, so
+    /// `visit_variable_declarator` can tell whether ITS declarator is the
+    /// one `lib.rs`'s plain entity pass actually emits a `core:value` entity
+    /// for -- see that field's own doc comment. Otherwise identical to the
+    /// default `walk_variable_declaration` (`visit_span` is a no-op this
+    /// walker never overrides, same as every other custom-traversal override
+    /// in this file, e.g. `visit_method_definition`).
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for (index, declarator) in declaration.declarations.iter().enumerate() {
+            self.declarator_owns_entity = index == 0;
+            self.visit_variable_declarator(declarator);
         }
     }
 
@@ -3511,6 +5211,46 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             declarator.type_annotation.as_deref(),
             declarator.init.as_ref(),
         );
+        // Parameter entities, "referenced-only" variant: a variable-bound
+        // arrow/function-expression owns its own params under the
+        // VARIABLE's entity, not a fresh anonymous frame -- set the one-shot
+        // hint `self.visit_function`/`self.visit_arrow_function_expression`
+        // drains as soon as `declarator.init` (the very next node either of
+        // them could possibly be) is reached below. Only when `declarator.
+        // owns_entity` (this is the FIRST declarator of its own `Variable
+        // Declaration` -- see that field's own doc comment) does the
+        // variable actually have an entity to point at; otherwise `owner` is
+        // `None`, same "falls back to the module" outcome as an anonymous
+        // callback. `Some(owner)` either way (not left unset) so this
+        // declarator's init can never inherit a stale OUTER hint.
+        if let Some(init) = &declarator.init
+            && matches!(
+                init,
+                Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+            )
+        {
+            let owner = if self.declarator_owns_entity {
+                match &declarator.id {
+                    BindingPattern::BindingIdentifier(ident) => Some(ParamOwner {
+                        entity_id: declaration_id(
+                            DeclKind::Variable,
+                            &self.path,
+                            ident.span.start,
+                            ident.name.as_str(),
+                        ),
+                        qualified_name: format!("{}.{}", self.path, ident.name.as_str()),
+                    }),
+                    // Non-identifier binding (`const [f] = [...]`, `const {f}
+                    // = {...}`): `lib.rs`'s own `push_entity` only ever fires
+                    // for `BindingPattern::BindingIdentifier`, so there is no
+                    // entity to point at either way.
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            self.pending_function_owner = Some(owner);
+        }
         walk_variable_declarator(self, declarator);
     }
 
@@ -3660,7 +5400,7 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// BindingIdentifier` guard) -- destructured/rest parameters are
     /// deliberately left unsited, same as everywhere else in this file.
     fn visit_formal_parameter(&mut self, parameter: &FormalParameter<'a>) {
-        if matches!(&parameter.pattern, BindingPattern::BindingIdentifier(_)) {
+        if let BindingPattern::BindingIdentifier(ident) = &parameter.pattern {
             self.push_site(
                 SiteKind::TypedDecl,
                 parameter.span.start,
@@ -3668,6 +5408,64 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 SiteDisposition::CheckerPending,
                 Some(REASON_TYPE_INFERENCE_REQUIRED),
             );
+            // Parameter entities, "referenced-only" variant: record this
+            // declaration's facts UNCONDITIONALLY (before it is known
+            // whether any reference ever targets it -- `finish` filters this
+            // map down to `referenced_parameter_targets` at the end). A
+            // parameter PROPERTY (`constructor(private x: T) {}`,
+            // `parameter.has_modifier()`) is EXCLUDED from this map --
+            // 2026-09-04 references-parity task, member-entities-in-cold
+            // follow-up: `urdira_jsts_typeflow::member_declarations` (via
+            // `push_member_entities` in `lib.rs`) now owns EVERY parameter
+            // property UNCONDITIONALLY, the same way it already owns every
+            // other class member, byte-identical entity id
+            // (`declaration_id(DeclKind::Parameter, ...)` here ==
+            // `declaration_id("parameter", ...)` there, both keyed by the
+            // BINDING IDENTIFIER's own span). Recording it here TOO would
+            // materialize the exact same declaration twice, once from each
+            // producer. `classify_symbol_declaration`'s own `FormalParameter`
+            // arm still never inspects `accessibility`/`readonly`, so a bare
+            // reference to `x` elsewhere in the constructor body, and a
+            // `this.x` member read (`resolve_static_member_reference`),
+            // still both resolve to this SAME entity id -- `finish`'s
+            // `referenced_parameter_targets` bucket simply finds no fact for
+            // it here (by construction, never inserted) and skips
+            // materializing it a second time, since `push_member_entities`
+            // already will.
+            if !parameter.has_modifier() {
+                let entity_id = declaration_id(
+                    DeclKind::Parameter,
+                    &self.path,
+                    ident.span.start,
+                    ident.name.as_str(),
+                );
+                let (parent_id, parent_qualified_name) =
+                    match self.param_owner_stack.last().cloned().flatten() {
+                        Some(owner) => (owner.entity_id, owner.qualified_name),
+                        // No owner frame at all (an impossible-to-reference TS
+                        // type-level function signature's own param, e.g. `type F
+                        // = (x: number) => void` -- see `param_owner_stack`'s own
+                        // doc comment) or an owner frame explicitly `None` (falls
+                        // back to the module, `parameter_entity_record`'s rule):
+                        // both degrade the same way `push_entity` treats every
+                        // module-level entity -- `self.path` doubles as the
+                        // module's own "qualified name" for concatenation
+                        // purposes even though the module entity's own `qualified
+                        // _name` field is `None`.
+                        None => (self.module_id.clone(), self.path.clone()),
+                    };
+                self.parameter_declarations.insert(
+                    entity_id.clone(),
+                    ParameterDeclarationFact {
+                        entity_id,
+                        name: ident.name.as_str().to_owned(),
+                        start: ident.span.start,
+                        end: ident.span.end,
+                        parent_id,
+                        qualified_name: format!("{parent_qualified_name}.{}", ident.name.as_str()),
+                    },
+                );
+            }
         }
         self.record_local_type(
             &parameter.pattern,
@@ -3675,6 +5473,88 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             None,
         );
         walk_formal_parameter(self, parameter);
+    }
+
+    /// 2026-09-04 references-parity task, bucket 1: the catch-clause
+    /// counterpart of `visit_formal_parameter`'s declaration-fact recording
+    /// -- see `classify_symbol_declaration`'s `AstKind::CatchParameter` arm
+    /// for why this needs a fact at all (an `isVariableDeclaration`
+    /// reference target the checker resolves, that nothing previously
+    /// published an entity for). A destructured catch binding (`catch ({
+    /// message }) {}`) records nothing, matching `classify_symbol_
+    /// declaration`'s own conservative `None` for that shape. Owner
+    /// attribution reuses `param_owner_stack.last()` exactly like an
+    /// ordinary parameter -- a catch clause is always directly inside SOME
+    /// callable's body (or, `None`/empty stack, module-level top-level
+    /// code), never its own separate "owner".
+    fn visit_catch_parameter(&mut self, param: &CatchParameter<'a>) {
+        if let BindingPattern::BindingIdentifier(ident) = &param.pattern {
+            let entity_id = declaration_id(
+                DeclKind::Variable,
+                &self.path,
+                ident.span.start,
+                ident.name.as_str(),
+            );
+            let (parent_id, parent_qualified_name) =
+                match self.param_owner_stack.last().cloned().flatten() {
+                    Some(owner) => (owner.entity_id, owner.qualified_name),
+                    None => (self.module_id.clone(), self.path.clone()),
+                };
+            self.catch_declarations.insert(
+                entity_id.clone(),
+                ParameterDeclarationFact {
+                    entity_id,
+                    name: ident.name.as_str().to_owned(),
+                    start: ident.span.start,
+                    end: ident.span.end,
+                    parent_id,
+                    qualified_name: format!("{parent_qualified_name}.{}", ident.name.as_str()),
+                },
+            );
+        }
+        walk_catch_parameter(self, param);
+    }
+
+    /// 2026-09-04 references-parity task, bucket 1: the rest-parameter
+    /// counterpart of `visit_formal_parameter`'s declaration-fact recording
+    /// -- reuses the SAME `parameter_declarations`/`referenced_parameter_
+    /// targets` bucket (a rest parameter's `target_id` already carries the
+    /// `"jsts:parameter:"` prefix `visit_identifier_reference`'s `Resolved`
+    /// arm already checks, see `classify_symbol_declaration`'s `AstKind::
+    /// FormalParameterRest` arm). `oxc` never routes a rest parameter
+    /// through `visit_formal_parameter` at all -- `FormalParameters::rest`
+    /// is a SIBLING field to `items`, walked through this SEPARATE visitor
+    /// method (`walk_formal_parameters`'s own body) -- so this needs its own
+    /// override rather than "extending" the existing one. No parameter-
+    /// property carve-out is needed here (TypeScript does not allow an
+    /// accessibility modifier on a rest parameter at all, so `FormalParameterRest`
+    /// has no `has_modifier`-equivalent to check).
+    fn visit_formal_parameter_rest(&mut self, parameter: &FormalParameterRest<'a>) {
+        if let BindingPattern::BindingIdentifier(ident) = &parameter.rest.argument {
+            let entity_id = declaration_id(
+                DeclKind::Parameter,
+                &self.path,
+                ident.span.start,
+                ident.name.as_str(),
+            );
+            let (parent_id, parent_qualified_name) =
+                match self.param_owner_stack.last().cloned().flatten() {
+                    Some(owner) => (owner.entity_id, owner.qualified_name),
+                    None => (self.module_id.clone(), self.path.clone()),
+                };
+            self.parameter_declarations.insert(
+                entity_id.clone(),
+                ParameterDeclarationFact {
+                    entity_id,
+                    name: ident.name.as_str().to_owned(),
+                    start: ident.span.start,
+                    end: ident.span.end,
+                    parent_id,
+                    qualified_name: format!("{parent_qualified_name}.{}", ident.name.as_str()),
+                },
+            );
+        }
+        walk_formal_parameter_rest(self, parameter);
     }
 }
 
@@ -3697,12 +5577,14 @@ pub fn analyze_owner_semantics(
     let resolver = WorkspaceResolver::default();
     let available = BTreeSet::new();
     let files = BTreeMap::new();
+    let ambient_index = resolver::AmbientModuleIndex::default();
     let ctx = HybridResolutionContext {
         resolver: &resolver,
         available: &available,
         files: &files,
         typeflow_index: None,
         typeflow_oracle: false,
+        ambient_index: &ambient_index,
     };
     analyze_owner_semantics_with_context(path, source_text, &ctx)
 }
@@ -3734,12 +5616,39 @@ pub fn analyze_owner_semantics_with_context(
         .with_build_nodes(true)
         .build(&parsed.program);
     let semantic = semantic_return.semantic;
+    // Parameter entities, "referenced-only" variant: the SAME enumeration
+    // `push_member_entities` (lib.rs, lane 1) uses to materialize a
+    // class/interface member's own entity -- reusing it here (rather than
+    // re-deriving "does this class/interface get a member entity" from
+    // scratch) means a method/constructor/getter/setter's `entity_id` is
+    // ALWAYS looked up against the exact set lib.rs actually emits: a
+    // NESTED class (not module-top-level) or an ANONYMOUS class is
+    // correctly absent (`member_declarations`'s own doc comment), so a
+    // parameter inside one of ITS methods falls back to the module entity
+    // instead of naming a `parent_id` that was never published. Keyed by
+    // `entity_id` (byte-identical to what `visit_method_definition`/`visit_
+    // object_property`/`visit_ts_method_signature` compute locally), valued
+    // by the qualified name lib.rs assigns that same entity
+    // (`push_member_entities`'s own `"{path}.{container}.{name}"` recipe) so
+    // a referenced parameter's own `qualified_name` can extend it without a
+    // second lookup. Must run AFTER `Utf8ToUtf16::convert_program` above,
+    // same as lib.rs's own call, so every span agrees on units (UTF-16).
+    let member_qualified_names: BTreeMap<String, String> =
+        urdira_jsts_typeflow::member_declarations(&parsed.program, path)
+            .into_iter()
+            .map(|declaration| {
+                let qualified_name =
+                    format!("{path}.{}.{}", declaration.container_name, declaration.name);
+                (declaration.entity_id, qualified_name)
+            })
+            .collect();
     let mut walker = SemanticWalker::new(
         path,
         semantic.scoping(),
         semantic.nodes(),
         jsdoc_typed_file,
         ctx,
+        member_qualified_names,
     );
     walker.visit_program(&parsed.program);
     Ok(walker.finish())
@@ -3748,6 +5657,28 @@ pub fn analyze_owner_semantics_with_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parameter entities, "referenced-only" variant: find the
+    /// `parameter_entity_rows` entry with this exact `id`, if one exists.
+    fn parameter_entity<'s>(semantics: &'s OwnerSemantics, id: &str) -> Option<&'s ProposedRecord> {
+        semantics
+            .parameter_entity_rows
+            .iter()
+            .find(|record| record.identity_key == id)
+    }
+
+    /// Parameter entities, "referenced-only" variant: find the
+    /// `parameter_contains_rows` entry whose `target_id` is this parameter
+    /// `id`, if one exists.
+    fn parameter_contains<'s>(
+        semantics: &'s OwnerSemantics,
+        parameter_id: &str,
+    ) -> Option<&'s ProposedRecord> {
+        semantics
+            .parameter_contains_rows
+            .iter()
+            .find(|record| record.body["target_id"].as_str() == Some(parameter_id))
+    }
 
     fn resolved(semantics: &OwnerSemantics) -> Vec<(u32, u32, &str, &str)> {
         semantics
@@ -3989,10 +5920,87 @@ mod tests {
     }
 
     #[test]
-    fn marks_type_predicate_parameter_name_pending() {
+    fn resolves_type_predicate_parameter_name_to_the_real_parameter() {
+        // 2026-09-04 references-parity task, bucket 3: `visit_ts_type_
+        // predicate` now manually binds the predicate's own repeated
+        // parameter name against `predicate_param_stack` instead of always
+        // staying pending.
         let source = "function isFoo(value: unknown): value is { kind: \"foo\" } {\n  return typeof value === \"object\";\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
         let predicate_name_start = source.find("value is").unwrap() as u32;
+        let predicate_name_end = predicate_name_start + "value".len() as u32;
+        let param_start = source.find("value:").unwrap() as u32;
+        let param_id = declaration_id(DeclKind::Parameter, "a.ts", param_start, "value");
+        let function_id = declaration_id(
+            DeclKind::Function,
+            "a.ts",
+            source.find("isFoo").unwrap() as u32,
+            "isFoo",
+        );
+        // No pending site at the predicate name's own span any more.
+        assert!(
+            !semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::IdentifierRef
+                    && site.start_utf16 == predicate_name_start),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.contains(&(
+                predicate_name_start,
+                predicate_name_end,
+                function_id.as_str(),
+                param_id.as_str()
+            )),
+            "rows: {:?}",
+            rows
+        );
+        // The parameter entity itself materializes even though its ONLY
+        // other appearance is the declaration site (the predicate reference
+        // is what makes it "referenced").
+        assert!(parameter_entity(&semantics, &param_id).is_some());
+    }
+
+    #[test]
+    fn resolves_asserts_predicate_parameter_name_to_the_real_parameter() {
+        let source = "function assertFoo(value: unknown): asserts value is string {\n  if (typeof value !== \"string\") throw new Error();\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let predicate_name_start = source.find("value is string").unwrap() as u32;
+        let predicate_name_end = predicate_name_start + "value".len() as u32;
+        let param_start = source.find("value:").unwrap() as u32;
+        let param_id = declaration_id(DeclKind::Parameter, "a.ts", param_start, "value");
+        let function_id = declaration_id(
+            DeclKind::Function,
+            "a.ts",
+            source.find("assertFoo").unwrap() as u32,
+            "assertFoo",
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.contains(&(
+                predicate_name_start,
+                predicate_name_end,
+                function_id.as_str(),
+                param_id.as_str()
+            )),
+            "rows: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn type_predicate_parameter_name_not_among_this_signatures_own_parameters_stays_pending() {
+        // Defensive/negative case (should not occur for valid TypeScript,
+        // but never assumed): the predicate repeats a name that is not one
+        // of THIS signature's own simple parameters -- falls back to the
+        // ordinary `checker_pending` disposition exactly like before this
+        // fix, never a wrong guess.
+        let source = "function isFoo(value: unknown): other is string {\n  return typeof value === \"string\";\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let predicate_name_start = source.find("other is").unwrap() as u32;
         let site = semantics.pending_sites.iter().find(|site| {
             site.site_kind == SiteKind::IdentifierRef && site.start_utf16 == predicate_name_start
         });
@@ -4005,16 +6013,24 @@ mod tests {
     }
 
     #[test]
-    fn marks_asserts_predicate_parameter_name_pending() {
-        let source = "function assertFoo(value: unknown): asserts value is string {\n  if (typeof value !== \"string\") throw new Error();\n}\n";
+    fn type_predicate_parameter_name_from_an_outer_function_does_not_leak_in() {
+        // Scope-aware: an INNER function's own predicate must resolve
+        // against ITS OWN parameters, never an outer enclosing function's
+        // same-shaped one -- `predicate_param_stack`'s own "always push a
+        // frame, even empty" discipline is what makes this fail closed
+        // (falls to `checker_pending`) rather than accidentally matching the
+        // outer `value`.
+        let source = "function outer(value: unknown) {\n  function inner(other: unknown): value is string {\n    return typeof other === \"string\";\n  }\n  return inner;\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
-        let predicate_name_start = source.find("value is string").unwrap() as u32;
+        let predicate_name_start = source.rfind("value is").unwrap() as u32;
         let site = semantics.pending_sites.iter().find(|site| {
             site.site_kind == SiteKind::IdentifierRef && site.start_utf16 == predicate_name_start
         });
         assert_eq!(
             site.and_then(|site| site.reason.as_deref()),
-            Some(REASON_TYPE_PREDICATE_PARAMETER)
+            Some(REASON_TYPE_PREDICATE_PARAMETER),
+            "sites: {:?}",
+            semantics.pending_sites
         );
     }
 
@@ -4082,27 +6098,40 @@ mod tests {
     }
 
     #[test]
-    fn sourceless_aliased_export_of_a_variable_marks_the_alias_half_pending() {
+    fn sourceless_aliased_export_of_a_variable_resolves_the_alias_half() {
         // The real-world shape this reconciliation gate caught: no `from`
         // clause, but the checker still resolves the alias (`bar`) straight
-        // through to the original `const` declaration -- the same shape
-        // over a `function` declaration instead resolves neither half (a
-        // real checker inconsistency, deliberately not replicated: siting
-        // `exported` unconditionally, per `visit_export_specifier`'s doc
-        // comment, is correct either way -- pending just means "the checker
-        // may resolve this," never "it definitely will").
+        // through to the original `const` declaration. 2026-09-04
+        // references-parity task, Phase B bucket 1: `visit_export_
+        // specifier` now resolves this too, through `local`'s own
+        // (already-computed, by the default walk's `visit_identifier_
+        // reference`) local-symbol resolution -- re-derived here via
+        // `resolve_identifier_reference` for `exported`'s own, different
+        // span. `local`'s own site (`foo`, the FIRST occurrence) already
+        // resolved before this fix (an ordinary `IdentifierReference`); only
+        // `exported`'s (`bar`) is new.
         let source = "const foo = 1;\nexport { foo as bar };\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
         let alias_start = source.rfind("bar").unwrap() as u32;
+        let alias_end = alias_start + "bar".len() as u32;
         assert!(
             semantics
                 .pending_sites
                 .iter()
-                .any(|site| site.site_kind == SiteKind::IdentifierRef
-                    && site.start_utf16 == alias_start
-                    && site.reason.as_deref() == Some(REASON_RE_EXPORT_BINDING)),
-            "sites: {:?}",
+                .all(|site| site.start_utf16 != alias_start),
+            "the alias half must no longer stay pending: sites: {:?}",
             semantics.pending_sites
+        );
+        let foo_start = source.find("foo").unwrap() as u32;
+        let target_id = format!("jsts:variable:a.ts:{foo_start}:foo");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter()
+                .any(|&(start, end, _source_id, row_target)| start == alias_start
+                    && end == alias_end
+                    && row_target == target_id),
+            "rows: {:?}",
+            rows
         );
     }
 
@@ -4302,82 +6331,54 @@ mod tests {
         );
     }
 
-    /// P2-2i: every pending `Call` site (member/`this`/`super` callee here)
-    /// gets a `classification: "possible"` `core:call` row -- no `target_id`
-    /// key at all, `"core:indirect"` in its facets -- immediately followed
-    /// by a paired `jsts:unresolved_call` diagnostic carrying the site's own
-    /// `reason`. Mirrors `analyzer.ts`'s `relate("call", relationSource,
-    /// undefined, node, "possible")` + `jsts:unresolved_call` push.
+    /// A2 (pending.sites migration): every pending `Call` site (member/
+    /// `this`/`super` callee here) produces exactly one `PendingSiteProposal`
+    /// (`site_kind: Call`) carrying the site's own `reason` and `source_id`
+    /// -- no `ProposedRecord`/`target_id`/diagnostic (folded, see
+    /// `OwnerSemantics::pending_site_rows`'s doc comment). Replaces the
+    /// P2-2i `possible_call_rows`-based test of the same scenario.
     #[test]
-    fn pending_call_sites_produce_possible_rows_and_paired_diagnostics() {
+    fn pending_call_sites_produce_pending_site_rows_with_reason() {
         let source = "function run() {\n  this.greet();\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
         assert_eq!(
-            semantics.possible_call_rows.len(),
-            2,
-            "one possible relation + one paired diagnostic: {:?}",
-            semantics.possible_call_rows
+            semantics.pending_site_rows.len(),
+            1,
+            "exactly one pending site row, no paired diagnostic: {:?}",
+            semantics.pending_site_rows
         );
-        let relation = &semantics.possible_call_rows[0];
-        assert_eq!(relation.category, "relation");
-        assert_eq!(relation.kind, "jsts:relation_call");
-        assert_eq!(relation.universal_kind, "core:call");
-        assert_eq!(relation.body["classification"], "possible");
-        assert!(
-            relation.body.get("target_id").is_none(),
-            "a possible call row must carry no target_id key at all: {:?}",
-            relation.body
-        );
-        assert!(relation.identity_key.ends_with(":unresolved"));
-        assert!(
-            relation.facets.contains("core:indirect"),
-            "facets: {}",
-            relation.facets
-        );
-        assert!(
-            relation.facets.contains("core:reference_relation"),
-            "facets: {}",
-            relation.facets
-        );
-
-        let diagnostic = &semantics.possible_call_rows[1];
-        assert_eq!(diagnostic.category, "diagnostic");
-        assert_eq!(diagnostic.kind, "jsts:diagnostic");
-        assert_eq!(diagnostic.universal_kind, "core:construct");
-        assert_eq!(diagnostic.body["code"], "jsts:unresolved_call");
-        assert_eq!(diagnostic.body["reason"], REASON_CALL_DEFERRED);
-        assert_eq!(diagnostic.body["path"], "a.ts");
+        let row = &semantics.pending_site_rows[0];
+        assert_eq!(row.site_kind, PendingSiteKind::Call);
+        assert_eq!(row.reason, REASON_CALL_DEFERRED);
+        assert!(!row.source_id.is_empty(), "row: {row:?}");
     }
 
     /// P2-2i: `import("./x")` is not a `CallExpression` (see
     /// `marks_dynamic_import_expression_pending_as_a_call_site` above) but
-    /// still gets the same possible-row + diagnostic treatment as any other
-    /// pending call site.
+    /// still gets the same pending-site-row treatment as any other pending
+    /// call site.
     #[test]
-    fn dynamic_import_produces_a_possible_call_row_and_diagnostic() {
+    fn dynamic_import_produces_a_pending_call_site_row() {
         let source = "async function load() {\n  return import(\"./x.js\");\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
-        assert_eq!(semantics.possible_call_rows.len(), 2);
+        assert_eq!(semantics.pending_site_rows.len(), 1);
         assert_eq!(
-            semantics.possible_call_rows[0].body["classification"],
-            "possible"
+            semantics.pending_site_rows[0].site_kind,
+            PendingSiteKind::Call
         );
-        assert_eq!(
-            semantics.possible_call_rows[1].body["reason"],
-            REASON_CALL_DEFERRED
-        );
+        assert_eq!(semantics.pending_site_rows[0].reason, REASON_CALL_DEFERRED);
     }
 
     /// P2-2i: an overloaded (ambiguous) local function call is a plain
     /// identifier callee (`REASON_CALL_TARGET_UNCERTAIN`), still gets a
-    /// possible row + diagnostic exactly like a non-identifier callee does.
+    /// pending site row exactly like a non-identifier callee does.
     #[test]
-    fn overloaded_local_call_produces_a_possible_row_with_the_uncertain_reason() {
+    fn overloaded_local_call_produces_a_pending_site_row_with_the_uncertain_reason() {
         let source = "function f(a: string): void;\nfunction f(a: number): void;\nfunction f(a: unknown): void {}\nfunction use() {\n  f(1);\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
-        assert_eq!(semantics.possible_call_rows.len(), 2);
+        assert_eq!(semantics.pending_site_rows.len(), 1);
         assert_eq!(
-            semantics.possible_call_rows[1].body["reason"],
+            semantics.pending_site_rows[0].reason,
             REASON_CALL_TARGET_UNCERTAIN
         );
     }
@@ -4535,30 +6536,32 @@ mod tests {
         );
     }
 
-    /// P2-2i: a pending heritage clause on a NAMED declaration (a real
-    /// `source_id` to attribute it to) gets a `classification: "possible"`
-    /// `core:inherits`/`core:implements` row -- no diagnostic (v3 never
-    /// diagnoses a heritage clause either).
+    /// A2 (pending.sites migration): a pending heritage clause on a NAMED
+    /// declaration (a real `source_id` to attribute it to) produces exactly
+    /// one `PendingSiteProposal` (`site_kind: Inherits`) -- no
+    /// `ProposedRecord`, no diagnostic (v3 never diagnoses a heritage clause
+    /// either). Replaces the P2-2i `possible_heritage_rows`-based test of
+    /// the same scenario.
     #[test]
-    fn pending_named_heritage_clause_produces_a_possible_row() {
+    fn pending_named_heritage_clause_produces_a_pending_site_row() {
         let source = "class Base<T> {}\nclass Derived extends Base<string> {}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
         assert_eq!(
-            semantics.possible_heritage_rows.len(),
+            semantics.pending_site_rows.len(),
             1,
             "rows: {:?}",
-            semantics.possible_heritage_rows
+            semantics.pending_site_rows
         );
-        let record = &semantics.possible_heritage_rows[0];
-        assert_eq!(record.category, "relation");
-        assert_eq!(record.kind, "jsts:relation_inherits");
-        assert_eq!(record.universal_kind, "core:inherits");
-        assert_eq!(record.body["classification"], "possible");
-        assert!(record.body.get("target_id").is_none());
-        assert!(record.identity_key.ends_with(":unresolved"));
+        let row = &semantics.pending_site_rows[0];
+        assert_eq!(row.site_kind, PendingSiteKind::Inherits);
+        // Generic heritage (`Base<string>`) is ruled out before Rust even
+        // attempts a plain-identifier resolution -- same reason the
+        // "generic heritage must never be rust_resolved" test above asserts
+        // on `pending_sites` directly.
+        assert_eq!(row.reason, REASON_HERITAGE_DEFERRED);
         let derived_start = source.find("Derived").unwrap() as u32;
         let derived_id = format!("jsts:class:a.ts:{derived_start}:Derived");
-        assert_eq!(record.body["source_id"], derived_id);
+        assert_eq!(row.source_id, derived_id);
     }
 
     #[test]
@@ -4667,13 +6670,14 @@ mod tests {
                 .any(|site| site.site_kind == SiteKind::Heritage
                     && site.reason.as_deref() == Some(REASON_HERITAGE_DEFERRED))
         );
-        // P2-2i: no `source_id` to build a possible row from -- matches v3's
-        // own `entityForDeclaration(node.parent)` gap exactly (see
-        // `finish_heritage_clause`'s doc comment).
+        // P2-2i/A2: no `source_id` to build a pending site row from --
+        // matches v3's own `entityForDeclaration(node.parent)` gap exactly
+        // (see `finish_heritage_clause`'s doc comment). This fixture has no
+        // pending CALL site either, so `pending_site_rows` is empty outright.
         assert!(
-            semantics.possible_heritage_rows.is_empty(),
+            semantics.pending_site_rows.is_empty(),
             "rows: {:?}",
-            semantics.possible_heritage_rows
+            semantics.pending_site_rows
         );
     }
 
@@ -5032,7 +7036,20 @@ mod tests {
             relations: Vec::new(),
             diagnostics: Vec::new(),
             export_bindings,
+            export_star_specifiers: Vec::new(),
+            ambient_modules: Vec::new(),
         }
+    }
+
+    /// Ambient module resolution task (2026-09-04): same as `target_file`
+    /// above, with an explicit `ambient_modules` list.
+    fn target_file_with_ambient(
+        path: &str,
+        ambient_modules: Vec<crate::AmbientModuleDeclaration>,
+    ) -> crate::SyntaxFileResult {
+        let mut result = target_file(path, Vec::new(), Vec::new());
+        result.ambient_modules = ambient_modules;
+        result
     }
 
     /// Build a `HybridResolutionContext` over a single available path
@@ -5044,12 +7061,14 @@ mod tests {
     ) -> HybridResolutionContext<'static> {
         let resolver = WorkspaceResolver::default();
         let available: BTreeSet<String> = files.keys().cloned().collect();
+        let ambient_index = resolver::AmbientModuleIndex::rebuild(&files);
         HybridResolutionContext {
             resolver: Box::leak(Box::new(resolver)),
             available: Box::leak(Box::new(available)),
             files: Box::leak(Box::new(files)),
             typeflow_index: None,
             typeflow_oracle: false,
+            ambient_index: Box::leak(Box::new(ambient_index)),
         }
     }
 
@@ -5105,6 +7124,401 @@ mod tests {
             rows.iter()
                 .any(|row| row.2 == function_id && row.3 == target_id),
             "expected a usage-site reference row from {function_id} to {target_id}, got {rows:?}"
+        );
+    }
+
+    // -- Ambient module resolution task (2026-09-04) ----------------------
+
+    fn ambient_decl(
+        specifier: &str,
+        path: &str,
+        identity_start: u32,
+        bodyful: bool,
+        members: Vec<crate::AmbientModuleMember>,
+        default_member: Option<crate::AmbientModuleMember>,
+    ) -> crate::AmbientModuleDeclaration {
+        crate::AmbientModuleDeclaration {
+            specifier: specifier.to_owned(),
+            bodyful,
+            // Script-level by default -- augmentation tests flip this on
+            // the returned value (`is_augmentation = true`).
+            is_augmentation: false,
+            namespace_entity_id: format!("jsts:namespace:{path}:{identity_start}:{specifier}"),
+            members,
+            default_member,
+        }
+    }
+
+    fn ambient_member(
+        kind_word: &str,
+        path: &str,
+        start: u32,
+        name: &str,
+    ) -> crate::AmbientModuleMember {
+        crate::AmbientModuleMember {
+            name: name.to_owned(),
+            entity_id: format!("jsts:{kind_word}:{path}:{start}:{name}"),
+        }
+    }
+
+    /// Fix item 1-2: a bare, otherwise-unresolvable specifier that a
+    /// workspace `.d.ts` file declares via `declare module "specifier" {
+    /// export function configure(): void; }` -- `import { configure } from
+    /// "eslint-plugin-lodash"` must resolve to THAT declaration, never to a
+    /// synthetic `jsts:external_symbol:...` entity. Regression fixture for
+    /// the 677 n8n `v4_different_target` rows this task closes.
+    #[test]
+    fn ambient_named_import_resolves_to_the_inner_declaration() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "plugins.d.ts".to_owned(),
+            target_file_with_ambient(
+                "plugins.d.ts",
+                vec![ambient_decl(
+                    "eslint-plugin-lodash",
+                    "plugins.d.ts",
+                    10,
+                    true,
+                    vec![ambient_member("function", "plugins.d.ts", 40, "configure")],
+                    None,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import { configure } from \"eslint-plugin-lodash\";\nconfigure();\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:function:plugins.d.ts:40:configure";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+        assert!(
+            semantics.external_entity_rows.is_empty(),
+            "an ambiently-resolved specifier must never fabricate an external entity: {:?}",
+            semantics.external_entity_rows
+        );
+    }
+
+    #[test]
+    fn ambient_default_import_resolves_to_the_inner_declaration() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "plugins.d.ts".to_owned(),
+            target_file_with_ambient(
+                "plugins.d.ts",
+                vec![ambient_decl(
+                    "my-widget",
+                    "plugins.d.ts",
+                    10,
+                    true,
+                    vec![],
+                    Some(ambient_member("class", "plugins.d.ts", 50, "Widget")),
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import Widget from \"my-widget\";\nnew Widget();\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:class:plugins.d.ts:50:Widget";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+        assert!(semantics.external_entity_rows.is_empty());
+    }
+
+    /// n8n corpus regression: `declare module '~icons/*' { const component:
+    /// T; export default component; }` -- a WILDCARD pattern specifier
+    /// (`~icons/*`, matching any `~icons/...` import) whose default export
+    /// names a BARE, never-itself-`export`ed local declaration. Both must
+    /// resolve for a real `import IconFoo from "~icons/foo"` to stop
+    /// falling through to an external entity.
+    #[test]
+    fn ambient_wildcard_default_export_of_a_bare_declaration_resolves() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "env.d.ts".to_owned(),
+            target_file_with_ambient(
+                "env.d.ts",
+                vec![ambient_decl(
+                    "~icons/*",
+                    "env.d.ts",
+                    20,
+                    true,
+                    vec![],
+                    Some(ambient_member("variable", "env.d.ts", 60, "component")),
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source =
+            "import IconFoo from \"~icons/lucide/message-square\";\nconsole.log(IconFoo);\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:variable:env.d.ts:60:component";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+        assert!(semantics.external_entity_rows.is_empty());
+    }
+
+    /// Fix item 3: a bodyless `declare module "specifier";` types the whole
+    /// module `any` to the checker -- v3 never provides a declaration for a
+    /// named import to resolve to. Mirrored as "stay pending", and -- just
+    /// as importantly -- NEVER promoted to an external entity either (the
+    /// specifier IS ambiently declared somewhere in this workspace).
+    #[test]
+    fn ambient_shorthand_declaration_stays_pending_never_external() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "globals.d.ts".to_owned(),
+            target_file_with_ambient(
+                "globals.d.ts",
+                vec![ambient_decl(
+                    "*.css",
+                    "globals.d.ts",
+                    5,
+                    false,
+                    vec![],
+                    None,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import styles from \"*.css\";\nconsole.log(styles);\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            resolved(&semantics).is_empty(),
+            "a shorthand ambient declaration must never resolve a default import: {:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            semantics.external_entity_rows.is_empty(),
+            "a shorthand ambient declaration must never fall through to external either: {:?}",
+            semantics.external_entity_rows
+        );
+    }
+
+    /// Fix item 2: two workspace files declaring the SAME `declare module
+    /// "specifier"` is workspace-ambiguous -- never guess which one a real
+    /// import resolves to, and never external either.
+    #[test]
+    fn ambient_declared_by_two_files_stays_pending_never_external() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.d.ts".to_owned(),
+            target_file_with_ambient(
+                "a.d.ts",
+                vec![ambient_decl(
+                    "shared-pkg",
+                    "a.d.ts",
+                    1,
+                    true,
+                    vec![ambient_member("function", "a.d.ts", 20, "thing")],
+                    None,
+                )],
+            ),
+        );
+        files.insert(
+            "b.d.ts".to_owned(),
+            target_file_with_ambient(
+                "b.d.ts",
+                vec![ambient_decl(
+                    "shared-pkg",
+                    "b.d.ts",
+                    1,
+                    true,
+                    vec![ambient_member("function", "b.d.ts", 20, "thing")],
+                    None,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import { thing } from \"shared-pkg\";\nthing();\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(resolved(&semantics).is_empty());
+        assert!(semantics.external_entity_rows.is_empty());
+    }
+
+    /// Regression guard (fix item 2's own scope boundary): a bare specifier
+    /// with NO ambient declaration anywhere in the workspace must still
+    /// resolve externally, exactly as before this task.
+    #[test]
+    fn specifier_with_no_ambient_declaration_still_resolves_externally() {
+        let files: BTreeMap<String, crate::SyntaxFileResult> = BTreeMap::new();
+        let ctx = helper_ctx(files);
+        let source = "import { get } from \"lodash\";\nget();\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:external_symbol:lodash#get";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+        assert!(
+            semantics
+                .external_entity_rows
+                .iter()
+                .any(|record| record.identity_key == target_id),
+            "expected an external_symbol entity row for {target_id}"
+        );
+    }
+
+    // -- 2026-09-04 references-parity task, Phase B bucket 1: default
+    // imports and with-source re-export specifiers --------------------
+
+    #[test]
+    fn resolves_default_import_to_a_named_function_default_export() {
+        // Found live against the n8n corpus: `import buildTrivyBlocks from
+        // "./build-trivy-blocks.mjs"` where the target does `export default
+        // function buildTrivyBlocks(...) {}` -- `lib.rs`'s `visit_export_
+        // default_declaration` is what makes `export_bindings` carry this
+        // at all (`exported_name: "default"`).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "helper.ts".to_owned(),
+            target_file(
+                "helper.ts",
+                vec![target_entity(
+                    crate::EntityKind::Function,
+                    "helper.ts",
+                    24,
+                    "buildThing",
+                )],
+                vec![export_binding("default", "buildThing")],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source =
+            "import buildThing from \"./helper\";\nfunction use() {\n  return buildThing();\n}\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:function:helper.ts:24:buildThing";
+        let local_start = source.find("buildThing").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != local_start),
+            "the default import specifier's local binding must not stay pending once resolved: sites: {:?}",
+            semantics.pending_sites
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter()
+                .any(|row| row.2 == "jsts:module:a.ts:0:a.ts" && row.3 == target_id),
+            "expected an import-site reference row to {target_id}, got {rows:?}"
+        );
+        // ...and the later `buildThing()` call's callee identifier too.
+        let function_id = format!("jsts:function:a.ts:{}:use", source.find("use").unwrap());
+        assert!(
+            rows.iter()
+                .any(|row| row.2 == function_id && row.3 == target_id),
+            "expected a usage-site reference row from {function_id} to {target_id}, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn default_import_of_a_target_with_no_default_export_stays_pending() {
+        // Negative: `helper.ts` is a real, resolvable file, but exports
+        // nothing as `"default"` (mirrors `export default { a: 1 };` or any
+        // other non-nameable default-export shape `lib.rs`'s `visit_
+        // export_default_declaration` deliberately never captures) --
+        // `resolve_named_export` must report `Unresolved`, never a guess.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "helper.ts".to_owned(),
+            target_file("helper.ts", vec![], vec![]),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import thing from \"./helper\";\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let local_start = source.find("thing").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.start_utf16 == local_start
+                    && site.reason.as_deref() == Some(REASON_IMPORT_BINDING)),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    #[test]
+    fn resolves_with_source_reexport_specifier_local_position_to_the_source_declaration() {
+        // Found live against the n8n corpus: barrel files like
+        // `packages/@n8n/agents/src/evals/index.ts` doing `export {
+        // helpfulness } from "./helpfulness"` for many sibling modules.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "helper.ts".to_owned(),
+            target_file(
+                "helper.ts",
+                vec![target_entity(
+                    crate::EntityKind::Function,
+                    "helper.ts",
+                    16,
+                    "helper",
+                )],
+                vec![export_binding("helper", "helper")],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "export { helper } from \"./helper\";\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:function:helper.ts:16:helper";
+        let local_start = source.find("helper }").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != local_start),
+            "the re-export specifier's local position must not stay pending once resolved: sites: {:?}",
+            semantics.pending_sites
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter()
+                .any(|row| row.2 == "jsts:module:a.ts:0:a.ts" && row.3 == target_id),
+            "expected a reference row to {target_id}, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn with_source_reexport_of_a_name_the_source_never_exports_stays_pending() {
+        // Negative: `helper.ts` is real and resolvable, but never exports
+        // `missing` under any name -- `resolve_named_export` reports
+        // `Unresolved`, never a guess.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "helper.ts".to_owned(),
+            target_file("helper.ts", vec![], vec![]),
+        );
+        let ctx = helper_ctx(files);
+        let source = "export { missing } from \"./helper\";\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let local_start = source.find("missing }").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.start_utf16 == local_start
+                    && site.reason.as_deref() == Some(REASON_RE_EXPORT_BINDING)),
+            "sites: {:?}",
+            semantics.pending_sites
         );
     }
 
@@ -5445,15 +7859,46 @@ mod tests {
             cross_file_count, 2,
             "expected both the import-site and usage-site reference rows: {references:?}"
         );
+        // External package/symbol entities task (2026-09-04): the fixture's
+        // own `import { test } from "node:test"` (needed to mark this owner
+        // a test container at all -- `node_test_from`) now ALSO resolves,
+        // like any other external named import, to `jsts:external_symbol:
+        // node:test#test` -- a genuine cross-file reference from a test
+        // container, so it gets its OWN `core:covers` row alongside the two
+        // `helper.ts` ones this test already asserted, exactly the same
+        // derivation rule applied uniformly (not a regression: a real
+        // checker would resolve `node:test`'s `test` too and cover it the
+        // same way). Scope the original per-`helper.ts`-target assertions
+        // to just those two rows; assert the external row separately.
         let covers_rows = covers(&semantics);
         assert_eq!(
             covers_rows.len(),
+            3,
+            "expected one covers row per cross-file reference, including the external node:test import: {covers_rows:?}"
+        );
+        let external_target_id = "jsts:external_symbol:node:test#test";
+        let external_covers: Vec<_> = covers_rows
+            .iter()
+            .filter(|row| row.3 == external_target_id)
+            .collect();
+        assert_eq!(
+            external_covers.len(),
+            1,
+            "expected exactly one covers row for the node:test import itself: {covers_rows:?}"
+        );
+        let helper_covers_rows: Vec<_> = covers_rows
+            .iter()
+            .filter(|row| row.3 == target_id)
+            .cloned()
+            .collect();
+        assert_eq!(
+            helper_covers_rows.len(),
             2,
-            "expected one covers row per cross-file reference: {covers_rows:?}"
+            "expected one covers row per cross-file reference to helper.ts: {covers_rows:?}"
         );
         let reference_spans: BTreeSet<(u32, u32)> =
             references.iter().map(|row| (row.0, row.1)).collect();
-        for (start, end, source_id, target) in &covers_rows {
+        for (start, end, source_id, target) in &helper_covers_rows {
             assert_eq!(
                 *source_id, module_id,
                 "covers source is always this owner's module, the test container"
@@ -5561,6 +8006,7 @@ mod tests {
             files: Box::leak(Box::new(files)),
             typeflow_index: Some(index),
             typeflow_oracle,
+            ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
         };
         (ctx, index)
     }
@@ -5590,6 +8036,143 @@ mod tests {
             semantics.typeflow_call_rows[0].body["target_id"],
             format!("jsts:method:a.ts:{base_start}:greet")
         );
+    }
+
+    // --- 2026-09-04 references-parity task: member-read references --------
+
+    #[test]
+    fn typeflow_resolves_a_this_property_read_reference() {
+        let source = "class Point {\n  x: number = 0;\n  get() {\n    return this.x;\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.reason.as_deref() != Some(REASON_MEMBER_ACCESS)),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+        let x_id = urdira_jsts_typeflow::declaration_id(
+            "property",
+            "a.ts",
+            source.find("x:").unwrap() as u32,
+            "x",
+        );
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .any(|record| record.body["target_id"] == x_id.as_str()),
+            "rows: {:?}",
+            semantics.reference_rows
+        );
+    }
+
+    /// The exact n8n shape the parameter-property fix (2026-09-04) targets:
+    /// `this.defaultConfig` reading a constructor parameter property, on a
+    /// class that ALSO `implements` an interface declaring a same-named
+    /// member -- must resolve to the class's OWN parameter property, never
+    /// the interface's `implements` fallback.
+    #[test]
+    fn typeflow_resolves_a_this_read_of_a_parameter_property_over_an_implemented_interface() {
+        let source = "interface I {\n  defaultConfig: string;\n}\nclass A implements I {\n  constructor(public defaultConfig?: string) {}\n  m() {\n    return this.defaultConfig;\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.reason.as_deref() != Some(REASON_MEMBER_ACCESS)),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+        // The parameter property's own id (`constructor(public defaultConfig?...`),
+        // NOT the interface's `defaultConfig` (which starts inside `interface I`,
+        // strictly before the class) and NOT the `this.defaultConfig` READ
+        // site itself (the third occurrence in `source`).
+        let own_start =
+            source.find("public defaultConfig").unwrap() as u32 + "public ".len() as u32;
+        let interface_start = source.find("defaultConfig").unwrap() as u32;
+        assert!(own_start > interface_start);
+        let own_id =
+            urdira_jsts_typeflow::declaration_id("parameter", "a.ts", own_start, "defaultConfig");
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .any(|record| record.body["target_id"] == own_id.as_str()),
+            "rows: {:?}",
+            semantics.reference_rows
+        );
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .all(|record| record.body["target_id"]
+                    != urdira_jsts_typeflow::declaration_id(
+                        "property",
+                        "a.ts",
+                        interface_start,
+                        "defaultConfig"
+                    )
+                    .as_str()),
+            "must never resolve to the interface's own member"
+        );
+    }
+
+    /// Negative: a member access whose object type is known but the member
+    /// itself does not exist on it (`MemberLookup::None`) stays pending --
+    /// never a guess.
+    #[test]
+    fn typeflow_member_read_of_a_nonexistent_member_stays_pending() {
+        let source = "class Point {\n  x: number = 0;\n  get() {\n    return this.y;\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.reason.as_deref() == Some(REASON_MEMBER_ACCESS)),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+        assert!(
+            semantics.reference_rows.is_empty(),
+            "rows: {:?}",
+            semantics.reference_rows
+        );
+    }
+
+    /// Negative: an overloaded member (`MemberLookup::Many` -- two same-
+    /// named `ClassElement`s on the SAME container; oxc is a syntax-only
+    /// parser and never flags the "duplicate declaration" a real checker
+    /// would) is a genuine ambiguity for a READ too -- unlike the call lane
+    /// (P2-2j `Candidates`), a member read never gets a `possible`-with-
+    /// candidates row at all; it simply stays pending, exactly like a
+    /// `None` miss.
+    #[test]
+    fn typeflow_member_read_of_an_overloaded_member_stays_pending() {
+        let source = "class C {\n  run: string = \"\";\n  run: number = 0;\n  use() {\n    return this.run;\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.reason.as_deref() == Some(REASON_MEMBER_ACCESS)),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+        assert!(semantics.reference_rows.iter().all(|record| {
+            record.body["target_id"]
+                .as_str()
+                .is_some_and(|id| !id.contains(":run"))
+        }));
     }
 
     #[test]
@@ -5683,6 +8266,187 @@ mod tests {
                 .any(|site| site.site_kind == SiteKind::Call
                     && site.reason.as_deref() == Some(REASON_CALL_DEFERRED))
         );
+    }
+
+    // --- P2-2j: per-candidate possible rows for overload/union receivers --
+
+    #[test]
+    fn typeflow_overloaded_member_produces_candidate_rows_via_this_and_a_typed_local() {
+        // Two `ClassElement::MethodDefinition`s share the name `run` -- oxc
+        // is a syntax-only parser, so this parses fine even though a real
+        // TypeScript checker would flag "duplicate function implementation"
+        // (a semantic diagnostic, out of scope for a syntax-level index).
+        // One call site through `this` (inside the SAME class), one through
+        // a separately-typed local parameter -- both must produce 2
+        // candidate rows each (distinct target ids), never a confirmed row.
+        let source = "class Foo {\n  run(a: string) {}\n  run(a: number) {}\n  useThis() {\n    this.run(1);\n  }\n}\nfunction useLocal(x: Foo) {\n  x.run(1);\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.call_rows.is_empty(),
+            "no E1-E3 confirmed calls expected"
+        );
+        assert!(
+            semantics.typeflow_call_rows.is_empty(),
+            "an overloaded member must never confirm -- rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+        assert_eq!(
+            semantics.candidate_call_rows.len(),
+            4,
+            "2 call sites x 2 overloads each -- rows: {:?}",
+            semantics.candidate_call_rows
+        );
+        let mut targets_by_site: BTreeMap<(u64, u64), BTreeSet<String>> = BTreeMap::new();
+        for row in &semantics.candidate_call_rows {
+            assert_eq!(row.body["reason"], REASON_OVERLOAD_AMBIGUOUS);
+            assert_eq!(row.body["classification"], "possible");
+            let start = row.body["start"].as_u64().expect("start is a number");
+            let end = row.body["end"].as_u64().expect("end is a number");
+            let target_id = row.body["target_id"]
+                .as_str()
+                .expect("target_id present")
+                .to_owned();
+            targets_by_site
+                .entry((start, end))
+                .or_default()
+                .insert(target_id);
+        }
+        assert_eq!(
+            targets_by_site.len(),
+            2,
+            "two distinct call sites -- {targets_by_site:?}"
+        );
+        for targets in targets_by_site.values() {
+            assert_eq!(
+                targets.len(),
+                2,
+                "each site must carry 2 DISTINCT overload targets -- {targets:?}"
+            );
+        }
+        let pending_call_sites: Vec<_> = semantics
+            .pending_sites
+            .iter()
+            .filter(|site| site.site_kind == SiteKind::Call)
+            .collect();
+        assert_eq!(pending_call_sites.len(), 2, "sites: {pending_call_sites:?}");
+        assert!(
+            pending_call_sites
+                .iter()
+                .all(|site| site.reason.as_deref() == Some(REASON_OVERLOAD_AMBIGUOUS)),
+            "sites: {pending_call_sites:?}"
+        );
+    }
+
+    #[test]
+    fn typeflow_union_receiver_where_both_constituents_declare_the_member_produces_two_candidates()
+    {
+        let source = "class A {\n  run() {}\n}\nclass B {\n  run() {}\n}\nfunction use(x: A | B) {\n  x.run();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(semantics.typeflow_call_rows.is_empty());
+        assert_eq!(
+            semantics.candidate_call_rows.len(),
+            2,
+            "rows: {:?}",
+            semantics.candidate_call_rows
+        );
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_call_rows {
+            assert_eq!(row.body["reason"], REASON_UNION_AMBIGUOUS);
+            assert_eq!(row.body["classification"], "possible");
+            target_ids.insert(
+                row.body["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids.len(),
+            2,
+            "distinct A.run/B.run targets -- {target_ids:?}"
+        );
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::Call
+                    && site.reason.as_deref() == Some(REASON_UNION_AMBIGUOUS))
+        );
+    }
+
+    #[test]
+    fn typeflow_union_receiver_missing_the_member_on_one_side_produces_no_candidates() {
+        let source =
+            "class A {\n  run() {}\n}\nclass B {}\nfunction use(x: A | B) {\n  x.run();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(semantics.typeflow_call_rows.is_empty());
+        assert!(
+            semantics.candidate_call_rows.is_empty(),
+            "rows: {:?}",
+            semantics.candidate_call_rows
+        );
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::Call
+                    && site.reason.as_deref() == Some(REASON_CALL_DEFERRED))
+        );
+    }
+
+    #[test]
+    fn typeflow_union_of_the_same_entity_twice_behaves_as_a_non_union() {
+        // `A | A` collapses to the single constituent `A` at the
+        // `TypeflowValue`/`RawTypeRef` construction step -- the call site
+        // must resolve exactly like `x: A` would (a normal, single-entity
+        // `members()` lookup), never a `Candidates` outcome.
+        let source = "class A {\n  run() {}\n}\nfunction use(x: A | A) {\n  x.run();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.candidate_call_rows.is_empty(),
+            "rows: {:?}",
+            semantics.candidate_call_rows
+        );
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.site_kind != SiteKind::Call)
+        );
+    }
+
+    #[test]
+    fn typeflow_union_with_an_unresolvable_constituent_produces_no_candidates() {
+        // A tuple constituent contaminates the WHOLE union to `Unknown` at
+        // the annotation-classification step -- `x` never even becomes a
+        // typed local, so the call site falls through to plain
+        // `call_deferred_to_e3`, never a `Candidates` outcome.
+        let source =
+            "class A {\n  run() {}\n}\nfunction use(x: A | [number, string]) {\n  x.run();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.candidate_call_rows.is_empty(),
+            "rows: {:?}",
+            semantics.candidate_call_rows
+        );
+        assert!(semantics.typeflow_call_rows.is_empty());
+        assert!(semantics.call_rows.is_empty());
     }
 
     #[test]
@@ -5978,6 +8742,7 @@ mod tests {
             files: Box::leak(Box::new(files)),
             typeflow_index: Some(index),
             typeflow_oracle: false,
+            ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
         };
         let semantics = analyze_owner_semantics_with_context("dto.ts", dto_source, &ctx)
             .expect("analysis succeeds");
@@ -6062,6 +8827,7 @@ mod tests {
             files: Box::leak(Box::new(files)),
             typeflow_index: Some(index),
             typeflow_oracle: false,
+            ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
         };
         let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
             .expect("analysis succeeds");
@@ -6363,6 +9129,633 @@ mod tests {
             1,
             "rows: {:?}",
             semantics.typeflow_call_rows
+        );
+    }
+
+    // -- Parameter entities, "referenced-only" variant (owner-approved,
+    // 2026-09-04) --------------------------------------------------------
+
+    #[test]
+    fn referenced_parameters_get_entities_matching_the_reference_target_across_owner_shapes() {
+        let source = concat!(
+            "function outer(value) {\n",
+            "  return value;\n",
+            "}\n",
+            "class Box {\n",
+            "  constructor(id) {\n",
+            "    return id;\n",
+            "  }\n",
+            "  render(size) {\n",
+            "    return size;\n",
+            "  }\n",
+            "}\n",
+            "const make = (count) => count;\n",
+        );
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+
+        let function_id = declaration_id(
+            DeclKind::Function,
+            "a.ts",
+            source.find("outer").unwrap() as u32,
+            "outer",
+        );
+        let constructor_id = declaration_id(
+            DeclKind::Constructor,
+            "a.ts",
+            source.find("constructor").unwrap() as u32,
+            "constructor",
+        );
+        let render_id = declaration_id(
+            DeclKind::Method,
+            "a.ts",
+            source.find("render").unwrap() as u32,
+            "render",
+        );
+        let make_id = declaration_id(
+            DeclKind::Variable,
+            "a.ts",
+            source.find("make").unwrap() as u32,
+            "make",
+        );
+
+        // Four owner shapes (function declaration, constructor, class
+        // method, variable-bound arrow), one referenced parameter each --
+        // every one of the four gets an entity, its id byte-identical to
+        // the `reference_rows` target already resolved for it.
+        let cases = [
+            ("value", function_id.as_str(), "a.ts.outer.value"),
+            ("id", constructor_id.as_str(), "a.ts.Box.constructor.id"),
+            ("size", render_id.as_str(), "a.ts.Box.render.size"),
+            ("count", make_id.as_str(), "a.ts.make.count"),
+        ];
+        assert_eq!(
+            semantics.parameter_entity_rows.len(),
+            cases.len(),
+            "rows: {:?}",
+            semantics.parameter_entity_rows
+        );
+        assert_eq!(semantics.parameter_contains_rows.len(), cases.len());
+        for (name, parent_id, qualified_name) in cases {
+            let param_id = declaration_id(
+                DeclKind::Parameter,
+                "a.ts",
+                source.find(name).unwrap() as u32,
+                name,
+            );
+            // The entity id is byte-identical to the target every reference
+            // to this parameter already resolved to.
+            assert!(
+                resolved(&semantics).iter().any(|row| row.3 == param_id),
+                "expected a resolved reference targeting {param_id}"
+            );
+            let entity = parameter_entity(&semantics, &param_id)
+                .unwrap_or_else(|| panic!("expected a parameter entity for {param_id}"));
+            assert_eq!(entity.category, "entity");
+            assert_eq!(entity.kind, "jsts:entity_parameter");
+            assert_eq!(entity.universal_kind, "core:parameter");
+            assert_eq!(entity.body["name"], name);
+            assert_eq!(entity.body["kind"], "parameter");
+            assert_eq!(entity.body["parent_id"], parent_id);
+            assert_eq!(entity.body["qualified_name"], qualified_name);
+
+            // `contains` parent -> parameter is present, source matching
+            // this same parent_id.
+            let contains = parameter_contains(&semantics, &param_id)
+                .unwrap_or_else(|| panic!("expected a contains row for {param_id}"));
+            assert_eq!(contains.kind, "jsts:relation_contains");
+            assert_eq!(contains.body["source_id"], parent_id);
+            assert_eq!(contains.body["target_id"], param_id);
+            assert_eq!(contains.body["classification"], "confirmed");
+        }
+    }
+
+    #[test]
+    fn unreferenced_parameter_produces_no_entity() {
+        let source = "function outer(value) {\n  return 1;\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert!(
+            semantics.parameter_entity_rows.is_empty(),
+            "rows: {:?}",
+            semantics.parameter_entity_rows
+        );
+        assert!(semantics.parameter_contains_rows.is_empty());
+    }
+
+    #[test]
+    fn destructured_parameters_produce_no_entity_but_a_referenced_rest_parameter_does() {
+        // A destructured parameter (`{ a, b }`) stays conservatively
+        // unsupported -- `classify_symbol_declaration`'s `FormalParameter`
+        // arm only ever resolves a simple `BindingIdentifier` pattern, same
+        // as before this task. A REST parameter (`...rest`), however, is
+        // the 2026-09-04 references-parity task's bucket-1 fix
+        // (`classify_symbol_declaration`'s new `AstKind::FormalParameterRest`
+        // arm + `visit_formal_parameter_rest`'s own fact recording): once
+        // referenced (`rest.length`), it now gets exactly the same
+        // "referenced-only" entity/contains-row treatment an ordinary
+        // parameter already did.
+        let source = "function outer({ a, b }, ...rest) {\n  return a + b + rest.length;\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let rest_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("rest)").unwrap() as u32,
+            "rest",
+        );
+        let entity = parameter_entity(&semantics, &rest_id).expect("rest parameter entity");
+        assert_eq!(entity.body["name"], "rest");
+        assert_eq!(entity.body["kind"], "parameter");
+        assert_eq!(
+            entity.body["parent_id"],
+            declaration_id(
+                DeclKind::Function,
+                "a.ts",
+                source.find("outer").unwrap() as u32,
+                "outer"
+            )
+        );
+        assert!(parameter_contains(&semantics, &rest_id).is_some());
+        // Only ONE parameter entity total: the destructured `{ a, b }`
+        // pattern still contributes nothing.
+        assert_eq!(semantics.parameter_entity_rows.len(), 1);
+        assert_eq!(semantics.parameter_contains_rows.len(), 1);
+        let function_id = declaration_id(
+            DeclKind::Function,
+            "a.ts",
+            source.find("outer").unwrap() as u32,
+            "outer",
+        );
+        let reference_start = source.rfind("rest.length").unwrap() as u32;
+        let rows = resolved(&semantics);
+        assert!(
+            rows.contains(&(
+                reference_start,
+                reference_start + "rest".len() as u32,
+                function_id.as_str(),
+                rest_id.as_str()
+            )),
+            "rows: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn unreferenced_rest_parameter_produces_no_entity() {
+        // Same "referenced-only" discipline an ordinary parameter already
+        // has (see `unreferenced_parameter_produces_no_entity`): a rest
+        // parameter that is never referenced in the body gets no entity at
+        // all, even though `classify_symbol_declaration` now knows how to
+        // classify it.
+        let source = "function outer(...rest) {\n  return 0;\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert!(semantics.parameter_entity_rows.is_empty());
+        assert!(semantics.parameter_contains_rows.is_empty());
+    }
+
+    #[test]
+    fn referenced_catch_binding_resolves_and_materializes_a_variable_entity() {
+        // 2026-09-04 references-parity task, bucket 1
+        // (`unsupported_declaration_kind`, 92% of the bucket): `catch
+        // (error) { ... }`'s own simple identifier binding, referenced in
+        // the catch block body, now resolves through `classify_symbol_
+        // declaration`'s new `AstKind::CatchParameter` arm (`DeclKind::
+        // Variable`, matching v3's `isVariableDeclaration` treatment) and
+        // materializes a `core:value` entity via `visit_catch_parameter`'s
+        // "referenced-only" fact recording.
+        let source = "function outer() {\n  try {\n    risky();\n  } catch (error) {\n    log(error.message);\n  }\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let catch_start = source.find("error) {").unwrap() as u32;
+        let catch_id = declaration_id(DeclKind::Variable, "a.ts", catch_start, "error");
+        let function_id = declaration_id(
+            DeclKind::Function,
+            "a.ts",
+            source.find("outer").unwrap() as u32,
+            "outer",
+        );
+        let rows = resolved(&semantics);
+        let reference_start = source.rfind("error.message").unwrap() as u32;
+        assert!(
+            rows.contains(&(
+                reference_start,
+                reference_start + "error".len() as u32,
+                function_id.as_str(),
+                catch_id.as_str()
+            )),
+            "rows: {:?}",
+            rows
+        );
+        let entity = parameter_entity(&semantics, &catch_id).expect("catch binding entity");
+        assert_eq!(entity.body["name"], "error");
+        assert_eq!(entity.body["kind"], "variable");
+        assert_eq!(entity.body["parent_id"], function_id.as_str());
+        assert!(parameter_contains(&semantics, &catch_id).is_some());
+    }
+
+    #[test]
+    fn unreferenced_catch_binding_produces_no_entity() {
+        let source =
+            "function outer() {\n  try {\n    risky();\n  } catch (error) {\n    log();\n  }\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert!(semantics.parameter_entity_rows.is_empty());
+        assert!(semantics.parameter_contains_rows.is_empty());
+    }
+
+    #[test]
+    fn destructured_catch_binding_produces_no_entity_and_stays_pending() {
+        // Same conservative rule as a destructured parameter: `catch ({
+        // message }) {}` never resolves through `classify_symbol_
+        // declaration` (`AstKind::CatchParameter`'s own pattern-shape guard
+        // requires a plain `BindingIdentifier`), so a reference to
+        // `message` inside the block stays `checker_pending` with the
+        // ordinary `unsupported_declaration_kind` reason, and no entity is
+        // recorded at all.
+        let source = "function outer() {\n  try {\n    risky();\n  } catch ({ message }) {\n    log(message);\n  }\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert!(semantics.parameter_entity_rows.is_empty());
+        assert!(semantics.parameter_contains_rows.is_empty());
+        let reference_start = source.rfind("message)").unwrap() as u32;
+        let site = semantics.pending_sites.iter().find(|site| {
+            site.site_kind == SiteKind::IdentifierRef && site.start_utf16 == reference_start
+        });
+        assert_eq!(
+            site.and_then(|site| site.reason.as_deref()),
+            Some(REASON_UNSUPPORTED_DECLARATION_KIND),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    #[test]
+    fn constructor_parameter_property_is_treated_like_any_other_identifier_parameter() {
+        // `classify_symbol_declaration`'s own `FormalParameter` arm never
+        // inspects `accessibility` -- a parameter property resolves to the
+        // SAME target id a plain constructor parameter would (`return x`
+        // inside the constructor body still produces a `core:references`
+        // row to it). But since the 2026-09-04 references-parity task's
+        // member-entities follow-up, the ENTITY itself is no longer
+        // materialized here: `urdira_jsts_typeflow::member_declarations`
+        // (via `push_member_entities` in lib.rs) owns every parameter
+        // property UNCONDITIONALLY now, the same way it owns every other
+        // class member, so this "referenced-only" producer deliberately
+        // skips it (`visit_formal_parameter`'s own doc comment) to avoid
+        // materializing the same declaration twice.
+        let source = "class Point {\n  constructor(private x: number) {\n    return x;\n  }\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let param_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("x:").unwrap() as u32,
+            "x",
+        );
+        assert!(
+            parameter_entity(&semantics, &param_id).is_none(),
+            "a parameter property's entity now comes from `push_member_entities`, \
+             never from this referenced-only producer"
+        );
+        assert!(
+            parameter_contains(&semantics, &param_id).is_none(),
+            "same for its `core:contains` row"
+        );
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .any(|record| record.body["target_id"] == param_id.as_str()),
+            "`return x` must still resolve to the parameter property's canonical id"
+        );
+    }
+
+    #[test]
+    fn object_literal_shorthand_method_parameter_falls_back_to_the_module_entity() {
+        // `member_declarations` (typeflow) never enumerates object literals,
+        // so an object-literal shorthand method has no entity of its own
+        // today -- its parameter's `parent_id` must fall back to the
+        // module, never a dangling `jsts:method:...` id.
+        let source = "const obj = {\n  method(value) {\n    return value;\n  },\n};\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let module_id = "jsts:module:a.ts:0:a.ts";
+        let param_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("value").unwrap() as u32,
+            "value",
+        );
+        let entity = parameter_entity(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a parameter entity for {param_id}"));
+        assert_eq!(entity.body["parent_id"], module_id);
+        assert_eq!(entity.body["qualified_name"], "a.ts.value");
+        let contains = parameter_contains(&semantics, &param_id).expect("contains row present");
+        assert_eq!(contains.body["source_id"], module_id);
+    }
+
+    #[test]
+    fn anonymous_callback_parameter_falls_back_to_the_module_entity() {
+        let source = concat!(
+            "function invoke(callback) {\n",
+            "  return callback();\n",
+            "}\n",
+            "invoke(function (value) {\n",
+            "  return value;\n",
+            "});\n",
+        );
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let module_id = "jsts:module:a.ts:0:a.ts";
+        let param_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("value").unwrap() as u32,
+            "value",
+        );
+        let entity = parameter_entity(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a parameter entity for {param_id}"));
+        assert_eq!(entity.body["parent_id"], module_id);
+        assert_eq!(entity.body["qualified_name"], "a.ts.value");
+
+        // `invoke`'s own referenced parameter, by contrast, DOES have an
+        // owner (the function declaration).
+        let invoke_id = declaration_id(
+            DeclKind::Function,
+            "a.ts",
+            source.find("invoke").unwrap() as u32,
+            "invoke",
+        );
+        let callback_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("callback").unwrap() as u32,
+            "callback",
+        );
+        let callback_entity = parameter_entity(&semantics, &callback_id)
+            .unwrap_or_else(|| panic!("expected a parameter entity for {callback_id}"));
+        assert_eq!(callback_entity.body["parent_id"], invoke_id.as_str());
+    }
+
+    // -- 2026-09-04 external package/symbol entities task ---------------
+
+    fn find_entity<'a>(
+        semantics: &'a OwnerSemantics,
+        identity_key: &str,
+    ) -> Option<&'a ProposedRecord> {
+        semantics
+            .external_entity_rows
+            .iter()
+            .find(|record| record.identity_key == identity_key)
+    }
+
+    #[test]
+    fn external_named_import_resolves_to_external_symbol_reference_and_entities() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source = "import { get } from \"lodash\";\nget(1);\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:external_symbol:lodash#get";
+        let local_start = source.find("{ get }").unwrap() as u32 + 2;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != local_start),
+            "the import specifier's local binding must not stay pending once resolved as external"
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter()
+                .any(|row| row.2 == "jsts:module:a.ts:0:a.ts" && row.3 == target_id),
+            "expected an import-site reference row to {target_id}, got {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.3 == target_id)
+                && rows.iter().filter(|row| row.3 == target_id).count() >= 2,
+            "expected both the import-site AND usage-site (`get(1)`) reference rows to {target_id}, got {rows:?}"
+        );
+        let module_entity =
+            find_entity(&semantics, "jsts:external_module:lodash").expect("module entity present");
+        assert_eq!(module_entity.kind, "jsts:entity_container");
+        assert_eq!(module_entity.universal_kind, "core:container");
+        assert_eq!(module_entity.body["name"], "lodash");
+        let symbol_entity = find_entity(&semantics, target_id).expect("symbol entity present");
+        assert_eq!(symbol_entity.kind, "jsts:entity_variable");
+        assert_eq!(symbol_entity.universal_kind, "core:value");
+        assert_eq!(symbol_entity.body["name"], "get");
+        assert_eq!(
+            symbol_entity.body["parent_id"],
+            "jsts:external_module:lodash"
+        );
+        assert_eq!(symbol_entity.body["qualified_name"], "lodash.get");
+        assert!(
+            semantics
+                .external_contains_rows
+                .iter()
+                .any(|row| row.body["source_id"] == "jsts:external_module:lodash"
+                    && row.body["target_id"] == target_id),
+            "expected a core:contains row from the module to the symbol"
+        );
+    }
+
+    #[test]
+    fn external_default_import_resolves_to_hash_default_symbol() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source = "import express from \"express\";\nexpress();\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:external_symbol:express#default";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row to {target_id}, got {rows:?}"
+        );
+        find_entity(&semantics, target_id).expect("default symbol entity present");
+    }
+
+    #[test]
+    fn external_namespace_import_used_as_value_resolves_to_hash_star_symbol() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source =
+            "import * as _ from \"lodash\";\nfunction use(fn) { return fn(_); }\nuse(_);\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:external_symbol:lodash#*";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row to {target_id}, got {rows:?}"
+        );
+        find_entity(&semantics, target_id).expect("namespace symbol entity present");
+    }
+
+    #[test]
+    fn external_namespace_member_read_resolves_to_symbol_and_emits_entity() {
+        // Item 2's explicit example: `import * as _ from "lodash"; _.get(...)`
+        // -- a MEMBER read (not the namespace binding itself), resolved via
+        // `resolve_external_namespace_member`/`visit_static_member_expression`,
+        // not `import_bindings`.
+        let ctx = helper_ctx(BTreeMap::new());
+        let source = "import * as _ from \"lodash\";\n_.get(1, 2);\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:external_symbol:lodash#get";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a member-read reference row to {target_id}, got {rows:?}"
+        );
+        let member_start = source.rfind("get").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != member_start),
+            "the member-read site must not stay pending once resolved externally"
+        );
+        find_entity(&semantics, target_id).expect("member symbol entity present");
+        find_entity(&semantics, "jsts:external_module:lodash").expect("module entity present");
+    }
+
+    #[test]
+    fn external_scoped_package_with_subpath_keeps_full_specifier_identity() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source =
+            "import { HumanMessage } from \"@langchain/core/messages\";\nnew HumanMessage();\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        // The identity keeps the FULL specifier, subpath included -- never
+        // collapsed to the package root `@langchain/core`.
+        find_entity(&semantics, "jsts:external_module:@langchain/core/messages")
+            .expect("module entity keyed by the full subpath");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter()
+                .any(|row| row.3 == "jsts:external_symbol:@langchain/core/messages#HumanMessage"),
+            "expected a reference row scoped to the full subpath specifier, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn external_node_builtin_bare_specifier_normalizes_to_node_prefix() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source = "import { readFile } from \"fs\";\nreadFile(\"x\");\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        find_entity(&semantics, "jsts:external_module:node:fs")
+            .expect("bare `fs` normalizes to `node:fs`");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter()
+                .any(|row| row.3 == "jsts:external_symbol:node:fs#readFile"),
+            "expected a reference row under the normalized node:fs identity, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn external_type_only_import_gets_core_type_symbol() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source = "import type { Foo } from \"pkg\";\nlet x: Foo;\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let symbol =
+            find_entity(&semantics, "jsts:external_symbol:pkg#Foo").expect("type symbol entity");
+        assert_eq!(
+            symbol.universal_kind, "core:type",
+            "an `import type` binding gets a core:type external symbol, not core:value"
+        );
+        assert_eq!(symbol.kind, "jsts:entity_type");
+    }
+
+    #[test]
+    fn external_reexport_named_specifier_resolves_to_external_symbol() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source = "export { get } from \"lodash\";\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:external_symbol:lodash#get";
+        let local_start = source.find("get }").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != local_start),
+            "the re-export specifier's local position must not stay pending once resolved externally"
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row from the re-export to {target_id}, got {rows:?}"
+        );
+        find_entity(&semantics, target_id).expect("symbol entity present for the re-export");
+    }
+
+    #[test]
+    fn relative_import_that_fails_to_resolve_does_not_become_external() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source = "import { helper } from \"./missing\";\nhelper();\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.external_entity_rows.is_empty(),
+            "a relative specifier that merely failed to resolve must never become an external entity: {:?}",
+            semantics.external_entity_rows
+        );
+        assert!(
+            semantics.external_contains_rows.is_empty(),
+            "no external contains rows either: {:?}",
+            semantics.external_contains_rows
+        );
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.reason.as_deref() == Some(REASON_IMPORT_BINDING)),
+            "must still degrade to the ordinary pending import-binding reason"
+        );
+    }
+
+    #[test]
+    fn absolute_specifier_that_fails_to_resolve_does_not_become_external() {
+        let ctx = helper_ctx(BTreeMap::new());
+        let source = "import { helper } from \"/abs/missing\";\nhelper();\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.external_entity_rows.is_empty(),
+            "an absolute specifier that merely failed to resolve must never become external: {:?}",
+            semantics.external_entity_rows
+        );
+    }
+
+    #[test]
+    fn two_owners_importing_the_same_external_specifier_propose_byte_identical_entities() {
+        // Prerequisite for `urdira-indexing-worker::v4::analyze::run_scoped`'s
+        // cross-owner dedup pass: two DIFFERENT owner files importing the
+        // SAME external specifier must produce byte-identical entity
+        // `ProposedRecord`s (same identity_key, same body, same everything)
+        // so the dedup pass can safely keep just one.
+        let ctx = helper_ctx(BTreeMap::new());
+        let semantics_a = analyze_owner_semantics_with_context(
+            "a.ts",
+            "import { get } from \"lodash\";\nget(1);\n",
+            &ctx,
+        )
+        .expect("analysis succeeds");
+        let semantics_b = analyze_owner_semantics_with_context(
+            "b.ts",
+            "import { get } from \"lodash\";\nget(2);\n",
+            &ctx,
+        )
+        .expect("analysis succeeds");
+        let module_a = find_entity(&semantics_a, "jsts:external_module:lodash")
+            .expect("module entity in a.ts");
+        let module_b = find_entity(&semantics_b, "jsts:external_module:lodash")
+            .expect("module entity in b.ts");
+        assert_eq!(
+            module_a, module_b,
+            "module entity must be byte-identical across owners"
+        );
+        let symbol_a = find_entity(&semantics_a, "jsts:external_symbol:lodash#get")
+            .expect("symbol entity in a.ts");
+        let symbol_b = find_entity(&semantics_b, "jsts:external_symbol:lodash#get")
+            .expect("symbol entity in b.ts");
+        assert_eq!(
+            symbol_a, symbol_b,
+            "symbol entity must be byte-identical across owners"
         );
     }
 }

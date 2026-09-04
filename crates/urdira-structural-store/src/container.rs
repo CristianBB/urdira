@@ -75,6 +75,8 @@ pub enum SectionId {
     SubjectsKeys = 16,
     ClosuresRecords = 17,
     ClosuresDeps = 18,
+    PendingSites = 19,
+    ClosuresPending = 20,
 }
 
 impl SectionId {
@@ -98,6 +100,8 @@ impl SectionId {
             16 => Self::SubjectsKeys,
             17 => Self::ClosuresRecords,
             18 => Self::ClosuresDeps,
+            19 => Self::PendingSites,
+            20 => Self::ClosuresPending,
             _ => return None,
         })
     }
@@ -124,6 +128,8 @@ impl SectionId {
             Self::SubjectsKeys => "subjects.keys",
             Self::ClosuresRecords => "closures.records",
             Self::ClosuresDeps => "closures.deps",
+            Self::PendingSites => "pending.sites",
+            Self::ClosuresPending => "closures.pending",
         }
     }
 }

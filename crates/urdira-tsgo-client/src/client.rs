@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 use crate::binary::TsgoBinary;
 use crate::node::{NodeHandle, RemoteSourceFile};
 use crate::proto::{
-    InitializeResponse, SignatureResponse, SnapshotInfo, SymbolResponse, TypeResponse,
-    UpdateSnapshotParams,
+    DiagnosticResponse, InitializeResponse, SignatureResponse, SnapshotInfo, SymbolResponse,
+    TypeResponse, UpdateSnapshotParams,
 };
 use crate::rpc::{RpcErrorPayload, read_message, write_request, write_response};
 use crate::virtual_fs::VirtualFs;
@@ -372,6 +372,120 @@ impl TsgoClient {
             .ok_or(ClientError::UnexpectedNull {
                 method: "typeToString",
             })
+    }
+
+    /// `getExportsOfModule` -- the module symbol's own exported symbols
+    /// (`dist/api/async/api.js`'s `Checker.getExportsOfModule`), used by
+    /// `crate::semantic_extras` to reproduce `analyzer.ts`'s
+    /// `checker.getExportsOfModule(moduleSymbol)` exported-declaration set
+    /// (task P1-D "inferred types" half). `symbol` is a module symbol's own
+    /// `id` (fetched via `get_symbol_at_location` on the source file's own
+    /// node, index 1 -- see `crate::node::syntax_kind::SOURCE_FILE`). An
+    /// absent/null response (a script with no module symbol) is an empty
+    /// list, mirroring `analyzer.ts`'s own `try {...} catch { /* a script
+    /// without a module symbol has no exported type facts */ }`.
+    pub fn get_exports_of_module(
+        &self,
+        snapshot: u64,
+        project: &str,
+        symbol: u64,
+    ) -> RequestResult<Vec<SymbolResponse>> {
+        let value = self.send(
+            "getExportsOfModule",
+            json!({ "snapshot": snapshot, "project": project, "symbol": symbol }),
+        )?;
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        let items = value.as_array().ok_or_else(|| {
+            ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected an array",
+            ))
+        })?;
+        items
+            .iter()
+            .map(|item| {
+                serde_json::from_value(item.clone()).map_err(|e| {
+                    ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn diagnostics_request(
+        &self,
+        method: &str,
+        snapshot: u64,
+        project: &str,
+        file: Option<&str>,
+    ) -> RequestResult<Vec<DiagnosticResponse>> {
+        let mut params = json!({ "snapshot": snapshot, "project": project });
+        if let Some(file) = file {
+            params["file"] = json!(file);
+        }
+        let value = self.send(method, params)?;
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        let items = value.as_array().ok_or_else(|| {
+            ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected an array",
+            ))
+        })?;
+        items
+            .iter()
+            .map(|item| {
+                serde_json::from_value(item.clone()).map_err(|e| {
+                    ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// `getSyntacticDiagnostics` -- parse diagnostics for `file` (or every
+    /// file in `project` when `file` is `None`, unused by this crate's own
+    /// callers, which always scope to one owner file at a time exactly like
+    /// `analyzer.ts`'s per-file `program.getSyntacticDiagnostics(target)`).
+    pub fn get_syntactic_diagnostics(
+        &self,
+        snapshot: u64,
+        project: &str,
+        file: Option<&str>,
+    ) -> RequestResult<Vec<DiagnosticResponse>> {
+        self.diagnostics_request("getSyntacticDiagnostics", snapshot, project, file)
+    }
+
+    /// `getBindDiagnostics` -- binder diagnostics, the second of the three
+    /// diagnostic sources `analyzer.ts` concatenates into `jsts:diagnostic`
+    /// rows (`[...getSyntacticDiagnostics, ...getBindDiagnostics,
+    /// ...getSemanticDiagnostics]`).
+    pub fn get_bind_diagnostics(
+        &self,
+        snapshot: u64,
+        project: &str,
+        file: Option<&str>,
+    ) -> RequestResult<Vec<DiagnosticResponse>> {
+        self.diagnostics_request("getBindDiagnostics", snapshot, project, file)
+    }
+
+    /// `getSemanticDiagnostics` -- type-check diagnostics, the third of the
+    /// three sources `analyzer.ts` concatenates (see `get_bind_diagnostics`'s
+    /// doc comment).
+    pub fn get_semantic_diagnostics(
+        &self,
+        snapshot: u64,
+        project: &str,
+        file: Option<&str>,
+    ) -> RequestResult<Vec<DiagnosticResponse>> {
+        self.diagnostics_request("getSemanticDiagnostics", snapshot, project, file)
     }
 
     /// Closes stdin (unblocking tsgo's read loop, per the real client's own

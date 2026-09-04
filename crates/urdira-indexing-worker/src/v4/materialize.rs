@@ -60,10 +60,12 @@ use super::deps;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 #[cfg(test)]
 use urdira_indexing_core::StructuralKernelRecord;
-use urdira_jsts_syntax_worker::{ProposedRecord, ProposedRecordDependency};
+use urdira_jsts_syntax_worker::{
+    PendingReasonCode, PendingSiteKind as SyntaxPendingSiteKind, PendingSiteProposal,
+    ProposedRecord, ProposedRecordDependency, REASON_TARGET_NOT_INTERNED,
+};
 use urdira_native_core::{
     StructuralKernelRecordRef, StructuralKernelRow, structural_kernel_rows_ref,
     structural_kernel_rows_typed,
@@ -71,7 +73,85 @@ use urdira_native_core::{
 use urdira_structural_store::row::{
     CATEGORY_DIAGNOSTIC, CATEGORY_ENTITY, CATEGORY_RELATION, NONE_U16,
 };
-use urdira_structural_store::{DependencyRow, Dictionaries, N_NIBBLES, RecordRow, nibble_of};
+use urdira_structural_store::{
+    DependencyRow, Dictionaries, N_NIBBLES, PENDING_SITE_KIND_CALL, PENDING_SITE_KIND_IMPLEMENTS,
+    PENDING_SITE_KIND_INHERITS, PendingSiteRow, RecordRow, nibble_of,
+};
+
+/// A2 (pending.sites migration): maps this crate's `PendingSiteKind` to the
+/// store's on-disk `PENDING_SITE_KIND_*` byte constants.
+fn pending_site_kind_byte(kind: SyntaxPendingSiteKind) -> u8 {
+    match kind {
+        SyntaxPendingSiteKind::Call => PENDING_SITE_KIND_CALL,
+        SyntaxPendingSiteKind::Inherits => PENDING_SITE_KIND_INHERITS,
+        SyntaxPendingSiteKind::Implements => PENDING_SITE_KIND_IMPLEMENTS,
+    }
+}
+
+/// A2: the bit index `FACET_ORDER` assigns `"core:indirect"` (see that
+/// const's own doc comment) -- computed once, at runtime, the same way
+/// `crate::v4::residual::dump_call_bodies` locates it via `Dictionaries::
+/// facet_names` (which is always `FACET_ORDER.iter().map(...)`, see
+/// `materialize_generation`'s/`materialize_cold_partitioned`'s own dict-
+/// finalize step below), rather than hardcoding the position -- robust to
+/// `FACET_ORDER` being reordered in the future.
+fn core_indirect_facet_bit() -> u32 {
+    FACET_ORDER
+        .iter()
+        .position(|facet| *facet == "core:indirect")
+        .expect("FACET_ORDER always registers core:indirect") as u32
+}
+
+/// A2: builds one [`PendingSiteRow`] from a producer-side
+/// [`PendingSiteProposal`] (`OwnerFacts::pending_site_rows`) once its
+/// `source_id` has already been resolved to a subject ordinal the SAME way
+/// a relation row's own `source_id`/`target_id` resolve (`resolve_subject_
+/// key`/`resolve_record_id_cold` -> `subjects.intern`, see each caller's own
+/// resolution pass). `owner_version` == `owner_artifact`: this pipeline's
+/// dictionary scheme keys `dicts.artifacts` on the full `(artifact_id,
+/// artifact_version_id)` pair with a single shared ordinal for both halves
+/// (see `RecordRow.owner_artifact`/`.owner_version`'s own convention,
+/// unchanged here).
+fn pending_site_row_from_proposal(
+    owner_ordinal: u32,
+    generation: u32,
+    proposal: &PendingSiteProposal,
+    source_subject: Option<u32>,
+) -> PendingSiteRow {
+    PendingSiteRow {
+        owner_artifact: owner_ordinal,
+        owner_version: owner_ordinal,
+        valid_from: generation,
+        valid_to: 0,
+        start: proposal.start,
+        end: proposal.end,
+        start_line: 0,
+        end_line: 0,
+        site_kind: pending_site_kind_byte(proposal.site_kind),
+        reason: PendingReasonCode::from_reason(proposal.reason),
+        source_subject,
+    }
+}
+
+/// Sorts `pending_sites` by `(owner_artifact, start, end, site_kind)` --
+/// the store's own on-disk order, `PendingSiteRow::key()`'s field order --
+/// and deduplicates identical keys, keeping the FIRST occurrence
+/// deterministically (the writer rejects a duplicate key within one
+/// segment outright). Two distinct sources can, in principle, both name the
+/// same `(owner_artifact, start, end, site_kind)`: a producer-side
+/// `PendingSiteProposal` and a `target_not_interned` repair-site can never
+/// collide by construction (an ambiguous/deferred call is never ALSO a
+/// confirmed-shaped relation record, and `RelationRepairPlan`'s own
+/// `needs_pending_site: false` branch already excludes the one case --
+/// a P2-2j candidate row -- that could otherwise double up with its own
+/// no-target sibling's proposal); this function exists as a safety net
+/// anyway, so a future producer/repair change that violates that invariant
+/// degrades to "one row kept, deterministically" instead of the writer's
+/// own hard rejection.
+fn sort_and_dedupe_pending_sites(pending_sites: &mut Vec<PendingSiteRow>) {
+    pending_sites.sort_by_key(|row| row.key());
+    pending_sites.dedup_by_key(|row| row.key());
+}
 
 /// Bit order for the `facets` bitmask (new v4 recipe -- see module doc).
 /// Source strings: `packages/plugin-javascript-typescript/src/registry-
@@ -346,6 +426,13 @@ fn kernel_rows_batches_typed(
 pub struct MaterializedGeneration {
     pub records: Vec<RecordRow>,
     pub dependencies: Vec<DependencyRow>,
+    /// A2 (pending.sites migration): every no-target call/heritage site this
+    /// generation's owners produced, plus every `target_not_interned` site
+    /// synthesized by the classification-repair step (see `plan_relation_
+    /// repair`'s own doc comment) -- sorted by `(owner_artifact, start, end,
+    /// site_kind)` and deduplicated by that same key (see this field's
+    /// construction site for why a duplicate key can occur at all).
+    pub pending_sites: Vec<PendingSiteRow>,
     pub dicts: Dictionaries,
     /// P3-1: `owner_path -> owner_artifact/owner_version ordinal` for every
     /// owner this call materialized. `delta.rs` needs this to find each
@@ -379,6 +466,11 @@ struct OwnerKernelRows {
     rows: Vec<StructuralKernelRow>,
     proposal_keys: Vec<String>,
     dependencies: Vec<ProposedRecordDependency>,
+    /// A2 (pending.sites migration): this owner's own no-target call/
+    /// heritage sites, carried straight through from `OwnerFacts::pending_
+    /// site_rows` (untouched by kernel canonicalization -- these never
+    /// become `ProposedRecord`s at all).
+    pending_site_rows: Vec<PendingSiteProposal>,
     /// How many `structural_kernel_rows` calls this owner needed (1 unless
     /// bisecting kicked in because the owner alone exceeded
     /// `MAX_BATCH_RECORDS`/`MAX_BATCH_FRAMED_BYTES`). Debug-timing-only
@@ -389,14 +481,10 @@ struct OwnerKernelRows {
 fn category_byte(category: &'static str) -> u8 {
     match category {
         "relation" => CATEGORY_RELATION,
-        // P2-2i: `jsts:unresolved_call` is the first `category: "diagnostic"`
-        // `ProposedRecord` this pipeline ever produces (v4 was diagnostic-free
-        // before this task -- see `analyze.rs`'s module doc) -- this arm was
-        // missing entirely, so every diagnostic row silently stored as
-        // `CATEGORY_ENTITY` (byte 0) instead, making it invisible to any
-        // category-filtered diagnostic query. Found live against the n8n
-        // corpus (`recordsByKindExact("core:construct", "diagnostic",
-        // "jsts:diagnostic", ...)` returned 0 rows until this fix).
+        // P2-2i found this arm missing (every diagnostic row silently
+        // stored as `CATEGORY_ENTITY`). v4 emits no diagnostic-category
+        // `ProposedRecord` any more since the `jsts:unresolved_call` fold
+        // (2026-09-04), but the mapping stays correct for any future one.
         "diagnostic" => CATEGORY_DIAGNOSTIC,
         _ => CATEGORY_ENTITY,
     }
@@ -427,16 +515,14 @@ fn canonicalize_owner(owner: OwnerFacts) -> Result<OwnerKernelRows, ScanError> {
         records,
         dependencies,
         direct_imports: _,
-        // P2-2i deliverable 2 (pending-site export for the residual pass,
-        // plan P1-D-c's input contract) is plumbed at the `analyze`/
-        // `OwnerFacts` boundary (this task, deliverable 1) but NOT YET
-        // persisted into the structural store's `pending.sites`/
-        // `entities.index` tables -- that storage-format work remains open,
-        // see this task's evidence doc for the exact remaining scope (row
-        // layouts, `SectionId`/`TableId` additions, reader API). Not
-        // silently lost: `analyze::run_scoped` already keeps it on
-        // `OwnerFacts` for whichever future call wires this through.
+        // The full checker-dispatch listing (every site, any disposition)
+        // has no reader anywhere in this crate today (the residual pass
+        // derives its own input from the STORE's `pending.sites` table,
+        // built below from `pending_site_rows`, not from this in-memory
+        // field of one particular scan) -- kept on `OwnerFacts` regardless,
+        // same "not silently dropped" rationale its own doc comment gives.
         pending_sites: _,
+        pending_site_rows,
     } = owner;
     let mut kind_universal_category = Vec::with_capacity(records.len());
     let mut relation_endpoints = Vec::with_capacity(records.len());
@@ -488,6 +574,7 @@ fn canonicalize_owner(owner: OwnerFacts) -> Result<OwnerKernelRows, ScanError> {
         rows,
         proposal_keys,
         dependencies,
+        pending_site_rows,
         batch_count,
     })
 }
@@ -563,6 +650,10 @@ pub fn materialize_incremental(
 pub struct MaterializedPartitionedGeneration {
     pub partitions: Vec<Vec<RecordRow>>,
     pub dependencies: Vec<DependencyRow>,
+    /// A2 (pending.sites migration): see `MaterializedGeneration::pending_
+    /// sites`'s own doc comment -- same contract, this struct's own
+    /// partitioned sibling.
+    pub pending_sites: Vec<PendingSiteRow>,
     pub dicts: Dictionaries,
 }
 
@@ -827,8 +918,30 @@ pub fn materialize_cold_partitioned(
         })
         .collect();
 
+    // ---- Step 3b (A2, pending.sites migration): resolve every pending
+    // site's own `source_id` the SAME way -- these must feed the SAME
+    // distinct-sorted subject set (Step 4) a relation endpoint does, so
+    // interning order (and therefore every subject ordinal) stays fully
+    // deterministic regardless of which of the two populations happens to
+    // name a given record_id first. ----
+    let resolved_pending_sources: Vec<Vec<Option<[u8; 32]>>> = owner_rows
+        .par_iter()
+        .map(|owner| {
+            owner
+                .pending_site_rows
+                .iter()
+                .map(|proposal| {
+                    resolve_record_id_cold(
+                        Some(proposal.source_id.as_str()),
+                        &identity_key_digest_to_record_id,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+
     // ---- Step 4: distinct subject keys, sorted (parallel fold/reduce) ----
-    let subject_key_set: FxHashSet<[u8; 32]> = resolved_endpoints
+    let mut subject_key_set: FxHashSet<[u8; 32]> = resolved_endpoints
         .par_iter()
         .fold(FxHashSet::default, |mut acc, owner_endpoints| {
             for endpoints in owner_endpoints.iter().flatten() {
@@ -848,6 +961,26 @@ pub fn materialize_cold_partitioned(
             a.extend(b);
             a
         });
+    // A2: fold the pending-site sources (Step 3b) into the SAME set, before
+    // sorting/interning -- a separate fold/reduce pass (not merged into the
+    // one above) since the two source `Vec`s have different element shapes
+    // (`ResolvedEndpoints` vs. a plain `Option<[u8; 32]>`).
+    let pending_source_set: FxHashSet<[u8; 32]> = resolved_pending_sources
+        .par_iter()
+        .fold(FxHashSet::default, |mut acc, owner_sources| {
+            for source in owner_sources.iter().flatten() {
+                acc.insert(*source);
+            }
+            acc
+        })
+        .reduce(FxHashSet::default, |mut a, mut b| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
+            }
+            a.extend(b);
+            a
+        });
+    subject_key_set.extend(pending_source_set);
     let mut subject_values: Vec<[u8; 32]> = subject_key_set.into_iter().collect();
     subject_values.par_sort_unstable();
     let mut subjects: OrdinalDict<[u8; 32]> = OrdinalDict::new();
@@ -878,197 +1011,218 @@ pub fn materialize_cold_partitioned(
         Vec<Vec<RecordRow>>,
         FxHashMap<String, [u8; 32]>,
         Vec<(u32, u32, String, ProposedRecordDependency)>,
+        Vec<PendingSiteRow>,
     );
     let empty_accum = || -> Accum {
         (
             (0..N_NIBBLES).map(|_| Vec::new()).collect(),
             FxHashMap::default(),
             Vec::new(),
+            Vec::new(),
         )
     };
 
-    let (partitions, proposal_key_to_record_id, pending_deps): Accum = owner_rows
-        .into_par_iter()
-        .zip(resolved_endpoints.into_par_iter())
-        .fold(
-            empty_accum,
-            |(mut partitions, mut proposal_map, mut deps), (mut owner, endpoints)| {
-                let owner_key = (
-                    owner.owner_artifact_id.clone(),
-                    owner.owner_artifact_version_id.clone(),
-                );
-                let owner_ordinal = artifacts
-                    .ordinal_of(&owner_key)
-                    .expect("every owner artifact was interned in step 1");
-                for (index, row) in owner.rows.iter_mut().enumerate() {
-                    let (kind, universal_kind, category) = &owner.kind_universal_category[index];
-                    let category = *category;
-                    let kind_id =
-                        u16::try_from(kinds.ordinal_of(kind).expect("kind interned in step 1"))
-                            .unwrap_or(NONE_U16);
-                    let universal_kind_id = u16::try_from(
-                        universal_kinds
-                            .ordinal_of(universal_kind)
-                            .expect("universal_kind interned in step 1"),
-                    )
-                    .unwrap_or(NONE_U16);
-                    let relation_kind_id = if category == CATEGORY_RELATION {
-                        u16::try_from(
-                            relation_kinds
+    let (partitions, proposal_key_to_record_id, pending_deps, mut pending_sites): Accum =
+        owner_rows
+            .into_par_iter()
+            .zip(resolved_endpoints.into_par_iter())
+            .zip(resolved_pending_sources.into_par_iter())
+            .fold(
+                empty_accum,
+                |(mut partitions, mut proposal_map, mut deps, mut pending_sites),
+                 ((mut owner, endpoints), pending_sources)| {
+                    let owner_key = (
+                        owner.owner_artifact_id.clone(),
+                        owner.owner_artifact_version_id.clone(),
+                    );
+                    let owner_ordinal = artifacts
+                        .ordinal_of(&owner_key)
+                        .expect("every owner artifact was interned in step 1");
+                    for (index, row) in owner.rows.iter_mut().enumerate() {
+                        let (kind, universal_kind, category) =
+                            &owner.kind_universal_category[index];
+                        let category = *category;
+                        let kind_id =
+                            u16::try_from(kinds.ordinal_of(kind).expect("kind interned in step 1"))
+                                .unwrap_or(NONE_U16);
+                        let universal_kind_id = u16::try_from(
+                            universal_kinds
                                 .ordinal_of(universal_kind)
-                                .expect("relation_kind interned in step 1"),
+                                .expect("universal_kind interned in step 1"),
                         )
-                        .unwrap_or(NONE_U16)
-                    } else {
-                        NONE_U16
-                    };
-                    let name_key = identity_key_name(&row.identity_key).to_owned();
-                    let name_id = names
-                        .ordinal_of(&name_key)
-                        .expect("name interned in step 1");
+                        .unwrap_or(NONE_U16);
+                        let relation_kind_id = if category == CATEGORY_RELATION {
+                            u16::try_from(
+                                relation_kinds
+                                    .ordinal_of(universal_kind)
+                                    .expect("relation_kind interned in step 1"),
+                            )
+                            .unwrap_or(NONE_U16)
+                        } else {
+                            NONE_U16
+                        };
+                        let name_key = identity_key_name(&row.identity_key).to_owned();
+                        let name_id = names
+                            .ordinal_of(&name_key)
+                            .expect("name interned in step 1");
 
-                    let record_id = row.record_id;
-                    let record_digest = row.record_digest;
-                    let body_digest = row.body_digest;
-                    let identity_id = row.identity_id;
-                    let identity_key_digest = row.identity_key_digest;
-                    let body = std::mem::take(&mut row.body);
-                    let identity_key = std::mem::take(&mut row.identity_key);
-                    let (span_start_byte, span_end_byte) = (row.span_start, row.span_end);
-                    let facets = facets_bitmask(&row.facets);
-                    let identity_type = identity_type_byte(row.identity_type);
+                        let record_id = row.record_id;
+                        let record_digest = row.record_digest;
+                        let body_digest = row.body_digest;
+                        let identity_id = row.identity_id;
+                        let identity_key_digest = row.identity_key_digest;
+                        let body = std::mem::take(&mut row.body);
+                        let identity_key = std::mem::take(&mut row.identity_key);
+                        let (span_start_byte, span_end_byte) = (row.span_start, row.span_end);
+                        let facets = facets_bitmask(&row.facets);
+                        let identity_type = identity_type_byte(row.identity_type);
 
-                    let (source_subject, target_subject) = match &endpoints[index] {
-                        Some((source, target)) => (
-                            source.and_then(|key| subjects.ordinal_of(&key)),
-                            target.and_then(|key| subjects.ordinal_of(&key)),
-                        ),
-                        None => (None, None),
-                    };
+                        let (source_subject, target_subject) = match &endpoints[index] {
+                            Some((source, target)) => (
+                                source.and_then(|key| subjects.ordinal_of(&key)),
+                                target.and_then(|key| subjects.ordinal_of(&key)),
+                            ),
+                            None => (None, None),
+                        };
 
-                    if needed_proposal_keys.contains(&owner.proposal_keys[index]) {
-                        proposal_map.insert(owner.proposal_keys[index].clone(), record_id);
+                        if needed_proposal_keys.contains(&owner.proposal_keys[index]) {
+                            proposal_map.insert(owner.proposal_keys[index].clone(), record_id);
+                        }
+
+                        let nib = nibble_of(&record_id);
+                        partitions[nib].push(RecordRow {
+                            record_id,
+                            owner_artifact: owner_ordinal,
+                            owner_version: owner_ordinal,
+                            valid_from: 1,
+                            valid_to: 0,
+                            category,
+                            kind_id,
+                            universal_kind_id,
+                            facets,
+                            span_artifact_version: owner_ordinal,
+                            span_start_byte,
+                            span_end_byte,
+                            span_start_line: 0,
+                            span_end_line: 0,
+                            identity_type,
+                            assignment_kind: 0,
+                            name_id,
+                            identity_key: identity_key.into_bytes(),
+                            record_digest,
+                            body_digest,
+                            identity_id,
+                            identity_key_digest,
+                            previous_record_id: NONE_ZERO,
+                            source_subject,
+                            target_subject,
+                            relation_kind_id,
+                            body,
+                        });
                     }
-
-                    let nib = nibble_of(&record_id);
-                    partitions[nib].push(RecordRow {
-                        record_id,
-                        owner_artifact: owner_ordinal,
-                        owner_version: owner_ordinal,
-                        valid_from: 1,
-                        valid_to: 0,
-                        category,
-                        kind_id,
-                        universal_kind_id,
-                        facets,
-                        span_artifact_version: owner_ordinal,
-                        span_start_byte,
-                        span_end_byte,
-                        span_start_line: 0,
-                        span_end_line: 0,
-                        identity_type,
-                        assignment_kind: 0,
-                        name_id,
-                        identity_key: identity_key.into_bytes(),
-                        record_digest,
-                        body_digest,
-                        identity_id,
-                        identity_key_digest,
-                        previous_record_id: NONE_ZERO,
-                        source_subject,
-                        target_subject,
-                        relation_kind_id,
-                        body,
-                    });
-                }
-                for dependency in &owner.dependencies {
-                    deps.push((
-                        owner_ordinal,
-                        owner_ordinal,
-                        owner.owner_path.clone(),
-                        dependency.clone(),
-                    ));
-                }
-                (partitions, proposal_map, deps)
-            },
-        )
-        .reduce(
-            empty_accum,
-            |(mut partitions_a, mut map_a, mut deps_a), (partitions_b, map_b, deps_b)| {
-                for (bucket_a, mut bucket_b) in partitions_a.iter_mut().zip(partitions_b) {
-                    bucket_a.append(&mut bucket_b);
-                }
-                map_a.extend(map_b);
-                deps_a.extend(deps_b);
-                (partitions_a, map_a, deps_a)
-            },
-        );
+                    for dependency in &owner.dependencies {
+                        deps.push((
+                            owner_ordinal,
+                            owner_ordinal,
+                            owner.owner_path.clone(),
+                            dependency.clone(),
+                        ));
+                    }
+                    // A2 (pending.sites migration): one `PendingSiteRow` per
+                    // `PendingSiteProposal`, `source_id` resolved to a subject
+                    // ordinal via the SAME `pending_sources` (Step 3b) this
+                    // owner's relation endpoints already used `subjects.
+                    // ordinal_of` for, just above.
+                    for (proposal, source_key) in
+                        owner.pending_site_rows.iter().zip(pending_sources.iter())
+                    {
+                        let source_subject = source_key.and_then(|key| subjects.ordinal_of(&key));
+                        pending_sites.push(pending_site_row_from_proposal(
+                            owner_ordinal,
+                            1,
+                            proposal,
+                            source_subject,
+                        ));
+                    }
+                    (partitions, proposal_map, deps, pending_sites)
+                },
+            )
+            .reduce(
+                empty_accum,
+                |(mut partitions_a, mut map_a, mut deps_a, mut pending_a),
+                 (partitions_b, map_b, deps_b, pending_b)| {
+                    for (bucket_a, mut bucket_b) in partitions_a.iter_mut().zip(partitions_b) {
+                        bucket_a.append(&mut bucket_b);
+                    }
+                    map_a.extend(map_b);
+                    deps_a.extend(deps_b);
+                    pending_a.extend(pending_b);
+                    (partitions_a, map_a, deps_a, pending_a)
+                },
+            );
     let assemble_elapsed = assemble_started.elapsed();
     let mut partitions = partitions;
 
-    // P1-D-h item 1: repair every relation whose identity claims a
-    // resolved target that never interned (`plan_relation_repair`'s own
-    // doc comment) -- same fix as `materialize_generation` (above),
-    // adapted for this function's own nibble-bucketed partitions: a repair
-    // recomputes `record_id`, which can move a row into a DIFFERENT nibble
-    // bucket than the one Step 6 just placed it in.
+    // A2 (pending.sites migration): drop every relation whose identity
+    // claims a resolved target that never interned (`plan_relation_repair`'s
+    // own doc comment) -- replacing P1-D-h's in-place rewrite. Adapted for
+    // this function's own nibble-bucketed partitions: since a drop never
+    // recomputes `record_id` any more (there is no replacement identity to
+    // compute at all -- the whole point of dropping instead of rewriting),
+    // there is no cross-nibble relocation to do either, unlike the pre-A2
+    // version this replaces.
     //
-    // Two phases (see `RepairedRelation`'s own doc comment for why they are
-    // split this way -- a first, single-phase version that mutated
-    // `RecordRow`s directly from inside `par_iter_mut()` was flaky, rarely
-    // corrupting a repaired row's identity/body to all-zero bytes of the
-    // right length): (1) PARALLEL, READ-ONLY planning across partitions
-    // (`par_iter()`, `&RecordRow` only) -- each candidate's own repair is
-    // an independent SHA-256 kernel computation; (2) SEQUENTIAL application
-    // of every plan, then relocating any row whose repair changed its own
-    // nibble (typically ~15/16 of them, since a fresh digest's own top
-    // nibble is effectively random) with `swap_remove` (O(1), safe here:
-    // this scan's own Step 7 sorts every partition by `record_id` again
-    // right below, so within-partition order never matters otherwise) --
-    // `Vec::remove`'s O(n) shift alone cost ~28.7s of a ~60s n8n cold scan
-    // in an earlier version of this fix; see this task's evidence doc.
-    // Must run before dictionary finalization too, for the same `names`-
-    // still-open reason `materialize_generation` documents.
+    // Two phases, same rationale the pre-A2 version already established
+    // (`RelationRepairPlan`'s own doc comment carries the history): (1)
+    // PARALLEL, READ-ONLY planning across partitions (`par_iter()`,
+    // `&RecordRow` only); (2) SEQUENTIAL application (drop via `swap_remove`
+    // -- O(1), safe here since this scan's own Step 7 sorts every partition
+    // by `record_id` again right below, so within-partition order never
+    // matters otherwise -- plus pending-site synthesis). Must run before
+    // dictionary finalization too, for the same `names`-still-open reason
+    // `materialize_generation` documents (this function's own dictionaries
+    // stay open a little longer than that one's, but the ordering
+    // constraint is the same in spirit: nothing here needs a NEW dictionary
+    // entry any more, since a drop mints no new kind/identity text at all).
     let classification_started = std::time::Instant::now();
-    let repairs_by_partition: Vec<Vec<(usize, RepairedRelation)>> = partitions
+    let repair_plans_by_partition: Vec<Vec<(usize, RelationRepairPlan)>> = partitions
         .par_iter()
         .map(|partition| {
             partition
                 .iter()
                 .enumerate()
-                .filter_map(|(index, record)| match plan_relation_repair(record) {
-                    Ok(Some(repaired)) => Some(Ok((index, repaired))),
-                    Ok(None) => None,
-                    Err(error) => Some(Err(error)),
+                .filter_map(|(index, record)| {
+                    plan_relation_repair(record).map(|plan| (index, plan))
                 })
-                .collect::<Result<Vec<_>, ScanError>>()
+                .collect()
         })
-        .collect::<Result<Vec<_>, ScanError>>()?;
-    let unresolved_name_ordinal = names.intern(&"unresolved".to_string());
-    let mut classification_repaired = 0u64;
-    let mut moved_records: Vec<RecordRow> = Vec::new();
-    for (partition, repairs) in partitions.iter_mut().zip(repairs_by_partition) {
-        let mut moved_indices = Vec::with_capacity(repairs.len());
-        for (index, repaired) in repairs {
-            let old_nibble = nibble_of(&partition[index].record_id);
-            apply_relation_repair(&mut partition[index], repaired, unresolved_name_ordinal);
-            classification_repaired += 1;
-            if nibble_of(&partition[index].record_id) != old_nibble {
-                moved_indices.push(index);
+        .collect();
+    let mut target_not_interned_count = 0u64;
+    let mut dropped_candidate_count = 0u64;
+    for (partition, repair_plans) in partitions.iter_mut().zip(repair_plans_by_partition) {
+        let mut drop_indices = Vec::with_capacity(repair_plans.len());
+        for (index, plan) in &repair_plans {
+            drop_indices.push(*index);
+            if plan.needs_pending_site {
+                pending_sites.push(target_not_interned_pending_site(
+                    &partition[*index],
+                    plan.site_kind,
+                ));
+                target_not_interned_count += 1;
+            } else {
+                dropped_candidate_count += 1;
             }
         }
         // Descending order: `swap_remove` moves the LAST element into the
         // removed slot, so removing from the highest index down never
         // disturbs an index still queued for removal in this same batch.
-        moved_indices.sort_unstable_by(|a, b| b.cmp(a));
-        for index in moved_indices {
-            moved_records.push(partition.swap_remove(index));
+        drop_indices.sort_unstable_by(|a, b| b.cmp(a));
+        for index in drop_indices {
+            partition.swap_remove(index);
         }
     }
-    for record in moved_records {
-        partitions[nibble_of(&record.record_id)].push(record);
-    }
     let classification_elapsed = classification_started.elapsed();
+    sort_and_dedupe_pending_sites(&mut pending_sites);
 
     // ---- Step 7: sort each partition ascending by record_id, in parallel ----
     let sort_started = std::time::Instant::now();
@@ -1135,7 +1289,7 @@ pub fn materialize_cold_partitioned(
     if debug_timing {
         let record_count: usize = partitions.iter().map(Vec::len).sum();
         eprintln!(
-            "[urdira-indexing-worker] v4 materialize pass2 (partitioned): {:.3}s total dict={:.3}s subject_resolve={:.3}s assemble={:.3}s classification_repair={:.3}s partition_sort={:.3}s deps={:.3}s dict_finalize={:.3}s records={record_count} dependencies={} subjects={} classification_repaired={}",
+            "[urdira-indexing-worker] v4 materialize pass2 (partitioned): {:.3}s total dict={:.3}s subject_resolve={:.3}s assemble={:.3}s classification_repair={:.3}s partition_sort={:.3}s deps={:.3}s dict_finalize={:.3}s records={record_count} dependencies={} subjects={} pending_sites={} target_not_interned={} dropped_candidates={}",
             pass2_started.elapsed().as_secs_f64(),
             dict_elapsed.as_secs_f64(),
             subject_map_elapsed.as_secs_f64(),
@@ -1146,13 +1300,16 @@ pub fn materialize_cold_partitioned(
             dict_finalize_elapsed.as_secs_f64(),
             dependencies.len(),
             dicts.subjects.len(),
-            classification_repaired,
+            pending_sites.len(),
+            target_not_interned_count,
+            dropped_candidate_count,
         );
     }
 
     Ok(MaterializedPartitionedGeneration {
         partitions,
         dependencies,
+        pending_sites,
         dicts,
     })
 }
@@ -1250,6 +1407,13 @@ fn materialize_generation(
     let mut deferred_subjects: Vec<(usize, Option<String>, Option<String>)> = Vec::new();
     let mut pending_deps: Vec<(u32, u32, String, ProposedRecordDependency)> = Vec::new();
     let mut owner_ordinals: FxHashMap<String, u32> = FxHashMap::default();
+    // A2 (pending.sites migration): `(owner_ordinal, proposal)` pairs
+    // collected alongside every other per-owner field this loop already
+    // walks -- resolved to real `PendingSiteRow`s in a second sub-pass
+    // below, same timing as `deferred_subjects`' own relation-endpoint
+    // resolution (a pending site's `source_id` can equally point forward to
+    // a file processed later in owner-path order).
+    let mut pending_proposals: Vec<(u32, PendingSiteProposal)> = Vec::new();
 
     for owner in &mut owner_rows {
         let owner_ordinal = artifacts.intern(&(
@@ -1338,6 +1502,9 @@ fn materialize_generation(
                 owner.owner_path.clone(),
                 dependency.clone(),
             ));
+        }
+        for proposal in std::mem::take(&mut owner.pending_site_rows) {
+            pending_proposals.push((owner_ordinal, proposal));
         }
     }
     let owner_loop_elapsed = pass2_started.elapsed();
@@ -1431,43 +1598,51 @@ fn materialize_generation(
     }
     let subject_intern_elapsed = subject_intern_started.elapsed();
 
-    // P1-D-h item 1: repair every relation whose identity claims a
-    // resolved target that never interned (see `plan_relation_repair`'s
-    // own doc comment). Must run AFTER `target_subject` is known (just
-    // above) and BEFORE dictionary finalization below (`names` is still an
-    // open `OrdinalDict`, so interning `"unresolved"` here, ONCE, up
-    // front, never needs a separate dict pass).
-    //
-    // Two phases -- see `RepairedRelation`'s own doc comment for why: (1)
-    // PARALLEL, READ-ONLY planning (`par_iter()`, `&RecordRow` only) over
-    // every record; (2) SEQUENTIAL application of every plan. A first,
-    // single-phase version that mutated `RecordRow`s directly from inside
-    // `par_iter_mut()` was flaky (rarely corrupting a repaired row's
-    // identity/body to all-zero bytes of the right length; see this task's
-    // evidence doc), while a fully sequential (plan-and-apply-together)
-    // version cost ~28.7s of a ~60s n8n cold scan -- this keeps the
-    // expensive SHA-256 kernel work parallel while confining every
-    // `RecordRow` mutation to plain, sequential code.
-    let repairs: Vec<(usize, RepairedRelation)> = records
+    // A2 (pending.sites migration): resolve every pending site's own
+    // `source_id` to a subject ordinal the SAME way a relation row's own
+    // `source_id` resolves just above (`resolve_subject_key`) -- parallel
+    // resolve, then sequential ordinal assignment (same two-phase split
+    // subject resolution uses, for the identical determinism reason:
+    // `OrdinalDict` assignment order matters, resolution itself does not).
+    let pending_resolve_started = std::time::Instant::now();
+    let resolved_pending_sources: Vec<Option<[u8; 32]>> = pending_proposals
         .par_iter()
-        .enumerate()
-        .filter_map(|(index, record)| match plan_relation_repair(record) {
-            Ok(Some(repaired)) => Some(Ok((index, repaired))),
-            Ok(None) => None,
-            Err(error) => Some(Err(error)),
+        .map(|(_, proposal)| {
+            resolve_subject_key(
+                &records,
+                &identity_key_to_ordinal,
+                Some(proposal.source_id.as_str()),
+                external_subject_lookup,
+            )
         })
-        .collect::<Result<Vec<_>, ScanError>>()?;
-    let unresolved_name_ordinal = names.intern(&"unresolved".to_string());
-    let classification_repaired = repairs.len() as u64;
-    for (index, repaired) in repairs {
-        apply_relation_repair(&mut records[index], repaired, unresolved_name_ordinal);
+        .collect();
+    let mut pending_sites: Vec<PendingSiteRow> = Vec::with_capacity(pending_proposals.len());
+    for ((owner_ordinal, proposal), source_key) in
+        pending_proposals.into_iter().zip(resolved_pending_sources)
+    {
+        let source_subject = source_key.map(|key| subjects.intern(&key));
+        pending_sites.push(pending_site_row_from_proposal(
+            owner_ordinal,
+            generation,
+            &proposal,
+            source_subject,
+        ));
     }
+    let pending_resolve_elapsed = pending_resolve_started.elapsed();
 
     let mut dicts = Dictionaries {
         subjects: subjects.into_values(),
         ..Dictionaries::default()
     };
 
+    // Dependency materialization needs `proposal_key_to_ordinal` (built
+    // during the owner loop above, keyed by each record's ordinal AT THAT
+    // TIME) -- it must run BEFORE the drop-based repair step below, which
+    // removes entries from `records` and would otherwise leave stale
+    // ordinals behind for any record that shifts position. (`Dependency
+    // Row.record` is best-effort metadata only, per `deps.rs`'s own doc
+    // comment, but there is no reason to let it go stale when running this
+    // step first is free.)
     let deps_started = std::time::Instant::now();
     let dependencies = deps::materialize_dependencies(
         pending_deps,
@@ -1476,6 +1651,50 @@ fn materialize_generation(
         generation,
     )?;
     let deps_elapsed = deps_started.elapsed();
+
+    // A2 (pending.sites migration): drop every relation whose identity
+    // claims a resolved target that never interned (see `plan_relation_
+    // repair`'s own doc comment) -- replacing P1-D-h's in-place rewrite.
+    // Two phases, same rationale the pre-A2 version already established
+    // (`RelationRepairPlan`'s own doc comment carries the history): (1)
+    // PARALLEL, READ-ONLY planning (`par_iter()`, `&RecordRow` only) over
+    // every record; (2) SEQUENTIAL application (drop + pending-site
+    // synthesis). Stable removal (`Vec::remove`, not `swap_remove`): this
+    // path's own record count is small (a cold-flat oracle fixture or one
+    // incremental generation's affected closure, never the full n8n
+    // corpus -- that always goes through `materialize_cold_partitioned`'s
+    // own nibble-partitioned repair below), so the O(drop_count) shift cost
+    // is not worth trading away the simplicity of not having to reconcile
+    // ordinal drift afterward.
+    let repair_started = std::time::Instant::now();
+    let repair_plans: Vec<(usize, RelationRepairPlan)> = records
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, record)| plan_relation_repair(record).map(|plan| (index, plan)))
+        .collect();
+    let mut target_not_interned_count = 0u64;
+    let mut dropped_candidate_count = 0u64;
+    let mut drop_indices: Vec<usize> = Vec::with_capacity(repair_plans.len());
+    for (index, plan) in &repair_plans {
+        drop_indices.push(*index);
+        if plan.needs_pending_site {
+            pending_sites.push(target_not_interned_pending_site(
+                &records[*index],
+                plan.site_kind,
+            ));
+            target_not_interned_count += 1;
+        } else {
+            dropped_candidate_count += 1;
+        }
+    }
+    // Descending order: removing from the highest index down keeps every
+    // earlier queued index valid.
+    drop_indices.sort_unstable_by(|a, b| b.cmp(a));
+    for index in drop_indices {
+        records.remove(index);
+    }
+    let repair_elapsed = repair_started.elapsed();
+    sort_and_dedupe_pending_sites(&mut pending_sites);
 
     let dict_finalize_started = std::time::Instant::now();
     dicts.kinds = kinds.into_values();
@@ -1525,25 +1744,30 @@ fn materialize_generation(
 
     if debug_timing {
         eprintln!(
-            "[urdira-indexing-worker] v4 materialize pass2 (overlapped owner_rows drop={:.3}s): {:.3}s total owner_loop={:.3}s subject_resolve(parallel)={:.3}s subject_intern(sequential)={:.3}s deps={:.3}s dict_finalize={:.3}s records={} deferred_subjects={} dependencies={} subjects={} classification_repaired={}",
+            "[urdira-indexing-worker] v4 materialize pass2 (overlapped owner_rows drop={:.3}s): {:.3}s total owner_loop={:.3}s subject_resolve(parallel)={:.3}s subject_intern(sequential)={:.3}s pending_resolve={:.3}s deps={:.3}s repair={:.3}s dict_finalize={:.3}s records={} deferred_subjects={} dependencies={} subjects={} pending_sites={} target_not_interned={} dropped_candidates={}",
             drop_elapsed.as_secs_f64(),
             pass2_started.elapsed().as_secs_f64(),
             owner_loop_elapsed.as_secs_f64(),
             subject_resolve_elapsed.as_secs_f64(),
             subject_intern_elapsed.as_secs_f64(),
+            pending_resolve_elapsed.as_secs_f64(),
             deps_elapsed.as_secs_f64(),
+            repair_elapsed.as_secs_f64(),
             dict_finalize_elapsed.as_secs_f64(),
             records.len(),
             deferred_subject_count,
             dependencies.len(),
             dicts.subjects.len(),
-            classification_repaired,
+            pending_sites.len(),
+            target_not_interned_count,
+            dropped_candidate_count,
         );
     }
 
     Ok(MaterializedGeneration {
         records,
         dependencies,
+        pending_sites,
         dicts,
         owner_ordinals: owner_ordinals.into_iter().collect(),
     })
@@ -1592,237 +1816,119 @@ pub(super) fn identity_key_name(identity_key: &str) -> &str {
     identity_key.rsplit(':').next().unwrap_or(identity_key)
 }
 
-fn canonical_json(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).expect("materialize builds only plain JSON values")
-}
-
-fn canonical_span(path: &str, start: u32, end: u32) -> String {
-    canonical_json(&serde_json::json!({ "path": path, "start": start, "end": end }))
-}
-
-fn canonical_evidence(path: &str, start: u32, end: u32) -> String {
-    canonical_json(&serde_json::json!([{ "path": path, "start": start, "end": end }]))
-}
-
-/// `urdira-jsts-syntax-worker::lib.rs`'s `proposal_record_key` recipe,
-/// reimplemented here for the same crate-isolation reason `residual.rs`
-/// already documents for its own independent copy: this module cannot
-/// depend on that crate's `pub(crate)` helpers.
-fn proposal_record_key(identity_key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"urdira:jsts-proposal-record:v1\0");
-    hasher.update((identity_key.len() as u64).to_be_bytes());
-    hasher.update(identity_key.as_bytes());
-    let mut out = String::with_capacity(80);
-    out.push_str("jsts:record:sha256:");
-    for byte in hasher.finalize() {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// P1-D-h item 1 (cold-producer classification fix): recovers `path`,
-/// `start`, `end`, `source_id`, and the relation's own kind word (`"call"`,
-/// `"inherits"`, or `"implements"`) from a relation record's OWN identity
-/// string -- never `body`, which this pipeline's Rust side never decodes
-/// (`residual.rs`'s own `is_classification_consistent`/`collect()` doc
-/// comments establish and rely on the same "no body decode" invariant).
+/// A2 (pending.sites migration): recovers the relation's own kind word
+/// (`"call"`, `"inherits"`, or `"implements"`) from a relation record's OWN
+/// identity string -- never `body`, which this pipeline's Rust side never
+/// decodes (`residual.rs`'s own `is_classification_consistent`/`collect()`
+/// doc comments establish and rely on the same "no body decode" invariant).
 ///
-/// Every relation this pipeline's E1-E3 typeflow lane resolves with
-/// checker-grade confidence (`semantic_sites.rs`'s `call_proposed_record`/
-/// `heritage_proposed_record`) writes an identity of the fixed shape
-/// `jsts:{relation_kind}:{path}:{start}:{end}:{source_id}:{target_id}`,
-/// where `source_id`/`target_id` are themselves `declaration_id`'s own
-/// 5-`:`-field `jsts:{kind}:{path}:{start}:{name}` recipe. `start`/`end`
-/// are already known (the record's own `span_start_byte`/`span_end_byte`),
-/// so the exact substring `:{start}:{end}:` locates the boundary between
-/// `path` and the two trailing compound ids without needing an owner-path
-/// lookup at all -- a real filesystem path never contains a literal
-/// `:123:456:`-shaped substring in practice (the same assumption
-/// `residual.rs`'s own prefix-strip already relies on). Returns `None`
-/// (caller leaves the record untouched) for anything this cannot recover
-/// unambiguously: an identity that isn't `call`/`inherits`/`implements`
-/// shaped, one that is already the canonical `:unresolved` possible form
-/// (nothing to fix), or a remainder that does not split into exactly 10
-/// `:`-tokens (a name segment containing a literal `:`, e.g. certain
-/// computed/string-literal property keys -- `residual.rs`'s own P1-D-g
-/// finding, left as this fix's own known, accepted gap rather than
-/// guessed at).
-fn parse_unresolved_confirmed_relation(
-    identity_key: &[u8],
-    span_start_byte: u32,
-    span_end_byte: u32,
-) -> Option<(String, String, &'static str)> {
+/// Every relation this pipeline's E1-E3/typeflow lane resolves with
+/// checker-grade confidence, or believes it resolved (P2-2j's own per-
+/// candidate rows included), writes an identity of the fixed shape
+/// `jsts:{relation_kind}:{path}:{start}:{end}:{source_id}:{target_id}` --
+/// `"jsts:"` followed directly by the bare kind word (never `"relation_
+/// call"` -- that is `RecordRow.kind`'s own text, a different dictionary
+/// entirely). Returns `None` for anything not shaped this way: a kind other
+/// than the three this module repairs, or an identity already ending in the
+/// canonical `":unresolved"` possible-site sentinel (nothing to repair --
+/// after this migration such an identity should never even reach a
+/// `RecordRow` at cold-materialize time, since `owner.records` no longer
+/// receives one, but the check stays as defense in depth).
+fn confirmed_relation_kind(identity_key: &[u8]) -> Option<&'static str> {
     let identity_str = std::str::from_utf8(identity_key).ok()?;
     if identity_str.ends_with(":unresolved") {
         return None;
     }
     let rest = identity_str.strip_prefix("jsts:")?;
-    let (relation_kind, rest) = rest.split_once(':')?;
-    let relation_kind = match relation_kind {
-        "call" => "call",
-        "inherits" => "inherits",
-        "implements" => "implements",
-        _ => return None,
-    };
-    let needle = format!(":{span_start_byte}:{span_end_byte}:");
-    let needle_pos = rest.find(&needle)?;
-    let path = rest[..needle_pos].to_string();
-    let after = &rest[needle_pos + needle.len()..];
-    let tokens: Vec<&str> = after.split(':').collect();
-    if tokens.len() != 10 {
+    let (relation_kind, _) = rest.split_once(':')?;
+    match relation_kind {
+        "call" => Some("call"),
+        "inherits" => Some("inherits"),
+        "implements" => Some("implements"),
+        _ => None,
+    }
+}
+
+/// A2 (pending.sites migration): what to do with one classification-
+/// mismatched relation record -- a `core:call`/`core:inherits`/`core:
+/// implements` row whose identity claims a resolved target
+/// (`confirmed_relation_kind` matched) that this module's subject-
+/// resolution pass (above) never actually interned into `target_subject`.
+/// Before this migration such a record was REWRITTEN in place into the
+/// canonical `":unresolved"` possible shape (P1-D-h's own `RepairedRelation`/
+/// `apply_relation_repair`); now it is always DROPPED outright (the pipeline
+/// never publishes a no-target relation record any more) and, unless
+/// `needs_pending_site` is `false`, replaced by a [`urdira_structural_store::
+/// PendingSiteRow`] with reason `target_not_interned` at the SAME span.
+///
+/// `needs_pending_site` is `false` only when this record already carries the
+/// P2-2j `"core:indirect"` candidate facet (`candidate_call_record`, a
+/// per-candidate `possible` row for an overload/union receiver -- these
+/// carry a REAL `target_id` in their identity too, which is exactly why
+/// `confirmed_relation_kind` matches them the same as a genuinely confirmed
+/// row). That row's own no-target sibling (`PendingSiteProposal`, same span,
+/// reason `overload_ambiguous`/`union_ambiguous`, built in `analyze.rs` from
+/// `OwnerSemantics::pending_site_rows`) already produced a pending site for
+/// this exact `(owner_artifact, start, end, site_kind)` key -- synthesizing
+/// a second one here would collide with it (the writer rejects a duplicate
+/// key within one segment) and would in any case be strictly less
+/// informative than the reason that already exists. Today the cold producer
+/// materializes only module-level entities, so a real-corpus run is
+/// expected to synthesize a `target_not_interned` pending site for every
+/// typeflow-confirmed MEMBER call (`jsts:method:...` etc, whose target
+/// entity the cold producer never interned) and to drop every candidate row
+/// silently for the same underlying reason -- both counts are reported by
+/// `materialize_cold_partitioned`'s own `URDIRA_DEBUG_TIMING` line.
+struct RelationRepairPlan {
+    site_kind: u8, // one of the `PENDING_SITE_KIND_*` constants
+    needs_pending_site: bool,
+}
+
+/// Detects a classification-mismatched relation record and plans its fate
+/// -- see [`RelationRepairPlan`]'s own doc comment for the full rule.
+/// `None` for anything not a relation, already resolved, or not one of the
+/// three kinds this module repairs -- the caller leaves such a record
+/// untouched. Pure and read-only (`&RecordRow`, no kernel/SHA-256 work at
+/// all any more -- the DROP-based repair needs no replacement identity to
+/// compute), so safe to call from a rayon `par_iter`.
+fn plan_relation_repair(record: &RecordRow) -> Option<RelationRepairPlan> {
+    if record.category != CATEGORY_RELATION || record.target_subject.is_some() {
         return None;
     }
-    let source_id = tokens[..5].join(":");
-    Some((path, source_id, relation_kind))
+    let relation_kind = confirmed_relation_kind(&record.identity_key)?;
+    let site_kind = match relation_kind {
+        "call" => PENDING_SITE_KIND_CALL,
+        "inherits" => PENDING_SITE_KIND_INHERITS,
+        "implements" => PENDING_SITE_KIND_IMPLEMENTS,
+        _ => return None,
+    };
+    let is_candidate = (record.facets & (1u64 << core_indirect_facet_bit())) != 0;
+    Some(RelationRepairPlan {
+        site_kind,
+        needs_pending_site: !is_candidate,
+    })
 }
 
-/// P1-D-h item 1: rewrites `record`, in place, into the canonical
-/// "possible" identity `possible_call_record`/`possible_heritage_record`
-/// (`urdira_jsts_syntax_worker::semantic_sites`) would have produced for
-/// the exact same site, whenever `record`'s own identity claims a resolved
-/// target that this module's subject-resolution pass (above) never
-/// managed to intern (`record.target_subject.is_none()`) -- see
-/// [`parse_unresolved_confirmed_relation`]'s own doc comment for the full
-/// rule and its scope. A no-op (`Ok(false)`) for anything not a relation,
-/// already resolved, or not unambiguously parseable. This always runs
-/// against BRAND NEW, not-yet-published cold-generation rows (never a live
-/// store), so unlike `residual.rs`'s own repair step there is no
-/// predecessor to chain against and no live-identity collision to guard
-/// against: `record_id`/`record_digest` are simply recomputed fresh, decision
-/// 11's "cold: no predecessors" case, same as every other cold record.
-/// The precomputed replacement fields for one repaired relation row --
-/// [`plan_relation_repair`]'s output, [`apply_relation_repair`]'s input.
-/// Split out from a single combined "compute AND mutate" function
-/// (P1-D-h's own first version) specifically so the expensive SHA-256
-/// kernel computation (`plan_relation_repair`) can run behind a SHARED
-/// `&RecordRow` in a parallel pass, while every actual WRITE to a
-/// `RecordRow` happens afterward, strictly sequentially
-/// (`apply_relation_repair`, run from a plain loop, never from inside
-/// `par_iter`/`par_iter_mut`). A first version that mutated `RecordRow`
-/// fields directly from inside `materialize_cold_partitioned`'s own
-/// `par_iter_mut()` closure was measured to occasionally (non-
-/// deterministically, ~1-in-2 real n8n cold scans in this session's own
-/// testing) leave a repaired row's `identity_key`/`body` as all-zero bytes
-/// of the RIGHT length -- never reproduced with this split in place across
-/// several repeat runs. The exact mechanism was not root-caused (this
-/// session's own budget did not allow chasing it further into `urdira-
-/// native-core`/rayon's own internals), but confining every `RecordRow`
-/// mutation to sequential code removes the entire class of "was this the
-/// concurrent-mutation path" suspects, which is the responsible fix given
-/// data corruption is categorically worse than a slower repair -- see this
-/// task's evidence doc for the full incident writeup.
-struct RepairedRelation {
-    record_id: [u8; 32],
-    record_digest: [u8; 32],
-    body_digest: [u8; 32],
-    identity_id: [u8; 32],
-    identity_key_digest: [u8; 32],
-    identity_key: Vec<u8>,
-    body: Vec<u8>,
-    facets: u64,
-}
-
-/// Pure, read-only (`&RecordRow`, never `&mut`) computation of the
-/// canonical possible-row replacement for one classification-mismatched
-/// relation -- see [`RepairedRelation`]'s own doc comment for why this is
-/// split from the actual mutation, and [`parse_unresolved_confirmed_
-/// relation`]'s doc comment for the parsing rule/scope. `Ok(None)` for
-/// anything not a relation, already resolved, or not unambiguously
-/// parseable -- the caller leaves such a record untouched. Safe to call
-/// from a rayon `par_iter`/`par_iter_mut` (no shared mutable state, no
-/// interior mutability): the only write this function performs is to its
-/// own local `body`/`record_key`, both freshly allocated per call.
-fn plan_relation_repair(record: &RecordRow) -> Result<Option<RepairedRelation>, ScanError> {
-    if record.category != CATEGORY_RELATION || record.target_subject.is_some() {
-        return Ok(None);
+/// Builds the [`PendingSiteRow`] a [`RelationRepairPlan`] with
+/// `needs_pending_site: true` requires, straight from the record being
+/// dropped (its own `owner_artifact`/`owner_version`/`valid_from`/
+/// `source_subject`/span are exactly what the pending site needs -- no
+/// further resolution required, unlike a producer-side `PendingSiteProposal`
+/// which still carries a text `source_id` to resolve).
+fn target_not_interned_pending_site(record: &RecordRow, site_kind: u8) -> PendingSiteRow {
+    PendingSiteRow {
+        owner_artifact: record.owner_artifact,
+        owner_version: record.owner_version,
+        valid_from: record.valid_from,
+        valid_to: 0,
+        start: record.span_start_byte,
+        end: record.span_end_byte,
+        start_line: 0,
+        end_line: 0,
+        site_kind,
+        reason: PendingReasonCode::from_reason(REASON_TARGET_NOT_INTERNED),
+        source_subject: record.source_subject,
     }
-    let Some((path, source_id, relation_kind)) = parse_unresolved_confirmed_relation(
-        &record.identity_key,
-        record.span_start_byte,
-        record.span_end_byte,
-    ) else {
-        return Ok(None);
-    };
-    let start = record.span_start_byte;
-    let end = record.span_end_byte;
-    let identity_key = format!("jsts:{relation_kind}:{path}:{start}:{end}:{source_id}:unresolved");
-    let mut body = serde_json::Map::new();
-    body.insert("source_id".into(), serde_json::Value::String(source_id));
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("possible".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.clone()));
-    body.insert("start".into(), serde_json::Value::from(start));
-    body.insert("end".into(), serde_json::Value::from(end));
-    let body = serde_json::Value::Object(body);
-
-    let facets = canonical_json(&serde_json::json!([
-        "core:reference_relation",
-        "core:indirect"
-    ]));
-    let source_span = canonical_span(&path, start, end);
-    let evidence_references = canonical_evidence(&path, start, end);
-    let kind = format!("jsts:relation_{relation_kind}");
-    let universal_kind = format!("core:{relation_kind}");
-    let record_key = StructuralKernelRecordRef {
-        proposal_record_key: &proposal_record_key(&identity_key),
-        category: "relation",
-        kind: &kind,
-        universal_kind: &universal_kind,
-        facets: &facets,
-        schema_version: 1,
-        source_span: &source_span,
-        identity_key: &identity_key,
-        body: &body,
-        evidence_references: &evidence_references,
-    };
-    let mut batches = kernel_rows_batches(std::slice::from_ref(&record_key))?;
-    let Some(kernel_rows) = batches.pop() else {
-        return Ok(None);
-    };
-    let Some(kernel_row) = kernel_rows.rows.into_iter().next() else {
-        return Ok(None);
-    };
-    Ok(Some(RepairedRelation {
-        record_id: kernel_row.record_id,
-        record_digest: kernel_row.record_digest,
-        body_digest: kernel_row.body_digest,
-        identity_id: kernel_row.identity_id,
-        identity_key_digest: kernel_row.identity_key_digest,
-        identity_key: kernel_row.identity_key.into_bytes(),
-        body: kernel_row.body,
-        facets: facets_bitmask(&kernel_row.facets),
-    }))
-}
-
-/// Writes a [`RepairedRelation`] (from [`plan_relation_repair`]) into
-/// `record`, in place. Always called from strictly sequential code (never
-/// from inside a rayon `par_iter`/`par_iter_mut`) -- see
-/// [`RepairedRelation`]'s own doc comment for why. `unresolved_name_
-/// ordinal` is `names`'s already-interned ordinal for the literal string
-/// `"unresolved"` (every repaired row's own `name_id`, `identity_key_
-/// name`'s last `:`-segment of the canonical possible identity).
-fn apply_relation_repair(
-    record: &mut RecordRow,
-    repaired: RepairedRelation,
-    unresolved_name_ordinal: u32,
-) {
-    record.record_id = repaired.record_id;
-    record.record_digest = repaired.record_digest;
-    record.body_digest = repaired.body_digest;
-    record.identity_id = repaired.identity_id;
-    record.identity_key_digest = repaired.identity_key_digest;
-    record.identity_key = repaired.identity_key;
-    record.body = repaired.body;
-    record.facets = repaired.facets;
-    record.name_id = unresolved_name_ordinal;
-    // `kind_id`/`universal_kind_id`/`relation_kind_id` are unchanged:
-    // `possible_call_record`/`possible_heritage_record` use the IDENTICAL
-    // `kind`/`universal_kind` strings as their `confirmed` counterpart, so
-    // no new dictionary ordinal is ever needed here.
 }
 
 /// Byte-arithmetic hex nibble decode (no `char`/`to_digit` round trip).
@@ -1987,6 +2093,7 @@ mod tests {
             dependencies: Vec::new(),
             direct_imports: Vec::new(),
             pending_sites: Vec::new(),
+            pending_site_rows: Vec::new(),
         }
     }
 
@@ -2212,18 +2319,18 @@ mod tests {
         }
     }
 
-    /// P1-D-h item 1 (cold-producer classification fix), flat `materialize_
-    /// cold` path: a `core:call` relation whose body/identity already claim
+    /// A2 (pending.sites migration), flat `materialize_cold` path: a
+    /// `core:call` relation whose body/identity already claim
     /// `classification: "confirmed"` against a class-member target this
     /// fixture never emits an entity for MUST NOT survive materialization
-    /// as an inconsistent "confirmed, but nothing to point at" row -- it
-    /// must be rewritten into the canonical possible shape
-    /// (`:unresolved`-suffixed identity, `target_subject` still `None`,
-    /// same store-wide invariant `residual.rs`'s own `is_classification_
-    /// consistent` checks: identity ends in `:unresolved` IFF `target_
-    /// subject` is `None`).
+    /// as a relation record at all any more (P1-D-h's own "rewrite to the
+    /// canonical possible shape" is gone -- the pipeline never publishes a
+    /// no-target relation record any more, period). It is DROPPED, and a
+    /// `PendingSiteRow` with reason `target_not_interned` appears at the
+    /// SAME span instead, its `source_subject` resolving to the caller
+    /// entity's own record.
     #[test]
-    fn confirmed_call_to_an_uninterned_member_target_is_repaired_to_the_possible_row() {
+    fn confirmed_call_to_an_uninterned_member_target_is_dropped_and_becomes_a_pending_site() {
         let source = entity_record("caller", "caller", "src/a.ts");
         let source_identity_key = source.identity_key.clone();
         let member_target_identity_key = "jsts:method:src/b.ts:40:doWork".to_string();
@@ -2238,39 +2345,51 @@ mod tests {
         let owners = vec![owner_facts("src/a.ts", vec![source, relation])];
         let materialized = materialize_cold(owners).expect("materialize_cold succeeds");
 
-        let relation_record = materialized
+        assert!(
+            materialized
+                .records
+                .iter()
+                .all(|record| record.category != CATEGORY_RELATION),
+            "no relation record may survive materialization without a target: {:?}",
+            materialized.records
+        );
+        assert_eq!(
+            materialized.pending_sites.len(),
+            1,
+            "pending_sites: {:?}",
+            materialized.pending_sites
+        );
+        let pending = &materialized.pending_sites[0];
+        assert_eq!(pending.site_kind, PENDING_SITE_KIND_CALL);
+        assert_eq!(
+            pending.reason,
+            PendingReasonCode::from_reason(REASON_TARGET_NOT_INTERNED)
+        );
+        assert_eq!(pending.start, 0);
+        assert_eq!(pending.end, 20);
+        let caller_record_id = materialized
             .records
             .iter()
-            .find(|record| record.category == CATEGORY_RELATION)
-            .expect("relation row present");
-        assert!(relation_record.target_subject.is_none());
-        let identity = std::str::from_utf8(&relation_record.identity_key).unwrap();
-        assert!(
-            identity.ends_with(":unresolved"),
-            "identity should be rewritten to the canonical possible shape: {identity}"
-        );
+            .find(|record| {
+                std::str::from_utf8(&record.identity_key) == Ok(source_identity_key.as_str())
+            })
+            .expect("the caller entity record survives materialization")
+            .record_id;
+        let source_subject_ordinal = pending
+            .source_subject
+            .expect("the caller entity is in this same owner's batch, so it must resolve");
         assert_eq!(
-            identity,
-            format!("jsts:call:src/a.ts:0:20:{source_identity_key}:unresolved")
-        );
-        // The store-wide invariant itself (`residual.rs`'s own
-        // `is_classification_consistent`): identity claims "resolved" IFF
-        // `target_subject` is interned. Verified directly here (not via a
-        // cross-module call) since that predicate is private to `residual`.
-        assert_eq!(
-            !identity.ends_with(":unresolved"),
-            relation_record.target_subject.is_some()
+            materialized.dicts.subjects[source_subject_ordinal as usize],
+            caller_record_id,
         );
     }
 
     /// Same scenario as above, but through `materialize_cold_partitioned`
     /// (the REAL production cold-scan entrypoint, `scan.rs`'s own caller) --
-    /// confirms the partitioned path's own repair-then-rebucket logic (a
-    /// repair can move a row into a different nibble bucket than Step 6
-    /// originally placed it in) reaches the exact same result as the flat
-    /// oracle above.
+    /// confirms the partitioned path's own drop-based repair reaches the
+    /// exact same result as the flat oracle above.
     #[test]
-    fn confirmed_call_to_an_uninterned_member_target_is_repaired_in_the_partitioned_path_too() {
+    fn confirmed_call_to_an_uninterned_member_target_is_dropped_in_the_partitioned_path_too() {
         let source = entity_record("caller", "caller", "src/a.ts");
         let source_identity_key = source.identity_key.clone();
         let member_target_identity_key = "jsts:method:src/b.ts:40:doWork".to_string();
@@ -2286,37 +2405,29 @@ mod tests {
         let materialized =
             materialize_cold_partitioned(owners).expect("materialize_cold_partitioned succeeds");
 
-        let relation_record = materialized
-            .partitions
-            .iter()
-            .flatten()
-            .find(|record| record.category == CATEGORY_RELATION)
-            .expect("relation row present");
-        assert!(relation_record.target_subject.is_none());
-        let identity = std::str::from_utf8(&relation_record.identity_key).unwrap();
         assert!(
-            identity.ends_with(":unresolved"),
-            "identity should be rewritten to the canonical possible shape: {identity}"
-        );
-        // The row must actually sit in the partition matching its NEW
-        // record_id (the repair recomputes record_id, which can change
-        // which nibble bucket it belongs in) -- not wherever Step 6
-        // originally placed the pre-repair row.
-        let nib = nibble_of(&relation_record.record_id);
-        assert!(
-            materialized.partitions[nib]
+            materialized
+                .partitions
                 .iter()
-                .any(|record| record.record_id == relation_record.record_id)
+                .flatten()
+                .all(|record| record.category != CATEGORY_RELATION),
+            "no relation record may survive materialization without a target"
+        );
+        assert_eq!(materialized.pending_sites.len(), 1);
+        assert_eq!(
+            materialized.pending_sites[0].site_kind,
+            PENDING_SITE_KIND_CALL
+        );
+        assert_eq!(
+            materialized.pending_sites[0].reason,
+            PendingReasonCode::from_reason(REASON_TARGET_NOT_INTERNED)
         );
     }
 
     /// Same fix, heritage relation (`core:implements`) -- confirms the
-    /// repair is not scoped to `core:call` alone. `possible_heritage_
-    /// record`'s own identity/facets shape (`urdira_jsts_syntax_worker::
-    /// semantic_sites`) is otherwise identical to `possible_call_record`'s,
-    /// just parametrized by the relation's own kind word.
+    /// repair is not scoped to `core:call` alone.
     #[test]
-    fn confirmed_implements_to_an_uninterned_member_target_is_repaired_too() {
+    fn confirmed_implements_to_an_uninterned_member_target_is_dropped_too() {
         let source = entity_record("caller", "caller", "src/a.ts");
         let source_identity_key = source.identity_key.clone();
         // Heritage targets are ordinarily classes/interfaces (always
@@ -2336,17 +2447,17 @@ mod tests {
         let owners = vec![owner_facts("src/a.ts", vec![source, relation])];
         let materialized = materialize_cold(owners).expect("materialize_cold succeeds");
 
-        let relation_record = materialized
-            .records
-            .iter()
-            .find(|record| record.category == CATEGORY_RELATION)
-            .expect("relation row present");
-        assert!(relation_record.target_subject.is_none());
-        let identity = std::str::from_utf8(&relation_record.identity_key).unwrap();
-        assert!(identity.ends_with(":unresolved"));
+        assert!(
+            materialized
+                .records
+                .iter()
+                .all(|record| record.category != CATEGORY_RELATION),
+            "no relation record may survive materialization without a target"
+        );
+        assert_eq!(materialized.pending_sites.len(), 1);
         assert_eq!(
-            identity,
-            format!("jsts:implements:src/a.ts:0:20:{source_identity_key}:unresolved")
+            materialized.pending_sites[0].site_kind,
+            PENDING_SITE_KIND_IMPLEMENTS
         );
     }
 

@@ -108,7 +108,27 @@ pub mod syntax_kind {
     pub const CALL_EXPRESSION: u32 = 214;
     pub const NEW_EXPRESSION: u32 = 215;
     pub const EXPRESSION_WITH_TYPE_ARGUMENTS: u32 = 234;
+    /// `FunctionDeclaration` -- from `dist/enums/syntaxKind.enum.js`
+    /// (TypeScript 7.0.2), same authoritative source as the other constants
+    /// in this module. Needed by `crate::semantic_extras` to recognize a
+    /// top-level exported function declaration (v3's `typeOf` walks this
+    /// node kind, `analyzer.ts`'s `addEntity`'s `isFunctionDeclaration`
+    /// branch).
+    pub const FUNCTION_DECLARATION: u32 = 263;
     pub const CLASS_DECLARATION: u32 = 264;
+    /// `InterfaceDeclaration` -- from `dist/enums/syntaxKind.enum.js`.
+    /// `crate::semantic_extras` walks an exported interface's own
+    /// `MethodSignature`/`PropertySignature` children the same way it walks
+    /// an exported class's `MethodDeclaration`/`PropertyDeclaration`
+    /// children -- see that module's doc comment.
+    pub const INTERFACE_DECLARATION: u32 = 265;
+    /// `TypeAliasDeclaration` -- from `dist/enums/syntaxKind.enum.js`.
+    pub const TYPE_ALIAS_DECLARATION: u32 = 266;
+    /// `EnumDeclaration` -- from `dist/enums/syntaxKind.enum.js`.
+    pub const ENUM_DECLARATION: u32 = 267;
+    /// `ModuleDeclaration` (a TypeScript `namespace`/`module` block) --
+    /// from `dist/enums/syntaxKind.enum.js`.
+    pub const MODULE_DECLARATION: u32 = 268;
     pub const HERITAGE_CLAUSE: u32 = 299;
     pub const SOURCE_FILE: u32 = 307;
     pub const JSDOC: u32 = 315;

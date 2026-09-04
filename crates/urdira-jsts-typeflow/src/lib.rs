@@ -102,9 +102,30 @@ pub enum RawTypeRef {
         base: Box<RawTypeRef>,
         key: String,
     },
-    /// Anything this crate does not (yet) reason about: a union type, a
-    /// conditional/mapped/keyof/tuple type, a qualified type name, a type-
-    /// parameter reference, ... -- never a guess.
+    /// P2-2j: a TypeScript union type (`A | B`) used as a member-access
+    /// receiver -- see `raw_type_ref_of_ts_type`'s `TSUnionType` arm for the
+    /// exact construction rules: `null`/`undefined`/literal/primitive
+    /// constituents are dropped first (TypeScript's own nullability
+    /// convention -- `A | null` means "possibly-null A", not a real second
+    /// branch to look members up on -- never a guess about the OTHER
+    /// constituents); ANY remaining constituent this crate cannot classify
+    /// makes the WHOLE union `Unknown` (conservative, never a partial
+    /// guess, same "never widen past what's proven" discipline as
+    /// everywhere else in this crate); constituents are deduped; a union
+    /// that collapses to one distinct constituent (including `A | A`) is
+    /// that constituent, never a one-element `Union`. Resolved
+    /// (`ProgramIndex::members_of_union`) to CANDIDATE member ids only -- a
+    /// union receiver never promotes to a single confirmed target, even
+    /// when every constituent resolves to the SAME member id (see
+    /// `MemberLookup::UnionCandidates`'s own doc comment) -- this crate's
+    /// zero-wrong-target record is never spent on a genuine receiver
+    /// ambiguity.
+    Union(Vec<RawTypeRef>),
+    /// Anything this crate does not (yet) reason about: a conditional/
+    /// mapped/keyof/tuple type, a qualified type name, a type-parameter
+    /// reference, ... -- never a guess. (A union type is `Union` instead,
+    /// see its own doc comment, unless it contaminates to `Unknown` per
+    /// that variant's own rule.)
     Unknown,
 }
 
@@ -139,6 +160,13 @@ pub enum ResolvedTypeRef {
     PromiseOf(Box<ResolvedTypeRef>),
     /// P1-C: see `RawTypeRef::RecordOf`'s doc comment.
     RecordOf(Box<ResolvedTypeRef>),
+    /// P2-2j: see `RawTypeRef::Union`'s doc comment. `resolve_raw_type_ref`/
+    /// `resolve_raw_type_ref_deferred` resolve EVERY constituent or none at
+    /// all (`Option<Vec<_>>::collect`'s short-circuit) -- a union with one
+    /// unresolvable constituent (an import that never closed, ...) is never
+    /// partially represented, matching the "resolve fully or stay `None`"
+    /// contract every other composite `RawTypeRef` wrapper already has.
+    Union(Vec<ResolvedTypeRef>),
 }
 
 /// One member of a class or interface: enough to answer "does this
@@ -1784,8 +1812,73 @@ fn raw_type_ref_of_ts_type(
             });
             RawTypeRef::Local(entity_id)
         }
+        // P2-2j: `A | B` -- see `RawTypeRef::Union`'s own doc comment for
+        // the full contract (drop null/undefined/literal/primitive
+        // constituents, contaminate to `Unknown` on any other unclassified
+        // remaining constituent, dedupe, collapse a single survivor).
+        TSType::TSUnionType(union) => {
+            let mut constituents: Vec<RawTypeRef> = Vec::new();
+            for member in &union.types {
+                if is_dropped_union_constituent(member) {
+                    continue;
+                }
+                let raw = raw_type_ref_of_ts_type(
+                    member,
+                    path,
+                    scoping,
+                    import_specifiers,
+                    synthetic_interfaces,
+                );
+                if matches!(raw, RawTypeRef::Unknown) {
+                    // Conservative contamination: one unclassifiable
+                    // constituent (a generic, a nested union, `any`,
+                    // `unknown`, ...) makes the WHOLE union `Unknown`,
+                    // never a partial guess from the classifiable
+                    // constituents alone.
+                    return RawTypeRef::Unknown;
+                }
+                if !constituents.contains(&raw) {
+                    constituents.push(raw);
+                }
+            }
+            match constituents.len() {
+                // Every constituent was null/undefined/literal/primitive
+                // (`"a" | "b"`, `string | null`) -- nothing left to
+                // represent as a member-lookup receiver.
+                0 => RawTypeRef::Unknown,
+                // A union that collapses to one distinct constituent
+                // (`A | A`, `A | null`) is that constituent, not a union.
+                1 => constituents.into_iter().next().expect("checked len == 1"),
+                _ => RawTypeRef::Union(constituents),
+            }
+        }
         _ => RawTypeRef::Unknown,
     }
+}
+
+/// P2-2j: whether `ty` is one of the constituent shapes a union receiver
+/// drops silently rather than treating as a real member-lookup candidate --
+/// `null`/`undefined` (TypeScript's own nullability convention: `A | null`
+/// means "possibly-null A", not a real second branch to look members up on)
+/// and a literal/primitive keyword type (`"a" | "b"`, `string | Foo`) --
+/// neither ever has class/interface members of its own to resolve a call
+/// against. Every OTHER constituent (including `any`/`unknown`/`void`/
+/// `never`/`object`, deliberately NOT dropped here) is classified normally
+/// by `raw_type_ref_of_ts_type`, which -- for anything this crate cannot
+/// classify -- already falls back to `Unknown`, contaminating the whole
+/// union via that function's own `TSUnionType` arm.
+fn is_dropped_union_constituent(ty: &TSType) -> bool {
+    matches!(
+        ty,
+        TSType::TSNullKeyword(_)
+            | TSType::TSUndefinedKeyword(_)
+            | TSType::TSLiteralType(_)
+            | TSType::TSStringKeyword(_)
+            | TSType::TSNumberKeyword(_)
+            | TSType::TSBooleanKeyword(_)
+            | TSType::TSBigIntKeyword(_)
+            | TSType::TSSymbolKeyword(_)
+    )
 }
 
 /// `raw_type_ref_of_ts_type` over an optional `TSTypeAnnotation` (the shape
@@ -1933,21 +2026,32 @@ fn summarize_class(
             heritage_target_of_type_name(&implements.expression, path, scoping, import_specifiers)
         })
         .collect();
-    let members = class
-        .body
-        .body
-        .iter()
-        .filter_map(|element| {
-            member_entry_of_class_element(
-                element,
-                path,
-                scoping,
-                import_specifiers,
-                synthetic_interfaces,
-                &entity_id,
-            )
-        })
-        .collect();
+    let mut members = Vec::new();
+    for element in &class.body.body {
+        if let Some(entry) = member_entry_of_class_element(
+            element,
+            path,
+            scoping,
+            import_specifiers,
+            synthetic_interfaces,
+            &entity_id,
+        ) {
+            members.push(entry);
+        }
+        // Parameter properties: see `push_constructor_parameter_property_
+        // declarations`'s doc comment -- the SAME discovery/identity rule,
+        // just building a `MemberEntry` (for `ProgramIndex::members`/
+        // `member_type_ref`) instead of a `MemberDeclaration` (for the cold
+        // entity producer). A non-constructor element (or a constructor
+        // with no parameter properties) contributes nothing here.
+        members.extend(member_entries_of_constructor_parameter_properties(
+            element,
+            path,
+            scoping,
+            import_specifiers,
+            synthetic_interfaces,
+        ));
+    }
     Some(ClassSummary {
         entity_id,
         extends,
@@ -1997,23 +2101,34 @@ fn summarize_interface(
     }
 }
 
-/// The `(start, name)` an identity-bearing `PropertyKey` contributes, when
-/// it has one at all. Mirrors `semantic_sites::property_key_name` exactly
-/// (same "#"-prefix and literal-key handling) -- see that function's doc
-/// comment for why a computed key has none.
-fn property_key_name(key: &PropertyKey) -> Option<(u32, String)> {
+/// The `(start, end, name)` an identity-bearing `PropertyKey` contributes,
+/// when it has one at all. Mirrors `semantic_sites::property_key_name`
+/// exactly (same "#"-prefix and literal-key handling) -- see that
+/// function's doc comment for why a computed key has none. The single
+/// source both `property_key_name` (start/name only, this crate's own
+/// pre-existing callers) and `class_element_member_shape`/`signature_
+/// member_shape` (need the key's own END too, for `MemberDeclaration::
+/// key_end`) build on.
+fn property_key_span(key: &PropertyKey) -> Option<(u32, u32, String)> {
     match key {
-        PropertyKey::StaticIdentifier(name) => {
-            Some((name.span.start, name.name.as_str().to_owned()))
-        }
-        PropertyKey::PrivateIdentifier(name) => {
-            Some((name.span.start, format!("#{}", name.name.as_str())))
-        }
-        PropertyKey::StringLiteral(literal) => {
-            Some((literal.span.start, literal.value.as_str().to_owned()))
-        }
+        PropertyKey::StaticIdentifier(name) => Some((
+            name.span.start,
+            name.span.end,
+            name.name.as_str().to_owned(),
+        )),
+        PropertyKey::PrivateIdentifier(name) => Some((
+            name.span.start,
+            name.span.end,
+            format!("#{}", name.name.as_str()),
+        )),
+        PropertyKey::StringLiteral(literal) => Some((
+            literal.span.start,
+            literal.span.end,
+            literal.value.as_str().to_owned(),
+        )),
         PropertyKey::NumericLiteral(literal) => Some((
             literal.span.start,
+            literal.span.end,
             literal
                 .raw
                 .as_ref()
@@ -2021,6 +2136,323 @@ fn property_key_name(key: &PropertyKey) -> Option<(u32, String)> {
                 .unwrap_or_else(|| literal.value.to_string()),
         )),
         _ => None,
+    }
+}
+
+fn property_key_name(key: &PropertyKey) -> Option<(u32, String)> {
+    property_key_span(key).map(|(start, _end, name)| (start, name))
+}
+
+/// The `(kind_word, key_start, key_end, name, is_static)` shape a class
+/// element or interface signature contributes as a member, when it has one
+/// at all -- the single source of truth `member_entry_of_class_element`/
+/// `member_entry_of_signature` (own type/return-inference logic, unaffected
+/// by this refactor) and `push_class_member_declarations`/`push_interface_
+/// member_declarations` (own entity-materialization logic, see
+/// `member_declarations`'s doc comment) both build on, so the identity/
+/// kind-word classification the syntax worker's cold entity producer needs
+/// cannot drift from what this crate's own `MemberEntry` index builds.
+struct MemberShape {
+    name: String,
+    kind_word: &'static str,
+    key_start: u32,
+    key_end: u32,
+    is_static: bool,
+}
+
+fn class_element_member_shape(element: &ClassElement) -> Option<MemberShape> {
+    match element {
+        ClassElement::MethodDefinition(method) => {
+            let (key_start, key_end, name) = property_key_span(&method.key)?;
+            let kind_word = match method.kind {
+                MethodDefinitionKind::Constructor => "constructor",
+                MethodDefinitionKind::Method => "method",
+                MethodDefinitionKind::Get => "getter",
+                MethodDefinitionKind::Set => "setter",
+            };
+            Some(MemberShape {
+                name,
+                kind_word,
+                key_start,
+                key_end,
+                is_static: method.r#static,
+            })
+        }
+        ClassElement::PropertyDefinition(property) => {
+            if property.computed {
+                return None;
+            }
+            let (key_start, key_end, name) = property_key_span(&property.key)?;
+            Some(MemberShape {
+                name,
+                kind_word: "property",
+                key_start,
+                key_end,
+                is_static: property.r#static,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn signature_member_shape(signature: &TSSignature) -> Option<MemberShape> {
+    match signature {
+        TSSignature::TSMethodSignature(method) => {
+            let (key_start, key_end, name) = property_key_span(&method.key)?;
+            let kind_word = match method.kind {
+                oxc_ast::ast::TSMethodSignatureKind::Method => "method",
+                oxc_ast::ast::TSMethodSignatureKind::Get => "getter",
+                oxc_ast::ast::TSMethodSignatureKind::Set => "setter",
+            };
+            Some(MemberShape {
+                name,
+                kind_word,
+                key_start,
+                key_end,
+                is_static: false,
+            })
+        }
+        TSSignature::TSPropertySignature(property) => {
+            let (key_start, key_end, name) = property_key_span(&property.key)?;
+            Some(MemberShape {
+                name,
+                kind_word: "property",
+                key_start,
+                key_end,
+                is_static: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// One class/interface member DECLARATION site -- the identity/kind/span/
+/// container facts the v4 cold entity producer
+/// (`urdira_jsts_syntax_worker::SyntaxCollector`) needs to materialize a
+/// `SyntaxEntity` for every member this crate's own `ProgramIndex` would
+/// build a `MemberEntry` for. `entity_id` is byte-identical to `declaration_
+/// id(kind_word, path, key_start, name)`, the SAME recipe `MemberEntry::
+/// entity_id` uses (see `member_declarations`'s own unit test asserting the
+/// two agree over a fixture). `container_entity_id`/`container_name` are
+/// the class/interface's own `push_entity`-recipe id (`jsts:{class|
+/// interface}:{path}:{start}:{name}`) and name, matching what `push_entity`
+/// already assigns that container in `urdira-jsts-syntax-worker` -- the
+/// caller does not need to recompute either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDeclaration {
+    pub entity_id: String,
+    pub name: String,
+    pub kind_word: &'static str,
+    pub key_start: u32,
+    pub key_end: u32,
+    pub container_entity_id: String,
+    pub container_name: String,
+    pub is_static: bool,
+}
+
+/// Walks `program`'s top-level (module/`export`/`export default`)
+/// statements for every class/interface declaration `extract_decl_summary`
+/// itself would summarize (via `collect_from_statement`/`collect_from_
+/// declaration`/`collect_from_default_declaration`), and every member of it
+/// `member_entry_of_class_element`/`member_entry_of_signature` would build
+/// a `MemberEntry` for -- the EXACT same discovery surface, never a superset
+/// or subset: a class nested inside a function body is invisible to both
+/// (typeflow's own `DeclSummary` never recurses into a function body
+/// looking for a nested class), and an anonymous class (no `class.id`) is
+/// skipped by both (`summarize_class`'s own `?` on `class.id`, mirrored
+/// here) -- there is no stable container id to key its members under, and
+/// `urdira_jsts_syntax_worker::SyntaxCollector::push_entity` itself never
+/// materializes an entity for one either (`visit_class`'s own `class.id`
+/// guard). Object-shape (`const x = { ... }`) and callable-variable member
+/// tables are OUT of scope here (see `MemberEntry`'s own construction sites
+/// in `object_shape_members_of`) -- those are not class/interface members,
+/// have no comparable container entity id of their own, and `push_entity`
+/// never materializes one for their "members" either; this function's own
+/// equivalence unit test uses a fixture with no such declarations so the
+/// two enumerations agree exactly.
+pub fn member_declarations(program: &Program, path: &str) -> Vec<MemberDeclaration> {
+    let mut out = Vec::new();
+    for statement in &program.body {
+        collect_member_declarations_from_statement(statement, path, &mut out);
+    }
+    out
+}
+
+fn collect_member_declarations_from_statement(
+    statement: &Statement,
+    path: &str,
+    out: &mut Vec<MemberDeclaration>,
+) {
+    match statement {
+        Statement::ClassDeclaration(class) => push_class_member_declarations(class, path, out),
+        Statement::TSInterfaceDeclaration(declaration) => {
+            push_interface_member_declarations(declaration, path, out);
+        }
+        Statement::ExportNamedDeclaration(export) => {
+            if let Some(declaration) = &export.declaration {
+                collect_member_declarations_from_declaration(declaration, path, out);
+            }
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class) =
+                &export.declaration
+            {
+                push_class_member_declarations(class, path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_member_declarations_from_declaration(
+    declaration: &oxc_ast::ast::Declaration,
+    path: &str,
+    out: &mut Vec<MemberDeclaration>,
+) {
+    use oxc_ast::ast::Declaration;
+    match declaration {
+        Declaration::ClassDeclaration(class) => push_class_member_declarations(class, path, out),
+        Declaration::TSInterfaceDeclaration(declaration) => {
+            push_interface_member_declarations(declaration, path, out);
+        }
+        _ => {}
+    }
+}
+
+fn push_class_member_declarations(class: &Class, path: &str, out: &mut Vec<MemberDeclaration>) {
+    if class.r#type != ClassType::ClassDeclaration {
+        return;
+    }
+    let Some(ident) = class.id.as_ref() else {
+        return;
+    };
+    let container_entity_id = declaration_id("class", path, ident.span.start, ident.name.as_str());
+    let container_name = ident.name.as_str().to_owned();
+    for element in &class.body.body {
+        let Some(shape) = class_element_member_shape(element) else {
+            continue;
+        };
+        let member_entity_id = declaration_id(shape.kind_word, path, shape.key_start, &shape.name);
+        let is_constructor = shape.kind_word == "constructor";
+        out.push(MemberDeclaration {
+            entity_id: member_entity_id.clone(),
+            name: shape.name,
+            kind_word: shape.kind_word,
+            key_start: shape.key_start,
+            key_end: shape.key_end,
+            container_entity_id: container_entity_id.clone(),
+            container_name: container_name.clone(),
+            is_static: shape.is_static,
+        });
+        // Parameter properties (see `constructor_parameter_property_
+        // params`'s doc comment): only a constructor can declare one, and
+        // its container is the CONSTRUCTOR's own just-computed entity id
+        // (v3 parity -- `analyzer.ts`'s `addEntity`/`collect` parents a
+        // parameter's entity on whatever recognized-entity ancestor node
+        // directly contains it, which for a parameter is the constructor,
+        // never the class itself), so `qualified_name` needs the SAME
+        // ".constructor" segment v3's own `nameOf(ConstructorDeclaration)`
+        // synthesizes -- reusing `container_name`'s existing "{path}.
+        // {container_name}.{name}" concatenation in `push_member_entities`
+        // by appending it here rather than adding a new field.
+        if is_constructor {
+            push_constructor_parameter_property_declarations(
+                element,
+                path,
+                &member_entity_id,
+                &format!("{container_name}.constructor"),
+                out,
+            );
+        }
+    }
+}
+
+/// TS parameter properties (`constructor(public x: T, private readonly y:
+/// U)`) are, from the checker's own point of view, class members declared
+/// via the SAME `FormalParameter` node that also serves as the parameter's
+/// own declaration -- v3's `analyzer.ts` never gives one a separate
+/// "property" entity kind (`addEntity`'s `isParameterDeclaration(node)`
+/// check fires unconditionally, before its `isPropertyDeclaration` arm even
+/// runs, and TypeScript's own checker resolves BOTH a bare `defaultConfig`
+/// reference inside the constructor body AND a `this.defaultConfig` member
+/// read to that exact same `ParameterDeclaration` node). This crate mirrors
+/// that identity: a parameter property contributes a `MemberDeclaration`/
+/// `MemberEntry` with kind word "parameter" (never "property"), keyed by its
+/// BINDING IDENTIFIER's own span -- byte-identical to
+/// `urdira_jsts_syntax_worker::semantic_sites::declaration_id(DeclKind::
+/// Parameter, ...)` for the SAME node (see `visit_formal_parameter`'s own
+/// "referenced-only" parameter-entity producer there, which this crate's
+/// caller coordinates with so the same declaration is never materialized
+/// twice -- `visit_formal_parameter` skips recording a parameter-property
+/// fact into its own referenced-only bucket, deferring entirely to THIS
+/// producer, which is unconditional like every other member entity). Only
+/// an identifier-pattern parameter (never a destructured/rest one --
+/// TypeScript itself rejects an accessibility/`readonly` modifier on those)
+/// with an accessibility modifier OR `readonly` (`FormalParameter::
+/// has_modifier`, the exact predicate oxc's own ESTree serializer uses to
+/// decide whether a parameter is really a `TSParameterProperty`) qualifies;
+/// a plain `constructor(x: T)` parameter is never a member.
+fn push_constructor_parameter_property_declarations(
+    element: &ClassElement,
+    path: &str,
+    constructor_entity_id: &str,
+    constructor_qualified_name_segment: &str,
+    out: &mut Vec<MemberDeclaration>,
+) {
+    use oxc_ast::ast::BindingPattern;
+    let ClassElement::MethodDefinition(method) = element else {
+        return;
+    };
+    if method.kind != MethodDefinitionKind::Constructor {
+        return;
+    }
+    for param in &method.value.params.items {
+        if !param.has_modifier() {
+            continue;
+        }
+        let BindingPattern::BindingIdentifier(param_ident) = &param.pattern else {
+            continue;
+        };
+        let name = param_ident.name.as_str().to_owned();
+        out.push(MemberDeclaration {
+            entity_id: declaration_id("parameter", path, param_ident.span.start, &name),
+            name,
+            kind_word: "parameter",
+            key_start: param_ident.span.start,
+            key_end: param_ident.span.end,
+            container_entity_id: constructor_entity_id.to_owned(),
+            container_name: constructor_qualified_name_segment.to_owned(),
+            is_static: false,
+        });
+    }
+}
+
+fn push_interface_member_declarations(
+    declaration: &TSInterfaceDeclaration,
+    path: &str,
+    out: &mut Vec<MemberDeclaration>,
+) {
+    let container_entity_id = declaration_id(
+        "interface",
+        path,
+        declaration.id.span.start,
+        declaration.id.name.as_str(),
+    );
+    let container_name = declaration.id.name.as_str().to_owned();
+    for signature in &declaration.body.body {
+        let Some(shape) = signature_member_shape(signature) else {
+            continue;
+        };
+        out.push(MemberDeclaration {
+            entity_id: declaration_id(shape.kind_word, path, shape.key_start, &shape.name),
+            name: shape.name,
+            kind_word: shape.kind_word,
+            key_start: shape.key_start,
+            key_end: shape.key_end,
+            container_entity_id: container_entity_id.clone(),
+            container_name: container_name.clone(),
+            is_static: false,
+        });
     }
 }
 
@@ -2032,15 +2464,9 @@ fn member_entry_of_class_element(
     synthetic_interfaces: &mut Vec<InterfaceSummary>,
     enclosing_class_id: &str,
 ) -> Option<MemberEntry> {
+    let shape = class_element_member_shape(element)?;
     match element {
         ClassElement::MethodDefinition(method) => {
-            let (key_start, key_name) = property_key_name(&method.key)?;
-            let kind = match method.kind {
-                MethodDefinitionKind::Constructor => "constructor",
-                MethodDefinitionKind::Method => "method",
-                MethodDefinitionKind::Get => "getter",
-                MethodDefinitionKind::Set => "setter",
-            };
             let type_ref = raw_type_ref_of_annotation(
                 method.value.return_type.as_deref(),
                 path,
@@ -2066,19 +2492,15 @@ fn member_entry_of_class_element(
             })
             .flatten();
             Some(MemberEntry {
-                name: key_name.clone(),
-                is_static: method.r#static,
-                entity_id: declaration_id(kind, path, key_start, &key_name),
+                name: shape.name.clone(),
+                is_static: shape.is_static,
+                entity_id: declaration_id(shape.kind_word, path, shape.key_start, &shape.name),
                 type_ref,
                 pending_return,
                 is_async: method.value.r#async,
             })
         }
         ClassElement::PropertyDefinition(property) => {
-            if property.computed {
-                return None;
-            }
-            let (key_start, key_name) = property_key_name(&property.key)?;
             let type_ref = raw_type_ref_of_annotation(
                 property.type_annotation.as_deref(),
                 path,
@@ -2087,9 +2509,9 @@ fn member_entry_of_class_element(
                 synthetic_interfaces,
             );
             Some(MemberEntry {
-                name: key_name.clone(),
-                is_static: property.r#static,
-                entity_id: declaration_id("property", path, key_start, &key_name),
+                name: shape.name.clone(),
+                is_static: shape.is_static,
+                entity_id: declaration_id(shape.kind_word, path, shape.key_start, &shape.name),
                 type_ref,
                 pending_return: None,
                 is_async: false,
@@ -2106,6 +2528,62 @@ fn return_type_eligible(kind: MethodDefinitionKind) -> bool {
     )
 }
 
+/// The `MemberEntry` half of `push_constructor_parameter_property_
+/// declarations` (see that function's doc comment for the full identity
+/// rationale) -- one entry per identifier-pattern constructor parameter
+/// with an accessibility modifier or `readonly`, `entity_id` byte-identical
+/// to what that function assigns the SAME declaration. `is_static` is
+/// always `false` (TypeScript has no such thing as a static parameter
+/// property); `type_ref` comes from the parameter's own annotation, exactly
+/// like a `PropertyDefinition`'s; `pending_return`/`is_async` are always
+/// `None`/`false` (a property, never a callable). A non-constructor element
+/// contributes nothing.
+fn member_entries_of_constructor_parameter_properties(
+    element: &ClassElement,
+    path: &str,
+    scoping: &Scoping,
+    import_specifiers: &HashMap<SymbolId, (String, Option<String>)>,
+    synthetic_interfaces: &mut Vec<InterfaceSummary>,
+) -> Vec<MemberEntry> {
+    use oxc_ast::ast::BindingPattern;
+    let ClassElement::MethodDefinition(method) = element else {
+        return Vec::new();
+    };
+    if method.kind != MethodDefinitionKind::Constructor {
+        return Vec::new();
+    }
+    method
+        .value
+        .params
+        .items
+        .iter()
+        .filter_map(|param| {
+            if !param.has_modifier() {
+                return None;
+            }
+            let BindingPattern::BindingIdentifier(param_ident) = &param.pattern else {
+                return None;
+            };
+            let name = param_ident.name.as_str().to_owned();
+            let type_ref = raw_type_ref_of_annotation(
+                param.type_annotation.as_deref(),
+                path,
+                scoping,
+                import_specifiers,
+                synthetic_interfaces,
+            );
+            Some(MemberEntry {
+                name: name.clone(),
+                is_static: false,
+                entity_id: declaration_id("parameter", path, param_ident.span.start, &name),
+                type_ref,
+                pending_return: None,
+                is_async: false,
+            })
+        })
+        .collect()
+}
+
 fn member_entry_of_signature(
     signature: &TSSignature,
     path: &str,
@@ -2113,14 +2591,9 @@ fn member_entry_of_signature(
     import_specifiers: &HashMap<SymbolId, (String, Option<String>)>,
     synthetic_interfaces: &mut Vec<InterfaceSummary>,
 ) -> Option<MemberEntry> {
+    let shape = signature_member_shape(signature)?;
     match signature {
         TSSignature::TSMethodSignature(method) => {
-            let (key_start, key_name) = property_key_name(&method.key)?;
-            let kind = match method.kind {
-                oxc_ast::ast::TSMethodSignatureKind::Method => "method",
-                oxc_ast::ast::TSMethodSignatureKind::Get => "getter",
-                oxc_ast::ast::TSMethodSignatureKind::Set => "setter",
-            };
             let type_ref = raw_type_ref_of_annotation(
                 method.return_type.as_deref(),
                 path,
@@ -2129,7 +2602,7 @@ fn member_entry_of_signature(
                 synthetic_interfaces,
             );
             Some(MemberEntry {
-                name: key_name.clone(),
+                name: shape.name.clone(),
                 // Interface members have no static/instance distinction --
                 // an interface can never be `new`'d directly, so `a: IFoo`
                 // member access is always the instance shape. `false` here
@@ -2139,7 +2612,7 @@ fn member_entry_of_signature(
                 // being instance-shaped for a `TSTypeLiteral`, out of
                 // scope here).
                 is_static: false,
-                entity_id: declaration_id(kind, path, key_start, &key_name),
+                entity_id: declaration_id(shape.kind_word, path, shape.key_start, &shape.name),
                 type_ref,
                 // Interface signatures have no body -- nothing to infer.
                 pending_return: None,
@@ -2147,7 +2620,6 @@ fn member_entry_of_signature(
             })
         }
         TSSignature::TSPropertySignature(property) => {
-            let (key_start, key_name) = property_key_name(&property.key)?;
             let type_ref = raw_type_ref_of_annotation(
                 property.type_annotation.as_deref(),
                 path,
@@ -2156,9 +2628,9 @@ fn member_entry_of_signature(
                 synthetic_interfaces,
             );
             Some(MemberEntry {
-                name: key_name.clone(),
+                name: shape.name.clone(),
                 is_static: false,
-                entity_id: declaration_id("property", path, key_start, &key_name),
+                entity_id: declaration_id(shape.kind_word, path, shape.key_start, &shape.name),
                 type_ref,
                 pending_return: None,
                 is_async: false,
@@ -2678,6 +3150,20 @@ pub enum MemberLookup {
     None,
     One(String),
     Many(Vec<String>),
+    /// P2-2j: the outcome of `ProgramIndex::members_of_union` -- one or more
+    /// CANDIDATE member entity ids gathered across a union receiver's own
+    /// constituent entities (`RawTypeRef::Union`/the syntax worker's
+    /// `TypeflowValue::Union`). Distinct from `Many` (an overloaded member
+    /// declared more than once on a SINGLE container): this variant pools
+    /// the member lookups of DIFFERENT constituent containers, and -- per
+    /// this crate's own zero-wrong-target discipline -- is NEVER promoted
+    /// to `One` even when every constituent happens to resolve to the
+    /// exact same member id (a union receiver is a genuine ambiguity about
+    /// WHICH constituent type the runtime value actually is, not merely
+    /// about which overload/declaration answers `members`). `members()`
+    /// (single-entity) never constructs this variant itself -- only
+    /// `members_of_union` does.
+    UnionCandidates(Vec<String>),
 }
 
 impl ProgramIndex {
@@ -3197,6 +3683,48 @@ impl ProgramIndex {
         }
     }
 
+    /// P2-2j: the union of every constituent entity's own `members` lookup,
+    /// for a union-typed receiver (`a: A | B; a.run()`) -- `entity_ids` are
+    /// the union's own distinct constituent entity ids (already deduped by
+    /// the caller's `RawTypeRef::Union`/`TypeflowValue::Union`
+    /// construction). `MemberLookup::None` (never a guess) as soon as ANY
+    /// constituent's own `members` call itself returns `None` -- a union
+    /// receiver where even ONE branch lacks the member entirely means the
+    /// call could fail at runtime for that branch, so this is not a safe
+    /// candidate set (mirrors this crate's own "found or not" discipline
+    /// everywhere else). Otherwise every resolved id (from a constituent's
+    /// `One` or `Many` outcome) is pooled, sorted, deduped, and returned as
+    /// `UnionCandidates` -- NEVER `One`, even when the pooled, deduped set
+    /// collapses to a single id: two different container types sharing an
+    /// inherited (or coincidentally same-named) member is still a genuine
+    /// receiver ambiguity, not a confirmed target -- see `MemberLookup::
+    /// UnionCandidates`'s own doc comment.
+    pub fn members_of_union(
+        &self,
+        entity_ids: &[String],
+        name: &str,
+        is_static: bool,
+    ) -> MemberLookup {
+        let mut candidates: Vec<String> = Vec::new();
+        for entity_id in entity_ids {
+            match self.members(entity_id, name, is_static) {
+                MemberLookup::None => return MemberLookup::None,
+                MemberLookup::One(target) => candidates.push(target),
+                MemberLookup::Many(targets) => candidates.extend(targets),
+                // Defensive only -- `members()` (single-entity) never
+                // actually produces this variant; only this function does.
+                MemberLookup::UnionCandidates(targets) => candidates.extend(targets),
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        if candidates.is_empty() {
+            MemberLookup::None
+        } else {
+            MemberLookup::UnionCandidates(candidates)
+        }
+    }
+
     fn collect_members(
         &self,
         entity_id: &str,
@@ -3306,6 +3834,13 @@ fn resolve_raw_type_ref(
             .map(|resolved| ResolvedTypeRef::PromiseOf(Box::new(resolved))),
         RawTypeRef::RecordOf(inner) => resolve_raw_type_ref(inner, owning_path, import_targets)
             .map(|resolved| ResolvedTypeRef::RecordOf(Box::new(resolved))),
+        // P2-2j: resolve every constituent or none at all -- see
+        // `ResolvedTypeRef::Union`'s doc comment.
+        RawTypeRef::Union(items) => items
+            .iter()
+            .map(|item| resolve_raw_type_ref(item, owning_path, import_targets))
+            .collect::<Option<Vec<_>>>()
+            .map(ResolvedTypeRef::Union),
         // P1-C: needs `ProgramIndex::build`'s later, fourth pass instead --
         // see `resolve_raw_type_ref_deferred`'s doc comment.
         RawTypeRef::ReturnTypeOfFn(_) | RawTypeRef::IndexedAccess { .. } => None,
@@ -3326,6 +3861,8 @@ fn contains_deferred(raw: &RawTypeRef) -> bool {
         RawTypeRef::ArrayOf(inner) | RawTypeRef::PromiseOf(inner) | RawTypeRef::RecordOf(inner) => {
             contains_deferred(inner)
         }
+        // P2-2j: a union needs the later pass if ANY constituent does.
+        RawTypeRef::Union(items) => items.iter().any(contains_deferred),
         RawTypeRef::Local(_) | RawTypeRef::Imported { .. } | RawTypeRef::ThisType => false,
         RawTypeRef::Unknown => false,
     }
@@ -3421,6 +3958,23 @@ fn resolve_raw_type_ref_deferred(
             };
             lookup_member_type_ref(containers, &base_entity, key, false)
         }
+        // P2-2j: resolve every constituent (through the SAME deferred pass,
+        // so a union containing a `ReturnTypeOfFn`/`IndexedAccess`
+        // constituent still closes) or none at all -- see `ResolvedTypeRef
+        // ::Union`'s doc comment.
+        RawTypeRef::Union(items) => items
+            .iter()
+            .map(|item| {
+                resolve_raw_type_ref_deferred(
+                    item,
+                    owning_path,
+                    import_targets,
+                    containers,
+                    function_return_types,
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(ResolvedTypeRef::Union),
         RawTypeRef::Unknown => None,
     }
 }
@@ -3848,6 +4402,159 @@ mod tests {
         assert!(child.members.iter().any(|m| m.name == "name"));
     }
 
+    /// The equivalence the task brief requires: `member_declarations`'s own
+    /// AST walk and `ProgramIndex`'s `MemberEntry` construction (via
+    /// `extract_decl_summary`) must agree on the exact same set of entity
+    /// ids for a fixture that exercises every member shape this crate
+    /// indexes today (class method/`constructor`/`get`/`set`/static,
+    /// class property incl. static, interface method signature, interface
+    /// property signature, and -- since this crate's parameter-property
+    /// support landed -- a constructor parameter property) -- see
+    /// `member_declarations`'s own doc comment for why object-shape/
+    /// callable-variable "members" are deliberately excluded from this
+    /// fixture (they are out of `MemberDeclaration`'s scope, so including
+    /// one here would make this test fail for the wrong reason). The
+    /// constructor's plain (non-property) `x` parameter is included
+    /// specifically to prove it is NOT enumerated as a member either side.
+    #[test]
+    fn member_declarations_matches_member_entry_index() {
+        let source = "class Base {\n  constructor(x, public prop) {}\n  greet() {}\n  static make() {}\n  get id() { return 1; }\n  set id(v) {}\n  name = \"x\";\n  static count = 0;\n  #secret() {}\n}\ninterface Shape {\n  area(): number;\n  readonly kind: string;\n}\n";
+        let path = "member_shapes.ts";
+
+        let summary = extract_decl_summary(path, source).expect("parses");
+        let mut from_index: Vec<String> = summary
+            .classes
+            .iter()
+            .flat_map(|class| class.members.iter().map(|member| member.entity_id.clone()))
+            .chain(summary.interfaces.iter().flat_map(|interface| {
+                interface
+                    .members
+                    .iter()
+                    .map(|member| member.entity_id.clone())
+            }))
+            .collect();
+        from_index.sort();
+
+        let allocator = Allocator::default();
+        let source_type =
+            SourceType::from_path(std::path::Path::new(path)).expect("valid source type");
+        let mut parsed = Parser::new(&allocator, source, source_type).parse();
+        Utf8ToUtf16::new(source).convert_program(&mut parsed.program);
+        let declarations = member_declarations(&parsed.program, path);
+        let mut from_helper: Vec<String> = declarations
+            .iter()
+            .map(|declaration| declaration.entity_id.clone())
+            .collect();
+        from_helper.sort();
+
+        assert_eq!(from_index, from_helper);
+        // Sanity: the fixture actually exercises every shape this crate
+        // indexes -- an empty (or trivially-agreeing) intersection would
+        // make the equality above meaningless.
+        assert_eq!(from_helper.len(), 11);
+        assert!(
+            declarations
+                .iter()
+                .any(|declaration| declaration.kind_word == "constructor")
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|declaration| declaration.kind_word == "getter")
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|declaration| declaration.kind_word == "setter")
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|declaration| declaration.kind_word == "method" && declaration.is_static)
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|declaration| declaration.kind_word == "property" && declaration.is_static)
+        );
+        let base_id = declaration_id("class", path, 6, "Base");
+        assert!(
+            declarations
+                .iter()
+                .all(|declaration| declaration.container_entity_id != base_id
+                    || declaration.container_name == "Base")
+        );
+        // The parameter property (`public prop`): kind word "parameter"
+        // (never "property" -- see `push_constructor_parameter_property_
+        // declarations`'s doc comment for the v3-parity reason), parented
+        // on the CONSTRUCTOR's own entity id (not the class's), and its
+        // plain sibling `x` is never enumerated at all.
+        let constructor_id = declarations
+            .iter()
+            .find(|declaration| declaration.kind_word == "constructor")
+            .expect("constructor is enumerated")
+            .entity_id
+            .clone();
+        let prop_param = declarations
+            .iter()
+            .find(|declaration| declaration.name == "prop")
+            .expect("the parameter property is enumerated as a member");
+        assert_eq!(prop_param.kind_word, "parameter");
+        assert!(!prop_param.is_static);
+        assert_eq!(prop_param.container_entity_id, constructor_id);
+        assert_eq!(prop_param.container_name, "Base.constructor");
+        assert!(
+            !declarations
+                .iter()
+                .any(|declaration| declaration.name == "x"),
+            "a plain (non-property) constructor parameter is never a member"
+        );
+    }
+
+    /// Every accessibility spelling (`public`/`private`/`protected`) and
+    /// `readonly` alone, each with and without the parameter's own `?`
+    /// optionality marker -- all six qualify as members; a bare parameter
+    /// with no modifier at all never does.
+    #[test]
+    fn parameter_properties_enumerated_for_every_modifier_spelling() {
+        let source = "class C {\n  constructor(\n    public a: string,\n    private b?: string,\n    protected c: string,\n    readonly d?: string,\n    readonly e: string,\n    plain: string,\n  ) {}\n}\n";
+        let path = "params.ts";
+        let allocator = Allocator::default();
+        let source_type =
+            SourceType::from_path(std::path::Path::new(path)).expect("valid source type");
+        let mut parsed = Parser::new(&allocator, source, source_type).parse();
+        Utf8ToUtf16::new(source).convert_program(&mut parsed.program);
+        let declarations = member_declarations(&parsed.program, path);
+        let mut parameter_names: Vec<&str> = declarations
+            .iter()
+            .filter(|declaration| declaration.kind_word == "parameter")
+            .map(|declaration| declaration.name.as_str())
+            .collect();
+        parameter_names.sort_unstable();
+        assert_eq!(parameter_names, vec!["a", "b", "c", "d", "e"]);
+        // Exactly one non-parameter member: the constructor itself.
+        assert_eq!(
+            declarations
+                .iter()
+                .filter(|declaration| declaration.kind_word != "parameter")
+                .count(),
+            1
+        );
+
+        // `ProgramIndex`'s own `MemberEntry` construction must agree
+        // exactly (the crate's own equivalence discipline, same as
+        // `member_declarations_matches_member_entry_index` above).
+        let file_summary = extract_decl_summary(path, source).expect("parses");
+        let mut from_index: Vec<String> = file_summary.classes[0]
+            .members
+            .iter()
+            .filter(|member| member.name != "constructor")
+            .map(|member| member.name.clone())
+            .collect();
+        from_index.sort();
+        assert_eq!(from_index, vec!["a", "b", "c", "d", "e"]);
+    }
+
     #[test]
     fn erases_generic_type_arguments() {
         let source = "class Box<T> {}\nclass IntBox extends Box<number> {}\n";
@@ -3947,6 +4654,86 @@ mod tests {
             MemberLookup::None
         );
         assert!(!index.is_container("jsts:class:missing.ts:0:X"));
+    }
+
+    // P2-2j: union receiver support.
+
+    #[test]
+    fn union_type_annotation_parses_dedupes_and_collapses() {
+        let source = "class A {}\nclass B {}\nconst two: A | B = null as any;\nconst dup: A | A = null as any;\nconst nullable: A | null = null as any;\n";
+        let summary = summary(source);
+        assert_eq!(summary.classes.len(), 2);
+        let a_id = summary.classes[0].entity_id.clone();
+        let b_id = summary.classes[1].entity_id.clone();
+        assert_eq!(summary.variables.len(), 3, "{summary:?}");
+        assert_eq!(
+            summary.variables[0].type_ref,
+            RawTypeRef::Union(vec![
+                RawTypeRef::Local(a_id.clone()),
+                RawTypeRef::Local(b_id.clone())
+            ]),
+            "`A | B` should classify as a genuine two-constituent union"
+        );
+        assert_eq!(
+            summary.variables[1].type_ref,
+            RawTypeRef::Local(a_id.clone()),
+            "`A | A` must dedupe and collapse to the single constituent, never a \
+             one-element Union"
+        );
+        assert_eq!(
+            summary.variables[2].type_ref,
+            RawTypeRef::Local(a_id),
+            "`A | null` must drop the null constituent and collapse to `A`"
+        );
+    }
+
+    #[test]
+    fn union_with_unclassifiable_constituent_contaminates_to_unknown() {
+        // A tuple type is one of this crate's own unclassified shapes
+        // (falls straight to `raw_type_ref_of_ts_type`'s own `_ => Unknown`
+        // arm, no wrapper) -- the union as a whole must NOT partially guess
+        // from the classifiable `A` branch.
+        let source = "class A {}\nconst mixed: A | [number, string] = null as any;\n";
+        let summary = summary(source);
+        assert_eq!(summary.variables.len(), 1, "{summary:?}");
+        assert_eq!(summary.variables[0].type_ref, RawTypeRef::Unknown);
+    }
+
+    #[test]
+    fn members_of_union_pools_candidates_and_never_collapses_to_one() {
+        // `A` and `B` share `run` only through their common base `Base` --
+        // both branches resolve to the SAME member id, but the result must
+        // still be `UnionCandidates`, never promoted to `One`: a union
+        // receiver is a genuine ambiguity about which constituent the
+        // runtime value actually is.
+        let file_summary = summary_for(
+            "a.ts",
+            "class Base {\n  run() {}\n}\nclass A extends Base {}\nclass B extends Base {}\n",
+        );
+        let base_run_id = file_summary.classes[0].members[0].entity_id.clone();
+        let a_id = file_summary.classes[1].entity_id.clone();
+        let b_id = file_summary.classes[2].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(
+            index.members_of_union(&[a_id, b_id], "run", false),
+            MemberLookup::UnionCandidates(vec![base_run_id])
+        );
+    }
+
+    #[test]
+    fn members_of_union_is_none_when_one_constituent_lacks_the_member() {
+        let file_summary = summary_for("a.ts", "class A {\n  run() {}\n}\nclass B {}\n");
+        let a_id = file_summary.classes[0].entity_id.clone();
+        let b_id = file_summary.classes[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(
+            index.members_of_union(&[a_id, b_id], "run", false),
+            MemberLookup::None
+        );
     }
 
     fn summary_for(path: &str, source: &str) -> DeclSummary {
@@ -4052,6 +4839,46 @@ mod tests {
         assert_eq!(
             index.member_type_ref(&derived_id, "build", false),
             Some(ResolvedTypeRef::Entity(result_id))
+        );
+    }
+
+    /// The exact n8n shape that produced a wrong `core:references` target
+    /// before parameter properties were enumerated as members (2026-09-04
+    /// references-parity task): a class `implements` an interface that
+    /// ALSO declares a same-named member. Before this fix, `A`'s own
+    /// `container.members` never contained `defaultConfig` at all (the
+    /// parameter property was invisible to `member_entry_of_class_element`),
+    /// so `collect_members`'s own-body check found nothing and fell through
+    /// to the `implements` fallback, wrongly resolving to `I`'s member.
+    /// `collect_members` itself needed NO change for this fix -- it already
+    /// returns as soon as the container's own `members` list has a hit; the
+    /// bug was purely a missing enumeration.
+    #[test]
+    fn members_resolves_own_parameter_property_over_implemented_interface_same_named_member() {
+        let file_summary = summary_for(
+            "a.ts",
+            "interface I<T> {\n  defaultConfig: T;\n}\nclass A implements I<string> {\n  constructor(public defaultConfig?: string) {}\n  m() { return this.defaultConfig; }\n}\n",
+        );
+        let interface_member_id = file_summary.interfaces[0].members[0].entity_id.clone();
+        let class_id = file_summary.classes[0].entity_id.clone();
+        let own_member_id = file_summary.classes[0]
+            .members
+            .iter()
+            .find(|member| member.name == "defaultConfig")
+            .expect("the parameter property is indexed as A's own member")
+            .entity_id
+            .clone();
+        assert_ne!(
+            own_member_id, interface_member_id,
+            "fixture sanity: the class's own member and the interface's member \
+             must be genuinely different declarations"
+        );
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(
+            index.members(&class_id, "defaultConfig", false),
+            MemberLookup::One(own_member_id)
         );
     }
 

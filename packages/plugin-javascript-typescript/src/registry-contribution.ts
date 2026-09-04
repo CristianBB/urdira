@@ -72,6 +72,31 @@ const relationPayload: ClosedPayloadSchema = Object.freeze({
     path: { type: "string", description: "Normalized owner source path." },
     start: { type: "integer", minimum: 0, description: "Start offset in the owner source artifact." },
     end: { type: "integer", minimum: 0, description: "Exclusive end offset in the owner source artifact." },
+    // v4's Rust pipeline has no checker to cross-reference for context, so a
+    // `classification: "possible"` row surfaces the pending site's own reason
+    // directly (v3's checker-backed `relate()` never populated this field,
+    // and the `jsts:unresolved_call` diagnostic that used to carry it in v4
+    // was folded away on 2026-09-04: no query operation consumed it). Values
+    // are the site-pending reason codes `crates/urdira-jsts-syntax-worker`
+    // attaches to a CALL site that stayed unresolved through both the E1-E3
+    // lane and typeflow: `call_deferred_to_e3` (a non-identifier callee --
+    // member/`this`/`super`/a dynamic `import()`/any other expression --
+    // never even attempted) and `call_target_uncertain` (an identifier
+    // callee whose binding does not lead to a single, non-overloaded
+    // declaration). P2-2j added the other two reasons the plan's fuller
+    // taxonomy reserved: `overload_ambiguous` (the receiver resolved to a
+    // single entity, but the requested member is declared more than once on
+    // it -- `urdira_jsts_typeflow::MemberLookup::Many`) and `union_ambiguous`
+    // (a union-typed receiver, `a: A | B`, where every constituent declares
+    // the member -- `MemberLookup::UnionCandidates`); UNLIKE the first two
+    // reasons, a row carrying either of these two ALSO carries a real
+    // `target_id` (one row per candidate -- see `candidate_call_record`'s
+    // own doc comment in `semantic_sites.rs`), so `required` below is
+    // unaffected but a possible row is no longer guaranteed target-less.
+    // `external_module`/`generic` remain reserved for a future widening of
+    // the Rust emission channel and are not listed until something actually
+    // produces them.
+    reason: { type: "string", enum: ["call_deferred_to_e3", "call_target_uncertain", "overload_ambiguous", "union_ambiguous"], description: "Why a possible call site stayed unresolved (v4's Rust pipeline only; absent on checker-produced and confirmed rows)." },
   },
   required: ["source_id", "classification", "path", "start", "end"],
 } satisfies ClosedPayloadSchema);
@@ -86,23 +111,6 @@ const diagnosticPayload: ClosedPayloadSchema = Object.freeze({
     path: { type: "string", description: "Normalized owner source path." },
     start: { type: "integer", minimum: 0, description: "Start offset when available." },
     end: { type: "integer", minimum: 0, description: "Exclusive end offset when available." },
-    // P2-2i: v4's Rust pipeline has no compiler to cross-reference for
-    // context, so it surfaces the pending site's own reason directly on a
-    // `jsts:unresolved_call` diagnostic instead -- v3 never populated this
-    // field (its `diagnostics.push` call carries no reason at all). Values
-    // are the site-pending reason codes `crates/urdira-jsts-syntax-worker`
-    // can attach to a CALL site that stayed unresolved through both the
-    // E1-E3 lane and typeflow: `call_deferred_to_e3` (a non-identifier
-    // callee -- member/`this`/`super`/a dynamic `import()`/any other
-    // expression -- never even attempted) and `call_target_uncertain` (an
-    // identifier callee whose binding does not lead to a single,
-    // non-overloaded declaration). The plan's fuller taxonomy
-    // (`union_ambiguous`, `overload_ambiguous`, `external_module`,
-    // `generic`) is reserved for a future widening of the Rust emission
-    // channel (decision 28's own documented residual) and is not produced
-    // yet, so it is not listed here to avoid claiming a value this schema
-    // can never actually see today.
-    reason: { type: "string", enum: ["call_deferred_to_e3", "call_target_uncertain"], description: "Why the call site stayed unresolved (v4's Rust pipeline only; absent when the checker produced this diagnostic)." },
   },
   required: ["code", "message", "path"],
 } satisfies ClosedPayloadSchema);

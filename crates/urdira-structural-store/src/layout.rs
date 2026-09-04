@@ -26,6 +26,15 @@ pub const DEPS_KEYS_STRIDE: usize = 32;
 pub const DEPS_META_STRIDE: usize = 32;
 pub const DEPS_REVERSE_STRIDE: usize = 8; // (u32 dep_artifact, u32 ordinal)
 
+/// One `pending.sites` row (38 bytes used, 2 reserved).
+pub const PENDING_SITE_STRIDE: usize = 40;
+/// One `closures.pending` entry: `(owner_artifact u32, start u32, end u32,
+/// site_kind u8, 3 reserved bytes, valid_to u32)` -- unlike `CLOSURE_
+/// STRIDE` (32-byte digest key + valid_to), a pending site has no
+/// standalone key file to reference, so its identity fields are inlined
+/// here directly.
+pub const PENDING_CLOSURE_STRIDE: usize = 20;
+
 #[repr(u16)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TableId {
@@ -33,6 +42,7 @@ pub enum TableId {
     Dependencies = 2,
     Dict = 3,
     SubjectsKeys = 4,
+    PendingSites = 5,
 }
 
 /// Byte offsets within one `records.meta` row (96-byte stride; 89 bytes
@@ -88,6 +98,34 @@ pub mod deps_meta {
     pub const VALID_TO: usize = 25;
     #[allow(dead_code)]
     pub const USED: usize = 29;
+}
+
+/// Byte offsets within one `pending.sites` row (40-byte stride; 38 used,
+/// 2 reserved).
+pub mod pending_sites {
+    pub const OWNER_ARTIFACT: usize = 0;
+    pub const OWNER_VERSION: usize = 4;
+    pub const VALID_FROM: usize = 8;
+    pub const VALID_TO: usize = 12;
+    pub const START: usize = 16;
+    pub const END: usize = 20;
+    pub const START_LINE: usize = 24;
+    pub const END_LINE: usize = 28;
+    pub const SITE_KIND: usize = 32;
+    pub const REASON: usize = 33;
+    pub const SOURCE_SUBJECT: usize = 34;
+    #[allow(dead_code)]
+    pub const USED: usize = 38;
+}
+
+/// Byte offsets within one `closures.pending` entry (20-byte stride; 17
+/// used -- `SITE_KIND` is 1 byte, `RESERVED` 3 bytes -- 3 reserved).
+pub mod pending_closure {
+    pub const OWNER_ARTIFACT: usize = 0;
+    pub const START: usize = 4;
+    pub const END: usize = 8;
+    pub const SITE_KIND: usize = 12;
+    pub const VALID_TO: usize = 16;
 }
 
 #[inline]

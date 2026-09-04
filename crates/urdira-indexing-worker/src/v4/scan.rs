@@ -224,11 +224,16 @@ fn run_full(
     let materialized = super::materialize::materialize_cold_partitioned(analysis.owners)?;
     let materialize_elapsed = materialize_started.elapsed();
     clock.record_materialize(materialize_elapsed);
+    // A2 (pending.sites migration): captured before `materialized` moves
+    // into `publish_cold_partitioned` below -- the only count from this
+    // struct the debug timing report needs.
+    let pending_sites_count = materialized.pending_sites.len();
     if debug_timing {
         eprintln!(
             "[urdira-indexing-worker] v4 rss@post-materialize: {:.1} MiB",
             super::timings::peak_rss_mib()
         );
+        eprintln!("[urdira-indexing-worker] v4 materialize: pending_sites={pending_sites_count}");
     }
 
     let publish_started = std::time::Instant::now();

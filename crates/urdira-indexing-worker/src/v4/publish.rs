@@ -152,6 +152,7 @@ pub fn publish_cold(
     let MaterializedGeneration {
         mut records,
         mut dependencies,
+        pending_sites,
         dicts,
         owner_ordinals: _,
     } = materialized;
@@ -175,12 +176,13 @@ pub fn publish_cold(
     let write_started = std::time::Instant::now();
     let writer = SegmentWriter::new();
     let summary = writer
-        .write_base(
+        .write_base_with_pending(
             structural_root,
             &records,
             &dependencies,
             &dicts,
             generation_u64,
+            &pending_sites,
         )
         .map_err(|error| ScanError(format!("v4 publish: segment write failed: {error}")))?;
     let write_base_elapsed = write_started.elapsed();
@@ -321,6 +323,7 @@ pub fn publish_cold_partitioned(
     let MaterializedPartitionedGeneration {
         partitions,
         dependencies,
+        pending_sites,
         dicts,
     } = materialized;
 
@@ -332,12 +335,13 @@ pub fn publish_cold_partitioned(
     let write_started = std::time::Instant::now();
     let writer = SegmentWriter::new();
     let summary = writer
-        .write_base_partitioned(
+        .write_base_partitioned_with_pending(
             structural_root,
             &partitions,
             &dependencies,
             &dicts,
             generation_u64,
+            &pending_sites,
         )
         .map_err(|error| {
             ScanError(format!(

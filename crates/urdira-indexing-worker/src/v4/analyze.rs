@@ -26,9 +26,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use urdira_jsts_syntax_worker::{
-    AnalysisBudgets, ConfigAssetInput, HybridResolutionContext, ProposedRecord,
+    AmbientModuleIndex, AnalysisBudgets, ConfigAssetInput, HybridResolutionContext, ProposedRecord,
     ProposedRecordDependency, SourceInput, SyntaxFileResult, SyntaxWorkerState, WorkerMessage,
-    WorkspaceResolver, analyze_owner_semantics_with_context, decode_config_assets,
+    WorkspaceResolver, ambiguous_ambient_would_be_external_count,
+    analyze_owner_semantics_with_context, decode_config_assets,
+    reset_ambiguous_ambient_would_be_external_count,
 };
 use urdira_source_frontier::cas::object_relative_path;
 use urdira_source_frontier::frontier::Frontier;
@@ -61,6 +63,18 @@ pub struct OwnerFacts {
     /// (`materialize`/`publish` never touch an unaffected owner's rows at
     /// all, so there is nothing to overwrite here either).
     pub pending_sites: Vec<urdira_jsts_syntax_worker::SemanticSite>,
+    /// A2 (pending.sites migration): every no-target call/heritage site this
+    /// owner's hybrid/typeflow lane could not resolve, in the store-bound
+    /// `PendingSiteProposal` shape (`urdira-jsts-syntax-worker::
+    /// OwnerSemantics::pending_site_rows`'s own doc comment has the full
+    /// rationale) -- `materialize.rs` resolves each one's `source_id` into a
+    /// `Dictionaries::subjects` ordinal and emits a `PendingSiteRow` into
+    /// `MaterializedGeneration::pending_sites`/`MaterializedPartitionedGeneration
+    /// ::pending_sites`. `owner.records` no longer receives a no-target
+    /// possible relation row at all -- this field is the only place that
+    /// population survives from this point on. Same "empty for an
+    /// unaffected owner" caveat as `pending_sites` above.
+    pub pending_site_rows: Vec<urdira_jsts_syntax_worker::PendingSiteProposal>,
 }
 
 pub struct ColdAnalysis {
@@ -211,7 +225,8 @@ type ExportedSurfaceEntry = (String, Option<String>, Option<String>, Option<Stri
 /// answer (see its doc comment: additions alone must not count as a
 /// surface change).
 fn exported_surface(file: &SyntaxFileResult) -> BTreeSet<ExportedSurfaceEntry> {
-    file.export_bindings
+    let mut surface: BTreeSet<ExportedSurfaceEntry> = file
+        .export_bindings
         .iter()
         .map(|binding| {
             let local_entity_id = if binding.source_specifier.is_none() {
@@ -229,7 +244,29 @@ fn exported_surface(file: &SyntaxFileResult) -> BTreeSet<ExportedSurfaceEntry> {
                 binding.source_target_path.clone(),
             )
         })
-        .collect()
+        .collect();
+    // 2026-09-04 references-parity task, bucket 2: a bare `export * from
+    // "./x"` barrel (`export_star_specifiers`, tracked separately from
+    // `export_bindings` -- see that field's own doc comment) is now part of
+    // this module's resolvable surface too (`resolver::resolve_named_
+    // export_inner` chases it), so a change to ITS specifier resolution
+    // must count as a surface change here exactly like a named re-export's
+    // `source_target_path` already does just above -- otherwise an edit
+    // that re-points a star barrel would incorrectly narrow the affected
+    // closure and leave stale resolutions unrevisited (see `run_scoped`'s
+    // own `surface_changed` doc comment for the invalidation this feeds).
+    // `"*"` as the `exported_name` slot is a safe sentinel (never a real
+    // JS export name), distinguishing these entries from any ordinary
+    // `export_bindings` one without needing a wider tuple shape.
+    surface.extend(file.export_star_specifiers.iter().map(|star| {
+        (
+            "*".to_owned(),
+            None,
+            Some(star.specifier.clone()),
+            star.target_path.clone(),
+        )
+    }));
+    surface
 }
 
 pub fn run_scoped(
@@ -435,6 +472,7 @@ pub fn run_scoped(
                 dependencies: facts.dependencies,
                 direct_imports: facts.direct_imports,
                 pending_sites: Vec::new(),
+                pending_site_rows: Vec::new(),
             },
         );
     }
@@ -522,6 +560,21 @@ pub fn run_scoped(
             typeflow_index_elapsed.as_secs_f64(),
         );
     }
+    // Ambient module resolution task (2026-09-04): built ONCE per scan from
+    // this SAME `project_files` snapshot (never per-owner -- see
+    // `HybridResolutionContext::ambient_index`'s own doc comment), so a
+    // bare specifier's named/default/namespace-value import/reference can
+    // resolve through a workspace `declare module "specifier" { ... }`
+    // block BEFORE the external-entity classification fires.
+    let ambient_index_started = std::time::Instant::now();
+    let ambient_index = AmbientModuleIndex::rebuild(project_files);
+    let ambient_index_elapsed = ambient_index_started.elapsed();
+    if debug_timing {
+        eprintln!(
+            "[urdira-indexing-worker] v4 ambient index rebuild: {:.3}s",
+            ambient_index_elapsed.as_secs_f64(),
+        );
+    }
     let ctx = HybridResolutionContext {
         resolver: &resolver,
         available: &available,
@@ -538,6 +591,7 @@ pub fn run_scoped(
         // resolution to the checker's own independent one) -- always
         // `false` here.
         typeflow_oracle: false,
+        ambient_index: &ambient_index,
     };
 
     let hybrid_owners: Vec<&SourceInput> = affected_paths
@@ -550,6 +604,19 @@ pub fn run_scoped(
             })
         })
         .collect::<Result<Vec<_>, ScanError>>()?;
+    // Ambient module resolution task (2026-09-04) follow-up, owner-flagged
+    // review: reset THIS scan's own count of "would have resolved
+    // externally, but a script-level ambient declaration for the same
+    // specifier is workspace-ambiguous (or bodyless-shorthand-only), so it
+    // correctly stays pending instead" -- see `semantic_sites::
+    // AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL`'s own doc comment. Distinguishes
+    // a real (intentional, spec-required) reduction in v4's own confirmed-
+    // reference count from a mere external-to-ambient TARGET SWAP (a swap
+    // never touches this counter).
+    let debug_ambient_modules = std::env::var_os("URDIRA_V4_DEBUG_AMBIENT_MODULES").is_some();
+    if debug_ambient_modules {
+        reset_ambiguous_ambient_would_be_external_count();
+    }
     let hybrid_call_started = std::time::Instant::now();
     let hybrid_results = run_hybrid_semantics(&hybrid_owners, &ctx)?;
     if debug_timing {
@@ -558,6 +625,12 @@ pub fn run_scoped(
             hybrid_call_started.elapsed().as_secs_f64(),
             affected_path_count,
             hybrid_owners.len(),
+        );
+    }
+    if debug_ambient_modules {
+        eprintln!(
+            "[urdira-indexing-worker] v4 ambient-ambiguous-would-be-external this scan: {}",
+            ambiguous_ambient_would_be_external_count(),
         );
     }
     clock.record_resolve(resolve_started.elapsed());
@@ -589,36 +662,138 @@ pub fn run_scoped(
         // so nothing here needs to inspect or set it.
         owner.records.extend(semantics.typeflow_call_rows);
         owner.records.extend(semantics.typeflow_heritage_rows);
-        // P2-2i: v3 parity fix -- every pending call/heritage site that
-        // neither the E1-E3 lane nor typeflow resolved now publishes a
-        // `classification: "possible"` `core:call`/`core:inherits`/
-        // `core:implements` row (a call site's row is paired with a
-        // `jsts:unresolved_call` diagnostic, interleaved in this same
-        // field) instead of being silently dropped -- see
-        // `OwnerSemantics::possible_call_rows`/`::possible_heritage_rows`'s
-        // doc comments in `urdira-jsts-syntax-worker` for the exact
-        // contract this closes.
+        // A2 (pending.sites migration, 2026-09-04): every pending call/
+        // heritage site that neither the E1-E3 lane nor typeflow resolved
+        // used to publish a `classification: "possible"` `core:call`/
+        // `core:inherits`/`core:implements` RECORD with no `target_id` (the
+        // P2-2i "v3 parity fix"). That record is GONE -- `owner.records`
+        // never receives a no-target relation row any more; the same
+        // population now lives on `owner.pending_site_rows`, consumed by
+        // `materialize.rs`/`crate::v4::residual` instead of the query
+        // engine. See `OwnerSemantics::pending_site_rows`'s doc comment in
+        // `urdira-jsts-syntax-worker` for the exact contract this closes.
+        //
         // P2-2j item 3: measurement-only escape hatch, gated behind an env
         // var an operator must deliberately set -- NEVER on by default, and
-        // NOT a real feature (it silently drops possible/diagnostic rows a
-        // real workspace scan must publish, per P2-2i's own "v3 parity"
-        // fix this comment sits next to). Exists purely so this task's
-        // evidence doc can report the possible+diagnostic rows' own
-        // marginal materialize/publish cost on a real corpus by diffing a
-        // normal run against a run with this set -- see that doc's
-        // "diagnostics cost" section. `pending_sites` is still recorded
-        // either way (the residual-pass input contract this field feeds is
-        // independent of whether a possible ROW gets published).
+        // NOT a real feature (it silently drops candidate rows a real
+        // workspace scan must publish). Exists purely so this task's
+        // evidence doc can report the candidate rows' own marginal
+        // materialize/publish cost on a real corpus by diffing a normal run
+        // against a run with this set. `pending_sites`/`pending_site_rows`
+        // are still recorded either way (the residual-pass input contract
+        // these fields feed is independent of whether a candidate ROW gets
+        // published).
         if std::env::var_os("URDIRA_V4_SUPPRESS_POSSIBLE_ROWS_FOR_MEASUREMENT_ONLY").is_none() {
-            owner.records.extend(semantics.possible_call_rows);
-            owner.records.extend(semantics.possible_heritage_rows);
+            // P2-2j: per-candidate `possible` `core:call` rows (own
+            // `target_id` each) for a call site whose typeflow receiver was
+            // an overload set or a union -- see `OwnerSemantics::
+            // candidate_call_rows`'s own doc comment. The site itself still
+            // contributes a `pending_site_rows`/`pending_sites` entry
+            // regardless (see below), independent of whether any candidate
+            // ROW gets published.
+            owner.records.extend(semantics.candidate_call_rows);
         }
+        // Parameter entities, "referenced-only" variant (owner-approved,
+        // 2026-09-04): one `jsts:entity_parameter` record + one `core:
+        // contains` record per parameter that received at least one
+        // resolved reference in this owner -- see `OwnerSemantics::
+        // parameter_entity_rows`'s own doc comment in `urdira-jsts-syntax-
+        // worker` for the exact eligibility/`parent_id` rule. Unconditional
+        // (unlike `candidate_call_rows` above): there is no measurement
+        // escape hatch for these, they are load-bearing for `core:
+        // references`'s own `target_subject` on a parameter target.
+        owner.records.extend(semantics.parameter_entity_rows);
+        owner.records.extend(semantics.parameter_contains_rows);
+        // External package/symbol entities task (2026-09-04): one `jsts:
+        // external_module`/`jsts:external_symbol` entity per DISTINCT
+        // identity this owner's own imports/re-exports/namespace-member
+        // reads resolved to (already deduped WITHIN this owner by
+        // `SemanticWalker::finish`), plus one `core:contains` row per
+        // occurrence. Cross-OWNER dedup (many files importing the SAME
+        // external specifier) happens below, once every owner's records
+        // exist -- see `dedupe_external_entities_across_owners`'s own doc
+        // comment for the full mechanism and its documented edit/delete
+        // limitation.
+        owner.records.extend(semantics.external_entity_rows);
+        owner.records.extend(semantics.external_contains_rows);
         owner.pending_sites = semantics.pending_sites;
+        owner.pending_site_rows = semantics.pending_site_rows;
     }
 
     let mut owners: Vec<OwnerFacts> = owners.into_values().collect();
     owners.sort_by(|a, b| a.owner_path.cmp(&b.owner_path));
+    dedupe_external_entities_across_owners(&mut owners);
     Ok(ColdAnalysis { owners })
+}
+
+/// External package/symbol entities task (2026-09-04): `urdira-structural-
+/// store`'s `records` table has no mechanism to dedup two DIFFERENT owners
+/// proposing the SAME record identity within one materialize batch --
+/// `materialize.rs`'s `identity_key_to_ordinal`/`identity_key_digest_to_
+/// record_id` maps are last-write-wins for SUBJECT RESOLUTION, but every
+/// owner's row still gets pushed into the `records`/partition output
+/// unconditionally (confirmed by reading `materialize_generation`'s and
+/// `materialize_cold_partitioned`'s owner loops directly: neither checks
+/// for a pre-existing identity before pushing a `RecordRow`) -- two owners
+/// proposing `jsts:external_module:lodash` would otherwise both become
+/// live records with the identical identity, which nothing downstream
+/// expects (`StoreReader::by_identity_last`, `core:contains`/relation
+/// subject resolution, and every count/root derived from `records` all
+/// assume at most one live row per identity).
+///
+/// This is the "cleanest" mechanism the task brief itself named: every
+/// importing owner proposes the external module/symbol entity with the
+/// SAME identity_key and a BYTE-IDENTICAL body (`external_module_entity`/
+/// `external_symbol_entity` are pure functions of the specifier/name alone,
+/// never the importing file -- see their own doc comments), and this pass
+/// keeps exactly ONE of the (many, identical) proposals per identity,
+/// applied AFTER `owners` is sorted by `owner_path` (line above), so the
+/// keeper is always the alphabetically-FIRST importing owner in this batch
+/// -- deterministic, reproducible across runs of the same corpus. `core:
+/// contains` rows are NEVER touched here: their identity already varies per
+/// occurrence (`(path, start, end, source_id, target_id)`), so every
+/// importer keeps its own contains edge regardless of which owner "won" the
+/// entity.
+///
+/// **Edit/delete behavior (verified live, not merely reasoned about -- see
+/// `dedupe_external_entities_keeps_first_owner_deterministically`/the v4
+/// daemon e2e external-entities test)**: the "winning" owner becomes that
+/// identity's `owner_artifact` in the store. `diff_owner` (`diff.rs`)
+/// diffs each SCANNED owner's prior rows against its fresh proposals; an
+/// owner NOT in the current incremental batch is not reprocessed at all.
+/// So: (a) editing the winning owner while it keeps the same import
+/// re-proposes the identical identity+body -> `diff_owner`'s "unchanged"
+/// case, no churn; (b) editing the winning owner to DROP the import (or
+/// deleting it) while another, unscanned owner still imports the same
+/// specifier closes the entity's current row (`diff_owner`'s "not matched
+/// -> close" tail) even though the OTHER importer still needs it -- the
+/// entity temporarily disappears from the live store; (c) the NEXT
+/// incremental scan that touches ANY other importer of the same specifier
+/// re-proposes the identical identity+body, and `diff_owner`'s store-wide
+/// `by_identity_last` lookup finds it closed and REOPENS it (chained,
+/// `"reopen"` case) -- so the entity recovers on the next scan that
+/// happens to touch a surviving importer, and always recovers on the next
+/// FULL cold rescan (every owner is in the same batch again, this
+/// function's own dedup runs fresh). This is a documented, accepted
+/// limitation (owner sign-off, task brief's own explicit escape hatch),
+/// not a bug: no COLD scan and no scan that touches every remaining
+/// importer can ever lose the entity, and the gap is self-healing rather
+/// than permanent.
+fn dedupe_external_entities_across_owners(owners: &mut [OwnerFacts]) {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for owner in owners.iter_mut() {
+        owner.records.retain(|record| {
+            if record.category != "entity" {
+                return true;
+            }
+            if !(record.identity_key.starts_with("jsts:external_module:")
+                || record.identity_key.starts_with("jsts:external_symbol:"))
+            {
+                return true;
+            }
+            seen.insert(record.identity_key.clone())
+        });
+    }
 }
 
 /// Cold (`Full`) convenience wrapper over [`run_scoped`], kept so

@@ -75,9 +75,105 @@ use urdira_jsts_syntax_worker::SyntaxWorkerState;
 use urdira_source_frontier::frontier::FrontierEntry;
 use urdira_source_frontier::inclusion::{GitIgnoreRules, default_workspace_inclusion};
 use urdira_source_frontier::{BatchMeta, CasStore, Catalog, Delta as SourceDelta, Walker};
-use urdira_structural_store::row::{DependencyRow, Dictionaries, RecordRow};
-use urdira_structural_store::{SetKind, StoreReader};
+use urdira_structural_store::row::{
+    CATEGORY_ENTITY, CATEGORY_RELATION, DependencyRow, Dictionaries, PendingSiteRow, RecordRow,
+};
+use urdira_structural_store::{PendingSiteKey, SetKind, StoreReader};
 use urdira_worker_protocol::{ChangeKind, ChangedPath, IndexingEvent};
+
+/// `jsts:external_module:*`/`jsts:external_symbol:*` identity prefixes --
+/// see `analyze.rs::dedupe_external_entities_across_owners`'s own doc
+/// comment for why these two, and only these two, identity families need
+/// the cross-batch close-protection [`protected_external_entity_ids`]
+/// implements below.
+const EXTERNAL_MODULE_PREFIX: &[u8] = b"jsts:external_module:";
+const EXTERNAL_SYMBOL_PREFIX: &[u8] = b"jsts:external_symbol:";
+
+fn is_external_entity_identity(identity_key: &[u8]) -> bool {
+    identity_key.starts_with(EXTERNAL_MODULE_PREFIX)
+        || identity_key.starts_with(EXTERNAL_SYMBOL_PREFIX)
+}
+
+/// Bug found live 2026-09-05 (`n8n_incremental_create_delete_roots_match_
+/// oracle`'s `records` root regression, diagnosed via `tests_e2e.rs`'s
+/// `dump_records_set_diff`): `analyze.rs::dedupe_external_entities_across_
+/// owners` attributes a shared `jsts:external_module:*`/`jsts:external_
+/// symbol:*` entity to "the alphabetically-first importing owner IN THE
+/// BATCH" -- correct at COLD (every owner is in the batch), silently wrong
+/// on an INCREMENTAL batch, which only ever contains the handful of
+/// touched owners. When the batch's current live owner of such an entity
+/// is deleted (or edited to drop the import) and no OTHER batch owner
+/// happens to re-propose the identical identity, `diff_owner`'s own
+/// "prev not matched -> close" tail closes the entity outright even
+/// though some untouched file elsewhere in the workspace still imports
+/// it -- confirmed live: deleting `.github/actions/ci-filter/__tests__/
+/// ci-filter.test.ts` (an importer of `node:test`/`node:assert/strict`/
+/// `node:fs`/`node:path`/`node:child_process`) closed 16 external module/
+/// symbol entities that a from-scratch oracle scan of the SAME mutated
+/// tree still produced, diverging the `records` root.
+///
+/// **Why the fix is "never close it", not "migrate it to a new owner"
+/// (`diff_owner`'s own "owner migration" case)**: a migration CHAINS a
+/// fresh `record_id` (`diff::chained_record_id`, `H(record_digest,
+/// predecessor_record_id)`) -- but a from-scratch cold oracle (generation
+/// 1, no prior state) can only ever produce the kernel's plain
+/// `sha256(record_digest)` first-occurrence id for that same entity.
+/// `record_digest`/`record_id` are pure functions of `identity_key`/
+/// `body`/etc., NEVER of `owner_artifact` (`urdira-native-core::
+/// structural_record_digest_hash`, confirmed by reading it directly) --
+/// so a migration would trade "entity missing" for "entity present under
+/// a different, chained record_id", still failing root byte-equality
+/// against a from-scratch oracle. Leaving `owner_artifact` untouched (even
+/// if it now names a deleted file's stale dictionary entry) costs NOTHING
+/// for `records`/`graph` root correctness, since owner never enters either
+/// digest -- the only mechanism this task found that can byte-match an
+/// oracle scan without widening the store schema to support in-place
+/// owner reattribution of an already-written row.
+///
+/// **Precision, not a coarse "does someone import the same specifier"
+/// heuristic**: "still needed" is decided from the STORE's own already-
+/// materialized relation rows (`core:contains`, the only relation kind
+/// this task's `external_contains_rows` ever emits against these
+/// identities, but this checks ANY live relation targeting the entity, to
+/// stay correct if a future population adds another kind) targeting this
+/// exact entity's `record_id` -- never a reparse of candidate files, which
+/// could not tell "imports the module" apart from "imports this SPECIFIC
+/// symbol" for the `external_symbol` case without re-running the semantic
+/// walker. A relation row belonging to an owner ALSO in `touched_owner_
+/// ordinals` is excluded: that owner's own `diff_owner` call independently
+/// decides its fate this generation (using its FRESH facts, not this
+/// generation-`prev_generation` snapshot), so counting it here would
+/// double-count a same-batch drop as a false protector.
+fn protected_external_entity_ids(
+    store_reader: &StoreReader,
+    prev_generation: u64,
+    dicts: &Dictionaries,
+    touched_owner_ordinals: &HashSet<u32>,
+    at_risk: &HashSet<[u8; 32]>,
+) -> HashSet<[u8; 32]> {
+    let mut protected = HashSet::new();
+    if at_risk.is_empty() {
+        return protected;
+    }
+    for view in store_reader.iter_visible(prev_generation) {
+        if view.category() != CATEGORY_RELATION {
+            continue;
+        }
+        if touched_owner_ordinals.contains(&view.owner_artifact()) {
+            continue;
+        }
+        let Some(target_ordinal) = view.target_subject() else {
+            continue;
+        };
+        let Some(&target_record_id) = dicts.subjects.get(target_ordinal as usize) else {
+            continue;
+        };
+        if at_risk.contains(&target_record_id) {
+            protected.insert(target_record_id);
+        }
+    }
+    protected
+}
 
 /// Reverse `(artifact_id, artifact_version_id) -> ordinal` lookup over a
 /// `Dictionaries.artifacts` snapshot -- built once per `Changed` scan.
@@ -552,6 +648,153 @@ fn run_one(
             .or_default()
             .push(dep);
     }
+    // A2 (pending.sites migration): same per-owner grouping as `records`/
+    // `dependencies` just above.
+    let mut pending_sites_by_owner: HashMap<u32, Vec<PendingSiteRow>> = HashMap::new();
+    for pending in materialized.pending_sites {
+        pending_sites_by_owner
+            .entry(pending.owner_artifact)
+            .or_default()
+            .push(pending);
+    }
+
+    // Deleted owners' ordinals, computed once here (rather than inline in
+    // the "Deleted owners" loop below) so the external-entity close-
+    // protection pass just below can treat them as "touched" too --
+    // deletion is exactly as much a reason an owner might stop being the
+    // live owner of a shared external entity as an edit is.
+    let mut deleted_owner_ordinals: HashSet<u32> = HashSet::new();
+    for uri in &source_delta.deleted {
+        if let Some(ordinal) = old_owner_ordinal(uri, &old_entries, current_present, &ordinal_of) {
+            deleted_owner_ordinals.insert(ordinal);
+        }
+        // Not found: this owner never had any materialized rows (e.g. a
+        // non-JS/TS file, or a file deleted before it was ever indexed) --
+        // nothing to close.
+    }
+
+    // External-entity close-protection (see `protected_external_entity_
+    // ids`'s own doc comment for the full bug/fix writeup): find every
+    // `jsts:external_module:*`/`jsts:external_symbol:*` identity this
+    // generation's batch is about to drop (present in an about-to-be-
+    // touched owner's PREVIOUS rows, absent from that SAME owner's fresh
+    // proposals), then -- ONLY if that set is non-empty -- consult the
+    // store for a still-live protector elsewhere in the workspace.
+    let mut touched_owner_ordinals: HashSet<u32> = deleted_owner_ordinals.clone();
+    let mut at_risk_external_entities: HashSet<[u8; 32]> = HashSet::new();
+    for path in &affected_owner_paths {
+        let Some(old_ordinal) = old_owner_ordinal(path, &old_entries, current_present, &ordinal_of)
+        else {
+            continue; // brand-new path: nothing previously live to protect.
+        };
+        touched_owner_ordinals.insert(old_ordinal);
+        let next_identities: HashSet<&[u8]> = materialized
+            .owner_ordinals
+            .get(path)
+            .and_then(|new_ordinal| records_by_owner.get(new_ordinal))
+            .into_iter()
+            .flatten()
+            .filter(|record| {
+                record.category == CATEGORY_ENTITY
+                    && is_external_entity_identity(&record.identity_key)
+            })
+            .map(|record| record.identity_key.as_slice())
+            .collect();
+        for prev in store_reader.by_owner(old_ordinal, prev_generation) {
+            if prev.category() == CATEGORY_ENTITY
+                && is_external_entity_identity(prev.identity_key())
+                && !next_identities.contains(prev.identity_key())
+            {
+                at_risk_external_entities.insert(prev.record_id());
+            }
+        }
+    }
+    for &ordinal in &deleted_owner_ordinals {
+        for prev in store_reader.by_owner(ordinal, prev_generation) {
+            if prev.category() == CATEGORY_ENTITY
+                && is_external_entity_identity(prev.identity_key())
+            {
+                at_risk_external_entities.insert(prev.record_id());
+            }
+        }
+    }
+
+    // "Zombie owner" case (bug found live via this module's own small
+    // fixture test, `external_module_entity_survives_deleting_the_owning_
+    // importer_while_another_remains`'s FINAL step): a protected entity's
+    // `owner_artifact` keeps naming a file that was ALREADY deleted in an
+    // earlier generation (protection never reassigns it -- see
+    // `protected_external_entity_ids`'s doc comment for why). The two
+    // loops above only ever find an at-risk identity by looking at a
+    // TOUCHED owner's OWN entity rows -- but a zombie-owned entity's
+    // entity row belongs to nobody in THIS batch at all, so those loops
+    // never see it. Instead: for every touched owner, look at its own
+    // PREVIOUS relation rows (`core:contains`, the only kind these
+    // entities' occurrences ever target) whose TARGET is a zombie-owned
+    // external entity (its declared `owner_artifact` no longer names a
+    // currently-live file) -- if this touched owner was that entity's
+    // last remaining protector, the entity must close explicitly, since
+    // no owner's own diff will ever touch its row otherwise.
+    let current_live_artifact_pairs: HashSet<(String, String)> = current_present
+        .values()
+        .map(|entry| (entry.artifact_id.clone(), entry.artifact_version_id.clone()))
+        .collect();
+    let owner_ordinal_is_live = |ordinal: u32| -> bool {
+        base_dicts
+            .artifacts
+            .get(ordinal as usize)
+            .is_some_and(|pair| current_live_artifact_pairs.contains(pair))
+    };
+    let mut zombie_candidates: HashSet<[u8; 32]> = HashSet::new();
+    for &ordinal in &touched_owner_ordinals {
+        for prev in store_reader.by_owner(ordinal, prev_generation) {
+            if prev.category() != CATEGORY_RELATION {
+                continue;
+            }
+            let Some(target_ordinal) = prev.target_subject() else {
+                continue;
+            };
+            let Some(&target_record_id) = base_dicts.subjects.get(target_ordinal as usize) else {
+                continue;
+            };
+            let Some(target) = store_reader.get(&target_record_id) else {
+                continue;
+            };
+            if target.category() == CATEGORY_ENTITY
+                && is_external_entity_identity(target.identity_key())
+                && !owner_ordinal_is_live(target.owner_artifact())
+            {
+                zombie_candidates.insert(target_record_id);
+            }
+        }
+    }
+    at_risk_external_entities.extend(&zombie_candidates);
+
+    let protected_external_entities = protected_external_entity_ids(
+        store_reader,
+        prev_generation,
+        &base_dicts,
+        &touched_owner_ordinals,
+        &at_risk_external_entities,
+    );
+    // Every zombie candidate that found no protector must close NOW,
+    // explicitly: unlike a rule-(a) at-risk identity (owned by a touched
+    // owner, so simply excluding it from that owner's `prev` leaves it
+    // untouched), a zombie candidate's row belongs to an owner NOT in
+    // this batch at all -- nothing else will ever close it.
+    let zombie_closures: Vec<([u8; 32], u32)> = zombie_candidates
+        .difference(&protected_external_entities)
+        .map(|id| (*id, generation_u32))
+        .collect();
+    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() && !at_risk_external_entities.is_empty() {
+        eprintln!(
+            "[urdira-indexing-worker] v4 delta DEBUG: external-entity close-protection: at_risk={} protected={} zombie_candidates={} zombie_closures={}",
+            at_risk_external_entities.len(),
+            protected_external_entities.len(),
+            zombie_candidates.len(),
+            zombie_closures.len(),
+        );
+    }
 
     // --- Per-owner diff (plan §6.3) ---
     let write_started = std::time::Instant::now();
@@ -561,27 +804,53 @@ fn run_one(
     let mut kernel_to_final: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
     let mut opened_deps: Vec<DependencyRow> = Vec::new();
     let mut deps_closures: Vec<([u8; 32], u32)> = Vec::new();
+    // A2 (pending.sites migration): `pending_opened` is the wholesale-
+    // replace set (an owner's fresh pending sites, from `materialize_
+    // incremental`'s own resolution against this generation's live store);
+    // `pending_closures` closes every one of that owner's PREVIOUSLY
+    // visible pending sites (task brief's "wholesale replace, no diffing"
+    // rule) -- unlike `record_closures`, there is no attempt to keep an
+    // unchanged pending site open across the edit, mirroring this module's
+    // own documented dependency-diffing simplification just above (owner
+    // granularity, not edge/key granularity).
+    let mut pending_opened: Vec<PendingSiteRow> = Vec::new();
+    let mut pending_closures: Vec<(PendingSiteKey, u32)> = Vec::new();
 
-    let mut diff_one_owner =
-        |prev_ordinal: Option<u32>, next_records: Vec<RecordRow>, next_deps: Vec<DependencyRow>| {
-            let prev_records = match prev_ordinal {
-                Some(ordinal) => store_reader.by_owner(ordinal, prev_generation),
-                None => Vec::new(),
-            };
-            let owner_diff: OwnerDiff =
-                diff::diff_owner(prev_records, next_records, store_reader, generation_u32);
-            opened_records.extend(owner_diff.opened);
-            record_closures.extend(owner_diff.record_closures);
-            closed_relation_keys.extend(owner_diff.closed_relation_keys);
-            kernel_to_final.extend(owner_diff.kernel_to_final);
-
-            if let Some(ordinal) = prev_ordinal {
-                for dep in store_reader.deps_by_owner(ordinal, prev_generation) {
-                    deps_closures.push((dep.dependency_id(), generation_u32));
-                }
-            }
-            opened_deps.extend(next_deps);
+    let mut diff_one_owner = |prev_ordinal: Option<u32>,
+                              next_records: Vec<RecordRow>,
+                              next_deps: Vec<DependencyRow>,
+                              next_pending: Vec<PendingSiteRow>| {
+        let prev_records = match prev_ordinal {
+            // Excludes any protected external entity: never handed to
+            // `diff_owner`, so its "unmatched -> close" tail never sees
+            // it and the row stays open, untouched, exactly as some
+            // earlier generation wrote it (see `protected_external_
+            // entity_ids`'s own doc comment).
+            Some(ordinal) => store_reader
+                .by_owner(ordinal, prev_generation)
+                .into_iter()
+                .filter(|view| !protected_external_entities.contains(&view.record_id()))
+                .collect(),
+            None => Vec::new(),
         };
+        let owner_diff: OwnerDiff =
+            diff::diff_owner(prev_records, next_records, store_reader, generation_u32);
+        opened_records.extend(owner_diff.opened);
+        record_closures.extend(owner_diff.record_closures);
+        closed_relation_keys.extend(owner_diff.closed_relation_keys);
+        kernel_to_final.extend(owner_diff.kernel_to_final);
+
+        if let Some(ordinal) = prev_ordinal {
+            for dep in store_reader.deps_by_owner(ordinal, prev_generation) {
+                deps_closures.push((dep.dependency_id(), generation_u32));
+            }
+            for pending in store_reader.pending_sites_by_owner(ordinal, prev_generation) {
+                pending_closures.push((pending.key(), generation_u32));
+            }
+        }
+        opened_deps.extend(next_deps);
+        pending_opened.extend(next_pending);
+    };
 
     // Affected (modified/created) owners: diff each by path, resolving its
     // OLD ordinal (if any -- `None` for a brand-new file) and NEW ordinal
@@ -596,23 +865,22 @@ fn run_one(
             .expect("materialize_incremental assigns an ordinal to every owner it processes");
         let next_records = records_by_owner.remove(&new_ordinal).unwrap_or_default();
         let next_deps = deps_by_owner.remove(&new_ordinal).unwrap_or_default();
-        diff_one_owner(old_ordinal, next_records, next_deps);
+        let next_pending = pending_sites_by_owner
+            .remove(&new_ordinal)
+            .unwrap_or_default();
+        diff_one_owner(old_ordinal, next_records, next_deps, next_pending);
     }
 
     // Deleted owners: no fresh rows at all, close everything under their
-    // OLD ordinal.
-    let mut deleted_owner_ordinals: HashSet<u32> = HashSet::new();
-    for uri in &source_delta.deleted {
-        if let Some(ordinal) = old_owner_ordinal(uri, &old_entries, current_present, &ordinal_of) {
-            deleted_owner_ordinals.insert(ordinal);
-        }
-        // Not found: this owner never had any materialized rows (e.g. a
-        // non-JS/TS file, or a file deleted before it was ever indexed) --
-        // nothing to close.
-    }
+    // OLD ordinal (`deleted_owner_ordinals` computed once, above, ahead of
+    // the external-entity close-protection pass).
     for ordinal in deleted_owner_ordinals {
-        diff_one_owner(Some(ordinal), Vec::new(), Vec::new());
+        diff_one_owner(Some(ordinal), Vec::new(), Vec::new(), Vec::new());
     }
+    // Zombie-owned external entities with no remaining protector (see the
+    // "Zombie owner" case above): explicit closures, since no owner's own
+    // diff in this batch would otherwise ever touch these rows.
+    record_closures.extend(zombie_closures);
     // P3-2 item 6/8 diagnostic (kept permanently, `URDIRA_DEBUG_TIMING`-gated,
     // same convention as this crate's other debug-timing prints): bisects
     // `write_ms` into diff-loop / `write_delta` / graph-merkle thirds.
@@ -674,7 +942,7 @@ fn run_one(
     // (§7.3-§7.4 of the P3-1 evidence doc).
     let writer = urdira_structural_store::writer::SegmentWriter::new();
     let summary = writer
-        .write_delta_with_reader(
+        .write_delta_with_reader_and_pending(
             structural_root,
             store_reader,
             &opened_records,
@@ -683,6 +951,8 @@ fn run_one(
             &deps_closures,
             &dict_additions,
             generation,
+            &pending_opened,
+            &pending_closures,
         )
         .map_err(|error| ScanError(format!("v4 delta publish: write_delta failed: {error}")))?;
     if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {

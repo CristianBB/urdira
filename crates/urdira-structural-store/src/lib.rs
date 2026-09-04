@@ -41,11 +41,14 @@ pub use compact::compact;
 pub use error::{Result, StoreError};
 pub use manifest::{Manifest, ManifestFileEntry};
 pub use merkle::recompute_roots_from_scratch;
-pub use reader::{ChangeEntry, DependencyView, Direction, RecordView, StoreReader, VisibleIter};
+pub use reader::{
+    ChangeEntry, DependencyView, Direction, PendingSiteView, RecordView, StoreReader, VisibleIter,
+};
 pub use recover::recover;
 pub use row::{
     CATEGORY_DIAGNOSTIC, CATEGORY_ENTITY, CATEGORY_RELATION, DependencyRow, Dictionaries, NONE_U16,
-    NONE_U32, RecordRow,
+    NONE_U32, PENDING_SITE_KIND_CALL, PENDING_SITE_KIND_IMPLEMENTS, PENDING_SITE_KIND_INHERITS,
+    PendingSiteKey, PendingSiteRow, RecordRow,
 };
 pub use writer::{SegmentSummary, SegmentWriter};
 
