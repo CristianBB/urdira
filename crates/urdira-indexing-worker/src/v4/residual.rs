@@ -616,7 +616,7 @@ fn run_once_with_quiet_period(
                     Some(id) => store.get_visible(&id, publish_generation).map(|view| {
                         (
                             id,
-                            String::from_utf8_lossy(view.identity_key()).into_owned(),
+                            String::from_utf8_lossy(&view.identity_key()).into_owned(),
                         )
                     }),
                     None => try_synthesize_member_entity(
@@ -802,7 +802,7 @@ fn run_once_with_quiet_period(
                     Some(id) => store.get_visible(&id, publish_generation).map(|view| {
                         (
                             id,
-                            String::from_utf8_lossy(view.identity_key()).into_owned(),
+                            String::from_utf8_lossy(&view.identity_key()).into_owned(),
                         )
                     }),
                     None => try_synthesize_member_entity(
@@ -921,7 +921,7 @@ fn run_once_with_quiet_period(
                 {
                     continue;
                 }
-                let identity = String::from_utf8_lossy(candidate.identity_key()).into_owned();
+                let identity = String::from_utf8_lossy(&candidate.identity_key()).into_owned();
                 if new_identities.contains(&identity) {
                     continue;
                 }
@@ -1302,7 +1302,7 @@ fn collect(
             .subjects
             .get(source_subject as usize)
             .and_then(|record_id| store.get_visible(record_id, generation))
-            .map(|source_view| String::from_utf8_lossy(source_view.identity_key()).into_owned())
+            .map(|source_view| String::from_utf8_lossy(&source_view.identity_key()).into_owned())
         else {
             continue;
         };
@@ -2910,7 +2910,7 @@ mod tests {
         let confirmed_view = store_after
             .get_visible(&confirmed_rows[0], outcome.generation)
             .expect("confirmed row is visible at its own publish generation");
-        let identity_key = String::from_utf8(confirmed_view.identity_key().to_vec())
+        let identity_key = String::from_utf8(confirmed_view.identity_key().into_owned())
             .expect("identity_key is valid UTF-8");
         let mut parts = identity_key.split(':');
         assert_eq!(parts.next(), Some("jsts"));
@@ -2999,7 +2999,7 @@ mod tests {
         for view in store_after.iter_visible(outcome.generation) {
             if view.category() == CATEGORY_ENTITY {
                 *entity_records_by_identity
-                    .entry(view.identity_key().to_vec())
+                    .entry(view.identity_key().into_owned())
                     .or_insert(0) += 1;
             }
         }
@@ -3028,7 +3028,7 @@ mod tests {
             else {
                 continue;
             };
-            let target_identity = String::from_utf8_lossy(target_view.identity_key()).into_owned();
+            let target_identity = String::from_utf8_lossy(&target_view.identity_key()).into_owned();
             let is_member = member_kind_words
                 .iter()
                 .any(|word| target_identity.starts_with(&format!("jsts:{word}:")));
@@ -3188,7 +3188,7 @@ mod tests {
         let mut diagnostic_ts2322_found = false;
         for view in store1.iter_visible(outcome1.generation) {
             let Some(kind) = kind_of(&view) else { continue };
-            let identity = String::from_utf8_lossy(view.identity_key()).into_owned();
+            let identity = String::from_utf8_lossy(&view.identity_key()).into_owned();
             match kind {
                 "jsts:entity_inferred_type" => {
                     // Byte-for-byte identity recipe check.
@@ -3251,7 +3251,7 @@ mod tests {
         let live_type_of_after_run2: Vec<String> = store2
             .iter_visible(outcome2.generation)
             .filter(|view| kind_of_at(&dicts1, view) == Some("jsts:relation_type_of"))
-            .map(|view| String::from_utf8_lossy(view.identity_key()).into_owned())
+            .map(|view| String::from_utf8_lossy(&view.identity_key()).into_owned())
             .collect();
         for identity in &type_of_identities {
             if !live_type_of_after_run2.contains(identity) {
@@ -3340,7 +3340,7 @@ mod tests {
             StoreReader::open(&structural_root).expect("store opens after edit scan");
         let stale_still_visible = store_after_edit.iter_visible(edit_generation).any(|view| {
             kind_of_at(&dicts1, &view) == Some("jsts:relation_type_of")
-                && String::from_utf8_lossy(view.identity_key()) == add_type_of_identity
+                && String::from_utf8_lossy(&view.identity_key()) == add_type_of_identity
         });
         assert!(
             !stale_still_visible,
@@ -3362,7 +3362,7 @@ mod tests {
         let live_type_of_after_run3: Vec<String> = store3
             .iter_visible(outcome3.generation)
             .filter(|view| kind_of_at(&dicts1, view) == Some("jsts:relation_type_of"))
-            .map(|view| String::from_utf8_lossy(view.identity_key()).into_owned())
+            .map(|view| String::from_utf8_lossy(&view.identity_key()).into_owned())
             .collect();
         assert!(
             !live_type_of_after_run3.contains(&add_type_of_identity),
@@ -3538,7 +3538,7 @@ mod tests {
                         };
                         if kind == "jsts:entity_inferred_type" {
                             v4_live_identities
-                                .insert(String::from_utf8_lossy(view.identity_key()).into_owned());
+                                .insert(String::from_utf8_lossy(&view.identity_key()).into_owned());
                         }
                     }
                     let matched = v3_sample
@@ -3845,7 +3845,7 @@ mod tests {
                 .and_then(|ordinal| dicts.subjects.get(ordinal as usize))
                 .and_then(|record_id| store.get_visible(record_id, generation))
                 .map(|source_view| {
-                    String::from_utf8_lossy(source_view.identity_key()).into_owned()
+                    String::from_utf8_lossy(&source_view.identity_key()).into_owned()
                 })
             else {
                 continue;
@@ -4027,7 +4027,7 @@ mod tests {
             ) {
                 continue;
             }
-            let identity = String::from_utf8_lossy(view.identity_key()).into_owned();
+            let identity = String::from_utf8_lossy(&view.identity_key()).into_owned();
             if !is_classification_consistent(view.target_subject().is_some()) {
                 let owner_pair = dicts.artifacts.get(view.owner_artifact() as usize);
                 eprintln!(

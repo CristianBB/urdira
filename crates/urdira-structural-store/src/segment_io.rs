@@ -31,8 +31,9 @@
 //! occurs), closing the gap.
 
 use crate::error::{Result, store_err};
+use crate::identity_codec::{self, BatchIndex, IDENTITY_LAYOUT_RAW};
 use crate::layout::*;
-use crate::row::{NONE_U32, PendingSiteKey, RecordRow};
+use crate::row::{Dictionaries, NONE_U32, PendingSiteKey, RecordRow};
 use crate::xxh;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -255,6 +256,7 @@ pub fn write_hot_and_secondary_files(
     dir: &Path,
     rows: &[RecordRow],
     order: &[u32],
+    dicts: &Dictionaries,
     generation: u64,
     n_threads: usize,
     by_owner_path: &Path,
@@ -278,6 +280,21 @@ pub fn write_hot_and_secondary_files(
         nibble_start[N_NIBBLES] = n;
     }
 
+    // A3a: classify every row's identity storage layout ONCE, up front,
+    // single-threaded (the batch index below must exist before any
+    // per-nibble parallel work starts -- resolving a relation's endpoint
+    // may need ANY entity in the batch, not just ones in the same nibble
+    // partition). `layouts[k]` aligns with `order[k]`, reused directly by
+    // the per-nibble write loop below so `classify_identity_layout` never
+    // runs twice for the same row.
+    let batch_index = BatchIndex::from_rows(rows);
+    let resolve_identity = |id: &[u8; 32]| batch_index.get(id);
+    let mut layouts = vec![IDENTITY_LAYOUT_RAW; n];
+    for (k, layout) in layouts.iter_mut().enumerate() {
+        let row = &rows[order[k] as usize];
+        *layout = identity_codec::classify_identity_layout(row, dicts, &resolve_identity);
+    }
+
     let mut body_off = vec![0u64; n];
     let mut ident_off = vec![0u64; n];
     let mut cur_body = 0u64;
@@ -287,7 +304,9 @@ pub fn write_hot_and_secondary_files(
         body_off[k] = cur_body;
         cur_body += row.body.len() as u64;
         ident_off[k] = cur_ident;
-        cur_ident += row.identity_key.len() as u64;
+        if layouts[k] == IDENTITY_LAYOUT_RAW {
+            cur_ident += row.identity_key.len() as u64;
+        }
     }
     let total_body = cur_body;
     let total_ident = cur_ident;
@@ -337,6 +356,7 @@ pub fn write_hot_and_secondary_files(
             let order = &order;
             let body_off = &body_off;
             let ident_off = &ident_off;
+            let layouts = &layouts;
             let nibble_start = nibble_start;
 
             handles.push(scope.spawn(move || -> Result<Work> {
@@ -391,7 +411,14 @@ pub fn write_hot_and_secondary_files(
                         put_u64le(m, meta::BODY_OFF, body_off[k]);
                         put_u32le(m, meta::BODY_LEN, row.body.len() as u32);
                         put_u64le(m, meta::IDENT_OFF, ident_off[k]);
-                        put_u32le(m, meta::IDENT_LEN, row.identity_key.len() as u32);
+                        let layout = layouts[k];
+                        m[meta::IDENTITY_LAYOUT] = layout;
+                        let ident_len = if layout == IDENTITY_LAYOUT_RAW {
+                            row.identity_key.len() as u32
+                        } else {
+                            0
+                        };
+                        put_u32le(m, meta::IDENT_LEN, ident_len);
 
                         let d =
                             &mut digests_buf[local * DIGESTS_STRIDE..(local + 1) * DIGESTS_STRIDE];
@@ -407,7 +434,9 @@ pub fn write_hot_and_secondary_files(
                             .copy_from_slice(&row.previous_record_id);
 
                         body_buf.extend_from_slice(&row.body);
-                        ident_buf.extend_from_slice(&row.identity_key);
+                        if layout == IDENTITY_LAYOUT_RAW {
+                            ident_buf.extend_from_slice(&row.identity_key);
+                        }
                     }
 
                     keys_file.write_all_at(
@@ -711,6 +740,7 @@ fn global_k(row_base: &[usize; N_NIBBLES + 1], nib: usize, local: usize) -> u32 
 pub fn write_hot_and_secondary_files_partitioned(
     dir: &Path,
     partitions: &[Vec<RecordRow>],
+    dicts: &Dictionaries,
     generation: u64,
     by_owner_path: &Path,
     by_name_path: &Path,
@@ -725,16 +755,41 @@ pub fn write_hot_and_secondary_files_partitioned(
         "write_hot_and_secondary_files_partitioned requires exactly N_NIBBLES partitions"
     );
 
+    // A3a: the batch index (`record_id -> identity_key bytes`, spanning
+    // EVERY partition) must exist before any per-partition work starts --
+    // a relation in partition N may point at an entity in partition M != N
+    // -- so it's built here, once, and shared by reference into the
+    // `par_iter` below (never rebuilt per partition).
+    let batch_index = BatchIndex::from_partitions(partitions);
+    let resolve_identity = |id: &[u8; 32]| batch_index.get(id);
+    // `layouts[nib][local]` mirrors `partitions[nib][local]`, classified
+    // once here (single pass, still cheap relative to the I/O this
+    // function does) and reused by both this prefix-sum loop and the
+    // per-partition write loop below -- never re-classified per row.
+    let layouts: Vec<Vec<u8>> = partitions
+        .iter()
+        .map(|part| {
+            part.iter()
+                .map(|row| identity_codec::classify_identity_layout(row, dicts, &resolve_identity))
+                .collect()
+        })
+        .collect();
+
     let mut row_base = [0usize; N_NIBBLES + 1];
     let mut body_base = [0u64; N_NIBBLES + 1];
     let mut ident_base = [0u64; N_NIBBLES + 1];
     for nib in 0..N_NIBBLES {
-        let (body_len, ident_len) = partitions[nib].iter().fold((0u64, 0u64), |(b, id), row| {
-            (
-                b + row.body.len() as u64,
-                id + row.identity_key.len() as u64,
-            )
-        });
+        let (body_len, ident_len) = partitions[nib].iter().zip(layouts[nib].iter()).fold(
+            (0u64, 0u64),
+            |(b, id), (row, &layout)| {
+                let ident_add = if layout == IDENTITY_LAYOUT_RAW {
+                    row.identity_key.len() as u64
+                } else {
+                    0
+                };
+                (b + row.body.len() as u64, id + ident_add)
+            },
+        );
         row_base[nib + 1] = row_base[nib] + partitions[nib].len();
         body_base[nib + 1] = body_base[nib] + body_len;
         ident_base[nib + 1] = ident_base[nib] + ident_len;
@@ -797,6 +852,7 @@ pub fn write_hot_and_secondary_files_partitioned(
                         nib,
                         "write_hot_and_secondary_files_partitioned: partition/nibble mismatch"
                     );
+                    let layout = layouts[nib][local];
                     keys_buf[local * KEYS_STRIDE..local * KEYS_STRIDE + 32]
                         .copy_from_slice(&row.record_id);
 
@@ -831,7 +887,13 @@ pub fn write_hot_and_secondary_files_partitioned(
                     put_u64le(m, meta::BODY_OFF, body_base[nib] + local_body_off);
                     put_u32le(m, meta::BODY_LEN, row.body.len() as u32);
                     put_u64le(m, meta::IDENT_OFF, ident_base[nib] + local_ident_off);
-                    put_u32le(m, meta::IDENT_LEN, row.identity_key.len() as u32);
+                    m[meta::IDENTITY_LAYOUT] = layout;
+                    let ident_len = if layout == IDENTITY_LAYOUT_RAW {
+                        row.identity_key.len() as u32
+                    } else {
+                        0
+                    };
+                    put_u32le(m, meta::IDENT_LEN, ident_len);
 
                     let d = &mut digests_buf[local * DIGESTS_STRIDE..(local + 1) * DIGESTS_STRIDE];
                     d[digests::RECORD_DIGEST..digests::RECORD_DIGEST + 32]
@@ -846,9 +908,11 @@ pub fn write_hot_and_secondary_files_partitioned(
                         .copy_from_slice(&row.previous_record_id);
 
                     body_buf.extend_from_slice(&row.body);
-                    ident_buf.extend_from_slice(&row.identity_key);
+                    if layout == IDENTITY_LAYOUT_RAW {
+                        ident_buf.extend_from_slice(&row.identity_key);
+                        local_ident_off += row.identity_key.len() as u64;
+                    }
                     local_body_off += row.body.len() as u64;
-                    local_ident_off += row.identity_key.len() as u64;
                 }
 
                 keys_file.write_all_at(

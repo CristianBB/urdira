@@ -3150,19 +3150,21 @@ pub enum MemberLookup {
     None,
     One(String),
     Many(Vec<String>),
-    /// P2-2j: the outcome of `ProgramIndex::members_of_union` -- one or more
+    /// P2-2j: the outcome of `ProgramIndex::members_of_union` -- two or more
     /// CANDIDATE member entity ids gathered across a union receiver's own
     /// constituent entities (`RawTypeRef::Union`/the syntax worker's
     /// `TypeflowValue::Union`). Distinct from `Many` (an overloaded member
     /// declared more than once on a SINGLE container): this variant pools
-    /// the member lookups of DIFFERENT constituent containers, and -- per
-    /// this crate's own zero-wrong-target discipline -- is NEVER promoted
-    /// to `One` even when every constituent happens to resolve to the
-    /// exact same member id (a union receiver is a genuine ambiguity about
-    /// WHICH constituent type the runtime value actually is, not merely
-    /// about which overload/declaration answers `members`). `members()`
-    /// (single-entity) never constructs this variant itself -- only
-    /// `members_of_union` does.
+    /// the member lookups of DIFFERENT constituent containers. 2026-09-05
+    /// A5 references-parity task, Paso 1 fix point 5: when every
+    /// constituent's own lookup agrees on the exact SAME member id, `members_
+    /// of_union` now promotes that outcome to `One` instead (proven safe --
+    /// see that function's own doc comment for why this is not a guess);
+    /// this variant therefore only ever holds two or more DISTINCT ids --
+    /// a genuine ambiguity about which of several different declarations
+    /// answers the read, not merely about which constituent type the
+    /// runtime value actually is. `members()` (single-entity) never
+    /// constructs this variant itself -- only `members_of_union` does.
     UnionCandidates(Vec<String>),
 }
 
@@ -3693,12 +3695,27 @@ impl ProgramIndex {
     /// call could fail at runtime for that branch, so this is not a safe
     /// candidate set (mirrors this crate's own "found or not" discipline
     /// everywhere else). Otherwise every resolved id (from a constituent's
-    /// `One` or `Many` outcome) is pooled, sorted, deduped, and returned as
-    /// `UnionCandidates` -- NEVER `One`, even when the pooled, deduped set
-    /// collapses to a single id: two different container types sharing an
-    /// inherited (or coincidentally same-named) member is still a genuine
-    /// receiver ambiguity, not a confirmed target -- see `MemberLookup::
-    /// UnionCandidates`'s own doc comment.
+    /// `One` or `Many` outcome) is pooled, sorted, deduped.
+    ///
+    /// 2026-09-05 A5 references-parity task, Paso 1 fix point 5: a pooled,
+    /// deduped set of size 1 IS promoted to `MemberLookup::One` -- proven
+    /// safe by construction, not a new heuristic: a `Many` outcome from any
+    /// SINGLE constituent always contributes at least two DISTINCT ids to
+    /// the pool (`members()`'s own `Many` arm is only reached when its own
+    /// `found.len() >= 2` after dedup), and dedup only ever REMOVES
+    /// duplicate entries, never merges distinct ones -- so the pooled set
+    /// can only ever shrink to exactly 1 when EVERY constituent's own
+    /// lookup was independently `One`, AND all of those agree on the exact
+    /// same entity id. That is no longer "two different container types
+    /// coincidentally sharing a same-named member" (this crate's own
+    /// identity scheme never gives two DIFFERENT declarations the same id):
+    /// it is every branch of the union agreeing, with certainty, on the
+    /// SAME declaration (the common case found live: `A | B` both
+    /// inheriting `run` from the same `Base`) -- calling/reading that
+    /// member is provably correct regardless of which constituent is the
+    /// receiver's actual runtime type, exactly like TypeScript's own
+    /// checker would resolve it. A pooled size of 2+ stays `UnionCandidates`
+    /// unchanged -- still a genuine, unresolved ambiguity.
     pub fn members_of_union(
         &self,
         entity_ids: &[String],
@@ -3718,10 +3735,10 @@ impl ProgramIndex {
         }
         candidates.sort();
         candidates.dedup();
-        if candidates.is_empty() {
-            MemberLookup::None
-        } else {
-            MemberLookup::UnionCandidates(candidates)
+        match candidates.len() {
+            0 => MemberLookup::None,
+            1 => MemberLookup::One(candidates.into_iter().next().expect("checked len == 1")),
+            _ => MemberLookup::UnionCandidates(candidates),
         }
     }
 
@@ -4700,12 +4717,15 @@ mod tests {
     }
 
     #[test]
-    fn members_of_union_pools_candidates_and_never_collapses_to_one() {
-        // `A` and `B` share `run` only through their common base `Base` --
-        // both branches resolve to the SAME member id, but the result must
-        // still be `UnionCandidates`, never promoted to `One`: a union
-        // receiver is a genuine ambiguity about which constituent the
-        // runtime value actually is.
+    fn members_of_union_promotes_a_shared_inherited_member_to_one() {
+        // 2026-09-05 A5 references-parity task, Paso 1 fix point 5: `A` and
+        // `B` share `run` only through their common base `Base` -- both
+        // branches resolve to the exact SAME member id, so this is now
+        // promoted to `One` (proven safe -- see `members_of_union`'s own
+        // doc comment): calling/reading `run` on an `A | B` receiver is
+        // correct no matter which constituent the runtime value actually
+        // is, since both paths lead to the identical `Base::run`
+        // declaration.
         let file_summary = summary_for(
             "a.ts",
             "class Base {\n  run() {}\n}\nclass A extends Base {}\nclass B extends Base {}\n",
@@ -4718,8 +4738,37 @@ mod tests {
         let index = ProgramIndex::build(&summaries, &HashMap::new());
         assert_eq!(
             index.members_of_union(&[a_id, b_id], "run", false),
-            MemberLookup::UnionCandidates(vec![base_run_id])
+            MemberLookup::One(base_run_id)
         );
+    }
+
+    #[test]
+    fn members_of_union_stays_candidates_for_two_genuinely_different_declarations() {
+        // Negative sibling of `members_of_union_promotes_a_shared_
+        // inherited_member_to_one`: `A` and `B` are UNRELATED classes, each
+        // with its OWN separately-declared `run` -- two distinct entity
+        // ids, so the pooled/deduped set has size 2 and must stay
+        // `UnionCandidates`, never a guess at which declaration answers it.
+        let file_summary = summary_for(
+            "a.ts",
+            "class A {\n  run() {}\n}\nclass B {\n  run() {}\n}\n",
+        );
+        let a_run_id = file_summary.classes[0].members[0].entity_id.clone();
+        let b_run_id = file_summary.classes[1].members[0].entity_id.clone();
+        let a_id = file_summary.classes[0].entity_id.clone();
+        let b_id = file_summary.classes[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let MemberLookup::UnionCandidates(mut candidates) =
+            index.members_of_union(&[a_id, b_id], "run", false)
+        else {
+            panic!("expected UnionCandidates");
+        };
+        candidates.sort();
+        let mut expected = vec![a_run_id, b_run_id];
+        expected.sort();
+        assert_eq!(candidates, expected);
     }
 
     #[test]

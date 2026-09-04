@@ -43,9 +43,9 @@ impl Manifest {
         let bytes =
             std::fs::read(path).map_err(|e| store_err!("read manifest {}: {e}", path.display()))?;
         let manifest: Manifest = serde_json::from_slice(&bytes)?;
-        if manifest.format != 4 {
+        if manifest.format != 5 {
             return Err(store_err!(
-                "unsupported manifest format {} (want 4)",
+                "unsupported manifest format {} (want 5)",
                 manifest.format
             ));
         }

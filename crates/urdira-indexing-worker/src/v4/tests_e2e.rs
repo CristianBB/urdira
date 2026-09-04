@@ -441,7 +441,7 @@ fn cold_scan_materializes_member_entities_and_confirms_a_typeflow_member_call() 
         if view.category() != urdira_structural_store::row::CATEGORY_ENTITY {
             continue;
         }
-        let identity_key = String::from_utf8_lossy(view.identity_key()).into_owned();
+        let identity_key = String::from_utf8_lossy(&view.identity_key()).into_owned();
         for kind_word in ["method", "constructor", "getter", "setter", "property"] {
             if identity_key.starts_with(&format!("jsts:{kind_word}:")) {
                 member_kind_words_seen.insert(kind_word);
@@ -484,7 +484,7 @@ fn cold_scan_materializes_member_entities_and_confirms_a_typeflow_member_call() 
         let Some(target_view) = reader.get_visible(target_record_id, generation) else {
             continue;
         };
-        let target_identity = String::from_utf8_lossy(target_view.identity_key()).into_owned();
+        let target_identity = String::from_utf8_lossy(&target_view.identity_key()).into_owned();
         if ["method", "constructor", "getter", "setter", "property"]
             .iter()
             .any(|kind_word| target_identity.starts_with(&format!("jsts:{kind_word}:")))
@@ -567,11 +567,11 @@ fn cold_scan_materializes_referenced_parameter_entities_and_resolves_their_targe
         let Some(target_view) = reader.get_visible(target_record_id, generation) else {
             continue;
         };
-        if parameter_entity_ids.contains(target_view.identity_key()) {
+        if parameter_entity_ids.contains(target_view.identity_key().as_ref()) {
             found_referenced_parameter = true;
             println!(
                 "resolved core:references target: {}",
-                String::from_utf8_lossy(target_view.identity_key())
+                String::from_utf8_lossy(&target_view.identity_key())
             );
             break;
         }
@@ -2173,7 +2173,7 @@ fn incremental_ambient_declaration_flips_a_previously_external_importer() {
             let Some(target_view) = reader.get_visible(target_record_id, generation) else {
                 continue;
             };
-            let target_identity = String::from_utf8_lossy(target_view.identity_key()).into_owned();
+            let target_identity = String::from_utf8_lossy(&target_view.identity_key()).into_owned();
             if target_identity.contains("urdira-harness-ambient-pkg") {
                 return target_identity;
             }

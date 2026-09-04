@@ -14,6 +14,7 @@ mod bin_io;
 pub mod container;
 mod dict;
 pub mod error;
+mod identity_codec;
 mod layout;
 pub mod manifest;
 // P3-1 (`crates/urdira-indexing-worker/src/v4/*`): made `pub` (was crate-

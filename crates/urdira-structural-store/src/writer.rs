@@ -6,6 +6,7 @@
 use crate::container::{self, EncodedSection, SectionId};
 use crate::dict;
 use crate::error::{Result, store_err};
+use crate::identity_codec;
 use crate::layout::*;
 use crate::manifest::{Manifest, ManifestFileEntry, fsync_segment_dir};
 use crate::merkle;
@@ -103,6 +104,7 @@ impl SegmentWriter {
             &base_dir,
             rows,
             &order,
+            dicts,
             generation,
             self.n_threads,
             &base_dir.join("records.by_owner"),
@@ -141,7 +143,7 @@ impl SegmentWriter {
         let durable = t0.elapsed();
 
         let manifest = Manifest {
-            format: 4,
+            format: 5,
             generation,
             snapshot_id: None,
             base: base_name.clone(),
@@ -228,6 +230,7 @@ impl SegmentWriter {
                 write_hot_and_secondary_files_partitioned(
                     &base_dir,
                     partitions,
+                    dicts,
                     generation,
                     &base_dir.join("records.by_owner"),
                     &base_dir.join("records.by_name"),
@@ -309,7 +312,7 @@ impl SegmentWriter {
         }
 
         let manifest = Manifest {
-            format: 4,
+            format: 5,
             generation,
             snapshot_id: None,
             base: base_name.clone(),
@@ -483,6 +486,18 @@ impl SegmentWriter {
         let delta_name = format!("delta-{generation}.seg");
         let delta_path = dir.join(&delta_name);
 
+        // A3a: `opened_rows`' `kind_id`/`owner_artifact`/`name_id`/
+        // `source_subject`/`target_subject` ordinals are indices into the
+        // FULL append-only dictionary space (every generation up to and
+        // including this one), not just `dict_additions` (this
+        // generation's own new entries) -- so `classify_identity` needs
+        // the merge of both to resolve them. `current_reader.dictionaries
+        // ()` is an in-memory clone off the already-loaded snapshot (no
+        // disk read), and `Dictionaries::append` is the same append-only
+        // merge the reader itself performs across segments.
+        let mut full_dicts = current_reader.dictionaries();
+        full_dicts.append(dict_additions);
+
         // Builds every logical section's blob (header + data, byte-
         // identical to what the pre-P3-6 standalone file would have held)
         // entirely in memory -- see `build_delta_sections`'s own doc for
@@ -498,6 +513,8 @@ impl SegmentWriter {
             generation,
             pending_opened,
             pending_closures,
+            &full_dicts,
+            current_reader,
         )?;
         let t_segment_files = t0.elapsed();
         // Kept as a separate checkpoint (was "closures" pre-P3-6, now
@@ -655,7 +672,7 @@ impl SegmentWriter {
         );
 
         let manifest = Manifest {
-            format: 4,
+            format: 5,
             generation,
             snapshot_id: None,
             base: current.base.clone(),
@@ -907,8 +924,29 @@ fn build_delta_sections(
     generation: u64,
     pending_opened: &[PendingSiteRow],
     pending_closures: &[(PendingSiteKey, u32)],
+    full_dicts: &Dictionaries,
+    current_reader: &StoreReader,
 ) -> Result<Vec<EncodedSection>> {
     let mut sections: Vec<EncodedSection> = Vec::with_capacity(18);
+
+    // A3a: resolves a relation endpoint's `record_id` to its OWN identity
+    // key bytes, first against this delta's own batch (`opened_rows` --
+    // most relations point at an entity opened in the SAME delta), falling
+    // back to the live store (`StoreReader::get`, which does NOT filter by
+    // visibility/`valid_to` -- an endpoint minted in an earlier, still-open
+    // generation must resolve here too) for an endpoint outside this
+    // delta's own batch. Built once, up front (delta row counts are tiny,
+    // so this whole function stays single-threaded -- see its own doc
+    // comment).
+    let batch_index = identity_codec::BatchIndex::from_rows(opened_rows);
+    let resolve_identity = |id: &[u8; 32]| -> Option<Vec<u8>> {
+        if let Some(key) = batch_index.get(id) {
+            return Some(key);
+        }
+        current_reader
+            .get(id)
+            .map(|v| v.identity_key().into_owned())
+    };
 
     // -- records.keys/meta/digests/body/ident --
     let order = compute_order(opened_rows);
@@ -921,6 +959,9 @@ fn build_delta_sections(
     for (k, &i) in order.iter().enumerate() {
         let row = &opened_rows[i as usize];
         keys_body.extend_from_slice(&row.record_id);
+
+        let (layout, ident_bytes) =
+            identity_codec::classify_identity(row, full_dicts, &resolve_identity);
 
         let body_off = body_body.len() as u64;
         let ident_off = ident_body.len() as u64;
@@ -955,7 +996,8 @@ fn build_delta_sections(
         put_u64le(m, meta::BODY_OFF, body_off);
         put_u32le(m, meta::BODY_LEN, row.body.len() as u32);
         put_u64le(m, meta::IDENT_OFF, ident_off);
-        put_u32le(m, meta::IDENT_LEN, row.identity_key.len() as u32);
+        m[meta::IDENTITY_LAYOUT] = layout;
+        put_u32le(m, meta::IDENT_LEN, ident_bytes.len() as u32);
 
         let d = &mut digests_body[k * DIGESTS_STRIDE..(k + 1) * DIGESTS_STRIDE];
         d[digests::RECORD_DIGEST..digests::RECORD_DIGEST + 32].copy_from_slice(&row.record_digest);
@@ -967,7 +1009,7 @@ fn build_delta_sections(
             .copy_from_slice(&row.previous_record_id);
 
         body_body.extend_from_slice(&row.body);
-        ident_body.extend_from_slice(&row.identity_key);
+        ident_body.extend_from_slice(&ident_bytes);
     }
     sections.push((
         SectionId::RecordsKeys,

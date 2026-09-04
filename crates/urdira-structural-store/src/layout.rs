@@ -11,7 +11,12 @@ use crate::error::{Result, store_err};
 
 pub const HEADER_LEN: usize = 64;
 pub const HEADER_MAGIC: &[u8; 4] = b"URD4";
-pub const HEADER_FORMAT: u16 = 4;
+/// A3a (2026-09-05): bumped 4->5 for the `records.meta` `IDENTITY_LAYOUT`
+/// byte (`meta::IDENTITY_LAYOUT`, offset 89) -- no migration, a store
+/// written at format 4 fails to open with a clear error (`FileHeader::
+/// decode` below); the daemon reindexes from scratch. See `identity_codec`'s
+/// module doc for the mechanism this format bump enables.
+pub const HEADER_FORMAT: u16 = 5;
 
 pub const KEYS_STRIDE: usize = 32;
 pub const DIGESTS_STRIDE: usize = 160; // record_digest, body_digest, identity_id, identity_key_digest, previous_record_id
@@ -73,8 +78,41 @@ pub mod meta {
     pub const BODY_LEN: usize = 73;
     pub const IDENT_OFF: usize = 77;
     pub const IDENT_LEN: usize = 85;
+    /// A3a: one byte, `IDENTITY_LAYOUT_{RAW,ENTITY,RELATION}` below --
+    /// whether `records.ident`'s `IDENT_OFF..IDENT_OFF+IDENT_LEN` bytes are
+    /// this row's real identity key (`RAW`, `IDENT_LEN` > 0, the pre-A3a
+    /// behavior and the default for a zero-initialized row) or the
+    /// candidate string reconstructed from this row's OWN typed fields was
+    /// found to be byte-for-byte identical to the producer's original
+    /// identity key, so the store elides storing it at all (`ENTITY`/
+    /// `RELATION`, `IDENT_LEN` == 0). See `crate::identity_codec`.
+    pub const IDENTITY_LAYOUT: usize = 89;
     #[allow(dead_code)] // documents the byte budget vs the 96B stride
-    pub const USED: usize = 89;
+    pub const USED: usize = 90;
+
+    /// This row's `identity_key()` bytes are stored verbatim in
+    /// `records.ident` at `IDENT_OFF..IDENT_OFF+IDENT_LEN` -- either
+    /// because the producer's string could not be reconstructed from this
+    /// row's typed fields (external/type-of/diagnostic/v3-converted/test
+    /// identities, or a relation whose endpoint isn't resolvable), or
+    /// because a store written before A3a never classified anything (a
+    /// zero-initialized `records.meta` byte reads as this value, matching
+    /// the pre-A3a "always store the real bytes" behavior exactly).
+    pub const IDENTITY_LAYOUT_RAW: u8 = 0;
+    /// This row is a `CATEGORY_ENTITY` row whose identity key is exactly
+    /// `jsts:{kind}:{path}:{start}:{name}` reconstructed from `kind_id`/
+    /// `owner_artifact`/`span_start_byte`/`name_id` -- `IDENT_LEN` is 0,
+    /// nothing is stored in `records.ident` for this row.
+    pub const IDENTITY_LAYOUT_ENTITY: u8 = 1;
+    /// This row is a `CATEGORY_RELATION` row whose identity key is exactly
+    /// `jsts:{rel}:{path}:{start}:{end}:{source_identity_key}:
+    /// {target_identity_key}` reconstructed from `kind_id`/`owner_artifact`/
+    /// `span_start_byte`/`span_end_byte`/`source_subject`/`target_subject`
+    /// (the two endpoints' own identity keys, resolved one level deep via
+    /// `dicts.subjects` -> `record_id` -> that record's own `identity_key
+    /// ()`) -- `IDENT_LEN` is 0, nothing is stored in `records.ident` for
+    /// this row.
+    pub const IDENTITY_LAYOUT_RELATION: u8 = 2;
 }
 
 pub mod digests {

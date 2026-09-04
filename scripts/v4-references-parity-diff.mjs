@@ -374,6 +374,17 @@ const forwardBuckets = {
 };
 const forwardCounts = { v4_same_target: 0, v4_different_target: 0, v4_missing: 0 };
 const missingReasonHistogram = new Map();
+// 2026-09-05 A5 references-parity task, Paso 0: `reason` can now carry a
+// `/`-delimited diagnostic sub-reason suffix (`semantic_sites.rs`'s
+// `import_binding_sub_reason`/`member_access_sub_reason`, in-memory-only --
+// see either function's own doc comment) -- this histogram groups by the
+// PREFIX alone (`reason.split("/")[0]`, i.e. the coarse reason token every
+// prior evidence doc's histogram already reports), so a reason with no
+// sub-reason at all (every OTHER pending reason in this file, and every
+// sub-reason-less `import_binding`/`re_export_binding`/`member_access`
+// degrade point outside the three instrumented functions) collapses to
+// itself unchanged and this histogram stays comparable across runs.
+const missingReasonPrefixHistogram = new Map();
 const missingTargetKindHistogram = new Map();
 
 for (const [key, v3site] of v3ByKey) {
@@ -393,6 +404,8 @@ for (const [key, v3site] of v3ByKey) {
     const targetKind = targetKindBucket(v3site.target_id);
     detail = { reason, v3_target_kind: targetKind };
     missingReasonHistogram.set(reason, (missingReasonHistogram.get(reason) ?? 0) + 1);
+    const reasonPrefix = reason.split("/")[0];
+    missingReasonPrefixHistogram.set(reasonPrefix, (missingReasonPrefixHistogram.get(reasonPrefix) ?? 0) + 1);
     missingTargetKindHistogram.set(targetKind, (missingTargetKindHistogram.get(targetKind) ?? 0) + 1);
   }
   forwardCounts[bucket]++;
@@ -434,6 +447,11 @@ const targetClassHistogram = new Map(); // targetClass -> count
 const reasonByTargetClassHistogram = new Map(); // "reason|targetClass" -> count
 const workspaceReasonByRawKindHistogram = new Map(); // "reason|rawKind" -> count (workspace-only)
 const reasonWorkspaceSamples = new Map(); // reason -> {seen, items:[]}
+// Paso 0: the workspace-only sibling of `missingReasonPrefixHistogram` --
+// this is the table the task brief actually asks for ("sub-reason x filas
+// v4_missing con destino workspace"), since every non-workspace target is
+// out of this task's recoverable scope by construction (§9.8.1).
+const workspaceReasonPrefixHistogram = new Map();
 if (CLASSIFY_TARGETS_ENABLED) {
   if (!args["corpus-root"]) {
     console.error(
@@ -452,6 +470,8 @@ if (CLASSIFY_TARGETS_ENABLED) {
       const rawKind = rawTargetKind(v3site.target_id);
       const kindKey = `${reason}|${rawKind}`;
       workspaceReasonByRawKindHistogram.set(kindKey, (workspaceReasonByRawKindHistogram.get(kindKey) ?? 0) + 1);
+      const reasonPrefix = reason.split("/")[0];
+      workspaceReasonPrefixHistogram.set(reasonPrefix, (workspaceReasonPrefixHistogram.get(reasonPrefix) ?? 0) + 1);
       let reservoirState = reasonWorkspaceSamples.get(reason);
       if (!reservoirState) {
         reservoirState = { seen: 0, items: [] };
@@ -489,8 +509,13 @@ for (const [bucket, count] of Object.entries(forwardCounts)) {
   console.log(`  ${bucket.padEnd(24)} ${String(count).padStart(8)}  (${pct}%)`);
 }
 console.log("");
-console.log("-- v4_missing reason histogram --");
+console.log("-- v4_missing reason histogram (full reason, sub-reason suffix included) --");
 for (const [reason, count] of [...missingReasonHistogram.entries()].sort((a, b) => b[1] - a[1])) {
+  console.log(`  ${reason.padEnd(40)} ${String(count).padStart(8)}`);
+}
+console.log("");
+console.log("-- v4_missing reason histogram (prefix only, matches prior evidence docs) --");
+for (const [reason, count] of [...missingReasonPrefixHistogram.entries()].sort((a, b) => b[1] - a[1])) {
   console.log(`  ${reason.padEnd(32)} ${String(count).padStart(8)}`);
 }
 console.log("");
@@ -511,6 +536,11 @@ if (CLASSIFY_TARGETS_ENABLED) {
   for (const [cls, count] of [...targetClassHistogram.entries()].sort((a, b) => b[1] - a[1])) {
     const pct = ((count / missingTotal) * 100).toFixed(2);
     console.log(`  ${cls.padEnd(16)} ${String(count).padStart(8)}  (${pct}% of v4_missing)`);
+  }
+  console.log("");
+  console.log("-- v4_missing workspace-only reason histogram (prefix only) --");
+  for (const [reason, count] of [...workspaceReasonPrefixHistogram.entries()].sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${reason.padEnd(32)} ${String(count).padStart(8)}`);
   }
   console.log("");
   console.log("-- v4_missing reason x target-class cross-tab --");
@@ -563,11 +593,13 @@ if (args.out) {
     v3Total,
     forwardCounts,
     missingReasonHistogram: Object.fromEntries(missingReasonHistogram),
+    missingReasonPrefixHistogram: Object.fromEntries(missingReasonPrefixHistogram),
     missingTargetKindHistogram: Object.fromEntries(missingTargetKindHistogram),
     reasonByKindHistogram: Object.fromEntries(reasonByKindHistogram),
     ...(CLASSIFY_TARGETS_ENABLED
       ? {
           targetClassHistogram: Object.fromEntries(targetClassHistogram),
+          workspaceReasonPrefixHistogram: Object.fromEntries(workspaceReasonPrefixHistogram),
           reasonByTargetClassHistogram: Object.fromEntries(reasonByTargetClassHistogram),
           workspaceReasonByRawKindHistogram: Object.fromEntries(workspaceReasonByRawKindHistogram),
           reasonWorkspaceSamples: Object.fromEntries(

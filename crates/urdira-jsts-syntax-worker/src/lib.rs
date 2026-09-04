@@ -1494,26 +1494,102 @@ impl SyntaxWorkerState {
             });
         }
         let available = paths.clone();
-        let next_files_clone_started = std::time::Instant::now();
-        let mut next_files = if path_membership_incremental {
-            let mut files = prior
-                .as_ref()
-                .map_or_else(BTreeMap::new, |state| state.files.clone());
-            for path in &removed {
-                files.remove(path);
+        // A1 (grupo A campaign): `next_files`'s starting point used to be an
+        // UNCONDITIONAL `prior...files.clone()` right here -- a full
+        // O(corpus) clone of the entire `BTreeMap<String, SyntaxFileResult>`
+        // on every incremental scan (14k entries/70-140ms at n8n scale),
+        // even though `next_files` never needs to coexist with `prior`'s own
+        // copy once this point is reached: every OTHER read of `prior` in
+        // this function happens either strictly BEFORE this point (the
+        // root_names/configuration_digest/source_metadata/pending_analysis
+        // comparisons above, all done) or is one of exactly two later reads,
+        // both snapshotted into cheap, O(changes) (never O(corpus)) owned
+        // values right here, before `prior`'s borrow of `self.projects` is
+        // dropped and the entry is MOVED out instead of cloned:
+        //   (a) the ambient-module diff loop below (`ambient_touched_
+        //       specifiers`) only ever reads `prior...files.get(path).
+        //       ambient_modules` for `path` in `changed ∪ removed` --
+        //       `prior_ambient_specifiers` snapshots exactly that (just the
+        //       specifier strings actually used), and nothing else, for
+        //       exactly those paths.
+        //   (b) `reverse_affected_closure`'s defensive fallback (used only
+        //       when this project has no maintained `ImportReverseIndex`
+        //       yet) reads `prior...&state.files` in full. `ProjectState`
+        //       entries and `ImportReverseIndex` entries are only ever
+        //       created together (the index-build block a few lines below,
+        //       which unconditionally does `.entry(project_key).or_
+        //       default()` for THIS call before either of that fallback's
+        //       two call sites is reached) and only ever removed together
+        //       (`reset`) -- so by the time either call site's `match self.
+        //       import_reverse_indexes.get(&project_key)` runs, the index
+        //       already exists, always, making the `None` arm provably
+        //       dead code (not just "shouldn't fire in practice", as the
+        //       comment near those call sites already said) -- `None` is
+        //       passed there directly below rather than trying to source a
+        //       value from `prior` that's no longer reachable at that
+        //       point.
+        //
+        // `self.projects.remove` below then takes ownership of the whole
+        // `ProjectState` (not just `files`) so a `Cancelled`/parse-`Err`/
+        // output-budget early return anywhere between here and this
+        // function's own final `self.projects.insert(...)` (there are
+        // several: before parsing starts, mid-parse-loop, mid-reresolve-
+        // loop, and the `max_output_bytes` check) can restore it via
+        // `restore_prior_on_bail` instead of silently losing this project's
+        // persisted state. That restore pairs whatever `next_files` holds
+        // at the bail point with the ORIGINAL (never this call's freshly
+        // computed) `root_names`/`configuration_digest`/`source_metadata`/
+        // `analysis_token`/`pending_analysis` -- see `restore_prior_on_bail`
+        // for why that pairing, not a byte-identical restore, is what makes
+        // every bail point safe without paying for a second clone.
+        let next_files_move_started = std::time::Instant::now();
+        let prior_ambient_specifiers: HashMap<&str, Vec<String>> = changed
+            .iter()
+            .chain(removed.iter())
+            .filter_map(|path| {
+                prior
+                    .as_ref()
+                    .and_then(|state| state.files.get(path))
+                    .map(|file| {
+                        let specifiers = file
+                            .ambient_modules
+                            .iter()
+                            .map(|decl| decl.specifier.clone())
+                            .collect::<Vec<_>>();
+                        (path.as_str(), specifiers)
+                    })
+            })
+            .collect();
+        let owned_prior = self.projects.remove(&project_key);
+        let (mut next_files, prior_rest) = match owned_prior {
+            Some(mut state) => {
+                let files = std::mem::take(&mut state.files);
+                let files = if path_membership_incremental {
+                    let mut files = files;
+                    for path in &removed {
+                        files.remove(path);
+                    }
+                    files
+                } else if reset_reason.is_some() {
+                    // Full reset: `state`'s old `files` are intentionally
+                    // discarded (`files` local above just drops here), not
+                    // reused -- but `state` itself (now holding an empty
+                    // `files` placeholder) is still kept as `prior_rest` so
+                    // a bail during the reset's from-scratch reparse can
+                    // still restore something sane (see
+                    // `restore_prior_on_bail`).
+                    BTreeMap::new()
+                } else {
+                    files
+                };
+                (files, Some(state))
             }
-            files
-        } else if reset_reason.is_some() {
-            BTreeMap::new()
-        } else {
-            prior
-                .as_ref()
-                .map_or_else(BTreeMap::new, |state| state.files.clone())
+            None => (BTreeMap::new(), None),
         };
         if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
             eprintln!(
-                "[urdira-jsts-syntax-worker] v4 DEBUG: next_files clone: {:.3}s ({} entries)",
-                next_files_clone_started.elapsed().as_secs_f64(),
+                "[urdira-jsts-syntax-worker] v4 DEBUG: next_files move: {:.3}s ({} entries)",
+                next_files_move_started.elapsed().as_secs_f64(),
                 next_files.len(),
             );
         }
@@ -1522,6 +1598,7 @@ impl SyntaxWorkerState {
             .filter(|source| changed.contains(&source.path))
             .collect::<Vec<_>>();
         if cancelled.load(Ordering::Acquire) {
+            self.restore_prior_on_bail(&project_key, prior_rest, next_files);
             return Ok(WorkerMessage::Cancelled {
                 request_id,
                 cancellation_id,
@@ -1582,12 +1659,16 @@ impl SyntaxWorkerState {
                     if cancelled.load(Ordering::Acquire)
                         && error.message == "analysis cancelled" =>
                 {
+                    self.restore_prior_on_bail(&project_key, prior_rest, next_files);
                     return Ok(WorkerMessage::Cancelled {
                         request_id,
                         cancellation_id,
                     });
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.restore_prior_on_bail(&project_key, prior_rest, next_files);
+                    return Err(error);
+                }
             }
         }
         // P3-6 item 2: maintain this project's reverse candidate-path
@@ -1691,6 +1772,7 @@ impl SyntaxWorkerState {
             };
             for path in stale_paths {
                 if cancelled.load(Ordering::Acquire) {
+                    self.restore_prior_on_bail(&project_key, prior_rest, next_files);
                     return Ok(WorkerMessage::Cancelled {
                         request_id,
                         cancellation_id,
@@ -1758,12 +1840,8 @@ impl SyntaxWorkerState {
         }
         let mut ambient_touched_specifiers: BTreeSet<String> = BTreeSet::new();
         for path in changed.iter().chain(removed.iter()) {
-            if let Some(file) = prior.as_ref().and_then(|state| state.files.get(path)) {
-                ambient_touched_specifiers.extend(
-                    file.ambient_modules
-                        .iter()
-                        .map(|decl| decl.specifier.clone()),
-                );
+            if let Some(specifiers) = prior_ambient_specifiers.get(path.as_str()) {
+                ambient_touched_specifiers.extend(specifiers.iter().cloned());
             }
             if let Some(file) = next_files.get(path.as_str()) {
                 ambient_touched_specifiers.extend(
@@ -1820,28 +1898,24 @@ impl SyntaxWorkerState {
         // task's own new randomized test still passing). Falls back to the
         // old from-scratch rebuild only if this project has no index yet
         // (defensive; every path that returns from this function updates
-        // the index, so this should never fire in practice).
+        // the index, so this should never fire in practice -- A1: provably
+        // so, not just empirically, per the note next to `next_files`'s own
+        // construction above; `None` is passed for `prior` in that dead
+        // arm because `prior`'s own borrow is gone by this point, moved out
+        // for `next_files` instead of cloned).
         let affected = if path_membership_incremental {
             let closure_changed: BTreeSet<String> =
                 added.iter().chain(reresolved.iter()).cloned().collect();
             match self.import_reverse_indexes.get(&project_key) {
                 Some(index) => index.affected_closure(&closure_changed),
-                None => reverse_affected_closure(
-                    prior.as_ref().map(|state| &state.files),
-                    &next_files,
-                    &closure_changed,
-                ),
+                None => reverse_affected_closure(None, &next_files, &closure_changed),
             }
         } else if reset_reason.is_some() {
             paths
         } else {
             match self.import_reverse_indexes.get(&project_key) {
                 Some(index) => index.affected_closure(&changed),
-                None => reverse_affected_closure(
-                    prior.as_ref().map(|state| &state.files),
-                    &next_files,
-                    &changed,
-                ),
+                None => reverse_affected_closure(None, &next_files, &changed),
             }
         };
         // Ambient module resolution task (2026-09-04): fold in every
@@ -1884,13 +1958,18 @@ impl SyntaxWorkerState {
             affected_files: affected_files.clone(),
             metrics,
         };
-        let output_length = serde_json::to_vec(&response)
-            .map_err(|_| AnalysisError {
-                code: ErrorCode::AnalysisFailed,
-                message: "analysis response serialization failed".into(),
-            })?
-            .len();
+        let output_length = match serde_json::to_vec(&response) {
+            Ok(bytes) => bytes.len(),
+            Err(_) => {
+                self.restore_prior_on_bail(&project_key, prior_rest, next_files);
+                return Err(AnalysisError {
+                    code: ErrorCode::AnalysisFailed,
+                    message: "analysis response serialization failed".into(),
+                });
+            }
+        };
         if output_length > budgets.max_output_bytes as usize || output_length > MAX_MESSAGE_BYTES {
+            self.restore_prior_on_bail(&project_key, prior_rest, next_files);
             return resource_error("analysis response exceeds max_output_bytes");
         }
         self.projects.insert(
@@ -1914,6 +1993,54 @@ impl SyntaxWorkerState {
             },
         );
         Ok(response)
+    }
+
+    /// A1 (grupo A campaign): puts a project's state back once `analyze`
+    /// has moved (not cloned) `prior`'s `files` out of `self.projects` --
+    /// via `self.projects.remove` -- for `next_files`'s own starting point,
+    /// on every one of `analyze`'s early-return paths between that point
+    /// and its own final, successful `self.projects.insert(...)`
+    /// (`Cancelled` before parsing starts, a cancelled or genuinely failed
+    /// parse mid-loop, a cancellation mid-reresolve, a response
+    /// serialization failure, or the `max_output_bytes` budget check).
+    /// Called at most once per `analyze` invocation (every call site is a
+    /// `return`), so `prior_rest`/`next_files` are always still owned,
+    /// unmoved, at whichever single site actually calls this.
+    ///
+    /// Deliberately does NOT try to restore the byte-identical original
+    /// `ProjectState` -- `next_files` may already hold partial progress
+    /// (some `removed` paths already dropped, some `changed`/`added`
+    /// sources already reparsed and merged in, or some paths already
+    /// reresolved) by the time a bail happens, and reconstructing the
+    /// exact pre-call snapshot would need the very clone this change
+    /// exists to avoid. Instead, whatever `next_files` currently holds is
+    /// paired with `prior_rest`'s fields taken from the ORIGINAL, pre-call
+    /// `ProjectState` -- never this call's freshly computed
+    /// `root_names`/`configuration_digest`/`source_metadata` locals (those
+    /// describe the analysis this call never got to finish). That pairing
+    /// is always safe, even when it doesn't exactly match the pre-call
+    /// state: `analyze`'s own `reset_reason`/`authoritative_changed_paths`
+    /// comparisons on the NEXT call key off `state.files.keys()` (for
+    /// `prior_paths`) and `state.source_metadata` (for content-hash diffs)
+    /// -- pairing a partially-advanced `files` with the OLD scalar fields
+    /// can only make those comparisons MORE conservative (a spurious full
+    /// `ResetReason`, or a path recomputed as `changed` when it already,
+    /// unknowingly, wasn't), which just repeats some work on the next call.
+    /// The unsafe direction -- `files` genuinely stale for a path while
+    /// `source_metadata` already reports its NEW content hash, so a later
+    /// read of that path's facts is silently wrong until its next edit --
+    /// can only happen by pairing partial `files` with the FRESH metadata,
+    /// which this function never does.
+    fn restore_prior_on_bail(
+        &mut self,
+        project_key: &str,
+        prior_rest: Option<ProjectState>,
+        next_files: BTreeMap<String, SyntaxFileResult>,
+    ) {
+        if let Some(mut rest) = prior_rest {
+            rest.files = next_files;
+            self.projects.insert(project_key.to_string(), rest);
+        }
     }
 }
 

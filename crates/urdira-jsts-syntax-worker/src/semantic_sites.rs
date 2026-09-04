@@ -470,6 +470,52 @@ const REASON_IMPORT_BINDING: &str = "import_binding";
 const REASON_MULTIPLE_DECLARATIONS: &str = "multiple_declarations";
 const REASON_UNSUPPORTED_DECLARATION_KIND: &str = "unsupported_declaration_kind";
 const REASON_MEMBER_ACCESS: &str = "member_access";
+
+/// 2026-09-05 A5 references-parity task, Paso 0 (diagnosis only): every
+/// `Pending` outcome an `IdentifierRef` site can carry stays entirely
+/// in-memory -- `n8n_references_parity_debug_dump`'s own doc comment (and
+/// `pending_sites`' module doc, point 2) is explicit that this population
+/// is NEVER persisted, NEVER sent to tsgo, and dropped for good once
+/// `materialize_cold`/`materialize_delta` consume `OwnerFacts` by value. So
+/// widening `REASON_IMPORT_BINDING`/`REASON_RE_EXPORT_BINDING`/`REASON_
+/// MEMBER_ACCESS`'s own string with a `/`-delimited sub-reason suffix (this
+/// module's own diagnostic instrumentation, wired into `resolve_named_
+/// binding_via_specifier` and `visit_static_member_expression`) changes
+/// NOTHING observable outside this crate's own debug dump/tests: the
+/// downstream `reason` string only ever reaches `scripts/v4-references-
+/// parity-diff.mjs` (which groups by BOTH the full string and the `/`-
+/// prefix, so the existing coarse histogram is unaffected) or this file's
+/// own unit tests (updated to match on the `/`-prefix, never the exact
+/// string, wherever a sub-reason now applies). `import_binding_sub_reason`
+/// covers the six `resolve_named_binding_via_specifier` degrade points the
+/// task brief names (`no_specifier`, `unresolved_specifier`, `export:
+/// namespace`, `export:ambiguous`, `export:unresolved`, `ambient:
+/// ambiguous`); `member_access_sub_reason` covers the receiver-shape
+/// classification for a pending member read.
+fn import_binding_sub_reason(base: &'static str, sub: &'static str) -> &'static str {
+    match (base, sub) {
+        (REASON_IMPORT_BINDING, "no_specifier") => "import_binding/no_specifier",
+        (REASON_IMPORT_BINDING, "unresolved_specifier") => "import_binding/unresolved_specifier",
+        (REASON_IMPORT_BINDING, "export:namespace") => "import_binding/export:namespace",
+        (REASON_IMPORT_BINDING, "export:ambiguous") => "import_binding/export:ambiguous",
+        (REASON_IMPORT_BINDING, "export:unresolved") => "import_binding/export:unresolved",
+        (REASON_IMPORT_BINDING, "ambient:ambiguous") => "import_binding/ambient:ambiguous",
+        (REASON_RE_EXPORT_BINDING, "no_specifier") => "re_export_binding/no_specifier",
+        (REASON_RE_EXPORT_BINDING, "unresolved_specifier") => {
+            "re_export_binding/unresolved_specifier"
+        }
+        (REASON_RE_EXPORT_BINDING, "export:namespace") => "re_export_binding/export:namespace",
+        (REASON_RE_EXPORT_BINDING, "export:ambiguous") => "re_export_binding/export:ambiguous",
+        (REASON_RE_EXPORT_BINDING, "export:unresolved") => "re_export_binding/export:unresolved",
+        (REASON_RE_EXPORT_BINDING, "ambient:ambiguous") => "re_export_binding/ambient:ambiguous",
+        // Any other `(base, sub)` pair is not one of the six named degrade
+        // points (should not happen -- every call site below passes a
+        // literal from the match arms above) -- fall back to the
+        // unsuffixed base reason rather than panic on a diagnostic-only
+        // path.
+        _ => base,
+    }
+}
 const REASON_THIS_EXPRESSION: &str = "this_expression";
 const REASON_CALL_DEFERRED: &str = "call_deferred_to_e3";
 const REASON_HERITAGE_DEFERRED: &str = "heritage_deferred_to_e3";
@@ -1371,6 +1417,15 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// resolve this call). Consulted by `resolve_call_target_typeflow`'s
     /// new identifier-callee branch.
     destructured_member_entities: HashMap<SymbolId, String>,
+    /// 2026-09-05 A5 references-parity task, Paso 0 (diagnosis only): every
+    /// symbol bound by ONE property of an `ObjectPattern` this walk's own
+    /// `record_destructured_object_types` visited, regardless of whether
+    /// the member's type was itself resolved (a superset of `local_types`'
+    /// destructured entries -- inserted BEFORE the `member_type_ref` lookup
+    /// that can fail). Consulted ONLY by `member_access_sub_reason`'s
+    /// `ident:param_destructured` bucket -- never read by any resolution
+    /// path, so it changes no observable behavior.
+    destructured_pattern_symbols: std::collections::HashSet<SymbolId>,
     /// Safe-partition rule (see `is_jsdoc_typed_file`): when set, every
     /// identifier-kind site in this owner is forced `checker_pending` with
     /// `REASON_JSDOC_TYPED_FILE`, and zero `reference_rows` are produced,
@@ -1512,6 +1567,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             member_qualified_names,
             local_types: HashMap::new(),
             destructured_member_entities: HashMap::new(),
+            destructured_pattern_symbols: std::collections::HashSet::new(),
             jsdoc_typed_file,
             ctx,
             current_import_source: None,
@@ -1613,7 +1669,10 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             return ReferenceResolution::Pending(REASON_JSDOC_TYPED_FILE);
         }
         let Some(source_specifier) = source_specifier else {
-            return ReferenceResolution::Pending(pending_reason);
+            return ReferenceResolution::Pending(import_binding_sub_reason(
+                pending_reason,
+                "no_specifier",
+            ));
         };
         let Some(target_path) =
             self.ctx
@@ -1644,7 +1703,10 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                         AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    return ReferenceResolution::Pending(pending_reason);
+                    return ReferenceResolution::Pending(import_binding_sub_reason(
+                        pending_reason,
+                        "ambient:ambiguous",
+                    ));
                 }
                 resolver::AmbientResolution::NoDeclaration => {}
             }
@@ -1668,7 +1730,10 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                         cross_file: true,
                     }
                 }
-                None => ReferenceResolution::Pending(pending_reason),
+                None => ReferenceResolution::Pending(import_binding_sub_reason(
+                    pending_reason,
+                    "unresolved_specifier",
+                )),
             };
         };
         match resolver::resolve_named_export(self.ctx.files, &target_path, name) {
@@ -1692,11 +1757,15 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // `Ambiguous`/`Unresolved` (see `register_namespace_reexport`
             // for the SEPARATE mechanism that makes `evals.member(...)`
             // member access resolve).
-            resolver::ExportResolution::Namespace(_)
-            | resolver::ExportResolution::Ambiguous
-            | resolver::ExportResolution::Unresolved => {
-                ReferenceResolution::Pending(pending_reason)
-            }
+            resolver::ExportResolution::Namespace(_) => ReferenceResolution::Pending(
+                import_binding_sub_reason(pending_reason, "export:namespace"),
+            ),
+            resolver::ExportResolution::Ambiguous => ReferenceResolution::Pending(
+                import_binding_sub_reason(pending_reason, "export:ambiguous"),
+            ),
+            resolver::ExportResolution::Unresolved => ReferenceResolution::Pending(
+                import_binding_sub_reason(pending_reason, "export:unresolved"),
+            ),
         }
     }
 
@@ -2768,6 +2837,18 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             let Some((_, key_name)) = property_key_name(&property.key) else {
                 continue;
             };
+            // 2026-09-05 A5 references-parity task, Paso 0 (diagnosis
+            // only): see `destructured_pattern_symbols`'s own doc comment
+            // -- recorded unconditionally, BEFORE either lookup below can
+            // fail, so `member_access_sub_reason` can tell "this receiver
+            // came from an object-destructuring binding" apart from an
+            // ordinary untyped local even when the member's own type never
+            // resolved.
+            if let BindingPattern::BindingIdentifier(ident) = &property.value
+                && let Some(symbol_id) = ident.symbol_id.get()
+            {
+                self.destructured_pattern_symbols.insert(symbol_id);
+            }
             // P1-C: the member's own DECLARATION entity id (never its
             // return type) -- attempted independently of the `member_type_
             // ref` lookup below, since a member whose own declared return
@@ -2866,14 +2947,72 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// `StaticMemberExpression` node (the callee) and each publish their
     /// own relation kind, exactly like the checker does.
     fn resolve_static_member_reference(&self, expr: &StaticMemberExpression<'a>) -> Option<String> {
-        let index = self.ctx.typeflow_index?;
-        let (base_value, _rule) = self.type_of_expression(&expr.object)?;
-        let (base_entity, is_static) = Self::as_entity(&base_value)?;
-        match index.members(&base_entity, expr.property.name.as_str(), is_static) {
-            urdira_jsts_typeflow::MemberLookup::One(target) => Some(target),
-            urdira_jsts_typeflow::MemberLookup::None
-            | urdira_jsts_typeflow::MemberLookup::Many(_)
-            | urdira_jsts_typeflow::MemberLookup::UnionCandidates(_) => None,
+        if let Some(index) = self.ctx.typeflow_index
+            && let Some((base_value, _rule)) = self.type_of_expression(&expr.object)
+            && let Some((base_entity, is_static)) = Self::as_entity(&base_value)
+            && let urdira_jsts_typeflow::MemberLookup::One(target) =
+                index.members(&base_entity, expr.property.name.as_str(), is_static)
+        {
+            return Some(target);
+        }
+        // 2026-09-05 A5 references-parity task, Paso 1 fix Form 1: a
+        // namespace-import-bound identifier read as a plain VALUE (not a
+        // call callee) -- `(transport.odooApiRequest as jest.Mock).
+        // mockResolvedValue(...)` where `transport` is bound by `import *
+        // as transport from "./transport"` (or a named import that itself
+        // resolved to a namespace re-export -- see `resolve_namespace_
+        // member`'s own doc comment for both cases). `type_of_expression`'s
+        // `Identifier` arm never types a namespace-import binding at all
+        // (it is not a class/interface, never enters `local_types`, and is
+        // not a `Variable` declaration with an interned type), so the
+        // typeflow attempt above always misses for this receiver shape --
+        // exactly the SAME gap `type_of_call_expression`'s own member-
+        // callee branch (rule (f)) already closes for a CALLED member
+        // (`ns.fn(...)`); this reuses the identical mechanism for an
+        // uncalled member read, never a new heuristic.
+        self.resolve_namespace_member(&expr.object, expr.property.name.as_str())
+    }
+
+    /// 2026-09-05 A5 references-parity task, Paso 0 (diagnosis only): the
+    /// receiver-shape classification the task brief names for a pending
+    /// `member_access` site -- `ident:import_bound` (a plain identifier
+    /// bound by a namespace import/re-export, OR a named import -- any
+    /// `import_bindings` entry), `ident:param_destructured` (a binding
+    /// introduced by destructuring an `ObjectPattern` -- see `destructured_
+    /// pattern_symbols`'s own doc comment), `ident:local_untyped` (any
+    /// other plain identifier), `call_chain` (the receiver is itself a
+    /// call or a further member/chain expression), `this`, `other`
+    /// (anything else -- a literal, a parenthesized/`as`/non-null
+    /// expression, ...). See `import_binding_sub_reason`'s doc comment for
+    /// why this changes nothing observable outside this crate's own debug
+    /// dump/tests.
+    fn member_access_sub_reason(&self, object: &Expression<'a>) -> &'static str {
+        match object {
+            Expression::ThisExpression(_) => "member_access/this",
+            Expression::CallExpression(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
+            | Expression::ChainExpression(_) => "member_access/call_chain",
+            Expression::Identifier(ident) => {
+                let Some(reference_id) = ident.reference_id.get() else {
+                    return "member_access/other";
+                };
+                let reference = self.scoping.get_reference(reference_id);
+                let Some(symbol_id) = reference.symbol_id() else {
+                    return "member_access/other";
+                };
+                if self.namespace_import_specifiers.contains_key(&symbol_id)
+                    || self.namespace_reexport_targets.contains_key(&symbol_id)
+                    || self.import_bindings.contains_key(&symbol_id)
+                {
+                    return "member_access/ident:import_bound";
+                }
+                if self.destructured_pattern_symbols.contains(&symbol_id) {
+                    return "member_access/ident:param_destructured";
+                }
+                "member_access/ident:local_untyped"
+            }
+            _ => "member_access/other",
         }
     }
 
@@ -4515,12 +4654,17 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 }
             }
             None => {
+                let reason = if self.jsdoc_typed_file {
+                    REASON_JSDOC_TYPED_FILE
+                } else {
+                    self.member_access_sub_reason(&expr.object)
+                };
                 self.push_site(
                     SiteKind::IdentifierRef,
                     start,
                     end,
                     SiteDisposition::CheckerPending,
-                    Some(self.identifier_pending_reason(REASON_MEMBER_ACCESS)),
+                    Some(reason),
                 );
             }
         }
@@ -5759,7 +5903,9 @@ mod tests {
             .filter_map(|site| site.reason.as_deref())
             .collect();
         assert!(
-            reasons.contains(&REASON_IMPORT_BINDING),
+            reasons
+                .iter()
+                .any(|reason| reason.starts_with(REASON_IMPORT_BINDING)),
             "reasons: {reasons:?}"
         );
     }
@@ -5773,7 +5919,10 @@ mod tests {
                 site.site_kind == SiteKind::IdentifierRef
                     && site.start_utf16 == start
                     && site.end_utf16 == end
-                    && site.reason.as_deref() == Some(REASON_IMPORT_BINDING)
+                    && site
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with(REASON_IMPORT_BINDING))
             })
         };
         let span_of = |needle: &str| {
@@ -5830,7 +5979,10 @@ mod tests {
                 semantics.pending_sites.iter().any(|site| {
                     site.site_kind == SiteKind::IdentifierRef
                         && site.start_utf16 == start
-                        && site.reason.as_deref() == Some(REASON_IMPORT_BINDING)
+                        && site
+                            .reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.starts_with(REASON_IMPORT_BINDING))
                 }),
                 "expected a pending site at {start}: {:?}",
                 semantics.pending_sites
@@ -6042,9 +6194,9 @@ mod tests {
         let site = semantics.pending_sites.iter().find(|site| {
             site.site_kind == SiteKind::IdentifierRef && site.start_utf16 == local_start
         });
-        assert_eq!(
-            site.and_then(|site| site.reason.as_deref()),
-            Some(REASON_RE_EXPORT_BINDING),
+        assert!(
+            site.and_then(|site| site.reason.as_deref())
+                .is_some_and(|reason| reason.starts_with(REASON_RE_EXPORT_BINDING)),
             "sites: {:?}",
             semantics.pending_sites
         );
@@ -6065,7 +6217,10 @@ mod tests {
             semantics.pending_sites.iter().any(|site| {
                 site.site_kind == SiteKind::IdentifierRef
                     && site.start_utf16 == start
-                    && site.reason.as_deref() == Some(REASON_RE_EXPORT_BINDING)
+                    && site
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with(REASON_RE_EXPORT_BINDING))
             })
         };
         let local_start = source.find("correctness as").unwrap() as u32;
@@ -6088,10 +6243,10 @@ mod tests {
         let source = "const foo = 1;\nexport { foo };\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
         assert!(
-            !semantics
-                .pending_sites
-                .iter()
-                .any(|site| site.reason.as_deref() == Some(REASON_RE_EXPORT_BINDING)),
+            !semantics.pending_sites.iter().any(|site| site
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(REASON_RE_EXPORT_BINDING))),
             "sites: {:?}",
             semantics.pending_sites
         );
@@ -6142,7 +6297,11 @@ mod tests {
         let member_sites: Vec<&SemanticSite> = semantics
             .pending_sites
             .iter()
-            .filter(|site| site.reason.as_deref() == Some(REASON_MEMBER_ACCESS))
+            .filter(|site| {
+                site.reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with(REASON_MEMBER_ACCESS))
+            })
             .collect();
         assert_eq!(
             member_sites.len(),
@@ -7449,7 +7608,10 @@ mod tests {
                 .pending_sites
                 .iter()
                 .any(|site| site.start_utf16 == local_start
-                    && site.reason.as_deref() == Some(REASON_IMPORT_BINDING)),
+                    && site
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with(REASON_IMPORT_BINDING))),
             "sites: {:?}",
             semantics.pending_sites
         );
@@ -7516,7 +7678,10 @@ mod tests {
                 .pending_sites
                 .iter()
                 .any(|site| site.start_utf16 == local_start
-                    && site.reason.as_deref() == Some(REASON_RE_EXPORT_BINDING)),
+                    && site
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with(REASON_RE_EXPORT_BINDING))),
             "sites: {:?}",
             semantics.pending_sites
         );
@@ -7569,12 +7734,11 @@ mod tests {
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
         assert!(resolved(&semantics).is_empty());
-        assert!(
-            semantics
-                .pending_sites
-                .iter()
-                .any(|site| site.reason.as_deref() == Some(REASON_IMPORT_BINDING))
-        );
+        assert!(semantics.pending_sites.iter().any(|site| {
+            site.reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(REASON_IMPORT_BINDING))
+        }));
     }
 
     #[test]
@@ -7639,12 +7803,11 @@ mod tests {
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
         assert!(resolved(&semantics).is_empty());
-        assert!(
-            semantics
-                .pending_sites
-                .iter()
-                .any(|site| site.reason.as_deref() == Some(REASON_IMPORT_BINDING))
-        );
+        assert!(semantics.pending_sites.iter().any(|site| {
+            site.reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(REASON_IMPORT_BINDING))
+        }));
     }
 
     // -- E3: call/heritage partition (T1/T2) ---------------------------
@@ -8047,10 +8210,10 @@ mod tests {
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
         assert!(
-            semantics
-                .pending_sites
-                .iter()
-                .all(|site| site.reason.as_deref() != Some(REASON_MEMBER_ACCESS)),
+            semantics.pending_sites.iter().all(|site| !site
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(REASON_MEMBER_ACCESS))),
             "sites: {:?}",
             semantics.pending_sites
         );
@@ -8082,10 +8245,10 @@ mod tests {
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
         assert!(
-            semantics
-                .pending_sites
-                .iter()
-                .all(|site| site.reason.as_deref() != Some(REASON_MEMBER_ACCESS)),
+            semantics.pending_sites.iter().all(|site| !site
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(REASON_MEMBER_ACCESS))),
             "sites: {:?}",
             semantics.pending_sites
         );
@@ -8133,10 +8296,10 @@ mod tests {
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
         assert!(
-            semantics
-                .pending_sites
-                .iter()
-                .any(|site| site.reason.as_deref() == Some(REASON_MEMBER_ACCESS)),
+            semantics.pending_sites.iter().any(|site| site
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(REASON_MEMBER_ACCESS))),
             "sites: {:?}",
             semantics.pending_sites
         );
@@ -8161,10 +8324,10 @@ mod tests {
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
         assert!(
-            semantics
-                .pending_sites
-                .iter()
-                .any(|site| site.reason.as_deref() == Some(REASON_MEMBER_ACCESS)),
+            semantics.pending_sites.iter().any(|site| site
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(REASON_MEMBER_ACCESS))),
             "sites: {:?}",
             semantics.pending_sites
         );
@@ -8848,6 +9011,125 @@ mod tests {
     }
 
     #[test]
+    fn a5_form1_resolves_a_namespace_member_read_as_a_plain_value() {
+        // 2026-09-05 A5 references-parity task, Paso 1 fix Form 1: found
+        // live in n8n's own `packages/nodes-base/nodes/Odoo/test/v2/
+        // methods/listSearch.test.ts` -- `(transport.odooApiRequest as
+        // jest.Mock).mockResolvedValue(...)` where `transport` is bound by
+        // `import * as transport from "./transport"`. Unlike `typeflow_
+        // resolves_a_namespace_member_call_directly` (a CALL callee, rule
+        // (f)), `make` here is read as a plain value, never called --
+        // `resolve_static_member_reference`'s new fallback must still
+        // resolve it.
+        let base_source =
+            "class Foo {\n  greet() {}\n}\nexport function make(): Foo {\n  return new Foo();\n}\n";
+        let user_source = "import * as ns from \"./base\";\nfunction use() {\n  const ref = ns.make;\n  return ref;\n}\n";
+        let mut summaries = BTreeMap::new();
+        summaries.insert(
+            "base.ts".to_owned(),
+            urdira_jsts_typeflow::extract_decl_summary("base.ts", base_source).expect("parses"),
+        );
+        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new());
+        let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "base.ts".to_owned(),
+            target_file(
+                "base.ts",
+                vec![
+                    target_entity(crate::EntityKind::Class, "base.ts", 6, "Foo"),
+                    target_entity(crate::EntityKind::Function, "base.ts", 43, "make"),
+                ],
+                vec![export_binding("make", "make")],
+            ),
+        );
+        let resolver = WorkspaceResolver::default();
+        let available: BTreeSet<String> = files.keys().cloned().collect();
+        let ctx = HybridResolutionContext {
+            resolver: Box::leak(Box::new(resolver)),
+            available: Box::leak(Box::new(available)),
+            files: Box::leak(Box::new(files)),
+            typeflow_index: Some(index),
+            typeflow_oracle: false,
+            ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
+        };
+        let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
+            .expect("analysis succeeds");
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .any(|record| record.body["target_id"] == "jsts:function:base.ts:43:make"),
+            "rows: {:?}",
+            semantics.reference_rows
+        );
+    }
+
+    #[test]
+    fn a5_form1_negative_ambiguous_namespace_member_read_stays_pending() {
+        // Negative sibling of `a5_form1_resolves_a_namespace_member_read_
+        // as_a_plain_value`: the namespace's target module does not
+        // provide `missing` at all -- `resolve_namespace_member` returns
+        // `None` (`ExportResolution::Unresolved`), so the read stays
+        // pending, never a guess.
+        let base_source = "export function make(): void {}\n";
+        let user_source = "import * as ns from \"./base\";\nfunction use() {\n  const ref = ns.missing;\n  return ref;\n}\n";
+        let mut summaries = BTreeMap::new();
+        summaries.insert(
+            "base.ts".to_owned(),
+            urdira_jsts_typeflow::extract_decl_summary("base.ts", base_source).expect("parses"),
+        );
+        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new());
+        let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "base.ts".to_owned(),
+            target_file(
+                "base.ts",
+                vec![target_entity(
+                    crate::EntityKind::Function,
+                    "base.ts",
+                    17,
+                    "make",
+                )],
+                vec![export_binding("make", "make")],
+            ),
+        );
+        let resolver = WorkspaceResolver::default();
+        let available: BTreeSet<String> = files.keys().cloned().collect();
+        let ctx = HybridResolutionContext {
+            resolver: Box::leak(Box::new(resolver)),
+            available: Box::leak(Box::new(available)),
+            files: Box::leak(Box::new(files)),
+            typeflow_index: Some(index),
+            typeflow_oracle: false,
+            ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
+        };
+        let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
+            .expect("analysis succeeds");
+        let missing_start = user_source.find("missing").unwrap() as u32;
+        // `return ref;` (a plain, UNRELATED identifier reference to the
+        // local `ref` binding) legitimately resolves -- only the `ns.
+        // missing` member-read site itself must never guess.
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .all(|record| record.body["start"] != missing_start),
+            "must never guess: rows: {:?}",
+            semantics.reference_rows
+        );
+        assert!(
+            semantics.pending_sites.iter().any(|site| {
+                site.start_utf16 == missing_start
+                    && site.reason.as_deref() == Some("member_access/ident:import_bound")
+            }),
+            "sites: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    #[test]
     fn typeflow_resolves_a_member_call_through_a_named_import_of_a_namespace_reexport() {
         // P1-B: `import { evals } from "./index"` where `index.ts` does
         // `export * as evals from "./evals/index"` -- see
@@ -8963,6 +9245,27 @@ mod tests {
     }
 
     #[test]
+    fn a5_diagnostic_probe_parameter_destructured_in_a_later_statement() {
+        // 2026-09-05 A5 diagnostic probe (temporary, to be removed after
+        // confirming the baseline): unlike `typeflow_resolves_a_
+        // destructured_parameter_from_an_annotated_type` (destructuring
+        // directly in the parameter list), this destructures a PLAIN
+        // `BindingIdentifier` parameter's OWN typed binding in a LATER
+        // statement -- `const { agent } = setup;` where `setup: Setup` is
+        // the parameter.
+        let source = "class Agent {\n  close() {}\n}\ninterface Setup {\n  agent: Agent;\n}\nfunction use(setup: Setup) {\n  const { agent } = setup;\n  agent.close();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.typeflow_call_rows.len(),
+            1,
+            "rows: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
     fn typeflow_resolves_a_nested_destructured_parameter_two_levels_deep() {
         // Found live in this corpus's own migration DSL: EVERY migration's
         // `up`/`down` method destructures straight through `schemaBuilder`
@@ -8998,6 +9301,111 @@ mod tests {
             1,
             "rows: {:?}",
             semantics.typeflow_call_rows
+        );
+    }
+
+    #[test]
+    fn a5_form3_diagnostic_probe_fluent_getter_chain_migration_dsl() {
+        // 2026-09-05 A5 diagnostic probe (temporary): the REAL migrations
+        // DSL shape (`packages/@n8n/db/src/migrations/dsl/{column,index}.ts`
+        // + a real migration file) -- `column('id').varchar(36).primary.
+        // notNull`, where `.primary`/`.notNull` are GETTERS (`get primary()
+        // { ...; return this; }`), not methods, and `column` itself comes
+        // from a `ReturnType<typeof createSchemaBuilder>` object-shape
+        // arrow property returning `new Column(name)`.
+        let source = "class Column {\n  varchar(length) {\n    return this;\n  }\n  get primary() {\n    return this;\n  }\n  get notNull() {\n    return this;\n  }\n}\nconst createSchemaBuilder = (prefix) => ({\n  column: (name) => new Column(name),\n});\ninterface Context {\n  schemaBuilder: ReturnType<typeof createSchemaBuilder>;\n}\nfunction up({ schemaBuilder: { column } }: Context) {\n  column('id').varchar(36).primary.notNull;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let not_null_start = source.find("get notNull").unwrap() as u32 + "get ".len() as u32;
+        let target_id = format!("jsts:getter:a.ts:{not_null_start}:notNull");
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .any(|record| record.body["target_id"] == target_id.as_str()),
+            "target_id={target_id} rows: {:?} pending: {:?}",
+            semantics.reference_rows,
+            semantics.pending_sites
+        );
+    }
+
+    #[test]
+    fn a5_form3_diagnostic_probe_fluent_getter_chain_cross_file() {
+        // 2026-09-05 A5 diagnostic probe (temporary): the SAME shape as
+        // `a5_form3_diagnostic_probe_fluent_getter_chain_migration_dsl`,
+        // but with `Column` in a SEPARATE file (`column.ts`), imported by
+        // name into `user.ts` -- exactly how the real corpus splits it
+        // (`dsl/column.ts` vs `dsl/index.ts`). Isolates whether the gap (if
+        // any) is cross-file import resolution rather than the single-file
+        // body-inference mechanism itself (already proven sound by the
+        // single-file sibling probe).
+        let column_source = "export class Column {\n  varchar(length) {\n    return this;\n  }\n  get primary() {\n    return this;\n  }\n  get notNull() {\n    return this;\n  }\n}\n";
+        let user_source = "import { Column } from \"./column\";\nconst createSchemaBuilder = (prefix) => ({\n  column: (name) => new Column(name),\n});\ninterface Context {\n  schemaBuilder: ReturnType<typeof createSchemaBuilder>;\n}\nfunction up({ schemaBuilder: { column } }: Context) {\n  column('id').varchar(36).primary.notNull;\n}\n";
+        let mut summaries = BTreeMap::new();
+        summaries.insert(
+            "column.ts".to_owned(),
+            urdira_jsts_typeflow::extract_decl_summary("column.ts", column_source).expect("parses"),
+        );
+        summaries.insert(
+            "user.ts".to_owned(),
+            urdira_jsts_typeflow::extract_decl_summary("user.ts", user_source).expect("parses"),
+        );
+        // `ProgramIndex::build`'s own cross-file import closure (SEPARATE
+        // from `urdira-jsts-syntax-worker`'s E2 `resolve_named_export`
+        // chain) needs `import_targets` populated -- in the real pipeline
+        // this comes from the same resolved import graph every other
+        // cross-file typeflow test builds by hand (see `members_walks_
+        // extends_chain_across_files` in `urdira-jsts-typeflow`'s own test
+        // module for the identical pattern).
+        let mut import_targets = HashMap::new();
+        import_targets.insert(
+            (
+                "user.ts".to_owned(),
+                "./column".to_owned(),
+                "Column".to_owned(),
+            ),
+            "jsts:class:column.ts:13:Column".to_owned(),
+        );
+        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets);
+        let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
+        let not_null_start =
+            column_source.find("get notNull").unwrap() as u32 + "get ".len() as u32;
+        let mut files = BTreeMap::new();
+        files.insert(
+            "column.ts".to_owned(),
+            target_file(
+                "column.ts",
+                vec![target_entity(
+                    crate::EntityKind::Class,
+                    "column.ts",
+                    13,
+                    "Column",
+                )],
+                vec![export_binding("Column", "Column")],
+            ),
+        );
+        let resolver = WorkspaceResolver::default();
+        let available: BTreeSet<String> = files.keys().cloned().collect();
+        let ctx = HybridResolutionContext {
+            resolver: Box::leak(Box::new(resolver)),
+            available: Box::leak(Box::new(available)),
+            files: Box::leak(Box::new(files)),
+            typeflow_index: Some(index),
+            typeflow_oracle: false,
+            ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
+        };
+        let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
+            .expect("analysis succeeds");
+        let target_id = format!("jsts:getter:column.ts:{not_null_start}:notNull");
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .any(|record| record.body["target_id"] == target_id.as_str()),
+            "target_id={target_id} rows: {:?} pending: {:?}",
+            semantics.reference_rows,
+            semantics.pending_sites
         );
     }
 
@@ -9700,10 +10108,10 @@ mod tests {
             semantics.external_contains_rows
         );
         assert!(
-            semantics
-                .pending_sites
-                .iter()
-                .any(|site| site.reason.as_deref() == Some(REASON_IMPORT_BINDING)),
+            semantics.pending_sites.iter().any(|site| site
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(REASON_IMPORT_BINDING))),
             "must still degrade to the ordinary pending import-binding reason"
         );
     }

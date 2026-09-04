@@ -889,7 +889,7 @@ impl NativeStructuralStoreHandle {
         let identity_key = if view.identity_key().is_empty() {
             None
         } else {
-            Some(String::from_utf8_lossy(view.identity_key()).into_owned())
+            Some(String::from_utf8_lossy(&view.identity_key()).into_owned())
         };
         // Gap A2 (task P2-2d): the v3-conversion path (`NativeStoreBuilder`)
         // carries a v3-authored `identity_id` text verbatim through the
@@ -1477,7 +1477,7 @@ fn pending_site_rows_for_owner(
                     .get(ordinal as usize)
                     .and_then(|record_id| reader.get_visible(record_id, generation))
                     .map(|source_view| {
-                        String::from_utf8_lossy(source_view.identity_key()).into_owned()
+                        String::from_utf8_lossy(&source_view.identity_key()).into_owned()
                     })
             });
             NativeOutputPendingSiteRow {

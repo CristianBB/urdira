@@ -702,8 +702,8 @@ fn run_one(
             .collect();
         for prev in store_reader.by_owner(old_ordinal, prev_generation) {
             if prev.category() == CATEGORY_ENTITY
-                && is_external_entity_identity(prev.identity_key())
-                && !next_identities.contains(prev.identity_key())
+                && is_external_entity_identity(&prev.identity_key())
+                && !next_identities.contains(prev.identity_key().as_ref())
             {
                 at_risk_external_entities.insert(prev.record_id());
             }
@@ -712,7 +712,7 @@ fn run_one(
     for &ordinal in &deleted_owner_ordinals {
         for prev in store_reader.by_owner(ordinal, prev_generation) {
             if prev.category() == CATEGORY_ENTITY
-                && is_external_entity_identity(prev.identity_key())
+                && is_external_entity_identity(&prev.identity_key())
             {
                 at_risk_external_entities.insert(prev.record_id());
             }
@@ -761,7 +761,7 @@ fn run_one(
                 continue;
             };
             if target.category() == CATEGORY_ENTITY
-                && is_external_entity_identity(target.identity_key())
+                && is_external_entity_identity(&target.identity_key())
                 && !owner_ordinal_is_live(target.owner_artifact())
             {
                 zombie_candidates.insert(target_record_id);

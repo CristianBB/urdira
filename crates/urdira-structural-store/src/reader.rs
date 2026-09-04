@@ -8,11 +8,13 @@
 use crate::container::{self, SectionId, SectionRanges};
 use crate::dict::{read_dict_body, read_subjects_body};
 use crate::error::{Result, store_err};
+use crate::identity_codec;
 use crate::layout::*;
 use crate::manifest::Manifest;
 use crate::row::{Dictionaries, NONE_U32, PendingSiteKey, PendingSiteRow};
 use crate::segment_io::*;
 use memmap2::Mmap;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -357,10 +359,16 @@ impl Segment {
 }
 
 /// A live handle onto one record row, borrowed from its owning segment's
-/// mmap. Cheap to clone (an `Arc` bump).
+/// mmap. Cheap to clone (two `Arc` bumps). A3a: also holds the owning
+/// store snapshot (`store`) so [`Self::identity_key`] can reconstruct a
+/// tagged row's identity string from typed fields elsewhere on `self`
+/// (`store.dicts`) and, for a relation, resolve its endpoints' own
+/// identity keys one level deep (`store.get`) -- see `crate::identity_
+/// codec`'s module doc for the mechanism.
 #[derive(Clone)]
 pub struct RecordView {
     pub(crate) segment: Arc<Segment>,
+    pub(crate) store: Arc<StoreInner>,
     pub(crate) ordinal: usize,
 }
 
@@ -449,10 +457,94 @@ impl RecordView {
         let len = u32le(self.meta(), meta::BODY_LEN) as usize;
         &self.segment.body[HEADER_LEN + off..HEADER_LEN + off + len]
     }
-    pub fn identity_key(&self) -> &[u8] {
+    /// A3a: `Cow` because a `RAW`-layout row's bytes are a real borrow of
+    /// the mmap'd `records.ident` (as before this task), while an `ENTITY`/
+    /// `RELATION`-layout row's bytes are reconstructed fresh from `self`'s
+    /// own typed fields (`crate::identity_codec::reconstruct_entity`/
+    /// `reconstruct_relation`) -- nothing is stored for those rows at all.
+    /// Never panics: a reconstruction that cannot complete (an inconsistent
+    /// store -- a dangling dictionary ordinal, an unresolvable relation
+    /// endpoint) returns an empty `Cow` instead, same as a genuinely empty
+    /// identity key would read; `debug_assert!`s below catch that case in
+    /// tests/debug builds without changing release behavior.
+    pub fn identity_key(&self) -> Cow<'_, [u8]> {
+        let layout = self.meta()[meta::IDENTITY_LAYOUT];
+        let reconstructed = if layout == meta::IDENTITY_LAYOUT_ENTITY {
+            self.reconstruct_entity_identity_key()
+        } else if layout == meta::IDENTITY_LAYOUT_RELATION {
+            self.reconstruct_relation_identity_key()
+        } else {
+            None
+        };
+        if let Some(bytes) = reconstructed {
+            return Cow::Owned(bytes);
+        }
+        debug_assert!(
+            layout == meta::IDENTITY_LAYOUT_RAW,
+            "identity_key: tagged layout {layout} failed to reconstruct (store data \
+             inconsistency) -- falling back to the (empty, for a tagged row) stored ident bytes"
+        );
         let off = u64le(self.meta(), meta::IDENT_OFF) as usize;
         let len = u32le(self.meta(), meta::IDENT_LEN) as usize;
-        &self.segment.ident[HEADER_LEN + off..HEADER_LEN + off + len]
+        Cow::Borrowed(&self.segment.ident[HEADER_LEN + off..HEADER_LEN + off + len])
+    }
+
+    /// `jsts:{kind}:{path}:{start}:{name}`, rebuilt from `kind_id` ->
+    /// `dicts.kinds`, `owner_artifact` -> `dicts.artifacts` (stripping the
+    /// fixed `"artifact:"` prefix), `span_start_byte`, and `name_id` ->
+    /// `dicts.names`. `None` on any missing/out-of-range field -- this
+    /// should never actually happen for a row this crate itself tagged
+    /// `IDENTITY_LAYOUT_ENTITY` at write time (the writer only tags a row
+    /// once the SAME reconstruction already matched its real identity key
+    /// byte for byte), so a `None` here would mean the store itself is
+    /// inconsistent; the caller's `debug_assert!` is what actually catches
+    /// that in tests.
+    fn reconstruct_entity_identity_key(&self) -> Option<Vec<u8>> {
+        let dicts = &self.store.dicts;
+        let kind = dicts.kinds.get(self.kind_id() as usize)?;
+        let (artifact_text, _version) = dicts.artifacts.get(self.owner_artifact() as usize)?;
+        let path = artifact_text.strip_prefix("artifact:")?;
+        let name_id = self.name_id()?;
+        let name = dicts.names.get(name_id as usize)?;
+        Some(identity_codec::reconstruct_entity(
+            kind,
+            path,
+            self.span_start_byte(),
+            name,
+        ))
+    }
+
+    /// `jsts:{rel}:{path}:{start}:{end}:{source_identity_key}:
+    /// {target_identity_key}` -- `{rel}` from `kind_id` -> `dicts.kinds`
+    /// stripped of the fixed `"jsts:relation_"` prefix; the two endpoint
+    /// identity keys resolved one level deep: `source_subject`/
+    /// `target_subject` -> `dicts.subjects[ord]` (that entity's own
+    /// `record_id`) -> `store.get(record_id)?.identity_key()` (which may
+    /// itself be `RAW` or `ENTITY`-tagged -- either way, this is exactly
+    /// that entity's own identity key bytes). Same never-panic contract as
+    /// [`Self::reconstruct_entity_identity_key`].
+    fn reconstruct_relation_identity_key(&self) -> Option<Vec<u8>> {
+        let dicts = &self.store.dicts;
+        let kind_text = dicts.kinds.get(self.kind_id() as usize)?;
+        let rel = kind_text.strip_prefix("jsts:relation_")?;
+        let (artifact_text, _version) = dicts.artifacts.get(self.owner_artifact() as usize)?;
+        let path = artifact_text.strip_prefix("artifact:")?;
+        let source_ord = self.source_subject()?;
+        let target_ord = self.target_subject()?;
+        let source_record_id = dicts.subjects.get(source_ord as usize)?;
+        let target_record_id = dicts.subjects.get(target_ord as usize)?;
+        let source_view = self.store.get(source_record_id)?;
+        let target_view = self.store.get(target_record_id)?;
+        let source_key = source_view.identity_key();
+        let target_key = target_view.identity_key();
+        Some(identity_codec::reconstruct_relation(
+            rel,
+            path,
+            self.span_start_byte(),
+            self.span_end_byte(),
+            &source_key,
+            &target_key,
+        ))
     }
     fn digests(&self) -> &[u8] {
         self.segment.digests_row(self.ordinal)
@@ -872,6 +964,29 @@ impl StoreInner {
     fn generation(&self) -> u64 {
         self.manifest.generation
     }
+
+    /// The row for `key` in ANY segment, regardless of visibility/
+    /// `valid_to` -- factored out of [`StoreReader::get`] (which is now a
+    /// thin wrapper over this) so [`RecordView::identity_key`]'s relation
+    /// endpoint resolution, and `writer.rs`'s delta-side `resolve_identity`
+    /// fallback, can look up an arbitrary `record_id` without going back
+    /// through a `StoreReader`'s own snapshot lock. `self: &Arc<Self>`
+    /// (not a plain `&self`) because the returned [`RecordView`] needs to
+    /// hold its own `Arc<StoreInner>` clone.
+    pub fn get(self: &Arc<Self>, key: &[u8; 32]) -> Option<RecordView> {
+        for seg in &self.segments {
+            if let Some(ord) =
+                binary_search_exact32(seg.n, KEYS_STRIDE, &seg.keys[HEADER_LEN..], key)
+            {
+                return Some(RecordView {
+                    segment: Arc::clone(seg),
+                    store: Arc::clone(self),
+                    ordinal: ord,
+                });
+            }
+        }
+        None
+    }
 }
 
 /// A handle onto an open structural store. Cheap to `clone` (an `Arc`
@@ -948,18 +1063,7 @@ impl StoreReader {
     }
 
     pub fn get(&self, key: &[u8; 32]) -> Option<RecordView> {
-        let inner = self.snapshot();
-        for seg in &inner.segments {
-            if let Some(ord) =
-                binary_search_exact32(seg.n, KEYS_STRIDE, &seg.keys[HEADER_LEN..], key)
-            {
-                return Some(RecordView {
-                    segment: Arc::clone(seg),
-                    ordinal: ord,
-                });
-            }
-        }
-        None
+        self.snapshot().get(key)
     }
 
     pub fn get_visible(&self, key: &[u8; 32], generation: u64) -> Option<RecordView> {
@@ -983,6 +1087,7 @@ impl StoreReader {
                 }
                 out.push(RecordView {
                     segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
                     ordinal: ord as usize,
                 });
             }
@@ -1000,6 +1105,7 @@ impl StoreReader {
                 let (_, ord) = pair2_at(data, i);
                 let view = RecordView {
                     segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
                     ordinal: ord as usize,
                 };
                 if view.is_visible(generation) {
@@ -1031,6 +1137,7 @@ impl StoreReader {
                 let ord = by_kind_ordinal_at(data, i) as usize;
                 let view = RecordView {
                     segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
                     ordinal: ord,
                 };
                 if view.is_visible(generation) {
@@ -1056,6 +1163,7 @@ impl StoreReader {
                 let ord = by_identity_ordinal_at(data, i) as usize;
                 let view = RecordView {
                     segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
                     ordinal: ord,
                 };
                 let better = match &best {
@@ -1103,6 +1211,7 @@ impl StoreReader {
                 }
                 out.push(RecordView {
                     segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
                     ordinal: ord as usize,
                 });
             }
@@ -1317,6 +1426,7 @@ impl StoreReader {
             for ord in lo..hi {
                 let view = RecordView {
                     segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
                     ordinal: ord,
                 };
                 if view.is_visible(generation) {
@@ -1371,6 +1481,7 @@ impl StoreReader {
                 for ord in 0..seg.n {
                     out.push(ChangeEntry::Opened(RecordView {
                         segment: Arc::clone(seg),
+                        store: Arc::clone(&inner),
                         ordinal: ord,
                     }));
                 }
@@ -1507,6 +1618,7 @@ impl Iterator for VisibleIter {
             }
             let view = RecordView {
                 segment: Arc::clone(seg),
+                store: Arc::clone(&self.inner),
                 ordinal: local_idx,
             };
             if view.is_visible(self.generation) {

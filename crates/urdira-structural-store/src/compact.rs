@@ -36,7 +36,7 @@ fn view_to_row(v: &RecordView) -> RecordRow {
         identity_type: v.identity_type(),
         assignment_kind: v.assignment_kind(),
         name_id: v.name_id().unwrap_or(NONE_U32),
-        identity_key: v.identity_key().to_vec(),
+        identity_key: v.identity_key().into_owned(),
         record_digest: v.record_digest(),
         body_digest: v.body_digest(),
         identity_id: v.identity_id(),
