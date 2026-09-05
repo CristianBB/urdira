@@ -79,6 +79,9 @@ impl SegmentWriter {
         generation: u64,
         pending_sites: &[PendingSiteRow],
     ) -> Result<SegmentSummary> {
+        // A1 (2026-09-05, Frente A): per-file write instrumentation, same
+        // env var every other sub-timer in this crate uses.
+        let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
         let t0 = Instant::now();
         std::fs::create_dir_all(dir)?;
         let base_name = format!("base-{generation}");
@@ -154,8 +157,32 @@ impl SegmentWriter {
         let merkle_dir = dir.join("merkle");
         merkle::persist(&records_set, &merkle_dir, SetKind::Records, generation)?;
         merkle::persist(&dep_set, &merkle_dir, SetKind::Dependency, generation)?;
+        let fsync_started = Instant::now();
         fsync_segment_dir(&base_dir)?;
+        let fsync_elapsed = fsync_started.elapsed();
         let durable = t0.elapsed();
+
+        // A1: one grep-able line -- per-secondary-file wall time from
+        // `write_hot_and_secondary_files` (`hs.hot_elapsed_ms`/`hs.
+        // secondary_elapsed_ms`) plus this function's own `fsync` time and
+        // row count. Matches `write_base_partitioned_with_pending`'s own
+        // line below, same field order, so both are grep/diff-comparable.
+        if debug_timing {
+            let se = &hs.secondary_elapsed_ms;
+            eprintln!(
+                "[urdira-structural-store] base write (flat): hot={}ms by_owner={}ms by_name={}ms by_kind={}ms by_identity={}ms adj.out={}ms adj.in={}ms entities.index={}ms fsync={:.3}s rows={}",
+                hs.hot_elapsed_ms,
+                se.get("records.by_owner").copied().unwrap_or(0),
+                se.get("records.by_name").copied().unwrap_or(0),
+                se.get("records.by_kind").copied().unwrap_or(0),
+                se.get("records.by_identity").copied().unwrap_or(0),
+                se.get("adj.out").copied().unwrap_or(0),
+                se.get("adj.in").copied().unwrap_or(0),
+                se.get("entities.index").copied().unwrap_or(0),
+                fsync_elapsed.as_secs_f64(),
+                rows.len(),
+            );
+        }
 
         let manifest = Manifest {
             format: 6,
@@ -290,6 +317,10 @@ impl SegmentWriter {
         );
         let hs = hs?;
         let hot_and_entries_elapsed = hot_and_entries_started.elapsed();
+        // A1: captured before `hs.secondary` moves into `files` just below.
+        let hs_hot_elapsed_ms = hs.hot_elapsed_ms;
+        let hs_secondary_elapsed_ms = hs.secondary_elapsed_ms.clone();
+        let row_count: usize = partitions.iter().map(Vec::len).sum();
         for (name, bytes) in &hs.hot.bytes {
             files.insert(name.to_string(), (*bytes, hs.hot.xxh3[name]));
         }
@@ -338,6 +369,41 @@ impl SegmentWriter {
                 persist_elapsed.as_secs_f64(),
                 fsync_elapsed.as_secs_f64(),
                 durable.as_secs_f64(),
+            );
+            // A1 (2026-09-05, Frente A): one grep-able line -- per-secondary-
+            // file wall time from `write_hot_and_secondary_files_partitioned`
+            // (`hs.hot_elapsed_ms`/`hs.secondary_elapsed_ms`, saved above
+            // BEFORE `hs.secondary` was moved into `files` at line ~323)
+            // plus this function's own `fsync` time and row count. This is
+            // the line the cold n8n bench greps (the partitioned path is
+            // what the cold scan actually uses).
+            eprintln!(
+                "[urdira-structural-store] base write (partitioned): hot={}ms by_owner={}ms by_name={}ms by_kind={}ms by_identity={}ms adj.out={}ms adj.in={}ms entities.index={}ms fsync={:.3}s rows={}",
+                hs_hot_elapsed_ms,
+                hs_secondary_elapsed_ms
+                    .get("records.by_owner")
+                    .copied()
+                    .unwrap_or(0),
+                hs_secondary_elapsed_ms
+                    .get("records.by_name")
+                    .copied()
+                    .unwrap_or(0),
+                hs_secondary_elapsed_ms
+                    .get("records.by_kind")
+                    .copied()
+                    .unwrap_or(0),
+                hs_secondary_elapsed_ms
+                    .get("records.by_identity")
+                    .copied()
+                    .unwrap_or(0),
+                hs_secondary_elapsed_ms.get("adj.out").copied().unwrap_or(0),
+                hs_secondary_elapsed_ms.get("adj.in").copied().unwrap_or(0),
+                hs_secondary_elapsed_ms
+                    .get("entities.index")
+                    .copied()
+                    .unwrap_or(0),
+                fsync_elapsed.as_secs_f64(),
+                row_count,
             );
         }
 
@@ -978,6 +1044,16 @@ fn build_delta_sections(
     full_dicts: &Dictionaries,
     current_reader: &StoreReader,
 ) -> Result<Vec<EncodedSection>> {
+    // A1 (2026-09-05, Frente A): per-section wall time, same env var every
+    // other sub-timer in this crate uses. Delta row counts are tiny (this
+    // whole function is single-threaded, see its own doc comment above),
+    // so this is mostly useful as a sanity check that no section dominates
+    // unexpectedly -- not a target for the cold-write optimization A.2
+    // measures (that path is `write_base_partitioned_with_pending`).
+    let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
+    let mut section_elapsed_ms: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
+    let hot_started = Instant::now();
     let mut sections: Vec<EncodedSection> = Vec::with_capacity(18);
 
     // A3a: resolves a relation endpoint's `record_id` to its OWN identity
@@ -1184,7 +1260,10 @@ fn build_delta_sections(
         .0,
     ));
 
+    section_elapsed_ms.insert("hot", hot_started.elapsed().as_millis() as u64);
+
     // -- secondary sorted-index arrays --
+    let t = Instant::now();
     let mut by_owner: Vec<(u32, u32, u32, u32)> = order
         .iter()
         .enumerate()
@@ -1205,7 +1284,9 @@ fn build_delta_sections(
         SectionId::RecordsByOwner,
         encode_framed(TableId::Records, generation, by_owner.len() as u64, &buf).0,
     ));
+    section_elapsed_ms.insert("records.by_owner", t.elapsed().as_millis() as u64);
 
+    let t = Instant::now();
     let mut by_name: Vec<(u32, u32)> = order
         .iter()
         .enumerate()
@@ -1225,7 +1306,9 @@ fn build_delta_sections(
         SectionId::RecordsByName,
         encode_framed(TableId::Records, generation, by_name.len() as u64, &buf).0,
     ));
+    section_elapsed_ms.insert("records.by_name", t.elapsed().as_millis() as u64);
 
+    let t = Instant::now();
     let mut by_kind: Vec<(u16, u8, u16, u32)> = order
         .iter()
         .enumerate()
@@ -1246,7 +1329,9 @@ fn build_delta_sections(
         SectionId::RecordsByKind,
         encode_framed(TableId::Records, generation, by_kind.len() as u64, &buf).0,
     ));
+    section_elapsed_ms.insert("records.by_kind", t.elapsed().as_millis() as u64);
 
+    let t = Instant::now();
     let mut by_identity: Vec<([u8; 32], u32)> = order
         .iter()
         .enumerate()
@@ -1262,7 +1347,9 @@ fn build_delta_sections(
         SectionId::RecordsByIdentity,
         encode_framed(TableId::Records, generation, by_identity.len() as u64, &buf).0,
     ));
+    section_elapsed_ms.insert("records.by_identity", t.elapsed().as_millis() as u64);
 
+    let t = Instant::now();
     let mut adj_out: Vec<(u32, u32, u32, u32)> = order
         .iter()
         .enumerate()
@@ -1284,7 +1371,9 @@ fn build_delta_sections(
         SectionId::AdjOut,
         encode_framed(TableId::Records, generation, adj_out.len() as u64, &buf).0,
     ));
+    section_elapsed_ms.insert("adj.out", t.elapsed().as_millis() as u64);
 
+    let t = Instant::now();
     let mut adj_in: Vec<(u32, u32, u32, u32)> = order
         .iter()
         .enumerate()
@@ -1306,41 +1395,48 @@ fn build_delta_sections(
         SectionId::AdjIn,
         encode_framed(TableId::Records, generation, adj_in.len() as u64, &buf).0,
     ));
+    section_elapsed_ms.insert("adj.in", t.elapsed().as_millis() as u64);
 
     // F4 4.3: `entities.index` -- same exclusion/ordinal convention as the
     // base writers (`segment_io::write_hot_and_secondary_files[_partitioned]`);
     // `full_dicts` (not `dict_additions`) because a delta's OWN new words
     // are a suffix of it and `"jsts:entity_inferred_type"` was almost
     // always interned by an earlier generation already.
-    let inferred_type_kind_id = inferred_type_kind_id(full_dicts);
-    let mut entities_index: Vec<(u32, u32, u32)> = order
-        .iter()
-        .enumerate()
-        .filter_map(|(k, &i)| {
-            let r = &opened_rows[i as usize];
-            is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id).then_some((
-                r.owner_artifact,
-                r.span_start_byte,
-                k as u32,
-            ))
-        })
-        .collect();
-    entities_index.sort_unstable();
-    let mut buf = Vec::with_capacity(entities_index.len() * TRIPLE_STRIDE);
-    for (a, b, c) in &entities_index {
-        buf.extend_from_slice(&a.to_le_bytes());
-        buf.extend_from_slice(&b.to_le_bytes());
-        buf.extend_from_slice(&c.to_le_bytes());
-    }
+    let t = Instant::now();
+    let (entities_index_row_count, buf) =
+        if diag_skip_entities_index() {
+            (0u64, Vec::new())
+        } else {
+            let inferred_type_kind_id = inferred_type_kind_id(full_dicts);
+            let mut entities_index: Vec<(u32, u32, u32)> =
+                order
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, &i)| {
+                        let r = &opened_rows[i as usize];
+                        is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id)
+                            .then_some((r.owner_artifact, r.span_start_byte, k as u32))
+                    })
+                    .collect();
+            // A2 (2026-09-05): see `segment_io`'s identical comment -- packed
+            // `(owner, start)` primary key, `ordinal` kept as an explicit
+            // secondary key so the total order matches the old `sort_unstable()`
+            // over the full 3-tuple exactly.
+            entities_index.sort_unstable_by_key(|t| (((t.0 as u64) << 32) | t.1 as u64, t.2));
+            let mut buf = Vec::with_capacity(entities_index.len() * TRIPLE_STRIDE);
+            for (a, b, c) in &entities_index {
+                let mut rec = [0u8; TRIPLE_STRIDE];
+                rec[0..4].copy_from_slice(&a.to_le_bytes());
+                rec[4..8].copy_from_slice(&b.to_le_bytes());
+                rec[8..12].copy_from_slice(&c.to_le_bytes());
+                buf.extend_from_slice(&rec);
+            }
+            (entities_index.len() as u64, buf)
+        };
+    section_elapsed_ms.insert("entities.index", t.elapsed().as_millis() as u64);
     sections.push((
         SectionId::EntitiesIndex,
-        encode_framed(
-            TableId::Records,
-            generation,
-            entities_index.len() as u64,
-            &buf,
-        )
-        .0,
+        encode_framed(TableId::Records, generation, entities_index_row_count, &buf).0,
     ));
 
     // -- deps.keys/meta/reverse --
@@ -1503,6 +1599,40 @@ fn build_delta_sections(
             )
             .0,
         ));
+    }
+
+    // A1 (2026-09-05, Frente A): one grep-able line, same field order as
+    // the base writers' own lines (`hot` here covers records.keys/meta/
+    // digests/body/ident together, matching `writer::SegmentWriter::write_
+    // base_with_pending`'s "hot=" meaning).
+    if debug_timing {
+        eprintln!(
+            "[urdira-structural-store] delta write: hot={}ms by_owner={}ms by_name={}ms by_kind={}ms by_identity={}ms adj.out={}ms adj.in={}ms entities.index={}ms rows={}",
+            section_elapsed_ms.get("hot").copied().unwrap_or(0),
+            section_elapsed_ms
+                .get("records.by_owner")
+                .copied()
+                .unwrap_or(0),
+            section_elapsed_ms
+                .get("records.by_name")
+                .copied()
+                .unwrap_or(0),
+            section_elapsed_ms
+                .get("records.by_kind")
+                .copied()
+                .unwrap_or(0),
+            section_elapsed_ms
+                .get("records.by_identity")
+                .copied()
+                .unwrap_or(0),
+            section_elapsed_ms.get("adj.out").copied().unwrap_or(0),
+            section_elapsed_ms.get("adj.in").copied().unwrap_or(0),
+            section_elapsed_ms
+                .get("entities.index")
+                .copied()
+                .unwrap_or(0),
+            opened_rows.len(),
+        );
     }
 
     Ok(sections)
