@@ -55,6 +55,23 @@ function manifestDigestOf(manifest: Record<string, unknown>): string {
   return digestBytes(canonicalBytes(rest));
 }
 
+/** Perf-gate bound for the scale tests below (plan 3.2): v8 coverage
+ * instrumentation (`vitest run --coverage`) runs roughly 3x slower than a
+ * plain run, and both of this file's OFFSET-regression gates were
+ * originally tuned against an uninstrumented baseline. Rather than hand-
+ * tuning a dedicated `*_BOUND_MS` override for every such gate forever, an
+ * explicit override env var still wins when set (keeps the "controlled
+ * profiling without editing the test" escape hatch these gates already
+ * documented), but absent one, `URDIRA_COVERAGE_RUN` (set by the
+ * `test:coverage` script) doubles the plain-run base automatically -- one
+ * flag instead of a per-gate variable. */
+function perfBoundMs(overrideEnvVar: string, baseMs: number): number {
+  const override = process.env[overrideEnvVar];
+  if (override !== undefined) return Number(override);
+  const underCoverage = process.env["URDIRA_COVERAGE_RUN"] !== undefined;
+  return underCoverage ? baseMs * 2 : baseMs;
+}
+
 interface Fixture {
   readonly dataRoot: string;
   readonly donorRoot: string;
@@ -524,7 +541,7 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
     // regression signal: the known OFFSET implementation took 87.8s on this
     // fixture, whereas the keyset implementation stays below this 45s gate.
     // The override supports controlled profiling without editing the test.
-    const PERF_BOUND_MS = Number(process.env["URDIRA_PACK_IDENTITY_BOUND_MS"] ?? 45_000);
+    const PERF_BOUND_MS = perfBoundMs("URDIRA_PACK_IDENTITY_BOUND_MS", 45_000);
 
     const fixture = await buildReadyDonorAndExport("perf-scale");
     const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-perf-scale-target-"));
@@ -621,7 +638,7 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
     // (URDIRA_PACK_SCALE_ROWS, with URDIRA_STORAGE_DEBUG_TIMING=1 for the
     // per-bucket breakdown).
     const N_SYNTHETIC_RECORDS = Number(process.env["URDIRA_PACK_SCALE_ROWS"] ?? 150_000);
-    const PERF_BOUND_MS = Number(process.env["URDIRA_PACK_SCALE_BOUND_MS"] ?? 60_000);
+    const PERF_BOUND_MS = perfBoundMs("URDIRA_PACK_SCALE_BOUND_MS", 60_000);
 
     const fixture = await buildReadyDonorAndExport("perf-codec");
     const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-perf-codec-target-"));

@@ -117,6 +117,12 @@ function freshDeltaFor(files: readonly AnalyzerFile[], rootNames: readonly strin
   return buildJavascriptTypescriptFactDelta(input);
 }
 
+// Every `it` below carries an explicit 30_000ms timeout (plan 3.2), not the
+// 5s default: the slowest of these (the whole-project-analysis cache-reuse
+// test) already measures ~1.5s on an idle machine, and v8 coverage
+// instrumentation (`vitest run --coverage`) roughly triples that -- an
+// incidental timeout flake under `pnpm test:coverage` at the 5s default,
+// documented in docs/evidence/2026-09-04-v4-p4-b-prep-health.md Part 3.
 describe("JavaScript/TypeScript worker analysis cache", () => {
   it("keeps structural stage 1 syntax-only for a large corpus", async () => {
     const files = Array.from({ length: 512 }, (_, index): AnalyzerFile => ({
@@ -135,7 +141,7 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
     } finally {
       await worker.terminate();
     }
-  });
+  }, 30_000);
 
   it("keeps a large stage-1 closure scan lightweight and rebuilds only the bounded owner view", async () => {
     const files = Array.from({ length: 512 }, (_, index): AnalyzerFile => ({
@@ -167,7 +173,7 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
     } finally {
       await worker.terminate();
     }
-  });
+  }, 30_000);
 
   it("reuses a single cached whole-project analysis across analyze_artifact calls for different owners without cross-contamination", async () => {
     const files = await fixtureFiles();
@@ -191,7 +197,7 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
     } finally {
       await worker.terminate();
     }
-  });
+  }, 30_000);
 
   it("computes the expensive whole-project analysis only once across N invoke() calls with the same effective inputs", async () => {
     const files = await fixtureFiles();
@@ -208,7 +214,7 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
     } finally {
       await worker.terminate();
     }
-  });
+  }, 30_000);
 
   it("rebuilds when the effective inputs genuinely change, and caches again afterwards", async () => {
     const files = await fixtureFiles();
@@ -233,7 +239,7 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
     } finally {
       await worker.terminate();
     }
-  });
+  }, 30_000);
 
   it("clears the cache on terminate so a fresh worker never reuses a prior instance's analysis", async () => {
     const files = await fixtureFiles();
@@ -248,7 +254,7 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
     await secondWorker.invoke(analyzeRequest(files, rootNames, owner.path));
     await secondWorker.terminate();
     expect(analysisBuildCount).toBe(2);
-  });
+  }, 30_000);
 
   // Phase 5.1: the worker's subset-reuse contract (`isSubsetOfCache`,
   // `packages/plugin-javascript-typescript/src/worker.ts`). A full-corpus
@@ -290,7 +296,7 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
     } finally {
       await worker.terminate();
     }
-  });
+  }, 30_000);
 
   it("rebuilds (does not subset-reuse) when a file inside the narrowed subset has actually changed", async () => {
     const files = await fixtureFiles();
@@ -318,7 +324,7 @@ describe("JavaScript/TypeScript worker analysis cache", () => {
     } finally {
       await worker.terminate();
     }
-  });
+  }, 30_000);
 });
 
 // P3-3b: the host-side pre-seed (`apps/urdira/src/index.ts`) writes the
@@ -384,7 +390,7 @@ describe("P3-3b host pre-seed of the worker's durable syntax-dependency-graph ca
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("a correctly pre-seeded graph (no tamper) matches exactly what the worker would have built itself", async () => {
     const dir = await temporaryCacheDir();
@@ -409,7 +415,7 @@ describe("P3-3b host pre-seed of the worker's durable syntax-dependency-graph ca
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("falls back safely (no pre-seed, worker builds normally) when the corpus is below the large-corpus threshold", async () => {
     const dir = await temporaryCacheDir();
@@ -437,5 +443,5 @@ describe("P3-3b host pre-seed of the worker's durable syntax-dependency-graph ca
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

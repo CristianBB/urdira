@@ -3870,6 +3870,16 @@ fn run_jsts_generation(
     let cancellation = core.cancellation();
     let cancelled = cancellation.atomic();
     let syntax_started = Instant::now();
+    // In-process caller (Rust -> Rust, no IPC frame): the envelope's
+    // `budgets` comes straight from TS and never sets `enforce_output_
+    // bytes` (the TS side has no reason to know about it), so the override
+    // happens here rather than in TS -- skip the serialize-and-measure pass
+    // `analyze` would otherwise run just to compare against `max_output_
+    // bytes` (plan 3.1). Only the stdio binary's IPC path needs the guard.
+    let budgets = AnalysisBudgets {
+        enforce_output_bytes: false,
+        ..input.budgets
+    };
     let analysis = syntax
         .analyze(
             format!("{}:syntax", request.operation_id),
@@ -3880,7 +3890,7 @@ fn run_jsts_generation(
             input.files.clone(),
             input.config_assets.clone(),
             request.change_set.clone(),
-            input.budgets,
+            budgets,
             &cancelled,
         )
         .map_err(|error| CoreError(format!("JS/TS syntax analysis failed: {}", error.message)))?;

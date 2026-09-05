@@ -14,7 +14,7 @@
 #![cfg(test)]
 
 use super::timings::ScanClock;
-use super::{analyze, catalog, materialize, publish, scan};
+use super::{analyze, catalog, materialize, publish, residual, scan};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use urdira_jsts_syntax_worker::SyntaxWorkerState;
@@ -3120,12 +3120,12 @@ fn inspect_store_record_histogram() {
     // with-target (P2-2j candidate rows) breakdown, and the store-wide
     // "no relation record without target" invariant count -- see
     // `residual.rs`'s `is_classification_consistent`/`count_
-    // classification_mismatches` for the same rule, reimplemented here
-    // (this module cannot import a private `residual` item).
-    let indirect_bit = dicts
-        .facet_names
-        .iter()
-        .position(|name| name == "core:indirect");
+    // classification_mismatches` for the same rule. Plan 3.4 (this task):
+    // the confirmed/possible split itself now calls `residual::
+    // classify_confirmed_possible` (extracted from `residual.rs`'s own
+    // `print_confirmed_possible_histogram`, `pub(crate)` specifically so
+    // this module no longer has to reimplement it) instead of a second,
+    // independently-hand-written copy of the same facet-bit check.
     let mut call_confirmed = 0u64;
     let mut call_possible_with_target = 0u64;
     let mut relation_without_target = 0u64;
@@ -3209,12 +3209,11 @@ fn inspect_store_record_histogram() {
                 }
             }
             if universal_kind == "core:call" {
-                let is_candidate = indirect_bit
-                    .map(|bit| (view.facets() & (1u64 << bit)) != 0)
-                    .unwrap_or(false);
-                match (view.target_subject().is_some(), is_candidate) {
-                    (true, false) => call_confirmed += 1,
-                    (true, true) => call_possible_with_target += 1,
+                match residual::classify_confirmed_possible(&view, &dicts) {
+                    Some((residual::SiteFamily::Call, true)) => call_confirmed += 1,
+                    Some((residual::SiteFamily::Call, false)) => {
+                        call_possible_with_target += 1;
+                    }
                     _ => {}
                 }
             }

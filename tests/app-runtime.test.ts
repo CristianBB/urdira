@@ -664,12 +664,21 @@ describe("Urdira application runner: real multi-file JavaScript/TypeScript works
       expect(secondQuery.outcome).toBe("success");
       expect(recordNames(secondQuery.payload)).toEqual(expect.arrayContaining(["TaskService", "TaskRepository", "InMemoryTaskRepository"]));
 
-      console.log(`[app-runtime pooled-rescan timing] first=${firstMs.toFixed(0)}ms second=${secondMs.toFixed(0)}ms`);
-      // Progressive publication performs up to three ordered atomic passes on
-      // each scan.  A pooled content-only rescan should still complete within
-      // that bounded staged-work envelope rather than asserting a brittle
-      // absolute wall-time win against a warm, noisy first sample.
-      expect(secondMs).toBeLessThan(firstMs * 3);
+      // No wire-protocol-safe or cross-process-boundary signal exists for
+      // "the pooled worker was reused" (see this test's own top comment,
+      // and `AnalysisWorkerPool`, `apps/urdira/src/analysis-worker-pool.ts`
+      // -- its instance is a local inside `defaultDaemonOptions`, and
+      // `DaemonRuntimeOptions` only exposes the `evict`/`closeAll` closures,
+      // never a `size`/`active` getter). Searched for one (plan 3.2) and
+      // found none without widening this test's own scope into daemon/app
+      // production code, so this asserts the weakest ratio-free invariant
+      // that is still true regardless of contention noise -- an
+      // incremental, pooled rescan is faster than a cold one -- and reports
+      // the actual ratio as a diagnostic only, not an assertion, so a CI
+      // run under load never flakes on an arbitrary multiplier.
+      const speedupRatio = firstMs / secondMs;
+      console.info(`[app-runtime pooled-rescan timing] first=${firstMs.toFixed(0)}ms second=${secondMs.toFixed(0)}ms speedup=${speedupRatio.toFixed(2)}x`);
+      expect(secondMs).toBeLessThan(firstMs);
     } finally {
       if (runtime) await runtime.stop();
       await rm(dataRoot, { recursive: true, force: true });
