@@ -77,12 +77,14 @@ describeIfBuilt("v4 index pack export/import (task-planner fixture)", () => {
     if (dataDir !== undefined) rmSync(dataDir, { recursive: true, force: true });
   });
 
-  // 20s, not the 5s default: this export+import+verify round trip measured
+  // 60s, not the 5s default: this export+import+verify round trip measured
   // 3.14-4.40s on an idle machine (docs/evidence/2026-09-04-v4-p4-b-prep-
   // health.md Part 2, item #3) but timed out at the 5s default under
   // full-suite CPU load (19+ files' worth of real native-addon scans
-  // running concurrently in the same vitest process) -- ~5x the idle max
-  // gives headroom for that contention without masking a genuine hang.
+  // running concurrently in the same vitest process). A prior fix bumped
+  // this to 20s (~5x the idle max); widened further to an explicit 60_000
+  // (plan 3.2) since this session runs under heavier-than-usual multi-agent
+  // CPU contention (concurrent cargo builds from sibling worktrees).
   it("round-trips a v4 workspace through export -> import with verified roots", async () => {
     const { exportV4IndexPack, importV4IndexPack } = (await import(resolve(repoRoot, "packages/engine/dist/index-pack.js"))) as typeof import("../packages/engine/src/index-pack.js");
     const { verifyV4Workspace } = await import(resolve(repoRoot, "packages/engine/dist/v4-verify.js"));
@@ -109,9 +111,9 @@ describeIfBuilt("v4 index pack export/import (task-planner fixture)", () => {
     } finally {
       await database.close();
     }
-  }, 20_000);
+  }, 60_000);
 
-  // Same 20s rationale as the round-trip tests below: this exports the WHOLE
+  // Same 60s rationale as the round-trip tests below: this exports the WHOLE
   // structural store before truncating it, so it carries the identical
   // full-suite CPU-contention risk under the 5s default.
   it("catches a truncated pack file", async () => {
@@ -125,9 +127,9 @@ describeIfBuilt("v4 index pack export/import (task-planner fixture)", () => {
     const targetDatabasePath = resolve(dataDir, "target-truncated", "workspace.sqlite");
     const targetStructuralRoot = resolve(dataDir, "target-truncated", "structural");
     await expect(importV4IndexPack({ packPath: truncatedPath, targetDatabasePath, targetStructuralRoot })).rejects.toThrow();
-  }, 20_000);
+  }, 60_000);
 
-  // Same 20s rationale as the main round-trip test above: this exports and
+  // Same 60s rationale as the main round-trip test above: this exports and
   // re-imports the WHOLE structural store (not just the sidecar file), so it
   // carries the identical full-suite CPU-contention risk under the 5s default.
   it("round-trips a sidecar/ entry when both sidecarRoot (export) and targetSidecarRoot (import) are given", async () => {
@@ -148,9 +150,9 @@ describeIfBuilt("v4 index pack export/import (task-planner fixture)", () => {
 
     const copied = await readFile(resolve(targetSidecarRoot, "lexical.marker"), "utf8");
     expect(copied).toBe("lexical-fixture");
-  }, 20_000);
+  }, 60_000);
 
-  // Same 20s rationale as the round-trip tests above: this exports the
+  // Same 60s rationale as the round-trip tests above: this exports the
   // WHOLE structural store (plus a sidecar entry) before the import
   // rejection, so it carries the identical full-suite CPU-contention risk
   // under the 5s default -- measured flaking under `pnpm test:coverage`
@@ -171,7 +173,7 @@ describeIfBuilt("v4 index pack export/import (task-planner fixture)", () => {
     // the pack's own "sidecar/..." entries rather than silently dropping
     // them or writing them somewhere unintended.
     await expect(importV4IndexPack({ packPath, targetDatabasePath, targetStructuralRoot })).rejects.toThrow(/targetSidecarRoot/);
-  }, 20_000);
+  }, 60_000);
 
   it("rejects an entry path outside the known workspace.sqlite/structural/sidecar roots (malformed or hand-crafted pack)", async () => {
     const { importV4IndexPack } = (await import(resolve(repoRoot, "packages/engine/dist/index-pack.js"))) as typeof import("../packages/engine/src/index-pack.js");
