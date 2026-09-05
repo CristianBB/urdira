@@ -184,21 +184,25 @@ pub struct ResidualPassConfig {
     /// so a caller that only wants call/heritage resolution (a bench, or a
     /// test exercising just that half) pays no extra RPC cost.
     pub fetch_semantics: bool,
-    /// F4 4.2 (revised C.1, 2026-09-05): a wall-clock point past which
-    /// `run_lane` stops doing new work. Contract: **the deadline is checked
-    /// at the start of each window, and again between roots of the
-    /// semantics fetch** — never mid-RPC (an `updateSnapshot`/`resolve`/
+    /// F4 4.2 (revised C.1, 2026-09-05; revised again same day after a live
+    /// n8n budget-overshoot finding): a wall-clock point past which
+    /// `run_lane` stops doing new work. Contract: **the deadline is
+    /// checked at the start of each window (a), between OWNER GROUPS
+    /// inside `ResidualResolver::resolve_with_deadline` (c), and between
+    /// roots of the semantics fetch (b)** — never mid-RPC (an
+    /// `updateSnapshot`/one owner group's batched `getSymbolsAtLocations`/
     /// single-root semantics fetch already in flight always finishes; this
     /// never aborts one). The maximum overrun past the cutoff is therefore
-    /// one tsgo request (tens of milliseconds), not one whole window
-    /// (~1-2s on the n8n corpus, `WindowPlan::DEFAULT_WINDOW_SIZE` = 512
-    /// owners × 4 semantics requests each) — the pre-C.1 behavior only
-    /// checked at the START of each window (see `run_lane`'s two check
-    /// points, tagged `(a)` and `(b)` in its own comments). `None` means
-    /// unbounded (the pre-4.2 behavior, and `URDIRA_V4_RESIDUAL_BUDGET_MS=0`'s
-    /// meaning). Every lane checks against the SAME `Instant` (computed
-    /// once by the caller before spawning lanes), not a per-lane budget —
-    /// a slow lane stopping early does not entitle a fast lane to keep
+    /// one tsgo request (tens of milliseconds for a snapshot or single-root
+    /// semantics fetch; up to a few SECONDS for one owner group's own
+    /// `getSymbolsAtLocations` batch, the actual budget-overshoot culprit
+    /// diagnosed live on the n8n corpus — see `resolve_with_deadline`'s own
+    /// doc comment), not one whole window (the pre-C.1 behavior only
+    /// checked at the START of each window). `None` means unbounded (the
+    /// pre-4.2 behavior, and `URDIRA_V4_RESIDUAL_BUDGET_MS=0`'s meaning).
+    /// Every lane checks against the SAME `Instant` (computed once by the
+    /// caller before spawning lanes), not a per-lane budget — a slow lane
+    /// stopping early does not entitle a fast lane to keep
     /// going past the shared wall-clock cutoff.
     pub deadline: Option<Instant>,
 }
@@ -246,6 +250,18 @@ pub struct WindowStats {
     pub window_index: usize,
     pub roots: usize,
     pub snapshot_ms: f64,
+    /// C.1 budget-overshoot diagnosis (2026-09-05): wall time of the
+    /// `ResidualResolver::resolve` call alone (call/heritage resolution,
+    /// check point `(c)` — deliberately NOT deadline-gated, see
+    /// `ResidualPassConfig::deadline`'s own doc comment). `0.0` when
+    /// `window_sites` was empty (`resolve` never called at all).
+    pub resolve_ms: f64,
+    /// C.1 budget-overshoot diagnosis: wall time of this window's ENTIRE
+    /// `fetch_semantics` loop (every root's `get_source_file` +
+    /// `fetch_exported_types` + `fetch_owner_diagnostics`), including any
+    /// time spent on roots before check point `(b)` cut it short. `0.0`
+    /// when `ResidualPassConfig::fetch_semantics` is `false`.
+    pub semantics_ms: f64,
     pub sites_resolved: usize,
     /// The lane's child tsgo process id, sampled right after this window's
     /// `updateSnapshot` returned (`crate::residual_pass::sample_rss_kb`) —
@@ -513,6 +529,8 @@ fn run_lane(
                 window_sites.extend(sites.iter().cloned());
             }
         }
+        let resolve_started = std::time::Instant::now();
+        let mut resolve_deadline_hit = false;
         if !window_sites.is_empty() {
             let mut resolver = ResidualResolver::new(
                 &client,
@@ -520,21 +538,60 @@ fn run_lane(
                 snapshot.snapshot,
                 project.clone(),
             );
-            let resolutions = resolver.resolve(&window_sites);
-            for (site, resolution) in window_sites.iter().zip(resolutions) {
+            let (attempted, skipped_owners) =
+                resolver.resolve_with_deadline(&window_sites, config.deadline);
+            for (index, resolution) in attempted {
+                let site = &window_sites[index];
                 out.push(classify(site, resolution, layered.as_ref(), &mut lib_texts));
             }
+            resolve_deadline_hit = !skipped_owners.is_empty();
         }
+        let resolve_ms = resolve_started.elapsed().as_secs_f64() * 1000.0;
 
         stats.windows.push(WindowStats {
             lane: lane_index,
             window_index: window.index,
             roots: window.roots.len(),
             snapshot_ms,
+            resolve_ms,
+            // Filled in below once the semantics loop finishes (or is cut
+            // short by check point (b)) -- `0.0` if `fetch_semantics` is
+            // `false`, in which case the loop never runs at all, or if
+            // check point (c) below fires (semantics never starts).
+            semantics_ms: 0.0,
             sites_resolved: window_sites.len(),
             child_rss_kb: sample_rss_kb(client.pid()),
             partial: false,
         });
+
+        // C.1 budget-overshoot fix (2026-09-05): check point (c) --
+        // `ResidualResolver::resolve_with_deadline` cut this window's OWN
+        // call/heritage resolution short (a single owner group's batched
+        // `getSymbolsAtLocations` calls routinely cost multiple seconds on
+        // a real corpus, the actual overshoot culprit -- see that
+        // method's own doc comment). Resolutions already attempted stay
+        // in `out` untouched (same "never filtered" precedent as check
+        // points (a)/(b)); this window's semantics fetch never starts at
+        // all, and EVERY root of this window (including the ones that DID
+        // resolve) goes to `remaining_roots` -- re-resolving an
+        // already-closed `pending.sites` row next round is idempotent
+        // (same argument check point (b)'s own comment makes), and this
+        // window still needs its semantics fetch done regardless. No
+        // further windows open after this one.
+        if resolve_deadline_hit {
+            stats.truncated = true;
+            stats.remaining_roots.extend(window.roots.iter().cloned());
+            for remaining_window in &windows[position + 1..] {
+                stats
+                    .remaining_roots
+                    .extend(remaining_window.roots.iter().cloned());
+            }
+            if let Some(last) = stats.windows.last_mut() {
+                last.partial = true;
+            }
+            let _ = client.release(snapshot.snapshot);
+            break 'windows;
+        }
 
         // Decision 28's "inferred types + compiler diagnostics" task: on
         // the SAME snapshot this window just resolved its call/heritage
@@ -545,6 +602,7 @@ fn run_lane(
         // calls yet still have exported declarations needing a type (see
         // `ResidualPassConfig::fetch_semantics`'s own doc comment).
         if config.fetch_semantics {
+            let semantics_started = std::time::Instant::now();
             for (root_index, root) in window.roots.iter().enumerate() {
                 // C.1 check point (b): checked at the START of each root's
                 // own semantics fetch, never mid-RPC -- a root already
@@ -571,6 +629,7 @@ fn run_lane(
                     }
                     if let Some(last) = stats.windows.last_mut() {
                         last.partial = true;
+                        last.semantics_ms = semantics_started.elapsed().as_secs_f64() * 1000.0;
                     }
                     let _ = client.release(snapshot.snapshot);
                     break 'windows;
@@ -608,6 +667,11 @@ fn run_lane(
                         site,
                     });
                 }
+            }
+            // The loop above ran to completion (no `break 'windows`) --
+            // record the full semantics-loop duration.
+            if let Some(last) = stats.windows.last_mut() {
+                last.semantics_ms = semantics_started.elapsed().as_secs_f64() * 1000.0;
             }
         }
 
