@@ -4821,6 +4821,368 @@ mod tests {
         }
     }
 
+    /// C.2: exercises [`schedule`]'s REAL re-trigger mechanism (F4 4.2) end
+    /// to end on the n8n corpus -- until this test, only the pure, synthetic
+    /// `splitting_the_plan_across_two_passes_matches_one_unbounded_pass`
+    /// (`urdira-tsgo-client`'s own `tests/residual_pass.rs`) exercised the
+    /// "truncate then resume" invariant; `schedule`'s own `bump_epoch`/
+    /// `should_reschedule_truncated`/`MAX_CONSECUTIVE_RESCHEDULES` wiring
+    /// had never been driven by a real truncated attempt.
+    ///
+    /// Cold-scans a real n8n corpus copy, then calls [`schedule`] ONCE --
+    /// the caller's shell must have `URDIRA_V4_RESIDUAL_BUDGET_MS=15000` set
+    /// (this crate is `#![forbid(unsafe_code)]`, so a test cannot itself
+    /// call `std::env::set_var`, same reason `n8n_residual_pass_debug_
+    /// histogram` above cannot set `URDIRA_V4_RESIDUAL_DEBUG` itself -- the
+    /// budget must come from the invoking shell) -- with a
+    /// [`ResidualEventTarget`] backed by an `mpsc` channel, then drains that
+    /// channel until an event reports `truncated == Some(false)` (full
+    /// convergence) or 300s pass, capturing every `UpgradeCompleted` event
+    /// `schedule`'s re-trigger chain emits along the way.
+    ///
+    /// Run: `URDIRA_TSGO_BINARY=<path> URDIRA_V4_N8N_CORPUS=<corpus>
+    /// URDIRA_V4_N8N_DATA=<fresh-dir> URDIRA_V4_RESIDUAL_BUDGET_MS=15000
+    /// URDIRA_DEBUG_TIMING=1 cargo test --release -p urdira-indexing-worker
+    /// v4::residual::tests::n8n_residual_schedule_resumes_after_truncation
+    /// -- --ignored --test-threads=1 --nocapture`.
+    #[test]
+    #[ignore]
+    fn n8n_residual_schedule_resumes_after_truncation() {
+        let (Ok(corpus), Ok(data_root)) = (
+            std::env::var("URDIRA_V4_N8N_CORPUS"),
+            std::env::var("URDIRA_V4_N8N_DATA"),
+        ) else {
+            eprintln!(
+                "set URDIRA_V4_N8N_CORPUS=<path> URDIRA_V4_N8N_DATA=<fresh-dir> to run this diagnostic"
+            );
+            return;
+        };
+        if std::env::var("URDIRA_V4_RESIDUAL_BUDGET_MS").as_deref() != Ok("15000") {
+            eprintln!(
+                "set URDIRA_V4_RESIDUAL_BUDGET_MS=15000 in the invoking shell -- this test cannot \
+                 set it itself (forbid(unsafe_code)) and relies on it to reliably truncate the \
+                 first attempt"
+            );
+            return;
+        }
+
+        let workspace_root =
+            crate::v4::tests_e2e::scratch_copy_of_n8n_corpus("n8n-residual-schedule", &corpus);
+        let data_root = PathBuf::from(&data_root);
+        std::fs::create_dir_all(&data_root).expect("create data root");
+        let database_path = data_root.join("workspace.sqlite");
+        let structural_root = data_root.join("structural");
+        let cas_root = data_root.join("cas");
+        let workspace_id = "workspace:n8n-residual-schedule".to_string();
+
+        let request = scan::ScanRequest {
+            request_id: "request:n8n-residual-schedule".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: data_root.join("sidecar").to_string_lossy().into_owned(),
+            scope: urdira_worker_protocol::ScanScope::Full,
+            registry_snapshot_id: "registry:n8n-residual-schedule".to_string(),
+            configuration_revision_id: "configuration:n8n-residual-schedule".to_string(),
+            resolution_lock_id: "resolution:n8n-residual-schedule".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = WorkerState::default();
+        let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+        let cold_started = std::time::Instant::now();
+        let cold_event = scan::run_with_residual(
+            request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("cold scan succeeds");
+        let base_generation = match cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+        eprintln!(
+            "[n8n_residual_schedule_resumes_after_truncation] cold scan wall={:.3}s generation={base_generation}",
+            cold_started.elapsed().as_secs_f64()
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let event_target = ResidualEventTarget {
+            stream_id: 0,
+            cancellation_id: "cancellation:n8n-residual-schedule".to_string(),
+            sender,
+        };
+        let context = ResidualContext {
+            request_id: "request:n8n-residual-schedule-upgrade".to_string(),
+            workspace_id,
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            registry_snapshot_id: "registry:n8n-residual-schedule".to_string(),
+            configuration_revision_id: "configuration:n8n-residual-schedule".to_string(),
+            resolution_lock_id: "resolution:n8n-residual-schedule".to_string(),
+            touched_owners: None,
+            reschedule_count: 0,
+        };
+
+        let schedule_started = std::time::Instant::now();
+        schedule(context, Some(event_target));
+
+        #[derive(Debug, Clone)]
+        struct Captured {
+            generation: u64,
+            truncated: Option<bool>,
+            windows_done: Option<u32>,
+            windows_total: Option<u32>,
+            checker_ms: Option<u64>,
+        }
+
+        let overall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let mut events: Vec<Captured> = Vec::new();
+        loop {
+            let remaining = overall_deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                remaining > std::time::Duration::ZERO,
+                "timed out after 300s waiting for schedule() to fully converge; captured so far: \
+                 {events:?}"
+            );
+            let (_stream_id, _cancellation_id, event) = receiver
+                .recv_timeout(remaining)
+                .expect("schedule()'s background thread should keep sending UpgradeCompleted events until it converges or hits the reschedule cap");
+            let IndexingEvent::UpgradeCompleted {
+                generation,
+                truncated,
+                windows_done,
+                windows_total,
+                checker_ms,
+                ..
+            } = event
+            else {
+                panic!("expected an UpgradeCompleted event, got {event:?}");
+            };
+            eprintln!(
+                "[n8n_residual_schedule_resumes_after_truncation] event #{} wall={:.3}s generation={generation} truncated={truncated:?} windows={windows_done:?}/{windows_total:?} checker_ms={checker_ms:?}",
+                events.len() + 1,
+                schedule_started.elapsed().as_secs_f64(),
+            );
+            let done = truncated == Some(false);
+            events.push(Captured {
+                generation,
+                truncated,
+                windows_done,
+                windows_total,
+                checker_ms,
+            });
+            if done || events.len() > MAX_CONSECUTIVE_RESCHEDULES as usize {
+                break;
+            }
+        }
+
+        assert!(
+            events.len() >= 2,
+            "expected at least one truncated attempt followed by a converging one, got {} \
+             event(s): {events:?}",
+            events.len()
+        );
+        eprintln!(
+            "[n8n_residual_schedule_resumes_after_truncation] schedule chain summary ({} events):",
+            events.len()
+        );
+        for (index, event) in events.iter().enumerate() {
+            eprintln!(
+                "  #{}: generation={} truncated={:?} windows={:?}/{:?} checker_ms={:?}",
+                index + 1,
+                event.generation,
+                event.truncated,
+                event.windows_done,
+                event.windows_total,
+                event.checker_ms,
+            );
+        }
+
+        let first = &events[0];
+        assert_eq!(
+            first.truncated,
+            Some(true),
+            "the first attempt should be cut off by the 15s budget on this corpus: {first:?}"
+        );
+        assert!(
+            first.windows_done < first.windows_total,
+            "a truncated first attempt should open fewer windows than its own plan total: \
+             {first:?}"
+        );
+        let last = events.last().expect("events is non-empty (asserted above)");
+        assert_eq!(
+            last.truncated,
+            Some(false),
+            "the last captured event should report full convergence (not a reschedule-cap \
+             bailout): {events:?}"
+        );
+        let generations: Vec<u64> = events.iter().map(|e| e.generation).collect();
+        let mut sorted_generations = generations.clone();
+        sorted_generations.sort_unstable();
+        sorted_generations.dedup();
+        assert_eq!(
+            generations.len(),
+            sorted_generations.len(),
+            "every re-scheduled attempt should publish a strictly NEW generation, never repeat \
+             one: {generations:?}"
+        );
+        assert_eq!(
+            generations, sorted_generations,
+            "generations should be strictly increasing in emission order: {generations:?}"
+        );
+
+        // F4 4.1/4.2's own correctness gate (§7 of the 2026-09-05 evidence):
+        // a truncated-then-resumed chain must publish EXACTLY what one
+        // unbounded pass would -- 161,794, the same figure recorded for both
+        // the B and C checkpoints in that evidence with zero tolerance (a
+        // difference here is a partial-pass idempotency bug, not noise).
+        let final_confirmed_combined =
+            print_confirmed_possible_histogram("FINAL", &structural_root, last.generation);
+        assert_eq!(
+            final_confirmed_combined, 161_794,
+            "confirmed_combined after schedule() fully converges via truncate-then-resume must \
+             match the unbounded pass's own figure exactly (2026-09-05 evidence §7)"
+        );
+    }
+
+    /// C.2 (second half of the plan's own item): the n8n version of the
+    /// synthetic `residual_emits_types_and_diagnostics_with_zero_pending_
+    /// sites` -- reopens the store this test's own preceding convergence
+    /// left behind (via `URDIRA_V4_N8N_DATA`, the SAME data root
+    /// `n8n_residual_schedule_resumes_after_truncation` just fully
+    /// converged, so this test must run AFTER it against the same data
+    /// root) and confirms decision 28's "always build file_map, always run
+    /// the checker pass" path still opens fresh `jsts:entity_inferred_type`/
+    /// `jsts:relation_type_of`/`jsts:diagnostic` rows for one real owner
+    /// even with ZERO pending call/heritage sites left anywhere in the
+    /// store.
+    ///
+    /// Run (after `n8n_residual_schedule_resumes_after_truncation` against
+    /// the SAME `URDIRA_V4_N8N_DATA`): `URDIRA_TSGO_BINARY=<path>
+    /// URDIRA_V4_N8N_DATA=<same-dir-as-above> cargo test --release -p
+    /// urdira-indexing-worker
+    /// v4::residual::tests::n8n_residual_second_pass_without_pending_sites
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn n8n_residual_second_pass_without_pending_sites() {
+        let Ok(data_root) = std::env::var("URDIRA_V4_N8N_DATA") else {
+            eprintln!(
+                "set URDIRA_V4_N8N_DATA=<data root n8n_residual_schedule_resumes_after_truncation \
+                 already fully converged> to run this diagnostic"
+            );
+            return;
+        };
+        let data_root = PathBuf::from(&data_root);
+        let database_path = data_root.join("workspace.sqlite");
+        let structural_root = data_root.join("structural");
+        let cas_root = data_root.join("cas");
+        let workspace_id = "workspace:n8n-residual-schedule".to_string();
+        let workspace_root = data_root.join("workspace");
+
+        let store = StoreReader::open(&structural_root).expect("existing store reopens");
+        let base_generation = store.generation();
+        let dicts = store.dictionaries();
+        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog reopens");
+        let frontier = Frontier::load(&conn, &workspace_id).expect("frontier reloads");
+        drop(conn);
+        let mut path_by_pair: HashMap<(String, String), String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            path_by_pair.insert(
+                (entry.artifact_id.clone(), entry.artifact_version_id.clone()),
+                path.clone(),
+            );
+        }
+        let owner_path_fn = |ordinal: u32| -> Option<String> {
+            dicts
+                .artifacts
+                .get(ordinal as usize)
+                .and_then(|pair| path_by_pair.get(pair))
+                .cloned()
+        };
+        let collected = collect(
+            &store,
+            &dicts,
+            &owner_path_fn,
+            &frontier,
+            base_generation,
+            false,
+        );
+        assert!(
+            collected.pending_by_owner.is_empty(),
+            "the store this test reopens should already have zero open pending.sites -- run \
+             n8n_residual_schedule_resumes_after_truncation against the SAME URDIRA_V4_N8N_DATA \
+             first: {} owner(s) still pending",
+            collected.pending_by_owner.len()
+        );
+
+        let mut jsts_owners: Vec<&String> = frontier
+            .present
+            .keys()
+            .filter(|path| is_jsts_source_path(path))
+            .collect();
+        jsts_owners.sort();
+        let touched_owner = jsts_owners
+            .first()
+            .expect("the n8n corpus has at least one jsts source file")
+            .to_string();
+
+        let context = ResidualContext {
+            request_id: "request:n8n-residual-schedule-second-pass".to_string(),
+            workspace_id,
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            registry_snapshot_id: "registry:n8n-residual-schedule".to_string(),
+            configuration_revision_id: "configuration:n8n-residual-schedule".to_string(),
+            resolution_lock_id: "resolution:n8n-residual-schedule".to_string(),
+            touched_owners: Some(vec![touched_owner.clone()]),
+            reschedule_count: 0,
+        };
+        let outcome = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
+            .expect("residual pass does not error")
+            .expect("residual pass always reports an outcome once file_map is non-empty");
+
+        eprintln!(
+            "[n8n_residual_second_pass_without_pending_sites] touched_owner={touched_owner} \
+             generation={} upgraded_sites={} inferred_type_entities={}",
+            outcome.generation, outcome.upgraded_sites, outcome.inferred_type_entities,
+        );
+        assert_eq!(
+            outcome.upgraded_sites, 0,
+            "there were zero pending call/heritage sites to begin with, so this pass should \
+             upgrade none: upgraded_sites={} inferred_type_entities={} generation={}",
+            outcome.upgraded_sites, outcome.inferred_type_entities, outcome.generation
+        );
+        assert!(
+            outcome.inferred_type_entities > 0,
+            "decision 28's inferred-types/diagnostics half should still run and find at least \
+             one exported declaration to type for {touched_owner}, even with zero pending sites: \
+             upgraded_sites={} inferred_type_entities={} generation={}",
+            outcome.upgraded_sites,
+            outcome.inferred_type_entities,
+            outcome.generation
+        );
+        assert_eq!(
+            outcome.generation,
+            base_generation + 1,
+            "a pass that opens ANY new row (inferred types here) publishes exactly one new \
+             generation: upgraded_sites={} inferred_type_entities={} generation={}",
+            outcome.upgraded_sites,
+            outcome.inferred_type_entities,
+            outcome.generation
+        );
+    }
+
     /// Decision 28's "inferred types" task, gate section: dumps `core:call`
     /// bodies for `scripts/v4-call-parity-diff.mjs` from an ALREADY-scanned
     /// n8n store (produced by a prior `n8n_residual_pass_debug_histogram`
@@ -5167,7 +5529,16 @@ mod tests {
     /// the SAME test run eliminates the cross-session drift the P1-D-c
     /// evidence doc could not rule out for its own 96,847-vs-64,931
     /// discrepancy.
-    fn print_confirmed_possible_histogram(label: &str, structural_root: &Path, generation: u64) {
+    /// C.2: returns `confirmed_combined` (`call_confirmed + heritage_
+    /// confirmed`) in addition to printing the histogram, so a caller
+    /// (`n8n_residual_schedule_resumes_after_truncation`) can assert on it
+    /// directly against the unbounded-pass figure recorded in evidence,
+    /// rather than only eyeballing stderr.
+    fn print_confirmed_possible_histogram(
+        label: &str,
+        structural_root: &Path,
+        generation: u64,
+    ) -> u64 {
         let store = StoreReader::open(structural_root).expect("store reopens for histogram");
         let dicts = store.dictionaries();
         let (mut call_confirmed, mut call_possible) = (0u64, 0u64);
@@ -5181,10 +5552,11 @@ mod tests {
                 None => {}
             }
         }
+        let confirmed_combined = call_confirmed + heritage_confirmed;
         eprintln!(
-            "[confirmed_possible_histogram] {label} generation={generation} core:call confirmed={call_confirmed} possible={call_possible} | heritage confirmed={heritage_confirmed} possible={heritage_possible} | confirmed_combined={}",
-            call_confirmed + heritage_confirmed,
+            "[confirmed_possible_histogram] {label} generation={generation} core:call confirmed={call_confirmed} possible={call_possible} | heritage confirmed={heritage_confirmed} possible={heritage_possible} | confirmed_combined={confirmed_combined}",
         );
+        confirmed_combined
     }
 
     /// P1-D-g deliverable 1's own invariant, printed at both the cold and
