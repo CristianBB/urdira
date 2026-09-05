@@ -908,12 +908,22 @@ fn run_one(
     }
     at_risk_external_entities.extend(&zombie_candidates);
 
+    // Q5 B.3: `adjacency_lookups` is exactly `at_risk_external_entities.
+    // len()` -- the rewritten `protected_external_entity_ids` (B.1) issues
+    // one `StoreReader::adjacency` call per `at_risk` id, no more, no
+    // fewer. `protection_us` times just that call, isolated from the
+    // at-risk/deleted/zombie passes that built its inputs (those are
+    // already covered, together with this, by the outer
+    // `close_protection_ms` below) -- so a bench can see how much of
+    // `close_protection_ms` this one call accounts for.
+    let protection_started = std::time::Instant::now();
     let protected_external_entities = protected_external_entity_ids(
         store_reader,
         prev_generation,
         &touched_owner_ordinals,
         &at_risk_external_entities,
     );
+    let protection_us = protection_started.elapsed().as_micros();
     // Every zombie candidate that found no protector must close NOW,
     // explicitly: unlike a rule-(a) at-risk identity (owned by a touched
     // owner, so simply excluding it from that owner's `prev` leaves it
@@ -925,11 +935,13 @@ fn run_one(
         .collect();
     if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() && !at_risk_external_entities.is_empty() {
         eprintln!(
-            "[urdira-indexing-worker] v4 delta DEBUG: external-entity close-protection: at_risk={} protected={} zombie_candidates={} zombie_closures={}",
+            "[urdira-indexing-worker] v4 delta DEBUG: external-entity close-protection: at_risk={} protected={} zombie_candidates={} zombie_closures={} adjacency_lookups={} protection_us={}",
             at_risk_external_entities.len(),
             protected_external_entities.len(),
             zombie_candidates.len(),
             zombie_closures.len(),
+            at_risk_external_entities.len(),
+            protection_us,
         );
     }
     clock.record_close_protection(close_protection_started.elapsed());
