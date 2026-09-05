@@ -46,8 +46,8 @@
 //! out of scope here too -- see the design doc's own E2b note.
 
 use crate::{
-    AmbientModuleDeclaration, AmbientModuleMember, EntityKind, SyntaxEntity, SyntaxExportBinding,
-    SyntaxFileResult,
+    AmbientGlobalDeclaration, AmbientModuleDeclaration, AmbientModuleMember, EntityKind,
+    SyntaxEntity, SyntaxExportBinding, SyntaxFileResult,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1379,6 +1379,16 @@ pub struct AmbientModuleIndex {
     /// through `by_specifier`'s literal-text match, same as before this
     /// wildcard support existed.
     patterns: Vec<(String, String, AmbientModuleDeclaration)>,
+    /// D.1 (2026-09-05, references-parity task): every workspace file's own
+    /// `SyntaxFileResult::ambient_globals`, keyed by NAME, in the same
+    /// `(declaring_path, declaration)` shape `by_specifier` uses -- see
+    /// `resolve_global`'s own doc comment for the lookup contract. Built in
+    /// `rebuild`'s SAME single pass over `files` (a `BTreeMap`, so each
+    /// name's `Vec` is naturally in ascending-path order -- `resolve_
+    /// global`'s own namespace-merge tie-break relies on exactly that
+    /// order, mirroring `resolve_direct_export`'s `FirstDeclaration`
+    /// policy).
+    globals: HashMap<String, Vec<(String, AmbientGlobalDeclaration)>>,
 }
 
 impl AmbientModuleIndex {
@@ -1397,8 +1407,10 @@ impl AmbientModuleIndex {
         let mut by_specifier: HashMap<String, Vec<(String, AmbientModuleDeclaration)>> =
             HashMap::new();
         let mut patterns: Vec<(String, String, AmbientModuleDeclaration)> = Vec::new();
+        let mut globals: HashMap<String, Vec<(String, AmbientGlobalDeclaration)>> = HashMap::new();
         let mut script_count = 0u64;
         let mut augmentation_count = 0u64;
+        let mut global_count = 0u64;
         for (path, file) in files {
             for declaration in &file.ambient_modules {
                 if declaration.is_augmentation {
@@ -1418,17 +1430,32 @@ impl AmbientModuleIndex {
                     .or_default()
                     .push((path.clone(), declaration.clone()));
             }
+            // D.1 (2026-09-05, references-parity task): `file.ambient_
+            // globals` is already fully filtered/deduped by `parse_source`
+            // (ScriptTopLevel candidates dropped for a module file,
+            // DeclareGlobal always kept) -- every remaining entry here is a
+            // real global-scope candidate, pushed in this SAME `files`
+            // iteration order (a `BTreeMap`, ascending by path).
+            for declaration in &file.ambient_globals {
+                global_count += 1;
+                globals
+                    .entry(declaration.name.clone())
+                    .or_default()
+                    .push((path.clone(), declaration.clone()));
+            }
         }
         if std::env::var_os("URDIRA_V4_DEBUG_AMBIENT_MODULES").is_some() {
             eprintln!(
-                "[AmbientModuleIndex::rebuild] script_declarations={script_count} (exact_specifiers={} wildcard_specifiers={}) module_augmentations_ignored={augmentation_count}",
+                "[AmbientModuleIndex::rebuild] script_declarations={script_count} (exact_specifiers={} wildcard_specifiers={}) module_augmentations_ignored={augmentation_count} ambient_globals={global_count} (unique_names={})",
                 by_specifier.len(),
                 patterns.len(),
+                globals.len(),
             );
         }
         Self {
             by_specifier,
             patterns,
+            globals,
         }
     }
 
@@ -1548,6 +1575,62 @@ impl AmbientModuleIndex {
             }
         }
     }
+
+    /// D.1 (2026-09-05, references-parity task): resolve a bare identifier
+    /// `name` that reached `resolve_identifier_reference` with NO oxc scope
+    /// binding at all (`REASON_UNRESOLVED_GLOBAL`'s own condition) against
+    /// every workspace file's own ambient-global declarations. `Absent`
+    /// (no declaring file at all) is the exact same outcome as before this
+    /// task -- stays `checker_pending`. `Unique` when exactly one distinct
+    /// `entity_id` claims this name workspace-wide (either a single
+    /// declaring file, or several declaring the SAME entity -- never
+    /// happens by construction, since `entity_id` embeds the declaring
+    /// path/position, but checked via a `BTreeSet` of ids rather than a
+    /// raw count for robustness). Otherwise `Ambiguous`, UNLESS every
+    /// candidate is a namespace merge (`EntityKind::Namespace`, the
+    /// `jest`/`globalThis`-shaped case this task closes): TypeScript's own
+    /// `valueDeclaration ?? declarations[0]` rule applies there too, same
+    /// as `resolve_direct_export`'s `ExportPolicy::FirstDeclaration` (see
+    /// `first_declaration_merge_target`'s own doc comment for the single-
+    /// file version of this exact rule) -- the FIRST declaration in
+    /// `globals`' own insertion order, which is `rebuild`'s `files`
+    /// iteration order (`BTreeMap`, ascending by path) followed by each
+    /// file's own `ambient_globals` source order, i.e. "first declaring
+    /// path, first declaration in that file" -- never a guess for any
+    /// other kind mismatch (a `namespace X` merged with a `class X`, for
+    /// instance, stays `Ambiguous`: no value declaration exists to prefer
+    /// the way `resolve_direct_export`'s single-file version can).
+    pub fn resolve_global(&self, name: &str) -> GlobalLookup {
+        let Some(candidates) = self.globals.get(name) else {
+            return GlobalLookup::Absent;
+        };
+        if candidates.is_empty() {
+            return GlobalLookup::Absent;
+        }
+        let unique_ids: BTreeSet<&str> = candidates
+            .iter()
+            .map(|(_, declaration)| declaration.entity_id.as_str())
+            .collect();
+        if let [only] = unique_ids.iter().copied().collect::<Vec<_>>().as_slice() {
+            return GlobalLookup::Unique((*only).to_owned());
+        }
+        if candidates
+            .iter()
+            .all(|(_, declaration)| declaration.kind == EntityKind::Namespace)
+        {
+            return GlobalLookup::Unique(candidates[0].1.entity_id.clone());
+        }
+        GlobalLookup::Ambiguous
+    }
+}
+
+/// Outcome of [`AmbientModuleIndex::resolve_global`] -- see that method's
+/// own doc comment for the exact rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalLookup {
+    Unique(String),
+    Ambiguous,
+    Absent,
 }
 
 /// TypeScript's ambient module wildcard match: `pattern` (containing
@@ -2132,6 +2215,7 @@ mod tests {
             export_bindings,
             export_star_specifiers,
             ambient_modules: Vec::new(),
+            ambient_globals: Vec::new(),
             line_index: crate::LineIndex::from_text(""),
         }
     }

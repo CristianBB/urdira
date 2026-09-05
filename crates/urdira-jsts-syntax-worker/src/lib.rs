@@ -6,8 +6,8 @@ use oxc_ast::ast::{
     ExportAllDeclaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
     ExportNamedDeclaration, ExportSpecifier, Expression, Function, FunctionType, ImportDeclaration,
     ImportDeclarationSpecifier, ImportExpression, ModuleExportName, Statement, TSEnumDeclaration,
-    TSExportAssignment, TSInterfaceDeclaration, TSModuleDeclaration, TSModuleDeclarationBody,
-    TSModuleDeclarationName, TSTypeAliasDeclaration, VariableDeclaration,
+    TSExportAssignment, TSGlobalDeclaration, TSInterfaceDeclaration, TSModuleDeclaration,
+    TSModuleDeclarationBody, TSModuleDeclarationName, TSTypeAliasDeclaration, VariableDeclaration,
 };
 use oxc_ast_visit::{
     Visit,
@@ -16,8 +16,8 @@ use oxc_ast_visit::{
         walk_call_expression, walk_class, walk_export_all_declaration,
         walk_export_default_declaration, walk_export_named_declaration, walk_export_specifier,
         walk_function, walk_import_declaration, walk_import_expression, walk_ts_enum_declaration,
-        walk_ts_export_assignment, walk_ts_interface_declaration, walk_ts_module_declaration,
-        walk_ts_type_alias_declaration, walk_variable_declaration,
+        walk_ts_export_assignment, walk_ts_global_declaration, walk_ts_interface_declaration,
+        walk_ts_module_declaration, walk_ts_type_alias_declaration, walk_variable_declaration,
     },
 };
 use oxc_parser::Parser;
@@ -519,6 +519,30 @@ pub struct SyntaxFileResult {
     /// resolving externally where v3 resolved to a declaration inside one
     /// of these).
     pub ambient_modules: Vec<AmbientModuleDeclaration>,
+    /// D.1 (2026-09-05, references-parity task): every top-level ambient
+    /// GLOBAL-scope declaration this file contributes to the workspace-wide
+    /// `resolver::AmbientModuleIndex::globals` lookup -- a `namespace X`/
+    /// `declare namespace X`/`interface X`/`type X`/`declare var|let|const|
+    /// function|class|enum X` at this file's OWN top level (a SCRIPT file
+    /// only -- see `AmbientGlobalDeclaration::scope`'s own doc comment for
+    /// why `ScriptTopLevel` candidates are dropped post-walk for a MODULE
+    /// file, in `parse_source`, right next to `ambient_modules`' own
+    /// `is_augmentation` patch), or a declaration directly inside a
+    /// `declare global { ... }` block (valid regardless of script-vs-module,
+    /// collected during the walk by `SyntaxCollector::visit_ts_global_
+    /// declaration`). Closes `unresolved_global × namespace` reference-
+    /// parity gap (`jest.Mock`/`globalThis.X` referencing a `.d.ts` script's
+    /// `namespace jest {}`, `docs/evidence/2026-09-05-v4-frentes-1-2-3-4-
+    /// reopen-references-analyze-residual.md` §10.7): `resolve_identifier_
+    /// reference` had no cross-file table of globals to consult at all
+    /// before this task -- every unresolved-scope `IdentifierReference`
+    /// degraded straight to `REASON_UNRESOLVED_GLOBAL`, permanently.
+    /// `entity_id` is NEVER a new entity: it is the EXACT SAME `stable_
+    /// entity_id` formula the ordinary recursive walk already used to give
+    /// this SAME declaration its own `SyntaxEntity` (this list is purely a
+    /// workspace-wide NAME lookup fact pointing at an entity that exists
+    /// either way).
+    pub ambient_globals: Vec<AmbientGlobalDeclaration>,
     /// A4 (line numbers task, 2026-09-05): this file's own UTF-16-code-unit
     /// line index, built ONCE per parse (`LineIndex::from_text`, over the
     /// SAME original UTF-8 `text` `Utf8ToUtf16::convert_program` already
@@ -621,6 +645,39 @@ pub struct AmbientModuleDeclaration {
 pub struct AmbientModuleMember {
     pub name: String,
     pub entity_id: String,
+}
+
+/// D.1 (2026-09-05, references-parity task): where an [`AmbientGlobalDeclaration`]
+/// was found. `ScriptTopLevel` candidates are collected during the walk
+/// (`script_top_level_ambient_global_candidates`) but only kept when
+/// `parse_source`'s own post-walk `file_has_top_level_module_syntax` check
+/// confirms the file has NO top-level `import`/`export` of its own -- a
+/// SCRIPT's top level genuinely extends the shared global scope (that is
+/// what makes a `.d.ts` without any `import`/`export` an ambient
+/// declaration file at all), while the identically-shaped declaration in a
+/// MODULE file is scoped to that module alone, never a global. `DeclareGlobal`
+/// candidates (inside a `declare global { ... }` block) are ALWAYS kept
+/// regardless of their own file's script-vs-module status -- augmenting the
+/// true global scope is the entire point of the `global` keyword, valid
+/// from a module file too (see `SyntaxCollector::visit_ts_global_
+/// declaration`'s own doc comment).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum GlobalScope {
+    ScriptTopLevel,
+    DeclareGlobal,
+}
+
+/// D.1 (2026-09-05, references-parity task): one ambient (cross-file,
+/// import-less) global name this file contributes to the workspace-wide
+/// `resolver::AmbientModuleIndex::globals` lookup -- see `SyntaxFileResult::
+/// ambient_globals`'s own doc comment for the full mechanism and why
+/// `entity_id` is never a NEW entity.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AmbientGlobalDeclaration {
+    pub name: String,
+    pub entity_id: String,
+    pub kind: EntityKind,
+    pub scope: GlobalScope,
 }
 
 /// One bare `export * from "specifier"` this module has -- see
@@ -3227,10 +3284,36 @@ fn parse_source(
     // makes it a module augmentation). Skipped entirely when this file
     // declared no ambient modules at all (the overwhelming majority) --
     // `file_has_top_level_module_syntax` is never worth the scan otherwise.
-    if !collector.ambient_modules.is_empty() {
+    // D.1 (2026-09-05, references-parity task): script-top-level ambient
+    // global candidates -- a flat, non-recursive scan of `program.body`
+    // appended AFTER the walk so it runs alongside (and shares the exact
+    // same whole-file script-vs-module fact as) the `is_augmentation` patch
+    // just below. `DeclareGlobal` candidates (from `visit_ts_global_
+    // declaration`, during the walk above) are already in `collector.
+    // ambient_globals` at this point and are never touched here.
+    collector
+        .ambient_globals
+        .extend(script_top_level_ambient_global_candidates(
+            &parsed.program.body,
+            &source.path,
+        ));
+    if !collector.ambient_modules.is_empty()
+        || collector
+            .ambient_globals
+            .iter()
+            .any(|global| global.scope == GlobalScope::ScriptTopLevel)
+    {
         let is_augmentation = file_has_top_level_module_syntax(&parsed.program.body);
         for declaration in &mut collector.ambient_modules {
             declaration.is_augmentation = is_augmentation;
+        }
+        // A MODULE file's own top level never extends the shared global
+        // scope (see `GlobalScope::ScriptTopLevel`'s own doc comment) --
+        // `DeclareGlobal` candidates are unaffected, kept unconditionally.
+        if is_augmentation {
+            collector
+                .ambient_globals
+                .retain(|global| global.scope != GlobalScope::ScriptTopLevel);
         }
     }
     // Class/interface MEMBER entities (method/constructor/getter/setter/
@@ -3278,6 +3361,9 @@ fn parse_source(
     collector
         .ambient_modules
         .sort_by(|left, right| left.namespace_entity_id.cmp(&right.namespace_entity_id));
+    collector
+        .ambient_globals
+        .sort_by(|left, right| left.entity_id.cmp(&right.entity_id));
     let diagnostics = parsed
         .diagnostics
         .into_iter()
@@ -3309,6 +3395,7 @@ fn parse_source(
         export_bindings: collector.export_bindings,
         export_star_specifiers: collector.export_star_specifiers,
         ambient_modules: collector.ambient_modules,
+        ambient_globals: collector.ambient_globals,
         line_index: LineIndex::from_text(text),
     })
 }
@@ -3340,6 +3427,13 @@ struct SyntaxCollector {
     /// `declare module "specifier" { ... }` this file declares -- see
     /// `SyntaxFileResult::ambient_modules`'s own doc comment.
     ambient_modules: Vec<AmbientModuleDeclaration>,
+    /// D.1 (2026-09-05, references-parity task): see `SyntaxFileResult::
+    /// ambient_globals`'s own doc comment. Populated from two sources: the
+    /// `visit_ts_global_declaration` override below (`DeclareGlobal`
+    /// candidates, during the walk) and a post-`visit_program` flat scan of
+    /// `parsed.program.body` in `parse_source` (`ScriptTopLevel`
+    /// candidates, filtered there once script-vs-module is known).
+    ambient_globals: Vec<AmbientGlobalDeclaration>,
     /// A5b (2026-09-05 references-parity task, bucket 1 --
     /// `import_binding/export:unresolved`, 1,340 workspace sites): every
     /// local binding this file's own `import` statements introduce, keyed by
@@ -3379,6 +3473,7 @@ impl SyntaxCollector {
             export_bindings: Vec::new(),
             export_star_specifiers: Vec::new(),
             ambient_modules: Vec::new(),
+            ambient_globals: Vec::new(),
             imported_locals: HashMap::new(),
         }
     }
@@ -3827,6 +3922,147 @@ fn file_has_top_level_module_syntax(body: &[Statement<'_>]) -> bool {
                 Some(Declaration::TSImportEqualsDeclaration(_))
             )
     })
+}
+
+/// D.1 (2026-09-05, references-parity task): every ambient-global
+/// candidate directly inside `body` -- a flat, NON-RECURSIVE scan (same
+/// "top-level = one pass over a statement list" idiom `file_has_top_level_
+/// module_syntax`/`urdira_jsts_typeflow::collect_import_specifiers` already
+/// use for other top-level-only facts), so a same-shaped declaration
+/// nested one level deeper (inside a function/class/block) is never
+/// mistaken for one of these. Recognizes `namespace X`/`declare namespace
+/// X` (an `Identifier`-named `TSModuleDeclaration`), `interface X`, `type
+/// X` unconditionally, and `var|let|const`/`function`/`class`/`enum X`
+/// gated on `require_declare` -- `false` for a `declare global { ... }`
+/// block's own children (ambient context is inherited, oxc's own `declare`
+/// flag on a nested declaration stays `false` there), `true` for a
+/// script's own top level (where an ordinary, non-`declare` `var x = 1;`
+/// is NOT one of these -- see `GlobalScope::ScriptTopLevel`'s own doc
+/// comment). Multiple declarators in one `declare const a, b;` each become
+/// their own candidate, matching `SyntaxCollector::visit_variable_
+/// declaration`'s own "one entity per declarator" rule. `entity_id` is the
+/// EXACT SAME `stable_entity_id` formula the ordinary recursive walk
+/// already used for this SAME declaration's own entity (see
+/// `AmbientGlobalDeclaration`'s own doc comment).
+fn ambient_global_candidates_in(
+    body: &[Statement<'_>],
+    path: &str,
+    scope: GlobalScope,
+    require_declare: bool,
+) -> Vec<AmbientGlobalDeclaration> {
+    let mut candidates = Vec::new();
+    for statement in body {
+        let Some(declaration) = statement.as_declaration() else {
+            continue;
+        };
+        match declaration {
+            Declaration::TSModuleDeclaration(module) => {
+                if let TSModuleDeclarationName::Identifier(identifier) = &module.id {
+                    push_ambient_global_candidate(
+                        &mut candidates,
+                        path,
+                        identifier,
+                        EntityKind::Namespace,
+                        scope,
+                    );
+                }
+            }
+            Declaration::TSInterfaceDeclaration(interface) => {
+                push_ambient_global_candidate(
+                    &mut candidates,
+                    path,
+                    &interface.id,
+                    EntityKind::Interface,
+                    scope,
+                );
+            }
+            Declaration::TSTypeAliasDeclaration(alias) => {
+                push_ambient_global_candidate(
+                    &mut candidates,
+                    path,
+                    &alias.id,
+                    EntityKind::Type,
+                    scope,
+                );
+            }
+            Declaration::VariableDeclaration(variable) if !require_declare || variable.declare => {
+                for declarator in &variable.declarations {
+                    if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
+                        push_ambient_global_candidate(
+                            &mut candidates,
+                            path,
+                            identifier,
+                            EntityKind::Variable,
+                            scope,
+                        );
+                    }
+                }
+            }
+            Declaration::FunctionDeclaration(function) if !require_declare || function.declare => {
+                if let Some(identifier) = &function.id {
+                    push_ambient_global_candidate(
+                        &mut candidates,
+                        path,
+                        identifier,
+                        EntityKind::Function,
+                        scope,
+                    );
+                }
+            }
+            Declaration::ClassDeclaration(class) if !require_declare || class.declare => {
+                if let Some(identifier) = &class.id {
+                    push_ambient_global_candidate(
+                        &mut candidates,
+                        path,
+                        identifier,
+                        EntityKind::Class,
+                        scope,
+                    );
+                }
+            }
+            Declaration::TSEnumDeclaration(enum_declaration)
+                if !require_declare || enum_declaration.declare =>
+            {
+                push_ambient_global_candidate(
+                    &mut candidates,
+                    path,
+                    &enum_declaration.id,
+                    EntityKind::Enum,
+                    scope,
+                );
+            }
+            _ => {}
+        }
+    }
+    candidates
+}
+
+/// D.1: script-top-level-only wrapper over `ambient_global_candidates_in`
+/// (`require_declare: true`, `scope: ScriptTopLevel`) -- see that
+/// function's own doc comment and this call site in `parse_source` for why
+/// the result is provisional until the post-walk script-vs-module check.
+fn script_top_level_ambient_global_candidates(
+    body: &[Statement<'_>],
+    path: &str,
+) -> Vec<AmbientGlobalDeclaration> {
+    ambient_global_candidates_in(body, path, GlobalScope::ScriptTopLevel, true)
+}
+
+fn push_ambient_global_candidate(
+    out: &mut Vec<AmbientGlobalDeclaration>,
+    path: &str,
+    identifier: &BindingIdentifier<'_>,
+    kind: EntityKind,
+    scope: GlobalScope,
+) {
+    let name = identifier.name.as_str().to_owned();
+    let entity_id = stable_entity_id(kind, path, identifier.span.start, &name);
+    out.push(AmbientGlobalDeclaration {
+        name,
+        entity_id,
+        kind,
+        scope,
+    });
 }
 
 fn declaration_entity_kind(declaration: &Declaration<'_>) -> Option<EntityKind> {
@@ -4484,6 +4720,32 @@ impl<'a> Visit<'a> for SyntaxCollector {
         }
         walk_ts_module_declaration(self, declaration);
     }
+
+    /// D.1 (2026-09-05, references-parity task): `declare global { ... }`
+    /// is its OWN oxc AST node (`Declaration::TSGlobalDeclaration`, distinct
+    /// from `TSModuleDeclaration` -- see `AmbientGlobalDeclaration::scope`'s
+    /// own doc comment), reached through its OWN `Visit` override point,
+    /// never through `visit_ts_module_declaration` above. Before this
+    /// override, this collector had no override for it at all, so the
+    /// default recursive walk (`walk_ts_global_declaration`) ran, still
+    /// giving every declaration directly inside the block its own ordinary
+    /// entity (unaffected -- that part of the walk is untouched) but never
+    /// recording that any of them is a GLOBAL, cross-file-visible name. This
+    /// override ADDS exactly that fact for every declaration ONE level
+    /// inside the block (`ambient_global_candidates_in`'s own flat,
+    /// non-recursive scan -- a nested `declare global { declare global {}
+    /// }` is not legal TypeScript, never a concern), then still runs the
+    /// unchanged default walk so entity emission is byte-identical to
+    /// before this task.
+    fn visit_ts_global_declaration(&mut self, declaration: &TSGlobalDeclaration<'a>) {
+        self.ambient_globals.extend(ambient_global_candidates_in(
+            &declaration.body.body,
+            &self.path,
+            GlobalScope::DeclareGlobal,
+            false,
+        ));
+        walk_ts_global_declaration(self, declaration);
+    }
 }
 
 fn stable_entity_id(kind: EntityKind, path: &str, start: u32, name: &str) -> String {
@@ -4584,6 +4846,7 @@ fn reresolve_file(
         export_bindings,
         export_star_specifiers,
         ambient_modules: file.ambient_modules.clone(),
+        ambient_globals: file.ambient_globals.clone(),
         // A4: `file`'s own byte content is untouched here (only import/
         // export target-path resolution changed), so its line index is
         // still valid unchanged -- see `SyntaxFileResult::line_index`'s own
@@ -4650,6 +4913,7 @@ fn reresolve_ambient_relations(
         export_bindings: file.export_bindings.clone(),
         export_star_specifiers: file.export_star_specifiers.clone(),
         ambient_modules: file.ambient_modules.clone(),
+        ambient_globals: file.ambient_globals.clone(),
         // A4: same reasoning as `reresolve_file` above -- this rebuild never
         // touches `file`'s own byte content either.
         line_index: file.line_index.clone(),
@@ -5460,6 +5724,148 @@ mod tests {
                 .iter()
                 .any(|record| record.identity_key == variable_id),
             "expected a variable entity {variable_id}: {records:?}"
+        );
+    }
+
+    fn parse_source_for_test(path: &str, text: &str) -> SyntaxFileResult {
+        let decoded = DecodedSource {
+            path: path.to_owned(),
+            content_digest: sha256_digest(text.as_bytes()),
+            bytes: text.as_bytes().to_vec(),
+            language: Language::Typescript,
+            script_kind: ScriptKind::Ts,
+        };
+        let available = BTreeSet::new();
+        let resolver = WorkspaceResolver::default();
+        parse_source(&decoded, &available, &resolver).expect("parses")
+    }
+
+    /// D.1 (2026-09-05, references-parity task): a SCRIPT file (no
+    /// top-level `import`/`export` of its own) declaring `namespace jest
+    /// {}` at its own top level contributes a `ScriptTopLevel` ambient
+    /// global candidate for `jest` -- the entity id is byte-identical to
+    /// the one the ordinary recursive walk already gives this same
+    /// declaration (`push_entity`'s own formula).
+    #[test]
+    fn script_top_level_namespace_becomes_an_ambient_global_candidate() {
+        let text = "namespace jest {\n  interface Mock {}\n}\n";
+        let result = parse_source_for_test("jest.d.ts", text);
+        let name_start = text.find("jest").unwrap() as u32;
+        let expected_id = format!("jsts:namespace:jest.d.ts:{name_start}:jest");
+        assert_eq!(
+            result.ambient_globals,
+            vec![AmbientGlobalDeclaration {
+                name: "jest".to_owned(),
+                entity_id: expected_id.clone(),
+                kind: EntityKind::Namespace,
+                scope: GlobalScope::ScriptTopLevel,
+            }],
+            "expected exactly one ScriptTopLevel candidate for jest, got {:?}",
+            result.ambient_globals
+        );
+        // Entity emission is unaffected -- the SAME entity id already
+        // exists in `entities`, this list is purely an additional lookup
+        // fact pointing at it.
+        assert!(
+            result
+                .entities
+                .iter()
+                .any(|entity| entity.id == expected_id),
+            "expected the namespace's own entity to still exist: {:?}",
+            result.entities
+        );
+    }
+
+    /// D.1: the SAME `namespace jest {}` declared at a file's top level,
+    /// but that file ALSO has `export {}` (module syntax --
+    /// `file_has_top_level_module_syntax`'s own five recognized forms): the
+    /// file is a MODULE, so its top level does NOT extend the shared
+    /// global scope -- the `ScriptTopLevel` candidate is discarded by
+    /// `parse_source`'s own post-walk filter (the SAME filter that patches
+    /// `AmbientModuleDeclaration::is_augmentation`), even though the
+    /// namespace's own entity still exists unaffected.
+    #[test]
+    fn namespace_in_a_module_file_never_enters_the_ambient_global_index() {
+        let text = "namespace jest {\n  interface Mock {}\n}\nexport {};\n";
+        let result = parse_source_for_test("mod-jest.d.ts", text);
+        assert!(
+            result.ambient_globals.is_empty(),
+            "a namespace in a MODULE file must never enter the ambient-global index: {:?}",
+            result.ambient_globals
+        );
+        let name_start = text.find("jest").unwrap() as u32;
+        let expected_id = format!("jsts:namespace:mod-jest.d.ts:{name_start}:jest");
+        assert!(
+            result
+                .entities
+                .iter()
+                .any(|entity| entity.id == expected_id),
+            "the namespace's own entity must still exist regardless of the ambient-global filter: {:?}",
+            result.entities
+        );
+    }
+
+    /// D.1: `declare global { var foo: number; interface Window {} }` --
+    /// every declaration DIRECTLY inside the block becomes a
+    /// `DeclareGlobal` candidate (via `visit_ts_global_declaration`'s own
+    /// flat, one-level scan), regardless of the file's own script-vs-
+    /// module status (this file itself has no top-level import/export --
+    /// see the next test for the module case) -- and no spurious `global`-
+    /// named entity is ever created for the block itself.
+    #[test]
+    fn declare_global_block_children_become_declare_global_candidates() {
+        let text = "declare global {\n  var foo: number;\n  interface Window {}\n}\n";
+        let result = parse_source_for_test("globals.ts", text);
+        let foo_start = text.find("foo").unwrap() as u32;
+        let window_start = text.find("Window").unwrap() as u32;
+        let mut globals = result.ambient_globals.clone();
+        globals.sort_by(|left, right| left.name.cmp(&right.name));
+        // ASCII sort puts the capitalized `Window` before lowercase `foo`.
+        assert_eq!(
+            globals,
+            vec![
+                AmbientGlobalDeclaration {
+                    name: "Window".to_owned(),
+                    entity_id: format!("jsts:interface:globals.ts:{window_start}:Window"),
+                    kind: EntityKind::Interface,
+                    scope: GlobalScope::DeclareGlobal,
+                },
+                AmbientGlobalDeclaration {
+                    name: "foo".to_owned(),
+                    entity_id: format!("jsts:variable:globals.ts:{foo_start}:foo"),
+                    kind: EntityKind::Variable,
+                    scope: GlobalScope::DeclareGlobal,
+                },
+            ],
+            "expected DeclareGlobal candidates for both foo and Window, got {:?}",
+            result.ambient_globals
+        );
+        assert!(
+            !result
+                .entities
+                .iter()
+                .any(|entity| entity.kind == EntityKind::Module && entity.name == "global"),
+            "declare global {{}} must never create its own spurious entity"
+        );
+    }
+
+    /// D.1: `declare global {}` reaches its shared-global-scope semantics
+    /// regardless of whether ITS OWN file is a script or a module -- unlike
+    /// `ScriptTopLevel` candidates, `DeclareGlobal` ones are never filtered
+    /// by `parse_source`'s post-walk script-vs-module check.
+    #[test]
+    fn declare_global_block_in_a_module_file_still_enters_the_ambient_global_index() {
+        let text = "declare global {\n  var foo: number;\n}\nexport {};\n";
+        let result = parse_source_for_test("globals.ts", text);
+        let foo_start = text.find("foo").unwrap() as u32;
+        assert_eq!(
+            result.ambient_globals,
+            vec![AmbientGlobalDeclaration {
+                name: "foo".to_owned(),
+                entity_id: format!("jsts:variable:globals.ts:{foo_start}:foo"),
+                kind: EntityKind::Variable,
+                scope: GlobalScope::DeclareGlobal,
+            }],
         );
     }
 
@@ -7677,6 +8083,7 @@ declare module 'markdown-it-task-lists' {
                 export_bindings: collector.export_bindings.clone(),
                 export_star_specifiers: Vec::new(),
                 ambient_modules: Vec::new(),
+                ambient_globals: Vec::new(),
                 line_index: LineIndex::from_text(source_text),
             },
         );

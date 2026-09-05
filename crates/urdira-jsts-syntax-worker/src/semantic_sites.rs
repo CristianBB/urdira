@@ -516,6 +516,15 @@ fn import_binding_sub_reason(base: &'static str, sub: &'static str) -> &'static 
         _ => base,
     }
 }
+
+/// D.1 (2026-09-05, references-parity task): sub-reason for a `REASON_
+/// UNRESOLVED_GLOBAL` site that DID find a name in `AmbientModuleIndex::
+/// globals` but not with certainty (`resolver::GlobalLookup::Ambiguous`) --
+/// same `/`-suffix convention `import_binding_sub_reason` already
+/// establishes. The plain, unsuffixed `REASON_UNRESOLVED_GLOBAL` stays
+/// exactly as before this task for `GlobalLookup::Absent` (no declaring
+/// file at all).
+const REASON_UNRESOLVED_GLOBAL_AMBIGUOUS: &str = "unresolved_global/ambient:ambiguous";
 const REASON_THIS_EXPRESSION: &str = "this_expression";
 const REASON_CALL_DEFERRED: &str = "call_deferred_to_e3";
 const REASON_HERITAGE_DEFERRED: &str = "heritage_deferred_to_e3";
@@ -2092,16 +2101,45 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         });
     }
 
+    /// D.1 (2026-09-05, references-parity task): what `resolve_identifier_
+    /// reference`'s two `REASON_UNRESOLVED_GLOBAL` degrade points now do
+    /// BEFORE giving up -- consult `AmbientModuleIndex::resolve_global`
+    /// (workspace-wide, built once by the caller from every file's own
+    /// `ambient_globals`) for `name`. `Unique` resolves with certainty,
+    /// `cross_file: true` unconditionally, same simplification `resolve_
+    /// named_binding_via_specifier`'s own ambient-module branch already
+    /// makes (see that call site's own comment) rather than compare
+    /// `self.path` against the declaring file's path. `Ambiguous`
+    /// degrades to the SAME `checker_pending` disposition, just a more
+    /// specific reason string for the histogram. `Absent` is the exact
+    /// unsuffixed `REASON_UNRESOLVED_GLOBAL` this call site always
+    /// returned before this task -- byte-identical outcome for every name
+    /// with no ambient global declaration anywhere in the workspace.
+    fn resolve_ambient_global(&self, name: &str) -> ReferenceResolution {
+        match self.ctx.ambient_index.resolve_global(name) {
+            resolver::GlobalLookup::Unique(target_id) => ReferenceResolution::Resolved {
+                target_id,
+                cross_file: true,
+            },
+            resolver::GlobalLookup::Ambiguous => {
+                ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL_AMBIGUOUS)
+            }
+            resolver::GlobalLookup::Absent => {
+                ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL)
+            }
+        }
+    }
+
     fn resolve_identifier_reference(&self, ident: &IdentifierReference<'a>) -> ReferenceResolution {
         if self.jsdoc_typed_file {
             return ReferenceResolution::Pending(REASON_JSDOC_TYPED_FILE);
         }
         let Some(reference_id) = ident.reference_id.get() else {
-            return ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL);
+            return self.resolve_ambient_global(&ident.name);
         };
         let reference = self.scoping.get_reference(reference_id);
         let Some(symbol_id) = reference.symbol_id() else {
-            return ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL);
+            return self.resolve_ambient_global(&ident.name);
         };
         let flags = self.scoping.symbol_flags(symbol_id);
         if flags.is_import() {
@@ -3370,7 +3408,19 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         };
         let reference = self.scoping.get_reference(reference_id);
         let Some(symbol_id) = reference.symbol_id() else {
-            return "unresolved_global";
+            // D.1 (2026-09-05, references-parity task): same ambient-global
+            // consultation `resolve_ambient_global` performs for the actual
+            // resolution, so this DIAGNOSTIC classifier (member_access's
+            // own receiver-shape histogram, `member_access_sub_reason`)
+            // never keeps calling a now-resolvable receiver "unresolved" --
+            // `resolve_identifier_reference` itself already resolves these,
+            // this call site only decides how the (rarer) surrounding
+            // member-access site is CLASSIFIED for the histogram.
+            return match self.ctx.ambient_index.resolve_global(ident.name.as_str()) {
+                resolver::GlobalLookup::Unique(_) => "unresolved_global_ambient_resolved",
+                resolver::GlobalLookup::Ambiguous => "unresolved_global_ambient_ambiguous",
+                resolver::GlobalLookup::Absent => "unresolved_global",
+            };
         };
         let flags = self.scoping.symbol_flags(symbol_id);
         if flags.is_import() {
@@ -7508,6 +7558,7 @@ mod tests {
             export_bindings,
             export_star_specifiers: Vec::new(),
             ambient_modules: Vec::new(),
+            ambient_globals: Vec::new(),
             line_index: crate::LineIndex::from_text(""),
         }
     }
@@ -7521,6 +7572,42 @@ mod tests {
         let mut result = target_file(path, Vec::new(), Vec::new());
         result.ambient_modules = ambient_modules;
         result
+    }
+
+    /// D.1 (2026-09-05, references-parity task): same as `target_file`
+    /// above, with an explicit `ambient_globals` list.
+    fn target_file_with_globals(
+        path: &str,
+        ambient_globals: Vec<crate::AmbientGlobalDeclaration>,
+    ) -> crate::SyntaxFileResult {
+        let mut result = target_file(path, Vec::new(), Vec::new());
+        result.ambient_globals = ambient_globals;
+        result
+    }
+
+    fn ambient_global(
+        kind: crate::EntityKind,
+        path: &str,
+        start: u32,
+        name: &str,
+        scope: crate::GlobalScope,
+    ) -> crate::AmbientGlobalDeclaration {
+        let kind_word = match kind {
+            crate::EntityKind::Namespace => "namespace",
+            crate::EntityKind::Interface => "interface",
+            crate::EntityKind::Type => "type",
+            crate::EntityKind::Variable => "variable",
+            crate::EntityKind::Function => "function",
+            crate::EntityKind::Class => "class",
+            crate::EntityKind::Enum => "enum",
+            other => panic!("unhandled entity kind in test helper: {other:?}"),
+        };
+        crate::AmbientGlobalDeclaration {
+            name: name.to_owned(),
+            entity_id: format!("jsts:{kind_word}:{path}:{start}:{name}"),
+            kind,
+            scope,
+        }
     }
 
     /// Build a `HybridResolutionContext` over a single available path
@@ -7843,6 +7930,141 @@ mod tests {
             "expected an external_symbol entity row for {target_id}"
         );
     }
+
+    // -- D.1 (2026-09-05, references-parity task): ambient globals -----
+
+    /// A script `.d.ts` file (no top-level `import`/`export`) declaring
+    /// `namespace jest {}` at its own top level: a consumer referencing
+    /// `jest` in TYPE position (`jest.Mock`, a `TSQualifiedName` whose root
+    /// reaches `resolve_identifier_reference` through the default
+    /// `visit_ts_type_name` walk, same as an ordinary value reference) now
+    /// resolves to the namespace declaration instead of staying
+    /// `REASON_UNRESOLVED_GLOBAL` forever. Regression fixture for the 193
+    /// n8n `unresolved_global x namespace` rows this closes (`jest.Mocked<T>`/
+    /// `jest.Mock`, `docs/evidence/2026-09-05-v4-frentes-1-2-3-4-reopen-
+    /// references-analyze-residual.md` §10.7).
+    #[test]
+    fn script_top_level_namespace_resolves_a_qualified_type_reference_from_another_file() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "let m: jest.Mock;\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:namespace:jest.d.ts:10:jest";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+        let jest_start = source.find("jest").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != jest_start),
+            "the `jest` root of the qualified type name must not stay pending: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    /// A `declare global { var foo: number; }` block: `foo`, referenced
+    /// from ANOTHER file, resolves to the declaration inside the block --
+    /// no spurious `global`-named entity is ever created (the block's own
+    /// `TSModuleBlock` has no nameable identifier at all; only ITS
+    /// CHILDREN become ambient-global candidates, via `visit_ts_global_
+    /// declaration`'s flat, one-level scan).
+    #[test]
+    fn declare_global_block_member_resolves_from_another_file() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "globals.ts".to_owned(),
+            target_file_with_globals(
+                "globals.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Variable,
+                    "globals.ts",
+                    30,
+                    "foo",
+                    crate::GlobalScope::DeclareGlobal,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "function use() {\n  return foo + 1;\n}\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:variable:globals.ts:30:foo";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+    }
+
+    /// Two SCRIPT files each declaring `namespace jest {}` at their own top
+    /// level (a real, if unusual, cross-file declaration merge -- e.g. two
+    /// separate `.d.ts` files both augmenting the same ambient namespace):
+    /// resolves to the FIRST declaration in `files`' own `BTreeMap` (path)
+    /// order, mirroring `resolve_direct_export`'s `ExportPolicy::
+    /// FirstDeclaration` (`valueDeclaration ?? declarations[0]`) for the
+    /// single-file case.
+    #[test]
+    fn two_files_declaring_the_same_namespace_resolve_to_the_first_by_path_order() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a-jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "a-jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "a-jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        files.insert(
+            "z-jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "z-jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "z-jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global("jest"),
+            resolver::GlobalLookup::Unique("jsts:namespace:a-jest.d.ts:10:jest".to_owned()),
+            "expected the FIRST declaring path (BTreeMap order) to win"
+        );
+    }
+
+    // The companion case -- the SAME `namespace jest {}` declared at a
+    // file's top level, but that file ALSO has `export {}` (module syntax)
+    // -- exercises `parse_source`'s own post-walk filter directly and
+    // lives in `lib.rs`'s own `mod tests`
+    // (`namespace_in_a_module_file_never_enters_the_ambient_global_index`),
+    // where `parse_source`/`DecodedSource` are actually visible; this
+    // module only sees the already-filtered `SyntaxFileResult` shape.
 
     // -- 2026-09-04 references-parity task, Phase B bucket 1: default
     // imports and with-source re-export specifiers --------------------
