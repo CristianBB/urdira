@@ -3214,6 +3214,86 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         self.resolve_namespace_member(&expr.object, expr.property.name.as_str())
     }
 
+    /// D.4 (2026-09-05, references-parity task, diagnosis only -- no
+    /// functional change, same pattern as A5 Paso 0 below): for a
+    /// `call_chain`-shaped `member_access` site (the receiver `object` is
+    /// itself a call/member/chain expression), which HOP `type_of_
+    /// expression(object)` bottoms out at: `root_untyped` (the innermost
+    /// receiver -- an identifier, or a callee that is neither a plain
+    /// identifier nor `<receiver>.<name>` -- never typed at all),
+    /// `receiver_not_entity` (the innermost receiver typed, but to a
+    /// union/promise/array/`this`-relative shape `as_entity` cannot reduce
+    /// to a single container), `member_unknown` (the receiver IS a single
+    /// entity, but the member/call name is not on its member table at
+    /// all), `return_unknown` (the member/call IS on the table, but ITS
+    /// OWN declared/inferred return type is what actually failed to
+    /// resolve -- the reason `type_of_expression` itself gives up one
+    /// level higher than this function inspects), `generic_erased` (a
+    /// computed/chain wrapper, or a call whose callee is neither a plain
+    /// identifier nor a member expression -- `ReturnType<typeof ..>`-
+    /// shaped or similar, this crate's own generic-erasure boundary). A
+    /// STRUCTURAL diagnostic built directly from the AST/typeflow index
+    /// (never a byte-for-byte re-trace of `type_of_expression`'s own full
+    /// recursive decision tree -- that function's real fixed-point/
+    /// `ThisType`/generic-erasure interactions are considerably richer),
+    /// used ONLY to produce the corpus-wide `call_chain/<hop>` histogram
+    /// this task's own D.4 needs to pick (or rule out) a top-1 fix
+    /// category -- never consulted by the actual resolution path, changes
+    /// nothing observable outside this crate's own debug dump/tests.
+    fn call_chain_hop_reason(&self, object: &Expression<'a>) -> &'static str {
+        let Some(index) = self.ctx.typeflow_index else {
+            return "member_access/call_chain/root_untyped";
+        };
+        let (receiver, member_name, is_call) = match object {
+            Expression::CallExpression(call) => match &call.callee {
+                Expression::Identifier(ident) => {
+                    // A bare call `f(...)`: the "receiver" IS `f` itself --
+                    // typed (a known function) or not.
+                    return if self
+                        .resolve_identifier_to_kind(ident, &[DeclKind::Function])
+                        .is_some()
+                    {
+                        "member_access/call_chain/return_unknown"
+                    } else {
+                        "member_access/call_chain/root_untyped"
+                    };
+                }
+                Expression::StaticMemberExpression(member) => {
+                    (&member.object, member.property.name.as_str(), true)
+                }
+                _ => return "member_access/call_chain/generic_erased",
+            },
+            Expression::StaticMemberExpression(member) => {
+                (&member.object, member.property.name.as_str(), false)
+            }
+            Expression::ComputedMemberExpression(_) | Expression::ChainExpression(_) => {
+                return "member_access/call_chain/generic_erased";
+            }
+            _ => return "member_access/call_chain/generic_erased",
+        };
+        let Some((value, _rule)) = self.type_of_expression(receiver) else {
+            return "member_access/call_chain/root_untyped";
+        };
+        let Some((entity_id, is_static)) = Self::as_entity(&value) else {
+            return "member_access/call_chain/receiver_not_entity";
+        };
+        let found = if is_call {
+            !matches!(
+                index.members(&entity_id, member_name, is_static),
+                urdira_jsts_typeflow::MemberLookup::None
+            )
+        } else {
+            index
+                .member_type_ref(&entity_id, member_name, is_static)
+                .is_some()
+        };
+        if found {
+            "member_access/call_chain/return_unknown"
+        } else {
+            "member_access/call_chain/member_unknown"
+        }
+    }
+
     /// 2026-09-05 A5 references-parity task, Paso 0 (diagnosis only): the
     /// receiver-shape classification the task brief names for a pending
     /// `member_access` site -- `ident:import_bound` (a plain identifier
@@ -3233,7 +3313,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             Expression::CallExpression(_)
             | Expression::StaticMemberExpression(_)
             | Expression::ComputedMemberExpression(_)
-            | Expression::ChainExpression(_) => "member_access/call_chain",
+            | Expression::ChainExpression(_) => self.call_chain_hop_reason(object),
             Expression::Identifier(ident) => {
                 let Some(reference_id) = ident.reference_id.get() else {
                     return "member_access/other";
@@ -9237,6 +9317,85 @@ mod tests {
             ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
         };
         (ctx, index)
+    }
+
+    // -- D.4 (2026-09-05, references-parity task): call_chain hop diagnosis
+
+    /// `root_untyped`: the innermost receiver (`x`, an unannotated
+    /// parameter) never types at all.
+    #[test]
+    fn call_chain_hop_reason_classifies_an_untyped_root_receiver() {
+        let source = "function use(x) {\n  return x.method().value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let reasons: Vec<&str> = semantics
+            .pending_sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect();
+        assert!(
+            reasons.contains(&"member_access/call_chain/root_untyped"),
+            "reasons: {reasons:?}"
+        );
+    }
+
+    /// `member_unknown`: the receiver types to a known class, but the
+    /// called member is not on its table at all.
+    #[test]
+    fn call_chain_hop_reason_classifies_an_unknown_member_on_a_typed_receiver() {
+        let source = "class Foo {\n  bar(): Foo {\n    return this;\n  }\n}\nfunction use(): Foo {\n  return new Foo().missing().value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let reasons: Vec<&str> = semantics
+            .pending_sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect();
+        assert!(
+            reasons.contains(&"member_access/call_chain/member_unknown"),
+            "reasons: {reasons:?}"
+        );
+    }
+
+    /// `return_unknown`: the called member IS on the receiver's table, but
+    /// ITS OWN return type does not resolve (an unannotated, un-inferable
+    /// method body).
+    #[test]
+    fn call_chain_hop_reason_classifies_a_known_member_with_an_unresolved_return_type() {
+        let source = "class Foo {\n  bar() {\n    return Math.random();\n  }\n}\nfunction use(): Foo {\n  return new Foo().bar().value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let reasons: Vec<&str> = semantics
+            .pending_sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect();
+        assert!(
+            reasons.contains(&"member_access/call_chain/return_unknown"),
+            "reasons: {reasons:?}"
+        );
+    }
+
+    /// `generic_erased`: a computed-member wrapper (`arr[0]`) as the
+    /// receiver -- this crate's own generic/computed-access boundary.
+    #[test]
+    fn call_chain_hop_reason_classifies_a_computed_member_receiver_as_generic_erased() {
+        let source = "function use(arr) {\n  return arr[0].value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let reasons: Vec<&str> = semantics
+            .pending_sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect();
+        assert!(
+            reasons.contains(&"member_access/call_chain/generic_erased"),
+            "reasons: {reasons:?}"
+        );
     }
 
     #[test]
