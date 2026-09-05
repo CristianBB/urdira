@@ -87,17 +87,28 @@ not yet the plan's own `<data_root>/workspaces/<ws>/` subdirectory — see
 ### Per-table files and the 64-byte header
 
 Every segment file except `MANIFEST`/`MANIFEST.next` starts with a common
-64-byte header, little-endian: magic `"URD4"` (4 B), `format` (`u16` = `4`),
-`table_id` (`u16`: `Records=1`, `Dependencies=2`, `Dict=3`, `SubjectsKeys=4`),
-`row_count` (`u64`), `generation` (`u64`), `xxh3` of the data region after
-byte 64 (`u64`), 32 B reserved.
+64-byte header, little-endian: magic `"URD4"` (4 B), `format` (`u16` = `5`
+as of the 2026-09-05 "group A" campaign, `4` before it — see the format-bump
+note below), `table_id` (`u16`: `Records=1`, `Dependencies=2`, `Dict=3`,
+`SubjectsKeys=4`, `PendingSites=5`), `row_count` (`u64`), `generation`
+(`u64`), `xxh3` of the data region after byte 64 (`u64`), 32 B reserved. For
+the five hot `records.*` sections (`records.keys`/`records.meta`/
+`records.digests`/`records.body`/`records.ident`), that `xxh3` is not a
+single hash over the whole re-mmap'd region: it combines the 16
+per-nibble-partition xxh3 hashes the partitioned writer already computed
+while writing (`write_base_partitioned`), concatenating their
+little-endian bytes in nibble order and hashing that concatenation — a
+nibble with no rows is skipped (needed for a store with fewer than 16
+populated nibbles). This avoids a second full re-mmap-and-hash pass after
+the partitioned write (`crates/urdira-structural-store/src/segment_io.rs`).
 
 | File | Content | Stride |
 |---|---|---:|
 | `records.keys` | `record_id` (32 B), sorted ascending | 32 |
-| `records.meta` | fixed row: `owner_artifact u32`, `owner_version u32`, `valid_from u32`, `valid_to u32` (0=open), `category u8`, `kind_id u16`, `universal_kind_id u16`, `facets u64` (bitmask), `span_artifact_version u32`, `span_start_byte u32`, `span_end_byte u32`, `span_start_line u32`, `span_end_line u32` (always 0, no producer emits line numbers), `identity_type u8`, `assignment_kind u8`, `name_id u32`, `source_subject u32`, `target_subject u32`, `relation_kind_id u16`, `body_off u64`, `body_len u32`, `ident_off u64`, `ident_len u32` (89 B used, 96 B stride) | 96 |
+| `records.meta` | fixed row: `owner_artifact u32`, `owner_version u32`, `valid_from u32`, `valid_to u32` (0=open), `category u8`, `kind_id u16`, `universal_kind_id u16`, `facets u64` (bitmask), `span_artifact_version u32`, `span_start_byte u32`, `span_end_byte u32`, `span_start_line u32`, `span_end_line u32` (1-based, UTF-16 code units, since the 2026-09-05 line-numbers task — every producer now populates these via a shared per-file `LineIndex`; both fields stay OUT of the record digest, same treatment as every other derived-not-canonical field, so a line value can never change a record's digest), `identity_type u8`, `assignment_kind u8`, `name_id u32`, `source_subject u32`, `target_subject u32`, `relation_kind_id u16`, `body_off u64`, `body_len u32`, `ident_off u64`, `ident_len u32`, `identity_layout u8` (byte 89, since the 2026-09-05 campaign: `RAW=0`/`ENTITY=1`/`RELATION=2`/`RELATION_NO_SPAN=3` — see below), `entity_kind u8` (byte 90, ordinal into `dict.bin`'s `entity_kinds` list, `255`="not applicable") (91 B used, 96 B stride) | 96 |
 | `records.digests` | `record_digest`, `body_digest`, `identity_id`, `identity_key_digest`, `previous_record_id` (32 B each, zero when absent) | 160 |
-| `records.body` / `records.ident` | heaps: byte-identical UCE bodies / UTF-8 identity-key text | variable |
+| `records.body` | heap: byte-identical UCE bodies | variable |
+| `records.ident` | heap: UTF-8 identity-key text — since the 2026-09-05 campaign, populated ONLY for rows whose `identity_layout` is `RAW` (byte 89 == 0, `ident_len` == 0 otherwise); at n8n scale this is 1.66% of all rows (36,113 of 2,174,446), 9 MB instead of the pre-campaign 611 MB, because an `ENTITY`/`RELATION`/`RELATION_NO_SPAN` row's identity key is reconstructed on read from its own typed fields instead (see below) | variable |
 | `records.by_owner` | `(owner_artifact u32, valid_from u32, valid_to u32, ordinal u32)`, sorted by `owner_artifact`, **inline validity** | 16 |
 | `records.by_name` | `(name_id u32, ordinal u32)`, sorted, no inline validity | 8 |
 | `records.by_kind` | `(universal_kind_id u16, category u8, kind_id u16, ordinal u32)`, sorted | 9 |
@@ -107,8 +118,32 @@ byte 64 (`u64`), 32 B reserved.
 | `deps.meta` | `record_ordinal u32` (`u32::MAX` = the bare `record:` sentinel v3-data quirk), `owner_artifact u32`, `owner_version u32`, `dep_artifact u32`, `dep_version u32`, `role u8`, `valid_from u32`, `valid_to u32` (29 B used, 32 B stride) | 32 |
 | `deps.reverse` | `(dep_artifact u32, ordinal u32)`, sorted | 8 |
 | `closures.records` / `closures.deps` (delta only) | `(key 32 B, valid_to u32)`, sorted by key | 36 |
-| `dict.bin` | framed body: seven length-prefixed lists — `kinds`, `universal_kinds`, `relation_kinds`, `names`, `artifacts` as `(artifact_id, artifact_version_id)` text pairs, plus, since P2-2e, `facet_names` (indexed by the bit position of `records.meta.facets`, sourced from the plugin's `entityFacets`/`relationFacets` via the `FACET_ORDER` constant) and `subject_text` (aligned by ordinal to `subjects.keys`, `"record:<hex>"`); the base directory's copy is the full dictionary, a delta's copy holds only that generation's additions; a pre-P2-2e file short-reads the two new lists as empty | variable |
+| `pending.sites` | fixed row (40 bytes, 38 used, 2 reserved), since decision 29's fold campaign: `owner_artifact u32`, `owner_version u32`, `valid_from u32`, `valid_to u32`, `start u32`, `end u32`, `start_line u32`, `end_line u32`, `site_kind u8`, `reason u8`, `source_subject u32` (`NONE_U32`=None) — see decision 29 for the full contract | 40 |
+| `dict.bin` | framed body: NINE length-prefixed lists (up from seven pre-campaign) — `kinds`, `universal_kinds`, `relation_kinds`, `names`, `artifacts` as `(artifact_id, artifact_version_id)` text pairs, `facet_names` (indexed by the bit position of `records.meta.facets`, sourced from the plugin's `entityFacets`/`relationFacets` via the `FACET_ORDER` constant, since P2-2e), `subject_text` (aligned by ordinal to `subjects.keys`, `"record:<hex>"`, since P2-2e), and, since the 2026-09-05 campaign (A3a-fix), `artifact_paths` (indexed by `owner_artifact`, the artifact's own path text — needed to reconstruct an `ENTITY`/`RELATION` row's identity key without touching `records.ident`) and `entity_kinds` (the vocabulary of FINE per-declaration kind words, e.g. `"method"`, distinct from the five coarse `UniversalKind` buckets `kind_id` uses — a `records.meta.entity_kind` byte indexes into this list); every new list is appended at the END of the framed body so an older reader simply stops decoding one list earlier and leaves the rest unread; the base directory's copy is the full dictionary, a delta's copy holds only that generation's additions | variable |
 | `subjects.keys` | framed body: length-prefixed list of 32-byte subject keys, same append-only-per-generation split as `dict.bin` | variable |
+
+**Identity-key reconstruction (A3a/A3a-fix, `identity_codec.rs`, since the
+2026-09-05 campaign, format bump 4→5, no migration — a format-4 store fails
+to open with a clear error and the daemon reindexes from scratch)**:
+`records.meta`'s `identity_layout` byte (89) records whether
+`records.ident`'s `ident_off..ident_off+ident_len` bytes hold this row's
+real identity key verbatim (`RAW`=0, the only layout a pre-campaign store
+ever wrote, `ident_len` > 0) or whether the key is instead reconstructed
+losslessly from this row's own typed fields, with nothing stored in
+`records.ident` (`ident_len`==0): `ENTITY`=1
+(`jsts:{kind}:{path}:{start}:{name}`, `{kind}` from `entity_kind`'s
+`dict.bin` lookup, `{path}` from `artifact_paths[owner_artifact]`), `RELATION`=2
+(`jsts:{rel}:{path}:{start}:{end}:{source_identity_key}:{target_identity_key}`,
+the two endpoints resolved one level deep via `dicts.subjects` -> `record_id`
+-> that record's own `identity_key()`), `RELATION_NO_SPAN`=3
+(`jsts:{rel}:{source_identity_key}:{target_identity_key}`, no
+`{path}:{start}:{end}` segment, e.g. `jsts:contains:...`). At n8n scale:
+98.34% of all rows classify as `ENTITY`/`RELATION`/`RELATION_NO_SPAN`
+(370,285 / 1,768,048 / 0 of 2,174,446), only 1.66% (36,113 — external/type-of/
+diagnostic/v3-converted identities, or a relation whose endpoint is not
+resolvable) still need `RAW`. See `docs/evidence/
+2026-09-05-v4-group-a-cold-lines-references.md` §4 for the measured
+byte-size effect (`records.ident` 611 MB → 9 MB).
 
 **Two documented deviations from the plan's literal byte layout**: `facets`
 is `u64` (the plan's table specified `u32`; the shipped crate widened it per
