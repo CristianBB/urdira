@@ -389,9 +389,16 @@ fn run_one(
     // restart" cost).
     match &mut workspace_state.store_reader {
         Some(reader) => {
+            let reopen_started = std::time::Instant::now();
             reader.reopen_if_changed()?;
+            clock.record_reopen(reopen_started.elapsed());
         }
         None => {
+            // First touch of this workspace's store in this process: a
+            // full `StoreReader::open`, not a "reopen" -- deliberately left
+            // out of `reopen_ms` (see that field's doc comment in
+            // `urdira-worker-protocol`), it is a different, one-time cost
+            // already visible elsewhere (`state.rs`'s own module doc).
             workspace_state.store_reader = Some(StoreReader::open(structural_root)?);
         }
     }
@@ -673,6 +680,14 @@ fn run_one(
         // nothing to close.
     }
 
+    // F1 1.1: instrumented as one block (`close_protection_ms`) -- the
+    // three `by_owner` passes below (at-risk/deleted/zombie) plus
+    // `protected_external_entity_ids`'s own `iter_visible` fallback were
+    // previously invisible in `ScanTimings`, falling into the unaccounted
+    // `total_ms − Σ phases` gap (plan `bright-churning-wind.md` Frente 1,
+    // diagnosed at 33-61% of the HUB scenario's wall time).
+    let close_protection_started = std::time::Instant::now();
+
     // External-entity close-protection (see `protected_external_entity_
     // ids`'s own doc comment for the full bug/fix writeup): find every
     // `jsts:external_module:*`/`jsts:external_symbol:*` identity this
@@ -680,8 +695,29 @@ fn run_one(
     // touched owner's PREVIOUS rows, absent from that SAME owner's fresh
     // proposals), then -- ONLY if that set is non-empty -- consult the
     // store for a still-live protector elsewhere in the workspace.
+    //
+    // F1 1.3: the three passes below (at-risk/deleted/zombie) all used to
+    // call `store_reader.by_owner(ordinal, prev_generation)` separately
+    // for the SAME set of touched owners -- 3x the disk/mmap-scan work
+    // for identical inputs. `touched_owner_ordinals` (built first, below)
+    // is the exact union `affected_owner_paths`' old ordinals ∪
+    // `deleted_owner_ordinals`; every subsequent pass fetches each
+    // touched owner's previous rows exactly ONCE (`prev_rows_by_owner`)
+    // and reuses that fetch. The at-risk/deleted asymmetry is preserved
+    // by keeping them as separate predicates over the SAME cached rows,
+    // not collapsed into one: an at-risk owner (came from `affected_
+    // owner_paths`) filters its previous external entities against that
+    // owner's OWN fresh proposals (`next_identities`); a deleted-only
+    // owner has no "next" batch at all (it produced no fresh proposals),
+    // so every one of its previous external entities is unconditionally
+    // at risk.
     let mut touched_owner_ordinals: HashSet<u32> = deleted_owner_ordinals.clone();
-    let mut at_risk_external_entities: HashSet<[u8; 32]> = HashSet::new();
+    // `Some(next_identities)` for an owner reached via `affected_owner_
+    // paths` (the at-risk rule); absent for a deleted-only owner (the
+    // deleted rule) -- `affected_owner_paths` and `source_delta.deleted`
+    // never name the same owner (a deleted file is never re-analyzed),
+    // so no owner is ever a member of both.
+    let mut next_identities_by_ordinal: HashMap<u32, HashSet<&[u8]>> = HashMap::new();
     for path in &affected_owner_paths {
         let Some(old_ordinal) = old_owner_ordinal(path, &old_entries, current_present, &ordinal_of)
         else {
@@ -700,21 +736,41 @@ fn run_one(
             })
             .map(|record| record.identity_key.as_slice())
             .collect();
-        for prev in store_reader.by_owner(old_ordinal, prev_generation) {
-            if prev.category() == CATEGORY_ENTITY
-                && is_external_entity_identity(&prev.identity_key())
-                && !next_identities.contains(prev.identity_key().as_ref())
-            {
-                at_risk_external_entities.insert(prev.record_id());
-            }
-        }
+        next_identities_by_ordinal.insert(old_ordinal, next_identities);
     }
-    for &ordinal in &deleted_owner_ordinals {
-        for prev in store_reader.by_owner(ordinal, prev_generation) {
-            if prev.category() == CATEGORY_ENTITY
-                && is_external_entity_identity(&prev.identity_key())
-            {
-                at_risk_external_entities.insert(prev.record_id());
+
+    // The one-fetch-per-owner cache every pass below consumes.
+    let prev_rows_by_owner: HashMap<u32, Vec<urdira_structural_store::RecordView>> =
+        touched_owner_ordinals
+            .iter()
+            .map(|&ordinal| (ordinal, store_reader.by_owner(ordinal, prev_generation)))
+            .collect();
+
+    let mut at_risk_external_entities: HashSet<[u8; 32]> = HashSet::new();
+    for (&ordinal, prev_rows) in &prev_rows_by_owner {
+        match next_identities_by_ordinal.get(&ordinal) {
+            // At-risk rule: an owner touched via `affected_owner_paths` --
+            // filter against that SAME owner's fresh proposals.
+            Some(next_identities) => {
+                for prev in prev_rows {
+                    if prev.category() == CATEGORY_ENTITY
+                        && is_external_entity_identity(&prev.identity_key())
+                        && !next_identities.contains(prev.identity_key().as_ref())
+                    {
+                        at_risk_external_entities.insert(prev.record_id());
+                    }
+                }
+            }
+            // Deleted rule: no "next" batch exists for this owner at all,
+            // so every previous external entity it owned is at risk.
+            None => {
+                for prev in prev_rows {
+                    if prev.category() == CATEGORY_ENTITY
+                        && is_external_entity_identity(&prev.identity_key())
+                    {
+                        at_risk_external_entities.insert(prev.record_id());
+                    }
+                }
             }
         }
     }
@@ -725,9 +781,9 @@ fn run_one(
     // `owner_artifact` keeps naming a file that was ALREADY deleted in an
     // earlier generation (protection never reassigns it -- see
     // `protected_external_entity_ids`'s doc comment for why). The two
-    // loops above only ever find an at-risk identity by looking at a
+    // passes above only ever find an at-risk identity by looking at a
     // TOUCHED owner's OWN entity rows -- but a zombie-owned entity's
-    // entity row belongs to nobody in THIS batch at all, so those loops
+    // entity row belongs to nobody in THIS batch at all, so those passes
     // never see it. Instead: for every touched owner, look at its own
     // PREVIOUS relation rows (`core:contains`, the only kind these
     // entities' occurrences ever target) whose TARGET is a zombie-owned
@@ -747,7 +803,14 @@ fn run_one(
     };
     let mut zombie_candidates: HashSet<[u8; 32]> = HashSet::new();
     for &ordinal in &touched_owner_ordinals {
-        for prev in store_reader.by_owner(ordinal, prev_generation) {
+        // `touched_owner_ordinals` is exactly `prev_rows_by_owner`'s key
+        // set (both built from the same union above), so this is always
+        // populated -- the `unwrap_or` empty slice is defensive only.
+        let prev_rows = prev_rows_by_owner
+            .get(&ordinal)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for prev in prev_rows {
             if prev.category() != CATEGORY_RELATION {
                 continue;
             }
@@ -795,6 +858,7 @@ fn run_one(
             zombie_closures.len(),
         );
     }
+    clock.record_close_protection(close_protection_started.elapsed());
 
     // --- Per-owner diff (plan §6.3) ---
     let write_started = std::time::Instant::now();

@@ -998,7 +998,7 @@ pub fn materialize_cold_partitioned(
         .iter()
         .map(|owner| (owner.owner_artifact_id.as_str(), owner.owner_path.as_str()))
         .collect();
-    let artifact_paths: Vec<String> = artifact_values
+    let mut artifact_paths: Vec<String> = artifact_values
         .iter()
         .map(|(id, _version)| {
             artifact_path_by_id
@@ -1431,6 +1431,7 @@ pub fn materialize_cold_partitioned(
         pending_deps,
         &record_ordinal_by_proposal_key,
         &mut artifacts,
+        &mut artifact_paths,
         1,
     )?;
     let deps_elapsed = deps_started.elapsed();
@@ -1445,11 +1446,23 @@ pub fn materialize_cold_partitioned(
     dicts.relation_kinds = relation_kinds.into_values();
     dicts.names = names.into_values();
     dicts.artifacts = artifacts.into_values();
-    // A3a-fix: `artifact_paths` is already ordinal-aligned with `artifact_
-    // values` (built above, before `owner_rows` was consumed) -- and
-    // `artifacts.into_values()` above is EXACTLY `artifact_values` (interned
-    // in the same sorted order), so no re-derivation is needed here.
+    // A3a-fix, F1 1.4: `artifact_paths` was seeded 1:1 with `artifact_
+    // values` (built above, before `owner_rows` was consumed), THEN kept
+    // aligned by `deps::materialize_dependencies` (called above) for the
+    // rare case a dependency target artifact mints an ordinal past that
+    // original set -- that call fills in the real target path for such an
+    // ordinal instead of leaving a gap, so `artifact_paths` stays exactly
+    // as long as `artifacts.into_values()` here, no re-derivation needed.
     dicts.artifact_paths = artifact_paths;
+    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        let empty_paths = dicts.artifact_paths.iter().filter(|p| p.is_empty()).count();
+        if empty_paths > 0 {
+            eprintln!(
+                "[urdira-indexing-worker] v4 materialize_cold_partitioned DEBUG: {empty_paths} artifact ordinal(s) still have no known path (out of {})",
+                dicts.artifact_paths.len(),
+            );
+        }
+    }
     dicts.facet_names = FACET_ORDER.iter().map(|name| (*name).to_string()).collect();
     dicts.subject_text = dicts
         .subjects
@@ -1876,6 +1889,7 @@ fn materialize_generation(
         pending_deps,
         &proposal_key_to_ordinal,
         &mut artifacts,
+        &mut artifact_paths,
         generation,
     )?;
     let deps_elapsed = deps_started.elapsed();
@@ -1930,16 +1944,30 @@ fn materialize_generation(
     dicts.relation_kinds = relation_kinds.into_values();
     dicts.names = names.into_values();
     dicts.artifacts = artifacts.into_values();
-    // A3a-fix: `artifact_paths` was seeded from `base_dicts` and extended
-    // during the owner loop above (before `deps::materialize_dependencies`
-    // ran) -- it may end up SHORTER than `dicts.artifacts` here in the rare
-    // case a dependency's target artifact was never itself a scanned owner
-    // this generation (`materialize_dependencies`'s own doc comment: it
-    // interns defensively for exactly this edge case). That's the
-    // documented, safe "can't reconstruct this ordinal's path" contract
-    // (`Dictionaries::artifact_paths`'s own doc comment) -- never
-    // re-derived or padded here.
+    // A3a-fix, F1 1.4: `artifact_paths` was seeded from `base_dicts` and
+    // extended during the owner loop above, THEN further extended inside
+    // `deps::materialize_dependencies` itself (called above, before this
+    // point) for the rare case a dependency's target artifact was never
+    // itself a scanned owner this generation -- that call now fills in the
+    // real `dependency_target_path` for such an ordinal instead of leaving
+    // it unpathed (see that function's own doc comment for the mechanism).
+    // `artifact_paths` can still end up SHORTER than `dicts.artifacts` only
+    // if some OTHER, non-dependency path mints an ordinal neither the
+    // owner loop nor `materialize_dependencies` ever sees -- not expected
+    // on this pipeline's current call graph, but still the same documented
+    // safe "can't reconstruct this ordinal's path" fallback contract
+    // (`Dictionaries::artifact_paths`'s own doc comment) if it ever
+    // happens.
     dicts.artifact_paths = artifact_paths;
+    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        let empty_paths = dicts.artifact_paths.iter().filter(|p| p.is_empty()).count();
+        if empty_paths > 0 {
+            eprintln!(
+                "[urdira-indexing-worker] v4 materialize_generation DEBUG: {empty_paths} artifact ordinal(s) still have no known path (out of {})",
+                dicts.artifact_paths.len(),
+            );
+        }
+    }
     // P2-2e deliverable 3: `facet_names` is NOT append-order-interned like
     // every dictionary above -- its ordinal IS the bit index (`FACET_ORDER`
     // is a fixed compile-time constant, never grown/reordered at runtime),
@@ -2917,6 +2945,49 @@ mod tests {
         assert_eq!(
             materialized.dicts.artifact_paths[owner_ordinal as usize], "src/new.ts",
             "the new owner's real path must land at its own ordinal, not be lost to the gap"
+        );
+    }
+
+    /// F1 1.4: a dependency whose target artifact was NEVER itself a
+    /// scanned owner (`deps::materialize_dependencies`'s "interns
+    /// defensively" edge case) must get its REAL path recorded at
+    /// `artifact_paths[dep_ordinal]` -- not left as an empty-string/absent
+    /// placeholder (`materialize.rs:1634-1636`'s old `String::new()` gap-
+    /// fill, before this fix, only ever ran for the OWNER side of a new
+    /// ordinal; the dependency side stayed permanently unpathed).
+    #[test]
+    fn materialize_generation_fills_a_real_path_for_a_dependency_only_ordinal() {
+        let owner_record = entity_record("owner_entity", "owner_entity", "src/owner.ts");
+        let mut owner = owner_facts("src/owner.ts", vec![owner_record]);
+        owner.dependencies.push(ProposedRecordDependency {
+            proposed_dependency_id: "dep:1".to_string(),
+            proposal_record_key: "record:owner_entity".to_string(),
+            dependency_artifact_id: "artifact:src/never-an-owner.ts".to_string(),
+            dependency_artifact_version_id: "version:src/never-an-owner.ts".to_string(),
+            dependency_target_path: "src/never-an-owner.ts".to_string(),
+            dependency_role: "jsts:resolution_input",
+            dependency_basis: "checker_resolution",
+            source_reference: serde_json::Value::Null,
+        });
+
+        let materialized = materialize_generation(vec![owner], 1, None, None)
+            .expect("materialize_generation succeeds");
+
+        let dep_ordinal = materialized
+            .dicts
+            .artifacts
+            .iter()
+            .position(|(id, _version)| id == "artifact:src/never-an-owner.ts")
+            .expect("dependency-only artifact interned") as u32;
+
+        assert_eq!(
+            materialized.dicts.artifact_paths.len(),
+            materialized.dicts.artifacts.len(),
+            "artifact_paths must stay 1:1 aligned with artifacts"
+        );
+        assert_eq!(
+            materialized.dicts.artifact_paths[dep_ordinal as usize], "src/never-an-owner.ts",
+            "the dependency-only ordinal must get its real target path, not an empty placeholder"
         );
     }
 

@@ -101,6 +101,7 @@ fn queryable_fixture_decodes() {
                 snapshot_ms: None,
                 lexical_ms: None,
                 total_ms: 5_320,
+                ..Default::default()
             },
         }
     );
@@ -137,6 +138,7 @@ fn scan_completed_fixture_decodes() {
                 snapshot_ms: Some(80),
                 lexical_ms: None,
                 total_ms: 5_800,
+                ..Default::default()
             },
         }
     );
@@ -165,6 +167,7 @@ fn upgrade_completed_fixture_decodes() {
                 snapshot_ms: Some(30),
                 lexical_ms: None,
                 total_ms: 2_600,
+                ..Default::default()
             },
         }
     );

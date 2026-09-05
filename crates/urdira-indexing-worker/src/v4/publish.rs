@@ -506,6 +506,10 @@ pub fn publish_delta_with_kind(
         .map_err(|_| ScanError("generation must be non-negative".into()))?;
     let prev_generation = generation - 1;
 
+    // F1 1.1: SELECTs run outside the transaction below (SQLite reads do
+    // not need one) -- timed separately from the transaction's own INSERTs
+    // + commit, per `ScanTimings::publish_sql_select_ms`/`_write_ms`.
+    let publish_select_started = std::time::Instant::now();
     let prev_snapshot_id: String = conn
         .query_row(
             "SELECT current_snapshot_id FROM workspace_current_state WHERE workspace_id = ?1",
@@ -525,6 +529,7 @@ pub fn publish_delta_with_kind(
     let prev_records_count = read_member_count(conn, "records", prev_generation)?;
     let prev_deps_count = read_member_count(conn, "dependency", prev_generation)?;
     let prev_graph_count = read_member_count(conn, "graph", prev_generation)?;
+    clock.record_publish_select(publish_select_started.elapsed());
 
     let roots = ScanRoots {
         records: to_prefixed_hex_bytes(&summary.records_root),
@@ -640,6 +645,9 @@ pub fn publish_delta_with_kind(
         &Value::Object(snapshot_payload),
     );
 
+    // F1 1.1: the transaction itself (8 INSERTs + commit), timed
+    // separately from the SELECT block above.
+    let publish_write_started = std::time::Instant::now();
     let transaction = conn.transaction().map_err(|error| {
         ScanError(format!(
             "v4 delta publish: opening SQLite transaction failed: {error}"
@@ -731,6 +739,7 @@ pub fn publish_delta_with_kind(
     transaction
         .commit()
         .map_err(|error| ScanError(format!("v4 delta publish: SQLite commit failed: {error}")))?;
+    clock.record_publish_write(publish_write_started.elapsed());
 
     Ok(IndexingEvent::ScanCompleted {
         request_id: request.request_id.clone(),

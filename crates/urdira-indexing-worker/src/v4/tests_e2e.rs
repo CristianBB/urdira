@@ -1080,6 +1080,28 @@ pub(super) fn generation_of(event: &IndexingEvent) -> u64 {
     }
 }
 
+/// F1 1.1: a one-line, grep-able rendering of the four new `ScanTimings`
+/// columns (`reopen_ms`/`close_protection_ms`/`publish_sql_select_ms`/
+/// `publish_sql_write_ms`) plus `total_ms`, for `n8n_incremental_
+/// measurement`'s printed A/B comparison -- the full `{:?}` of the event
+/// already carries these fields too, but a dedicated line keeps the
+/// before/after diff of a bench log to just the columns this task cares
+/// about instead of the whole event's debug dump.
+fn f1_timing_columns_of(event: &IndexingEvent) -> String {
+    let timings = match event {
+        IndexingEvent::ScanCompleted { timings, .. } => timings,
+        other => panic!("expected ScanCompleted, got {other:?}"),
+    };
+    format!(
+        "reopen_ms={:?} close_protection_ms={:?} publish_sql_select_ms={:?} publish_sql_write_ms={:?} total_ms={}",
+        timings.reopen_ms,
+        timings.close_protection_ms,
+        timings.publish_sql_select_ms,
+        timings.publish_sql_write_ms,
+        timings.total_ms,
+    )
+}
+
 /// P3-1's central correctness claim (plan §6, task brief: "Merkle roots
 /// identical to a from-scratch cold index of the mutated tree"): a cold
 /// scan, one incremental EDIT (`ScanScope::Changed`), then an independent
@@ -3494,6 +3516,7 @@ fn n8n_incremental_measurement() {
         t_edit.elapsed().as_secs_f64(),
         edit
     );
+    println!("EDIT#1 {}", f1_timing_columns_of(&edit));
 
     // A second edit of the SAME file, immediately after -- the "steady
     // state" number (no cold-cache effects from the first edit).
@@ -3525,6 +3548,7 @@ fn n8n_incremental_measurement() {
         t_edit2.elapsed().as_secs_f64(),
         edit2
     );
+    println!("EDIT#2 {}", f1_timing_columns_of(&edit2));
 
     // A create.
     let created_relative = format!(
@@ -3711,6 +3735,10 @@ fn n8n_incremental_measurement() {
             t_hub_unchanged.elapsed().as_secs_f64(),
             hub_unchanged
         );
+        println!(
+            "HUB_EDIT_SURFACE_UNCHANGED {}",
+            f1_timing_columns_of(&hub_unchanged)
+        );
 
         // Surface-changed: rename the FIRST existing exported function
         // found (a real export removal + a differently-named addition).
@@ -3755,6 +3783,10 @@ fn n8n_incremental_measurement() {
             generation_of(&hub_changed),
             t_hub_changed.elapsed().as_secs_f64(),
             hub_changed
+        );
+        println!(
+            "HUB_EDIT_SURFACE_CHANGED {}",
+            f1_timing_columns_of(&hub_changed)
         );
     } else {
         eprintln!(

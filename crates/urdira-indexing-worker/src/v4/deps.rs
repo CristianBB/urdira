@@ -158,10 +158,30 @@ fn dependency_id(owner_path: &str, dep_path: &str, role: u8) -> [u8; 32] {
 /// resolution only ever resolves within the workspace's own JS/TS set),
 /// but this function still interns defensively rather than erroring, so an
 /// edge case never aborts the whole scan.
+///
+/// F1 1.4: `artifact_paths` is that SAME `Dictionaries::artifact_paths`
+/// vector both `materialize_cold_partitioned` and `materialize_generation`
+/// build, aligned 1:1 by ordinal with `artifacts` -- passed here (instead
+/// of being left untouched, as before this fix) so the rare case just
+/// described (a dependency target artifact minted an ordinal `artifacts.
+/// intern` had never seen as an owner) fills in that ordinal's REAL path
+/// (`dependency.dependency_target_path`, already resolved to a workspace-
+/// relative path by the syntax worker -- `resolved_dependencies`) instead
+/// of leaving it as an empty-string/absent placeholder that permanently
+/// forces that ordinal's identity key back onto the store's Raw
+/// (non-reconstructed) encoding. Both call sites' own gap-fill code
+/// (`materialize_generation`'s owner loop, `materialize_cold_partitioned`'s
+/// `artifact_path_by_id` lookup) mint ordinals from the OWNER side only;
+/// this is the dependency-side counterpart, using the exact same "resize
+/// with empty padding up to the new ordinal, then push the real path"
+/// pattern so a pre-existing ordinal already interned by this generation's
+/// own owner loop is never touched (correctly skipped: `dep_ordinal <
+/// artifact_paths.len()` in that case).
 pub(super) fn materialize_dependencies(
     pending: Vec<(u32, u32, String, ProposedRecordDependency)>,
     record_ordinal_by_proposal_key: &FxHashMap<String, u32>,
     artifacts: &mut OrdinalDict<(String, String)>,
+    artifact_paths: &mut Vec<String>,
     generation: u32,
 ) -> Result<Vec<DependencyRow>, ScanError> {
     let mut rows = Vec::with_capacity(pending.len());
@@ -171,6 +191,10 @@ pub(super) fn materialize_dependencies(
             dependency.dependency_artifact_version_id.clone(),
         );
         let dep_ordinal = artifacts.intern(&dep_pair);
+        if (dep_ordinal as usize) >= artifact_paths.len() {
+            artifact_paths.resize(dep_ordinal as usize, String::new());
+            artifact_paths.push(dependency.dependency_target_path.clone());
+        }
         let record = record_ordinal_by_proposal_key
             .get(&dependency.proposal_record_key)
             .copied();

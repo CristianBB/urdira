@@ -58,6 +58,18 @@ pub struct PhaseTimings {
     pub fsync_ms: Option<u64>,
     pub snapshot_ms: Option<u64>,
     pub lexical_ms: Option<u64>,
+    /// F1 1.1: `StoreReader::reopen_if_changed` cost on the `Changed` path
+    /// (`delta.rs:run_one`, called BEFORE `catalog_started`).
+    pub reopen_ms: Option<u64>,
+    /// F1 1.1: external-entity close-protection cost on the `Changed` path
+    /// (`delta.rs:run_one`, between `record_materialize` and `write_
+    /// started`).
+    pub close_protection_ms: Option<u64>,
+    /// F1 1.1: `publish_delta_with_kind`'s pre-transaction SELECT block.
+    pub publish_sql_select_ms: Option<u64>,
+    /// F1 1.1: `publish_delta_with_kind`'s SQLite transaction (INSERTs +
+    /// commit), separate from the SELECT block above.
+    pub publish_sql_write_ms: Option<u64>,
 }
 
 pub struct ScanClock {
@@ -102,6 +114,18 @@ impl ScanClock {
     pub fn record_snapshot(&mut self, duration: Duration) {
         self.phases.snapshot_ms = Some(as_ms(duration));
     }
+    pub fn record_reopen(&mut self, duration: Duration) {
+        self.phases.reopen_ms = Some(as_ms(duration));
+    }
+    pub fn record_close_protection(&mut self, duration: Duration) {
+        self.phases.close_protection_ms = Some(as_ms(duration));
+    }
+    pub fn record_publish_select(&mut self, duration: Duration) {
+        self.phases.publish_sql_select_ms = Some(as_ms(duration));
+    }
+    pub fn record_publish_write(&mut self, duration: Duration) {
+        self.phases.publish_sql_write_ms = Some(as_ms(duration));
+    }
 
     /// Snapshot at the `Queryable` milestone: catalog/parse/resolve/
     /// materialize/write are known by then, fsync/snapshot are not (they
@@ -116,6 +140,16 @@ impl ScanClock {
             fsync_ms: None,
             snapshot_ms: None,
             lexical_ms: self.phases.lexical_ms,
+            // `reopen`/`close_protection` both run before `write_started`
+            // (see `delta.rs:run_one`), so both are already known by the
+            // `Queryable` milestone; `publish_sql_*` only run inside
+            // `publish::publish_delta`, which happens AFTER `Queryable` is
+            // emitted -- those two stay `None` here, filled in at
+            // `completed_timings` instead.
+            reopen_ms: self.phases.reopen_ms,
+            close_protection_ms: self.phases.close_protection_ms,
+            publish_sql_select_ms: None,
+            publish_sql_write_ms: None,
             total_ms: as_ms(self.elapsed()),
         }
     }
@@ -131,6 +165,10 @@ impl ScanClock {
             fsync_ms: self.phases.fsync_ms,
             snapshot_ms: self.phases.snapshot_ms,
             lexical_ms: self.phases.lexical_ms,
+            reopen_ms: self.phases.reopen_ms,
+            close_protection_ms: self.phases.close_protection_ms,
+            publish_sql_select_ms: self.phases.publish_sql_select_ms,
+            publish_sql_write_ms: self.phases.publish_sql_write_ms,
             total_ms: as_ms(self.elapsed()),
         }
     }
