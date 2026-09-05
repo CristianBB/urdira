@@ -274,6 +274,27 @@ pub struct ScanTimings {
     pub snapshot_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lexical_ms: Option<u64>,
+    /// F1 1.1: time spent in `StoreReader::reopen_if_changed` (`delta.rs`'s
+    /// `Changed` path calls this BEFORE `catalog_started`, so its cost
+    /// previously vanished into the unaccounted `total_ms − Σ phases` gap).
+    /// Always `None` on a cold scan (there is no reader to reopen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopen_ms: Option<u64>,
+    /// F1 1.1: time spent in the external-entity close-protection block
+    /// (`delta.rs`'s at-risk/deleted/zombie passes plus `protected_
+    /// external_entity_ids`), between `record_materialize` and `write_
+    /// started`. Always `None` on a cold scan (nothing to protect yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_protection_ms: Option<u64>,
+    /// F1 1.1: time spent in `publish_delta_with_kind`'s SELECT block
+    /// (`prev_snapshot_id` + the three `read_member_count` calls), run
+    /// BEFORE the SQLite transaction is opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_sql_select_ms: Option<u64>,
+    /// F1 1.1: time spent inside the SQLite transaction itself (the 8
+    /// INSERTs plus `commit()`), separate from `publish_sql_select_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_sql_write_ms: Option<u64>,
     pub total_ms: u64,
 }
 
@@ -1097,6 +1118,7 @@ mod tests {
                 snapshot_ms: None,
                 lexical_ms: None,
                 total_ms: 5_320,
+                ..Default::default()
             },
         };
         let encoded = serde_json::to_vec(&queryable).unwrap();
@@ -1125,6 +1147,7 @@ mod tests {
                 snapshot_ms: Some(80),
                 lexical_ms: None,
                 total_ms: 5_800,
+                ..Default::default()
             },
         };
         let encoded = serde_json::to_vec(&completed).unwrap();

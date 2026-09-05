@@ -389,9 +389,16 @@ fn run_one(
     // restart" cost).
     match &mut workspace_state.store_reader {
         Some(reader) => {
+            let reopen_started = std::time::Instant::now();
             reader.reopen_if_changed()?;
+            clock.record_reopen(reopen_started.elapsed());
         }
         None => {
+            // First touch of this workspace's store in this process: a
+            // full `StoreReader::open`, not a "reopen" -- deliberately left
+            // out of `reopen_ms` (see that field's doc comment in
+            // `urdira-worker-protocol`), it is a different, one-time cost
+            // already visible elsewhere (`state.rs`'s own module doc).
             workspace_state.store_reader = Some(StoreReader::open(structural_root)?);
         }
     }
@@ -673,6 +680,14 @@ fn run_one(
         // nothing to close.
     }
 
+    // F1 1.1: instrumented as one block (`close_protection_ms`) -- the
+    // three `by_owner` passes below (at-risk/deleted/zombie) plus
+    // `protected_external_entity_ids`'s own `iter_visible` fallback were
+    // previously invisible in `ScanTimings`, falling into the unaccounted
+    // `total_ms − Σ phases` gap (plan `bright-churning-wind.md` Frente 1,
+    // diagnosed at 33-61% of the HUB scenario's wall time).
+    let close_protection_started = std::time::Instant::now();
+
     // External-entity close-protection (see `protected_external_entity_
     // ids`'s own doc comment for the full bug/fix writeup): find every
     // `jsts:external_module:*`/`jsts:external_symbol:*` identity this
@@ -795,6 +810,7 @@ fn run_one(
             zombie_closures.len(),
         );
     }
+    clock.record_close_protection(close_protection_started.elapsed());
 
     // --- Per-owner diff (plan §6.3) ---
     let write_started = std::time::Instant::now();
