@@ -36,8 +36,8 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, Class, ClassElement, ClassType, Expression, Function, FunctionBody, FunctionType,
     IdentifierReference, MethodDefinitionKind, Program, PropertyKey, Statement,
-    TSInterfaceDeclaration, TSLiteral, TSSignature, TSType, TSTypeAnnotation, TSTypeName,
-    TSTypeQueryExprName,
+    TSInterfaceDeclaration, TSLiteral, TSSignature, TSType, TSTypeAliasDeclaration,
+    TSTypeAnnotation, TSTypeName, TSTypeQueryExprName,
 };
 use oxc_ast_visit::utf8_to_utf16::Utf8ToUtf16;
 use oxc_parser::Parser;
@@ -369,6 +369,31 @@ pub struct DeclSummary {
     /// VARIABLE's own entity id (never a `function`-kind id -- this is
     /// never a `function` declaration).
     pub callable_variables: Vec<FunctionSummary>,
+    /// D.2 (2026-09-05, references-parity task): every top-level (or
+    /// `export`ed) `type X = ...` declaration's own RHS, extracted the SAME
+    /// way a class/interface member's inline annotation already is
+    /// (`raw_type_ref_of_ts_type`, with `synthetic_interfaces` wired to
+    /// `summary.interfaces` directly -- a `type X = { a: Foo }` object-
+    /// literal RHS synthesizes an interface for `X` to point at, exactly
+    /// like an inline `{ ... }` annotation elsewhere does). Consumed by
+    /// `ProgramIndex::build`'s `alias_targets` map, NOT resolved here (the
+    /// RHS may itself be an import, only closeable once cross-file import
+    /// resolution has run -- see that field's own doc comment).
+    pub type_aliases: Vec<TypeAliasDecl>,
+}
+
+/// D.2 (2026-09-05, references-parity task): one top-level `type X = ...`
+/// declaration, as extracted at single-file `extract_decl_summary` time --
+/// `target` is the RHS's raw (not yet cross-file-resolved) type reference,
+/// generic type parameters erased the same way every other `RawTypeRef`
+/// producer in this crate already erases them (`type Box<T> = Inner<T>`
+/// extracts to `RawTypeRef::Local(Inner's id)`, `T` never inspected).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypeAliasDecl {
+    pub id: String,
+    pub name: String,
+    pub start: u32,
+    pub target: RawTypeRef,
 }
 
 /// P1-A: a top-level `const X: T = ...` declarator's own EXPLICIT type
@@ -444,6 +469,7 @@ pub fn extract_decl_summary(path: &str, source_text: &str) -> Result<DeclSummary
         object_shapes: Vec::new(),
         variables: Vec::new(),
         callable_variables: Vec::new(),
+        type_aliases: Vec::new(),
     };
     for statement in &parsed.program.body {
         collect_from_statement(statement, path, scoping, &import_specifiers, &mut summary);
@@ -538,6 +564,16 @@ fn collect_from_statement(
         Statement::VariableDeclaration(declaration) => {
             collect_object_shapes(declaration, path, scoping, import_specifiers, summary);
         }
+        Statement::TSTypeAliasDeclaration(declaration) => {
+            let alias = summarize_type_alias(
+                declaration,
+                path,
+                scoping,
+                import_specifiers,
+                &mut summary.interfaces,
+            );
+            summary.type_aliases.push(alias);
+        }
         Statement::ExportNamedDeclaration(export) => {
             if let Some(declaration) = &export.declaration {
                 collect_from_declaration(declaration, path, scoping, import_specifiers, summary);
@@ -600,7 +636,44 @@ fn collect_from_declaration(
         Declaration::VariableDeclaration(declaration) => {
             collect_object_shapes(declaration, path, scoping, import_specifiers, summary);
         }
+        Declaration::TSTypeAliasDeclaration(declaration) => {
+            let alias = summarize_type_alias(
+                declaration,
+                path,
+                scoping,
+                import_specifiers,
+                &mut summary.interfaces,
+            );
+            summary.type_aliases.push(alias);
+        }
         _ => {}
+    }
+}
+
+/// D.2 (2026-09-05, references-parity task): extract one `type X = ...`
+/// declaration's own `TypeAliasDecl` -- see that struct's own doc comment.
+fn summarize_type_alias(
+    declaration: &TSTypeAliasDeclaration,
+    path: &str,
+    scoping: &Scoping,
+    import_specifiers: &HashMap<SymbolId, (String, Option<String>)>,
+    synthetic_interfaces: &mut Vec<InterfaceSummary>,
+) -> TypeAliasDecl {
+    let name = declaration.id.name.as_str().to_owned();
+    let start = declaration.id.span.start;
+    let id = declaration_id("type", path, start, &name);
+    let target = raw_type_ref_of_ts_type(
+        &declaration.type_annotation,
+        path,
+        scoping,
+        import_specifiers,
+        synthetic_interfaces,
+    );
+    TypeAliasDecl {
+        id,
+        name,
+        start,
+        target,
     }
 }
 
@@ -1950,6 +2023,17 @@ fn classify_heritage_identifier(
     if flags.contains(oxc_syntax::symbol::SymbolFlags::Interface) {
         return HeritageTarget::Local(declaration_id("interface", path, target_start, target_name));
     }
+    // D.2 (2026-09-05, references-parity task): `class C extends Alias {}`
+    // where `Alias` is a top-level `type Alias = Base` -- classified as a
+    // `Local("type", ...)` id here, the SAME id `DeclSummary::type_aliases`
+    // gives this declaration; `ProgramIndex::build`'s `resolve_heritage_
+    // target` de-aliases it (via `alias_targets`) BEFORE `collect_members`
+    // ever looks it up in `containers` (which is indexed by class/
+    // interface/type-literal ids, never by a type-alias id) -- see that
+    // function's own doc comment.
+    if flags.contains(oxc_syntax::symbol::SymbolFlags::TypeAlias) {
+        return HeritageTarget::Local(declaration_id("type", path, target_start, target_name));
+    }
     HeritageTarget::Unknown
 }
 
@@ -2727,6 +2811,17 @@ pub struct ProgramIndex {
     /// the reverse import graph `transitive_importers_closure` walks to
     /// find the affected component of an edit.
     importers_of: HashMap<String, HashSet<String>>,
+    /// D.2 (2026-09-05, references-parity task): every top-level `type X =
+    /// ...` declaration's own id, mapped to its FINAL (hop-chased through
+    /// any number of other aliases, cycle-guarded) `ResolvedTypeRef` -- see
+    /// `build_alias_targets`'s own doc comment. Recomputed WHOLESALE (never
+    /// incrementally patched) at `build` and at the start of every
+    /// `reflow_files` call: cheap (real corpora have relatively few `type`
+    /// declarations, unlike the class/interface/function/variable
+    /// populations the rest of this incremental machinery is built for),
+    /// and correct by construction since it depends only on `summaries`
+    /// (always current before either call runs) and `import_targets`.
+    alias_targets: HashMap<String, Option<ResolvedTypeRef>>,
 }
 
 /// P3-8a: one file's pass-1 output that cannot resolve until later passes
@@ -2751,6 +2846,7 @@ fn resolve_members_for(
     members: &[MemberEntry],
     owning_path: &str,
     import_targets: &HashMap<(String, String, String), String>,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
 ) -> Vec<ResolvedMember> {
     members
         .iter()
@@ -2758,7 +2854,12 @@ fn resolve_members_for(
             name: member.name.clone(),
             is_static: member.is_static,
             entity_id: member.entity_id.clone(),
-            type_ref: resolve_raw_type_ref(&member.type_ref, owning_path, import_targets),
+            type_ref: resolve_raw_type_ref(
+                &member.type_ref,
+                owning_path,
+                import_targets,
+                alias_targets,
+            ),
         })
         .collect()
 }
@@ -2783,13 +2884,15 @@ fn insert_file_pass1(
     owned_entities: &mut Vec<String>,
     summary: &DeclSummary,
     import_targets: &HashMap<(String, String, String), String>,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
 ) -> FileDeferred {
     let path = summary.path.as_str();
     let mut deferred = FileDeferred::default();
 
     for class in &summary.classes {
-        let resolve =
-            |target: &HeritageTarget| resolve_heritage_target(target, path, import_targets);
+        let resolve = |target: &HeritageTarget| {
+            resolve_heritage_target(target, path, import_targets, alias_targets)
+        };
         containers.insert(
             class.entity_id.clone(),
             ResolvedContainer {
@@ -2800,7 +2903,7 @@ fn insert_file_pass1(
                     .into_iter()
                     .collect(),
                 implements: class.implements.iter().filter_map(resolve).collect(),
-                members: resolve_members_for(&class.members, path, import_targets),
+                members: resolve_members_for(&class.members, path, import_targets, alias_targets),
                 is_interface: false,
             },
         );
@@ -2818,14 +2921,20 @@ fn insert_file_pass1(
         }
     }
     for interface in &summary.interfaces {
-        let resolve =
-            |target: &HeritageTarget| resolve_heritage_target(target, path, import_targets);
+        let resolve = |target: &HeritageTarget| {
+            resolve_heritage_target(target, path, import_targets, alias_targets)
+        };
         containers.insert(
             interface.entity_id.clone(),
             ResolvedContainer {
                 extends: interface.extends.iter().filter_map(resolve).collect(),
                 implements: Vec::new(),
-                members: resolve_members_for(&interface.members, path, import_targets),
+                members: resolve_members_for(
+                    &interface.members,
+                    path,
+                    import_targets,
+                    alias_targets,
+                ),
                 is_interface: true,
             },
         );
@@ -2843,7 +2952,8 @@ fn insert_file_pass1(
         }
     }
     for function in &summary.functions {
-        if let Some(return_type) = resolve_raw_type_ref(&function.return_type, path, import_targets)
+        if let Some(return_type) =
+            resolve_raw_type_ref(&function.return_type, path, import_targets, alias_targets)
         {
             function_return_types.insert(function.entity_id.clone(), return_type);
         } else if contains_deferred(&function.return_type) {
@@ -2860,7 +2970,8 @@ fn insert_file_pass1(
     // `function_return_types` map, keyed by the VARIABLE's own entity id
     // (see `DeclSummary::callable_variables`'s doc comment).
     for callable in &summary.callable_variables {
-        if let Some(return_type) = resolve_raw_type_ref(&callable.return_type, path, import_targets)
+        if let Some(return_type) =
+            resolve_raw_type_ref(&callable.return_type, path, import_targets, alias_targets)
         {
             function_return_types.insert(callable.entity_id.clone(), return_type);
         } else if contains_deferred(&callable.return_type) {
@@ -2883,7 +2994,7 @@ fn insert_file_pass1(
             ResolvedContainer {
                 extends: Vec::new(),
                 implements: Vec::new(),
-                members: resolve_members_for(&shape.members, path, import_targets),
+                members: resolve_members_for(&shape.members, path, import_targets, alias_targets),
                 is_interface: true,
             },
         );
@@ -2901,7 +3012,9 @@ fn insert_file_pass1(
         }
     }
     for variable in &summary.variables {
-        if let Some(type_ref) = resolve_raw_type_ref(&variable.type_ref, path, import_targets) {
+        if let Some(type_ref) =
+            resolve_raw_type_ref(&variable.type_ref, path, import_targets, alias_targets)
+        {
             variable_types.insert(variable.entity_id.clone(), type_ref);
         } else if contains_deferred(&variable.type_ref) {
             deferred.variables.push((
@@ -2926,12 +3039,15 @@ fn run_pass2_for_summary(
     containers: &mut HashMap<String, ResolvedContainer>,
     summary: &DeclSummary,
     import_targets: &HashMap<(String, String, String), String>,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
 ) {
     for class in &summary.classes {
         let Some(HeritageTarget::CallMember { base, member }) = &class.extends else {
             continue;
         };
-        let Some(base_entity) = resolve_heritage_target(base, &summary.path, import_targets) else {
+        let Some(base_entity) =
+            resolve_heritage_target(base, &summary.path, import_targets, alias_targets)
+        else {
             continue;
         };
         let Some(ResolvedTypeRef::Entity(target_id)) =
@@ -2956,6 +3072,7 @@ fn run_pass2_for_summary(
 fn collect_pending_for_summary(
     summary: &DeclSummary,
     import_targets: &HashMap<(String, String, String), String>,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
     pending_functions: &mut Vec<(String, Vec<PreparedReturnShape>, bool)>,
     pending_members: &mut Vec<(String, String, Vec<PreparedReturnShape>, bool)>,
 ) {
@@ -2963,7 +3080,9 @@ fn collect_pending_for_summary(
         let Some(shapes) = &function.pending_return else {
             continue;
         };
-        let Some(prepared) = prepare_return_shapes(shapes, &summary.path, import_targets) else {
+        let Some(prepared) =
+            prepare_return_shapes(shapes, &summary.path, import_targets, alias_targets)
+        else {
             continue;
         };
         pending_functions.push((function.entity_id.clone(), prepared, function.is_async));
@@ -2973,7 +3092,8 @@ fn collect_pending_for_summary(
             let Some(shapes) = &member.pending_return else {
                 continue;
             };
-            let Some(prepared) = prepare_return_shapes(shapes, &summary.path, import_targets)
+            let Some(prepared) =
+                prepare_return_shapes(shapes, &summary.path, import_targets, alias_targets)
             else {
                 continue;
             };
@@ -3188,12 +3308,14 @@ impl ProgramIndex {
         summaries: &BTreeMap<String, DeclSummary>,
         import_targets: &HashMap<(String, String, String), String>,
     ) -> Self {
+        let alias_targets = build_alias_targets(summaries, import_targets);
         let mut me = Self {
             containers: HashMap::new(),
             function_return_types: HashMap::new(),
             variable_types: HashMap::new(),
             summaries: summaries.clone(),
             import_targets: import_targets.clone(),
+            alias_targets,
             file_import_keys: HashMap::new(),
             entity_owner: HashMap::new(),
             file_entities: HashMap::new(),
@@ -3219,6 +3341,7 @@ impl ProgramIndex {
                 &mut owned,
                 summary,
                 &me.import_targets,
+                &me.alias_targets,
             );
             me.file_entities.insert(summary.path.clone(), owned);
             deferred_functions.extend(file_deferred.functions);
@@ -3232,7 +3355,12 @@ impl ProgramIndex {
         }
 
         for summary in summaries.values() {
-            run_pass2_for_summary(&mut me.containers, summary, &me.import_targets);
+            run_pass2_for_summary(
+                &mut me.containers,
+                summary,
+                &me.import_targets,
+                &me.alias_targets,
+            );
         }
 
         let mut pending_functions = Vec::new();
@@ -3241,6 +3369,7 @@ impl ProgramIndex {
             collect_pending_for_summary(
                 summary,
                 &me.import_targets,
+                &me.alias_targets,
                 &mut pending_functions,
                 &mut pending_members,
             );
@@ -3449,6 +3578,12 @@ impl ProgramIndex {
         for file in files {
             self.remove_file_contributions(file);
         }
+        // D.2: recomputed wholesale from `self.summaries` (already current
+        // -- the caller installs a fresh summary for the edited file
+        // before calling this) -- see `alias_targets`'s own doc comment
+        // for why a full recompute, not an incremental patch, is correct
+        // and cheap here.
+        self.alias_targets = build_alias_targets(&self.summaries, &self.import_targets);
         let mut deferred_functions = Vec::new();
         let mut deferred_variables = Vec::new();
         let mut deferred_members = Vec::new();
@@ -3470,6 +3605,7 @@ impl ProgramIndex {
                 &mut owned,
                 &summary,
                 &self.import_targets,
+                &self.alias_targets,
             );
             self.file_entities.insert(file.clone(), owned);
             deferred_functions.extend(file_deferred.functions);
@@ -3478,7 +3614,12 @@ impl ProgramIndex {
         }
         for file in files {
             if let Some(summary) = self.summaries.get(file).cloned() {
-                run_pass2_for_summary(&mut self.containers, &summary, &self.import_targets);
+                run_pass2_for_summary(
+                    &mut self.containers,
+                    &summary,
+                    &self.import_targets,
+                    &self.alias_targets,
+                );
             }
         }
         let mut pending_functions = Vec::new();
@@ -3488,6 +3629,7 @@ impl ProgramIndex {
                 collect_pending_for_summary(
                     &summary,
                     &self.import_targets,
+                    &self.alias_targets,
                     &mut pending_functions,
                     &mut pending_members,
                 );
@@ -3819,6 +3961,181 @@ impl ProgramIndex {
     }
 }
 
+/// D.2 (2026-09-05, references-parity task): the maximum number of alias
+/// hops `build_alias_targets`/`resolve_type_ref_chasing_aliases` will
+/// follow (`type A = B; type B = C; ...`) before giving up -- a genuine
+/// cycle (`type A = B; type B = A`) never converges regardless of the cap
+/// and is caught earlier anyway by the `visiting` guard; this cap only
+/// bounds a pathologically long (but acyclic) real alias chain, never a
+/// guess either way.
+const MAX_ALIAS_DEPTH: u8 = 8;
+
+/// D.2: close every top-level `type X = ...` declaration's own RHS against
+/// `import_targets`, chasing through any number of hops where the RHS
+/// itself names ANOTHER type alias (`type A = B` where `B` is itself a
+/// `type` declaration) -- built ONCE, up front, before `insert_file_pass1`
+/// ever runs (pass 1 needs the FINAL, fully-chased map to de-alias a
+/// member/function/variable annotation's own `RawTypeRef::Local`/`Imported`
+/// leaf that happens to name an alias rather than a real class/interface/
+/// type-literal -- see `resolve_raw_type_ref`'s own doc comment for that
+/// consuming side). A cycle, or a chain longer than `MAX_ALIAS_DEPTH`,
+/// simply has no entry in the returned map -- its consumers see the
+/// UNCHANGED `RawTypeRef::Local(alias_id)` fall through `resolve_raw_type_
+/// ref`'s own fallback (treated as an ordinary, if unresolvable-further,
+/// entity id) -- never a guess.
+fn build_alias_targets(
+    summaries: &BTreeMap<String, DeclSummary>,
+    import_targets: &HashMap<(String, String, String), String>,
+) -> HashMap<String, Option<ResolvedTypeRef>> {
+    let mut raw_by_id: HashMap<String, (String, RawTypeRef)> = HashMap::new();
+    for summary in summaries.values() {
+        for alias in &summary.type_aliases {
+            raw_by_id.insert(
+                alias.id.clone(),
+                (summary.path.clone(), alias.target.clone()),
+            );
+        }
+    }
+    // Every KNOWN alias id gets an entry, `None` when it never converged (a
+    // cycle, or a chain longer than `MAX_ALIAS_DEPTH`) -- see `dealias_
+    // entity`/`dealias_heritage_id`'s own doc comments for why a key's
+    // MERE PRESENCE (not just its value) is load-bearing: it is what tells
+    // those two functions "this id IS a known alias" apart from "this id
+    // is an ordinary class/interface/type-literal `alias_targets` never
+    // heard of" -- a value-only map (inserting only on success) cannot
+    // express that distinction, so a cyclic alias's own id would otherwise
+    // silently fall through as if it were a real, final container id.
+    let mut resolved = HashMap::new();
+    for (id, (owning_path, raw)) in &raw_by_id {
+        let mut visiting = HashSet::new();
+        visiting.insert(id.clone());
+        let value = resolve_type_ref_chasing_aliases(
+            raw,
+            owning_path,
+            import_targets,
+            &raw_by_id,
+            &mut visiting,
+            0,
+        );
+        resolved.insert(id.clone(), value);
+    }
+    resolved
+}
+
+/// D.2: structurally the SAME wrapper recursion `resolve_raw_type_ref`
+/// itself does (`ArrayOf`/`PromiseOf`/`RecordOf`/`Union` recurse, `ThisType`
+/// passes through, `ReturnTypeOfFn`/`IndexedAccess`/`Unknown` give up) --
+/// the ONLY difference is the `Local`/`Imported` LEAF (`resolve_alias_
+/// chase_leaf`): where `resolve_raw_type_ref` treats a resolved id as
+/// final the instant it is found, this one recurses ONE MORE HOP whenever
+/// that id is ITSELF a known alias (`raw_by_id` has it) -- exactly what
+/// `build_alias_targets`'s own fixed, per-id `resolved` map cannot express
+/// while it is still being built (a partially-built map cannot tell "not
+/// an alias" from "an alias not resolved YET" apart, which is why this
+/// function threads `raw_by_id` -- the full set of KNOWN alias ids -- and
+/// a live `visiting`/`depth` pair instead of a flat lookup map).
+#[allow(clippy::too_many_arguments)]
+fn resolve_type_ref_chasing_aliases(
+    raw: &RawTypeRef,
+    owning_path: &str,
+    import_targets: &HashMap<(String, String, String), String>,
+    raw_by_id: &HashMap<String, (String, RawTypeRef)>,
+    visiting: &mut HashSet<String>,
+    depth: u8,
+) -> Option<ResolvedTypeRef> {
+    match raw {
+        RawTypeRef::Local(entity_id) => {
+            resolve_alias_chase_leaf(entity_id, import_targets, raw_by_id, visiting, depth)
+        }
+        RawTypeRef::Imported {
+            specifier,
+            imported_name,
+        } => {
+            let target_id = import_targets.get(&(
+                owning_path.to_owned(),
+                specifier.clone(),
+                imported_name.clone().unwrap_or_default(),
+            ))?;
+            resolve_alias_chase_leaf(target_id, import_targets, raw_by_id, visiting, depth)
+        }
+        RawTypeRef::ThisType => Some(ResolvedTypeRef::ThisType),
+        RawTypeRef::ArrayOf(inner) => resolve_type_ref_chasing_aliases(
+            inner,
+            owning_path,
+            import_targets,
+            raw_by_id,
+            visiting,
+            depth,
+        )
+        .map(|resolved| ResolvedTypeRef::ArrayOf(Box::new(resolved))),
+        RawTypeRef::PromiseOf(inner) => resolve_type_ref_chasing_aliases(
+            inner,
+            owning_path,
+            import_targets,
+            raw_by_id,
+            visiting,
+            depth,
+        )
+        .map(|resolved| ResolvedTypeRef::PromiseOf(Box::new(resolved))),
+        RawTypeRef::RecordOf(inner) => resolve_type_ref_chasing_aliases(
+            inner,
+            owning_path,
+            import_targets,
+            raw_by_id,
+            visiting,
+            depth,
+        )
+        .map(|resolved| ResolvedTypeRef::RecordOf(Box::new(resolved))),
+        RawTypeRef::Union(items) => items
+            .iter()
+            .map(|item| {
+                resolve_type_ref_chasing_aliases(
+                    item,
+                    owning_path,
+                    import_targets,
+                    raw_by_id,
+                    visiting,
+                    depth,
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(ResolvedTypeRef::Union),
+        RawTypeRef::ReturnTypeOfFn(_) | RawTypeRef::IndexedAccess { .. } => None,
+        RawTypeRef::Unknown => None,
+    }
+}
+
+/// D.2: `id` is not a known alias -- a real class/interface/type-literal
+/// (or a still-`Unknown` id `raw_by_id` never heard of, e.g. an unresolved
+/// import) -- so it IS the final answer, `Some(Entity(id))`. `id` IS a
+/// known alias: recurse into ITS OWN raw target one more hop, guarded by
+/// `visiting` (a repeat id anywhere on the current chain is a cycle,
+/// `None`, matching `resolve_named_export_inner`'s own `visiting`-set
+/// idiom in `urdira-jsts-syntax-worker::resolver`) and `depth` (capped at
+/// `MAX_ALIAS_DEPTH`).
+fn resolve_alias_chase_leaf(
+    id: &str,
+    import_targets: &HashMap<(String, String, String), String>,
+    raw_by_id: &HashMap<String, (String, RawTypeRef)>,
+    visiting: &mut HashSet<String>,
+    depth: u8,
+) -> Option<ResolvedTypeRef> {
+    let Some((alias_owning_path, alias_raw)) = raw_by_id.get(id) else {
+        return Some(ResolvedTypeRef::Entity(id.to_owned()));
+    };
+    if depth + 1 >= MAX_ALIAS_DEPTH || !visiting.insert(id.to_owned()) {
+        return None;
+    }
+    resolve_type_ref_chasing_aliases(
+        alias_raw,
+        alias_owning_path,
+        import_targets,
+        raw_by_id,
+        visiting,
+        depth + 1,
+    )
+}
+
 /// P1-A: close a `RawTypeRef`'s `Local`/`Imported` leaves against
 /// `import_targets` the same way `resolve_heritage_target` does for a
 /// heritage clause -- `ThisType` passes through untouched (resolved later,
@@ -3826,13 +4143,27 @@ impl ProgramIndex {
 /// only produce a wrapped result when their inner type resolved, and
 /// `Unknown`/an unresolved `Imported` reference both produce `None` --
 /// never a guess.
+///
+/// D.2 (2026-09-05, references-parity task): a `Local`/`Imported` leaf that
+/// resolves to a KNOWN type-alias id is substituted with `alias_targets`'
+/// own (already fully hop-chased, cycle-guarded -- see `build_alias_
+/// targets`'s doc comment) resolution for it, so a member/function/
+/// variable annotated with an alias sees exactly what the alias ultimately
+/// means, never the alias's own (uninformative to every caller here)
+/// entity id. `alias_targets` is ALWAYS the complete, already-converged map
+/// by the time this runs (built once, before `insert_file_pass1`) -- an id
+/// missing from it is definitively "not an alias" here, unlike inside
+/// `build_alias_targets`'s own still-converging computation (see
+/// `resolve_alias_chase_leaf`'s doc comment for why that one cannot reuse
+/// this same flat-lookup shortcut).
 fn resolve_raw_type_ref(
     raw: &RawTypeRef,
     owning_path: &str,
     import_targets: &HashMap<(String, String, String), String>,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
 ) -> Option<ResolvedTypeRef> {
     match raw {
-        RawTypeRef::Local(entity_id) => Some(ResolvedTypeRef::Entity(entity_id.clone())),
+        RawTypeRef::Local(entity_id) => dealias_entity(entity_id, alias_targets),
         RawTypeRef::Imported {
             specifier,
             imported_name,
@@ -3842,26 +4173,53 @@ fn resolve_raw_type_ref(
                 specifier.clone(),
                 imported_name.clone().unwrap_or_default(),
             ))
-            .cloned()
-            .map(ResolvedTypeRef::Entity),
+            .and_then(|target_id| dealias_entity(target_id, alias_targets)),
         RawTypeRef::ThisType => Some(ResolvedTypeRef::ThisType),
-        RawTypeRef::ArrayOf(inner) => resolve_raw_type_ref(inner, owning_path, import_targets)
-            .map(|resolved| ResolvedTypeRef::ArrayOf(Box::new(resolved))),
-        RawTypeRef::PromiseOf(inner) => resolve_raw_type_ref(inner, owning_path, import_targets)
-            .map(|resolved| ResolvedTypeRef::PromiseOf(Box::new(resolved))),
-        RawTypeRef::RecordOf(inner) => resolve_raw_type_ref(inner, owning_path, import_targets)
-            .map(|resolved| ResolvedTypeRef::RecordOf(Box::new(resolved))),
+        RawTypeRef::ArrayOf(inner) => {
+            resolve_raw_type_ref(inner, owning_path, import_targets, alias_targets)
+                .map(|resolved| ResolvedTypeRef::ArrayOf(Box::new(resolved)))
+        }
+        RawTypeRef::PromiseOf(inner) => {
+            resolve_raw_type_ref(inner, owning_path, import_targets, alias_targets)
+                .map(|resolved| ResolvedTypeRef::PromiseOf(Box::new(resolved)))
+        }
+        RawTypeRef::RecordOf(inner) => {
+            resolve_raw_type_ref(inner, owning_path, import_targets, alias_targets)
+                .map(|resolved| ResolvedTypeRef::RecordOf(Box::new(resolved)))
+        }
         // P2-2j: resolve every constituent or none at all -- see
         // `ResolvedTypeRef::Union`'s doc comment.
         RawTypeRef::Union(items) => items
             .iter()
-            .map(|item| resolve_raw_type_ref(item, owning_path, import_targets))
+            .map(|item| resolve_raw_type_ref(item, owning_path, import_targets, alias_targets))
             .collect::<Option<Vec<_>>>()
             .map(ResolvedTypeRef::Union),
         // P1-C: needs `ProgramIndex::build`'s later, fourth pass instead --
         // see `resolve_raw_type_ref_deferred`'s doc comment.
         RawTypeRef::ReturnTypeOfFn(_) | RawTypeRef::IndexedAccess { .. } => None,
         RawTypeRef::Unknown => None,
+    }
+}
+
+/// D.2: `entity_id` as `alias_targets` itself would want any consumer to
+/// see it -- its own de-aliased resolution when it names a KNOWN alias,
+/// the plain `Entity(entity_id)` otherwise (a real class/interface/type-
+/// literal, or an id `alias_targets` never heard of e.g. one that was part
+/// of an unconverged cycle -- both indistinguishable here, and both
+/// correctly fall back to treating `entity_id` as a real, final answer).
+fn dealias_entity(
+    entity_id: &str,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
+) -> Option<ResolvedTypeRef> {
+    match alias_targets.get(entity_id) {
+        Some(Some(value)) => Some(value.clone()),
+        // A KNOWN alias id that never converged (cycle/too-deep chain) --
+        // `None` here, never the (wrong) fallback of treating the alias's
+        // OWN id as if it were a real, final container.
+        Some(None) => None,
+        // Not a known alias at all -- a real class/interface/type-literal
+        // id, unchanged.
+        None => Some(ResolvedTypeRef::Entity(entity_id.to_owned())),
     }
 }
 
@@ -4057,13 +4415,41 @@ fn collect_member_type_ref(
     None
 }
 
+/// D.2 (2026-09-05, references-parity task): `entity_id` as a HERITAGE
+/// target specifically wants to see it -- unlike `dealias_entity` (which
+/// always has an answer, wrapping a non-entity alias shape as-is), a
+/// heritage clause (`extends`/`implements`) can ONLY ever name a
+/// class/interface/type-literal CONTAINER, never an array/promise/union/
+/// `this` shape, so an alias whose own target is one of those is not a
+/// usable heritage target at all -- `None`, never a guess (`class C
+/// extends Alias` where `type Alias = Foo[]` stays unresolved, exactly
+/// like `class C extends Foo[]` itself always has). An id `alias_targets`
+/// never heard of is not a known alias -- itself IS the (real) container,
+/// unchanged.
+fn dealias_heritage_id(
+    entity_id: String,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
+) -> Option<String> {
+    match alias_targets.get(&entity_id) {
+        Some(Some(ResolvedTypeRef::Entity(real_id))) => Some(real_id.clone()),
+        // A known alias, but its own target is not a usable heritage shape
+        // (`Some(Some(_))` -- an array/promise/union/`this`) or never
+        // converged at all (`Some(None)` -- a cycle/too-deep chain):
+        // either way, never a guess.
+        Some(Some(_)) | Some(None) => None,
+        // Not a known alias -- `entity_id` itself IS the (real) container.
+        None => Some(entity_id),
+    }
+}
+
 fn resolve_heritage_target(
     target: &HeritageTarget,
     owning_path: &str,
     import_targets: &HashMap<(String, String, String), String>,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
 ) -> Option<String> {
     match target {
-        HeritageTarget::Local(entity_id) => Some(entity_id.clone()),
+        HeritageTarget::Local(entity_id) => dealias_heritage_id(entity_id.clone(), alias_targets),
         HeritageTarget::Imported {
             specifier,
             imported_name,
@@ -4073,7 +4459,8 @@ fn resolve_heritage_target(
                 specifier.clone(),
                 imported_name.clone().unwrap_or_default(),
             ))
-            .cloned(),
+            .cloned()
+            .and_then(|entity_id| dealias_heritage_id(entity_id, alias_targets)),
         HeritageTarget::Unknown => None,
         // Resolved in `ProgramIndex::build`'s SECOND pass instead (needs
         // every container's member table already built) -- see
@@ -4124,10 +4511,11 @@ fn prepare_return_shapes(
     shapes: &[DeferredReturnShape],
     owning_path: &str,
     import_targets: &HashMap<(String, String, String), String>,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
 ) -> Option<Vec<PreparedReturnShape>> {
     shapes
         .iter()
-        .map(|shape| prepare_one_return_shape(shape, owning_path, import_targets))
+        .map(|shape| prepare_one_return_shape(shape, owning_path, import_targets, alias_targets))
         .collect()
 }
 
@@ -4135,10 +4523,13 @@ fn prepare_one_return_shape(
     shape: &DeferredReturnShape,
     owning_path: &str,
     import_targets: &HashMap<(String, String, String), String>,
+    alias_targets: &HashMap<String, Option<ResolvedTypeRef>>,
 ) -> Option<PreparedReturnShape> {
     match shape {
-        DeferredReturnShape::Known(raw) => resolve_raw_type_ref(raw, owning_path, import_targets)
-            .map(PreparedReturnShape::Resolved),
+        DeferredReturnShape::Known(raw) => {
+            resolve_raw_type_ref(raw, owning_path, import_targets, alias_targets)
+                .map(PreparedReturnShape::Resolved)
+        }
         DeferredReturnShape::MemberOf {
             container,
             name,
@@ -4165,7 +4556,8 @@ fn prepare_one_return_shape(
             Some(PreparedReturnShape::PendingFunction(entity_id))
         }
         DeferredReturnShape::AwaitOf(inner) => {
-            let inner = prepare_one_return_shape(inner, owning_path, import_targets)?;
+            let inner =
+                prepare_one_return_shape(inner, owning_path, import_targets, alias_targets)?;
             Some(PreparedReturnShape::AwaitOf(Box::new(inner)))
         }
         DeferredReturnShape::Unknown => None,
@@ -4606,6 +4998,157 @@ mod tests {
         // Identifier`, so `heritage_target_of_expression` never even
         // attempts to classify it.
         assert_eq!(summary.classes[0].extends, Some(HeritageTarget::Unknown));
+    }
+
+    // -- D.2 (2026-09-05, references-parity task): type aliases ---------
+
+    #[test]
+    fn type_alias_extraction_captures_the_rhs_as_a_raw_type_ref() {
+        let file_summary = summary("class Foo {}\ntype Alias = Foo;\n");
+        let foo_id = file_summary.classes[0].entity_id.clone();
+        assert_eq!(file_summary.type_aliases.len(), 1);
+        assert_eq!(file_summary.type_aliases[0].name, "Alias");
+        assert_eq!(
+            file_summary.type_aliases[0].target,
+            RawTypeRef::Local(foo_id)
+        );
+    }
+
+    /// D.2 point 4, case 1: `type Alias = Foo; class C { m(): Alias }` --
+    /// `member_type_ref` on `C`'s method `m` resolves to `Entity(Foo)`, the
+    /// alias's own OWN target, not a dangling reference to `Alias`'s own
+    /// (never-a-container) `type` entity id.
+    #[test]
+    fn member_return_type_annotated_with_a_local_type_alias_resolves_to_the_aliased_class() {
+        let file_summary = summary_for(
+            "a.ts",
+            "class Foo {}\ntype Alias = Foo;\nclass C {\n  m(): Alias {\n    return new Foo();\n  }\n}\n",
+        );
+        let foo_id = file_summary.classes[0].entity_id.clone();
+        let c_id = file_summary.classes[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(
+            index.member_type_ref(&c_id, "m", false),
+            Some(ResolvedTypeRef::Entity(foo_id))
+        );
+    }
+
+    /// D.2 point 4, case 2: `type Alias = { a: Foo }` -- the object-literal
+    /// RHS synthesizes an interface for `a` to live on (same mechanism an
+    /// inline `{ ... }` member annotation already uses), and the alias
+    /// points AT that synthesized interface.
+    #[test]
+    fn type_alias_to_an_object_literal_synthesizes_an_interface_with_the_member() {
+        let file_summary = summary_for("a.ts", "class Foo {}\ntype Alias = { a: Foo };\n");
+        let foo_id = file_summary.classes[0].entity_id.clone();
+        assert_eq!(file_summary.type_aliases.len(), 1, "{file_summary:?}");
+        assert_eq!(file_summary.interfaces.len(), 1, "{file_summary:?}");
+        let synthetic_id = file_summary.interfaces[0].entity_id.clone();
+        assert_eq!(
+            file_summary.type_aliases[0].target,
+            RawTypeRef::Local(synthetic_id.clone())
+        );
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(
+            index.member_type_ref(&synthetic_id, "a", false),
+            Some(ResolvedTypeRef::Entity(foo_id))
+        );
+    }
+
+    /// D.2 point 4, case 3: `interface I extends Alias {}` where `type
+    /// Alias = Base` -- `I` inherits `Base`'s own members, exactly as if it
+    /// had written `interface I extends Base {}` directly (a CLASS heritage
+    /// clause, unlike an interface's, is VALUE-space -- `class C extends
+    /// Alias` where `Alias` is a pure `type` is not even valid TypeScript,
+    /// `Alias` "only refers to a type"; an interface's own `extends` is the
+    /// shape D.2's own `SymbolFlags::TypeAlias` branch in `classify_
+    /// heritage_identifier` is actually for). Exercises `resolve_heritage_
+    /// target`'s own de-aliasing (`dealias_heritage_id`), not `resolve_raw_
+    /// type_ref`'s (the previous two tests).
+    #[test]
+    fn interface_extends_a_local_type_alias_inherits_the_aliased_interfaces_members() {
+        let file_summary = summary_for(
+            "a.ts",
+            "interface Base {\n  greet(): void;\n}\ntype Alias = Base;\ninterface I extends Alias {}\n",
+        );
+        let base_id = file_summary.interfaces[0].entity_id.clone();
+        let base_greet_id = file_summary.interfaces[0].members[0].entity_id.clone();
+        let i_id = file_summary.interfaces[1].entity_id.clone();
+        assert_eq!(
+            file_summary.interfaces[1].extends,
+            vec![HeritageTarget::Local(
+                file_summary.type_aliases[0].id.clone()
+            )],
+            "{file_summary:?}"
+        );
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(
+            index.members(&i_id, "greet", false),
+            MemberLookup::One(base_greet_id.clone())
+        );
+        // Not the interface's OWN entity_id -- `greet`'s own declaration
+        // lives on `Base`, `members` returns the member's owning entity id,
+        // same contract `members_walks_extends_chain_across_files`
+        // documents.
+        assert_ne!(base_id, base_greet_id);
+    }
+
+    /// D.2 point 4, case 4: `type A = B; type B = A` -- a genuine cycle
+    /// never converges, `alias_targets` has NO entry for either id, and a
+    /// member annotated `A` stays unresolved (`None`), never a guess.
+    #[test]
+    fn cyclic_type_aliases_never_resolve() {
+        let file_summary = summary_for(
+            "a.ts",
+            "type A = B;\ntype B = A;\nclass C {\n  m(): A { return undefined as any; }\n}\n",
+        );
+        let c_id = file_summary.classes[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(index.member_type_ref(&c_id, "m", false), None);
+    }
+
+    /// D.2 point 4, case 5: a type alias imported from another file --
+    /// `Alias`'s own workspace-wide id is closed against `import_targets`
+    /// the SAME way any other imported type name is, THEN de-aliased to
+    /// `base.ts`'s own `Base` class.
+    #[test]
+    fn member_return_type_annotated_with_an_imported_type_alias_resolves_to_the_aliased_class() {
+        let base_summary = summary_for(
+            "base.ts",
+            "export class Base {}\nexport type Alias = Base;\n",
+        );
+        let user_summary = summary_for(
+            "user.ts",
+            "import { Alias } from \"./base\";\nclass C {\n  m(): Alias { return undefined as any; }\n}\n",
+        );
+        let base_id = base_summary.classes[0].entity_id.clone();
+        let alias_id = base_summary.type_aliases[0].id.clone();
+        let c_id = user_summary.classes[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("base.ts".to_owned(), base_summary);
+        summaries.insert("user.ts".to_owned(), user_summary);
+        let mut import_targets = HashMap::new();
+        import_targets.insert(
+            (
+                "user.ts".to_owned(),
+                "./base".to_owned(),
+                "Alias".to_owned(),
+            ),
+            alias_id,
+        );
+        let index = ProgramIndex::build(&summaries, &import_targets);
+        assert_eq!(
+            index.member_type_ref(&c_id, "m", false),
+            Some(ResolvedTypeRef::Entity(base_id))
+        );
     }
 
     #[test]
