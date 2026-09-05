@@ -1558,11 +1558,14 @@ const NODE_BUILTIN_MODULES: &[&str] = &[
 /// build `external_module_id`/`external_symbol_id` from. A bare Node
 /// builtin (`fs`) and its explicit `node:`-prefixed form (`node:fs`) name
 /// the SAME entity (`jsts:external_module:node:fs`) -- both normalize to
-/// the `node:`-prefixed form. Every other specifier (including a subpath
-/// of a builtin that is not itself an exact builtin name, e.g. bare
-/// `fs/promises` without the `node:` prefix -- a documented, low-volume
-/// gap: it is still classified external, just not normalized) is returned
-/// AS-IS, full subpath included: two different subpaths of the same
+/// the `node:`-prefixed form. A bare SUBPATH of a builtin (`fs/promises`,
+/// h2 2026-09-05) normalizes the same way, full subpath included
+/// (`node:fs/promises`) -- checked by splitting at the FIRST `/` and
+/// matching only the prefix against [`NODE_BUILTIN_MODULES`], so a bare
+/// package whose own name merely CONTAINS a builtin as a prefix component
+/// of something else (`lodash/fp`: prefix `lodash` is not itself a
+/// builtin) is left untouched. Every other specifier is returned AS-IS,
+/// full subpath included: two different subpaths of the same non-builtin
 /// package (`@langchain/core` vs `@langchain/core/messages`) are two
 /// different external module entities, mirroring how two different
 /// workspace files are two different module entities.
@@ -1574,6 +1577,11 @@ pub fn classify_external_specifier(specifier: &str) -> Option<String> {
         return Some(format!("node:{builtin}"));
     }
     if NODE_BUILTIN_MODULES.contains(&specifier) {
+        return Some(format!("node:{specifier}"));
+    }
+    if let Some((prefix, _subpath)) = specifier.split_once('/')
+        && NODE_BUILTIN_MODULES.contains(&prefix)
+    {
         return Some(format!("node:{specifier}"));
     }
     Some(specifier.to_owned())
@@ -2495,16 +2503,38 @@ mod tests {
             classify_external_specifier("path"),
             Some("node:path".to_owned())
         );
-        // A subpath of a builtin without an explicit `node:` prefix is a
-        // documented gap: still external, just not normalized (see this
-        // function's own doc comment).
-        assert_eq!(
-            classify_external_specifier("fs/promises"),
-            Some("fs/promises".to_owned())
-        );
         assert_eq!(
             classify_external_specifier("node:fs/promises"),
             Some("node:fs/promises".to_owned())
+        );
+    }
+
+    /// h2 (2026-09-05): a bare SUBPATH of a builtin normalizes the same way
+    /// the exact builtin name does, full subpath included -- these eight are
+    /// the ones the plan named. `lodash/fp`'s prefix (`lodash`) is not a
+    /// builtin, so it stays untouched, same as any other scoped/subpath
+    /// package.
+    #[test]
+    fn classify_external_specifier_normalizes_node_builtin_subpaths() {
+        for (specifier, expected) in [
+            ("fs/promises", "node:fs/promises"),
+            ("stream/web", "node:stream/web"),
+            ("path/posix", "node:path/posix"),
+            ("util/types", "node:util/types"),
+            ("timers/promises", "node:timers/promises"),
+            ("assert/strict", "node:assert/strict"),
+            ("dns/promises", "node:dns/promises"),
+            ("readline/promises", "node:readline/promises"),
+        ] {
+            assert_eq!(
+                classify_external_specifier(specifier),
+                Some(expected.to_owned()),
+                "specifier: {specifier}"
+            );
+        }
+        assert_eq!(
+            classify_external_specifier("lodash/fp"),
+            Some("lodash/fp".to_owned())
         );
     }
 
