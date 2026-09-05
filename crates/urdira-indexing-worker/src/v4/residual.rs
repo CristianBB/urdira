@@ -1581,24 +1581,33 @@ fn try_synthesize_member_entity(
     };
     let kind = kind.to_string();
     let universal_kind = universal_kind.to_string();
-    let mut body = serde_json::Map::new();
-    body.insert("name".into(), serde_json::Value::String(name.clone()));
-    body.insert(
-        "kind".into(),
-        serde_json::Value::String(kind_name.to_string()),
-    );
-    body.insert(
-        "language".into(),
-        serde_json::Value::String("typescript".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(real_path.clone()));
-    body.insert("start".into(), serde_json::Value::from(decl_start));
-    body.insert("end".into(), serde_json::Value::from(decl_end));
-    body.insert(
-        "synthesized_by".into(),
-        serde_json::Value::String("v4_residual_pass".into()),
-    );
-    let body = serde_json::Value::Object(body);
+    // A3b: strict lexicographic key order (`end`, `kind`, `language`,
+    // `name`, `path`, `start`, `synthesized_by`).
+    let mut encoder = urdira_native_core::BodyEncoder::new();
+    encoder
+        .begin_object(7)
+        .expect("member entity body field count is fixed");
+    encoder.key("end").expect("member entity body key order");
+    encoder.int(i64::from(decl_end)).expect("int never fails");
+    encoder.key("kind").expect("member entity body key order");
+    encoder.string(kind_name).expect("string never fails");
+    encoder
+        .key("language")
+        .expect("member entity body key order");
+    encoder.string("typescript").expect("string never fails");
+    encoder.key("name").expect("member entity body key order");
+    encoder.string(&name).expect("string never fails");
+    encoder.key("path").expect("member entity body key order");
+    encoder.string(&real_path).expect("string never fails");
+    encoder.key("start").expect("member entity body key order");
+    encoder.int(i64::from(decl_start)).expect("int never fails");
+    encoder
+        .key("synthesized_by")
+        .expect("member entity body key order");
+    encoder
+        .string("v4_residual_pass")
+        .expect("string never fails");
+    let body = encoder.finish();
     let facets = canonical_json(&serde_json::json!([
         "core:declaration",
         "core:definition",
@@ -1615,7 +1624,7 @@ fn try_synthesize_member_entity(
         schema_version: 1,
         source_span: &source_span,
         identity_key: &identity_key,
-        body: &body,
+        body: urdira_native_core::BodyRef::Encoded(&body),
         evidence_references: &evidence_references,
     };
     let mut batches = materialize::kernel_rows_batches(std::slice::from_ref(&record_key)).ok()?;
@@ -1825,23 +1834,27 @@ fn build_confirmed_row(
         )
     };
 
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(source_id.to_string()),
-    );
-    body.insert(
-        "target_id".into(),
-        serde_json::Value::String(target_id.to_string()),
-    );
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("confirmed".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_string()));
-    body.insert("start".into(), serde_json::Value::from(start));
-    body.insert("end".into(), serde_json::Value::from(end));
-    let body = serde_json::Value::Object(body);
+    // A3b: strict lexicographic key order (`classification`, `end`, `path`,
+    // `source_id`, `start`, `target_id`).
+    let mut encoder = urdira_native_core::BodyEncoder::new();
+    encoder
+        .begin_object(6)
+        .expect("confirmed relation body field count is fixed");
+    encoder
+        .key("classification")
+        .expect("relation body key order");
+    encoder.string("confirmed").expect("string never fails");
+    encoder.key("end").expect("relation body key order");
+    encoder.int(i64::from(end)).expect("int never fails");
+    encoder.key("path").expect("relation body key order");
+    encoder.string(path).expect("string never fails");
+    encoder.key("source_id").expect("relation body key order");
+    encoder.string(source_id).expect("string never fails");
+    encoder.key("start").expect("relation body key order");
+    encoder.int(i64::from(start)).expect("int never fails");
+    encoder.key("target_id").expect("relation body key order");
+    encoder.string(target_id).expect("string never fails");
+    let body = encoder.finish();
 
     let facets = canonical_json(&serde_json::json!(["core:reference_relation"]));
     let source_span = canonical_span(path, start, end);
@@ -1855,7 +1868,7 @@ fn build_confirmed_row(
         schema_version: 1,
         source_span: &source_span,
         identity_key: &identity_key,
-        body: &body,
+        body: urdira_native_core::BodyRef::Encoded(&body),
         evidence_references: &evidence_references,
     };
 
@@ -2124,24 +2137,51 @@ fn build_inferred_type_rows(
     // `jsts:entity_inferred_type` row still carries `language:
     // "typescript"`) -- hardcoded here to match, not derived from the
     // owner's own extension.
-    let mut entity_body = serde_json::Map::new();
-    entity_body.insert(
-        "name".into(),
-        serde_json::Value::String(format!("inferred type of {display_name}")),
-    );
-    entity_body.insert(
-        "kind".into(),
-        serde_json::Value::String("inferred_type".into()),
-    );
-    entity_body.insert("type".into(), serde_json::Value::String(type_text.into()));
-    entity_body.insert(
-        "language".into(),
-        serde_json::Value::String("typescript".into()),
-    );
-    entity_body.insert("path".into(), serde_json::Value::String(path.into()));
-    entity_body.insert("start".into(), serde_json::Value::from(start));
-    entity_body.insert("end".into(), serde_json::Value::from(end));
-    let entity_body = serde_json::Value::Object(entity_body);
+    // A3b: strict lexicographic key order (`end`, `kind`, `language`,
+    // `name`, `path`, `start`, `type`).
+    let mut entity_encoder = urdira_native_core::BodyEncoder::new();
+    entity_encoder
+        .begin_object(7)
+        .expect("inferred type entity body field count is fixed");
+    entity_encoder
+        .key("end")
+        .expect("inferred type entity body key order");
+    entity_encoder.int(i64::from(end)).expect("int never fails");
+    entity_encoder
+        .key("kind")
+        .expect("inferred type entity body key order");
+    entity_encoder
+        .string("inferred_type")
+        .expect("string never fails");
+    entity_encoder
+        .key("language")
+        .expect("inferred type entity body key order");
+    entity_encoder
+        .string("typescript")
+        .expect("string never fails");
+    entity_encoder
+        .key("name")
+        .expect("inferred type entity body key order");
+    entity_encoder
+        .string(&format!("inferred type of {display_name}"))
+        .expect("string never fails");
+    entity_encoder
+        .key("path")
+        .expect("inferred type entity body key order");
+    entity_encoder.string(path).expect("string never fails");
+    entity_encoder
+        .key("start")
+        .expect("inferred type entity body key order");
+    entity_encoder
+        .int(i64::from(start))
+        .expect("int never fails");
+    entity_encoder
+        .key("type")
+        .expect("inferred type entity body key order");
+    entity_encoder
+        .string(type_text)
+        .expect("string never fails");
+    let entity_body = entity_encoder.finish();
     let entity_facets = canonical_json(&serde_json::json!([]));
     let span = canonical_span(path, start, end);
     let evidence = canonical_evidence(path, start, end);
@@ -2154,18 +2194,51 @@ fn build_inferred_type_rows(
         schema_version: 1,
         source_span: &span,
         identity_key: &entity_identity,
-        body: &entity_body,
+        body: urdira_native_core::BodyRef::Encoded(&entity_body),
         evidence_references: &evidence,
     };
 
-    let relation_body = serde_json::json!({
-        "source_id": entity_id,
-        "target_id": entity_identity,
-        "classification": "confirmed",
-        "path": path,
-        "start": start,
-        "end": end,
-    });
+    // A3b: strict lexicographic key order (`classification`, `end`, `path`,
+    // `source_id`, `start`, `target_id`).
+    let mut relation_encoder = urdira_native_core::BodyEncoder::new();
+    relation_encoder
+        .begin_object(6)
+        .expect("inferred type relation body field count is fixed");
+    relation_encoder
+        .key("classification")
+        .expect("relation body key order");
+    relation_encoder
+        .string("confirmed")
+        .expect("string never fails");
+    relation_encoder
+        .key("end")
+        .expect("relation body key order");
+    relation_encoder
+        .int(i64::from(end))
+        .expect("int never fails");
+    relation_encoder
+        .key("path")
+        .expect("relation body key order");
+    relation_encoder.string(path).expect("string never fails");
+    relation_encoder
+        .key("source_id")
+        .expect("relation body key order");
+    relation_encoder
+        .string(entity_id)
+        .expect("string never fails");
+    relation_encoder
+        .key("start")
+        .expect("relation body key order");
+    relation_encoder
+        .int(i64::from(start))
+        .expect("int never fails");
+    relation_encoder
+        .key("target_id")
+        .expect("relation body key order");
+    relation_encoder
+        .string(&entity_identity)
+        .expect("string never fails");
+    let relation_body = relation_encoder.finish();
     let relation_facets = canonical_json(&serde_json::json!(["core:reference_relation"]));
     let relation_key = StructuralKernelRecordRef {
         proposal_record_key: &proposal_record_key(&relation_identity),
@@ -2176,7 +2249,7 @@ fn build_inferred_type_rows(
         schema_version: 1,
         source_span: &span,
         identity_key: &relation_identity,
-        body: &relation_body,
+        body: urdira_native_core::BodyRef::Encoded(&relation_body),
         evidence_references: &evidence,
     };
 
@@ -2305,14 +2378,31 @@ fn build_diagnostic_row(
     names_dict: &mut OrdinalDict<String>,
 ) -> Result<Option<(String, Option<RecordRow>)>, ScanError> {
     let identity_key = format!("jsts:diagnostic:{path}:{start}:jsts:compiler_diagnostic:{index}");
-    let body = serde_json::json!({
-        "code": "jsts:compiler_diagnostic",
-        "compiler_code": compiler_code,
-        "message": message,
-        "path": path,
-        "start": start,
-        "end": end,
-    });
+    // A3b: strict lexicographic key order (`code`, `compiler_code`, `end`,
+    // `message`, `path`, `start`).
+    let mut encoder = urdira_native_core::BodyEncoder::new();
+    encoder
+        .begin_object(6)
+        .expect("diagnostic body field count is fixed");
+    encoder.key("code").expect("diagnostic body key order");
+    encoder
+        .string("jsts:compiler_diagnostic")
+        .expect("string never fails");
+    encoder
+        .key("compiler_code")
+        .expect("diagnostic body key order");
+    encoder
+        .uint(u64::from(compiler_code))
+        .expect("compiler_code is a finite u32");
+    encoder.key("end").expect("diagnostic body key order");
+    encoder.int(i64::from(end)).expect("int never fails");
+    encoder.key("message").expect("diagnostic body key order");
+    encoder.string(message).expect("string never fails");
+    encoder.key("path").expect("diagnostic body key order");
+    encoder.string(path).expect("string never fails");
+    encoder.key("start").expect("diagnostic body key order");
+    encoder.int(i64::from(start)).expect("int never fails");
+    let body = encoder.finish();
     let facets = canonical_json(&serde_json::json!([]));
     let span = canonical_span(path, start, end);
     let evidence = canonical_evidence(path, start, end);
@@ -2325,7 +2415,7 @@ fn build_diagnostic_row(
         schema_version: 1,
         source_span: &span,
         identity_key: &identity_key,
-        body: &body,
+        body: urdira_native_core::BodyRef::Encoded(&body),
         evidence_references: &evidence,
     };
     let mut batches = materialize::kernel_rows_batches(std::slice::from_ref(&record_key))?;
@@ -4045,7 +4135,7 @@ mod tests {
                 schema_version: 1,
                 source_span: &source_span_str,
                 identity_key: &identity_key,
-                body: &body_value,
+                body: urdira_native_core::BodyRef::Value(&body_value),
                 evidence_references: &evidence_str,
             };
             let Ok(mut batches) =

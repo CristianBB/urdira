@@ -74,11 +74,11 @@ use serde_json::Value;
 use urdira_indexing_core::StructuralKernelRecord;
 use urdira_jsts_syntax_worker::{
     PendingReasonCode, PendingSiteKind as SyntaxPendingSiteKind, PendingSiteProposal,
-    ProposedRecord, ProposedRecordDependency, REASON_TARGET_NOT_INTERNED,
+    ProposedRecord, ProposedRecordDependency, REASON_TARGET_NOT_INTERNED, RecordBody,
 };
 use urdira_native_core::{
-    StructuralKernelRecordRef, StructuralKernelRow, structural_kernel_rows_ref,
-    structural_kernel_rows_typed,
+    StructuralKernelRecordRef, StructuralKernelRow, structural_kernel_rows_owned_typed,
+    structural_kernel_rows_ref, structural_kernel_rows_typed,
 };
 use urdira_structural_store::row::{
     CATEGORY_DIAGNOSTIC, CATEGORY_ENTITY, CATEGORY_RELATION, NONE_U16, NONE_U32,
@@ -316,7 +316,7 @@ fn to_structural_record_ref(record: &ProposedRecord) -> StructuralKernelRecordRe
         schema_version: u32::from(record.schema_version),
         source_span: &record.source_span,
         identity_key: &record.identity_key,
-        body: &record.body,
+        body: record.body.as_body_ref(),
         evidence_references: &record.evidence_references,
     }
 }
@@ -336,7 +336,7 @@ fn to_structural_record(record: &ProposedRecord) -> StructuralKernelRecord {
         schema_version: u32::from(record.schema_version),
         source_span: record.source_span.clone(),
         identity_key: record.identity_key.clone(),
-        body: record.body.clone(),
+        body: record.body.to_value(),
         evidence_references: record.evidence_references.clone(),
     }
 }
@@ -523,12 +523,25 @@ fn relation_endpoints_from_body(body: &Value) -> (Option<String>, Option<String>
     (source_id, target_id)
 }
 
+/// A3b: dispatches on `record.body`'s variant -- an `Encoded` body (every
+/// migrated hot-path producer) reads the endpoints straight off
+/// `ProposedRecord::source_id`/`.target_id` (populated by every producer
+/// that puts these keys in its body, migrated or not), never decoding the
+/// payload; a `Value` body (every not-yet-migrated producer, and every test
+/// helper) is read exactly as before via [`relation_endpoints_from_body`].
+fn relation_endpoints_from_record(record: &ProposedRecord) -> (Option<String>, Option<String>) {
+    match &record.body {
+        RecordBody::Encoded(_) => (record.source_id.clone(), record.target_id.clone()),
+        RecordBody::Value(value) => relation_endpoints_from_body(value),
+    }
+}
+
 fn canonicalize_owner(owner: OwnerFacts) -> Result<OwnerKernelRows, ScanError> {
     let OwnerFacts {
         owner_artifact_id,
         owner_artifact_version_id,
         owner_path,
-        records,
+        mut records,
         dependencies,
         direct_imports: _,
         // The full checker-dispatch listing (every site, any disposition)
@@ -545,17 +558,18 @@ fn canonicalize_owner(owner: OwnerFacts) -> Result<OwnerKernelRows, ScanError> {
     let mut proposal_keys = Vec::with_capacity(records.len());
     // A4 (line numbers task): captured here, alongside the other per-record
     // fields this same loop already pulls off `record` before it is
-    // consumed by `to_structural_record_ref` -- see `OwnerKernelRows::
-    // span_lines`'s own doc comment for why these never reach
-    // `StructuralKernelRow`.
+    // consumed by `to_structural_record_ref`/`to_structural_record_ref_
+    // owned` -- see `OwnerKernelRows::span_lines`'s own doc comment for why
+    // these never reach `StructuralKernelRow`.
     let mut span_lines: Vec<(u32, u32)> = Vec::with_capacity(records.len());
     // P2-2g item 3: borrows straight into `records` (still owned by this
     // function's local `records`, destructured from `owner` above) instead
     // of cloning every field into an owned `StructuralKernelRecord` per
     // record -- see `to_structural_record_ref`'s doc comment. `record_refs`
-    // never outlives this function (consumed by `kernel_rows_batches`
-    // immediately below, which returns fully-owned `StructuralKernelRow`s),
-    // so `records` staying alive for the rest of this scope is enough.
+    // never outlives this function (consumed by `kernel_rows_batches`/
+    // `structural_kernel_rows_owned_typed` immediately below, which return
+    // fully-owned `StructuralKernelRow`s), so `records` staying alive for
+    // the rest of this scope is enough.
     // P2-2l item 2: `typed_facets` borrows each record's own `facets_list`
     // straight from `records` (still alive for this scope, same lifetime
     // argument as `record_refs` above it), so `kernel_rows_batches_typed`
@@ -564,30 +578,122 @@ fn canonicalize_owner(owner: OwnerFacts) -> Result<OwnerKernelRows, ScanError> {
     // `structural_kernel_rows_typed`'s doc comment for why this is safe
     // for every `ProposedRecord` this pipeline's producers build.
     let mut typed_facets: Vec<&[String]> = Vec::with_capacity(records.len());
-    let record_refs: Vec<StructuralKernelRecordRef<'_>> = records
-        .iter()
-        .map(|record| {
-            let category = category_byte(record.category);
-            kind_universal_category.push((
-                record.kind.clone(),
-                record.universal_kind.clone(),
-                category,
-            ));
-            proposal_keys.push(record.proposal_record_key.clone());
-            relation_endpoints.push(
-                (category == CATEGORY_RELATION).then(|| relation_endpoints_from_body(&record.body)),
-            );
-            typed_facets.push(record.facets_list.as_slice());
-            span_lines.push((record.span_start_line, record.span_end_line));
-            to_structural_record_ref(record)
-        })
-        .collect();
-    let batches = kernel_rows_batches_typed(&record_refs, &typed_facets)?;
-    let batch_count = batches.len();
-    let mut rows = Vec::with_capacity(record_refs.len());
-    for batch in batches {
-        rows.extend(batch.rows);
-    }
+
+    // A3b coste 2: this owner can take the zero-clone owned-body path
+    // (inlined into the `iter_mut()` closure below + `structural_kernel_
+    // rows_owned_typed`, moving every `Encoded` body's payload straight into
+    // its `StructuralKernelRow` instead of cloning it) IFF (a) every one of
+    // its records is `RecordBody::Encoded` -- true for every real v4
+    // hot-path producer today (`RecordBody::Value` survives only in this
+    // crate's own tests and the legacy/non-migrated v3 path, never a v4
+    // producer), and (b) the whole owner is knowably within `structural_
+    // kernel_rows_owned_typed`'s bounds
+    // (`MAX_BATCH_RECORDS`/`MAX_BATCH_FRAMED_BYTES`) BEFORE any record is
+    // consumed -- unlike the borrowed path (`kernel_rows_batches_typed`,
+    // below), the owned path cannot retry with a different split after a
+    // bounds failure (its input is already moved/consumed by then), so this
+    // precheck must never be optimistic. `body_byte_length` is read
+    // straight off each record's already-computed `EncodedBody` (a `usize`
+    // field, not a re-derivation), so this check costs an O(n) integer scan,
+    // never a body walk. A owner that fails either check (a not-yet-
+    // migrated `Value`-bodied record anywhere, or an owner large enough to
+    // need bisection -- rare; n8n's own evidence doc records at least one
+    // such owner) falls back to the existing, unchanged, bisecting borrowed
+    // path -- so this optimization can never turn a batch the kernel would
+    // have accepted (via bisection) into a hard error.
+    let mut total_encoded_bytes = 0usize;
+    let can_use_owned_fast_path = records.len() <= urdira_native_core::MAX_BATCH_RECORDS
+        && records.iter().all(|record| match &record.body {
+            RecordBody::Encoded(encoded) => {
+                total_encoded_bytes += encoded.body_byte_length;
+                total_encoded_bytes <= urdira_native_core::MAX_BATCH_FRAMED_BYTES
+            }
+            RecordBody::Value(_) => false,
+        });
+
+    let (rows, batch_count) = if can_use_owned_fast_path {
+        let record_refs: Vec<StructuralKernelRecordRef<'_>> = records
+            .iter_mut()
+            .map(|record| {
+                let category = category_byte(record.category);
+                kind_universal_category.push((
+                    record.kind.clone(),
+                    record.universal_kind.clone(),
+                    category,
+                ));
+                proposal_keys.push(record.proposal_record_key.clone());
+                relation_endpoints.push(
+                    (category == CATEGORY_RELATION).then(|| relation_endpoints_from_record(record)),
+                );
+                typed_facets.push(record.facets_list.as_slice());
+                span_lines.push((record.span_start_line, record.span_end_line));
+                // A3b coste 2: inlined (not a helper function taking `&mut
+                // ProposedRecord`) so the borrow checker sees `record.body`
+                // and every other field accessed below as DISJOINT places
+                // off the same `record: &mut ProposedRecord` -- a helper
+                // function's `&mut ProposedRecord` parameter would force the
+                // caller to treat the whole struct as exclusively borrowed,
+                // conflicting with `typed_facets`' already-live borrow of
+                // `record.facets_list` two lines up. `can_use_owned_fast_
+                // path` already confirmed every record here is `RecordBody::
+                // Encoded`, so the `Value` arm is unreachable by construction.
+                let body = match std::mem::replace(&mut record.body, RecordBody::Value(Value::Null))
+                {
+                    RecordBody::Encoded(encoded) => {
+                        urdira_native_core::BodyRef::EncodedOwned(encoded)
+                    }
+                    RecordBody::Value(_) => unreachable!(
+                        "can_use_owned_fast_path confirmed every record is RecordBody::Encoded"
+                    ),
+                };
+                StructuralKernelRecordRef {
+                    proposal_record_key: &record.proposal_record_key,
+                    category: record.category,
+                    kind: &record.kind,
+                    universal_kind: &record.universal_kind,
+                    facets: &record.facets,
+                    schema_version: u32::from(record.schema_version),
+                    source_span: &record.source_span,
+                    identity_key: &record.identity_key,
+                    body,
+                    evidence_references: &record.evidence_references,
+                }
+            })
+            .collect();
+        let batch =
+            structural_kernel_rows_owned_typed(record_refs, &typed_facets).map_err(|error| {
+                ScanError(format!(
+                    "v4 materialize: structural kernel rejected an owned batch: {error}"
+                ))
+            })?;
+        (batch.rows, 1)
+    } else {
+        let record_refs: Vec<StructuralKernelRecordRef<'_>> = records
+            .iter()
+            .map(|record| {
+                let category = category_byte(record.category);
+                kind_universal_category.push((
+                    record.kind.clone(),
+                    record.universal_kind.clone(),
+                    category,
+                ));
+                proposal_keys.push(record.proposal_record_key.clone());
+                relation_endpoints.push(
+                    (category == CATEGORY_RELATION).then(|| relation_endpoints_from_record(record)),
+                );
+                typed_facets.push(record.facets_list.as_slice());
+                span_lines.push((record.span_start_line, record.span_end_line));
+                to_structural_record_ref(record)
+            })
+            .collect();
+        let batches = kernel_rows_batches_typed(&record_refs, &typed_facets)?;
+        let batch_count = batches.len();
+        let mut rows = Vec::with_capacity(record_refs.len());
+        for batch in batches {
+            rows.extend(batch.rows);
+        }
+        (rows, batch_count)
+    };
     Ok(OwnerKernelRows {
         owner_path,
         owner_artifact_id,
@@ -2184,7 +2290,60 @@ mod tests {
             span_start_line: 0,
             span_end_line: 0,
             identity_key: format!("jsts:variable:{path}:0:{name}"),
-            body: json!({"name": name, "path": path, "start": 0u32, "end": 10u32}),
+            body: RecordBody::Value(
+                json!({"name": name, "path": path, "start": 0u32, "end": 10u32}),
+            ),
+            source_id: None,
+            target_id: None,
+            evidence_references: serde_json::to_string(&evidence).unwrap(),
+        }
+    }
+
+    /// A3b coste 2: `RecordBody::Encoded` counterpart of [`entity_record`]
+    /// -- SAME logical body (`{"end":10,"name":name,"path":path,"start":
+    /// 0}`, strict lexicographic key order: `end`, `name`, `path`, `start`,
+    /// matching what `serde_json::Map`'s `BTreeMap` iteration would give
+    /// the `Value` version) but built via `BodyEncoder` instead of `json!`,
+    /// so `canonicalize_owner`'s `can_use_owned_fast_path` check accepts
+    /// it. Exists so `owned_fast_path_matches_the_borrowed_fallback_path_
+    /// for_encoded_bodies` (below) can materialize the SAME owner twice --
+    /// once with these `Encoded` records (routed through the new owned
+    /// fast path) and once with `entity_record`'s `Value` records (which
+    /// fails the fast-path check and stays on the existing, unchanged,
+    /// borrowed/cloning path) -- and assert the two runs agree byte for
+    /// byte.
+    fn encoded_entity_record(identity: &str, name: &str, path: &str) -> ProposedRecord {
+        let source_span = json!({"path": path, "start": 0u32, "end": 10u32});
+        let evidence = json!([source_span]);
+        let mut encoder = urdira_native_core::BodyEncoder::new();
+        encoder.begin_object(4).expect("fixed 4-field entity body");
+        encoder.key("end").expect("strict key order");
+        encoder.uint(10).expect("uint never fails");
+        encoder.key("name").expect("strict key order");
+        encoder.string(name).expect("string never fails");
+        encoder.key("path").expect("strict key order");
+        encoder.string(path).expect("string never fails");
+        encoder.key("start").expect("strict key order");
+        encoder.uint(0).expect("uint never fails");
+        let body = encoder.finish();
+        ProposedRecord {
+            proposal_record_key: format!("jsts:record:sha256:{identity}"),
+            category: "entity",
+            kind: "jsts:entity_variable".to_string(),
+            universal_kind: "core:value".to_string(),
+            facets: serde_json::to_string(&json!(["core:declaration", "core:definition"])).unwrap(),
+            facets_list: vec![
+                "core:declaration".to_string(),
+                "core:definition".to_string(),
+            ],
+            schema_version: 1,
+            source_span: serde_json::to_string(&source_span).unwrap(),
+            span_start_line: 0,
+            span_end_line: 0,
+            identity_key: format!("jsts:variable:{path}:0:{name}"),
+            body: RecordBody::Encoded(body),
+            source_id: None,
+            target_id: None,
             evidence_references: serde_json::to_string(&evidence).unwrap(),
         }
     }
@@ -2218,7 +2377,9 @@ mod tests {
             span_start_line: 0,
             span_end_line: 0,
             identity_key: format!("jsts:contains:{source_identity_key}:{target_identity_key}"),
-            body,
+            body: RecordBody::Value(body),
+            source_id: Some(source_identity_key.to_string()),
+            target_id: Some(target_identity_key.to_string()),
             evidence_references: serde_json::to_string(&evidence).unwrap(),
         }
     }
@@ -2234,6 +2395,61 @@ mod tests {
             pending_sites: Vec::new(),
             pending_site_rows: Vec::new(),
         }
+    }
+
+    /// A3b coste 2 regression: `canonicalize_owner`'s zero-clone owned fast
+    /// path (every record `RecordBody::Encoded`, whole owner within
+    /// `structural_kernel_rows_owned_typed`'s bounds) must canonicalize
+    /// byte-for-byte identically to the pre-existing borrowed/cloning
+    /// fallback path (`kernel_rows_batches_typed`, unchanged) for the SAME
+    /// logical records -- proven by materializing one owner built with
+    /// `encoded_entity_record`s (routes through the fast path;
+    /// `can_use_owned_fast_path` requires every body `Encoded`) and a
+    /// byte-identical owner built with `entity_record`s (a `Value` body
+    /// fails that check, so this one stays on the fallback path), then
+    /// asserting every field `canonicalize_owner` produces agrees.
+    /// `batch_count == 1` on the fast-path owner additionally confirms no
+    /// bisection was needed (this owner is far below `MAX_BATCH_RECORDS`),
+    /// i.e. the fast path itself -- not an accidental fallback -- is what
+    /// ran.
+    #[test]
+    fn owned_fast_path_matches_the_borrowed_fallback_path_for_encoded_bodies() {
+        let encoded_owner = owner_facts(
+            "src/fast.ts",
+            vec![
+                encoded_entity_record("fast_a", "a", "src/fast.ts"),
+                encoded_entity_record("fast_b", "b", "src/fast.ts"),
+            ],
+        );
+        let value_owner = owner_facts(
+            "src/fast.ts",
+            vec![
+                entity_record("fast_a", "a", "src/fast.ts"),
+                entity_record("fast_b", "b", "src/fast.ts"),
+            ],
+        );
+
+        let encoded_rows = canonicalize_owner(encoded_owner).expect("owned fast path succeeds");
+        let value_rows = canonicalize_owner(value_owner).expect("borrowed fallback path succeeds");
+
+        assert_eq!(
+            encoded_rows.batch_count, 1,
+            "this owner is far below MAX_BATCH_RECORDS -- the fast path must not bisect"
+        );
+        assert_eq!(
+            encoded_rows.rows, value_rows.rows,
+            "owned fast path and borrowed fallback path must canonicalize identically"
+        );
+        assert_eq!(
+            encoded_rows.kind_universal_category,
+            value_rows.kind_universal_category
+        );
+        assert_eq!(
+            encoded_rows.relation_endpoints,
+            value_rows.relation_endpoints
+        );
+        assert_eq!(encoded_rows.span_lines, value_rows.span_lines);
+        assert_eq!(encoded_rows.proposal_keys, value_rows.proposal_keys);
     }
 
     #[test]
@@ -2455,7 +2671,9 @@ mod tests {
             span_start_line: 0,
             span_end_line: 0,
             identity_key,
-            body,
+            body: RecordBody::Value(body),
+            source_id: Some(source_identity_key.to_string()),
+            target_id: Some(target_identity_key.to_string()),
             evidence_references: serde_json::to_string(&evidence).unwrap(),
         }
     }

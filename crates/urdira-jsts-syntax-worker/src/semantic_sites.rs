@@ -33,9 +33,9 @@
 
 use crate::resolver::{self, WorkspaceResolver};
 use crate::{
-    AnalysisError, ErrorCode, LineIndex, ProposedRecord, SyntaxFileResult, bounded_sha256_identity,
-    canonical_evidence, canonical_json, canonical_span, facets_list_from_value,
-    proposal_record_key,
+    AnalysisError, ErrorCode, LineIndex, ProposedRecord, RecordBody, SyntaxFileResult,
+    bounded_sha256_identity, canonical_evidence, canonical_json, canonical_span,
+    facets_list_from_value, proposal_record_key,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
@@ -3852,6 +3852,47 @@ fn compute_sites_digest(sites: &[SemanticSite]) -> String {
     )
 }
 
+/// A3b: shared body builder for every "confirmed"-classification relation
+/// this file proposes directly (`reference_proposed_record`/`covers_
+/// proposed_record`/`call_proposed_record`/`heritage_proposed_record`, all
+/// four byte-for-byte identical `{source_id, target_id, classification:
+/// "confirmed", path, start, end}` shapes before this task, differing only
+/// in `kind`/`universal_kind`/`identity_key`). Field order is strict
+/// lexicographic (`classification`, `end`, `path`, `source_id`, `start`,
+/// `target_id`) -- the same order `serde_json::Map`'s `BTreeMap` iteration
+/// already produced for the equivalent `Value` tree.
+fn confirmed_relation_body(
+    source_id: &str,
+    target_id: &str,
+    path: &str,
+    start: u32,
+    end: u32,
+) -> urdira_native_core::EncodedBody {
+    let mut encoder = urdira_native_core::BodyEncoder::new();
+    encoder
+        .begin_object(6)
+        .expect("confirmed relation body field count is fixed");
+    encoder
+        .key("classification")
+        .expect("relation body key order");
+    encoder.string("confirmed").expect("string never fails");
+    encoder.key("end").expect("relation body key order");
+    encoder
+        .uint(u64::from(end))
+        .expect("relation end is a finite u32");
+    encoder.key("path").expect("relation body key order");
+    encoder.string(path).expect("string never fails");
+    encoder.key("source_id").expect("relation body key order");
+    encoder.string(source_id).expect("string never fails");
+    encoder.key("start").expect("relation body key order");
+    encoder
+        .uint(u64::from(start))
+        .expect("relation start is a finite u32");
+    encoder.key("target_id").expect("relation body key order");
+    encoder.string(target_id).expect("string never fails");
+    encoder.finish()
+}
+
 fn reference_proposed_record(
     path: &str,
     row: &ReferenceRow,
@@ -3861,22 +3902,7 @@ fn reference_proposed_record(
         "jsts:references:{path}:{}:{}:{}:{}",
         row.start, row.end, row.source_id, row.target_id
     );
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(row.source_id.clone()),
-    );
-    body.insert(
-        "target_id".into(),
-        serde_json::Value::String(row.target_id.clone()),
-    );
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("confirmed".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
-    body.insert("start".into(), serde_json::Value::from(row.start));
-    body.insert("end".into(), serde_json::Value::from(row.end));
+    let body = confirmed_relation_body(&row.source_id, &row.target_id, path, row.start, row.end);
     let facets = serde_json::json!(["core:reference_relation"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
@@ -3890,7 +3916,9 @@ fn reference_proposed_record(
         span_start_line: line_index.line_of(row.start),
         span_end_line: line_index.line_of(row.end),
         identity_key,
-        body: serde_json::Value::Object(body),
+        body: RecordBody::Encoded(body),
+        source_id: Some(row.source_id.clone()),
+        target_id: Some(row.target_id.clone()),
         evidence_references: canonical_evidence(path, row.start, row.end),
     }
 }
@@ -3919,22 +3947,7 @@ fn covers_proposed_record(
         "jsts:covers:{path}:{}:{}:{}:{}",
         row.start, row.end, test_container_id, row.target_id
     );
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(test_container_id.to_owned()),
-    );
-    body.insert(
-        "target_id".into(),
-        serde_json::Value::String(row.target_id.clone()),
-    );
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("confirmed".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
-    body.insert("start".into(), serde_json::Value::from(row.start));
-    body.insert("end".into(), serde_json::Value::from(row.end));
+    let body = confirmed_relation_body(test_container_id, &row.target_id, path, row.start, row.end);
     let facets = serde_json::json!(["core:reference_relation"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
@@ -3948,7 +3961,9 @@ fn covers_proposed_record(
         span_start_line: line_index.line_of(row.start),
         span_end_line: line_index.line_of(row.end),
         identity_key,
-        body: serde_json::Value::Object(body),
+        body: RecordBody::Encoded(body),
+        source_id: Some(test_container_id.to_owned()),
+        target_id: Some(row.target_id.clone()),
         evidence_references: canonical_evidence(path, row.start, row.end),
     }
 }
@@ -3972,22 +3987,7 @@ fn call_proposed_record(path: &str, row: &CallRow, line_index: &LineIndex) -> Pr
         "jsts:call:{path}:{}:{}:{}:{}",
         row.start, row.end, row.source_id, row.target_id
     );
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(row.source_id.clone()),
-    );
-    body.insert(
-        "target_id".into(),
-        serde_json::Value::String(row.target_id.clone()),
-    );
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("confirmed".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
-    body.insert("start".into(), serde_json::Value::from(row.start));
-    body.insert("end".into(), serde_json::Value::from(row.end));
+    let body = confirmed_relation_body(&row.source_id, &row.target_id, path, row.start, row.end);
     let facets = serde_json::json!(["core:reference_relation"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
@@ -4001,7 +4001,9 @@ fn call_proposed_record(path: &str, row: &CallRow, line_index: &LineIndex) -> Pr
         span_start_line: line_index.line_of(row.start),
         span_end_line: line_index.line_of(row.end),
         identity_key,
-        body: serde_json::Value::Object(body),
+        body: RecordBody::Encoded(body),
+        source_id: Some(row.source_id.clone()),
+        target_id: Some(row.target_id.clone()),
         evidence_references: canonical_evidence(path, row.start, row.end),
     }
 }
@@ -4026,22 +4028,7 @@ fn heritage_proposed_record(
         "jsts:{}:{path}:{}:{}:{}:{}",
         row.relation_kind, row.start, row.end, row.source_id, row.target_id
     );
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(row.source_id.clone()),
-    );
-    body.insert(
-        "target_id".into(),
-        serde_json::Value::String(row.target_id.clone()),
-    );
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("confirmed".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
-    body.insert("start".into(), serde_json::Value::from(row.start));
-    body.insert("end".into(), serde_json::Value::from(row.end));
+    let body = confirmed_relation_body(&row.source_id, &row.target_id, path, row.start, row.end);
     let facets = serde_json::json!(["core:reference_relation"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
@@ -4055,7 +4042,9 @@ fn heritage_proposed_record(
         span_start_line: line_index.line_of(row.start),
         span_end_line: line_index.line_of(row.end),
         identity_key,
-        body: serde_json::Value::Object(body),
+        body: RecordBody::Encoded(body),
+        source_id: Some(row.source_id.clone()),
+        target_id: Some(row.target_id.clone()),
         evidence_references: canonical_evidence(path, row.start, row.end),
     }
 }
@@ -4086,26 +4075,33 @@ fn candidate_call_record(
         "jsts:call:{path}:{}:{}:{}:{}",
         row.start, row.end, row.source_id, row.target_id
     );
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(row.source_id.clone()),
-    );
-    body.insert(
-        "target_id".into(),
-        serde_json::Value::String(row.target_id.clone()),
-    );
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String("possible".into()),
-    );
-    body.insert("path".into(), serde_json::Value::String(path.to_owned()));
-    body.insert("start".into(), serde_json::Value::from(row.start));
-    body.insert("end".into(), serde_json::Value::from(row.end));
-    body.insert(
-        "reason".into(),
-        serde_json::Value::String(row.reason.to_owned()),
-    );
+    // A3b: strict lexicographic key order (`classification`, `end`, `path`,
+    // `reason`, `source_id`, `start`, `target_id`).
+    let mut encoder = urdira_native_core::BodyEncoder::new();
+    encoder
+        .begin_object(7)
+        .expect("candidate call body field count is fixed");
+    encoder
+        .key("classification")
+        .expect("relation body key order");
+    encoder.string("possible").expect("string never fails");
+    encoder.key("end").expect("relation body key order");
+    encoder
+        .uint(u64::from(row.end))
+        .expect("row.end is a finite u32");
+    encoder.key("path").expect("relation body key order");
+    encoder.string(path).expect("string never fails");
+    encoder.key("reason").expect("relation body key order");
+    encoder.string(row.reason).expect("string never fails");
+    encoder.key("source_id").expect("relation body key order");
+    encoder.string(&row.source_id).expect("string never fails");
+    encoder.key("start").expect("relation body key order");
+    encoder
+        .uint(u64::from(row.start))
+        .expect("row.start is a finite u32");
+    encoder.key("target_id").expect("relation body key order");
+    encoder.string(&row.target_id).expect("string never fails");
+    let body = encoder.finish();
     let facets = serde_json::json!(["core:reference_relation", "core:indirect"]);
     ProposedRecord {
         proposal_record_key: proposal_record_key(&identity_key),
@@ -4119,7 +4115,9 @@ fn candidate_call_record(
         span_start_line: line_index.line_of(row.start),
         span_end_line: line_index.line_of(row.end),
         identity_key,
-        body: serde_json::Value::Object(body),
+        body: RecordBody::Encoded(body),
+        source_id: Some(row.source_id.clone()),
+        target_id: Some(row.target_id.clone()),
         evidence_references: canonical_evidence(path, row.start, row.end),
     }
 }
@@ -5919,23 +5917,20 @@ mod tests {
         semantics
             .parameter_contains_rows
             .iter()
-            .find(|record| record.body["target_id"].as_str() == Some(parameter_id))
+            .find(|record| record.body.to_value()["target_id"].as_str() == Some(parameter_id))
     }
 
-    fn resolved(semantics: &OwnerSemantics) -> Vec<(u32, u32, &str, &str)> {
+    fn resolved(semantics: &OwnerSemantics) -> Vec<(u32, u32, String, String)> {
         semantics
             .reference_rows
             .iter()
             .map(|record| {
-                let body = record
-                    .body
-                    .as_object()
-                    .expect("reference body is an object");
+                let body = record.body.to_value();
                 (
                     body["start"].as_u64().unwrap() as u32,
                     body["end"].as_u64().unwrap() as u32,
-                    body["source_id"].as_str().unwrap(),
-                    body["target_id"].as_str().unwrap(),
+                    body["source_id"].as_str().unwrap().to_owned(),
+                    body["target_id"].as_str().unwrap().to_owned(),
                 )
             })
             .collect()
@@ -5982,7 +5977,7 @@ mod tests {
         let reference = semantics
             .reference_rows
             .iter()
-            .find(|record| record.body["target_id"] == function_id)
+            .find(|record| record.body.to_value()["target_id"] == function_id)
             .unwrap_or_else(|| {
                 panic!(
                     "expected a reference row targeting {function_id}: {:?}",
@@ -6232,8 +6227,8 @@ mod tests {
             rows.contains(&(
                 predicate_name_start,
                 predicate_name_end,
-                function_id.as_str(),
-                param_id.as_str()
+                function_id.clone(),
+                param_id.clone()
             )),
             "rows: {:?}",
             rows
@@ -6263,8 +6258,8 @@ mod tests {
             rows.contains(&(
                 predicate_name_start,
                 predicate_name_end,
-                function_id.as_str(),
-                param_id.as_str()
+                function_id.clone(),
+                param_id.clone()
             )),
             "rows: {:?}",
             rows
@@ -6410,9 +6405,9 @@ mod tests {
         let rows = resolved(&semantics);
         assert!(
             rows.iter()
-                .any(|&(start, end, _source_id, row_target)| start == alias_start
-                    && end == alias_end
-                    && row_target == target_id),
+                .any(|(start, end, _source_id, row_target)| *start == alias_start
+                    && *end == alias_end
+                    && *row_target == target_id),
             "rows: {:?}",
             rows
         );
@@ -6533,11 +6528,11 @@ mod tests {
             source.find("function helper").unwrap() as u32 + "function ".len() as u32;
         let use_id = format!("jsts:function:a.ts:{use_start}:use");
         let helper_id = format!("jsts:function:a.ts:{helper_start}:helper");
-        assert_eq!(record.body["source_id"], use_id);
-        assert_eq!(record.body["target_id"], helper_id);
-        assert_eq!(record.body["classification"], "confirmed");
-        assert_eq!(record.body["start"], call_start);
-        assert_eq!(record.body["end"], call_end);
+        assert_eq!(record.body.to_value()["source_id"], use_id);
+        assert_eq!(record.body.to_value()["target_id"], helper_id);
+        assert_eq!(record.body.to_value()["classification"], "confirmed");
+        assert_eq!(record.body.to_value()["start"], call_start);
+        assert_eq!(record.body.to_value()["end"], call_end);
         assert_eq!(record.kind, "jsts:relation_call");
         assert_eq!(record.universal_kind, "core:call");
         assert_eq!(
@@ -6567,8 +6562,8 @@ mod tests {
             semantics.call_rows
         );
         let record = &semantics.call_rows[0];
-        assert_eq!(record.body["source_id"], function_id);
-        assert_eq!(record.body["target_id"], function_id);
+        assert_eq!(record.body.to_value()["source_id"], function_id);
+        assert_eq!(record.body.to_value()["target_id"], function_id);
     }
 
     #[test]
@@ -6739,9 +6734,9 @@ mod tests {
         let derived_id = format!("jsts:class:a.ts:{derived_start}:Derived");
         let extends_start = source.rfind("Base").unwrap() as u32;
         let extends_end = extends_start + "Base".len() as u32;
-        assert_eq!(record.body["source_id"], derived_id);
-        assert_eq!(record.body["target_id"], base_id);
-        assert_eq!(record.body["classification"], "confirmed");
+        assert_eq!(record.body.to_value()["source_id"], derived_id);
+        assert_eq!(record.body.to_value()["target_id"], base_id);
+        assert_eq!(record.body.to_value()["classification"], "confirmed");
         assert_eq!(record.kind, "jsts:relation_inherits");
         assert_eq!(record.universal_kind, "core:inherits");
         assert_eq!(
@@ -6765,7 +6760,7 @@ mod tests {
         assert_eq!(record.universal_kind, "core:implements");
         let greeter_start = source.find("Greeter {").unwrap() as u32;
         let greeter_id = format!("jsts:interface:a.ts:{greeter_start}:Greeter");
-        assert_eq!(record.body["target_id"], greeter_id);
+        assert_eq!(record.body.to_value()["target_id"], greeter_id);
     }
 
     #[test]
@@ -6782,7 +6777,7 @@ mod tests {
         assert_eq!(record.kind, "jsts:relation_inherits");
         let base_start = source.find("Base {").unwrap() as u32;
         let base_id = format!("jsts:interface:a.ts:{base_start}:Base");
-        assert_eq!(record.body["target_id"], base_id);
+        assert_eq!(record.body.to_value()["target_id"], base_id);
     }
 
     #[test]
@@ -7248,9 +7243,9 @@ mod tests {
         assert_eq!(record.kind, "jsts:relation_references");
         assert_eq!(record.universal_kind, "core:references");
         assert_eq!(record.category, "relation");
-        assert_eq!(record.body["source_id"], source_id);
-        assert_eq!(record.body["target_id"], target_id);
-        assert_eq!(record.body["classification"], "confirmed");
+        assert_eq!(record.body.to_value()["source_id"], source_id);
+        assert_eq!(record.body.to_value()["target_id"], target_id);
+        assert_eq!(record.body.to_value()["classification"], "confirmed");
     }
 
     // -- E2: import -> export -> declaration hybrid resolution --------
@@ -7970,10 +7965,10 @@ mod tests {
         );
         let record = &semantics.call_rows[0];
         assert_eq!(
-            record.body["target_id"],
+            record.body.to_value()["target_id"],
             "jsts:function:helper.ts:16:helper"
         );
-        assert_eq!(record.body["classification"], "confirmed");
+        assert_eq!(record.body.to_value()["classification"], "confirmed");
         assert!(
             semantics
                 .pending_sites
@@ -8063,7 +8058,10 @@ mod tests {
             semantics.heritage_rows
         );
         let record = &semantics.heritage_rows[0];
-        assert_eq!(record.body["target_id"], "jsts:class:base.ts:6:Base");
+        assert_eq!(
+            record.body.to_value()["target_id"],
+            "jsts:class:base.ts:6:Base"
+        );
         assert_eq!(record.kind, "jsts:relation_inherits");
     }
 
@@ -8096,17 +8094,17 @@ mod tests {
         )
     }
 
-    fn covers(semantics: &OwnerSemantics) -> Vec<(u32, u32, &str, &str)> {
+    fn covers(semantics: &OwnerSemantics) -> Vec<(u32, u32, String, String)> {
         semantics
             .covers_rows
             .iter()
             .map(|record| {
-                let body = record.body.as_object().expect("covers body is an object");
+                let body = record.body.to_value();
                 (
                     body["start"].as_u64().unwrap() as u32,
                     body["end"].as_u64().unwrap() as u32,
-                    body["source_id"].as_str().unwrap(),
-                    body["target_id"].as_str().unwrap(),
+                    body["source_id"].as_str().unwrap().to_owned(),
+                    body["target_id"].as_str().unwrap().to_owned(),
                 )
             })
             .collect()
@@ -8204,8 +8202,8 @@ mod tests {
                 .covers_rows
                 .iter()
                 .find(|record| {
-                    record.body["start"].as_u64().unwrap() as u32 == *start
-                        && record.body["end"].as_u64().unwrap() as u32 == *end
+                    record.body.to_value()["start"].as_u64().unwrap() as u32 == *start
+                        && record.body.to_value()["end"].as_u64().unwrap() as u32 == *end
                 })
                 .expect("matching covers record");
             let expected_identity_key =
@@ -8214,8 +8212,8 @@ mod tests {
             assert_eq!(record.kind, "jsts:relation_covers");
             assert_eq!(record.universal_kind, "core:covers");
             assert_eq!(record.category, "relation");
-            assert_eq!(record.body["classification"], "confirmed");
-            assert_eq!(record.body["path"], "a.ts");
+            assert_eq!(record.body.to_value()["classification"], "confirmed");
+            assert_eq!(record.body.to_value()["path"], "a.ts");
         }
     }
 
@@ -8325,7 +8323,7 @@ mod tests {
         );
         let base_start = source.find("greet").unwrap() as u32;
         assert_eq!(
-            semantics.typeflow_call_rows[0].body["target_id"],
+            semantics.typeflow_call_rows[0].body.to_value()["target_id"],
             format!("jsts:method:a.ts:{base_start}:greet")
         );
     }
@@ -8356,7 +8354,7 @@ mod tests {
             semantics
                 .reference_rows
                 .iter()
-                .any(|record| record.body["target_id"] == x_id.as_str()),
+                .any(|record| record.body.to_value()["target_id"] == x_id.as_str()),
             "rows: {:?}",
             semantics.reference_rows
         );
@@ -8395,7 +8393,7 @@ mod tests {
             semantics
                 .reference_rows
                 .iter()
-                .any(|record| record.body["target_id"] == own_id.as_str()),
+                .any(|record| record.body.to_value()["target_id"] == own_id.as_str()),
             "rows: {:?}",
             semantics.reference_rows
         );
@@ -8403,7 +8401,7 @@ mod tests {
             semantics
                 .reference_rows
                 .iter()
-                .all(|record| record.body["target_id"]
+                .all(|record| record.body.to_value()["target_id"]
                     != urdira_jsts_typeflow::declaration_id(
                         "property",
                         "a.ts",
@@ -8461,7 +8459,7 @@ mod tests {
             semantics.pending_sites
         );
         assert!(semantics.reference_rows.iter().all(|record| {
-            record.body["target_id"]
+            record.body.to_value()["target_id"]
                 .as_str()
                 .is_some_and(|id| !id.contains(":run"))
         }));
@@ -8481,7 +8479,7 @@ mod tests {
         );
         let base_start = source.find("greet").unwrap() as u32;
         assert_eq!(
-            semantics.typeflow_call_rows[0].body["target_id"],
+            semantics.typeflow_call_rows[0].body.to_value()["target_id"],
             format!("jsts:method:a.ts:{base_start}:greet")
         );
     }
@@ -8592,11 +8590,15 @@ mod tests {
         );
         let mut targets_by_site: BTreeMap<(u64, u64), BTreeSet<String>> = BTreeMap::new();
         for row in &semantics.candidate_call_rows {
-            assert_eq!(row.body["reason"], REASON_OVERLOAD_AMBIGUOUS);
-            assert_eq!(row.body["classification"], "possible");
-            let start = row.body["start"].as_u64().expect("start is a number");
-            let end = row.body["end"].as_u64().expect("end is a number");
-            let target_id = row.body["target_id"]
+            assert_eq!(row.body.to_value()["reason"], REASON_OVERLOAD_AMBIGUOUS);
+            assert_eq!(row.body.to_value()["classification"], "possible");
+            let start = row.body.to_value()["start"]
+                .as_u64()
+                .expect("start is a number");
+            let end = row.body.to_value()["end"]
+                .as_u64()
+                .expect("end is a number");
+            let target_id = row.body.to_value()["target_id"]
                 .as_str()
                 .expect("target_id present")
                 .to_owned();
@@ -8647,10 +8649,10 @@ mod tests {
         );
         let mut target_ids = BTreeSet::new();
         for row in &semantics.candidate_call_rows {
-            assert_eq!(row.body["reason"], REASON_UNION_AMBIGUOUS);
-            assert_eq!(row.body["classification"], "possible");
+            assert_eq!(row.body.to_value()["reason"], REASON_UNION_AMBIGUOUS);
+            assert_eq!(row.body.to_value()["classification"], "possible");
             target_ids.insert(
-                row.body["target_id"]
+                row.body.to_value()["target_id"]
                     .as_str()
                     .expect("target_id present")
                     .to_owned(),
@@ -8923,7 +8925,8 @@ mod tests {
         // The interface's own `run` (at offset 26) must win, never the
         // object literal's own `run` method (at offset 84).
         assert_eq!(
-            semantics.typeflow_call_rows[0].body["target_id"], "jsts:method:a.ts:26:run",
+            semantics.typeflow_call_rows[0].body.to_value()["target_id"],
+            "jsts:method:a.ts:26:run",
             "rows: {:?}",
             semantics.typeflow_call_rows
         );
@@ -9133,7 +9136,7 @@ mod tests {
             semantics
                 .typeflow_call_rows
                 .iter()
-                .any(|row| row.body["target_id"] == "jsts:function:base.ts:43:make"),
+                .any(|row| row.body.to_value()["target_id"] == "jsts:function:base.ts:43:make"),
             "rows: {:?}",
             semantics.typeflow_call_rows
         );
@@ -9185,10 +9188,9 @@ mod tests {
         let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
             .expect("analysis succeeds");
         assert!(
-            semantics
-                .reference_rows
-                .iter()
-                .any(|record| record.body["target_id"] == "jsts:function:base.ts:43:make"),
+            semantics.reference_rows.iter().any(
+                |record| record.body.to_value()["target_id"] == "jsts:function:base.ts:43:make"
+            ),
             "rows: {:?}",
             semantics.reference_rows
         );
@@ -9244,7 +9246,7 @@ mod tests {
             semantics
                 .reference_rows
                 .iter()
-                .all(|record| record.body["start"] != missing_start),
+                .all(|record| record.body.to_value()["start"] != missing_start),
             "must never guess: rows: {:?}",
             semantics.reference_rows
         );
@@ -9303,7 +9305,7 @@ mod tests {
             semantics
                 .typeflow_call_rows
                 .iter()
-                .any(|row| row.body["target_id"]
+                .any(|row| row.body.to_value()["target_id"]
                     == "jsts:function:evals/index.ts:899:stringSimilarity"),
             "rows: {:?}",
             semantics.typeflow_call_rows
@@ -9353,7 +9355,7 @@ mod tests {
             semantics
                 .typeflow_call_rows
                 .iter()
-                .any(|row| row.body["target_id"] == "jsts:method:a.ts:76:createTable"),
+                .any(|row| row.body.to_value()["target_id"] == "jsts:method:a.ts:76:createTable"),
             "rows: {:?}",
             semantics.typeflow_call_rows
         );
@@ -9452,7 +9454,7 @@ mod tests {
             semantics
                 .reference_rows
                 .iter()
-                .any(|record| record.body["target_id"] == target_id.as_str()),
+                .any(|record| record.body.to_value()["target_id"] == target_id.as_str()),
             "target_id={target_id} rows: {:?} pending: {:?}",
             semantics.reference_rows,
             semantics.pending_sites
@@ -9531,7 +9533,7 @@ mod tests {
             semantics
                 .reference_rows
                 .iter()
-                .any(|record| record.body["target_id"] == target_id.as_str()),
+                .any(|record| record.body.to_value()["target_id"] == target_id.as_str()),
             "target_id={target_id} rows: {:?} pending: {:?}",
             semantics.reference_rows,
             semantics.pending_sites
@@ -9750,19 +9752,19 @@ mod tests {
             assert_eq!(entity.category, "entity");
             assert_eq!(entity.kind, "jsts:entity_parameter");
             assert_eq!(entity.universal_kind, "core:parameter");
-            assert_eq!(entity.body["name"], name);
-            assert_eq!(entity.body["kind"], "parameter");
-            assert_eq!(entity.body["parent_id"], parent_id);
-            assert_eq!(entity.body["qualified_name"], qualified_name);
+            assert_eq!(entity.body.to_value()["name"], name);
+            assert_eq!(entity.body.to_value()["kind"], "parameter");
+            assert_eq!(entity.body.to_value()["parent_id"], parent_id);
+            assert_eq!(entity.body.to_value()["qualified_name"], qualified_name);
 
             // `contains` parent -> parameter is present, source matching
             // this same parent_id.
             let contains = parameter_contains(&semantics, &param_id)
                 .unwrap_or_else(|| panic!("expected a contains row for {param_id}"));
             assert_eq!(contains.kind, "jsts:relation_contains");
-            assert_eq!(contains.body["source_id"], parent_id);
-            assert_eq!(contains.body["target_id"], param_id);
-            assert_eq!(contains.body["classification"], "confirmed");
+            assert_eq!(contains.body.to_value()["source_id"], parent_id);
+            assert_eq!(contains.body.to_value()["target_id"], param_id);
+            assert_eq!(contains.body.to_value()["classification"], "confirmed");
         }
     }
 
@@ -9799,10 +9801,10 @@ mod tests {
             "rest",
         );
         let entity = parameter_entity(&semantics, &rest_id).expect("rest parameter entity");
-        assert_eq!(entity.body["name"], "rest");
-        assert_eq!(entity.body["kind"], "parameter");
+        assert_eq!(entity.body.to_value()["name"], "rest");
+        assert_eq!(entity.body.to_value()["kind"], "parameter");
         assert_eq!(
-            entity.body["parent_id"],
+            entity.body.to_value()["parent_id"],
             declaration_id(
                 DeclKind::Function,
                 "a.ts",
@@ -9827,8 +9829,8 @@ mod tests {
             rows.contains(&(
                 reference_start,
                 reference_start + "rest".len() as u32,
-                function_id.as_str(),
-                rest_id.as_str()
+                function_id.clone(),
+                rest_id.clone()
             )),
             "rows: {:?}",
             rows
@@ -9874,16 +9876,16 @@ mod tests {
             rows.contains(&(
                 reference_start,
                 reference_start + "error".len() as u32,
-                function_id.as_str(),
-                catch_id.as_str()
+                function_id.clone(),
+                catch_id.clone()
             )),
             "rows: {:?}",
             rows
         );
         let entity = parameter_entity(&semantics, &catch_id).expect("catch binding entity");
-        assert_eq!(entity.body["name"], "error");
-        assert_eq!(entity.body["kind"], "variable");
-        assert_eq!(entity.body["parent_id"], function_id.as_str());
+        assert_eq!(entity.body.to_value()["name"], "error");
+        assert_eq!(entity.body.to_value()["kind"], "variable");
+        assert_eq!(entity.body.to_value()["parent_id"], function_id.as_str());
         assert!(parameter_contains(&semantics, &catch_id).is_some());
     }
 
@@ -9956,7 +9958,7 @@ mod tests {
             semantics
                 .reference_rows
                 .iter()
-                .any(|record| record.body["target_id"] == param_id.as_str()),
+                .any(|record| record.body.to_value()["target_id"] == param_id.as_str()),
             "`return x` must still resolve to the parameter property's canonical id"
         );
     }
@@ -9978,10 +9980,10 @@ mod tests {
         );
         let entity = parameter_entity(&semantics, &param_id)
             .unwrap_or_else(|| panic!("expected a parameter entity for {param_id}"));
-        assert_eq!(entity.body["parent_id"], module_id);
-        assert_eq!(entity.body["qualified_name"], "a.ts.value");
+        assert_eq!(entity.body.to_value()["parent_id"], module_id);
+        assert_eq!(entity.body.to_value()["qualified_name"], "a.ts.value");
         let contains = parameter_contains(&semantics, &param_id).expect("contains row present");
-        assert_eq!(contains.body["source_id"], module_id);
+        assert_eq!(contains.body.to_value()["source_id"], module_id);
     }
 
     #[test]
@@ -10004,8 +10006,8 @@ mod tests {
         );
         let entity = parameter_entity(&semantics, &param_id)
             .unwrap_or_else(|| panic!("expected a parameter entity for {param_id}"));
-        assert_eq!(entity.body["parent_id"], module_id);
-        assert_eq!(entity.body["qualified_name"], "a.ts.value");
+        assert_eq!(entity.body.to_value()["parent_id"], module_id);
+        assert_eq!(entity.body.to_value()["qualified_name"], "a.ts.value");
 
         // `invoke`'s own referenced parameter, by contrast, DOES have an
         // owner (the function declaration).
@@ -10023,7 +10025,10 @@ mod tests {
         );
         let callback_entity = parameter_entity(&semantics, &callback_id)
             .unwrap_or_else(|| panic!("expected a parameter entity for {callback_id}"));
-        assert_eq!(callback_entity.body["parent_id"], invoke_id.as_str());
+        assert_eq!(
+            callback_entity.body.to_value()["parent_id"],
+            invoke_id.as_str()
+        );
     }
 
     // -- 2026-09-04 external package/symbol entities task ---------------
@@ -10068,22 +10073,27 @@ mod tests {
             find_entity(&semantics, "jsts:external_module:lodash").expect("module entity present");
         assert_eq!(module_entity.kind, "jsts:entity_container");
         assert_eq!(module_entity.universal_kind, "core:container");
-        assert_eq!(module_entity.body["name"], "lodash");
+        assert_eq!(module_entity.body.to_value()["name"], "lodash");
         let symbol_entity = find_entity(&semantics, target_id).expect("symbol entity present");
         assert_eq!(symbol_entity.kind, "jsts:entity_variable");
         assert_eq!(symbol_entity.universal_kind, "core:value");
-        assert_eq!(symbol_entity.body["name"], "get");
+        assert_eq!(symbol_entity.body.to_value()["name"], "get");
         assert_eq!(
-            symbol_entity.body["parent_id"],
+            symbol_entity.body.to_value()["parent_id"],
             "jsts:external_module:lodash"
         );
-        assert_eq!(symbol_entity.body["qualified_name"], "lodash.get");
+        assert_eq!(
+            symbol_entity.body.to_value()["qualified_name"],
+            "lodash.get"
+        );
         assert!(
             semantics
                 .external_contains_rows
                 .iter()
-                .any(|row| row.body["source_id"] == "jsts:external_module:lodash"
-                    && row.body["target_id"] == target_id),
+                .any(
+                    |row| row.body.to_value()["source_id"] == "jsts:external_module:lodash"
+                        && row.body.to_value()["target_id"] == target_id
+                ),
             "expected a core:contains row from the module to the symbol"
         );
     }
@@ -10339,6 +10349,9 @@ mod tests {
             "the call itself must resolve too: {:?}",
             semantics.call_rows
         );
-        assert_eq!(semantics.call_rows[0].body["target_id"], target_id);
+        assert_eq!(
+            semantics.call_rows[0].body.to_value()["target_id"],
+            target_id
+        );
     }
 }

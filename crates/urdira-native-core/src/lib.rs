@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 
@@ -39,7 +40,16 @@ pub struct StructuralKernelRecord {
 /// (`structural_kernel_rows`, `structural_kernel_batch_parts`, ...) is
 /// rewritten in terms of the ref-based core functions so there is exactly
 /// one digest/canonicalization implementation, never two that could drift.
-#[derive(Debug, Clone, Copy)]
+///
+/// A3b coste 2: no longer `Copy` -- [`BodyRef`] gained an owned
+/// (`EncodedOwned`) variant, so this struct can no longer be `Copy` either
+/// (a `Vec<u8>` inside is never `Copy`). Every existing borrowed-body caller
+/// (`BodyRef::Value`/`Encoded`, both still plain references) still gets a
+/// trivially cheap `.clone()` wherever the old `Copy` derive used to supply
+/// an implicit copy -- see `structural_kernel_rows_ref`/`_typed`'s own hot
+/// loops, which now `.clone()` once per record instead of relying on
+/// pattern-match-copy.
+#[derive(Debug, Clone)]
 pub struct StructuralKernelRecordRef<'a> {
     pub proposal_record_key: &'a str,
     pub category: &'a str,
@@ -49,8 +59,42 @@ pub struct StructuralKernelRecordRef<'a> {
     pub schema_version: u32,
     pub source_span: &'a str,
     pub identity_key: &'a str,
-    pub body: &'a Value,
+    pub body: BodyRef<'a>,
     pub evidence_references: &'a str,
+}
+
+/// A3b: a borrowed view over a record's body that lets
+/// [`structural_kernel_row`] take either the original `serde_json::Value`
+/// tree (`Value`, the v3/legacy shape and every not-yet-migrated producer's
+/// shape) or an already-[`BodyEncoder`]-built [`EncodedBody`] (`Encoded`,
+/// the v4 hot-path producers' shape) without cloning or converting between
+/// them. For `Value`, the kernel still walks the tree via [`fused_body_pass`]
+/// exactly as before this task. For `Encoded`, the kernel skips that walk
+/// entirely: the payload bytes, `body_digest`, and `body_byte_length` were
+/// already produced, once, by the producer itself, and the whole-record
+/// digest is fed the identical byte sequence via `record_hash.update(&
+/// encoded.payload)` -- byte-identical to what feeding the same bytes
+/// through `fused_body_pass` node-by-node would have produced, since
+/// `Sha256::update` is purely sequential. See `encoded_body_matches_value_
+/// body_oracle` (this crate's tests) for the equivalence proof.
+///
+/// A3b coste 2: a third variant, `EncodedOwned`, holds an `EncodedBody` BY
+/// VALUE rather than by reference -- for a caller that owns its
+/// `ProposedRecord`s outright (`urdira-indexing-worker`'s v4
+/// `canonicalize_owner`) and can therefore MOVE an `Encoded` body's payload
+/// straight into `StructuralKernelRow.body` (`structural_kernel_row`'s
+/// `EncodedOwned` arm) instead of paying `encoded.payload.clone()` the way
+/// the borrowed `Encoded` arm must. This is the reason `BodyRef` (and, by
+/// extension, `StructuralKernelRecordRef`) can no longer derive `Copy`: a
+/// `Vec<u8>`-holding variant is never `Copy`. Produced only by
+/// `structural_kernel_rows_owned_typed`'s caller -- `StructuralKernelRecord::
+/// as_ref` and every other existing constructor still only ever builds
+/// `Value`/`Encoded`.
+#[derive(Debug, Clone)]
+pub enum BodyRef<'a> {
+    Value(&'a Value),
+    Encoded(&'a EncodedBody),
+    EncodedOwned(EncodedBody),
 }
 
 impl StructuralKernelRecord {
@@ -65,7 +109,7 @@ impl StructuralKernelRecord {
             schema_version: self.schema_version,
             source_span: &self.source_span,
             identity_key: &self.identity_key,
-            body: &self.body,
+            body: BodyRef::Value(&self.body),
             evidence_references: &self.evidence_references,
         }
     }
@@ -374,7 +418,18 @@ fn structural_record_digest_hash(
     hash.update([6]);
     update_varint(&mut hash, 10);
     update_uce_text(&mut hash, "body");
-    update_uce_value(&mut hash, record.body, 1)?;
+    match record.body {
+        BodyRef::Value(value) => update_uce_value(&mut hash, value, 1)?,
+        // `StructuralKernelRecord::as_ref` (this function's only caller,
+        // via `structural_record_digest`) always produces `BodyRef::Value`
+        // -- `StructuralKernelRecord.body` is still a plain `Value` field,
+        // untouched by this task (the v3/N-API path this function serves).
+        BodyRef::Encoded(_) | BodyRef::EncodedOwned(_) => {
+            return Err(NativeCoreError::new(
+                "structural_record_digest_hash does not support an already-encoded body.",
+            ));
+        }
+    }
     update_uce_key_value_text(&mut hash, "category", record.category);
     update_uce_key_value_text(&mut hash, "evidence_references", record.evidence_references);
     update_uce_key_value_text(&mut hash, "facets", record.facets);
@@ -684,6 +739,585 @@ fn fused_body_pass(
         }
     }
     Ok(())
+}
+
+/// A3b: result of [`BodyEncoder::finish`] -- everything [`structural_kernel_
+/// row`] needs from a producer-built body without ever walking a
+/// `serde_json::Value` tree for it. `payload` is byte-identical to what
+/// [`encode_publication_body`]/[`fused_body_pass`] would have produced for
+/// the equivalent `Value` tree (tag 0 null, 1/2 bool, `3 + varint(len) +
+/// bytes` string, `5 + varint(n)` array, `6 + varint(n)` object with each
+/// key encoded the same way as a string, `7 + f64_be` number); `body_digest`/
+/// `body_byte_length` are the `LogicalDigestWriter` (`urdira:relational-
+/// value:v3`) results [`encode_publication_body`] would also have produced.
+/// `record_hash.update(&payload)` at the point [`structural_kernel_row`]
+/// used to call `fused_body_pass` reproduces the identical `record_digest`
+/// -- see [`BodyRef`]'s own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedBody {
+    pub payload: Vec<u8>,
+    pub body_digest: [u8; 32],
+    pub body_byte_length: usize,
+}
+
+/// A3b: one open object/array frame on [`BodyEncoder`]'s stack --
+/// `remaining` counts down the number of children [`BodyEncoder::begin_
+/// object`]/[`BodyEncoder::begin_array`] declared still to come, `last_key`
+/// tracks the most recent object key written (`None` for an array frame, or
+/// an object frame that has not yet had its first key written) so
+/// [`BodyEncoder::key`] can enforce strict lexicographic order.
+type BodyEncoderFrame = (usize, Option<String>);
+
+/// A3b: a streaming, allocation-light replacement for building a
+/// `serde_json::Value` tree with a producer's own inserts/pushes and then
+/// feeding it through [`fused_body_pass`]/[`encode_publication_body`].
+/// Every producer that migrates to this encoder must emit exactly the same
+/// keys/values [`fused_body_pass`] would see for the equivalent `Value`
+/// tree, in strictly increasing (byte-lexicographic) key order per object
+/// -- the same order `serde_json::Map` (a `BTreeMap` in this workspace,
+/// which never enables the `preserve_order` feature -- see this task's own
+/// evidence entry) always iterates in regardless of insertion order.
+///
+/// Nesting is tracked with a small stack of `(remaining_children, last_key)`
+/// frames (`pending_keys`) instead of explicit `end_object`/`end_array`
+/// calls: `begin_object(n)`/`begin_array(n)` push a frame expecting exactly
+/// `n` children (or, for `n == 0`, close immediately); every leaf write
+/// (`null`/`bool`/`string`/`int`/`uint`/`real`) and every container close
+/// counts as ONE child consumed from the current top frame, decrementing
+/// its `remaining`; when a frame's `remaining` reaches zero it is popped
+/// and that pop itself counts as one child consumed from whatever frame is
+/// now on top (cascading all the way to the root, where there is no parent
+/// frame left to notify). [`BodyEncoder::finish`] panics if any frame is
+/// still open -- a mismatched child count is a producer bug, not a
+/// data-dependent error, so it is caught loudly rather than silently
+/// truncating/padding the payload.
+///
+/// `depth` mirrors the `depth` parameter [`fused_body_pass`]/[`encode_
+/// publication_body`] thread through their recursion (starting at `1` for
+/// the body's own top-level value, incrementing by one per nesting level),
+/// checked against [`MAX_LOGICAL_DEPTH`] on every value write -- the exact
+/// same bound those two functions enforce.
+pub struct BodyEncoder {
+    payload: Vec<u8>,
+    logical: LogicalDigestWriter,
+    depth: usize,
+    pending_keys: Vec<BodyEncoderFrame>,
+}
+
+impl Default for BodyEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BodyEncoder {
+    pub fn new() -> Self {
+        Self {
+            payload: Vec::new(),
+            logical: LogicalDigestWriter::new("urdira:relational-value:v3"),
+            depth: 1,
+            pending_keys: Vec::new(),
+        }
+    }
+
+    fn check_depth(&self) -> NativeCoreResult<()> {
+        if self.depth > MAX_LOGICAL_DEPTH {
+            return Err(NativeCoreError::new(
+                "Structural publication body exceeds the maximum depth.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Called exactly once after every value (leaf or closed container) is
+    /// fully written, to decrement the current top frame's remaining-child
+    /// count and cascade the close of any frame(s) that reach zero as a
+    /// result -- see this struct's own doc comment.
+    fn record_child_and_cascade(&mut self) {
+        while let Some(frame) = self.pending_keys.last_mut() {
+            frame.0 -= 1;
+            if frame.0 == 0 {
+                self.pending_keys.pop();
+                self.depth -= 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// Opens an object expecting exactly `n` key/value children. Emits the
+    /// same `[6] varint(n)` payload preamble and `logical.tag(10); logical.
+    /// length(n)` [`encode_publication_body`]'s `Value::Object` arm emits.
+    pub fn begin_object(&mut self, n: usize) -> NativeCoreResult<()> {
+        validate_collection_length(n)?;
+        self.check_depth()?;
+        self.logical.tag(10);
+        self.logical.length(n);
+        self.payload.push(6);
+        append_varint(&mut self.payload, n);
+        if n == 0 {
+            self.record_child_and_cascade();
+        } else {
+            self.depth += 1;
+            self.pending_keys.push((n, None));
+        }
+        Ok(())
+    }
+
+    /// Opens an array expecting exactly `n` value children. Emits the same
+    /// `[5] varint(n)` payload preamble and `logical.tag(9); logical.
+    /// length(n)` [`encode_publication_body`]'s `Value::Array` arm emits.
+    pub fn begin_array(&mut self, n: usize) -> NativeCoreResult<()> {
+        validate_collection_length(n)?;
+        self.check_depth()?;
+        self.logical.tag(9);
+        self.logical.length(n);
+        self.payload.push(5);
+        append_varint(&mut self.payload, n);
+        if n == 0 {
+            self.record_child_and_cascade();
+        } else {
+            self.depth += 1;
+            self.pending_keys.push((n, None));
+        }
+        Ok(())
+    }
+
+    /// Writes one object key. Requires an object frame to be open (the top
+    /// of `pending_keys`) and the key to sort strictly after the previous
+    /// key written for THAT object (`serde_json::Map`'s own `BTreeMap`
+    /// iteration order, without `preserve_order`) -- violating this is a
+    /// producer bug (it means the producer's field order does not match
+    /// what iterating the equivalent `Value::Object` would have produced),
+    /// so it is rejected rather than silently accepted out of order. Does
+    /// NOT itself count as a child write -- the value written immediately
+    /// after this call does.
+    pub fn key(&mut self, key: &str) -> NativeCoreResult<()> {
+        let frame = self
+            .pending_keys
+            .last_mut()
+            .ok_or_else(|| NativeCoreError::new("BodyEncoder::key called with no open object."))?;
+        if let Some(last_key) = &frame.1
+            && key.as_bytes() <= last_key.as_bytes()
+        {
+            return Err(NativeCoreError::new(format!(
+                "BodyEncoder object keys must be strictly increasing: '{key}' after '{last_key}'."
+            )));
+        }
+        frame.1 = Some(key.to_owned());
+        self.logical.text(key);
+        self.logical.boolean(true);
+        self.payload.push(3);
+        append_varint(&mut self.payload, key.len());
+        self.payload.extend_from_slice(key.as_bytes());
+        Ok(())
+    }
+
+    pub fn null(&mut self) -> NativeCoreResult<()> {
+        self.check_depth()?;
+        self.logical.tag(3);
+        self.payload.push(0);
+        self.record_child_and_cascade();
+        Ok(())
+    }
+
+    pub fn bool(&mut self, value: bool) -> NativeCoreResult<()> {
+        self.check_depth()?;
+        self.logical.boolean(value);
+        self.payload.push(if value { 2 } else { 1 });
+        self.record_child_and_cascade();
+        Ok(())
+    }
+
+    pub fn string(&mut self, value: &str) -> NativeCoreResult<()> {
+        self.check_depth()?;
+        self.logical.text(value);
+        self.payload.push(3);
+        append_varint(&mut self.payload, value.len());
+        self.payload.extend_from_slice(value.as_bytes());
+        self.record_child_and_cascade();
+        Ok(())
+    }
+
+    /// A signed integer. Always takes `fused_body_pass`'s `value.as_i64()
+    /// == Some(_)` branch (any real `i64` is trivially representable as
+    /// `i64`): `logical.tag(5)` + the exact decimal text, payload `[7] +
+    /// (value as f64).to_be_bytes()` -- matching `Value::Number`'s handling
+    /// of a JSON number that was itself constructed from a Rust integer.
+    pub fn int(&mut self, value: i64) -> NativeCoreResult<()> {
+        self.check_depth()?;
+        self.logical.tag(5);
+        self.logical.text(&value.to_string());
+        self.payload.push(7);
+        self.payload
+            .extend_from_slice(&(value as f64).to_be_bytes());
+        self.record_child_and_cascade();
+        Ok(())
+    }
+
+    /// An unsigned integer. Mirrors `serde_json::Number::as_i64`: a value
+    /// that fits in `i64` (`<= i64::MAX`) takes the integer branch exactly
+    /// like [`Self::int`]; a value too large for `i64` falls into the SAME
+    /// "real" branch `fused_body_pass`'s `Value::Number` arm falls into for
+    /// such a number (`logical.tag(6)` + raw `f64` bytes -- unreachable for
+    /// the negative-zero rejection, since an unsigned value is never
+    /// negative), matching what `Value::from(huge_u64)`'s `as_i64()`
+    /// returning `None` would have produced. Payload is `[7] + (value as
+    /// f64).to_be_bytes()` either way, exactly like [`Self::int`].
+    pub fn uint(&mut self, value: u64) -> NativeCoreResult<()> {
+        self.check_depth()?;
+        if value <= i64::MAX as u64 {
+            self.logical.tag(5);
+            self.logical.text(&value.to_string());
+        } else {
+            self.logical.tag(6);
+            self.logical.raw(&(value as f64).to_be_bytes());
+        }
+        self.payload.push(7);
+        self.payload
+            .extend_from_slice(&(value as f64).to_be_bytes());
+        self.record_child_and_cascade();
+        Ok(())
+    }
+
+    /// A floating-point number that is not itself a Rust integer type --
+    /// matches `fused_body_pass`'s `Value::Number` "else" (non-`as_i64`)
+    /// branch: rejects non-finite values and negative zero exactly like
+    /// that branch, `logical.tag(6)` + raw `f64` bytes, payload `[7] +`
+    /// the zero-normalized `f64` bytes (`-0.0` is rejected above, so the
+    /// only zero that reaches the payload write is already `+0.0`).
+    pub fn real(&mut self, value: f64) -> NativeCoreResult<()> {
+        self.check_depth()?;
+        if !value.is_finite() {
+            return Err(NativeCoreError::new(
+                "Structural publication body contains an invalid number.",
+            ));
+        }
+        if value.to_bits() == (-0.0_f64).to_bits() {
+            return Err(NativeCoreError::new(
+                "Logical digest real values must not be negative zero.",
+            ));
+        }
+        self.logical.tag(6);
+        self.logical.raw(&value.to_be_bytes());
+        let normalized = if value == 0.0 { 0.0 } else { value };
+        self.payload.push(7);
+        self.payload.extend_from_slice(&normalized.to_be_bytes());
+        self.record_child_and_cascade();
+        Ok(())
+    }
+
+    /// Finishes the body. Panics if any `begin_object`/`begin_array` frame
+    /// is still open -- i.e. the producer declared a child count that its
+    /// own subsequent calls did not match -- a programmer error in this
+    /// encoder's caller, not a data-dependent one.
+    pub fn finish(self) -> EncodedBody {
+        assert!(
+            self.pending_keys.is_empty(),
+            "BodyEncoder::finish called with an unterminated object/array (declared child count did not match the number of values written)."
+        );
+        let (body_digest, body_byte_length) = self.logical.finish_bytes();
+        EncodedBody {
+            payload: self.payload,
+            body_digest,
+            body_byte_length,
+        }
+    }
+}
+
+/// A3b: exact inverse of the payload format [`encode_publication_body`]/
+/// [`fused_body_pass`]/[`BodyEncoder`] produce (tag `0` null, `1`/`2` bool,
+/// `3 + varint(len) + bytes` string, `5 + varint(n)` array, `6 + varint(n)`
+/// object with `n` `(string-key, value)` pairs, `7 + f64_be` number).
+/// Needed only by callers that still hold a payload but need the equivalent
+/// `serde_json::Value` back -- the v3/legacy `run_jsts_generation` path
+/// (`urdira-indexing-worker::main`) mutates a record's body as a `Value`
+/// object, and `ProposedRecord`'s `Serialize` impl for `RecordBody::Encoded`
+/// decodes to `Value` so the IPC/`AnalysisResponse` JSON shape is unchanged.
+pub fn decode_body(payload: &[u8]) -> NativeCoreResult<Value> {
+    let mut cursor = 0usize;
+    let value = decode_body_value(payload, &mut cursor)?;
+    if cursor != payload.len() {
+        return Err(NativeCoreError::new(
+            "Structural publication body payload has trailing bytes.",
+        ));
+    }
+    Ok(value)
+}
+
+fn read_byte(payload: &[u8], cursor: &mut usize) -> NativeCoreResult<u8> {
+    let byte = *payload
+        .get(*cursor)
+        .ok_or_else(|| NativeCoreError::new("Structural publication body payload is truncated."))?;
+    *cursor += 1;
+    Ok(byte)
+}
+
+fn read_bytes<'a>(payload: &'a [u8], cursor: &mut usize, len: usize) -> NativeCoreResult<&'a [u8]> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| NativeCoreError::new("Structural publication body payload overflowed."))?;
+    let slice = payload
+        .get(*cursor..end)
+        .ok_or_else(|| NativeCoreError::new("Structural publication body payload is truncated."))?;
+    *cursor = end;
+    Ok(slice)
+}
+
+fn read_varint(payload: &[u8], cursor: &mut usize) -> NativeCoreResult<usize> {
+    let mut result: usize = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let byte = read_byte(payload, cursor)?;
+        result |= usize::from(byte & 0x7f).checked_shl(shift).ok_or_else(|| {
+            NativeCoreError::new("Structural publication body varint overflowed.")
+        })?;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Ok(result)
+}
+
+fn decode_body_value(payload: &[u8], cursor: &mut usize) -> NativeCoreResult<Value> {
+    let tag = read_byte(payload, cursor)?;
+    match tag {
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Bool(false)),
+        2 => Ok(Value::Bool(true)),
+        3 => {
+            let len = read_varint(payload, cursor)?;
+            let bytes = read_bytes(payload, cursor, len)?;
+            let text = std::str::from_utf8(bytes).map_err(|_| {
+                NativeCoreError::new("Structural publication body string is not valid UTF-8.")
+            })?;
+            Ok(Value::String(text.to_owned()))
+        }
+        5 => {
+            let len = read_varint(payload, cursor)?;
+            let mut values = Vec::with_capacity(len);
+            for _ in 0..len {
+                values.push(decode_body_value(payload, cursor)?);
+            }
+            Ok(Value::Array(values))
+        }
+        6 => {
+            let len = read_varint(payload, cursor)?;
+            let mut map = serde_json::Map::with_capacity(len);
+            for _ in 0..len {
+                let key_tag = read_byte(payload, cursor)?;
+                if key_tag != 3 {
+                    return Err(NativeCoreError::new(
+                        "Structural publication body object key is not a string.",
+                    ));
+                }
+                let key_len = read_varint(payload, cursor)?;
+                let key_bytes = read_bytes(payload, cursor, key_len)?;
+                let key = std::str::from_utf8(key_bytes)
+                    .map_err(|_| {
+                        NativeCoreError::new("Structural publication body key is not valid UTF-8.")
+                    })?
+                    .to_owned();
+                let value = decode_body_value(payload, cursor)?;
+                map.insert(key, value);
+            }
+            Ok(Value::Object(map))
+        }
+        7 => {
+            let bytes = read_bytes(payload, cursor, 8)?;
+            let real = f64::from_be_bytes(bytes.try_into().expect("checked 8-byte slice"));
+            // The payload tag alone cannot distinguish "encoded via `int`/
+            // `uint`" from "encoded via `real` with a whole-number value" --
+            // both produce the identical `[7] + f64_be` bytes (see
+            // `BodyEncoder::int`/`uint`/`real`). Every real producer in this
+            // pipeline only ever puts actual integers (spans, counts, line
+            // numbers) into a body, never a literal whole-number float, so
+            // normalizing any exactly-integral, safely-representable value
+            // back to `serde_json`'s integer `Number` variant on decode
+            // matches what every real caller originally encoded -- and
+            // matches JSON's own semantics, where `5` and `5.0` are the same
+            // number. A genuinely fractional value decodes as a float
+            // either way.
+            if real.fract() == 0.0 && real.abs() <= MAX_SAFE_INTEGER as f64 {
+                Ok(Value::from(real as i64))
+            } else {
+                Ok(Value::from(real))
+            }
+        }
+        other => Err(NativeCoreError::new(format!(
+            "Structural publication body payload has an unknown tag byte {other}."
+        ))),
+    }
+}
+
+fn payload_cursor_read_byte(payload: &[u8], cursor: &Cell<usize>) -> NativeCoreResult<u8> {
+    let mut pos = cursor.get();
+    let byte = read_byte(payload, &mut pos)?;
+    cursor.set(pos);
+    Ok(byte)
+}
+
+fn payload_cursor_read_bytes<'a>(
+    payload: &'a [u8],
+    cursor: &Cell<usize>,
+    len: usize,
+) -> NativeCoreResult<&'a [u8]> {
+    let mut pos = cursor.get();
+    let bytes = read_bytes(payload, &mut pos, len)?;
+    cursor.set(pos);
+    Ok(bytes)
+}
+
+fn payload_cursor_read_varint(payload: &[u8], cursor: &Cell<usize>) -> NativeCoreResult<usize> {
+    let mut pos = cursor.get();
+    let value = read_varint(payload, &mut pos)?;
+    cursor.set(pos);
+    Ok(value)
+}
+
+fn payload_cursor_read_str<'a>(
+    payload: &'a [u8],
+    cursor: &Cell<usize>,
+) -> NativeCoreResult<&'a str> {
+    let len = payload_cursor_read_varint(payload, cursor)?;
+    let bytes = payload_cursor_read_bytes(payload, cursor, len)?;
+    std::str::from_utf8(bytes)
+        .map_err(|_| NativeCoreError::new("Structural publication body string is not valid UTF-8."))
+}
+
+/// Maps a [`NativeCoreError`] (this module's own malformed-payload errors)
+/// into whatever error type the caller's [`serde::Serializer`] uses --
+/// [`serialize_payload`]/[`serialize_payload_value`]'s error channel is
+/// generic over `S::Error`, not this crate's own `NativeCoreResult`.
+fn payload_ser_err<E: serde::ser::Error>(error: NativeCoreError) -> E {
+    E::custom(error.to_string())
+}
+
+/// A3b coste 1: one `serde::Serialize`-able view over the payload VALUE
+/// starting at `cursor`'s current position -- exists only so
+/// [`serialize_payload_value`]'s array/object arms can hand
+/// `SerializeSeq::serialize_element`/`SerializeMap::serialize_entry` a `&dyn
+/// Serialize` for each child without first decoding that child into a
+/// `serde_json::Value` (the whole point of this task: skip the `Value` tree
+/// entirely). `cursor` is a shared `&Cell<usize>` rather than `&mut usize`
+/// because `serde::Serialize::serialize` takes `&self`, so nothing here can
+/// hold a `&mut` cursor across the trait boundary -- `Cell` gives every
+/// sibling element in a sequence/map the same "read current position,
+/// advance it" capability a `&mut usize` would, just through get/set instead
+/// of direct mutation.
+struct PayloadElement<'a> {
+    payload: &'a [u8],
+    cursor: &'a Cell<usize>,
+}
+
+impl Serialize for PayloadElement<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serialize_payload_value(self.payload, self.cursor, serializer)
+    }
+}
+
+/// A3b coste 1: streaming counterpart of [`decode_body`]/[`decode_body_
+/// value`] -- walks a [`BodyEncoder`]-built payload directly into a
+/// `serde::Serializer`, emitting `serialize_unit`/`serialize_bool`/
+/// `serialize_str`/`serialize_seq`/`serialize_map`/`serialize_i64`/
+/// `serialize_f64` calls as it goes, WITHOUT ever building an intermediate
+/// `serde_json::Value` tree the way `RecordBody`'s old `Serialize` impl
+/// (`decode_body` then `value.serialize(serializer)`) did. Exists because
+/// `SyntaxWorkerState::analyze`'s `max_output_bytes` budget check
+/// (`serde_json::to_vec(&response)`, `urdira-jsts-syntax-worker::lib`) walks
+/// every `ProposedRecord` in the response, and on the v4 hot path EVERY
+/// record's body is `RecordBody::Encoded` -- decoding 2.17M bodies to
+/// `Value` purely to re-serialize them was pure waste this function removes.
+///
+/// Tag handling is the EXACT inverse of [`decode_body_value`], including
+/// tag `7`'s int-vs-float normalization: `decode_body_value` always
+/// reconstructs a whole-number, safely-representable payload float as
+/// `Value::from(real as i64)` (never a `u64` branch -- read that function's
+/// own doc comment), and `serde_json`'s own `Number::serialize` for such a
+/// `Value` prints the same plain decimal text a direct `serializer.
+/// serialize_i64` call does, so this function calls `serialize_i64` for
+/// that exact case (never `serialize_u64`) to match `decode_body_value`'s
+/// rule byte for byte, and `serialize_f64` for every other (genuinely
+/// fractional, or out-of-range) numeric payload. See `encoded_body_
+/// serializes_identically_to_a_plain_value_body`/this crate's own streaming-
+/// serializer tests for the byte-for-byte proof against `serde_json::to_
+/// string(&Value)`.
+pub fn serialize_payload<S>(payload: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let cursor = Cell::new(0usize);
+    let result = serialize_payload_value(payload, &cursor, serializer)?;
+    if cursor.get() != payload.len() {
+        return Err(serde::ser::Error::custom(
+            "Structural publication body payload has trailing bytes.",
+        ));
+    }
+    Ok(result)
+}
+
+fn serialize_payload_value<S>(
+    payload: &[u8],
+    cursor: &Cell<usize>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::{SerializeMap, SerializeSeq};
+
+    let tag = payload_cursor_read_byte(payload, cursor).map_err(payload_ser_err)?;
+    match tag {
+        0 => serializer.serialize_unit(),
+        1 => serializer.serialize_bool(false),
+        2 => serializer.serialize_bool(true),
+        3 => {
+            let text = payload_cursor_read_str(payload, cursor).map_err(payload_ser_err)?;
+            serializer.serialize_str(text)
+        }
+        5 => {
+            let len = payload_cursor_read_varint(payload, cursor).map_err(payload_ser_err)?;
+            let mut seq = serializer.serialize_seq(Some(len))?;
+            for _ in 0..len {
+                seq.serialize_element(&PayloadElement { payload, cursor })?;
+            }
+            seq.end()
+        }
+        6 => {
+            let len = payload_cursor_read_varint(payload, cursor).map_err(payload_ser_err)?;
+            let mut map = serializer.serialize_map(Some(len))?;
+            for _ in 0..len {
+                let key_tag = payload_cursor_read_byte(payload, cursor).map_err(payload_ser_err)?;
+                if key_tag != 3 {
+                    return Err(serde::ser::Error::custom(
+                        "Structural publication body object key is not a string.",
+                    ));
+                }
+                let key = payload_cursor_read_str(payload, cursor).map_err(payload_ser_err)?;
+                map.serialize_entry(key, &PayloadElement { payload, cursor })?;
+            }
+            map.end()
+        }
+        7 => {
+            let bytes = payload_cursor_read_bytes(payload, cursor, 8).map_err(payload_ser_err)?;
+            let real = f64::from_be_bytes(bytes.try_into().expect("checked 8-byte slice"));
+            // Byte-for-byte mirror of `decode_body_value`'s tag-`7` arm --
+            // see that arm's own doc comment for why this normalization is
+            // safe/correct for every real producer in this pipeline.
+            if real.fract() == 0.0 && real.abs() <= MAX_SAFE_INTEGER as f64 {
+                serializer.serialize_i64(real as i64)
+            } else {
+                serializer.serialize_f64(real)
+            }
+        }
+        other => Err(serde::ser::Error::custom(format!(
+            "Structural publication body payload has an unknown tag byte {other}."
+        ))),
+    }
 }
 
 fn publication_record(
@@ -1034,8 +1668,20 @@ fn parse_span_start_end(source_span: &str) -> (u32, u32) {
         .map_or((0, 0), span_start_end)
 }
 
+/// A3b coste 2: takes `record` BY REFERENCE (not by value) -- this function
+/// never reads `record.body` at all (only `.facets`/`.source_span`/
+/// `.evidence_references`, all plain `&str`), so a reference is enough, and
+/// keeping it a reference lets `structural_kernel_rows_ref`/`_owned_typed`'s
+/// hot loop still have `record` available, UNCONSUMED, for the
+/// `structural_kernel_row(record, ...)` call immediately after -- the one
+/// call that DOES need to consume `record.body` by value (to move an
+/// `EncodedOwned` payload out without cloning it). Before this change this
+/// function took `record` by value and relied on `StructuralKernelRecordRef`
+/// being `Copy` to leave the caller's own `record` binding usable afterward;
+/// `BodyRef::EncodedOwned` (coste 2) removed that `Copy` impl, so this is
+/// the replacement.
 fn canonical_nested_record_fields_and_span(
-    record: StructuralKernelRecordRef<'_>,
+    record: &StructuralKernelRecordRef<'_>,
     scratch: &mut String,
     unique: &mut HashSet<String>,
 ) -> (Option<Vec<String>>, (u32, u32)) {
@@ -1341,16 +1987,50 @@ fn structural_kernel_row(
     update_varint(&mut record_hash, 10);
     update_uce_text(&mut record_hash, "body");
 
-    let mut body_writer = LogicalDigestWriter::new("urdira:relational-value:v3");
-    let mut body = Vec::new();
-    fused_body_pass(
-        record.body,
-        &mut record_hash,
-        &mut body_writer,
-        &mut body,
-        1,
-    )?;
-    let (body_digest, body_byte_length) = body_writer.finish_bytes();
+    // A3b: `Value` still walks the tree via `fused_body_pass` exactly as
+    // before this task -- unchanged for every not-yet-migrated producer.
+    // `Encoded` skips that walk entirely: the producer already ran the
+    // equivalent traversal, once, through `BodyEncoder`, so the whole-record
+    // hasher is fed the identical byte sequence directly
+    // (`record_hash.update(&encoded.payload)` -- `Sha256::update` is purely
+    // sequential, so this reproduces the identical `record_digest`), and
+    // `body_digest`/`body_byte_length` are read straight off the already-
+    // computed `EncodedBody`. See `BodyRef`'s own doc comment and the
+    // `encoded_body_matches_value_body_oracle` test for the equivalence
+    // proof.
+    let (body_digest, body_byte_length, body) = match record.body {
+        BodyRef::Value(value) => {
+            let mut body_writer = LogicalDigestWriter::new("urdira:relational-value:v3");
+            let mut body = Vec::new();
+            fused_body_pass(value, &mut record_hash, &mut body_writer, &mut body, 1)?;
+            let (body_digest, body_byte_length) = body_writer.finish_bytes();
+            (body_digest, body_byte_length, body)
+        }
+        BodyRef::Encoded(encoded) => {
+            record_hash.update(&encoded.payload);
+            (
+                encoded.body_digest,
+                encoded.body_byte_length,
+                encoded.payload.clone(),
+            )
+        }
+        // A3b coste 2: identical to the `Encoded` arm above, except `record`
+        // (taken by value into this function) already OWNS `encoded`, so
+        // its `payload` can be moved straight into `StructuralKernelRow.
+        // body` -- no `.clone()`. Byte-identical output to the `Encoded`
+        // arm for the same bytes (`Sha256::update`/`body_digest`/
+        // `body_byte_length` don't care whether the payload was borrowed or
+        // owned), verified by this crate's `owned_encoded_body_matches_
+        // borrowed_encoded_body` test.
+        BodyRef::EncodedOwned(encoded) => {
+            record_hash.update(&encoded.payload);
+            (
+                encoded.body_digest,
+                encoded.body_byte_length,
+                encoded.payload,
+            )
+        }
+    };
 
     update_uce_key_value_text(&mut record_hash, "category", record.category);
     update_uce_key_value_text(
@@ -1469,15 +2149,23 @@ pub fn structural_kernel_rows_ref(
     // one comparison -- see `canonical_json_matches`'s doc comment.
     let mut canonical_scratch = String::new();
     let mut facet_dedup = HashSet::new();
-    for &record in records {
+    for record in records {
         let (facets, span) = canonical_nested_record_fields_and_span(
             record,
             &mut canonical_scratch,
             &mut facet_dedup,
         );
         let structural_attestation = facets.is_some();
+        // A3b coste 2: `.clone()` here (not a `Copy` deref any more --
+        // `BodyRef::EncodedOwned` cost `StructuralKernelRecordRef` its
+        // `Copy` impl) -- every record this borrowed-slice entrypoint ever
+        // sees carries `BodyRef::Value`/`Encoded` (a plain reference, never
+        // `EncodedOwned`), so this clone is exactly as cheap as the old
+        // implicit `Copy` was: no owned payload bytes are ever duplicated
+        // here. `structural_kernel_rows_owned_typed` (below) is the
+        // zero-clone sibling for a caller that owns `EncodedOwned` bodies.
         let row = structural_kernel_row(
-            record,
+            record.clone(),
             facets.unwrap_or_default(),
             structural_attestation,
             span,
@@ -1549,7 +2237,58 @@ pub fn structural_kernel_rows_typed(
     }
     let mut rows = Vec::with_capacity(records.len());
     let mut byte_length = 0usize;
-    for (&record, &facets) in records.iter().zip(typed_facets.iter()) {
+    // A3b coste 2: `.clone()`, same rationale as `structural_kernel_rows_
+    // ref`'s loop above -- every caller of this borrowed-slice entrypoint
+    // only ever supplies `BodyRef::Value`/`Encoded`, so this is exactly as
+    // cheap as the `Copy` deref it replaces.
+    for (record, &facets) in records.iter().zip(typed_facets.iter()) {
+        let span = parse_span_start_end(record.source_span);
+        let row = structural_kernel_row(record.clone(), facets.to_vec(), true, span)?;
+        byte_length = byte_length
+            .checked_add(row.body_byte_length)
+            .ok_or_else(|| NativeCoreError::new("Structural kernel byte length overflowed."))?;
+        rows.push(row);
+    }
+    if byte_length > MAX_BATCH_FRAMED_BYTES {
+        return Err(NativeCoreError::new(format!(
+            "Structural kernel batch exceeds the {MAX_BATCH_FRAMED_BYTES}-byte bound."
+        )));
+    }
+    Ok(StructuralKernelRows { rows, byte_length })
+}
+
+/// A3b coste 2: owned-input sibling of [`structural_kernel_rows_typed`] --
+/// identical bounds/behavior, but takes `records` as an OWNED `Vec` (not
+/// `&[...]`) and consumes it with `into_iter()` instead of `.iter().cloned()`.
+/// This is the entrypoint a caller whose records carry `BodyRef::
+/// EncodedOwned` bodies (an owned `EncodedBody`, not merely a borrow of one)
+/// must use to actually realize the saving that variant exists for: moving
+/// each record out of `records` moves its `EncodedOwned` payload straight
+/// into `structural_kernel_row`, with no `encoded.payload.clone()` anywhere
+/// on this path (contrast `structural_kernel_rows_typed`'s `record.clone()`,
+/// which -- for a hypothetical `EncodedOwned` record -- would clone the
+/// payload right back). Used by `urdira-indexing-worker`'s v4
+/// `canonicalize_owner`, the only place in this pipeline that both owns its
+/// `ProposedRecord`s outright and materializes them through the typed-facets
+/// path. `typed_facets` stays a borrowed slice: it is never consumed, only
+/// read, so there is nothing to move out of it.
+pub fn structural_kernel_rows_owned_typed(
+    records: Vec<StructuralKernelRecordRef<'_>>,
+    typed_facets: &[&[String]],
+) -> NativeCoreResult<StructuralKernelRows> {
+    if records.len() != typed_facets.len() {
+        return Err(NativeCoreError::new(
+            "Structural kernel typed facets length does not match record count.",
+        ));
+    }
+    if records.len() > MAX_BATCH_RECORDS {
+        return Err(NativeCoreError::new(format!(
+            "Structural kernel batch exceeds the {MAX_BATCH_RECORDS}-row bound."
+        )));
+    }
+    let mut rows = Vec::with_capacity(records.len());
+    let mut byte_length = 0usize;
+    for (record, &facets) in records.into_iter().zip(typed_facets.iter()) {
         let span = parse_span_start_end(record.source_span);
         let row = structural_kernel_row(record, facets.to_vec(), true, span)?;
         byte_length = byte_length

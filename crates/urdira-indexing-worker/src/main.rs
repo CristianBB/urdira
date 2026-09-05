@@ -26,6 +26,8 @@ use urdira_indexing_core::{
     LanguageEngine, PhysicalGroup, PublicationSink, StructuralKernelResult, prepare_engine_group,
 };
 use urdira_jsts_indexing_engine::JavascriptTypescriptEngine;
+#[cfg(test)]
+use urdira_jsts_syntax_worker::RecordBody;
 use urdira_jsts_syntax_worker::{
     AnalysisBudgets, ConfigAssetInput, ExportResolution, FactsCursor, FactsGroupEntry,
     HybridResolutionContext, OwnerSemantics, ProposedRecord, SiteKind, SourceInput,
@@ -1724,7 +1726,11 @@ fn hybrid_structural_record(
         schema_version: u32::from(record.schema_version),
         source_span: record.source_span.clone(),
         identity_key: record.identity_key.clone(),
-        body: record.body.clone(),
+        // A3b: `ProposedRecord::body` is now `RecordBody` (`Value` or
+        // `Encoded`); `StructuralKernelRecord::body` is still a plain
+        // `Value` (this v3/checker hybrid lane's own shape, untouched by
+        // this task) -- decode on demand rather than clone directly.
+        body: record.body.to_value(),
         evidence_references: record.evidence_references.clone(),
     }
 }
@@ -4079,7 +4085,10 @@ fn run_jsts_generation(
                     schema_version: u32::from(record.schema_version),
                     source_span: record.source_span,
                     identity_key: record.identity_key,
-                    body: record.body,
+                    // A3b: `record.body` (`ProposedRecord`) is `RecordBody`;
+                    // `StructuralKernelRecord::body` is still a plain
+                    // `Value` -- decode on demand rather than move directly.
+                    body: record.body.to_value(),
                     evidence_references: record.evidence_references,
                 })
                 .collect::<Vec<_>>();
@@ -8185,7 +8194,11 @@ mod tests {
             span_start_line: 0,
             span_end_line: 0,
             identity_key: identity_key.to_owned(),
-            body: json!({"source_id": "src", "target_id": "tgt", "classification": "confirmed"}),
+            body: RecordBody::Value(
+                json!({"source_id": "src", "target_id": "tgt", "classification": "confirmed"}),
+            ),
+            source_id: Some("src".into()),
+            target_id: Some("tgt".into()),
             evidence_references: "[]".into(),
         }
     }
@@ -8332,7 +8345,11 @@ mod tests {
             span_start_line: 0,
             span_end_line: 0,
             identity_key: identity_key.to_owned(),
-            body: json!({"source_id": "test_module", "target_id": "tgt", "classification": "confirmed"}),
+            body: RecordBody::Value(
+                json!({"source_id": "test_module", "target_id": "tgt", "classification": "confirmed"}),
+            ),
+            source_id: Some("test_module".into()),
+            target_id: Some("tgt".into()),
             evidence_references: "[]".into(),
         }
     }
@@ -8696,7 +8713,7 @@ mod tests {
                 let mut record = synthetic_reference_record(&format!(
                     "jsts:references:a.ts:hybrid:padded:{index}"
                 ));
-                if let Value::Object(body) = &mut record.body {
+                if let RecordBody::Value(Value::Object(body)) = &mut record.body {
                     body.insert("padding".into(), Value::String("x".repeat(padding_bytes)));
                 }
                 record

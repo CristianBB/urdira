@@ -4,6 +4,550 @@ use urdira_native_core::{
     structural_kernel_batch, structural_kernel_batch_parts, structural_kernel_rows,
 };
 
+// A3b: BodyEncoder/EncodedBody/decode_body oracle tests, below.
+mod a3b_body_encoder {
+    use serde::Serialize;
+    use serde_json::{Map, Value, json};
+    use urdira_native_core::{
+        BodyEncoder, BodyRef, StructuralKernelRecordRef, decode_body, serialize_payload,
+        structural_kernel_rows_ref,
+    };
+
+    /// A3b coste 1: `serde::Serialize`-able wrapper around a raw
+    /// `BodyEncoder`-produced payload, calling `serialize_payload` directly
+    /// -- exists only so `assert_body_oracle` (below) can hand
+    /// `serde_json::to_string` the STREAMING serializer path (no
+    /// intermediate `Value`) and compare its output against `serde_json::
+    /// to_string(&value)` byte for byte, for every one of this test's 14
+    /// producer-shape bodies.
+    struct PayloadWrapper<'a>(&'a [u8]);
+
+    impl Serialize for PayloadWrapper<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serialize_payload(self.0, serializer)
+        }
+    }
+
+    /// A small typed value tree used to build BOTH sides of the oracle: the
+    /// `serde_json::Value` a not-yet-migrated producer would build, and the
+    /// [`BodyEncoder`] calls a migrated producer makes for the exact same
+    /// logical content. Keeping ONE typed description and deriving both
+    /// sides from it (rather than writing the `Value` and the encoder calls
+    /// separately by hand) makes it structurally impossible for the two
+    /// sides to drift on anything but the one thing under test: whether the
+    /// two encodings actually agree.
+    #[derive(Clone)]
+    enum FieldValue {
+        Str(String),
+        /// Encoded via `BodyEncoder::uint` -- mirrors a body field built
+        /// from a Rust unsigned integer (`Value::from(some_u32)`, etc.).
+        Uint(u64),
+        /// Encoded via `BodyEncoder::int` -- mirrors a body field built
+        /// from a Rust signed integer (`Value::from(some_i32)`, etc.).
+        Int(i64),
+        /// Encoded via `BodyEncoder::real` -- mirrors a body field built
+        /// from an actual Rust `f64`.
+        Real(f64),
+        Bool(bool),
+        Null,
+        Array(Vec<FieldValue>),
+        Object(Vec<(&'static str, FieldValue)>),
+    }
+
+    impl FieldValue {
+        fn to_json(&self) -> Value {
+            match self {
+                FieldValue::Str(value) => Value::String(value.clone()),
+                FieldValue::Uint(value) => Value::from(*value),
+                FieldValue::Int(value) => Value::from(*value),
+                FieldValue::Real(value) => Value::from(*value),
+                FieldValue::Bool(value) => Value::Bool(*value),
+                FieldValue::Null => Value::Null,
+                FieldValue::Array(items) => {
+                    Value::Array(items.iter().map(FieldValue::to_json).collect())
+                }
+                FieldValue::Object(fields) => {
+                    let mut map = Map::new();
+                    for (key, value) in fields {
+                        map.insert((*key).to_owned(), value.to_json());
+                    }
+                    Value::Object(map)
+                }
+            }
+        }
+
+        fn encode(&self, encoder: &mut BodyEncoder) {
+            match self {
+                FieldValue::Str(value) => encoder.string(value).expect("string never fails"),
+                FieldValue::Uint(value) => encoder.uint(*value).expect("uint never fails"),
+                FieldValue::Int(value) => encoder.int(*value).expect("int never fails"),
+                FieldValue::Real(value) => encoder.real(*value).expect("finite, non-negative-zero"),
+                FieldValue::Bool(value) => encoder.bool(*value).expect("bool never fails"),
+                FieldValue::Null => encoder.null().expect("null never fails"),
+                FieldValue::Array(items) => {
+                    encoder
+                        .begin_array(items.len())
+                        .expect("array field count is fixed");
+                    for item in items {
+                        item.encode(encoder);
+                    }
+                }
+                FieldValue::Object(fields) => {
+                    encoder
+                        .begin_object(fields.len())
+                        .expect("object field count is fixed");
+                    for (key, value) in fields {
+                        encoder.key(key).expect("fields given in sorted order");
+                        value.encode(encoder);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Builds the top-level body `Value` for `fields` (already given in
+    /// strict lexicographic key order by the caller -- `serde_json::Map`
+    /// would reorder them into the same order regardless, since this
+    /// workspace never enables `preserve_order`, but keeping the test's own
+    /// input pre-sorted keeps it an honest mirror of what a real producer's
+    /// `BodyEncoder` calls must do).
+    fn build_value(fields: &[(&'static str, FieldValue)]) -> Value {
+        let mut map = Map::new();
+        for (key, value) in fields {
+            map.insert((*key).to_owned(), value.to_json());
+        }
+        Value::Object(map)
+    }
+
+    fn build_encoded(fields: &[(&'static str, FieldValue)]) -> urdira_native_core::EncodedBody {
+        let mut encoder = BodyEncoder::new();
+        encoder
+            .begin_object(fields.len())
+            .expect("object field count is fixed");
+        for (key, value) in fields {
+            encoder.key(key).expect("fields given in sorted order");
+            value.encode(&mut encoder);
+        }
+        encoder.finish()
+    }
+
+    fn record_ref<'a>(
+        category: &'a str,
+        kind: &'a str,
+        universal_kind: &'a str,
+        identity_key: &'a str,
+        body: BodyRef<'a>,
+    ) -> StructuralKernelRecordRef<'a> {
+        StructuralKernelRecordRef {
+            proposal_record_key: identity_key,
+            category,
+            kind,
+            universal_kind,
+            facets: "[]",
+            schema_version: 1,
+            source_span: "{\"end\":2,\"path\":\"a.ts\",\"start\":1}",
+            identity_key,
+            body,
+            evidence_references: "[]",
+        }
+    }
+
+    /// The core oracle: for `fields` (one representative body per
+    /// producer-shape, given in strict lexicographic key order), asserts
+    /// that canonicalizing a record whose body is the equivalent `Value`
+    /// tree and canonicalizing a record whose body is the [`BodyEncoder`]-
+    /// built [`urdira_native_core::EncodedBody`] produce byte-for-byte
+    /// identical `StructuralKernelRow`s -- `record_id`, `record_digest`,
+    /// `body_digest`, `body_byte_length`, `body` payload bytes,
+    /// `identity_key`, and `identity_id` all included (every field
+    /// `StructuralKernelRow` derives `PartialEq` over, so `assert_eq!` on
+    /// the whole row checks all of them at once). Both records share every
+    /// OTHER field (`category`/`kind`/`universal_kind`/`identity_key`), so
+    /// any difference in the resulting rows can only come from the body
+    /// encoding itself.
+    fn assert_body_oracle(
+        category: &str,
+        kind: &str,
+        universal_kind: &str,
+        identity_key: &str,
+        fields: &[(&'static str, FieldValue)],
+    ) {
+        let value = build_value(fields);
+        let encoded = build_encoded(fields);
+        let value_row = structural_kernel_rows_ref(&[record_ref(
+            category,
+            kind,
+            universal_kind,
+            identity_key,
+            BodyRef::Value(&value),
+        )])
+        .expect("value-bodied kernel call");
+        let encoded_row = structural_kernel_rows_ref(&[record_ref(
+            category,
+            kind,
+            universal_kind,
+            identity_key,
+            BodyRef::Encoded(&encoded),
+        )])
+        .expect("encoded-bodied kernel call");
+        assert_eq!(
+            value_row.rows, encoded_row.rows,
+            "Value vs Encoded row mismatch for identity_key={identity_key}"
+        );
+        assert_eq!(value_row.byte_length, encoded_row.byte_length);
+        // decode_body(encode(x)) == x, for the same case (whole-number
+        // encoder.uint/int values normalize back to serde_json's integer
+        // Number variant on decode -- see decode_body's own doc comment --
+        // which is exactly what every one of these fields was built from in
+        // the first place).
+        let decoded = decode_body(&encoded.payload).expect("decode_body succeeds");
+        assert_eq!(
+            decoded, value,
+            "decode_body(encode(x)) != x for identity_key={identity_key}"
+        );
+        // A3b coste 1: the STREAMING serializer (`serialize_payload`, no
+        // intermediate `Value`) must produce byte-for-byte the same JSON
+        // text `serde_json::to_string(&value)` does -- this is what
+        // `RecordBody`'s `Serialize` impl now calls for an `Encoded` body,
+        // in place of the old `decode_body` + `value.serialize(...)` round
+        // trip.
+        let streamed = serde_json::to_string(&PayloadWrapper(&encoded.payload))
+            .expect("serialize_payload succeeds");
+        let expected = serde_json::to_string(&value).expect("value serializes");
+        assert_eq!(
+            streamed, expected,
+            "serialize_payload(encode(x)) != serde_json::to_string(&x) for identity_key={identity_key}"
+        );
+    }
+
+    #[test]
+    fn encoded_body_matches_value_body_oracle() {
+        use FieldValue::{Bool, Int, Null, Object, Real, Str, Uint};
+
+        // 1. `core:references` (semantic_sites.rs::reference_proposed_record).
+        assert_body_oracle(
+            "relation",
+            "jsts:relation_references",
+            "core:references",
+            "jsts:references:a.ts:1:2:src:tgt",
+            &[
+                ("classification", Str("confirmed".into())),
+                ("end", Uint(2)),
+                ("path", Str("a.ts".into())),
+                ("source_id", Str("jsts:variable:a.ts:0:src".into())),
+                ("start", Uint(1)),
+                ("target_id", Str("jsts:variable:a.ts:0:tgt".into())),
+            ],
+        );
+
+        // 2. `core:call` confirmed (semantic_sites.rs::call_proposed_record).
+        assert_body_oracle(
+            "relation",
+            "jsts:relation_call",
+            "core:call",
+            "jsts:call:a.ts:1:2:src:tgt",
+            &[
+                ("classification", Str("confirmed".into())),
+                ("end", Uint(2)),
+                ("path", Str("a.ts".into())),
+                ("source_id", Str("jsts:function:a.ts:0:caller".into())),
+                ("start", Uint(1)),
+                ("target_id", Str("jsts:function:a.ts:0:callee".into())),
+            ],
+        );
+
+        // 3. `core:inherits` (semantic_sites.rs::heritage_proposed_record).
+        assert_body_oracle(
+            "relation",
+            "jsts:relation_inherits",
+            "core:inherits",
+            "jsts:inherits:a.ts:1:2:src:tgt",
+            &[
+                ("classification", Str("confirmed".into())),
+                ("end", Uint(2)),
+                ("path", Str("a.ts".into())),
+                ("source_id", Str("jsts:class:a.ts:0:Child".into())),
+                ("start", Uint(1)),
+                ("target_id", Str("jsts:class:a.ts:0:Base".into())),
+            ],
+        );
+
+        // 4. `core:covers` (semantic_sites.rs::covers_proposed_record).
+        assert_body_oracle(
+            "relation",
+            "jsts:relation_covers",
+            "core:covers",
+            "jsts:covers:a.ts:1:2:src:tgt",
+            &[
+                ("classification", Str("confirmed".into())),
+                ("end", Uint(2)),
+                ("path", Str("a.ts".into())),
+                ("source_id", Str("jsts:function:a.ts:0:testFn".into())),
+                ("start", Uint(1)),
+                (
+                    "target_id",
+                    Str("jsts:external_symbol:node:test#test".into()),
+                ),
+            ],
+        );
+
+        // 5. `core:call` possible/candidate, with the extra `reason` field
+        // (semantic_sites.rs::candidate_call_record).
+        assert_body_oracle(
+            "relation",
+            "jsts:relation_call",
+            "core:call",
+            "jsts:call:a.ts:1:2:candidate",
+            &[
+                ("classification", Str("possible".into())),
+                ("end", Uint(2)),
+                ("path", Str("a.ts".into())),
+                ("reason", Str("overload_candidate".into())),
+                ("source_id", Str("jsts:function:a.ts:0:caller".into())),
+                ("start", Uint(1)),
+                ("target_id", Str("jsts:function:a.ts:0:overload_1".into())),
+            ],
+        );
+
+        // 6. `core:contains` WITHOUT a `target_id` (lib.rs::proposal_relation_
+        // record's optional-`target_id` branch -- exercises 5 fields, not 6).
+        assert_body_oracle(
+            "relation",
+            "jsts:relation_contains",
+            "core:contains",
+            "jsts:contains:a.ts:1:2:no-target",
+            &[
+                ("classification", Str("confirmed".into())),
+                ("end", Uint(2)),
+                ("path", Str("a.ts".into())),
+                ("source_id", Str("jsts:module:a.ts:0:a".into())),
+                ("start", Uint(1)),
+            ],
+        );
+
+        // 7. Module/plain entity, no optional fields (lib.rs::
+        // proposal_entity_record's 6-field base case).
+        assert_body_oracle(
+            "entity",
+            "jsts:entity_container",
+            "core:container",
+            "jsts:module:a.ts:0:a",
+            &[
+                ("end", Uint(100)),
+                ("kind", Str("module".into())),
+                ("language", Str("typescript".into())),
+                ("name", Str("a".into())),
+                ("path", Str("a.ts".into())),
+                ("start", Uint(0)),
+            ],
+        );
+
+        // 8. Member entity, every optional field present (lib.rs::
+        // proposal_entity_record's full 9-field case) -- includes a
+        // non-ASCII qualified name.
+        assert_body_oracle(
+            "entity",
+            "jsts:entity_callable",
+            "core:callable",
+            "jsts:method:a.ts:10:métodó",
+            &[
+                ("end", Uint(20)),
+                ("is_test", Bool(true)),
+                ("kind", Str("method".into())),
+                ("language", Str("typescript".into())),
+                ("name", Str("métodó".into())),
+                ("parent_id", Str("jsts:class:a.ts:0:Wídget".into())),
+                ("path", Str("a.ts".into())),
+                ("qualified_name", Str("a.ts.Wídget.métodó".into())),
+                ("start", Uint(10)),
+            ],
+        );
+
+        // 9. Parameter entity, `parent_id` only (semantic_sites.rs::
+        // parameter_entity_record via lib.rs::proposal_entity_record).
+        assert_body_oracle(
+            "entity",
+            "jsts:entity_parameter",
+            "core:parameter",
+            "jsts:parameter:a.ts:15:value",
+            &[
+                ("end", Uint(20)),
+                ("kind", Str("parameter".into())),
+                ("language", Str("typescript".into())),
+                ("name", Str("value".into())),
+                ("parent_id", Str("jsts:function:a.ts:0:outer".into())),
+                ("path", Str("a.ts".into())),
+                ("start", Uint(15)),
+            ],
+        );
+
+        // 10. External symbol entity, fixed `language: "typescript"`
+        // (lib.rs::external_symbol_entity via proposal_entity_record) --
+        // synthetic zero-span, and a specifier with a non-ASCII byte.
+        assert_body_oracle(
+            "entity",
+            "jsts:entity_container",
+            "core:container",
+            "jsts:external_symbol:café-pkg#default",
+            &[
+                ("end", Uint(0)),
+                ("kind", Str("external_symbol".into())),
+                ("language", Str("typescript".into())),
+                ("name", Str("café-pkg#default".into())),
+                ("path", Str("external:café-pkg".into())),
+                ("start", Uint(0)),
+            ],
+        );
+
+        // 11. `core:imports` relation WITH a `target_id` (lib.rs::
+        // proposal_relation_record's 6-field branch).
+        assert_body_oracle(
+            "relation",
+            "jsts:relation_import",
+            "core:imports",
+            "jsts:import:a.ts:1:2:import",
+            &[
+                ("classification", Str("confirmed".into())),
+                ("end", Uint(2)),
+                ("path", Str("a.ts".into())),
+                ("source_id", Str("jsts:module:a.ts:0:a".into())),
+                ("start", Uint(1)),
+                ("target_id", Str("jsts:external_module:lodash".into())),
+            ],
+        );
+
+        // 12. `jsts:entity_inferred_type` (residual.rs::
+        // build_inferred_type_rows's entity body -- includes the `type`
+        // field no other shape here has).
+        assert_body_oracle(
+            "entity",
+            "jsts:entity_inferred_type",
+            "core:type",
+            "jsts:inferred-type:a.ts:0:x:abc123",
+            &[
+                ("end", Int(20)),
+                ("kind", Str("inferred_type".into())),
+                ("language", Str("typescript".into())),
+                ("name", Str("inferred type of x".into())),
+                ("path", Str("a.ts".into())),
+                ("start", Int(10)),
+                ("type", Str("string | number".into())),
+            ],
+        );
+
+        // 13. `jsts:diagnostic` (residual.rs::build_diagnostic_row).
+        assert_body_oracle(
+            "diagnostic",
+            "jsts:diagnostic",
+            "core:construct",
+            "jsts:diagnostic:a.ts:0:jsts:compiler_diagnostic:0",
+            &[
+                ("code", Str("jsts:compiler_diagnostic".into())),
+                ("compiler_code", Uint(2_322)),
+                ("end", Int(10)),
+                (
+                    "message",
+                    Str("Type 'string' is not assignable to type 'number'.".into()),
+                ),
+                ("path", Str("a.ts".into())),
+                ("start", Int(0)),
+            ],
+        );
+
+        // 14. Synthetic: nested arrays/objects (empty and non-empty),
+        // `null`, a large (but exactly-representable) integer, and a
+        // fractional `real` value -- no real producer's body nests this
+        // deeply, but `BodyEncoder` must still encode/decode it identically
+        // to the equivalent `Value` tree, and `structural_kernel_row` must
+        // still digest it identically.
+        assert_body_oracle(
+            "entity",
+            "jsts:entity_variable",
+            "core:value",
+            "jsts:synthetic:nested",
+            &[
+                ("empty_array", FieldValue::Array(vec![])),
+                ("empty_object", Object(vec![])),
+                ("large_uint", Uint(123_456_789_012_345)),
+                (
+                    "nested",
+                    Object(vec![
+                        ("a", FieldValue::Array(vec![Null, Bool(false), Uint(0)])),
+                        ("b", Str("é€🎉".into())),
+                    ]),
+                ),
+                ("ratio", Real(3.5)),
+                ("zero", Uint(0)),
+            ],
+        );
+    }
+
+    /// `BodyEncoder::uint` for a value past `i64::MAX` takes the SAME
+    /// fallback path `fused_body_pass`'s `Value::Number` arm takes for such
+    /// a number (`value.as_i64()` returns `None`, so it falls into the
+    /// "real" logical-digest branch) -- verified directly here rather than
+    /// folded into the round-trip oracle above, because encoding a number
+    /// this large through the `[7] + f64_be` payload format is ALREADY
+    /// lossy before this task (the payload has never had a wider numeric
+    /// encoding than `f64`, for either path): `decode_body(encode(x)) == x`
+    /// does not hold for it, and never could, regardless of which encoder
+    /// produced the bytes. What must still hold, and does, is that the
+    /// `Value`-bodied and `BodyEncoder`-bodied paths agree on every
+    /// resulting byte -- the same information loss, in the same place, for
+    /// both.
+    #[test]
+    fn uint_past_i64_max_matches_value_body_row_for_row() {
+        let huge = u64::MAX;
+        let value = json!({ "n": huge });
+        let mut encoder = BodyEncoder::new();
+        encoder.begin_object(1).expect("field count");
+        encoder.key("n").expect("only key");
+        encoder.uint(huge).expect("uint never fails");
+        let encoded = encoder.finish();
+
+        let value_row = structural_kernel_rows_ref(&[record_ref(
+            "entity",
+            "jsts:entity_variable",
+            "core:value",
+            "jsts:synthetic:huge-uint",
+            BodyRef::Value(&value),
+        )])
+        .expect("value-bodied kernel call");
+        let encoded_row = structural_kernel_rows_ref(&[record_ref(
+            "entity",
+            "jsts:entity_variable",
+            "core:value",
+            "jsts:synthetic:huge-uint",
+            BodyRef::Encoded(&encoded),
+        )])
+        .expect("encoded-bodied kernel call");
+        assert_eq!(value_row.rows, encoded_row.rows);
+    }
+
+    #[test]
+    fn key_order_is_enforced_strictly_increasing() {
+        let mut encoder = BodyEncoder::new();
+        encoder.begin_object(2).expect("field count");
+        encoder.key("a").expect("first key always ok");
+        encoder.string("x").expect("string never fails");
+        encoder.key("b").expect("'b' sorts after 'a'");
+        encoder.string("y").expect("string never fails");
+        encoder.finish();
+
+        let mut rejected = BodyEncoder::new();
+        rejected.begin_object(2).expect("field count");
+        rejected.key("b").expect("first key always ok");
+        rejected.string("x").expect("string never fails");
+        assert!(
+            rejected.key("a").is_err(),
+            "'a' sorts before 'b': must be rejected"
+        );
+    }
+}
+
 fn record(key: &str) -> StructuralKernelRecord {
     StructuralKernelRecord {
         proposal_record_key: key.to_owned(),

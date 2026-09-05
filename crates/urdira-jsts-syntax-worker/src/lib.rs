@@ -289,6 +289,76 @@ pub struct FactsTransferMetrics {
     pub bytes_copied: u64,
 }
 
+/// A3b: a record's `body`, either the pre-existing `serde_json::Value` tree
+/// (`Value` -- every not-yet-migrated producer, and every test helper) or an
+/// already-[`urdira_native_core::BodyEncoder`]-built payload (`Encoded` --
+/// every migrated hot-path producer, skipping the tree entirely). `PartialEq`/
+/// `Eq` are derived: `Value` compares structurally as before, `EncodedBody`
+/// derives `PartialEq`/`Eq` over its own `payload`/`body_digest`/
+/// `body_byte_length` fields.
+///
+/// `Serialize` is hand-written rather than derived so this enum's JSON shape
+/// is IDENTICAL to a plain `Value`'s -- `serde_json::to_string(&ProposedRecord)`
+/// (the shape that travels over IPC to the daemon on the v3/checker path, and
+/// in `AnalysisResponse`) must not change no matter which variant a given
+/// record carries: `Value` serializes directly, `Encoded` streams its
+/// payload straight into the serializer via
+/// [`urdira_native_core::serialize_payload`] -- NOT `decode_body` then
+/// `value.serialize(serializer)` (that decode-to-`Value`-then-reserialize
+/// round trip was `SyntaxWorkerState::analyze`'s single largest per-record
+/// cost on the v4 hot path, where every record's body is `Encoded`; see
+/// `serialize_payload`'s own doc comment). See `encoded_body_serializes_
+/// identically_to_a_plain_value_body` (this crate's tests) for the
+/// byte-for-byte proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordBody {
+    Value(serde_json::Value),
+    Encoded(urdira_native_core::EncodedBody),
+}
+
+impl RecordBody {
+    /// Borrows this body into the [`urdira_native_core::BodyRef`] the
+    /// structural kernel accepts, without cloning/converting either variant.
+    pub fn as_body_ref(&self) -> urdira_native_core::BodyRef<'_> {
+        match self {
+            RecordBody::Value(value) => urdira_native_core::BodyRef::Value(value),
+            RecordBody::Encoded(encoded) => urdira_native_core::BodyRef::Encoded(encoded),
+        }
+    }
+
+    /// Returns this body as an owned `serde_json::Value`, decoding an
+    /// `Encoded` payload on demand (`urdira_native_core::decode_body`).
+    /// Convenience for callers that only need occasional/one-off reads --
+    /// this crate's own tests, and the v3/legacy `run_jsts_generation` path
+    /// in `urdira-indexing-worker::main` -- never the v4 hot path, which
+    /// reads `source_id`/`target_id` off `ProposedRecord`'s own dedicated
+    /// fields instead of decoding a body at all. Panics if `payload` is
+    /// somehow not a valid encoding, which would mean this crate's own
+    /// `BodyEncoder` usage produced an invalid payload -- a producer bug,
+    /// not a data-dependent error.
+    pub fn to_value(&self) -> serde_json::Value {
+        match self {
+            RecordBody::Value(value) => value.clone(),
+            RecordBody::Encoded(encoded) => urdira_native_core::decode_body(&encoded.payload)
+                .expect("BodyEncoder-produced payload always decodes"),
+        }
+    }
+}
+
+impl Serialize for RecordBody {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            RecordBody::Value(value) => value.serialize(serializer),
+            RecordBody::Encoded(encoded) => {
+                urdira_native_core::serialize_payload(&encoded.payload, serializer)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProposedRecord {
     pub proposal_record_key: String,
@@ -318,7 +388,19 @@ pub struct ProposedRecord {
     pub span_start_line: u32,
     pub span_end_line: u32,
     pub identity_key: String,
-    pub body: serde_json::Value,
+    pub body: RecordBody,
+    /// A3b: a relation's `body.source_id`/`.target_id` (the referenced
+    /// entity's `identity_key`), carried alongside `body` so a reader that
+    /// only needs the endpoints (`urdira-indexing-worker::v4::materialize`'s
+    /// `relation_endpoints_from_body`) never has to decode an `Encoded`
+    /// body just to pull two strings back out of it. Every producer that
+    /// puts `source_id`/`target_id` into its body sets these to the exact
+    /// same values; an entity record (no endpoints at all) leaves both
+    /// `None`. A `Value`-bodied record's endpoints can still be read from
+    /// the body itself (unchanged reader path) -- these fields are purely
+    /// additive, never the only source of truth for a `Value` body.
+    pub source_id: Option<String>,
+    pub target_id: Option<String>,
     pub evidence_references: String,
     /// P2-2l item 2: the exact, already-deduplicated facet list `facets`
     /// (the canonical-JSON TEXT field above) was built from, carried
@@ -2415,15 +2497,6 @@ fn proposal_entity_record(
         UniversalKind::Value => "jsts:entity_variable",
         UniversalKind::Parameter => "jsts:entity_parameter",
     };
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "name".into(),
-        serde_json::Value::String(entity.name.clone()),
-    );
-    body.insert(
-        "kind".into(),
-        serde_json::Value::String(entity_kind_name(entity.kind).into()),
-    );
     // Cross-owner-dedup correctness bug found live 2026-09-05
     // (`n8n_incremental_create_delete_roots_match_oracle`'s `records` root
     // regression, root-caused via `debug_dump_external_entity_bodies`):
@@ -2467,31 +2540,60 @@ fn proposal_entity_record(
     } else {
         language
     };
-    body.insert(
-        "language".into(),
-        serde_json::Value::String(language_name(stamped_language).into()),
-    );
-    body.insert(
-        "path".into(),
-        serde_json::Value::String(entity.path.clone()),
-    );
-    body.insert("start".into(), serde_json::Value::from(entity.start));
-    body.insert("end".into(), serde_json::Value::from(entity.end));
-    if let Some(parent_id) = &entity.parent_id {
-        body.insert(
-            "parent_id".into(),
-            serde_json::Value::String(parent_id.clone()),
-        );
+    // A3b: fields written in strict lexicographic key order (`end`,
+    // `is_test`?, `kind`, `language`, `name`, `parent_id`?, `path`,
+    // `qualified_name`?, `start`) -- the same order `serde_json::Map`'s
+    // `BTreeMap` iteration already produced for the equivalent `Value`
+    // tree (no `preserve_order` feature anywhere in this workspace).
+    let mut field_count = 6;
+    if entity.parent_id.is_some() {
+        field_count += 1;
     }
-    if let Some(qualified_name) = &entity.qualified_name {
-        body.insert(
-            "qualified_name".into(),
-            serde_json::Value::String(qualified_name.clone()),
-        );
+    if entity.qualified_name.is_some() {
+        field_count += 1;
     }
+    if entity.is_test.is_some() {
+        field_count += 1;
+    }
+    let mut encoder = urdira_native_core::BodyEncoder::new();
+    encoder
+        .begin_object(field_count)
+        .expect("entity body field count is fixed");
+    encoder.key("end").expect("entity body key order");
+    encoder
+        .uint(u64::from(entity.end))
+        .expect("entity end is a finite u32");
     if let Some(is_test) = entity.is_test {
-        body.insert("is_test".into(), serde_json::Value::Bool(is_test));
+        encoder.key("is_test").expect("entity body key order");
+        encoder.bool(is_test).expect("bool never fails");
     }
+    encoder.key("kind").expect("entity body key order");
+    encoder
+        .string(entity_kind_name(entity.kind))
+        .expect("string never fails");
+    encoder.key("language").expect("entity body key order");
+    encoder
+        .string(language_name(stamped_language))
+        .expect("string never fails");
+    encoder.key("name").expect("entity body key order");
+    encoder.string(&entity.name).expect("string never fails");
+    if let Some(parent_id) = &entity.parent_id {
+        encoder.key("parent_id").expect("entity body key order");
+        encoder.string(parent_id).expect("string never fails");
+    }
+    encoder.key("path").expect("entity body key order");
+    encoder.string(&entity.path).expect("string never fails");
+    if let Some(qualified_name) = &entity.qualified_name {
+        encoder
+            .key("qualified_name")
+            .expect("entity body key order");
+        encoder.string(qualified_name).expect("string never fails");
+    }
+    encoder.key("start").expect("entity body key order");
+    encoder
+        .uint(u64::from(entity.start))
+        .expect("entity start is a finite u32");
+    let body = encoder.finish();
     let facets = if entity.parent_id.is_none() {
         serde_json::json!(["core:declaration", "core:definition"])
     } else {
@@ -2513,7 +2615,9 @@ fn proposal_entity_record(
         span_start_line,
         span_end_line,
         identity_key: entity.id.clone(),
-        body: serde_json::Value::Object(body),
+        body: RecordBody::Encoded(body),
+        source_id: None,
+        target_id: None,
         evidence_references: canonical_evidence(&entity.path, entity.start, entity.end),
         facets_list,
     }
@@ -2523,27 +2627,41 @@ fn proposal_relation_record(
     relation: &SyntaxRelation,
     line_index: Option<&LineIndex>,
 ) -> ProposedRecord {
-    let mut body = serde_json::Map::new();
-    body.insert(
-        "source_id".into(),
-        serde_json::Value::String(relation.source_id.clone()),
-    );
+    // A3b: strict lexicographic key order (`classification`, `end`, `path`,
+    // `source_id`, `start`, `target_id`?) -- same order as `serde_json::
+    // Map`'s `BTreeMap` iteration for the equivalent `Value` tree.
+    let field_count = if relation.target_id.is_some() { 6 } else { 5 };
+    let mut encoder = urdira_native_core::BodyEncoder::new();
+    encoder
+        .begin_object(field_count)
+        .expect("relation body field count is fixed");
+    encoder
+        .key("classification")
+        .expect("relation body key order");
+    encoder
+        .string(relation_classification_name(relation.classification))
+        .expect("string never fails");
+    encoder.key("end").expect("relation body key order");
+    encoder
+        .uint(u64::from(relation.end))
+        .expect("relation end is a finite u32");
+    encoder.key("path").expect("relation body key order");
+    encoder.string(&relation.path).expect("string never fails");
+    encoder.key("source_id").expect("relation body key order");
+    encoder
+        .string(&relation.source_id)
+        .expect("string never fails");
+    encoder.key("start").expect("relation body key order");
+    encoder
+        .uint(u64::from(relation.start))
+        .expect("relation start is a finite u32");
     if let Some(target_id) = &relation.target_id {
-        body.insert(
-            "target_id".into(),
-            serde_json::Value::String(target_id.clone()),
-        );
+        encoder.key("target_id").expect("relation body key order");
+        encoder.string(target_id).expect("string never fails");
     }
-    body.insert(
-        "classification".into(),
-        serde_json::Value::String(relation_classification_name(relation.classification).into()),
-    );
-    body.insert(
-        "path".into(),
-        serde_json::Value::String(relation.path.clone()),
-    );
-    body.insert("start".into(), serde_json::Value::from(relation.start));
-    body.insert("end".into(), serde_json::Value::from(relation.end));
+    let body = encoder.finish();
+    let source_id = Some(relation.source_id.clone());
+    let target_id = relation.target_id.clone();
     let facets = if relation.kind == RelationKind::Contains {
         serde_json::json!(["core:structural_relation"])
     } else if relation.classification == RelationClassification::Possible {
@@ -2567,7 +2685,9 @@ fn proposal_relation_record(
         span_start_line,
         span_end_line,
         identity_key: relation.id.clone(),
-        body: serde_json::Value::Object(body),
+        body: RecordBody::Encoded(body),
+        source_id,
+        target_id,
         evidence_references: canonical_evidence(&relation.path, relation.start, relation.end),
         facets_list,
     }
@@ -4540,6 +4660,114 @@ fn resource_error<T>(message: &str) -> Result<T, AnalysisError> {
 mod tests {
     use super::*;
 
+    /// A3b mechanism item 5: `RecordBody::Encoded` must serialize to the
+    /// EXACT same JSON `serde_json::to_string(&ProposedRecord)` would have
+    /// produced for the equivalent `RecordBody::Value` -- this is the IPC/
+    /// `AnalysisResponse` wire contract, and must not change no matter which
+    /// variant a given record happens to carry. Checked for one relation
+    /// body (`source_id`/`target_id`/`classification`/`path`/`start`/`end`)
+    /// and one entity body (`name`/`kind`/`language`/`path`/`start`/`end`,
+    /// with `parent_id` present) -- covers both a `BodyEncoder::string`+
+    /// `uint` mix and the optional-field case.
+    #[test]
+    fn encoded_body_serializes_identically_to_a_plain_value_body() {
+        fn record_with_body(body: RecordBody) -> ProposedRecord {
+            ProposedRecord {
+                proposal_record_key: "jsts:record:sha256:test".to_owned(),
+                category: "relation",
+                kind: "jsts:relation_call".to_owned(),
+                universal_kind: "core:call".to_owned(),
+                facets: "[\"core:reference_relation\"]".to_owned(),
+                schema_version: 1,
+                source_span: "{\"end\":2,\"path\":\"a.ts\",\"start\":1}".to_owned(),
+                span_start_line: 1,
+                span_end_line: 1,
+                identity_key: "jsts:call:a.ts:1:2:src:tgt".to_owned(),
+                body,
+                source_id: Some("src".to_owned()),
+                target_id: Some("tgt".to_owned()),
+                evidence_references: "[]".to_owned(),
+                facets_list: vec!["core:reference_relation".to_owned()],
+            }
+        }
+
+        let value_body = serde_json::json!({
+            "classification": "confirmed",
+            "end": 2u32,
+            "path": "a.ts",
+            "source_id": "src",
+            "start": 1u32,
+            "target_id": "tgt",
+        });
+        let mut encoder = urdira_native_core::BodyEncoder::new();
+        encoder.begin_object(6).unwrap();
+        encoder.key("classification").unwrap();
+        encoder.string("confirmed").unwrap();
+        encoder.key("end").unwrap();
+        encoder.uint(2).unwrap();
+        encoder.key("path").unwrap();
+        encoder.string("a.ts").unwrap();
+        encoder.key("source_id").unwrap();
+        encoder.string("src").unwrap();
+        encoder.key("start").unwrap();
+        encoder.uint(1).unwrap();
+        encoder.key("target_id").unwrap();
+        encoder.string("tgt").unwrap();
+        let encoded_body = encoder.finish();
+
+        let value_record = record_with_body(RecordBody::Value(value_body));
+        let encoded_record = record_with_body(RecordBody::Encoded(encoded_body));
+
+        assert_eq!(
+            serde_json::to_string(&value_record).unwrap(),
+            serde_json::to_string(&encoded_record).unwrap(),
+            "Encoded relation body must serialize identically to the equivalent Value body"
+        );
+
+        // Entity body variant, including an optional field (`parent_id`).
+        let value_entity_body = serde_json::json!({
+            "end": 20u32,
+            "kind": "method",
+            "language": "typescript",
+            "name": "run",
+            "parent_id": "jsts:class:a.ts:0:Widget",
+            "path": "a.ts",
+            "start": 10u32,
+        });
+        let mut entity_encoder = urdira_native_core::BodyEncoder::new();
+        entity_encoder.begin_object(7).unwrap();
+        entity_encoder.key("end").unwrap();
+        entity_encoder.uint(20).unwrap();
+        entity_encoder.key("kind").unwrap();
+        entity_encoder.string("method").unwrap();
+        entity_encoder.key("language").unwrap();
+        entity_encoder.string("typescript").unwrap();
+        entity_encoder.key("name").unwrap();
+        entity_encoder.string("run").unwrap();
+        entity_encoder.key("parent_id").unwrap();
+        entity_encoder.string("jsts:class:a.ts:0:Widget").unwrap();
+        entity_encoder.key("path").unwrap();
+        entity_encoder.string("a.ts").unwrap();
+        entity_encoder.key("start").unwrap();
+        entity_encoder.uint(10).unwrap();
+        let encoded_entity_body = entity_encoder.finish();
+
+        let mut value_entity = record_with_body(RecordBody::Value(value_entity_body));
+        value_entity.category = "entity";
+        value_entity.source_id = None;
+        value_entity.target_id = None;
+        let mut encoded_entity = record_with_body(RecordBody::Encoded(encoded_entity_body));
+        encoded_entity.category = "entity";
+        encoded_entity.source_id = None;
+        encoded_entity.target_id = None;
+
+        assert_eq!(
+            serde_json::to_string(&value_entity).unwrap(),
+            serde_json::to_string(&encoded_entity).unwrap(),
+            "Encoded entity body must serialize identically to the equivalent Value body"
+        );
+    }
+
     #[test]
     fn dependency_proposal_identity_is_bounded_and_domain_separated() {
         let relation_id = "jsts:import:packages/@n8n/agents/src/__tests__/integration/custom-message-suspend-resume.test.ts:63:98:jsts:module:packages/@n8n/agents/src/__tests__/integration/custom-message-suspend-resume.test.ts:0:packages/@n8n/agents/src/__tests__/integration/custom-message-suspend-resume.test.ts:jsts:module:packages/@n8n/agents/src/__tests__/integration/helpers.ts:0:packages/@n8n/agents/src/__tests__/integration/helpers.ts";
@@ -4744,16 +4972,18 @@ mod tests {
                 .iter()
                 .filter(|record| record.category == "entity")
                 .map(|record| {
+                    let body = record.body.to_value();
                     (
-                        record.body["kind"].as_str().unwrap(),
-                        record.body["name"].as_str().unwrap(),
+                        body["kind"].as_str().unwrap().to_owned(),
+                        body["name"].as_str().unwrap().to_owned(),
                     )
                 })
                 .collect::<Vec<_>>(),
-            vec![("module", "a.js")]
+            vec![("module".to_owned(), "a.js".to_owned())]
         );
         assert!(records.iter().any(|record| {
-            record.kind == "jsts:relation_export" && record.body["classification"] == "confirmed"
+            record.kind == "jsts:relation_export"
+                && record.body.to_value()["classification"] == "confirmed"
         }));
         let WorkerMessage::FactsResult {
             direct_imports,
@@ -4774,8 +5004,8 @@ mod tests {
         assert_eq!(direct_imports[0].target_path.as_deref(), Some("d.ts"));
         assert!(records.iter().any(|record| {
             record.category == "entity"
-                && record.body["kind"] == "variable"
-                && record.body["name"] == "V"
+                && record.body.to_value()["kind"] == "variable"
+                && record.body.to_value()["name"] == "V"
         }));
     }
 
@@ -4809,10 +5039,14 @@ mod tests {
             .find(|record| record.kind == "jsts:relation_import")
             .expect("expected an import relation record");
         assert_eq!(
-            import_relation.body["target_id"], "jsts:external_module:lodash",
+            import_relation.body.to_value()["target_id"],
+            "jsts:external_module:lodash",
             "the relation now carries the external module as its target"
         );
-        assert_eq!(import_relation.body["classification"], "confirmed");
+        assert_eq!(
+            import_relation.body.to_value()["classification"],
+            "confirmed"
+        );
         let module_entity = records
             .iter()
             .find(|record| record.identity_key == "jsts:external_module:lodash")
@@ -4820,8 +5054,8 @@ mod tests {
         assert_eq!(module_entity.category, "entity");
         assert_eq!(module_entity.kind, "jsts:entity_container");
         assert_eq!(module_entity.universal_kind, "core:container");
-        assert_eq!(module_entity.body["kind"], "external_module");
-        assert_eq!(module_entity.body["name"], "lodash");
+        assert_eq!(module_entity.body.to_value()["kind"], "external_module");
+        assert_eq!(module_entity.body.to_value()["name"], "lodash");
     }
 
     #[test]
@@ -4844,10 +5078,13 @@ mod tests {
             .find(|record| record.kind == "jsts:relation_export")
             .expect("expected an export relation record");
         assert_eq!(
-            export_relation.body["target_id"],
+            export_relation.body.to_value()["target_id"],
             "jsts:external_module:lodash"
         );
-        assert_eq!(export_relation.body["classification"], "confirmed");
+        assert_eq!(
+            export_relation.body.to_value()["classification"],
+            "confirmed"
+        );
     }
 
     #[test]
@@ -4869,8 +5106,11 @@ mod tests {
             .iter()
             .find(|record| record.kind == "jsts:relation_import")
             .expect("expected an import relation record");
-        assert_eq!(import_relation.body.get("target_id"), None);
-        assert_eq!(import_relation.body["classification"], "possible");
+        assert_eq!(import_relation.body.to_value().get("target_id"), None);
+        assert_eq!(
+            import_relation.body.to_value()["classification"],
+            "possible"
+        );
         assert!(
             !records
                 .iter()
@@ -4919,7 +5159,9 @@ mod tests {
         };
         let entity = records
             .iter()
-            .find(|record| record.kind == "jsts:entity_callable" && record.body["name"] == "greet")
+            .find(|record| {
+                record.kind == "jsts:entity_callable" && record.body.to_value()["name"] == "greet"
+            })
             .expect("expected the `greet` function entity");
         assert_eq!(
             entity.span_start_line, 3,
@@ -4960,9 +5202,12 @@ mod tests {
             .iter()
             .find(|record| record.identity_key == namespace_id)
             .unwrap_or_else(|| panic!("expected a namespace entity {namespace_id}: {records:?}"));
-        assert_eq!(namespace_entity.body["kind"], "namespace");
+        assert_eq!(namespace_entity.body.to_value()["kind"], "namespace");
         assert_eq!(namespace_entity.universal_kind, "core:type");
-        assert_eq!(namespace_entity.body["name"], "eslint-plugin-lodash");
+        assert_eq!(
+            namespace_entity.body.to_value()["name"],
+            "eslint-plugin-lodash"
+        );
         // The member's own entity id is UNAFFECTED by ambient nesting -- the
         // ordinary `visit_function`/`push_entity` producer already covers
         // it, byte-identical to what `AmbientModuleDeclaration::members`
@@ -5007,8 +5252,11 @@ mod tests {
             .iter()
             .find(|record| record.kind == "jsts:relation_import")
             .expect("expected an import relation record");
-        assert_eq!(import_relation.body["target_id"], namespace_id);
-        assert_eq!(import_relation.body["classification"], "confirmed");
+        assert_eq!(import_relation.body.to_value()["target_id"], namespace_id);
+        assert_eq!(
+            import_relation.body.to_value()["classification"],
+            "confirmed"
+        );
         assert!(
             !records
                 .iter()
@@ -5044,7 +5292,8 @@ mod tests {
             .find(|record| record.kind == "jsts:relation_import")
             .expect("expected an import relation record");
         assert_eq!(
-            import_relation.body["target_id"], "jsts:external_module:eslint-plugin-lodash",
+            import_relation.body.to_value()["target_id"],
+            "jsts:external_module:eslint-plugin-lodash",
             "before the ambient declaration exists, this stays external"
         );
 
@@ -5082,7 +5331,8 @@ mod tests {
             .find(|record| record.kind == "jsts:relation_import")
             .expect("expected an import relation record");
         assert_eq!(
-            import_relation.body["target_id"], namespace_id,
+            import_relation.body.to_value()["target_id"],
+            namespace_id,
             "the importer's relation must flip to the ambient namespace entity on the next scan"
         );
         assert!(
@@ -5128,12 +5378,12 @@ mod tests {
             .find(|record| record.kind == "jsts:relation_import")
             .expect("expected an import relation record");
         assert!(
-            import_relation.body["target_id"]
+            import_relation.body.to_value()["target_id"]
                 .as_str()
                 .unwrap()
                 .starts_with("jsts:namespace:env.d.ts:"),
             "the wildcard-matched import relation must target the namespace entity, got {:?}",
-            import_relation.body["target_id"]
+            import_relation.body.to_value()["target_id"]
         );
         assert!(
             !records
@@ -5198,11 +5448,15 @@ mod tests {
             .find(|record| record.kind == "jsts:relation_import")
             .expect("expected an import relation record");
         assert_eq!(
-            import_relation.body["target_id"], "jsts:external_module:vue",
+            import_relation.body.to_value()["target_id"],
+            "jsts:external_module:vue",
             "a module augmentation must never make `vue` resolve ambiently -- it must stay external, got {:?}",
-            import_relation.body["target_id"]
+            import_relation.body.to_value()["target_id"]
         );
-        assert_eq!(import_relation.body["classification"], "confirmed");
+        assert_eq!(
+            import_relation.body.to_value()["classification"],
+            "confirmed"
+        );
         // The augmentation block's own namespace entity still exists (v3
         // parity -- entity emission is unaffected, only RESOLUTION is
         // gated on `is_augmentation`), published under `augment.ts`'s own
@@ -5217,7 +5471,8 @@ mod tests {
         assert!(
             augment_records
                 .iter()
-                .any(|record| record.body["kind"] == "namespace" && record.body["name"] == "vue"),
+                .any(|record| record.body.to_value()["kind"] == "namespace"
+                    && record.body.to_value()["name"] == "vue"),
             "the augmentation block's own namespace entity must still be published: {augment_records:?}"
         );
     }
@@ -5297,26 +5552,32 @@ mod tests {
         assert!(
             !entity_records
                 .iter()
-                .any(|record| record.body["name"] == "hidden")
+                .any(|record| record.body.to_value()["name"] == "hidden")
         );
 
         let class_id = entity_records
             .iter()
-            .find(|record| record.body["kind"] == "class" && record.body["name"] == "Base")
+            .find(|record| {
+                record.body.to_value()["kind"] == "class"
+                    && record.body.to_value()["name"] == "Base"
+            })
             .expect("Base class entity present")
             .identity_key
             .clone();
         assert_eq!(class_id, "jsts:class:a.ts:6:Base");
         let interface_id = entity_records
             .iter()
-            .find(|record| record.body["kind"] == "interface" && record.body["name"] == "Shape")
+            .find(|record| {
+                record.body.to_value()["kind"] == "interface"
+                    && record.body.to_value()["name"] == "Shape"
+            })
             .expect("Shape interface entity present")
             .identity_key
             .clone();
 
         let module_id = entity_records
             .iter()
-            .find(|record| record.body["kind"] == "module")
+            .find(|record| record.body.to_value()["kind"] == "module")
             .expect("module entity present")
             .identity_key
             .clone();
@@ -5325,22 +5586,22 @@ mod tests {
         // unchanged by member-entity emission.
         assert!(relation_records.iter().any(|record| {
             record.kind == "jsts:relation_contains"
-                && record.body["source_id"] == module_id
-                && record.body["target_id"] == class_id
+                && record.body.to_value()["source_id"] == module_id
+                && record.body.to_value()["target_id"] == class_id
         }));
         assert!(relation_records.iter().any(|record| {
             record.kind == "jsts:relation_contains"
-                && record.body["source_id"] == module_id
-                && record.body["target_id"] == interface_id
+                && record.body.to_value()["source_id"] == module_id
+                && record.body.to_value()["target_id"] == interface_id
         }));
 
         let member = |container_id: &str, name: &str, kind: &str| {
             entity_records
                 .iter()
                 .find(|record| {
-                    record.body["parent_id"] == container_id
-                        && record.body["name"] == name
-                        && record.body["kind"] == kind
+                    record.body.to_value()["parent_id"] == container_id
+                        && record.body.to_value()["name"] == name
+                        && record.body.to_value()["kind"] == kind
                 })
                 .unwrap_or_else(|| panic!("missing member entity {container_id}/{name}:{kind}"))
         };
@@ -5361,17 +5622,20 @@ mod tests {
                 urdira_jsts_typeflow::declaration_id(
                     kind,
                     "a.ts",
-                    record.body["start"].as_u64().unwrap() as u32,
+                    record.body.to_value()["start"].as_u64().unwrap() as u32,
                     name
                 ),
                 "identity for {name}:{kind} matches typeflow's declaration_id"
             );
-            assert_eq!(record.body["qualified_name"], format!("a.ts.Base.{name}"));
+            assert_eq!(
+                record.body.to_value()["qualified_name"],
+                format!("a.ts.Base.{name}")
+            );
             // One `contains` relation, container -> this exact member.
             assert!(relation_records.iter().any(|relation| {
                 relation.kind == "jsts:relation_contains"
-                    && relation.body["source_id"] == class_id
-                    && relation.body["target_id"] == record.identity_key
+                    && relation.body.to_value()["source_id"] == class_id
+                    && relation.body.to_value()["target_id"] == record.identity_key
             }));
         }
 
@@ -5386,14 +5650,14 @@ mod tests {
                 urdira_jsts_typeflow::declaration_id(
                     kind,
                     "a.ts",
-                    record.body["start"].as_u64().unwrap() as u32,
+                    record.body.to_value()["start"].as_u64().unwrap() as u32,
                     name
                 ),
             );
             assert!(relation_records.iter().any(|relation| {
                 relation.kind == "jsts:relation_contains"
-                    && relation.body["source_id"] == interface_id
-                    && relation.body["target_id"] == record.identity_key
+                    && relation.body.to_value()["source_id"] == interface_id
+                    && relation.body.to_value()["target_id"] == record.identity_key
             }));
         }
     }

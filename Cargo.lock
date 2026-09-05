@@ -1400,6 +1400,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "urdira-jsts-typeflow",
+ "urdira-native-core",
  "urdira-worker-protocol",
 ]
 
