@@ -914,6 +914,16 @@ fn build_typeflow_program_index(
         for variable in &summary.variables {
             collect_type_ref_import(&summary.path, &variable.type_ref, &mut needed_imports);
         }
+        // D.2b (2026-09-05, references-parity task): `type X = ImportedFoo`
+        // -- `type_aliases` was added to `DeclSummary` by D.2 (typeflow's
+        // own `build_alias_targets`/`resolve_type_ref_chasing_aliases`)
+        // but this needed-imports scan never visited it, so an alias whose
+        // RHS names an import had no `import_targets` entry to resolve
+        // against -- see the byte-identical fix's own doc comment in
+        // `v4/typeflow.rs::collect_needed_imports_for_summary`.
+        for alias in &summary.type_aliases {
+            collect_type_ref_import(&summary.path, &alias.target, &mut needed_imports);
+        }
     }
     for (owning_path, specifier, imported_name) in needed_imports {
         let key = (
