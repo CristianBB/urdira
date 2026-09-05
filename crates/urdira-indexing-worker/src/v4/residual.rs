@@ -407,7 +407,22 @@ fn run_once_with_quiet_period(
             .cloned()
     };
 
-    let collected = collect(&store, &dicts, &owner_path, base_generation);
+    // F4 4.3: `URDIRA_V4_ENTITY_INDEX=scan` opts back into the pre-4.3 full
+    // `iter_visible` scan, purely to compare against the default `entities.
+    // index` section path (see `EntityLookup`'s own doc comment) -- read
+    // ONCE here, not inside `collect` itself, so a test can exercise both
+    // strategies directly without needing `std::env::set_var` (forbidden:
+    // this crate is `#![forbid(unsafe_code)]`).
+    let force_entity_scan = std::env::var_os("URDIRA_V4_ENTITY_INDEX")
+        .is_some_and(|v| v == std::ffi::OsStr::new("scan"));
+    let collected = collect(
+        &store,
+        &dicts,
+        &owner_path,
+        &frontier,
+        base_generation,
+        force_entity_scan,
+    );
     // F4 4.1: no more global early-return on "zero pending sites" -- decision
     // 28's inferred-types/diagnostics half of this pass (below) has always
     // been able to produce work (a newly-exported declaration needing a
@@ -759,7 +774,6 @@ fn run_once_with_quiet_period(
                         collected
                             .entities
                             .lookup(target_store_path, *name_start_utf16)
-                            .and_then(decode_hex32)
                     });
                 // `(record_id, identity_key text)` for the target, from
                 // whichever of the two sources actually has it -- an
@@ -959,10 +973,8 @@ fn run_once_with_quiet_period(
 
             for typed in types_by_owner.get(virtual_owner).into_iter().flatten() {
                 let site = &typed.site;
-                let existing_record_id = collected
-                    .entities
-                    .lookup(&real_path, site.name_start_utf16)
-                    .and_then(decode_hex32);
+                let existing_record_id =
+                    collected.entities.lookup(&real_path, site.name_start_utf16);
                 let entity_info: Option<([u8; 32], String)> = match existing_record_id {
                     Some(id) => store.get_visible(&id, publish_generation).map(|view| {
                         (
@@ -1374,10 +1386,76 @@ struct PendingMeta {
     relation_kind: &'static str,
 }
 
-struct Collected {
+struct Collected<'a> {
     pending_by_owner: BTreeMap<String, Vec<PendingSite>>,
     by_site: HashMap<String, PendingMeta>,
-    entities: EntityIndex,
+    entities: EntityLookup<'a>,
+}
+
+/// F4 4.3: replaces the pre-4.3 full-`iter_visible` scan (`EntityIndex::
+/// build(entity_entries)`, O(corpus)) with a lazy adapter over the store's
+/// own persisted `entities.index` section (`StoreReader::entity_by_owner_
+/// and_start`, O(sites)) by default. `URDIRA_V4_ENTITY_INDEX=scan` keeps
+/// the old full-scan `EntityIndex` path available for comparison/debugging
+/// (see `entities_index_section_and_scan_agree_on_the_shared_fixture`).
+enum EntityLookup<'a> {
+    /// `URDIRA_V4_ENTITY_INDEX=scan`: `urdira_tsgo_client::entity_index::
+    /// EntityIndex`, eagerly built from a full `iter_visible` scan of every
+    /// `CATEGORY_ENTITY` record (excluding `jsts:entity_inferred_type` --
+    /// see this module's own doc comment on that exclusion, still true
+    /// here), exactly what this module did before F4 4.3.
+    Scan(EntityIndex),
+    /// Default: resolves `path` to an `owner_artifact` ordinal (the same
+    /// `Frontier`-derived reverse map `owner_path`'s own callers already
+    /// build, kept local to this enum instead) then a single
+    /// `entity_by_owner_and_start` binary search per site --
+    /// `real_path_by_lower` is this variant's OWN copy of the exact
+    /// fallback `EntityIndex::lookup` always had (tsgo's `useCaseSensitive
+    /// FileNames: false` behavior lowercases a resolved declaration's
+    /// path -- see `run_once_with_quiet_period`'s `real_path_by_lower` for
+    /// the fuller writeup), built once here from the same `Frontier`
+    /// rather than reusing that outer map, so `collect()` stays a
+    /// self-contained function callable with nothing but a store+dicts+
+    /// frontier snapshot (as every existing test call site already has).
+    Section {
+        store: &'a StoreReader,
+        owner_ordinal_by_path: HashMap<String, u32>,
+        real_path_by_lower: HashMap<String, String>,
+        generation: u64,
+    },
+}
+
+impl EntityLookup<'_> {
+    /// Same contract `EntityIndex::lookup` always had (exact match, then a
+    /// lowercased-path fallback), except it returns the raw `record_id`
+    /// bytes directly instead of a hex string a caller must then `decode_
+    /// hex32` itself -- `EntityLookup` never had a reason to round-trip
+    /// through hex at all in the `Section` case (`entity_by_owner_and_
+    /// start` already returns a `RecordView`); `Scan` decodes once here so
+    /// both variants share one return type.
+    fn lookup(&self, path: &str, name_start_utf16: i32) -> Option<[u8; 32]> {
+        match self {
+            EntityLookup::Scan(index) => {
+                index.lookup(path, name_start_utf16).and_then(decode_hex32)
+            }
+            EntityLookup::Section {
+                store,
+                owner_ordinal_by_path,
+                real_path_by_lower,
+                generation,
+            } => {
+                let start = u32::try_from(name_start_utf16).ok()?;
+                let owner = owner_ordinal_by_path.get(path).copied().or_else(|| {
+                    real_path_by_lower
+                        .get(&path.to_ascii_lowercase())
+                        .and_then(|real| owner_ordinal_by_path.get(real).copied())
+                })?;
+                store
+                    .entity_by_owner_and_start(owner, start, *generation)
+                    .map(|view| view.record_id())
+            }
+        }
+    }
 }
 
 /// A2 (pending.sites migration): pending sites now come straight from the
@@ -1386,10 +1464,10 @@ struct Collected {
 /// subject().is_none()` relations -- there is no such relation any more to
 /// filter for (see this module's own doc comment, "Store access without a
 /// body decoder", for why every field this function needs is still a plain
-/// metadata column, never a body decode). The entity index is UNCHANGED: it
-/// still needs a full `iter_visible` scan of every entity-category record
-/// (`entities.index` is still not a real table -- P2-2i deliverable 2's own
-/// remaining scope, unaffected by this task).
+/// metadata column, never a body decode). F4 4.3: the entity index no
+/// longer needs a full `iter_visible` scan either (see `EntityLookup`'s own
+/// doc comment) -- `collect()`'s own cost is now O(pending sites + owners
+/// in the frontier), not O(corpus).
 ///
 /// **Known regression versus the pre-migration `collect()`** (reported, not
 /// silently fixed): the old implementation recovered a call site's
@@ -1404,55 +1482,94 @@ struct Collected {
 /// SKIPPED here (never sent to the checker at all), same as it always was
 /// for a heritage site missing the (never-implemented) text fallback, but
 /// now ALSO true for a member-owner call site P1-D-f specifically fixed.
-fn collect(
-    store: &StoreReader,
+/// `force_scan` is a plain parameter (not an env-var read inside this
+/// function) specifically so a test can call both entity-index strategies
+/// directly, side by side, in-process -- this crate is `#![forbid(unsafe_
+/// code)]`, so a test cannot itself call `std::env::set_var` to toggle
+/// `URDIRA_V4_ENTITY_INDEX` between two calls. Production has exactly one
+/// call site (`run_once_with_quiet_period`), which reads the env var once
+/// and passes the result in here.
+fn collect<'a>(
+    store: &'a StoreReader,
     dicts: &Dictionaries,
     owner_path: &dyn Fn(u32) -> Option<String>,
+    frontier: &Frontier,
     generation: u64,
-) -> Collected {
+    force_scan: bool,
+) -> Collected<'a> {
     let mut pending_by_owner: BTreeMap<String, Vec<PendingSite>> = BTreeMap::new();
     let mut by_site: HashMap<String, PendingMeta> = HashMap::new();
-    let mut entity_entries: Vec<(String, i32, String)> = Vec::new();
 
-    for view in store.iter_visible(generation) {
-        if view.category() == CATEGORY_ENTITY {
-            // Decision 28's "inferred types" task: a `jsts:entity_inferred_
-            // type` record deliberately carries the SAME `path`/`start`/
-            // `end` as the declaration it types (matching v3's own
-            // `semanticTypeRecords` recipe, verified byte-for-byte against
-            // the oracle -- see `build_inferred_type_rows`'s doc comment).
-            // For a class/interface member with no leading modifier
-            // keyword, that span's OWN start coincides EXACTLY with the
-            // member declaration's own name-identifier start (the key
-            // `EntityIndex` uses) -- e.g. `count = 0;`/`describe() {}`. If
-            // such an inferred-type entity were included here, it would
-            // collide with the very declaration it types in `EntityIndex`'s
-            // `(path, start)` key space, and (depending on iteration order)
-            // could WIN that slot -- corrupting every future lookup of the
-            // real declaration into pointing at its own inferred-type
-            // entity instead (confirmed live: `inferred_types_and_
-            // diagnostics_across_two_runs_and_an_edit`'s run 2 produced a
-            // `type_of` relation whose `source_id` was itself a `jsts:
-            // inferred-type:...` identity, not the declaration's, before
-            // this exclusion). An inferred-type entity is never a valid
-            // call/heritage TARGET or `type_of` SOURCE lookup result, so
-            // excluding it here is always correct, not merely a workaround.
-            let Some(kind) = dicts.kinds.get(view.kind_id() as usize) else {
-                continue;
-            };
-            if kind == "jsts:entity_inferred_type" {
-                continue;
+    let entities = if force_scan {
+        let mut entity_entries: Vec<(String, i32, String)> = Vec::new();
+        for view in store.iter_visible(generation) {
+            if view.category() == CATEGORY_ENTITY {
+                // Decision 28's "inferred types" task: a `jsts:entity_
+                // inferred_type` record deliberately carries the SAME
+                // `path`/`start`/`end` as the declaration it types
+                // (matching v3's own `semanticTypeRecords` recipe, verified
+                // byte-for-byte against the oracle -- see `build_inferred_
+                // type_rows`'s doc comment). For a class/interface member
+                // with no leading modifier keyword, that span's OWN start
+                // coincides EXACTLY with the member declaration's own
+                // name-identifier start (the key this index uses) -- e.g.
+                // `count = 0;`/`describe() {}`. If such an inferred-type
+                // entity were included here, it would collide with the
+                // very declaration it types in this index's `(path,
+                // start)` key space, and (depending on iteration order)
+                // could WIN that slot -- corrupting every future lookup of
+                // the real declaration into pointing at its own
+                // inferred-type entity instead (confirmed live:
+                // `inferred_types_and_diagnostics_across_two_runs_and_an_
+                // edit`'s run 2 produced a `type_of` relation whose
+                // `source_id` was itself a `jsts:inferred-type:...`
+                // identity, not the declaration's, before this exclusion).
+                // An inferred-type entity is never a valid call/heritage
+                // TARGET or `type_of` SOURCE lookup result, so excluding it
+                // here is always correct, not merely a workaround. The
+                // `Section` variant below enforces the SAME rule at write
+                // time instead (`segment_io::is_entities_index_row`).
+                let Some(kind) = dicts.kinds.get(view.kind_id() as usize) else {
+                    continue;
+                };
+                if kind == "jsts:entity_inferred_type" {
+                    continue;
+                }
+                let Some(path) = owner_path(view.owner_artifact()) else {
+                    continue;
+                };
+                entity_entries.push((
+                    path,
+                    view.span_start_byte() as i32,
+                    materialize::hex_encode(&view.record_id()),
+                ));
             }
-            let Some(path) = owner_path(view.owner_artifact()) else {
-                continue;
-            };
-            entity_entries.push((
-                path,
-                view.span_start_byte() as i32,
-                materialize::hex_encode(&view.record_id()),
-            ));
         }
-    }
+        EntityLookup::Scan(EntityIndex::build(entity_entries))
+    } else {
+        let pair_to_ordinal: HashMap<(String, String), u32> = dicts
+            .artifacts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, pair)| (pair.clone(), ordinal as u32))
+            .collect();
+        let mut owner_ordinal_by_path: HashMap<String, u32> = HashMap::new();
+        let mut real_path_by_lower: HashMap<String, String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            real_path_by_lower.insert(path.to_ascii_lowercase(), path.clone());
+            if let Some(&ordinal) =
+                pair_to_ordinal.get(&(entry.artifact_id.clone(), entry.artifact_version_id.clone()))
+            {
+                owner_ordinal_by_path.insert(path.clone(), ordinal);
+            }
+        }
+        EntityLookup::Section {
+            store,
+            owner_ordinal_by_path,
+            real_path_by_lower,
+            generation,
+        }
+    };
 
     for view in store.iter_visible_pending_sites(generation) {
         let (site_kind, relation_kind): (SiteKind, &'static str) = match view.site_kind() {
@@ -1513,7 +1630,7 @@ fn collect(
     Collected {
         pending_by_owner,
         by_site,
-        entities: EntityIndex::build(entity_entries),
+        entities,
     }
 }
 
@@ -3308,6 +3425,161 @@ mod tests {
         assert!(checked > 0, "expected at least one visible record");
     }
 
+    /// F4 4.3: `collect()`'s two entity-index strategies must agree on
+    /// every lookup a residual pass could ever make, driven from the SAME
+    /// cold-scanned store -- `force_scan=false` (default, the persisted
+    /// `entities.index` section) against `force_scan=true` (the pre-4.3
+    /// full `iter_visible` scan, kept only for this comparison). Also
+    /// confirms the OTHER half of `Collected` (`pending_by_owner`) is
+    /// completely unaffected by which entity strategy ran alongside it.
+    #[test]
+    fn entities_index_section_and_scan_agree_on_the_shared_fixture() {
+        let scratch = scratch_dir("entities-index-parity");
+        let workspace_root = fixture_root();
+        assert!(
+            workspace_root.is_dir(),
+            "shared fixture missing at {workspace_root:?}"
+        );
+        let database_path = scratch.join("workspace.sqlite");
+        let structural_root = scratch.join("structural");
+        let cas_root = scratch.join("cas");
+        let workspace_id = "workspace:entities-index-parity".to_string();
+        let request = scan::ScanRequest {
+            request_id: "request:entities-index-parity".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: urdira_worker_protocol::ScanScope::Full,
+            registry_snapshot_id: "registry:entities-index-parity".to_string(),
+            configuration_revision_id: "configuration:entities-index-parity".to_string(),
+            resolution_lock_id: "resolution:entities-index-parity".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = WorkerState::default();
+        let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+        let cold_event = scan::run_with_residual(
+            request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("cold scan succeeds");
+        let generation = match cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+
+        let store = StoreReader::open(&structural_root).expect("store opens");
+        let dicts = store.dictionaries();
+        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog opens");
+        let frontier = Frontier::load(&conn, &workspace_id).expect("frontier loads");
+        drop(conn);
+        let mut path_by_pair: HashMap<(String, String), String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            path_by_pair.insert(
+                (entry.artifact_id.clone(), entry.artifact_version_id.clone()),
+                path.clone(),
+            );
+        }
+        let owner_path = |ordinal: u32| -> Option<String> {
+            dicts
+                .artifacts
+                .get(ordinal as usize)
+                .and_then(|pair| path_by_pair.get(pair))
+                .cloned()
+        };
+
+        let via_section = collect(&store, &dicts, &owner_path, &frontier, generation, false);
+        let via_scan = collect(&store, &dicts, &owner_path, &frontier, generation, true);
+
+        // The pending-site half of `Collected` does not depend on the
+        // entity-index strategy at all -- same owners, same counts.
+        let section_pending: usize = via_section.pending_by_owner.values().map(Vec::len).sum();
+        let scan_pending: usize = via_scan.pending_by_owner.values().map(Vec::len).sum();
+        assert_eq!(section_pending, scan_pending);
+        assert_eq!(
+            via_section.pending_by_owner.keys().collect::<Vec<_>>(),
+            via_scan.pending_by_owner.keys().collect::<Vec<_>>()
+        );
+
+        // Every live, non-inferred-type entity in the store must resolve
+        // to the SAME record_id through both strategies -- grouped by
+        // `(path, start)` first (rather than asserted per-view directly)
+        // because this fixture, like any real corpus, has a handful of
+        // GENUINE key collisions (more than one visible entity reporting
+        // the same `(owner, span_start)`, e.g. every top-level declaration
+        // in a file whose `push_entity` recipe reports `start == 0` for
+        // some kind this fixture happens to exercise) -- an existing,
+        // orthogonal imprecision this task does not fix (see `StoreReader::
+        // entity_by_owner_and_start`'s own doc comment on "first visible
+        // wins, silently"). For an AMBIGUOUS key, `EntityIndex::build`'s
+        // hash-map insertion order and `entities.index`'s own `sort_
+        // unstable` tie-order need not agree on WHICH candidate wins --
+        // this test only requires each strategy's pick to be SOME live
+        // candidate for that key, not a specific one; only an
+        // UNAMBIGUOUS key (exactly one live entity) is checked for exact
+        // agreement with the known-correct record_id.
+        let inferred_type_kind_id = dicts
+            .kinds
+            .iter()
+            .position(|k| k == "jsts:entity_inferred_type");
+        let mut candidates_by_key: HashMap<(String, i32), Vec<[u8; 32]>> = HashMap::new();
+        for view in store.iter_visible(generation) {
+            if view.category() != CATEGORY_ENTITY {
+                continue;
+            }
+            if Some(view.kind_id() as usize) == inferred_type_kind_id {
+                continue;
+            }
+            let Some(path) = owner_path(view.owner_artifact()) else {
+                continue;
+            };
+            let start = view.span_start_byte() as i32;
+            candidates_by_key
+                .entry((path, start))
+                .or_default()
+                .push(view.record_id());
+        }
+        assert!(
+            !candidates_by_key.is_empty(),
+            "expected at least one visible entity in the shared fixture"
+        );
+        let mut checked_unambiguous = 0u64;
+        let mut ambiguous_keys = 0u64;
+        for ((path, start), candidates) in &candidates_by_key {
+            let section_hit = via_section.entities.lookup(path, *start);
+            let scan_hit = via_scan.entities.lookup(path, *start);
+            assert!(
+                section_hit.is_some_and(|id| candidates.contains(&id)),
+                "entities.index section path resolved {path}:{start} to a non-candidate: {section_hit:?}"
+            );
+            assert!(
+                scan_hit.is_some_and(|id| candidates.contains(&id)),
+                "full-scan path resolved {path}:{start} to a non-candidate: {scan_hit:?}"
+            );
+            if candidates.len() == 1 {
+                assert_eq!(section_hit, Some(candidates[0]));
+                assert_eq!(scan_hit, Some(candidates[0]));
+                checked_unambiguous += 1;
+            } else {
+                ambiguous_keys += 1;
+            }
+        }
+        eprintln!(
+            "[test] entities_index_section_and_scan_agree: unambiguous_keys={checked_unambiguous} ambiguous_keys={ambiguous_keys}"
+        );
+        assert!(
+            checked_unambiguous > 0,
+            "expected at least one unambiguous (path, start) key in the shared fixture"
+        );
+    }
+
     static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn scratch_dir(label: &str) -> PathBuf {
@@ -3420,7 +3692,14 @@ mod tests {
                 .and_then(|pair| path_by_pair.get(pair))
                 .cloned()
         };
-        let collected = collect(&store, &dicts, &owner_path, base_generation);
+        let collected = collect(
+            &store,
+            &dicts,
+            &owner_path,
+            &frontier,
+            base_generation,
+            false,
+        );
         let pending_before: usize = collected.pending_by_owner.values().map(Vec::len).sum();
 
         let result = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
@@ -4084,7 +4363,14 @@ mod tests {
                 .and_then(|pair| path_by_pair.get(pair))
                 .cloned()
         };
-        let collected = collect(&store, &dicts, &owner_path, base_generation);
+        let collected = collect(
+            &store,
+            &dicts,
+            &owner_path,
+            &frontier,
+            base_generation,
+            false,
+        );
         assert!(
             collected.pending_by_owner.is_empty(),
             "fixture must have zero pending call/heritage sites for this test to exercise the right code path: {:?}",

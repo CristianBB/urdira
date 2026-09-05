@@ -127,6 +127,7 @@ impl SegmentWriter {
             &base_dir.join("records.by_identity"),
             &base_dir.join("adj.out"),
             &base_dir.join("adj.in"),
+            &base_dir.join("entities.index"),
         )?;
         for (name, bytes) in &hs.hot.bytes {
             files.insert(name.to_string(), (*bytes, hs.hot.xxh3[name]));
@@ -157,7 +158,7 @@ impl SegmentWriter {
         let durable = t0.elapsed();
 
         let manifest = Manifest {
-            format: 5,
+            format: 6,
             generation,
             snapshot_id: None,
             base: base_name.clone(),
@@ -266,6 +267,7 @@ impl SegmentWriter {
                     &base_dir.join("records.by_identity"),
                     &base_dir.join("adj.out"),
                     &base_dir.join("adj.in"),
+                    &base_dir.join("entities.index"),
                 )
             },
             || {
@@ -340,7 +342,7 @@ impl SegmentWriter {
         }
 
         let manifest = Manifest {
-            format: 5,
+            format: 6,
             generation,
             snapshot_id: None,
             base: base_name.clone(),
@@ -721,7 +723,7 @@ impl SegmentWriter {
         );
 
         let manifest = Manifest {
-            format: 5,
+            format: 6,
             generation,
             snapshot_id: None,
             base: current.base.clone(),
@@ -1303,6 +1305,42 @@ fn build_delta_sections(
     sections.push((
         SectionId::AdjIn,
         encode_framed(TableId::Records, generation, adj_in.len() as u64, &buf).0,
+    ));
+
+    // F4 4.3: `entities.index` -- same exclusion/ordinal convention as the
+    // base writers (`segment_io::write_hot_and_secondary_files[_partitioned]`);
+    // `full_dicts` (not `dict_additions`) because a delta's OWN new words
+    // are a suffix of it and `"jsts:entity_inferred_type"` was almost
+    // always interned by an earlier generation already.
+    let inferred_type_kind_id = inferred_type_kind_id(full_dicts);
+    let mut entities_index: Vec<(u32, u32, u32)> = order
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &i)| {
+            let r = &opened_rows[i as usize];
+            is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id).then_some((
+                r.owner_artifact,
+                r.span_start_byte,
+                k as u32,
+            ))
+        })
+        .collect();
+    entities_index.sort_unstable();
+    let mut buf = Vec::with_capacity(entities_index.len() * TRIPLE_STRIDE);
+    for (a, b, c) in &entities_index {
+        buf.extend_from_slice(&a.to_le_bytes());
+        buf.extend_from_slice(&b.to_le_bytes());
+        buf.extend_from_slice(&c.to_le_bytes());
+    }
+    sections.push((
+        SectionId::EntitiesIndex,
+        encode_framed(
+            TableId::Records,
+            generation,
+            entities_index.len() as u64,
+            &buf,
+        )
+        .0,
     ));
 
     // -- deps.keys/meta/reverse --

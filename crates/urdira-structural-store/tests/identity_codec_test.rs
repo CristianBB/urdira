@@ -427,8 +427,9 @@ fn store_written_at_the_old_header_format_fails_to_open_with_a_clear_error() {
         .write_base(&dir, &rows, &[], &dicts, 1)
         .unwrap();
 
-    // Patch every hot file's format u16 (offset 4, little-endian) from 5
-    // to 4 -- simulates a store written by a pre-A3a build.
+    // Patch every hot file's format u16 (offset 4, little-endian) from the
+    // current `HEADER_FORMAT` (6, since F4 4.3's `entities.index` bump) to
+    // 4 -- simulates a store written by a pre-A3a build.
     for name in [
         "records.keys",
         "records.meta",
@@ -440,8 +441,8 @@ fn store_written_at_the_old_header_format_fails_to_open_with_a_clear_error() {
         let mut bytes = std::fs::read(&path).unwrap();
         assert_eq!(
             &bytes[4..6],
-            &5u16.to_le_bytes(),
-            "expected format 5 before patching"
+            &6u16.to_le_bytes(),
+            "expected format 6 before patching"
         );
         bytes[4..6].copy_from_slice(&4u16.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
@@ -472,10 +473,10 @@ fn manifest_written_at_the_old_format_fails_to_open_with_a_clear_error() {
     let manifest_path = dir.join("MANIFEST");
     let text = std::fs::read_to_string(&manifest_path).unwrap();
     assert!(
-        text.contains("\"format\": 5"),
-        "expected format 5 before patching"
+        text.contains("\"format\": 6"),
+        "expected format 6 before patching"
     );
-    let patched = text.replace("\"format\": 5", "\"format\": 4");
+    let patched = text.replace("\"format\": 6", "\"format\": 4");
     std::fs::write(&manifest_path, patched).unwrap();
 
     let result = StoreReader::open(&dir);

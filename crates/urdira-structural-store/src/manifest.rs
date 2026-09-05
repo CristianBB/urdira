@@ -43,9 +43,14 @@ impl Manifest {
         let bytes =
             std::fs::read(path).map_err(|e| store_err!("read manifest {}: {e}", path.display()))?;
         let manifest: Manifest = serde_json::from_slice(&bytes)?;
-        if manifest.format != 5 {
+        // F4 4.3: bumped 5->6 alongside `layout::HEADER_FORMAT` -- see that
+        // constant's own doc comment. A format-5 MANIFEST (written before
+        // the `entities.index` section existed) fails here with a clear
+        // error rather than opening a store this crate's reader would then
+        // find missing a mandatory section.
+        if manifest.format != 6 {
             return Err(store_err!(
-                "unsupported manifest format {} (want 5)",
+                "unsupported manifest format {} (want 6)",
                 manifest.format
             ));
         }

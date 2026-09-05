@@ -77,6 +77,9 @@ pub enum SectionId {
     ClosuresDeps = 18,
     PendingSites = 19,
     ClosuresPending = 20,
+    /// F4 4.3: `entities.index` -- see `layout::TRIPLE_STRIDE`'s doc comment
+    /// and `docs/decisions/26-v4-structural-store.md`'s amendment.
+    EntitiesIndex = 21,
 }
 
 impl SectionId {
@@ -102,6 +105,7 @@ impl SectionId {
             18 => Self::ClosuresDeps,
             19 => Self::PendingSites,
             20 => Self::ClosuresPending,
+            21 => Self::EntitiesIndex,
             _ => return None,
         })
     }
@@ -130,6 +134,7 @@ impl SectionId {
             Self::ClosuresDeps => "closures.deps",
             Self::PendingSites => "pending.sites",
             Self::ClosuresPending => "closures.pending",
+            Self::EntitiesIndex => "entities.index",
         }
     }
 }

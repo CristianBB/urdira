@@ -100,6 +100,13 @@ pub(crate) struct Segment {
     pub by_identity: SectionSource,
     pub adj_out: SectionSource,
     pub adj_in: SectionSource,
+    /// F4 4.3: `(owner_artifact, span_start, ordinal)` triples over this
+    /// segment's own `CATEGORY_ENTITY` rows (excluding `jsts:entity_
+    /// inferred_type`) -- MANDATORY, like `by_name`/`by_owner` (never
+    /// `Option`), because every base/delta this crate writes now carries it
+    /// unconditionally (`HEADER_FORMAT` 6). See `StoreReader::
+    /// entity_by_owner_and_start`.
+    pub entities_index: SectionSource,
     pub deps_keys: SectionSource,
     pub deps_meta: SectionSource,
     pub deps_reverse: SectionSource,
@@ -213,6 +220,7 @@ impl Segment {
         let by_identity = section("records.by_identity", SectionId::RecordsByIdentity)?;
         let adj_out = section("adj.out", SectionId::AdjOut)?;
         let adj_in = section("adj.in", SectionId::AdjIn)?;
+        let entities_index = section("entities.index", SectionId::EntitiesIndex)?;
         let deps_keys = section("deps.keys", SectionId::DepsKeys)?;
         let (deps_header, _) = header_and_data(&deps_keys)?;
         let deps_n = deps_header.row_count as usize;
@@ -267,6 +275,7 @@ impl Segment {
             by_identity,
             adj_out,
             adj_in,
+            entities_index,
             deps_keys,
             deps_meta,
             deps_reverse,
@@ -1494,6 +1503,46 @@ impl StoreReader {
         out
     }
 
+    /// F4 4.3: `entities.index` lookup -- exactly the `(owner_path ->
+    /// owner_artifact ordinal, span_start_byte) -> record_id` correlation
+    /// `urdira-tsgo-client::entity_index::EntityIndex` used to build from a
+    /// full `iter_visible` scan (`urdira-indexing-worker`'s `v4::residual::
+    /// collect`), now O(sites) via a per-segment binary search instead of
+    /// O(corpus). Segments are consulted newest-first (`inner.segments`'s
+    /// own ordering) and the first VISIBLE hit wins -- matching every other
+    /// "resolve a key across generations" reader path (`get`/`by_identity_
+    /// last`'s own doc comment). `(owner_artifact, span_start)` is expected
+    /// unique within one segment's own entity population (the `jsts:entity_
+    /// inferred_type` exclusion at write time exists specifically to keep
+    /// it that way, see `segment_io::is_entities_index_row`'s doc comment);
+    /// if more than one row shares the key regardless, the first visible
+    /// one in ascending index order wins, silently -- the same tolerance
+    /// `by_name`'s own binary-search range already has for a collision.
+    pub fn entity_by_owner_and_start(
+        &self,
+        owner: u32,
+        start: u32,
+        generation: u64,
+    ) -> Option<RecordView> {
+        let inner = self.snapshot();
+        for seg in &inner.segments {
+            let data = &seg.entities_index[HEADER_LEN..];
+            let (lo, hi) = triple_key_range(data, owner, start);
+            for i in lo..hi {
+                let ord = triple_ordinal_at(data, i) as usize;
+                let view = RecordView {
+                    segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
+                    ordinal: ord,
+                };
+                if view.is_visible(generation) {
+                    return Some(view);
+                }
+            }
+        }
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn by_kind(
         &self,
@@ -1963,6 +2012,7 @@ impl StoreReader {
                 ("records.by_identity", &seg.by_identity),
                 ("adj.out", &seg.adj_out),
                 ("adj.in", &seg.adj_in),
+                ("entities.index", &seg.entities_index),
                 ("deps.keys", &seg.deps_keys),
                 ("deps.meta", &seg.deps_meta),
                 ("deps.reverse", &seg.deps_reverse),
