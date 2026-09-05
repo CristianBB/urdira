@@ -42,6 +42,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::binary::TsgoBinary;
 use crate::client::{ClientError, TsgoClient};
@@ -183,6 +184,16 @@ pub struct ResidualPassConfig {
     /// so a caller that only wants call/heritage resolution (a bench, or a
     /// test exercising just that half) pays no extra RPC cost.
     pub fetch_semantics: bool,
+    /// F4 4.2: a wall-clock point past which `run_lane` stops opening new
+    /// windows — checked at the START of each window iteration (a window
+    /// already in flight always finishes; this never aborts a partially-
+    /// resolved `updateSnapshot`/resolve call). `None` means unbounded (the
+    /// pre-4.2 behavior, and `URDIRA_V4_RESIDUAL_BUDGET_MS=0`'s meaning).
+    /// Every lane checks against the SAME `Instant` (computed once by the
+    /// caller before spawning lanes), not a per-lane budget — a slow lane
+    /// stopping early does not entitle a fast lane to keep going past the
+    /// shared wall-clock cutoff.
+    pub deadline: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -262,6 +273,24 @@ pub struct PassStats {
     pub windows: Vec<WindowStats>,
     pub types: Vec<InferredTypeResult>,
     pub diagnostics: Vec<DiagnosticResult>,
+    /// F4 4.2: `true` if `ResidualPassConfig::deadline` cut at least one
+    /// lane off before it reached the end of its own block of windows. A
+    /// caller (`residual.rs`) still publishes everything `resolved`/`stats`
+    /// gathered before the cutoff — this flag only tells it whether MORE
+    /// work is waiting (see `remaining_roots`).
+    pub truncated: bool,
+    /// F4 4.2: every root (from an unopened window, in every lane that hit
+    /// the deadline) this run never got to — the caller re-schedules a
+    /// follow-up pass restricted to exactly these roots (plus, as always,
+    /// whatever still has an open `pending.sites` row). Owner-path strings
+    /// in the SAME form `Window::roots` uses (the caller's own virtual
+    /// paths), not yet stripped back to store-relative form.
+    pub remaining_roots: Vec<String>,
+    /// F4 4.2: total windows across every lane vs. how many this run
+    /// actually opened (`windows.len()` after a truncated run is strictly
+    /// less than this) — surfaced in `ResidualOutcome`/`ScanTimings` purely
+    /// for observability, never consulted for correctness.
+    pub windows_total: usize,
 }
 
 /// Runs a residual pass: resolves every pending site under `pending_by_owner`
@@ -321,10 +350,13 @@ impl ResidualPass {
                     stats.windows.extend(lane_stats.windows);
                     stats.types.extend(lane_stats.types);
                     stats.diagnostics.extend(lane_stats.diagnostics);
+                    stats.truncated |= lane_stats.truncated;
+                    stats.remaining_roots.extend(lane_stats.remaining_roots);
                 }
                 Ok((all, stats))
             },
         )?;
+        stats.windows_total = plan.windows.len();
 
         all.sort_by(|a, b| {
             a.owner_path
@@ -346,6 +378,7 @@ impl ResidualPass {
                 .cmp(&b.owner_path)
                 .then(a.site.start.cmp(&b.site.start))
         });
+        stats.remaining_roots.sort();
         Ok((all, stats))
     }
 }
@@ -403,7 +436,22 @@ fn run_lane(
         std::collections::HashMap::new();
 
     let mut previous_snapshot: Option<u64> = None;
-    for window in windows {
+    for (position, window) in windows.iter().enumerate() {
+        // F4 4.2: checked at the START of the window, never mid-window --
+        // a window already open always finishes its own `updateSnapshot` +
+        // resolve + (if enabled) semantics fetch before this lane looks at
+        // the clock again.
+        if let Some(deadline) = config.deadline
+            && Instant::now() >= deadline
+        {
+            stats.truncated = true;
+            for remaining in &windows[position..] {
+                stats
+                    .remaining_roots
+                    .extend(remaining.roots.iter().cloned());
+            }
+            break;
+        }
         let config_json = serde_json::json!({
             "compilerOptions": config.compiler_options,
             "files": window.roots,

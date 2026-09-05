@@ -376,6 +376,7 @@ fn bench_residual_pass_over_a_2000_owner_window_plan() {
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
         fetch_semantics: false,
+        deadline: None,
         lib_roots,
     };
 

@@ -109,6 +109,7 @@ fn run_semantics(
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
         fetch_semantics: true,
+        deadline: None,
     };
     let (_, stats) = ResidualPass::run_instrumented(&plan, 1, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed");
@@ -244,6 +245,7 @@ fn fetch_semantics_false_collects_no_types_or_diagnostics() {
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
         fetch_semantics: false,
+        deadline: None,
     };
     let (_, stats) = ResidualPass::run_instrumented(&plan, 1, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed");

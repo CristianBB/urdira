@@ -208,7 +208,22 @@ pub struct ResidualContext {
     /// diagnosed (`residual_pass.rs::run_lane`'s `fetch_semantics` fetch
     /// runs for every window root regardless of pending sites).
     pub touched_owners: Option<Vec<String>>,
+    /// F4 4.2: how many times [`schedule`] has already re-triggered itself
+    /// for a truncated (deadline-cut) attempt at the SAME base generation
+    /// -- `0` for the run any `ScanCompleted`/test caller starts fresh;
+    /// incremented by [`schedule`] each time it re-schedules a follow-up
+    /// restricted to `ResidualOutcome::remaining_roots`. Capped at
+    /// [`MAX_CONSECUTIVE_RESCHEDULES`] so a workspace whose residual work
+    /// never drains within its own budget cannot spawn an unbounded chain
+    /// of background tsgo passes -- past the cap, `schedule` stops
+    /// re-triggering and leaves the remaining roots' pending sites open for
+    /// the NEXT real `ScanCompleted` to pick up fresh (same fallback this
+    /// module already relies on for a superseded attempt).
+    pub reschedule_count: u32,
 }
+
+/// F4 4.2: see [`ResidualContext::reschedule_count`].
+const MAX_CONSECUTIVE_RESCHEDULES: u32 = 20;
 
 /// Schedules (or re-schedules, superseding any still-running prior attempt
 /// for this workspace) a residual pass after `ScanCompleted` for
@@ -223,7 +238,7 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
         match run_once(&context, my_epoch) {
             Ok(Some(outcome)) => {
                 eprintln!(
-                    "[urdira-indexing-worker] v4 residual pass complete workspace={workspace_id} generation={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={} total_ms={}",
+                    "[urdira-indexing-worker] v4 residual pass complete workspace={workspace_id} generation={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={} total_ms={} truncated={} windows={}/{}",
                     outcome.generation,
                     outcome.upgraded_sites,
                     outcome.external_sites,
@@ -232,8 +247,17 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                     outcome.type_of_relations,
                     outcome.diagnostics_emitted,
                     outcome.timings.total_ms,
+                    outcome.truncated,
+                    outcome.windows_done,
+                    outcome.windows_total,
                 );
-                if let Some(target) = event_target {
+                // F4 4.2: send the wire event BEFORE deciding whether to
+                // re-schedule -- `event_target` (not `Clone`-free -- see
+                // its own struct) is only borrowed here so the SAME sender
+                // can still be moved into a follow-up `schedule` call below
+                // without this attempt's own caller ever seeing two
+                // `UpgradeCompleted` events collapsed into one `Option`.
+                if let Some(target) = event_target.as_ref() {
                     let event = IndexingEvent::UpgradeCompleted {
                         request_id: context.request_id.clone(),
                         operation_id: context.request_id.clone(),
@@ -243,9 +267,42 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                         unresolved_sites: outcome.unresolved_sites,
                         timings: outcome.timings,
                     };
-                    let _ = target
-                        .sender
-                        .send((target.stream_id, target.cancellation_id, event));
+                    let _ = target.sender.send((
+                        target.stream_id,
+                        target.cancellation_id.clone(),
+                        event,
+                    ));
+                }
+                // F4 4.2: the deadline cut this run off before it opened
+                // every window in its own plan -- re-trigger a follow-up
+                // pass restricted to exactly the roots it never got to,
+                // same epoch-supersede/quiet-period machinery as any other
+                // `schedule` call, up to `MAX_CONSECUTIVE_RESCHEDULES`
+                // consecutive attempts. Past the cap, the remaining roots'
+                // pending sites simply stay open -- correct, if less
+                // timely, the same fallback this module already relies on
+                // for a superseded attempt (a future `ScanCompleted` will
+                // re-derive and re-schedule fresh).
+                if outcome.truncated {
+                    if context.reschedule_count < MAX_CONSECUTIVE_RESCHEDULES {
+                        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+                            eprintln!(
+                                "[urdira-indexing-worker] v4 residual pass: re-scheduling truncated attempt {} of {} workspace={workspace_id} remaining_owners={}",
+                                context.reschedule_count + 1,
+                                MAX_CONSECUTIVE_RESCHEDULES,
+                                outcome.remaining_roots.len(),
+                            );
+                        }
+                        let mut next_context = context.clone();
+                        next_context.touched_owners = Some(outcome.remaining_roots);
+                        next_context.reschedule_count += 1;
+                        schedule(next_context, event_target);
+                    } else {
+                        eprintln!(
+                            "[urdira-indexing-worker] v4 residual pass: reschedule cap ({MAX_CONSECUTIVE_RESCHEDULES}) reached workspace={workspace_id}; {} owner(s) remain pending for the next scan",
+                            outcome.remaining_roots.len(),
+                        );
+                    }
                 }
             }
             Ok(None) => {
@@ -279,6 +336,20 @@ pub struct ResidualOutcome {
     /// Newly opened `jsts:diagnostic` rows this run.
     pub diagnostics_emitted: u64,
     pub timings: ScanTimings,
+    /// F4 4.2: `true` if `URDIRA_V4_RESIDUAL_BUDGET_MS`'s deadline cut this
+    /// run off before every window in its own plan was opened. `schedule`
+    /// re-triggers a follow-up pass restricted to `remaining_roots` when
+    /// this is `true` (capped at `MAX_CONSECUTIVE_RESCHEDULES` consecutive
+    /// re-schedules -- see `ResidualContext::reschedule_count`).
+    pub truncated: bool,
+    /// F4 4.2: store-relative owner paths (the `workspace_root` virtual
+    /// prefix already stripped) this run never got to open a window for --
+    /// empty unless `truncated` is `true`.
+    pub remaining_roots: Vec<String>,
+    /// F4 4.2: how many windows this run actually opened, out of the plan's
+    /// own total (`windows_total`) -- equal when `truncated` is `false`.
+    pub windows_done: usize,
+    pub windows_total: usize,
 }
 
 /// Runs one residual pass to completion and, if anything upgraded,
@@ -454,6 +525,30 @@ fn run_once_with_quiet_period(
         pending_by_owner.insert(virtual_path, sites);
     }
 
+    // F4 4.2: `URDIRA_V4_RESIDUAL_BUDGET_MS` bounds how long this ONE
+    // `ResidualPass::run_instrumented` call may keep opening new windows --
+    // default 20s for an incremental run (`context.touched_owners` is
+    // `Some(...)`, a small window already), 120s for a cold run (`None`,
+    // the whole frontier); `0` means unbounded (`deadline: None`), matching
+    // the pre-4.2 behavior exactly. An explicit env value applies to BOTH
+    // shapes of run -- there is deliberately no separate incremental/cold
+    // override, since a caller setting this at all almost certainly wants
+    // one number for both (a bench, or a deployment capping worst-case
+    // latency regardless of trigger).
+    const DEFAULT_INCREMENTAL_BUDGET_MS: u64 = 20_000;
+    const DEFAULT_COLD_BUDGET_MS: u64 = 120_000;
+    let default_budget_ms = if context.touched_owners.is_none() {
+        DEFAULT_COLD_BUDGET_MS
+    } else {
+        DEFAULT_INCREMENTAL_BUDGET_MS
+    };
+    let budget_ms = std::env::var("URDIRA_V4_RESIDUAL_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default_budget_ms);
+    let deadline = (budget_ms > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(budget_ms));
+
     let config = ResidualPassConfig {
         binary,
         root: workspace_root.clone(),
@@ -488,6 +583,7 @@ fn run_once_with_quiet_period(
         // resolution -- see `ResidualPassConfig::fetch_semantics`'s own doc
         // comment.
         fetch_semantics: true,
+        deadline,
     };
 
     let (resolved, pass_stats) =
@@ -503,6 +599,31 @@ fn run_once_with_quiet_period(
     }
     if debug_enabled {
         print_diagnostic_code_histogram(&pass_stats.diagnostics);
+    }
+
+    // F4 4.2: `pass_stats.remaining_roots` is in `run_lane`'s own virtual-
+    // path form (`{workspace_root}/{store_path}`) -- convert back to
+    // store-relative paths here, the same shape `ResidualContext::
+    // touched_owners` expects, so `schedule` can hand them straight to a
+    // follow-up `ResidualContext` without this module's caller needing to
+    // know about the virtual root at all.
+    let windows_done = pass_stats.windows.len();
+    let windows_total = pass_stats.windows_total;
+    let truncated = pass_stats.truncated;
+    let remaining_owner_paths: Vec<String> = pass_stats
+        .remaining_roots
+        .iter()
+        .filter_map(|virtual_path| {
+            virtual_path
+                .strip_prefix(&workspace_root)
+                .map(|p| p.trim_start_matches('/').to_string())
+        })
+        .collect();
+    if truncated && std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        eprintln!(
+            "[urdira-indexing-worker] v4 residual: deadline hit, windows_done={windows_done}/{windows_total} remaining_owners={}",
+            remaining_owner_paths.len(),
+        );
     }
 
     if current_epoch(&context.workspace_id) != my_epoch {
@@ -1017,6 +1138,10 @@ fn run_once_with_quiet_period(
             type_of_relations: 0,
             diagnostics_emitted: 0,
             timings: clock.completed_timings(),
+            truncated,
+            remaining_roots: remaining_owner_paths,
+            windows_done,
+            windows_total,
         }));
     }
 
@@ -1176,6 +1301,10 @@ fn run_once_with_quiet_period(
         type_of_relations,
         diagnostics_emitted,
         timings: clock.completed_timings(),
+        truncated,
+        remaining_roots: remaining_owner_paths,
+        windows_done,
+        windows_total,
     }))
 }
 
@@ -3266,6 +3395,7 @@ mod tests {
             // Simulates the trigger a cold `Full` scan would build (see
             // `scan::run_with_residual`): the whole frontier is in scope.
             touched_owners: None,
+            reschedule_count: 0,
         };
 
         // Count possible call/heritage rows before the residual pass runs,
@@ -3623,6 +3753,7 @@ mod tests {
             // map scoped to the whole (tiny) fixture frontier, matching
             // this test's own pre-4.1 behavior exactly.
             touched_owners: None,
+            reschedule_count: 0,
         };
 
         // --- Run 1 ---
@@ -3971,6 +4102,7 @@ mod tests {
             configuration_revision_id: "configuration:v4-zero-pending-test".to_string(),
             resolution_lock_id: "resolution:v4-zero-pending-test".to_string(),
             touched_owners: None,
+            reschedule_count: 0,
         };
 
         let outcome = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
@@ -4104,6 +4236,7 @@ mod tests {
             configuration_revision_id: "configuration:n8n-residual-debug".to_string(),
             resolution_lock_id: "resolution:n8n-residual-debug".to_string(),
             touched_owners: None,
+            reschedule_count: 0,
         };
         let residual_started = std::time::Instant::now();
         let outcome = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
