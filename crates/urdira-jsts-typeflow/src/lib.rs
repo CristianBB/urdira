@@ -4109,10 +4109,26 @@ fn resolve_type_ref_chasing_aliases(
 /// (or a still-`Unknown` id `raw_by_id` never heard of, e.g. an unresolved
 /// import) -- so it IS the final answer, `Some(Entity(id))`. `id` IS a
 /// known alias: recurse into ITS OWN raw target one more hop, guarded by
-/// `visiting` (a repeat id anywhere on the current chain is a cycle,
+/// `visiting` (a repeat id anywhere on the CURRENT chain is a cycle,
 /// `None`, matching `resolve_named_export_inner`'s own `visiting`-set
 /// idiom in `urdira-jsts-syntax-worker::resolver`) and `depth` (capped at
 /// `MAX_ALIAS_DEPTH`).
+///
+/// D.5 (2026-09-05, adversarial review): `visiting.remove(id)` AFTER the
+/// recursive call returns -- found live: without it, `visiting` tracked
+/// "ever visited anywhere in this call tree" instead of "on the current
+/// path", so an ACYCLIC diamond (`type A = X | Y; type X = B; type Y = B;
+/// type B = Foo;`) broke: resolving `A`'s `Union([X, Y])` chases `X` first
+/// (`X` -> `B` -> `Foo`, leaving `B` stuck in `visiting` on return since it
+/// was never removed), then chases `Y` -> `B` using the SAME `visiting`
+/// set -- `B` looks already-visited (a false cycle from the SIBLING `X`
+/// branch, not an ancestor of `Y`) and `Y` wrongly resolves to `None`,
+/// failing the whole union. Removing `id` on return restores the correct
+/// "on this path only" DFS cycle-guard semantics: a GENUINE cycle (`type A
+/// = B; type B = A;`) still returns `None` for both (`A` is still in
+/// `visiting`, inserted by `build_alias_targets`'s own per-id call, when
+/// the recursion loops back to it -- untouched by this fix), while two
+/// INDEPENDENT branches sharing a common alias no longer collide.
 fn resolve_alias_chase_leaf(
     id: &str,
     import_targets: &HashMap<(String, String, String), String>,
@@ -4126,14 +4142,16 @@ fn resolve_alias_chase_leaf(
     if depth + 1 >= MAX_ALIAS_DEPTH || !visiting.insert(id.to_owned()) {
         return None;
     }
-    resolve_type_ref_chasing_aliases(
+    let resolved = resolve_type_ref_chasing_aliases(
         alias_raw,
         alias_owning_path,
         import_targets,
         raw_by_id,
         visiting,
         depth + 1,
-    )
+    );
+    visiting.remove(id);
+    resolved
 }
 
 /// P1-A: close a `RawTypeRef`'s `Local`/`Imported` leaves against
@@ -5104,6 +5122,54 @@ mod tests {
     /// member annotated `A` stays unresolved (`None`), never a guess.
     #[test]
     fn cyclic_type_aliases_never_resolve() {
+        let file_summary = summary_for(
+            "a.ts",
+            "type A = B;\ntype B = A;\nclass C {\n  m(): A { return undefined as any; }\n}\n",
+        );
+        let c_id = file_summary.classes[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(index.member_type_ref(&c_id, "m", false), None);
+    }
+
+    /// D.5 (2026-09-05, adversarial review) regression fixture: an ACYCLIC
+    /// diamond of type aliases through a union (`type A = X | Y; type X =
+    /// B; type Y = B; type B = Foo;`) must resolve `A` to `Foo | Foo`, not
+    /// `None` -- before `resolve_alias_chase_leaf`'s own `visiting.remove`
+    /// fix, chasing `X` (`X` -> `B` -> `Foo`) left `B` permanently marked
+    /// "visiting" on return, so chasing the SIBLING branch `Y` (`Y` -> `B`)
+    /// hit a FALSE cycle at `B` (a sibling's own leftover mark, never an
+    /// ancestor of `Y`) and wrongly returned `None`, failing the whole
+    /// union.
+    #[test]
+    fn diamond_shaped_type_alias_union_resolves_without_a_false_cycle() {
+        let file_summary = summary_for(
+            "a.ts",
+            "class Foo {}\ntype B = Foo;\ntype X = B;\ntype Y = B;\ntype A = X | Y;\nclass C {\n  m(): A {\n    return new Foo();\n  }\n}\n",
+        );
+        let foo_id = file_summary.classes[0].entity_id.clone();
+        let c_id = file_summary.classes[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        assert_eq!(
+            index.member_type_ref(&c_id, "m", false),
+            Some(ResolvedTypeRef::Union(vec![
+                ResolvedTypeRef::Entity(foo_id.clone()),
+                ResolvedTypeRef::Entity(foo_id),
+            ]))
+        );
+    }
+
+    /// D.5 (2026-09-05, adversarial review): the diamond fix above must
+    /// NOT weaken the genuine-cycle guard -- `type A = B; type B = A;`
+    /// still returns `None` for both (`A` is still `visiting` when the
+    /// chase loops back to it, since `build_alias_targets`'s OWN per-id
+    /// call only removes `A` from `visiting` on ITS OWN return, after the
+    /// whole chase already failed).
+    #[test]
+    fn cyclic_type_aliases_still_never_resolve_after_the_diamond_fix() {
         let file_summary = summary_for(
             "a.ts",
             "type A = B;\ntype B = A;\nclass C {\n  m(): A { return undefined as any; }\n}\n",

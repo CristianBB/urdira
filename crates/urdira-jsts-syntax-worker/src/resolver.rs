@@ -47,7 +47,7 @@
 
 use crate::{
     AmbientGlobalDeclaration, AmbientModuleDeclaration, AmbientModuleMember, EntityKind,
-    SyntaxEntity, SyntaxExportBinding, SyntaxFileResult,
+    GlobalScope, SyntaxEntity, SyntaxExportBinding, SyntaxFileResult,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1648,20 +1648,57 @@ impl AmbientModuleIndex {
     ///    reality (separate `tsconfig.json`s), never merged workspace-wide.
     ///    The plain "first declaring path in `BTreeMap` order" rule always
     ///    picked the `@n8n` one (`@` sorts before `c`), wrong for every
-    ///    one of 169 sampled `packages/cli/**` referencing sites. Before
-    ///    falling back to that rule, a same-scope candidate (the declaring
-    ///    path shares `referencing_path`'s OWN top-level package prefix)
-    ///    wins when there is EXACTLY ONE such candidate -- conservative:
-    ///    zero or more-than-one same-scope candidates fall through to the
-    ///    unchanged `BTreeMap`-order rule rather than guess further.
+    ///    one of 169 sampled `packages/cli/**` referencing sites. A same-
+    ///    scope candidate (the declaring path shares `referencing_path`'s
+    ///    OWN top-level package prefix) wins when there is EXACTLY ONE
+    ///    such candidate.
+    ///
+    /// D.5 (2026-09-05, adversarial review) sharpened both corrections
+    /// further, each found live by an independent reviewer reading this
+    /// exact function:
+    ///
+    /// 1a. **The standard-global denylist must not swallow a GENUINE
+    ///     `declare global` augmentation of the real global namespace**:
+    ///     `is_standard_global_name` lists `"globalThis"` (a real
+    ///     ECMAScript intrinsic, correctly denylisted for an ORDINARY
+    ///     `var`/`interface` re-declaration -- correction 1's own
+    ///     reasoning). But `declare global { namespace globalThis {} }` is
+    ///     the CANONICAL, textbook way to add a member to `globalThis`
+    ///     ITSELF (`expression-runtime/src/runtime/index.ts`, named in
+    ///     this crate's own `SyntaxFileResult::ambient_globals` doc
+    ///     comment as one of the two corpus samples motivating D.1 in the
+    ///     first place) -- unconditionally denylisting `"globalThis"`
+    ///     made that exact named case permanently unresolvable, contrary
+    ///     to the doc comment's own claim. The denylist is now bypassed
+    ///     for a name with AT LEAST ONE `(EntityKind::Namespace,
+    ///     GlobalScope::DeclareGlobal)` candidate (a real workspace
+    ///     augmentation of the global namespace, never an ordinary script-
+    ///     top-level re-declaration of a value/interface with the same
+    ///     name) -- every other standard-global collision (`console`/
+    ///     `Array`/`BigInt`/`Navigator`, all `Variable`/`Interface`-kind
+    ///     shims, never `DeclareGlobal` namespaces) still stays `Absent`
+    ///     unconditionally.
+    /// 2a. **Never guess when the package-scope tie-break itself is
+    ///     inconclusive**: the pre-D.5 fallback for zero or more-than-one
+    ///     same-scope candidates was "first declaring path in `BTreeMap`
+    ///     order" -- itself a guess, the SAME kind correction 2 exists to
+    ///     rule out (just for a DIFFERENT tie-break input: a referencing
+    ///     file with NO package match at all, or one that matches MULTIPLE
+    ///     candidates' packages). Both now degrade to `Ambiguous` instead
+    ///     -- `Unique` is returned ONLY for the exactly-one-same-scope
+    ///     case.
     pub fn resolve_global(&self, name: &str, referencing_path: &str) -> GlobalLookup {
-        if is_standard_global_name(name) {
-            return GlobalLookup::Absent;
-        }
         let Some(candidates) = self.globals.get(name) else {
             return GlobalLookup::Absent;
         };
         if candidates.is_empty() {
+            return GlobalLookup::Absent;
+        }
+        let is_declare_global_namespace_augmentation = candidates.iter().any(|(_, declaration)| {
+            declaration.kind == EntityKind::Namespace
+                && declaration.scope == GlobalScope::DeclareGlobal
+        });
+        if is_standard_global_name(name) && !is_declare_global_namespace_augmentation {
             return GlobalLookup::Absent;
         }
         let unique_ids: BTreeSet<&str> = candidates
@@ -1669,7 +1706,13 @@ impl AmbientModuleIndex {
             .map(|(_, declaration)| declaration.entity_id.as_str())
             .collect();
         if let [only] = unique_ids.iter().copied().collect::<Vec<_>>().as_slice() {
-            return GlobalLookup::Unique((*only).to_owned());
+            // Every candidate mapping to this SAME `entity_id` necessarily
+            // shares the SAME declaring path too (the id is derived FROM
+            // the path) -- `candidates[0]`'s own path is as good as any.
+            return GlobalLookup::Unique {
+                entity_id: (*only).to_owned(),
+                declaring_path: candidates[0].0.clone(),
+            };
         }
         if candidates
             .iter()
@@ -1680,10 +1723,17 @@ impl AmbientModuleIndex {
                 .iter()
                 .filter(|(path, _)| workspace_scope_prefix(path) == referencing_scope)
                 .collect();
-            if let [only] = same_scope.as_slice() {
-                return GlobalLookup::Unique(only.1.entity_id.clone());
-            }
-            return GlobalLookup::Unique(candidates[0].1.entity_id.clone());
+            return match same_scope.as_slice() {
+                [only] => GlobalLookup::Unique {
+                    entity_id: only.1.entity_id.clone(),
+                    declaring_path: only.0.clone(),
+                },
+                // D.5: zero same-scope candidates (the referencing file
+                // matches none of them) or more than one (the tie-break
+                // itself cannot distinguish them) both stay `Ambiguous` --
+                // never a guess, not even "first in `BTreeMap` order".
+                _ => GlobalLookup::Ambiguous,
+            };
         }
         GlobalLookup::Ambiguous
     }
@@ -1780,6 +1830,23 @@ fn workspace_scope_prefix(path: &str) -> &str {
 /// falls through to the ordinary (already-existing, harmless-if-imprecise)
 /// candidate lookup below, same risk profile as every other name before
 /// this task's D.1 correction shipped.
+///
+/// D.5 (2026-09-05, adversarial review): this list is a CURATED snapshot,
+/// validated ONLY against the n8n corpus this campaign measured against
+/// (`refs-parity-diff-*.log`) -- it is not, and is not meant to be, a
+/// complete enumeration of every name any TypeScript `lib` preset could
+/// ever provide. To extend it for a DIFFERENT corpus: re-run `scripts/
+/// v4-references-parity-diff.mjs --classify-targets 1`, look for
+/// `v4_different_target` rows whose `v4_target` is a workspace `.d.ts`
+/// re-declaration of a name whose `v3_target` is a `lib.*.d.ts` path (the
+/// exact signature the six names below were all found through), and add
+/// the colliding name as a new literal in `NAMES` -- never remove an
+/// existing entry without first confirming its own collision no longer
+/// reproduces (a removed name silently re-opens the exact wrong-answer
+/// class `is_standard_global_name` exists to close). `resolve_global`'s
+/// own `is_declare_global_namespace_augmentation` check is the ONE
+/// deliberate, structural (not name-based) exception to this list, added
+/// by D.5's own fix -- it never needs extending here.
 fn is_standard_global_name(name: &str) -> bool {
     const NAMES: &[&str] = &[
         // ECMAScript intrinsics (es5 through es2022).
@@ -1864,10 +1931,19 @@ fn is_standard_global_name(name: &str) -> bool {
 }
 
 /// Outcome of [`AmbientModuleIndex::resolve_global`] -- see that method's
-/// own doc comment for the exact rule.
+/// own doc comment for the exact rule. `Unique::declaring_path` (D.5,
+/// 2026-09-05, adversarial review) is the ambient declaration's OWN file
+/// path, straight from the index entry -- lets a caller (`semantic_
+/// sites.rs`'s `resolve_ambient_global`) compute a real `cross_file` flag
+/// (`declaring_path != referencing_path`) instead of assuming cross-file
+/// unconditionally, which was wrong for the (rare but real) same-file case
+/// -- a `declare global {}` block referenced later in that SAME file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalLookup {
-    Unique(String),
+    Unique {
+        entity_id: String,
+        declaring_path: String,
+    },
     Ambiguous,
     Absent,
 }

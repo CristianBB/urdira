@@ -2151,21 +2151,25 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// reference`'s two `REASON_UNRESOLVED_GLOBAL` degrade points now do
     /// BEFORE giving up -- consult `AmbientModuleIndex::resolve_global`
     /// (workspace-wide, built once by the caller from every file's own
-    /// `ambient_globals`) for `name`. `Unique` resolves with certainty,
-    /// `cross_file: true` unconditionally, same simplification `resolve_
-    /// named_binding_via_specifier`'s own ambient-module branch already
-    /// makes (see that call site's own comment) rather than compare
-    /// `self.path` against the declaring file's path. `Ambiguous`
-    /// degrades to the SAME `checker_pending` disposition, just a more
-    /// specific reason string for the histogram. `Absent` is the exact
-    /// unsuffixed `REASON_UNRESOLVED_GLOBAL` this call site always
-    /// returned before this task -- byte-identical outcome for every name
-    /// with no ambient global declaration anywhere in the workspace.
+    /// `ambient_globals`) for `name`. `Unique` resolves with certainty --
+    /// `cross_file` (D.5, 2026-09-05, adversarial review: the pre-D.5
+    /// `true` unconditionally was wrong for a `declare global {}` block
+    /// referenced again LATER IN THAT SAME FILE) is the real comparison
+    /// against the declaration's own `declaring_path`, straight from the
+    /// index entry. `Ambiguous` degrades to the SAME `checker_pending`
+    /// disposition, just a more specific reason string for the histogram.
+    /// `Absent` is the exact unsuffixed `REASON_UNRESOLVED_GLOBAL` this
+    /// call site always returned before this task -- byte-identical
+    /// outcome for every name with no ambient global declaration anywhere
+    /// in the workspace.
     fn resolve_ambient_global(&self, name: &str) -> ReferenceResolution {
         match self.ctx.ambient_index.resolve_global(name, &self.path) {
-            resolver::GlobalLookup::Unique(target_id) => ReferenceResolution::Resolved {
-                target_id,
-                cross_file: true,
+            resolver::GlobalLookup::Unique {
+                entity_id,
+                declaring_path,
+            } => ReferenceResolution::Resolved {
+                target_id: entity_id,
+                cross_file: declaring_path != self.path,
             },
             resolver::GlobalLookup::Ambiguous => {
                 ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL_AMBIGUOUS)
@@ -3211,7 +3215,30 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         // callee branch (rule (f)) already closes for a CALLED member
         // (`ns.fn(...)`); this reuses the identical mechanism for an
         // uncalled member read, never a new heuristic.
-        self.resolve_namespace_member(&expr.object, expr.property.name.as_str())
+        if let Some(target_id) =
+            self.resolve_namespace_member(&expr.object, expr.property.name.as_str())
+        {
+            return Some(target_id);
+        }
+        // D.5 (2026-09-05, adversarial review): `Ns.Member` in VALUE
+        // position where `Ns` is a LOCAL namespace or one imported BY
+        // NAME (as opposed to `import * as ns`/a namespace re-export,
+        // both already covered by `resolve_namespace_member` above) --
+        // D.3 wired this qualified-path resolver into `visit_ts_qualified_
+        // name` (TYPE position, `TSQualifiedName`) but never into this
+        // VALUE-position sibling, even though both shapes name the exact
+        // same kind of target and share the identical root-classification
+        // rule (`resolve_root_namespace`). A single-segment path (just
+        // `expr.property`'s own name) -- multi-level VALUE-position access
+        // (`A.B.C` as an expression) reaches here once per level through
+        // the SAME recursive `StaticMemberExpression` walk, each call
+        // seeing only its own outermost segment, mirroring `visit_ts_
+        // qualified_name`'s own one-level-per-call contract.
+        let Expression::Identifier(root) = &expr.object else {
+            return None;
+        };
+        let segment = expr.property.name.as_str().to_owned();
+        self.resolve_qualified_namespace_path(root, &[segment])
     }
 
     /// D.4 (2026-09-05, references-parity task, diagnosis only -- no
@@ -3320,7 +3347,27 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 };
                 let reference = self.scoping.get_reference(reference_id);
                 let Some(symbol_id) = reference.symbol_id() else {
-                    return "member_access/other";
+                    // D.5 (2026-09-05, adversarial review): an unresolved-
+                    // global root (no oxc scope binding at all) is exactly
+                    // the precondition `resolve_root_namespace`'s own
+                    // ambient-global fallback needs -- if THIS identifier,
+                    // treated as a qualified-name root, is genuinely
+                    // ambiguous there (two+ ambient globals of this name,
+                    // none a clean namespace-merge winner), surface the
+                    // SAME `qualified:ambiguous` sub-reason `resolve_
+                    // qualified_name_segment`'s own `TSQualifiedName` path
+                    // uses, instead of the generic `other` -- diagnostic
+                    // precision only, `resolve_static_member_reference`'s
+                    // own `resolve_qualified_namespace_path` attempt
+                    // already failed by the time this runs either way.
+                    return if matches!(
+                        self.resolve_root_namespace(ident),
+                        RootNamespaceLookup::Ambiguous
+                    ) {
+                        REASON_MEMBER_ACCESS_QUALIFIED_AMBIGUOUS
+                    } else {
+                        "member_access/other"
+                    };
                 };
                 // 3a: an import-bound symbol is keyed into `_ref` and
                 // `_call` TOGETHER at every population site -- either one
@@ -3547,7 +3594,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 .ambient_index
                 .resolve_global(ident.name.as_str(), &self.path)
             {
-                resolver::GlobalLookup::Unique(_) => "unresolved_global_ambient_resolved",
+                resolver::GlobalLookup::Unique { .. } => "unresolved_global_ambient_resolved",
                 resolver::GlobalLookup::Ambiguous => "unresolved_global_ambient_ambiguous",
                 resolver::GlobalLookup::Absent => "unresolved_global",
             };
@@ -4280,10 +4327,10 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .ambient_index
             .resolve_global(&root.name, &self.path)
         {
-            resolver::GlobalLookup::Unique(target_id)
-                if target_id_kind_is_one_of(&target_id, &[DeclKind::Namespace]) =>
+            resolver::GlobalLookup::Unique { entity_id, .. }
+                if target_id_kind_is_one_of(&entity_id, &[DeclKind::Namespace]) =>
             {
-                RootNamespaceLookup::Unique(target_id)
+                RootNamespaceLookup::Unique(entity_id)
             }
             resolver::GlobalLookup::Ambiguous => RootNamespaceLookup::Ambiguous,
             _ => RootNamespaceLookup::Absent,
@@ -8357,15 +8404,54 @@ mod tests {
         );
     }
 
+    /// D.5 (2026-09-05, adversarial review) regression fixture:
+    /// `resolve_ambient_global` used to hardcode `cross_file: true`
+    /// unconditionally -- wrong for a `declare global {}` block referenced
+    /// again LATER IN THAT SAME FILE. Observed indirectly through `core:
+    /// covers` derivation (`cross_file` is never serialized into the
+    /// reference row's own body -- `finish`'s own doc comment): a TEST-
+    /// CONTAINER owner (`is_test: true`, `test_container_owner_file`)
+    /// synthesizes a `core:covers` row ONLY for a `cross_file` reference
+    /// (`declare_global_block_member_resolves_from_another_file`'s own
+    /// cross-file case would, if it used a test-container owner); a same-
+    /// file `declare global` self-reference must synthesize NONE.
+    #[test]
+    fn declare_global_self_reference_in_the_declaring_test_file_is_not_cross_file() {
+        let mut declaring_file = test_container_owner_file("globals.ts");
+        declaring_file.ambient_globals = vec![ambient_global(
+            crate::EntityKind::Variable,
+            "globals.ts",
+            30,
+            "foo",
+            crate::GlobalScope::DeclareGlobal,
+        )];
+        let mut files = BTreeMap::new();
+        files.insert("globals.ts".to_owned(), declaring_file);
+        let ctx = helper_ctx(files);
+        let source = "function use() {\n  return foo + 1;\n}\n";
+        let semantics = analyze_owner_semantics_with_context("globals.ts", source, &ctx)
+            .expect("analysis succeeds");
+        let target_id = "jsts:variable:globals.ts:30:foo";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+        assert!(
+            covers(&semantics).is_empty(),
+            "a same-file ambient-global reference must not synthesize a core:covers row: {:?}",
+            covers(&semantics)
+        );
+    }
+
     /// Two SCRIPT files each declaring `namespace jest {}` at their own top
     /// level (a real, if unusual, cross-file declaration merge -- e.g. two
-    /// separate `.d.ts` files both augmenting the same ambient namespace):
-    /// resolves to the FIRST declaration in `files`' own `BTreeMap` (path)
-    /// order, mirroring `resolve_direct_export`'s `ExportPolicy::
-    /// FirstDeclaration` (`valueDeclaration ?? declarations[0]`) for the
-    /// single-file case.
+    /// separate `.d.ts` files both augmenting the same ambient namespace),
+    /// neither sharing the referencing file's own package scope: stays
+    /// `Ambiguous` (D.5) -- see `resolve_global`'s own doc comment for why
+    /// a `BTreeMap`-path-order "first declaration" guess was wrong here.
     #[test]
-    fn two_files_declaring_the_same_namespace_resolve_to_the_first_by_path_order() {
+    fn two_files_declaring_the_same_namespace_with_no_scope_match_stays_ambiguous() {
         let mut files = BTreeMap::new();
         files.insert(
             "a-jest.d.ts".to_owned(),
@@ -8394,16 +8480,62 @@ mod tests {
             ),
         );
         let ctx = helper_ctx(files);
-        // Neither top-level path shares a `packages/...` scope with the
-        // referencing file below, so `resolve_global`'s package-scope
-        // proximity correction never distinguishes them here -- this
-        // exercises the FALLBACK rule (`BTreeMap` path order), unaffected
-        // by that correction. See `two_namespace_packages_prefer_the_
-        // referencing_files_own_package` for the proximity rule itself.
+        // D.5 (2026-09-05, adversarial review): neither top-level path
+        // shares a `packages/...` scope with the referencing file below,
+        // so ZERO candidates match its own package -- `resolve_global`
+        // used to fall back to "first declaring path in `BTreeMap` order"
+        // here (a guess), now correctly stays `Ambiguous` -- never a
+        // guess. See `two_namespace_packages_prefer_the_referencing_
+        // files_own_package` for the EXACTLY-ONE-in-scope case (`Unique`).
         assert_eq!(
             ctx.ambient_index.resolve_global("jest", "consumer.ts"),
-            resolver::GlobalLookup::Unique("jsts:namespace:a-jest.d.ts:10:jest".to_owned()),
-            "expected the FIRST declaring path (BTreeMap order) to win"
+            resolver::GlobalLookup::Ambiguous,
+            "zero same-scope candidates must never guess (BTreeMap order or otherwise)"
+        );
+    }
+
+    /// D.5 (2026-09-05, adversarial review): companion to the test above
+    /// for the OTHER inconclusive case -- TWO candidates both share the
+    /// referencing file's OWN package scope (not zero, but still not
+    /// exactly one) -- also `Ambiguous`, never a guess at which of the two
+    /// same-package declarations to prefer.
+    #[test]
+    fn two_files_declaring_the_same_namespace_in_the_referencers_own_package_stays_ambiguous() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "packages/cli/src/a-jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/cli/src/a-jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "packages/cli/src/a-jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        files.insert(
+            "packages/cli/src/z-jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/cli/src/z-jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "packages/cli/src/z-jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global(
+                "jest",
+                "packages/cli/src/__tests__/active-executions.test.ts"
+            ),
+            resolver::GlobalLookup::Ambiguous,
+            "two same-package candidates must never guess which one wins"
         );
     }
 
@@ -8450,17 +8582,20 @@ mod tests {
                 "jest",
                 "packages/cli/src/__tests__/active-executions.test.ts"
             ),
-            resolver::GlobalLookup::Unique(
-                "jsts:namespace:packages/cli/src/jest.d.ts:10:jest".to_owned()
-            ),
+            resolver::GlobalLookup::Unique {
+                entity_id: "jsts:namespace:packages/cli/src/jest.d.ts:10:jest".to_owned(),
+                declaring_path: "packages/cli/src/jest.d.ts".to_owned(),
+            },
             "expected the referencing file's OWN package (packages/cli) to win over BTreeMap order"
         );
         assert_eq!(
             ctx.ambient_index
                 .resolve_global("jest", "packages/@n8n/json-schema-to-zod/test/some.test.ts"),
-            resolver::GlobalLookup::Unique(
-                "jsts:namespace:packages/@n8n/json-schema-to-zod/test/jest.d.ts:10:jest".to_owned()
-            ),
+            resolver::GlobalLookup::Unique {
+                entity_id: "jsts:namespace:packages/@n8n/json-schema-to-zod/test/jest.d.ts:10:jest"
+                    .to_owned(),
+                declaring_path: "packages/@n8n/json-schema-to-zod/test/jest.d.ts".to_owned(),
+            },
             "expected the OTHER package's own referencing file to resolve to ITS OWN jest.d.ts"
         );
     }
@@ -8493,6 +8628,41 @@ mod tests {
         assert_eq!(
             ctx.ambient_index.resolve_global("console", "a.ts"),
             resolver::GlobalLookup::Absent
+        );
+    }
+
+    /// D.5 (2026-09-05, adversarial review) regression fixture: unlike
+    /// `console` above (a `Variable`-kind shim, correctly denylisted),
+    /// `declare global { namespace globalThis { ... } }` is a genuine
+    /// workspace augmentation of the REAL global namespace -- the exact
+    /// corpus sample (`expression-runtime/src/runtime/index.ts`) named in
+    /// `SyntaxFileResult::ambient_globals`'s own doc comment as one of the
+    /// two cases motivating D.1. `globalThis.X` must resolve to it, not
+    /// stay `Absent` the way the plain denylist check would have left it.
+    #[test]
+    fn declare_global_namespace_augmentation_of_global_this_resolves() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "expression-runtime/src/runtime/index.ts".to_owned(),
+            target_file_with_globals(
+                "expression-runtime/src/runtime/index.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "expression-runtime/src/runtime/index.ts",
+                    30,
+                    "globalThis",
+                    crate::GlobalScope::DeclareGlobal,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global("globalThis", "a.ts"),
+            resolver::GlobalLookup::Unique {
+                entity_id: "jsts:namespace:expression-runtime/src/runtime/index.ts:30:globalThis"
+                    .to_owned(),
+                declaring_path: "expression-runtime/src/runtime/index.ts".to_owned(),
+            }
         );
     }
 
@@ -8619,6 +8789,37 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.3 == options_id),
             "expected a reference row targeting {options_id}, got {rows:?}"
+        );
+    }
+
+    /// D.5 (2026-09-05, adversarial review): `Ns.Member` in VALUE position
+    /// (a plain read, `StaticMemberExpression`, not the TYPE-position
+    /// `TSQualifiedName` D.3's own tests cover) where `Ns` is a LOCAL
+    /// namespace -- `resolve_static_member_reference` was never wired to
+    /// `resolve_qualified_namespace_path` at all, so this exact shape
+    /// stayed pending even after D.3 shipped.
+    #[test]
+    fn value_position_qualified_name_resolves_a_direct_export_of_a_local_namespace() {
+        let source = "namespace ListQuery {\n  export function getAll() {}\n}\nconst x = ListQuery.getAll;\n";
+        let namespace_start = source.find("ListQuery").unwrap() as u32;
+        let function_start = source.find("getAll").unwrap() as u32;
+        let namespace_id = format!("jsts:namespace:a.ts:{namespace_start}:ListQuery");
+        let function_id = format!("jsts:function:a.ts:{function_start}:getAll");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            target_file_with_namespace_members(
+                "a.ts",
+                vec![namespace_member(&namespace_id, "getAll", &function_id)],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == function_id),
+            "expected a reference row targeting {function_id}, got {rows:?}"
         );
     }
 
