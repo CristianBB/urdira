@@ -1508,16 +1508,27 @@ impl StoreReader {
     /// `urdira-tsgo-client::entity_index::EntityIndex` used to build from a
     /// full `iter_visible` scan (`urdira-indexing-worker`'s `v4::residual::
     /// collect`), now O(sites) via a per-segment binary search instead of
-    /// O(corpus). Segments are consulted newest-first (`inner.segments`'s
-    /// own ordering) and the first VISIBLE hit wins -- matching every other
-    /// "resolve a key across generations" reader path (`get`/`by_identity_
-    /// last`'s own doc comment). `(owner_artifact, span_start)` is expected
-    /// unique within one segment's own entity population (the `jsts:entity_
-    /// inferred_type` exclusion at write time exists specifically to keep
-    /// it that way, see `segment_io::is_entities_index_row`'s doc comment);
-    /// if more than one row shares the key regardless, the first visible
-    /// one in ascending index order wins, silently -- the same tolerance
-    /// `by_name`'s own binary-search range already has for a collision.
+    /// O(corpus). `(owner_artifact, span_start)` is expected unique among
+    /// LIVE rows within one segment's own entity population (the `jsts:
+    /// entity_inferred_type` exclusion at write time exists specifically to
+    /// keep it that way, see `segment_io::is_entities_index_row`'s doc
+    /// comment) -- but a genuine collision among several still-live
+    /// entities at the exact same span DOES occur in practice (confirmed
+    /// live: the shared `task-planner` fixture has exactly one, at
+    /// `start=0`, a pre-existing imprecision this section does not
+    /// introduce). This function scans EVERY segment (not "first segment
+    /// hit wins") and, among every VISIBLE candidate sharing the key,
+    /// deterministically picks the one with the greatest `valid_from`
+    /// (the most recently OPENED row); ties broken by the NEWEST segment
+    /// (`inner.segments`' own newest-first ordering); ties still remaining
+    /// (two rows in the very same segment's own key range, both visible,
+    /// both opened at the same `valid_from`) broken by the greater
+    /// `ordinal`. This rule is arbitrary but STABLE across repeated calls
+    /// against the same store snapshot (unlike an unordered "first hit in
+    /// whatever order the binary search range happens to enumerate"),
+    /// matching decision 26's amendment. See `docs/decisions/
+    /// 26-v4-structural-store.md`'s `entities.index` section for the same
+    /// rule spelled out at the format level.
     pub fn entity_by_owner_and_start(
         &self,
         owner: u32,
@@ -1525,7 +1536,15 @@ impl StoreReader {
         generation: u64,
     ) -> Option<RecordView> {
         let inner = self.snapshot();
-        for seg in &inner.segments {
+        // `(valid_from, newest-segment-first rank, ordinal)` -- compared
+        // with a plain tuple `>` so "greatest wins" reads directly off the
+        // doc comment's own tie-break order. `seg_rank` is the REVERSE of
+        // `inner.segments`' own index (segment 0 is newest) so a smaller
+        // segment index -- newer -- compares as a LARGER `seg_rank`.
+        let segment_count = inner.segments.len();
+        let mut best: Option<(u32, usize, usize, RecordView)> = None;
+        for (seg_index, seg) in inner.segments.iter().enumerate() {
+            let seg_rank = segment_count - seg_index;
             let data = &seg.entities_index[HEADER_LEN..];
             let (lo, hi) = triple_key_range(data, owner, start);
             for i in lo..hi {
@@ -1535,12 +1554,22 @@ impl StoreReader {
                     store: Arc::clone(&inner),
                     ordinal: ord,
                 };
-                if view.is_visible(generation) {
-                    return Some(view);
+                if !view.is_visible(generation) {
+                    continue;
+                }
+                let candidate_key = (view.valid_from(), seg_rank, ord);
+                let is_better = match &best {
+                    None => true,
+                    Some((valid_from, rank, ordinal, _)) => {
+                        candidate_key > (*valid_from, *rank, *ordinal)
+                    }
+                };
+                if is_better {
+                    best = Some((candidate_key.0, candidate_key.1, candidate_key.2, view));
                 }
             }
         }
-        None
+        best.map(|(_, _, _, view)| view)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1994,9 +2023,9 @@ impl StoreReader {
             // (`write_base`/`write_base_partitioned`/`build_delta_
             // sections`) -- verified together via `verify_records_hot_
             // partitioned`, which re-derives the nibble boundaries from
-            // `keys`/`meta` themselves. The other 9 mandatory sections are
-            // never partitioned, so they keep the plain whole-data
-            // `verify_xxh3`.
+            // `keys`/`meta` themselves. The other 10 mandatory sections
+            // (9 pre-F4-4.3, plus `entities.index`) are never partitioned,
+            // so they keep the plain whole-data `verify_xxh3`.
             verify_records_hot_partitioned(
                 &seg.keys,
                 &seg.meta,

@@ -164,16 +164,30 @@ writer (`writer::build_delta_sections`), filtered by the same rule
 (`segment_io::is_entities_index_row`/`inferred_type_kind_id`) so all three
 writers apply the exclusion identically. Read side: `StoreReader::entity_
 by_owner_and_start(owner, start, generation)` binary-searches each
-segment's own array (newest-first, same convention as `get`/`by_identity_
-last`) and returns the first VISIBLE hit — `(owner_artifact, span_start)` is
+segment's own array for the key — `(owner_artifact, span_start)` is
 expected unique among LIVE rows (enforced at write time by the inferred-
 type exclusion, not by any uniqueness check across every historical row a
 segment's array may still list), so a genuine collision among several
 still-live entities at the exact same span (observed once in the shared
 `task-planner` fixture, at `(owner, start=0)` — a pre-existing imprecision,
-not introduced by this section) resolves to whichever candidate sorts
-first, silently, the same tolerance `by_name`'s own binary-search range
-already has. The section is **mandatory** in every base/delta this crate
+not introduced by this section) is resolved DETERMINISTICALLY rather than
+by "whichever candidate the binary search range happens to enumerate
+first" (the original P4-review draft of this rule, replaced before this
+decision's text settled — revision fix, 2026-09-05): every segment is
+scanned (not just the newest), and among every VISIBLE candidate sharing
+the key the winner is picked by, in order, (1) the greatest `valid_from`
+(the most recently OPENED row), (2) on a tie, the NEWEST segment
+(`StoreInner::segments`' own newest-first ordering), (3) on a further tie
+(two rows in the very same segment's own key range), the greatest
+`ordinal`. This is arbitrary but STABLE across repeated calls against the
+same snapshot, unlike an order that depends on binary-search/sort
+internals — see `crates/urdira-structural-store/tests/entities_index_test
+.rs::entity_by_owner_and_start_breaks_ties_deterministically` for both
+tie-break levels exercised directly, and `urdira-indexing-worker`'s
+`entities_index_section_and_scan_agree_on_the_shared_fixture` for the
+real fixture's own collision resolving identically through both the
+`entities.index` section and the pre-4.3 full-scan path. The section is
+**mandatory** in every base/delta this crate
 writes from format 6 onward (unlike `pending.sites`/`dict.bin`/etc.'s
 "absent when empty" convention) — `container::open_container` already
 treats an unknown `SectionId` in a container's TOC as a hard error, so a

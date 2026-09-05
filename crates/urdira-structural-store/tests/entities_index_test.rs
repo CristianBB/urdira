@@ -163,3 +163,80 @@ fn entities_index_round_trips_across_base_and_two_deltas_with_visibility_by_gene
         .verify_all()
         .expect("verify_all accepts entities.index");
 }
+
+/// Revision fix (2026-09-05): `StoreReader::entity_by_owner_and_start`'s
+/// deterministic tie-break (greatest `valid_from`, then newest segment,
+/// then greatest `ordinal`) among several VISIBLE candidates sharing the
+/// same `(owner, start)` key -- a genuine ambiguity this store format does
+/// not itself forbid (only `push_entity`'s own producer discipline
+/// normally prevents two LIVE rows at the same span; this test constructs
+/// the ambiguous input directly rather than relying on a real corpus
+/// happening to contain one).
+#[test]
+fn entity_by_owner_and_start_breaks_ties_deterministically() {
+    let dicts = build_dictionaries(2, 0);
+    let writer = SegmentWriter::new();
+
+    // -- Same segment, same `valid_from`: the tie-break falls all the way
+    // through to `ordinal`, which is this row's own position in
+    // `compute_order`'s record_id-ascending sort within the base -- so the
+    // row with the GREATER `record_id` (`high`) must win.
+    let dir_a = tmp_dir("entities-index-tie-ordinal");
+    let mut low = entity_row(0, 100, 1, 0, "low");
+    low.record_id = [0x01; 32];
+    let mut high = entity_row(0, 100, 1, 0, "high");
+    high.record_id = [0xFF; 32];
+    writer
+        .write_base(&dir_a, &[low.clone(), high.clone()], &[], &dicts, 1)
+        .expect("write_base (ordinal tie fixture)");
+    let reader_a = StoreReader::open(&dir_a).expect("open ordinal tie fixture");
+    assert_eq!(
+        reader_a
+            .entity_by_owner_and_start(0, 100, 1)
+            .map(|view| view.record_id()),
+        Some(high.record_id),
+        "same valid_from, same segment: the candidate with the greater ordinal must win"
+    );
+
+    // -- Different segments, same key, BOTH still visible (the base row is
+    // deliberately never closed): the delta's own row has the GREATER
+    // `valid_from` and must win regardless of ordinal/record_id, since
+    // `valid_from` is the PRIMARY tie-break key, checked before segment
+    // recency or ordinal.
+    let dir_b = tmp_dir("entities-index-tie-valid-from");
+    let mut old = entity_row(1, 50, 1, 0, "old");
+    old.record_id = [0xFF; 32]; // deliberately the LARGER record_id, to prove valid_from wins first.
+    writer
+        .write_base(&dir_b, &[old.clone()], &[], &dicts, 1)
+        .expect("write_base (valid_from tie fixture)");
+    let reader_b = StoreReader::open(&dir_b).expect("open valid_from tie fixture");
+    let new_row = entity_row(1, 50, 2, 0, "new");
+    writer
+        .write_delta_with_reader(
+            &dir_b,
+            &reader_b,
+            std::slice::from_ref(&new_row),
+            &[], // `old` is deliberately never closed -- both rows are live.
+            &[],
+            &[],
+            &Dictionaries::default(),
+            2,
+        )
+        .expect("write_delta (valid_from tie fixture)");
+    reader_b.reopen_if_changed().expect("reopen");
+    assert_eq!(
+        reader_b
+            .entity_by_owner_and_start(1, 50, 2)
+            .map(|view| view.record_id()),
+        Some(new_row.record_id),
+        "both rows visible at generation 2: the one with the greater valid_from must win, \
+         even though the older row has the numerically larger record_id"
+    );
+    // At generation 1 only `old` was open yet -- unambiguous, no tie to break.
+    assert_eq!(
+        reader_b
+            .entity_by_owner_and_start(1, 50, 1)
+            .map(|view| view.record_id()),
+        Some(old.record_id)
+    );
+}

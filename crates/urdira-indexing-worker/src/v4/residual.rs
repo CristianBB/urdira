@@ -3633,20 +3633,36 @@ mod tests {
         // the same `(owner, span_start)`, e.g. every top-level declaration
         // in a file whose `push_entity` recipe reports `start == 0` for
         // some kind this fixture happens to exercise) -- an existing,
-        // orthogonal imprecision this task does not fix (see `StoreReader::
-        // entity_by_owner_and_start`'s own doc comment on "first visible
-        // wins, silently"). For an AMBIGUOUS key, `EntityIndex::build`'s
-        // hash-map insertion order and `entities.index`'s own `sort_
-        // unstable` tie-order need not agree on WHICH candidate wins --
-        // this test only requires each strategy's pick to be SOME live
-        // candidate for that key, not a specific one; only an
-        // UNAMBIGUOUS key (exactly one live entity) is checked for exact
-        // agreement with the known-correct record_id.
+        // orthogonal imprecision this task does not fix. Revision fix
+        // (2026-09-05): `StoreReader::entity_by_owner_and_start` now picks
+        // a DETERMINISTIC winner among candidates sharing a key (greatest
+        // `valid_from`, then newest segment, then greatest `ordinal` --
+        // see its own doc comment), so this test now requires an AMBIGUOUS
+        // key to resolve to that SAME specific candidate through BOTH
+        // strategies, not merely "some" candidate: `store.entity_by_owner_
+        // and_start` is used directly as the oracle (the `Section` variant
+        // of `EntityLookup` is a thin wrapper over it, so agreeing with it
+        // is definitional for that side; the real cross-check is that
+        // `Scan` -- a completely independent, hash-map-based
+        // implementation -- lands on the exact same record_id too, which
+        // it does for THIS fixture because both algorithms reduce to
+        // "greatest record_id among the tied candidates" for a
+        // single-generation, single-segment cold scan: `entities.index`'s
+        // `ordinal` is the row's own position in `compute_order`'s
+        // record_id-ascending sort, and `EntityIndex::build`'s hash-map
+        // "last write wins" is fed by `store.iter_visible`'s own
+        // record_id-ascending k-way merge -- not a coincidence expected to
+        // hold across every possible store shape, only asserted here for
+        // this specific single-segment fixture).
         let inferred_type_kind_id = dicts
             .kinds
             .iter()
             .position(|k| k == "jsts:entity_inferred_type");
-        let mut candidates_by_key: HashMap<(String, i32), Vec<[u8; 32]>> = HashMap::new();
+        // `(owner_artifact, every candidate record_id seen at that key)`,
+        // keyed by `(path, start)` -- a local alias only to satisfy
+        // clippy's `type_complexity` lint, no behavior change.
+        type CandidatesByKey = HashMap<(String, i32), (u32, Vec<[u8; 32]>)>;
+        let mut candidates_by_key: CandidatesByKey = HashMap::new();
         for view in store.iter_visible(generation) {
             if view.category() != CATEGORY_ENTITY {
                 continue;
@@ -3658,10 +3674,10 @@ mod tests {
                 continue;
             };
             let start = view.span_start_byte() as i32;
-            candidates_by_key
+            let entry = candidates_by_key
                 .entry((path, start))
-                .or_default()
-                .push(view.record_id());
+                .or_insert_with(|| (view.owner_artifact(), Vec::new()));
+            entry.1.push(view.record_id());
         }
         assert!(
             !candidates_by_key.is_empty(),
@@ -3669,20 +3685,28 @@ mod tests {
         );
         let mut checked_unambiguous = 0u64;
         let mut ambiguous_keys = 0u64;
-        for ((path, start), candidates) in &candidates_by_key {
+        for ((path, start), (owner_ordinal, candidates)) in &candidates_by_key {
             let section_hit = via_section.entities.lookup(path, *start);
             let scan_hit = via_scan.entities.lookup(path, *start);
+            let expected = store
+                .entity_by_owner_and_start(*owner_ordinal, *start as u32, generation)
+                .map(|view| view.record_id());
             assert!(
-                section_hit.is_some_and(|id| candidates.contains(&id)),
-                "entities.index section path resolved {path}:{start} to a non-candidate: {section_hit:?}"
+                expected.is_some_and(|id| candidates.contains(&id)),
+                "entity_by_owner_and_start's own deterministic pick for {path}:{start} is not \
+                 among the candidates it should be choosing from: {expected:?}"
             );
-            assert!(
-                scan_hit.is_some_and(|id| candidates.contains(&id)),
-                "full-scan path resolved {path}:{start} to a non-candidate: {scan_hit:?}"
+            assert_eq!(
+                section_hit, expected,
+                "entities.index section path disagreed with entity_by_owner_and_start's own \
+                 deterministic pick for {path}:{start}"
+            );
+            assert_eq!(
+                scan_hit, expected,
+                "full-scan path did not converge on the SAME deterministic pick as \
+                 entity_by_owner_and_start for {path}:{start} -- got {scan_hit:?}, expected {expected:?}"
             );
             if candidates.len() == 1 {
-                assert_eq!(section_hit, Some(candidates[0]));
-                assert_eq!(scan_hit, Some(candidates[0]));
                 checked_unambiguous += 1;
             } else {
                 ambiguous_keys += 1;
@@ -3694,6 +3718,12 @@ mod tests {
         assert!(
             checked_unambiguous > 0,
             "expected at least one unambiguous (path, start) key in the shared fixture"
+        );
+        assert!(
+            ambiguous_keys > 0,
+            "expected the shared fixture's known genuine key collision to still be present -- \
+             if this now fails, the collision may have been fixed upstream; update this test's \
+             own doc comment accordingly rather than deleting the ambiguous-key assertions"
         );
     }
 
