@@ -1389,6 +1389,18 @@ pub struct AmbientModuleIndex {
     /// order, mirroring `resolve_direct_export`'s `FirstDeclaration`
     /// policy).
     globals: HashMap<String, Vec<(String, AmbientGlobalDeclaration)>>,
+    /// D.3 (2026-09-05, references-parity task): every workspace file's own
+    /// `SyntaxFileResult::namespace_members`, keyed by `(namespace_entity_id,
+    /// member_name)` -- see `resolve_namespace_member_by_name`'s own doc
+    /// comment for the lookup contract. NOT merge-aware across files: a
+    /// `namespace_entity_id` already names ONE SPECIFIC declaring file's
+    /// own block (its id embeds that file's own path), so a namespace
+    /// merged across two files only ever exposes the members declared in
+    /// whichever ONE file `resolve_qualified_namespace_path`'s own root
+    /// resolution landed on -- a real, accepted limitation (never a WRONG
+    /// answer, only a possibly-incomplete one), out of this task's stated
+    /// scope.
+    namespace_members: HashMap<(String, String), Vec<String>>,
 }
 
 impl AmbientModuleIndex {
@@ -1408,6 +1420,7 @@ impl AmbientModuleIndex {
             HashMap::new();
         let mut patterns: Vec<(String, String, AmbientModuleDeclaration)> = Vec::new();
         let mut globals: HashMap<String, Vec<(String, AmbientGlobalDeclaration)>> = HashMap::new();
+        let mut namespace_members: HashMap<(String, String), Vec<String>> = HashMap::new();
         let mut script_count = 0u64;
         let mut augmentation_count = 0u64;
         let mut global_count = 0u64;
@@ -1443,6 +1456,14 @@ impl AmbientModuleIndex {
                     .or_default()
                     .push((path.clone(), declaration.clone()));
             }
+            // D.3 (2026-09-05, references-parity task): see
+            // `namespace_members`'s own doc comment.
+            for member in &file.namespace_members {
+                namespace_members
+                    .entry((member.namespace_entity_id.clone(), member.name.clone()))
+                    .or_default()
+                    .push(member.member_entity_id.clone());
+            }
         }
         if std::env::var_os("URDIRA_V4_DEBUG_AMBIENT_MODULES").is_some() {
             eprintln!(
@@ -1456,6 +1477,7 @@ impl AmbientModuleIndex {
             by_specifier,
             patterns,
             globals,
+            namespace_members,
         }
     }
 
@@ -1665,6 +1687,47 @@ impl AmbientModuleIndex {
         }
         GlobalLookup::Ambiguous
     }
+
+    /// D.3 (2026-09-05, references-parity task): resolve `member_name` as a
+    /// DIRECT `export` of `namespace_entity_id`'s own block -- the single-
+    /// segment lookup `resolve_qualified_namespace_path` (`semantic_
+    /// sites.rs`) chains once per `A.B`/`A.B.C` segment, descending into
+    /// the resolved member when it is ITSELF a namespace and there are
+    /// more segments left. `Unique` only when EXACTLY ONE `NamespaceMember`
+    /// fact named this pair (never happens twice for the SAME declaring
+    /// namespace id in practice -- a namespace body cannot legally export
+    /// the same name twice -- but checked via a `BTreeSet` of distinct ids
+    /// for robustness, same pattern `resolve_global` uses). `Absent` covers
+    /// both "no member with this name at all" and "`namespace_entity_id`
+    /// itself is not a namespace this index ever saw a body for" (e.g. an
+    /// ambient string-literal module, or a namespace declared only via the
+    /// bodyless nested-desugared form) -- both stay `checker_pending`,
+    /// never a guess either way.
+    pub fn resolve_namespace_member_by_name(
+        &self,
+        namespace_entity_id: &str,
+        member_name: &str,
+    ) -> NamespaceMemberLookup {
+        let key = (namespace_entity_id.to_owned(), member_name.to_owned());
+        let Some(candidates) = self.namespace_members.get(&key) else {
+            return NamespaceMemberLookup::Absent;
+        };
+        let unique_ids: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
+        match unique_ids.len() {
+            0 => NamespaceMemberLookup::Absent,
+            1 => NamespaceMemberLookup::Unique(candidates[0].clone()),
+            _ => NamespaceMemberLookup::Ambiguous,
+        }
+    }
+}
+
+/// Outcome of [`AmbientModuleIndex::resolve_namespace_member_by_name`] --
+/// see that method's own doc comment for the exact rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceMemberLookup {
+    Unique(String),
+    Ambiguous,
+    Absent,
 }
 
 /// D.1 correction 2 (see `resolve_global`'s own doc comment): the
@@ -2392,6 +2455,7 @@ mod tests {
             export_star_specifiers,
             ambient_modules: Vec::new(),
             ambient_globals: Vec::new(),
+            namespace_members: Vec::new(),
             line_index: crate::LineIndex::from_text(""),
         }
     }

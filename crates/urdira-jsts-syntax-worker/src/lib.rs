@@ -543,6 +543,24 @@ pub struct SyntaxFileResult {
     /// workspace-wide NAME lookup fact pointing at an entity that exists
     /// either way).
     pub ambient_globals: Vec<AmbientGlobalDeclaration>,
+    /// D.3 (2026-09-05, references-parity task): every DIRECT `export`
+    /// member of a LOCAL (`Identifier`-named, NEVER the string-literal
+    /// ambient-module shape -- see `visit_ts_module_declaration`'s own doc
+    /// comment for why the two are disjoint) `namespace X { ... }`/
+    /// `declare namespace X { ... }` block this file declares --
+    /// `A.B`/`A.B.C` qualified-name resolution (`resolver::AmbientModuleIndex
+    /// ::resolve_namespace_member_by_name`, consulted by `semantic_sites.rs`'s
+    /// `resolve_qualified_namespace_path`) needs a workspace-wide "what does
+    /// THIS namespace export under THIS name" table, which nothing before
+    /// this task built (`declaration_export_names`/`export_bindings` only
+    /// ever answer "what does a FILE export", never "what does a namespace
+    /// BLOCK export"). Reuses `ambient_module_members`'s own exported-name
+    /// extraction verbatim -- same "only a real `export` keyword makes a
+    /// member visible to a qualified-name lookup from outside the block"
+    /// rule TypeScript itself enforces, same shape (`name`, `entity_id`)
+    /// `AmbientModuleDeclaration::members` already uses for the string-
+    /// literal case.
+    pub namespace_members: Vec<NamespaceMember>,
     /// A4 (line numbers task, 2026-09-05): this file's own UTF-16-code-unit
     /// line index, built ONCE per parse (`LineIndex::from_text`, over the
     /// SAME original UTF-8 `text` `Utf8ToUtf16::convert_program` already
@@ -678,6 +696,16 @@ pub struct AmbientGlobalDeclaration {
     pub entity_id: String,
     pub kind: EntityKind,
     pub scope: GlobalScope,
+}
+
+/// D.3 (2026-09-05, references-parity task): one directly-`export`ed member
+/// of a LOCAL `namespace X { ... }` block -- see `SyntaxFileResult::
+/// namespace_members`'s own doc comment.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NamespaceMember {
+    pub namespace_entity_id: String,
+    pub name: String,
+    pub member_entity_id: String,
 }
 
 /// One bare `export * from "specifier"` this module has -- see
@@ -3364,6 +3392,18 @@ fn parse_source(
     collector
         .ambient_globals
         .sort_by(|left, right| left.entity_id.cmp(&right.entity_id));
+    collector.namespace_members.sort_by(|left, right| {
+        (
+            &left.namespace_entity_id,
+            &left.name,
+            &left.member_entity_id,
+        )
+            .cmp(&(
+                &right.namespace_entity_id,
+                &right.name,
+                &right.member_entity_id,
+            ))
+    });
     let diagnostics = parsed
         .diagnostics
         .into_iter()
@@ -3396,6 +3436,7 @@ fn parse_source(
         export_star_specifiers: collector.export_star_specifiers,
         ambient_modules: collector.ambient_modules,
         ambient_globals: collector.ambient_globals,
+        namespace_members: collector.namespace_members,
         line_index: LineIndex::from_text(text),
     })
 }
@@ -3434,6 +3475,10 @@ struct SyntaxCollector {
     /// `parsed.program.body` in `parse_source` (`ScriptTopLevel`
     /// candidates, filtered there once script-vs-module is known).
     ambient_globals: Vec<AmbientGlobalDeclaration>,
+    /// D.3 (2026-09-05, references-parity task): see `SyntaxFileResult::
+    /// namespace_members`'s own doc comment. Populated by `visit_ts_module_
+    /// declaration`'s `Identifier`-named branch.
+    namespace_members: Vec<NamespaceMember>,
     /// A5b (2026-09-05 references-parity task, bucket 1 --
     /// `import_binding/export:unresolved`, 1,340 workspace sites): every
     /// local binding this file's own `import` statements introduce, keyed by
@@ -3474,6 +3519,7 @@ impl SyntaxCollector {
             export_star_specifiers: Vec::new(),
             ambient_modules: Vec::new(),
             ambient_globals: Vec::new(),
+            namespace_members: Vec::new(),
             imported_locals: HashMap::new(),
         }
     }
@@ -4073,6 +4119,21 @@ fn declaration_entity_kind(declaration: &Declaration<'_>) -> Option<EntityKind> 
         Declaration::TSTypeAliasDeclaration(_) => Some(EntityKind::Type),
         Declaration::TSInterfaceDeclaration(_) => Some(EntityKind::Interface),
         Declaration::TSEnumDeclaration(_) => Some(EntityKind::Enum),
+        // D.3 (2026-09-05, references-parity task): `export namespace X {}`
+        // (`Identifier`-named only -- the string-literal ambient-module
+        // form is a different construct entirely, excluded here for the
+        // SAME reason `declaration_export_names`'s own `TSModuleDeclaration`
+        // arm excludes it) -- needed so `ambient_module_members`'s reuse as
+        // `SyntaxFileResult::namespace_members`'s own extraction captures a
+        // NESTED namespace as a member of its enclosing one
+        // (`ListQueryDb.Workflow.Plain`: `Workflow` is itself a namespace
+        // MEMBER of `ListQueryDb`, needed to keep descending the qualified-
+        // name chain -- see `resolve_qualified_namespace_path`, semantic_
+        // sites.rs).
+        Declaration::TSModuleDeclaration(module) => {
+            matches!(module.id, TSModuleDeclarationName::Identifier(_))
+                .then_some(EntityKind::Namespace)
+        }
         _ => None,
     }
 }
@@ -4682,6 +4743,30 @@ impl<'a> Visit<'a> for SyntaxCollector {
     fn visit_ts_module_declaration(&mut self, declaration: &TSModuleDeclaration<'a>) {
         if let TSModuleDeclarationName::Identifier(identifier) = &declaration.id {
             self.push_entity(identifier, EntityKind::Namespace, UniversalKind::Type);
+            // D.3 (2026-09-05, references-parity task): this LOCAL
+            // namespace's own directly-`export`ed members -- see
+            // `SyntaxFileResult::namespace_members`'s own doc comment. Only
+            // when the body is a real block directly on THIS declaration
+            // (never the nested-`TSModuleDeclaration` shape `namespace
+            // A.B {}` desugars `A`'s own body into -- there is nothing of
+            // `A`'s own to export directly there, only `B`, itself visited
+            // separately with its OWN `Identifier` branch when the walk
+            // reaches it).
+            if let Some(TSModuleDeclarationBody::TSModuleBlock(block)) = &declaration.body {
+                let namespace_entity_id = stable_entity_id(
+                    EntityKind::Namespace,
+                    &self.path,
+                    identifier.span.start,
+                    identifier.name.as_str(),
+                );
+                let (members, _default_member) = ambient_module_members(&self.path, &block.body);
+                self.namespace_members
+                    .extend(members.into_iter().map(|member| NamespaceMember {
+                        namespace_entity_id: namespace_entity_id.clone(),
+                        name: member.name,
+                        member_entity_id: member.entity_id,
+                    }));
+            }
         }
         if let TSModuleDeclarationName::StringLiteral(literal) = &declaration.id {
             let specifier = literal.value.as_str().to_owned();
@@ -4847,6 +4932,7 @@ fn reresolve_file(
         export_star_specifiers,
         ambient_modules: file.ambient_modules.clone(),
         ambient_globals: file.ambient_globals.clone(),
+        namespace_members: file.namespace_members.clone(),
         // A4: `file`'s own byte content is untouched here (only import/
         // export target-path resolution changed), so its line index is
         // still valid unchanged -- see `SyntaxFileResult::line_index`'s own
@@ -4914,6 +5000,7 @@ fn reresolve_ambient_relations(
         export_star_specifiers: file.export_star_specifiers.clone(),
         ambient_modules: file.ambient_modules.clone(),
         ambient_globals: file.ambient_globals.clone(),
+        namespace_members: file.namespace_members.clone(),
         // A4: same reasoning as `reresolve_file` above -- this rebuild never
         // touches `file`'s own byte content either.
         line_index: file.line_index.clone(),
@@ -8084,6 +8171,7 @@ declare module 'markdown-it-task-lists' {
                 export_star_specifiers: Vec::new(),
                 ambient_modules: Vec::new(),
                 ambient_globals: Vec::new(),
+                namespace_members: Vec::new(),
                 line_index: LineIndex::from_text(source_text),
             },
         );

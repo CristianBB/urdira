@@ -470,6 +470,16 @@ const REASON_IMPORT_BINDING: &str = "import_binding";
 const REASON_MULTIPLE_DECLARATIONS: &str = "multiple_declarations";
 const REASON_UNSUPPORTED_DECLARATION_KIND: &str = "unsupported_declaration_kind";
 const REASON_MEMBER_ACCESS: &str = "member_access";
+/// D.3 (2026-09-05, references-parity task): sub-reasons for a qualified
+/// name segment (`A.B`/`A.B.C`, `TSQualifiedName`) `resolve_qualified_
+/// namespace_path` could not resolve with certainty -- `absent` covers an
+/// unresolvable root, a segment with no matching export, or a non-last
+/// segment that resolved but is not itself a namespace to descend into;
+/// `ambiguous` covers a segment matching more than one export (should not
+/// happen for valid TypeScript -- a namespace body cannot legally export
+/// the same name twice -- but never assumed).
+const REASON_MEMBER_ACCESS_QUALIFIED_ABSENT: &str = "member_access/qualified:absent";
+const REASON_MEMBER_ACCESS_QUALIFIED_AMBIGUOUS: &str = "member_access/qualified:ambiguous";
 
 /// 2026-09-05 A5 references-parity task, Paso 0 (diagnosis only): every
 /// `Pending` outcome an `IdentifierRef` site can carry stays entirely
@@ -921,6 +931,33 @@ fn target_id_kind_is_one_of(target_id: &str, allowed: &[DeclKind]) -> bool {
     allowed.iter().any(|kind| kind.identity_name() == kind_name)
 }
 
+/// D.3 (2026-09-05, references-parity task): flattens a `TSTypeName` chain
+/// (`TSQualifiedName::left`, recursive by construction -- `A.B.C` parses as
+/// `QualifiedName{ left: QualifiedName{ left: Ident(A), right: B }, right:
+/// C }`) into its ROOT `IdentifierReference` plus the ordered segment NAMES
+/// from the root down to (but never including) the outermost `right`
+/// itself -- the caller appends that one separately, since it is the ONE
+/// segment `visit_ts_qualified_name` is actually resolving for THIS call
+/// (the walk visits each nesting level of a multi-segment chain
+/// separately, once per level, so `A.B.C`'s own `visit_ts_qualified_name`
+/// calls resolve `B` then `C` independently, each flattening only as far
+/// as ITS OWN `left`). `None` for a `this`-qualified name (`this.Foo`,
+/// legal but vanishingly rare in a qualified TYPE name -- no symbol table
+/// entry to resolve a root against, never a guess).
+fn flatten_qualified_name<'s, 'a>(
+    type_name: &'s TSTypeName<'a>,
+) -> Option<(&'s IdentifierReference<'a>, Vec<String>)> {
+    match type_name {
+        TSTypeName::IdentifierReference(ident) => Some((ident, Vec::new())),
+        TSTypeName::QualifiedName(inner) => {
+            let (root, mut segments) = flatten_qualified_name(&inner.left)?;
+            segments.push(inner.right.name.as_str().to_owned());
+            Some((root, segments))
+        }
+        TSTypeName::ThisExpression(_) => None,
+    }
+}
+
 struct ReferenceRow {
     start: u32,
     end: u32,
@@ -1135,6 +1172,15 @@ type HeritageClauseEntry = (u32, u32, Result<(String, String), &'static str>);
 enum ReferenceResolution {
     Resolved { target_id: String, cross_file: bool },
     Pending(&'static str),
+}
+
+/// D.3 (2026-09-05, references-parity task): `resolve_root_namespace`'s
+/// outcome -- see that method's own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootNamespaceLookup {
+    Unique(String),
+    Ambiguous,
+    Absent,
 }
 
 /// Ambient module resolution task (2026-09-04): `resolve_external_
@@ -4026,6 +4072,189 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             jsdoc_typed_file: self.jsdoc_typed_file,
         }
     }
+    /// D.3: what `visit_ts_qualified_name` resolves `name.right` to, or the
+    /// specific pending reason to fall back to. `jsdoc_typed_file` is
+    /// checked first, matching every other hand-rolled resolution in this
+    /// file. A `this`-qualified root (`flatten_qualified_name` returning
+    /// `None`) stays the plain, unsuffixed `REASON_MEMBER_ACCESS` --
+    /// exactly what this call site emitted unconditionally before this
+    /// task, for the one shape this mechanism was never going to reach
+    /// anyway.
+    fn resolve_qualified_name_segment(&self, name: &TSQualifiedName<'a>) -> ReferenceResolution {
+        if self.jsdoc_typed_file {
+            return ReferenceResolution::Pending(REASON_JSDOC_TYPED_FILE);
+        }
+        let Some((root, mut segments)) = flatten_qualified_name(&name.left) else {
+            return ReferenceResolution::Pending(
+                self.identifier_pending_reason(REASON_MEMBER_ACCESS),
+            );
+        };
+        segments.push(name.right.name.as_str().to_owned());
+        match self.resolve_qualified_namespace_path(root, &segments) {
+            Some(target_id) => ReferenceResolution::Resolved {
+                target_id,
+                // Same simplification `resolve_ambient_global` already
+                // makes (see that function's own doc comment) rather than
+                // compare `self.path` against the resolved member's own
+                // declaring path.
+                cross_file: true,
+            },
+            None => ReferenceResolution::Pending(self.qualified_name_pending_reason(root)),
+        }
+    }
+
+    /// D.3: `REASON_MEMBER_ACCESS_QUALIFIED_AMBIGUOUS` when re-resolving
+    /// JUST the root (ignoring every segment) would itself report
+    /// `Ambiguous` some segment along the chain (an approximation -- the
+    /// AMBIGUITY could equally be a later segment's, never a full re-trace
+    /// here -- but distinguishing exactly WHICH hop failed is diagnostic-
+    /// only value this task's own numeric criteria do not require);
+    /// `REASON_MEMBER_ACCESS_QUALIFIED_ABSENT` otherwise. Gated on
+    /// `jsdoc_typed_file` the same way every other reason constant already
+    /// is (`identifier_pending_reason`).
+    fn qualified_name_pending_reason(&self, root: &IdentifierReference<'a>) -> &'static str {
+        let reason = if matches!(
+            self.resolve_root_namespace(root),
+            RootNamespaceLookup::Ambiguous
+        ) {
+            REASON_MEMBER_ACCESS_QUALIFIED_AMBIGUOUS
+        } else {
+            REASON_MEMBER_ACCESS_QUALIFIED_ABSENT
+        };
+        self.identifier_pending_reason(reason)
+    }
+
+    /// D.3: resolve `root` (the LEFTMOST identifier of a qualified name
+    /// chain) to a namespace entity id, then descend through `segments` in
+    /// order via `NamespaceMember` facts (`resolver::AmbientModuleIndex::
+    /// resolve_namespace_member_by_name`), requiring every NON-LAST segment
+    /// to ITSELF resolve to a namespace (to keep descending) -- the LAST
+    /// segment's own resolved member id (of ANY kind) is the final answer.
+    /// `None` at any hop -- root unresolved/ambiguous, a segment absent/
+    /// ambiguous, or a non-last segment resolving to something that is not
+    /// itself a namespace -- never a guess.
+    fn resolve_qualified_namespace_path(
+        &self,
+        root: &IdentifierReference<'a>,
+        segments: &[String],
+    ) -> Option<String> {
+        let RootNamespaceLookup::Unique(mut current_namespace_id) =
+            self.resolve_root_namespace(root)
+        else {
+            return None;
+        };
+        let last_index = segments.len().checked_sub(1)?;
+        for (index, segment) in segments.iter().enumerate() {
+            let is_last = index == last_index;
+            match self
+                .ctx
+                .ambient_index
+                .resolve_namespace_member_by_name(&current_namespace_id, segment)
+            {
+                resolver::NamespaceMemberLookup::Unique(member_id) => {
+                    if is_last {
+                        return Some(member_id);
+                    }
+                    if !target_id_kind_is_one_of(&member_id, &[DeclKind::Namespace]) {
+                        return None;
+                    }
+                    current_namespace_id = member_id;
+                }
+                resolver::NamespaceMemberLookup::Ambiguous
+                | resolver::NamespaceMemberLookup::Absent => return None,
+            }
+        }
+        None
+    }
+
+    /// D.3: the ROOT identifier of a qualified-name chain, classified as a
+    /// namespace: a SAME-FILE local namespace or a named-import binding
+    /// resolving to one (`resolve_identifier_to_kind`, already covers
+    /// both, `UniqueOrAmbiguous` policy -- consistent with `resolve_call_
+    /// target`'s own use of the same function for a heritage/call target),
+    /// falling back to an AMBIENT GLOBAL namespace (D.1, `jest`/
+    /// `globalThis`-shaped) when the identifier has no oxc scope binding at
+    /// all. `Ambiguous` is surfaced separately from `Absent` ONLY for the
+    /// ambient-global fallback (the only one of the two `resolve_
+    /// identifier_to_kind`/`resolve_global` this function calls that
+    /// itself distinguishes the two -- `resolve_identifier_to_kind`
+    /// collapses everything doubtful to `None`).
+    fn resolve_root_namespace(&self, root: &IdentifierReference<'a>) -> RootNamespaceLookup {
+        if let Some(target_id) = self.resolve_identifier_to_kind(root, &[DeclKind::Namespace]) {
+            return RootNamespaceLookup::Unique(target_id);
+        }
+        if root.reference_id.get().is_some() {
+            let reference = self
+                .scoping
+                .get_reference(root.reference_id.get().expect("checked"));
+            if reference.symbol_id().is_some() {
+                // A bound (non-global) symbol that `resolve_identifier_to_
+                // kind` already tried and failed to classify as a
+                // namespace -- never an ambient global (those are, by
+                // definition, names with NO scope binding at all).
+                return RootNamespaceLookup::Absent;
+            }
+        }
+        match self
+            .ctx
+            .ambient_index
+            .resolve_global(&root.name, &self.path)
+        {
+            resolver::GlobalLookup::Unique(target_id)
+                if target_id_kind_is_one_of(&target_id, &[DeclKind::Namespace]) =>
+            {
+                RootNamespaceLookup::Unique(target_id)
+            }
+            resolver::GlobalLookup::Ambiguous => RootNamespaceLookup::Ambiguous,
+            _ => RootNamespaceLookup::Absent,
+        }
+    }
+
+    /// D.3: shared emission for a resolved-or-pending qualified-name
+    /// segment -- mirrors `visit_identifier_reference`'s own `Resolved`/
+    /// `Pending` handling, minus the parameter/catch-binding "referenced-
+    /// only" bookkeeping (a namespace member's own target id is never one
+    /// of those two kinds).
+    fn finish_qualified_name_segment(
+        &mut self,
+        start: u32,
+        end: u32,
+        resolution: ReferenceResolution,
+    ) {
+        match resolution {
+            ReferenceResolution::Resolved {
+                target_id,
+                cross_file,
+            } => {
+                self.push_site(
+                    SiteKind::IdentifierRef,
+                    start,
+                    end,
+                    SiteDisposition::RustResolved,
+                    None,
+                );
+                let source_id = self.current_owner();
+                if source_id != target_id {
+                    self.reference_rows.push(ReferenceRow {
+                        start,
+                        end,
+                        source_id,
+                        target_id,
+                        cross_file,
+                    });
+                }
+            }
+            ReferenceResolution::Pending(reason) => {
+                self.push_site(
+                    SiteKind::IdentifierRef,
+                    start,
+                    end,
+                    SiteDisposition::CheckerPending,
+                    Some(reason),
+                );
+            }
+        }
+    }
 }
 
 fn compute_sites_digest(sites: &[SemanticSite]) -> String {
@@ -4979,14 +5208,19 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         walk_static_member_expression(self, expr);
     }
 
+    /// D.3 (2026-09-05, references-parity task): before this task, EVERY
+    /// `TSQualifiedName` segment (`A.B`/`A.B.C`, e.g. `jest.Mocked<T>`/
+    /// `ListQuery.Options['filter']`) stayed unconditionally `checker_
+    /// pending` -- oxc gives `right` (the segment span this call resolves)
+    /// no `IdentifierReference`/symbol at all, so nothing in the ordinary
+    /// scope-based machinery could ever touch it. `resolve_qualified_
+    /// namespace_path` closes the case where `left` names a KNOWN
+    /// namespace (local, imported by name, or an ambient global -- D.1)
+    /// and `right` is one of that namespace's own directly-`export`ed
+    /// members (D.3's own `NamespaceMember` facts).
     fn visit_ts_qualified_name(&mut self, name: &TSQualifiedName<'a>) {
-        self.push_site(
-            SiteKind::IdentifierRef,
-            name.right.span.start,
-            name.right.span.end,
-            SiteDisposition::CheckerPending,
-            Some(self.identifier_pending_reason(REASON_MEMBER_ACCESS)),
-        );
+        let resolution = self.resolve_qualified_name_segment(name);
+        self.finish_qualified_name_segment(name.right.span.start, name.right.span.end, resolution);
         walk_ts_qualified_name(self, name);
     }
 
@@ -7528,6 +7762,7 @@ mod tests {
                     crate::EntityKind::Function => "function",
                     crate::EntityKind::Class => "class",
                     crate::EntityKind::Variable => "variable",
+                    crate::EntityKind::Namespace => "namespace",
                     other => panic!("unhandled entity kind in test helper: {other:?}"),
                 }
             ),
@@ -7563,6 +7798,7 @@ mod tests {
             export_star_specifiers: Vec::new(),
             ambient_modules: Vec::new(),
             ambient_globals: Vec::new(),
+            namespace_members: Vec::new(),
             line_index: crate::LineIndex::from_text(""),
         }
     }
@@ -7611,6 +7847,29 @@ mod tests {
             entity_id: format!("jsts:{kind_word}:{path}:{start}:{name}"),
             kind,
             scope,
+        }
+    }
+
+    /// D.3 (2026-09-05, references-parity task): same as `target_file`
+    /// above, with an explicit `namespace_members` list.
+    fn target_file_with_namespace_members(
+        path: &str,
+        namespace_members: Vec<crate::NamespaceMember>,
+    ) -> crate::SyntaxFileResult {
+        let mut result = target_file(path, Vec::new(), Vec::new());
+        result.namespace_members = namespace_members;
+        result
+    }
+
+    fn namespace_member(
+        namespace_entity_id: &str,
+        name: &str,
+        member_entity_id: &str,
+    ) -> crate::NamespaceMember {
+        crate::NamespaceMember {
+            namespace_entity_id: namespace_entity_id.to_owned(),
+            name: name.to_owned(),
+            member_entity_id: member_entity_id.to_owned(),
         }
     }
 
@@ -8164,6 +8423,124 @@ mod tests {
     // (`namespace_in_a_module_file_never_enters_the_ambient_global_index`),
     // where `parse_source`/`DecodedSource` are actually visible; this
     // module only sees the already-filtered `SyntaxFileResult` shape.
+
+    // -- D.3 (2026-09-05, references-parity task): qualified names -------
+
+    /// `namespace ListQuery { export interface Options {} }` + a SAME-FILE
+    /// reference `ListQuery.Options` (type position, `TSQualifiedName`):
+    /// the `Options` segment resolves to the interface, closing the exact
+    /// `member_access/bare` shape the plan's own evidence sample names
+    /// (`ListQuery.Options['filter']`, the indexed-access wrapper itself
+    /// irrelevant to reference resolution -- it has no identifier of its
+    /// own to resolve).
+    #[test]
+    fn qualified_name_resolves_a_direct_export_of_a_local_namespace() {
+        let source =
+            "namespace ListQuery {\n  export interface Options {}\n}\nlet x: ListQuery.Options;\n";
+        let namespace_start = source.find("ListQuery").unwrap() as u32;
+        let options_start = source.find("Options").unwrap() as u32;
+        let namespace_id = format!("jsts:namespace:a.ts:{namespace_start}:ListQuery");
+        let options_id = format!("jsts:interface:a.ts:{options_start}:Options");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            target_file_with_namespace_members(
+                "a.ts",
+                vec![namespace_member(&namespace_id, "Options", &options_id)],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == options_id),
+            "expected a reference row targeting {options_id}, got {rows:?}"
+        );
+        let usage_start = source.rfind("Options").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != usage_start),
+            "the ListQuery.Options usage must not stay pending: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    /// Two levels: `namespace ListQueryDb { export namespace Workflow {
+    /// export interface Plain {} } }` -- `ListQueryDb.Workflow.Plain`
+    /// descends through TWO `NamespaceMember` hops (`Workflow` itself is a
+    /// namespace-kind member of `ListQueryDb`, `Plain` an interface-kind
+    /// member of `Workflow`).
+    #[test]
+    fn qualified_name_resolves_two_levels_of_nested_namespace_members() {
+        let source = "namespace ListQueryDb {\n  export namespace Workflow {\n    export interface Plain {}\n  }\n}\nlet y: ListQueryDb.Workflow.Plain;\n";
+        let db_start = source.find("ListQueryDb").unwrap() as u32;
+        let workflow_start = source.find("Workflow").unwrap() as u32;
+        let plain_start = source.find("Plain").unwrap() as u32;
+        let db_id = format!("jsts:namespace:a.ts:{db_start}:ListQueryDb");
+        let workflow_id = format!("jsts:namespace:a.ts:{workflow_start}:Workflow");
+        let plain_id = format!("jsts:interface:a.ts:{plain_start}:Plain");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            target_file_with_namespace_members(
+                "a.ts",
+                vec![
+                    namespace_member(&db_id, "Workflow", &workflow_id),
+                    namespace_member(&workflow_id, "Plain", &plain_id),
+                ],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == plain_id),
+            "expected a reference row targeting {plain_id}, got {rows:?}"
+        );
+    }
+
+    /// A namespace imported BY NAME (`import { ListQuery } from "./lq"`,
+    /// not `import * as`) -- the root resolves through `resolve_
+    /// identifier_to_kind`'s own import-binding branch (already wired for
+    /// ANY `DeclKind`, F2b's own namespace export-binding work makes the
+    /// import chain itself resolve to a namespace target), then the SAME
+    /// `NamespaceMember` lookup as the local case.
+    #[test]
+    fn qualified_name_resolves_a_member_of_a_namespace_imported_by_name() {
+        let lq_source = "export namespace ListQuery {\n  export interface Options {}\n}\n";
+        let namespace_start = lq_source.find("ListQuery").unwrap() as u32;
+        let options_start = lq_source.find("Options").unwrap() as u32;
+        let namespace_id = format!("jsts:namespace:lq.ts:{namespace_start}:ListQuery");
+        let options_id = format!("jsts:interface:lq.ts:{options_start}:Options");
+        let mut files = BTreeMap::new();
+        files.insert("lq.ts".to_owned(), {
+            let mut file = target_file(
+                "lq.ts",
+                vec![target_entity(
+                    crate::EntityKind::Namespace,
+                    "lq.ts",
+                    namespace_start,
+                    "ListQuery",
+                )],
+                vec![export_binding("ListQuery", "ListQuery")],
+            );
+            file.namespace_members = vec![namespace_member(&namespace_id, "Options", &options_id)];
+            file
+        });
+        let ctx = helper_ctx(files);
+        let user_source = "import { ListQuery } from \"./lq\";\nlet x: ListQuery.Options;\n";
+        let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
+            .expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == options_id),
+            "expected a reference row targeting {options_id}, got {rows:?}"
+        );
+    }
 
     // -- 2026-09-04 references-parity task, Phase B bucket 1: default
     // imports and with-source re-export specifiers --------------------
