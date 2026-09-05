@@ -39,7 +39,8 @@ mod resolver;
 mod semantic_sites;
 pub use line_index::LineIndex;
 pub use resolver::{
-    AmbientModuleIndex, ConfigAsset, ExportResolution, WorkspaceResolver, resolve_named_export,
+    AmbientModuleIndex, ConfigAsset, ExportPolicy, ExportResolution, WorkspaceResolver,
+    resolve_named_export,
 };
 pub use semantic_sites::{
     HybridResolutionContext, OwnerSemantics, PendingReasonCode, PendingSiteKind,
@@ -7431,7 +7432,12 @@ declare module 'markdown-it-task-lists' {
             },
         );
         assert_eq!(
-            resolver::resolve_named_export(&files, "index.ts", "neverDeclared"),
+            resolver::resolve_named_export(
+                &files,
+                "index.ts",
+                "neverDeclared",
+                resolver::ExportPolicy::UniqueOrAmbiguous
+            ),
             resolver::ExportResolution::Unresolved
         );
     }

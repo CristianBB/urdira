@@ -1013,6 +1013,33 @@ const MAX_EXPORT_RESOLUTION_DEPTH: u8 = 8;
 /// simply not reach a provable answer (falls through to `checker_pending`
 /// either way -- callers never distinguish `Ambiguous` from `Unresolved`,
 /// the split exists purely so tests can assert *why* a case stays pending).
+/// 3a (2026-09-05): which rule [`resolve_direct_export`] applies when a
+/// direct declaration's `local_name` matches MORE THAN ONE same-named
+/// top-level entity (the overload/merge case -- see that function's own
+/// doc comment for the full mechanism and why it is now split by caller
+/// intent instead of always degrading to `Ambiguous`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportPolicy {
+    /// The pre-existing, always-safe rule: more than one same-named
+    /// candidate is `Ambiguous`, unconditionally. Required for a CALL
+    /// target (`resolve_identifier_to_kind`/`resolve_call_target`'s own
+    /// callers) -- picking a specific overload signature by source order
+    /// alone is never validated against v3's real argument-type-based
+    /// overload resolution, so a wrong guess here would fabricate a wrong
+    /// `core:call` edge.
+    UniqueOrAmbiguous,
+    /// Several same-named candidates that are ALL a legitimate overload
+    /// shape (every one `EntityKind::Function` or every one
+    /// `EntityKind::Method` -- never a mix, and never any other kind)
+    /// resolve to the one with the lowest `decl_start` (source order) --
+    /// v3's own checker behavior for a PLAIN reference, 11/11 sampled
+    /// clusters (see `resolve_direct_export`'s own doc comment). A kind
+    /// mismatch across candidates (e.g. a `const X` plus a `namespace X`
+    /// declaration merge) is not a real overload set and stays `Ambiguous`
+    /// under this policy too -- never a guess.
+    FirstDeclaration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportResolution {
     Resolved(String),
@@ -1051,15 +1078,17 @@ pub fn resolve_named_export(
     files: &BTreeMap<String, SyntaxFileResult>,
     path: &str,
     name: &str,
+    policy: ExportPolicy,
 ) -> ExportResolution {
     let mut visiting = BTreeSet::new();
-    resolve_named_export_inner(files, path, name, &mut visiting, 0)
+    resolve_named_export_inner(files, path, name, policy, &mut visiting, 0)
 }
 
 fn resolve_named_export_inner(
     files: &BTreeMap<String, SyntaxFileResult>,
     path: &str,
     name: &str,
+    policy: ExportPolicy,
     visiting: &mut BTreeSet<(String, String)>,
     depth: u8,
 ) -> ExportResolution {
@@ -1084,10 +1113,10 @@ fn resolve_named_export_inner(
         return ExportResolution::Ambiguous;
     }
     if !direct.is_empty() {
-        return resolve_direct_export(file, &direct);
+        return resolve_direct_export(file, &direct, policy);
     }
     match reexport.as_slice() {
-        [] => resolve_via_export_star(files, file, name, visiting, depth),
+        [] => resolve_via_export_star(files, file, name, policy, visiting, depth),
         [binding] if binding.local_name == crate::NAMESPACE_REEXPORT_LOCAL_NAME => {
             // P1-B: `export * as X from "spec"` -- `X` names the WHOLE
             // re-exported module, never a single symbol to chase further
@@ -1107,6 +1136,7 @@ fn resolve_named_export_inner(
                 files,
                 target_path,
                 &binding.local_name,
+                policy,
                 visiting,
                 depth + 1,
             ),
@@ -1134,6 +1164,7 @@ fn resolve_via_export_star(
     files: &BTreeMap<String, SyntaxFileResult>,
     file: &SyntaxFileResult,
     name: &str,
+    policy: ExportPolicy,
     visiting: &mut BTreeSet<(String, String)>,
     depth: u8,
 ) -> ExportResolution {
@@ -1142,7 +1173,8 @@ fn resolve_via_export_star(
         let Some(target_path) = &star.target_path else {
             continue;
         };
-        let outcome = resolve_named_export_inner(files, target_path, name, visiting, depth + 1);
+        let outcome =
+            resolve_named_export_inner(files, target_path, name, policy, visiting, depth + 1);
         if outcome != ExportResolution::Unresolved {
             providing.push(outcome);
         }
@@ -1154,9 +1186,10 @@ fn resolve_via_export_star(
     }
 }
 
-/// A5b (2026-09-05 references-parity task, overload sub-bucket) measured a
-/// candidate widening here -- NOT shipped, see this doc comment's tail for
-/// why -- against the v3 oracle (n8n corpus): TS function overloads
+/// A5b (2026-09-05 references-parity task, overload sub-bucket), IMPLEMENTED
+/// by 3a (2026-09-05) -- see [`ExportPolicy`] for the mechanism actually
+/// shipped and this doc comment's tail for the measurement that motivated
+/// it: TS function overloads
 /// (`function f(...): T; function f(...): T; function f(...) { ... }`) each
 /// get their OWN `SyntaxEntity` (one per `visit_function` call, since every
 /// overload SIGNATURE, a bodyless `TSDeclareFunction`, and the trailing
@@ -1165,13 +1198,13 @@ fn resolve_via_export_star(
 /// identical `export function f` binding they each independently push down
 /// to ONE -- so a genuinely overloaded exported function reaches here as a
 /// SINGLE `binding` against MULTIPLE same-named entities, and this function
-/// degrades that to `Ambiguous` today (the `_ => Ambiguous` arm below).
-/// Sampled every `import_binding/export:ambiguous` site (600
-/// reservoir-sampled, `--samples 600` on `scripts/v4-references-parity-
-/// diff.mjs`) down to its unique `(declaring file, name)` cluster (16 unique
-/// clusters) and checked, for the 11 clusters that actually had >1 same-file
-/// same-name `EntityKind::Function` entity (`createFilesystem`, `Service`,
-/// `mockSpawn`, `isCanvasGroupNode`, `validateFieldType`,
+/// degraded that to `Ambiguous` unconditionally before 3a (the `_ =>
+/// Ambiguous` arm below). Sampled every `import_binding/export:ambiguous`
+/// site (600 reservoir-sampled, `--samples 600` on `scripts/v4-references-
+/// parity-diff.mjs`) down to its unique `(declaring file, name)` cluster (16
+/// unique clusters) and checked, for the 11 clusters that actually had >1
+/// same-file same-name `EntityKind::Function` entity (`createFilesystem`,
+/// `Service`, `mockSpawn`, `isCanvasGroupNode`, `validateFieldType`,
 /// `sanitizeCredentials`, `clean`, `attempt`, `randomInt`, `randomString`,
 /// `continueInstanceAiTraceContext` -- 2-3 overloads each), which declaration
 /// v3's checker resolved a plain (non-call) reference to: the FIRST
@@ -1179,39 +1212,43 @@ fn resolve_via_export_star(
 /// the implementation (highest `start`, the intuitive guess this task
 /// started from).
 ///
-/// NOT implemented despite the unanimous sample: `resolve_direct_export` is
-/// the SAME function `resolve_named_export` uses for every caller, and in
-/// `semantic_sites.rs` its result is cached ONCE per imported symbol
+/// A5b originally left this unimplemented: `resolve_direct_export` is the
+/// SAME function `resolve_named_export` uses for every caller, and in
+/// `semantic_sites.rs` its result was cached ONCE per imported symbol
 /// (`HybridResolutionContext::import_bindings`, keyed by `SymbolId`) and
 /// consumed identically by a plain identifier reference
 /// (`resolve_identifier_reference`) AND a call's callee
 /// (`resolve_identifier_to_kind`, `resolve_call_target`'s own doc comment
-/// explicitly documents today's `resolve_direct_export`-is-`Ambiguous`
-/// behavior as why an overloaded callee stays `REASON_CALL_TARGET_UNCERTAIN`
-/// rather than a guessed target). Prototyping the first-declaration rule
-/// here made `semantic_sites::tests::ambiguous_multiple_declarations_in_
-/// target_stays_pending` (a PLAIN REFERENCE assertion, same shape as this
-/// task's own oracle sample) and `semantic_sites::tests::cross_file_call_
-/// target_ambiguous_in_the_target_module_stays_pending` both fail: the call
-/// site now resolved to a specific overload signature chosen purely by
-/// SOURCE ORDER, never validated against v3's ACTUAL call-site overload
-/// resolution (which picks a signature by ARGUMENT-TYPE matching, not
-/// declaration order, and could legitimately differ per call site) -- a
-/// real risk of introducing new WRONG `core:call` targets this task never
-/// measured. This producer has no way to give the reference and call
-/// consumers different answers without threading a caller-intent flag
-/// through `semantic_sites.rs`'s own cache population
-/// (`resolve_named_binding_via_specifier`) -- out of this task's file scope
-/// (semantic_sites.rs production code) and its own two pre-existing tests
-/// above are frozen (this task's scope: append-only there). Left
-/// unimplemented per this task's own explicit rule for a non-unanimous
-/// finding -- unanimous for the PLAIN-REFERENCE shape in isolation, but not
-/// safely implementable without also (unvalidated) changing CALL-target
-/// resolution, so treated as "do not implement, document" rather than
-/// shipped.
+/// explicitly documented `resolve_direct_export`-is-`Ambiguous` as why an
+/// overloaded callee stays `REASON_CALL_TARGET_UNCERTAIN` rather than a
+/// guessed target). Prototyping a blanket first-declaration rule here made
+/// `semantic_sites::tests::ambiguous_multiple_declarations_in_target_stays_
+/// pending` (a PLAIN REFERENCE assertion, same shape as this task's own
+/// oracle sample) and `semantic_sites::tests::cross_file_call_target_
+/// ambiguous_in_the_target_module_stays_pending` both fail: the call site
+/// resolved to a specific overload signature chosen purely by SOURCE ORDER,
+/// never validated against v3's ACTUAL call-site overload resolution (which
+/// picks a signature by ARGUMENT-TYPE matching, not declaration order, and
+/// could legitimately differ per call site) -- a real risk of introducing
+/// new WRONG `core:call` targets A5b never measured.
+///
+/// 3a's fix: [`ExportPolicy`] gives `resolve_direct_export` two rules
+/// instead of one, and `semantic_sites.rs` now threads caller intent all
+/// the way from `resolve_named_binding_via_specifier` down to here, exactly
+/// the mechanism A5b's own doc comment named as missing --
+/// `HybridResolutionContext::import_bindings` is split into `import_
+/// bindings_ref` (`ExportPolicy::FirstDeclaration`, read by `resolve_
+/// identifier_reference`) and `import_bindings_call`
+/// (`ExportPolicy::UniqueOrAmbiguous`, read by `resolve_identifier_to_kind`/
+/// `resolve_call_target`), populated together at each of the three import-
+/// specifier sites. The call side stays exactly as conservative as before
+/// (still `REASON_CALL_TARGET_UNCERTAIN`, still no argument-type
+/// validation) -- 3a does not attempt overload-by-argument resolution at
+/// all, only the plain-reference side A5b's own sample was unanimous about.
 fn resolve_direct_export(
     file: &SyntaxFileResult,
     direct: &[&SyntaxExportBinding],
+    policy: ExportPolicy,
 ) -> ExportResolution {
     let mut resolved_ids: BTreeSet<String> = BTreeSet::new();
     for binding in direct {
@@ -1229,7 +1266,27 @@ fn resolve_direct_export(
             [single] => {
                 resolved_ids.insert(single.id.clone());
             }
-            _ => return ExportResolution::Ambiguous,
+            several => {
+                // 3a: several same-named candidates -- a real overload set
+                // (every candidate the SAME `EntityKind::Function` or the
+                // same `EntityKind::Method`) resolves to the earliest
+                // declaration under `FirstDeclaration`; anything else (a
+                // kind mismatch, or `UniqueOrAmbiguous`) stays `Ambiguous`,
+                // never a guess.
+                let first_kind = several[0].kind;
+                let is_overload_shape =
+                    matches!(first_kind, EntityKind::Function | EntityKind::Method)
+                        && several.iter().all(|entity| entity.kind == first_kind);
+                if policy == ExportPolicy::FirstDeclaration && is_overload_shape {
+                    let first = several
+                        .iter()
+                        .min_by_key(|entity| entity.start)
+                        .expect("several is non-empty");
+                    resolved_ids.insert(first.id.clone());
+                } else {
+                    return ExportResolution::Ambiguous;
+                }
+            }
         }
     }
     match resolved_ids.len() {
@@ -2084,7 +2141,12 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/util.ts", "helper"),
+            resolve_named_export(
+                &files,
+                "src/util.ts",
+                "helper",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Resolved("jsts:function:src/util.ts:20:helper".to_owned())
         );
     }
@@ -2114,7 +2176,12 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "Widget"),
+            resolve_named_export(
+                &files,
+                "src/index.ts",
+                "Widget",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Resolved("jsts:class:src/impl.ts:10:Widget".to_owned())
         );
     }
@@ -2134,7 +2201,12 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/overloads.ts", "f"),
+            resolve_named_export(
+                &files,
+                "src/overloads.ts",
+                "f",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Ambiguous
         );
     }
@@ -2158,7 +2230,12 @@ mod tests {
             file("src/index.ts", vec![], vec![]),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "helper"),
+            resolve_named_export(
+                &files,
+                "src/index.ts",
+                "helper",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Unresolved
         );
     }
@@ -2183,7 +2260,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "a.ts", "x"),
+            resolve_named_export(&files, "a.ts", "x", ExportPolicy::UniqueOrAmbiguous),
             ExportResolution::Unresolved
         );
     }
@@ -2220,13 +2297,18 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "index.ts", "evals"),
+            resolve_named_export(&files, "index.ts", "evals", ExportPolicy::UniqueOrAmbiguous),
             ExportResolution::Namespace("evals/index.ts".to_owned())
         );
         // The whole point: a FURTHER member name resolves against the
         // re-exported module directly.
         assert_eq!(
-            resolve_named_export(&files, "evals/index.ts", "stringSimilarity"),
+            resolve_named_export(
+                &files,
+                "evals/index.ts",
+                "stringSimilarity",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Resolved(
                 "jsts:function:evals/index.ts:899:stringSimilarity".to_owned()
             )
@@ -2264,7 +2346,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "mid.ts", "evals"),
+            resolve_named_export(&files, "mid.ts", "evals", ExportPolicy::UniqueOrAmbiguous),
             ExportResolution::Namespace("leaf.ts".to_owned())
         );
     }
@@ -2298,7 +2380,12 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "Widget"),
+            resolve_named_export(
+                &files,
+                "src/index.ts",
+                "Widget",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Resolved("jsts:class:src/impl.ts:10:Widget".to_owned())
         );
     }
@@ -2329,7 +2416,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "f"),
+            resolve_named_export(&files, "src/index.ts", "f", ExportPolicy::UniqueOrAmbiguous),
             ExportResolution::Resolved("jsts:function:src/index.ts:50:f".to_owned())
         );
     }
@@ -2366,7 +2453,12 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "helper"),
+            resolve_named_export(
+                &files,
+                "src/index.ts",
+                "helper",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Ambiguous
         );
     }
@@ -2392,7 +2484,12 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "missing"),
+            resolve_named_export(
+                &files,
+                "src/index.ts",
+                "missing",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Unresolved
         );
     }
@@ -2408,7 +2505,12 @@ mod tests {
             file_with_star("src/index.ts", vec![], vec![], vec![star("some-pkg", None)]),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "anything"),
+            resolve_named_export(
+                &files,
+                "src/index.ts",
+                "anything",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Unresolved
         );
     }
@@ -2447,11 +2549,11 @@ mod tests {
             );
         }
         assert_eq!(
-            resolve_named_export(&files, "f8.ts", "target"),
+            resolve_named_export(&files, "f8.ts", "target", ExportPolicy::UniqueOrAmbiguous),
             ExportResolution::Unresolved
         );
         assert_eq!(
-            resolve_named_export(&files, "f7.ts", "target"),
+            resolve_named_export(&files, "f7.ts", "target", ExportPolicy::UniqueOrAmbiguous),
             ExportResolution::Resolved("jsts:function:f0.ts:1:target".to_owned())
         );
     }
@@ -2964,7 +3066,12 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "Widget"),
+            resolve_named_export(
+                &files,
+                "src/index.ts",
+                "Widget",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Resolved("jsts:class:src/impl.ts:10:Widget".to_owned())
         );
     }
@@ -3000,7 +3107,12 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolve_named_export(&files, "src/index.ts", "Def"),
+            resolve_named_export(
+                &files,
+                "src/index.ts",
+                "Def",
+                ExportPolicy::UniqueOrAmbiguous
+            ),
             ExportResolution::Resolved("jsts:function:src/impl.ts:10:Widget".to_owned())
         );
     }
