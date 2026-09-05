@@ -123,6 +123,7 @@ pub fn run_with_residual(
                 configuration_revision_id: request.configuration_revision_id.clone(),
                 resolution_lock_id: request.resolution_lock_id.clone(),
                 touched_owners: touched_owner_paths,
+                visible_owners: None,
                 reschedule_count: 0,
             },
             residual_events,

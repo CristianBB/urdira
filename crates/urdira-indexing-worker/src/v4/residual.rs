@@ -208,6 +208,35 @@ pub struct ResidualContext {
     /// diagnosed (`residual_pass.rs::run_lane`'s `fetch_semantics` fetch
     /// runs for every window root regardless of pending sites).
     pub touched_owners: Option<Vec<String>>,
+    /// C.5 fix (2026-09-05, adversarial-review finding on 49d2760):
+    /// separates SCHEDULING (which owners this run opens WINDOWS for --
+    /// `touched_owners` via `candidate_owners_for_pass`, narrowed to
+    /// exactly the prior attempt's own `remaining_roots` on a
+    /// continuation) from VISIBILITY (which files tsgo's own `VirtualFs`
+    /// can see at all, for cross-file module resolution/type inference --
+    /// `file_map`). Before this field existed, `file_map` was built from
+    /// the SAME narrowed `candidate_owners` a continuation's window plan
+    /// used, so a continuation's checker could not see any file already
+    /// resolved (and dropped from scope) by a PRIOR pass in the same
+    /// chain -- degrading cross-file type visibility and drifting
+    /// `confirmed_combined` with wall-clock timing (56,250 vs 56,297
+    /// `upgraded` summed over one chain; the sign of the drift flipped
+    /// between runs -- not a bounded, one-directional variance, a real
+    /// correctness bug).
+    ///
+    /// `None` (the value every fresh, non-continuation `ResidualContext`
+    /// sets, including the production trigger in `scan.rs`) means "not yet
+    /// resolved" -- `run_once_with_quiet_period` computes it ONCE, on the
+    /// FIRST pass of a chain, as: `None` (unrestricted, full frontier) for
+    /// a cold scan (`touched_owners: None`); otherwise the PRE-`49d2760`
+    /// breadth (`touched_owners` UNIONED with every owner `collect()`
+    /// found with an open `pending.sites` row) -- see
+    /// `ResidualOutcome::visible_owners`, which reports back exactly what
+    /// was resolved so [`schedule`] can propagate it, UNCHANGED, into
+    /// every continuation's own `next_context.visible_owners` -- a
+    /// continuation NEVER recomputes this, only the scheduling side
+    /// narrows round to round.
+    pub visible_owners: Option<Vec<String>>,
     /// F4 4.2: how many times [`schedule`] has already re-triggered itself
     /// for a truncated (deadline-cut) attempt at the SAME base generation
     /// -- `0` for the run any `ScanCompleted`/test caller starts fresh;
@@ -290,6 +319,45 @@ fn candidate_owners_for_pass(
         set.extend(pending_owners);
     }
     set
+}
+
+/// C.5 fix (2026-09-05, adversarial-review finding on `candidate_owners_
+/// for_pass`): the pure decision behind `run_once_with_quiet_period`'s own
+/// `resolved_visible_owners` -- see that call site's doc comment, and
+/// `ResidualContext::visible_owners`'s own doc comment, for the full
+/// mechanism/evidence this fixes (a continuation's checker losing
+/// cross-file type visibility for any file `candidate_owners_for_pass`
+/// dropped from scope, drifting `confirmed_combined` with wall-clock
+/// timing).
+///
+/// - `touched_owners: None` (a cold/full-frontier run): always `None`
+///   (unrestricted), regardless of `context_visible_owners` -- a cold run
+///   never narrows visibility.
+/// - `context_visible_owners: Some(explicit)` (a continuation, or any
+///   caller that already resolved this): returned AS-IS, verbatim --
+///   `pending_owners` is not even consulted. This is what keeps a whole
+///   reschedule chain's visibility STABLE: `schedule` propagates
+///   `ResidualOutcome::visible_owners` into every `next_context.
+///   visible_owners` unchanged, so this branch fires on every continuation
+///   regardless of how `collect()`'s own pending-sites population has
+///   shifted since the first pass.
+/// - Otherwise (a first pass with no explicit value yet): `touched_owners`
+///   unioned with `pending_owners` -- the same breadth `candidate_owners_
+///   for_pass` itself uses on a first pass (`is_continuation == false`),
+///   which is exactly why the two functions only ever diverge starting
+///   from a CONTINUATION.
+fn resolve_visible_owners_for_pass(
+    touched_owners: Option<&[String]>,
+    context_visible_owners: Option<&[String]>,
+    pending_owners: impl Iterator<Item = String>,
+) -> Option<std::collections::BTreeSet<String>> {
+    let touched = touched_owners?;
+    if let Some(explicit) = context_visible_owners {
+        return Some(explicit.iter().cloned().collect());
+    }
+    let mut set: std::collections::BTreeSet<String> = touched.iter().cloned().collect();
+    set.extend(pending_owners);
+    Some(set)
 }
 
 /// Schedules (or re-schedules, superseding any still-running prior attempt
@@ -394,6 +462,11 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                     }
                     let mut next_context = context.clone();
                     next_context.touched_owners = Some(outcome.remaining_roots);
+                    // C.5 fix: propagate the SAME visibility set this
+                    // attempt used, UNCHANGED -- never recomputed by a
+                    // continuation (see `ResidualContext::visible_owners`'
+                    // own doc comment).
+                    next_context.visible_owners = outcome.visible_owners.clone();
                     next_context.reschedule_count += 1;
                     schedule(next_context, event_target);
                 } else if outcome.truncated && current_epoch(&workspace_id) != my_epoch {
@@ -466,6 +539,13 @@ pub struct ResidualOutcome {
     /// every real run (this module always measures it); `None` only for a
     /// caller/version that predates this field.
     pub checker_ms: Option<u64>,
+    /// C.5 fix: the file-visibility set this run ACTUALLY used to build
+    /// its `VirtualFs`/`file_map` -- see `ResidualContext::visible_owners`'
+    /// own doc comment for the full mechanism. [`schedule`] copies this,
+    /// UNCHANGED, into `next_context.visible_owners` for a follow-up
+    /// reschedule, so the whole chain shares one stable visibility set
+    /// resolved only once (on the chain's first pass).
+    pub visible_owners: Option<Vec<String>>,
 }
 
 /// Runs one residual pass to completion and, if anything upgraded,
@@ -587,37 +667,21 @@ fn run_once_with_quiet_period(
     // mismatch when correlating a resolved `WorkspaceTarget.path` back to
     // this pass's own maps -- see this task's evidence doc for the exact
     // scope of this gap and why it was not fixed this session.
-    // F4 4.1: the exact set of owner paths this run's `VirtualFs`/window
-    // plan is scoped to -- `None` (cold, or an explicit forced full rescan)
-    // means "every jsts owner in the frontier", the same as before this
-    // task. `Some(...)` unions `context.touched_owners` (the owners THIS
-    // scan's own batch touched) with every owner that currently has an
-    // open pending site (`collected.pending_by_owner`'s keys) -- a pending
-    // call/heritage site must stay reachable across passes until it
-    // resolves even if its owner was not part of the batch that triggered
-    // this particular run.
-    //
-    // Fix (2026-09-05, live n8n non-convergence finding, C.2's own
-    // schedule harness): the union above is correct for a FIRST pass
-    // (`context.reschedule_count == 0` -- a real edit's own touched
-    // owners, or a prior attempt superseded before it ever ran, whose
-    // orphaned pending sites must not be lost) but WRONG for a
-    // CONTINUATION of an already-truncated attempt
-    // (`reschedule_count > 0`): `touched_owners` there is `schedule`'s own
-    // `ResidualOutcome::remaining_roots` from the PRIOR attempt in this
-    // SAME chain -- exactly the roots not yet fully processed. Unioning it
-    // with `collected.pending_by_owner.keys()` (every owner with ANY open
-    // `pending.sites` row, most of which never close -- `SiteOutcome::
-    // Unresolved` does not close a site's `pending.sites` row, see
-    // `materialize.rs`) re-admitted the SAME large, persistently-
-    // unresolvable population every single round: measured live on the
-    // full n8n corpus, `windows_total` stayed in the low-to-mid 20s across
-    // 21 consecutive reschedule attempts and `schedule` never reached
-    // `truncated == false` within `MAX_CONSECUTIVE_RESCHEDULES`
-    // (`docs/evidence/`-bound log: `v4-fold/q5-residual/schedule3.log`).
-    // Scoping a continuation STRICTLY to `touched_owners` makes each
-    // round's candidate set a subset of the PRIOR round's `remaining_
-    // roots`, so the plan drains monotonically toward the empty set.
+    // F4 4.1 (revised C.5, 2026-09-05): `candidate_owners` is the exact
+    // set of owner paths this run's WINDOW PLAN opens (schedules) -- `None`
+    // (cold, or an explicit forced full rescan) means "every jsts owner in
+    // the frontier". `Some(...)` on a FIRST pass unions `context.
+    // touched_owners` (the owners THIS scan's own batch touched) with
+    // every owner that currently has an open pending site (`collected.
+    // pending_by_owner`'s keys) -- a pending call/heritage site must stay
+    // reachable across passes until it resolves even if its owner was not
+    // part of the batch that triggered this particular run. On a
+    // CONTINUATION (`reschedule_count > 0`), it is `touched_owners` alone
+    // (`schedule`'s own `ResidualOutcome::remaining_roots` from the PRIOR
+    // attempt in this SAME chain) -- see `candidate_owners_for_pass`'s own
+    // doc comment for why unioning back the pending-sites population on a
+    // continuation caused `schedule` to never converge (2026-09-05 n8n
+    // finding, `v4-fold/q5-residual/schedule3.log`).
     let candidate_owners: Option<std::collections::BTreeSet<String>> =
         context.touched_owners.as_ref().map(|touched| {
             candidate_owners_for_pass(
@@ -627,13 +691,48 @@ fn run_once_with_quiet_period(
             )
         });
 
+    // C.5 fix (2026-09-05, adversarial-review finding on the fix above):
+    // SCHEDULING (`candidate_owners`, which owners get a WINDOW opened
+    // this run) must be kept separate from VISIBILITY (which files tsgo's
+    // own `VirtualFs`/`file_map` can see at all, for cross-file module
+    // resolution/type inference). Before this field existed, `file_map`
+    // was filtered by the SAME narrowed `candidate_owners` a continuation's
+    // window plan used, so a continuation's checker could not see any file
+    // already resolved (and dropped from `candidate_owners`'s scope) by a
+    // PRIOR pass in the same chain -- silently degrading cross-file type
+    // visibility and drifting `confirmed_combined` with wall-clock timing
+    // (56,250 vs 56,297 `upgraded` summed over one chain; the sign of the
+    // drift flipped between runs -- a real correctness bug, not bounded
+    // noise). Resolved ONCE per chain (see `ResidualContext::
+    // visible_owners`'s own doc comment for the full propagation
+    // mechanism): `None` for a cold run (unrestricted, matches
+    // `candidate_owners` there too); the CALLER's own explicit
+    // `context.visible_owners` in a continuation (propagated unchanged by
+    // `schedule`, never recomputed here); otherwise (a first pass with no
+    // explicit value yet) the PRE-`candidate_owners_for_pass`-fix breadth
+    // -- `touched_owners` unioned with `collected.pending_by_owner`'s keys
+    // -- which is, by construction, identical to `candidate_owners` on a
+    // first pass (only continuations ever diverge the two).
+    let resolved_visible_owners = resolve_visible_owners_for_pass(
+        context.touched_owners.as_deref(),
+        context.visible_owners.as_deref(),
+        collected.pending_by_owner.keys().cloned(),
+    );
+    // Reported back on `ResidualOutcome` so `schedule` can propagate it,
+    // UNCHANGED, into every continuation's own `next_context.
+    // visible_owners` -- computed once here (sorted `Vec`, store-relative
+    // paths, matching `touched_owners`/`remaining_roots`'s own shape).
+    let visible_owners_out: Option<Vec<String>> = resolved_visible_owners
+        .as_ref()
+        .map(|set| set.iter().cloned().collect());
+
     let workspace_root = VIRTUAL_ROOT.to_string();
     let mut file_map: BTreeMap<String, String> = BTreeMap::new();
     for (path, entry) in &frontier.present {
         if !is_jsts_source_path(path) {
             continue;
         }
-        if let Some(owners) = &candidate_owners
+        if let Some(owners) = &resolved_visible_owners
             && !owners.contains(path)
         {
             continue;
@@ -660,7 +759,24 @@ fn run_once_with_quiet_period(
     let fs: Arc<dyn VirtualFs> = Arc::new(MapFs::from_entries(
         file_map.iter().map(|(k, v)| (k.clone(), v.clone())),
     ));
-    let mut sorted_roots: Vec<String> = file_map.keys().cloned().collect();
+    // C.5 fix: the WINDOW PLAN (which owners actually get a window opened,
+    // and therefore their pending sites resolved, this run) is scoped to
+    // `candidate_owners`, NOT to the broader `file_map` -- a continuation's
+    // `file_map` is intentionally wider (full chain visibility, see
+    // above), but its own window plan must stay narrow (only its own
+    // `touched_owners`) for `schedule`'s reschedule loop to keep
+    // converging. `candidate_owners` is always a subset of `file_map`'s
+    // own keys by construction (every owner it names is jsts-sourced and
+    // present in the frontier, exactly like `resolved_visible_owners`'s
+    // own population -- the `filter` below is defensive, not load-bearing).
+    let mut sorted_roots: Vec<String> = match &candidate_owners {
+        Some(owners) => owners
+            .iter()
+            .map(|path| format!("{workspace_root}/{path}"))
+            .filter(|virtual_path| file_map.contains_key(virtual_path))
+            .collect(),
+        None => file_map.keys().cloned().collect(),
+    };
     sorted_roots.sort();
     let plan = WindowPlan::build(&sorted_roots, WINDOW_SIZE);
 
@@ -1321,6 +1437,7 @@ fn run_once_with_quiet_period(
             windows_done,
             windows_total,
             checker_ms,
+            visible_owners: visible_owners_out.clone(),
         }));
     }
 
@@ -1485,6 +1602,7 @@ fn run_once_with_quiet_period(
         windows_done,
         windows_total,
         checker_ms,
+        visible_owners: visible_owners_out,
     }))
 }
 
@@ -3562,6 +3680,110 @@ mod tests {
         );
     }
 
+    /// C.5 fix (2026-09-05, adversarial-review finding): the pure decision
+    /// behind `resolve_visible_owners_for_pass` -- see that function's own
+    /// doc comment for the full mechanism/evidence. Verifies the two
+    /// halves of the fix together: the VISIBLE set stays byte-identical
+    /// from a first pass through its continuation (even though the
+    /// continuation's own `pending_owners` population has shifted), while
+    /// the SCHEDULED set (`candidate_owners_for_pass`) strictly narrows.
+    #[test]
+    fn visible_owners_stay_stable_across_a_continuation_while_scheduling_narrows() {
+        let first_pass_touched = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let first_pass_pending = ["c.ts".to_string(), "d.ts".to_string()];
+
+        // First pass: no explicit `context.visible_owners` yet -> resolved
+        // as touched_owners UNIONED with the pending-sites population,
+        // identical to what `candidate_owners_for_pass` computes for a
+        // first pass too (the two functions only diverge on a
+        // continuation).
+        let first_pass_visible = resolve_visible_owners_for_pass(
+            Some(&first_pass_touched),
+            None,
+            first_pass_pending.iter().cloned(),
+        );
+        let expected_first_pass_visible = std::collections::BTreeSet::from([
+            "a.ts".to_string(),
+            "b.ts".to_string(),
+            "c.ts".to_string(),
+            "d.ts".to_string(),
+        ]);
+        assert_eq!(
+            first_pass_visible,
+            Some(expected_first_pass_visible.clone()),
+            "a first pass's visible set is touched_owners unioned with every pending owner, \
+             matching candidate_owners_for_pass's own first-pass breadth"
+        );
+        assert_eq!(
+            first_pass_visible,
+            Some(candidate_owners_for_pass(
+                &first_pass_touched,
+                first_pass_pending.iter().cloned(),
+                false
+            )),
+            "on a first pass, visible and scheduled sets must be IDENTICAL (only a \
+             continuation ever diverges them)"
+        );
+
+        // Continuation: touched_owners narrows to remaining_roots from the
+        // prior attempt (say just "b.ts"), the pending-sites population
+        // for THIS round has completely shifted (a different owner, "e.ts",
+        // stands in for the "persistently unresolvable" population that
+        // keeps re-entering collect()'s own pending scope), and
+        // `context.visible_owners` carries the FIRST pass's own resolved
+        // set forward, propagated unchanged by `schedule`.
+        let continuation_touched = vec!["b.ts".to_string()];
+        let propagated_visible: Vec<String> = expected_first_pass_visible.iter().cloned().collect();
+        let this_round_pending = ["e.ts".to_string()];
+
+        let continuation_visible = resolve_visible_owners_for_pass(
+            Some(&continuation_touched),
+            Some(&propagated_visible),
+            this_round_pending.iter().cloned(),
+        );
+        assert_eq!(
+            continuation_visible,
+            Some(expected_first_pass_visible),
+            "a continuation's visible set must stay byte-identical to the first pass's own \
+             resolved set -- NEVER recomputed, and NOT affected by this round's own \
+             pending-sites population ('e.ts' must not appear, 'a.ts' must not disappear)"
+        );
+
+        let continuation_scheduled = candidate_owners_for_pass(
+            &continuation_touched,
+            this_round_pending.iter().cloned(),
+            true,
+        );
+        assert_eq!(
+            continuation_scheduled,
+            std::collections::BTreeSet::from(["b.ts".to_string()]),
+            "the SCHEDULED set narrows to touched_owners alone on a continuation"
+        );
+        assert!(
+            continuation_scheduled.is_subset(
+                continuation_visible
+                    .as_ref()
+                    .expect("continuation_visible is Some, asserted above")
+            ),
+            "the scheduled set must always be a subset of the (wider, stable) visible set: \
+             scheduled={continuation_scheduled:?} visible={continuation_visible:?}"
+        );
+        assert!(
+            continuation_scheduled.len() < continuation_visible.as_ref().unwrap().len(),
+            "the whole point of the fix: scheduling narrows round to round while visibility \
+             does not"
+        );
+
+        // A cold/full-frontier run (touched_owners: None) never narrows
+        // visibility, regardless of any explicit `context.visible_owners`
+        // a caller might mistakenly set.
+        assert_eq!(
+            resolve_visible_owners_for_pass(None, Some(&propagated_visible), std::iter::empty()),
+            None,
+            "touched_owners: None (cold) always resolves to unrestricted visibility"
+        );
+    }
+
     /// Plan 3.4: `classify_confirmed_possible` is now the ONE definition
     /// both `print_confirmed_possible_histogram` (this module) and
     /// `tests_e2e.rs`'s `inspect_store_record_histogram` call -- which
@@ -3947,6 +4169,7 @@ mod tests {
             // Simulates the trigger a cold `Full` scan would build (see
             // `scan::run_with_residual`): the whole frontier is in scope.
             touched_owners: None,
+            visible_owners: None,
             reschedule_count: 0,
         };
 
@@ -4309,6 +4532,7 @@ mod tests {
             // map scoped to the whole (tiny) fixture frontier, matching
             // this test's own pre-4.1 behavior exactly.
             touched_owners: None,
+            visible_owners: None,
             reschedule_count: 0,
         };
 
@@ -4662,6 +4886,7 @@ mod tests {
             configuration_revision_id: "configuration:v4-zero-pending-test".to_string(),
             resolution_lock_id: "resolution:v4-zero-pending-test".to_string(),
             touched_owners: None,
+            visible_owners: None,
             reschedule_count: 0,
         };
 
@@ -4796,6 +5021,7 @@ mod tests {
             configuration_revision_id: "configuration:n8n-residual-debug".to_string(),
             resolution_lock_id: "resolution:n8n-residual-debug".to_string(),
             touched_owners: None,
+            visible_owners: None,
             reschedule_count: 0,
         };
         let residual_started = std::time::Instant::now();
@@ -4967,6 +5193,20 @@ mod tests {
     /// `windows_total` can only shrink (asserted below) and the chain
     /// converges within the cap.
     ///
+    /// **Second live finding + fix (2026-09-05, adversarial review of the
+    /// fix above)**: narrowing `candidate_owners` also narrowed `file_map`
+    /// (tsgo's own `VirtualFs`) by the SAME amount, so a continuation's
+    /// checker lost cross-file type visibility for any file the narrower
+    /// scheduling scope dropped -- drifting `confirmed_combined` with
+    /// wall-clock timing (a real correctness bug, not the bounded
+    /// process-spawn variance an earlier revision of this test wrongly
+    /// concluded). Fixed by `ResidualContext::visible_owners`: `file_map`
+    /// is now built from a STABLE visibility set resolved once (on the
+    /// chain's first pass) and propagated unchanged through every
+    /// continuation, while only the window plan (`candidate_owners`)
+    /// keeps narrowing -- see `resolve_visible_owners_for_pass`'s own doc
+    /// comment.
+    ///
     /// Run: `URDIRA_TSGO_BINARY=<path> URDIRA_V4_N8N_CORPUS=<corpus>
     /// URDIRA_V4_N8N_DATA=<fresh-dir> URDIRA_V4_RESIDUAL_BUDGET_MS=15000
     /// URDIRA_DEBUG_TIMING=1 cargo test --release -p urdira-indexing-worker
@@ -5055,6 +5295,7 @@ mod tests {
             configuration_revision_id: "configuration:n8n-residual-schedule".to_string(),
             resolution_lock_id: "resolution:n8n-residual-schedule".to_string(),
             touched_owners: None,
+            visible_owners: None,
             reschedule_count: 0,
         };
 
@@ -5213,51 +5454,36 @@ mod tests {
         }
 
         // F4 4.1/4.2's own correctness gate (§7 of the 2026-09-05
-        // evidence): a truncated-then-resumed chain must publish
-        // (approximately) what one unbounded pass would -- 161,794,
-        // independently RE-VERIFIED against `n8n_residual_pass_debug_
-        // histogram` on this exact build/corpus (`v4-fold/q5-residual/
-        // histogram-unbounded.log`: confirmed_combined=161794,
-        // inferred_type_entities=41042, diagnostics_emitted=248193, wall
-        // 59.2s -- all four match the plan's own cited baseline exactly).
+        // evidence): a truncated-then-resumed chain must publish EXACTLY
+        // what one unbounded pass would -- 161,794, independently
+        // RE-VERIFIED against `n8n_residual_pass_debug_histogram` on this
+        // exact build/corpus (`v4-fold/q5-residual/histogram-unbounded.log`:
+        // confirmed_combined=161794, inferred_type_entities=41042,
+        // diagnostics_emitted=248193, wall 59.2s -- all four match the
+        // plan's own cited baseline exactly). Zero tolerance.
         //
-        // Investigated finding (2026-09-05, after the candidate_owners_
-        // for_pass fix): the CONVERGED chain (5 attempts,
-        // `v4-fold/q5-residual/schedule4.log`) publishes confirmed_
-        // combined=161,824 -- 30 MORE than the unbounded pass's 161,794
-        // (+0.019%, always in the "extra resolution", never "lost data"
-        // direction; re-ran the unbounded histogram fresh to confirm
-        // 161,794 is stable and NOT itself subject to drift). Ruled out as
-        // a double-count/idempotency bug: `print_confirmed_possible_
-        // histogram` scans `store.iter_visible(generation)` ONCE at the
-        // final generation only (a single point-in-time snapshot, not a
-        // sum across rounds), so 30 MORE confirmed sites means 30 call/
-        // heritage sites genuinely classify differently, not a counting
-        // artifact. The one structural difference between the two runs:
-        // the unbounded pass reuses ONE continuous `TsgoClient` process
-        // across all of its windows, while the chain spawns a FRESH tsgo
-        // child process per reschedule attempt -- plausible source for a
-        // handful of genuinely AMBIGUOUS overload/union-receiver call
-        // sites (already flagged elsewhere in this codebase as having
-        // underspecified tie-breaking) to resolve differently across
-        // separate process lifetimes. A documented, bounded tolerance
-        // (0.1% of the reference, comfortably above the observed 0.019%)
-        // rather than an exact match, given this is orthogonal to what
-        // C.1-C.4 own (residual_pass.rs's window/lane splitting, not
-        // ResidualResolver's own overload tie-breaking).
+        // C.5 fix (2026-09-05, adversarial-review finding): the `49d2760`
+        // fix above (`candidate_owners_for_pass`) narrowed a continuation's
+        // WINDOW PLAN correctly, but `file_map` (tsgo's own `VirtualFs`)
+        // was ALSO filtered by that same narrow set -- so a continuation's
+        // checker lost cross-file type visibility for any file dropped
+        // from `candidate_owners`'s scope, drifting `confirmed_combined`
+        // with wall-clock timing (56,250 vs 56,297 `upgraded` summed over
+        // one chain; the sign of the drift flipped between runs -- a real
+        // correctness bug, not bounded process-to-process noise, which the
+        // previous revision of this comment wrongly concluded). Fixed by
+        // `ResidualContext::visible_owners`/`resolve_visible_owners_for_
+        // pass`: `file_map` is now built from the STABLE, once-resolved
+        // visible set (propagated unchanged through the whole chain),
+        // while only the window plan narrows -- see both functions' own
+        // doc comments for the full mechanism.
         let final_confirmed_combined =
             print_confirmed_possible_histogram("FINAL", &structural_root, last.generation);
-        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_794;
-        let tolerance = REFERENCE_CONFIRMED_COMBINED / 1000; // 0.1%
-        let diff = final_confirmed_combined.abs_diff(REFERENCE_CONFIRMED_COMBINED);
-        assert!(
-            diff <= tolerance,
-            "confirmed_combined after schedule() fully converges via truncate-then-resume \
-             ({final_confirmed_combined}) must be within 0.1% ({tolerance}) of the unbounded \
-             pass's own figure ({REFERENCE_CONFIRMED_COMBINED}, independently re-verified on \
-             this build) -- got a difference of {diff}, larger than the ~30-site \
-             cross-process overload-resolution variance already investigated and documented \
-             above"
+        assert_eq!(
+            final_confirmed_combined, 161_794,
+            "confirmed_combined after schedule() fully converges via truncate-then-resume must \
+             match the unbounded pass's own figure exactly (2026-09-05 evidence §7; C.5 fix \
+             restored cross-file visibility across reschedule continuations)"
         );
     }
 
@@ -5354,6 +5580,7 @@ mod tests {
             configuration_revision_id: "configuration:n8n-residual-schedule".to_string(),
             resolution_lock_id: "resolution:n8n-residual-schedule".to_string(),
             touched_owners: Some(vec![touched_owner.clone()]),
+            visible_owners: None,
             reschedule_count: 0,
         };
         let outcome = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
