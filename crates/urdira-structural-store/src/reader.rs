@@ -1391,13 +1391,31 @@ impl StoreReader {
         }
         let fresh_manifest = Manifest::read(&manifest_path)?;
         let fresh = match new_delta_suffix(&current.manifest, &fresh_manifest) {
-            Some(new_delta_names) if !new_delta_names.is_empty() => StoreInner::extend(
-                &current,
-                &current.dir,
-                fresh_manifest,
-                mtime,
-                &new_delta_names,
-            )?,
+            Some(new_delta_names) if !new_delta_names.is_empty() => {
+                // F1 review follow-up (cheap, non-load-bearing): every
+                // writer in this crate sets `Manifest.dict_generation`
+                // to exactly the `generation` it just published
+                // (`writer.rs`'s three `dict_generation: generation`
+                // sites), and each `write_delta*` call advances
+                // `generation` by exactly 1 while appending exactly one
+                // delta name -- so catching up `new_delta_names.len()`
+                // deltas in one `extend` call must also advance `dict_
+                // generation` by exactly that many. A real mismatch here
+                // would mean `new_delta_suffix`'s prefix check let
+                // through something it should not have.
+                debug_assert_eq!(
+                    fresh_manifest.dict_generation,
+                    current.manifest.dict_generation + new_delta_names.len() as u64,
+                    "dict_generation must advance by exactly the number of new deltas being folded in"
+                );
+                StoreInner::extend(
+                    &current,
+                    &current.dir,
+                    fresh_manifest,
+                    mtime,
+                    &new_delta_names,
+                )?
+            }
             _ => StoreInner::load(&current.dir)?,
         };
         let new_prefault = spawn_prefault(&fresh);
