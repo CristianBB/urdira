@@ -271,7 +271,7 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
         match run_once(&context, my_epoch) {
             Ok(Some(outcome)) => {
                 eprintln!(
-                    "[urdira-indexing-worker] v4 residual pass complete workspace={workspace_id} generation={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={} total_ms={} truncated={} windows={}/{}",
+                    "[urdira-indexing-worker] v4 residual pass complete workspace={workspace_id} generation={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={} checker_ms={} total_ms={} truncated={} windows={}/{}",
                     outcome.generation,
                     outcome.upgraded_sites,
                     outcome.external_sites,
@@ -279,6 +279,10 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                     outcome.inferred_type_entities,
                     outcome.type_of_relations,
                     outcome.diagnostics_emitted,
+                    outcome
+                        .checker_ms
+                        .map(|ms| ms.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
                     outcome.timings.total_ms,
                     outcome.truncated,
                     outcome.windows_done,
@@ -302,6 +306,7 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                         truncated: Some(outcome.truncated),
                         windows_done: u32::try_from(outcome.windows_done).ok(),
                         windows_total: u32::try_from(outcome.windows_total).ok(),
+                        checker_ms: outcome.checker_ms,
                     };
                     let _ = target.sender.send((
                         target.stream_id,
@@ -415,6 +420,18 @@ pub struct ResidualOutcome {
     /// own total (`windows_total`) -- equal when `truncated` is `false`.
     pub windows_done: usize,
     pub windows_total: usize,
+    /// C.3: wall-clock milliseconds of the `ResidualPass::run_instrumented`
+    /// call ALONE -- the checker itself, not the materialize/write/fsync/
+    /// snapshot work that follows it (those already have their own
+    /// `ScanTimings` fields; `timings.resolve_ms` also covers this same
+    /// span, but buried inside `ScanTimings`'s many other phases, it is
+    /// easy to miss when checking `URDIRA_V4_RESIDUAL_BUDGET_MS` compliance
+    /// -- see docs/evidence/2026-09-05-v4-frentes-1-2-3-4-reopen-
+    /// references-analyze-residual.md §7's own note that `total_ms` mixes
+    /// publish and cannot be used to verify the budget alone). `Some` on
+    /// every real run (this module always measures it); `None` only for a
+    /// caller/version that predates this field.
+    pub checker_ms: Option<u64>,
 }
 
 /// Runs one residual pass to completion and, if anything upgraded,
@@ -669,6 +686,7 @@ fn run_once_with_quiet_period(
     let (resolved, pass_stats) =
         ResidualPass::run_instrumented(&plan, residual_lanes(), &pending_by_owner, fs, &config)
             .map_err(|error| ScanError(format!("v4 residual: checker pass failed: {error}")))?;
+    let checker_ms = Some(u64::try_from(resolve_started.elapsed().as_millis()).unwrap_or(u64::MAX));
     clock.record_resolve(resolve_started.elapsed());
     let debug_enabled = std::env::var_os("URDIRA_V4_RESIDUAL_DEBUG").is_some();
     let site_dump_path = std::env::var("URDIRA_V4_RESIDUAL_SITE_DUMP").ok();
@@ -1219,6 +1237,7 @@ fn run_once_with_quiet_period(
             remaining_roots: remaining_owner_paths,
             windows_done,
             windows_total,
+            checker_ms,
         }));
     }
 
@@ -1382,6 +1401,7 @@ fn run_once_with_quiet_period(
         remaining_roots: remaining_owner_paths,
         windows_done,
         windows_total,
+        checker_ms,
     }))
 }
 
@@ -4681,8 +4701,12 @@ mod tests {
             // n8n frontier regardless of `pending.sites`).
             .expect("residual pass always reports an outcome once file_map is non-empty");
         eprintln!(
-            "[n8n_residual_pass_debug_histogram] residual pass wall={:.3}s total_ms={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={}",
+            "[n8n_residual_pass_debug_histogram] residual pass wall={:.3}s checker_ms={} total_ms={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={} truncated={} windows={}/{}",
             residual_started.elapsed().as_secs_f64(),
+            outcome
+                .checker_ms
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
             outcome.timings.total_ms,
             outcome.upgraded_sites,
             outcome.external_sites,
@@ -4690,6 +4714,9 @@ mod tests {
             outcome.inferred_type_entities,
             outcome.type_of_relations,
             outcome.diagnostics_emitted,
+            outcome.truncated,
+            outcome.windows_done,
+            outcome.windows_total,
         );
 
         // Decision 28's "inferred types" task, gate section: "sample of 200
