@@ -400,33 +400,49 @@ impl RemoteSourceFile {
     /// immediate Identifier child at all, so this returns `None` for that
     /// (the caller then falls back to the declaration's own start, matching
     /// `analyzer.ts`'s `nameNode === undefined` branch) rather than the
-    /// real `.name` node's position. A default-value initializer that is
-    /// ITSELF a bare identifier reference on a `BindingElement` (`{a =
-    /// defaultRef}`) is also a known narrow divergence — see the
-    /// `BindingElement` branch below.
+    /// real `.name` node's position. A NESTED destructuring rename whose
+    /// `name` is itself a binding pattern, not an Identifier (`{a: {b}}` —
+    /// the property `a` renamed-and-destructured into `{b}`) falls back to
+    /// the propertyName's own position (`a`'s), same as the pre-F4-4.4
+    /// behavior for this shape — a future task could descend into the
+    /// nested pattern for a more precise position.
     ///
     /// F4 4.4: `BindingElement` (`const { a, b: renamed } = x`'s `a`/`b:
     /// renamed` elements — verified live, `crate::node::syntax_kind::
-    /// BINDING_ELEMENT`'s own doc comment) needs the LAST identifier child,
-    /// not the first: its children are ordered `[propertyName?, name,
-    /// initializer?]`, so a plain element (`{a}`, one identifier child —
-    /// `name` itself) and a renamed one (`{b: renamed}`, two identifier
-    /// children — `propertyName` `b` then `name` `renamed`) both resolve
-    /// correctly this way, whereas the first-child rule below would
-    /// incorrectly return the renamed element's PROPERTY name (`b`) instead
-    /// of its actual local binding name (`renamed`) — confirmed live: a
-    /// real `getExportsOfModule` response for a renamed destructured export
-    /// points its `value_declaration` handle directly at the `BindingElement`
-    /// node, not the enclosing `VariableDeclaration`.
+    /// BINDING_ELEMENT`'s own doc comment) needs special handling: its
+    /// children are ordered `[propertyName?, name, initializer?]`, and
+    /// naively taking "the last Identifier child" (this function's first
+    /// cut at this fix) breaks a default-value initializer that is ITSELF a
+    /// bare identifier reference (`{a = defaultRef}` has children `[name
+    /// a, initializer defaultRef]` — TWO identifier children, and "last"
+    /// wrongly picks `defaultRef`). The reliable signal is not child COUNT
+    /// but the literal source text: a rename is exactly the case where the
+    /// first identifier child is immediately followed (past trivia) by a
+    /// `:` token (`{b: renamed}` — `b` then `:` then `renamed`); a plain
+    /// element, renamed or not, whose first identifier is followed by
+    /// anything else (`}`, `,`, `=`) means that FIRST identifier already
+    /// IS the bound name (`{a}`, `{a = defaultRef}`). Only when the `:`
+    /// signal fires AND a second identifier child actually exists (not the
+    /// nested-pattern case above) does this return the second child's
+    /// position instead of the first's.
     pub fn name_start(&self, index: usize, text: &[u16]) -> Option<i32> {
         let is_identifier =
             |kind: u32| kind == syntax_kind::IDENTIFIER || kind == syntax_kind::PRIVATE_IDENTIFIER;
         if self.kind(index) == syntax_kind::BINDING_ELEMENT {
-            return self
+            let identifier_children: Vec<usize> = self
                 .children(index)
                 .into_iter()
-                .rfind(|&child| is_identifier(self.kind(child)))
-                .map(|child| self.node_start(child, text));
+                .filter(|&child| is_identifier(self.kind(child)))
+                .collect();
+            let &first = identifier_children.first()?;
+            let after_first = skip_trivia(text, self.end(first) as usize, false);
+            let is_renamed = text.get(after_first).copied() == Some(u16::from(b':'));
+            let chosen = if is_renamed {
+                identifier_children.get(1).copied().unwrap_or(first)
+            } else {
+                first
+            };
+            return Some(self.node_start(chosen, text));
         }
         for child in self.children(index) {
             if is_identifier(self.kind(child)) {
