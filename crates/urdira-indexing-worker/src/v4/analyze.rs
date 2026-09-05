@@ -336,6 +336,10 @@ pub fn run_scoped(
                     .unwrap_or(u32::MAX)
                     .saturating_add(1),
                 max_source_bytes: u32::MAX,
+                // In-process caller (Rust -> Rust, no IPC frame): skip the
+                // serialize-and-measure pass `analyze` would otherwise run
+                // just to compare against `max_output_bytes` (plan 3.1).
+                enforce_output_bytes: false,
             },
             &cancelled,
         )

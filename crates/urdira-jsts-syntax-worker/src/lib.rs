@@ -144,12 +144,35 @@ pub struct ConfigAssetInput {
     pub byte_length: usize,
 }
 
+/// Explicit `serde(default = ...)` target for `AnalysisBudgets::
+/// enforce_output_bytes`. A bare `#[serde(default)]` would resolve to
+/// `bool::default()` (`false`), silently disabling the `max_output_bytes`/
+/// `MAX_MESSAGE_BYTES` guard in `SyntaxWorkerState::analyze` for every
+/// caller whose envelope predates this field -- including the stdio
+/// binary's IPC path, where the guard also keeps this worker's internal
+/// state in sync with the frame actually sent to the host. Named so every
+/// deserialization of a `budgets` object missing the field keeps the guard
+/// ON unless a caller opts out explicitly.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalysisBudgets {
     pub max_output_bytes: u32,
     pub max_files: u32,
     pub max_source_bytes: u32,
+    /// When `true` (the default, including for any pre-existing envelope
+    /// that never sent this field), `analyze` serializes its response to
+    /// measure it against `max_output_bytes`/`MAX_MESSAGE_BYTES` before
+    /// committing the new project state, exactly as it always has.
+    /// In-process Rust->Rust callers that never go over the wire (v3's
+    /// `run_jsts_generation`, v4's `run_cold`) set this to `false` to skip
+    /// that serialize-and-discard pass entirely -- there is no frame size
+    /// to bound and no desync risk since nothing is sent anywhere.
+    #[serde(default = "default_true")]
+    pub enforce_output_bytes: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2077,19 +2100,23 @@ impl SyntaxWorkerState {
             affected_files: affected_files.clone(),
             metrics,
         };
-        let output_length = match serde_json::to_vec(&response) {
-            Ok(bytes) => bytes.len(),
-            Err(_) => {
+        if budgets.enforce_output_bytes {
+            let output_length = match serde_json::to_vec(&response) {
+                Ok(bytes) => bytes.len(),
+                Err(_) => {
+                    self.restore_prior_on_bail(&project_key, prior_rest, next_files);
+                    return Err(AnalysisError {
+                        code: ErrorCode::AnalysisFailed,
+                        message: "analysis response serialization failed".into(),
+                    });
+                }
+            };
+            if output_length > budgets.max_output_bytes as usize
+                || output_length > MAX_MESSAGE_BYTES
+            {
                 self.restore_prior_on_bail(&project_key, prior_rest, next_files);
-                return Err(AnalysisError {
-                    code: ErrorCode::AnalysisFailed,
-                    message: "analysis response serialization failed".into(),
-                });
+                return resource_error("analysis response exceeds max_output_bytes");
             }
-        };
-        if output_length > budgets.max_output_bytes as usize || output_length > MAX_MESSAGE_BYTES {
-            self.restore_prior_on_bail(&project_key, prior_rest, next_files);
-            return resource_error("analysis response exceeds max_output_bytes");
         }
         self.projects.insert(
             project_key,
@@ -4878,6 +4905,7 @@ mod tests {
                 max_output_bytes: 1_000_000,
                 max_files: 100,
                 max_source_bytes: 1_000_000,
+                enforce_output_bytes: true,
             },
             &AtomicBool::new(false),
         )
@@ -6366,6 +6394,7 @@ declare module 'markdown-it-task-lists' {
                         max_output_bytes: 10_000_000,
                         max_files: 1000,
                         max_source_bytes: 10_000_000,
+                        enforce_output_bytes: true,
                     },
                     &AtomicBool::new(false),
                 )
@@ -6559,11 +6588,117 @@ declare module 'markdown-it-task-lists' {
                     max_output_bytes: 1000,
                     max_files: 1,
                     max_source_bytes: 1000,
+                    enforce_output_bytes: true,
                 },
                 &AtomicBool::new(false),
             )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::SourceDigestMismatch);
+    }
+
+    #[test]
+    fn enforced_output_bytes_bails_and_restores_prior_state_on_overflow() {
+        // (a) Plan 3.1: with `enforce_output_bytes: true` (the guarded
+        // path every IPC caller keeps), an unreasonably small
+        // `max_output_bytes` must still trip `ResourceExhausted` and leave
+        // the project's PRIOR `analysis_token`/`pending_analysis` in place
+        // -- exactly as it did before this field existed.
+        let mut state = SyntaxWorkerState::default();
+        let baseline = analyze(
+            &mut state,
+            vec![source("a.ts", "export const a = 1;")],
+            &["a.ts"],
+            '1',
+        );
+        let WorkerMessage::AnalysisResult {
+            analysis_token: baseline_token,
+            ..
+        } = baseline
+        else {
+            panic!("expected analysis result");
+        };
+        let error = state
+            .analyze(
+                "request:two".into(),
+                "cancel:two".into(),
+                "project:one".into(),
+                format!("sha256:{}", "1".repeat(64)),
+                vec!["a.ts".into()],
+                vec![source("a.ts", "export const a = 2;")],
+                Vec::new(),
+                AuthoritativeChangeSet::Full,
+                AnalysisBudgets {
+                    max_output_bytes: 1,
+                    max_files: 1,
+                    max_source_bytes: 1000,
+                    enforce_output_bytes: true,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceExhausted);
+        let restored = state
+            .projects
+            .get("project:one")
+            .expect("project state kept after bail");
+        assert_eq!(
+            restored.analysis_token, baseline_token,
+            "a bail must restore the pre-call analysis_token, not adopt the failed call's"
+        );
+        assert_eq!(
+            restored
+                .pending_analysis
+                .as_ref()
+                .map(|pending| pending.analysis_token.clone()),
+            Some(baseline_token),
+            "a bail must restore the pre-call pending_analysis, not adopt the failed call's"
+        );
+    }
+
+    #[test]
+    fn disabled_output_bytes_enforcement_skips_the_size_guard() {
+        // (b) Same oversized-relative-to-budget response, but with
+        // `enforce_output_bytes: false` (the in-process v3/v4 caller
+        // setting): the serialize-and-measure pass is skipped entirely, so
+        // the same `max_output_bytes: 1` that fails case (a) must now
+        // succeed.
+        let mut state = SyntaxWorkerState::default();
+        let result = state
+            .analyze(
+                "request:one".into(),
+                "cancel:one".into(),
+                "project:one".into(),
+                format!("sha256:{}", "1".repeat(64)),
+                vec!["a.ts".into()],
+                vec![source("a.ts", "export const a = 1;")],
+                Vec::new(),
+                AuthoritativeChangeSet::Full,
+                AnalysisBudgets {
+                    max_output_bytes: 1,
+                    max_files: 1,
+                    max_source_bytes: 1000,
+                    enforce_output_bytes: false,
+                },
+                &AtomicBool::new(false),
+            )
+            .expect("enforce_output_bytes: false must skip the max_output_bytes guard");
+        assert!(matches!(result, WorkerMessage::AnalysisResult { .. }));
+    }
+
+    #[test]
+    fn budgets_without_the_enforce_field_default_to_enforcing() {
+        // (c) A `budgets` JSON object built before this field existed (the
+        // shape every pre-existing envelope/test fixture still sends) must
+        // deserialize with `enforce_output_bytes == true` -- a bare
+        // `#[serde(default)]` would silently resolve to `false` instead and
+        // disable the guard for every such caller.
+        let budgets: AnalysisBudgets = serde_json::from_value(serde_json::json!({
+            "max_output_bytes": 1024,
+            "max_files": 16,
+            "max_source_bytes": 1024
+        }))
+        .expect("budgets without enforce_output_bytes must still deserialize");
+        assert!(budgets.enforce_output_bytes);
     }
 
     #[test]
