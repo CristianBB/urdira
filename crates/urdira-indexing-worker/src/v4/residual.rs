@@ -192,6 +192,22 @@ pub struct ResidualContext {
     pub registry_snapshot_id: String,
     pub configuration_revision_id: String,
     pub resolution_lock_id: String,
+    /// F4 4.1: which owner paths this run should build its `VirtualFs`/
+    /// window plan around, ON TOP OF every owner that currently has an
+    /// open `pending.sites` row (`collect()` always includes those,
+    /// unconditionally -- see `run_once_with_quiet_period`'s own doc
+    /// comment on `candidate_owners`). `None` for a `Full`/cold scan: the
+    /// whole `Frontier` is in scope, exactly as before this task (a fresh
+    /// store has no prior generation's owners to narrow against, and a
+    /// forced full rescan should re-check everything). `Some(paths)` for a
+    /// `Changed` scan: `delta::run`'s own `touched_owner_paths` (edited/
+    /// created + deleted owners, already computed for that scan's
+    /// external-entity close-protection pass) -- bounds the pass to a
+    /// small window instead of paying for every jsts file in the workspace
+    /// on every single edit, the dominant cost this task's own plan
+    /// diagnosed (`residual_pass.rs::run_lane`'s `fetch_semantics` fetch
+    /// runs for every window root regardless of pending sites).
+    pub touched_owners: Option<Vec<String>>,
 }
 
 /// Schedules (or re-schedules, superseding any still-running prior attempt
@@ -321,25 +337,23 @@ fn run_once_with_quiet_period(
     };
 
     let collected = collect(&store, &dicts, &owner_path, base_generation);
-    if collected.pending_by_owner.is_empty() {
-        // Genuine completion, not a supersede: nothing was pending, so
-        // there is nothing further to run for this generation. Report it
-        // (rather than `Ok(None)`, this module's "superseded, stay
-        // silent" signal) so a caller like `schedule` can still emit
-        // `UpgradeCompleted` -- the daemon's own status lane needs SOME
-        // terminal signal per generation to know a residual attempt
-        // finished, even an attempt that found nothing to do (see
-        // `packages/daemon/src/runtime.ts`'s `v4SemanticUpgradeState`).
-        return Ok(Some(ResidualOutcome {
-            generation: base_generation,
-            upgraded_sites: 0,
-            external_sites: 0,
-            unresolved_sites: 0,
-            inferred_type_entities: 0,
-            type_of_relations: 0,
-            diagnostics_emitted: 0,
-            timings: ScanClock::start().completed_timings(),
-        }));
+    // F4 4.1: no more global early-return on "zero pending sites" -- decision
+    // 28's inferred-types/diagnostics half of this pass (below) has always
+    // been able to produce work (a newly-exported declaration needing a
+    // type, a fresh compiler diagnostic) independent of whether ANY
+    // call/heritage site is still pending, so gating the entire pass on
+    // `pending_by_owner` silently starved that half whenever a corpus (or a
+    // fixture) happened to have zero outstanding possible sites. `has_sites`
+    // is kept only for the debug log below -- every downstream step already
+    // tolerates an empty `pending_by_owner` (`run_lane`'s `pending_by_owner.
+    // get(root)` is a plain `Option`, and the inferred-types/diagnostics
+    // loop near the end of this function does not consult it at all).
+    let has_sites = !collected.pending_by_owner.is_empty();
+    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        eprintln!(
+            "[urdira-indexing-worker] v4 residual: has_sites={has_sites} touched_owners={:?}",
+            context.touched_owners,
+        );
     }
 
     let binary = discover_binary(&context.workspace_root).map_err(|error| {
@@ -371,10 +385,31 @@ fn run_once_with_quiet_period(
     // mismatch when correlating a resolved `WorkspaceTarget.path` back to
     // this pass's own maps -- see this task's evidence doc for the exact
     // scope of this gap and why it was not fixed this session.
+    // F4 4.1: the exact set of owner paths this run's `VirtualFs`/window
+    // plan is scoped to -- `None` (cold, or an explicit forced full rescan)
+    // means "every jsts owner in the frontier", the same as before this
+    // task. `Some(...)` unions `context.touched_owners` (the owners THIS
+    // scan's own batch touched) with every owner that currently has an
+    // open pending site (`collected.pending_by_owner`'s keys) -- a pending
+    // call/heritage site must stay reachable across passes until it
+    // resolves even if its owner was not part of the batch that triggered
+    // this particular run.
+    let candidate_owners: Option<std::collections::BTreeSet<String>> =
+        context.touched_owners.as_ref().map(|touched| {
+            let mut set: std::collections::BTreeSet<String> = touched.iter().cloned().collect();
+            set.extend(collected.pending_by_owner.keys().cloned());
+            set
+        });
+
     let workspace_root = VIRTUAL_ROOT.to_string();
     let mut file_map: BTreeMap<String, String> = BTreeMap::new();
     for (path, entry) in &frontier.present {
         if !is_jsts_source_path(path) {
+            continue;
+        }
+        if let Some(owners) = &candidate_owners
+            && !owners.contains(path)
+        {
             continue;
         }
         let source_input = urdira_jsts_syntax_worker::SourceInput {
@@ -3228,6 +3263,9 @@ mod tests {
             registry_snapshot_id: "registry:v4-residual-test".to_string(),
             configuration_revision_id: "configuration:v4-residual-test".to_string(),
             resolution_lock_id: "resolution:v4-residual-test".to_string(),
+            // Simulates the trigger a cold `Full` scan would build (see
+            // `scan::run_with_residual`): the whole frontier is in scope.
+            touched_owners: None,
         };
 
         // Count possible call/heritage rows before the residual pass runs,
@@ -3515,12 +3553,13 @@ mod tests {
         // The `[1, 2].map((n) => n)` call is deliberate: it is the SAME
         // "guaranteed pending call site" shape `tests/residual_pass.rs`
         // uses (a lib.d.ts `Array.prototype` method E1-E3/typeflow cannot
-        // resolve without a real checker) -- without at least one pending
-        // call/heritage site, `collect()` returns an empty
-        // `pending_by_owner` and `run_once_with_quiet_period` bails out
-        // BEFORE ever reaching the checker pass at all (this module's own
-        // early-return doc comment), so the inferred-type/diagnostic half
-        // this test exercises would never run either.
+        // resolve without a real checker). F4 4.1 removed the early return
+        // that used to make a call/heritage site load-bearing for the
+        // inferred-types/diagnostics half of this test too (that half now
+        // runs regardless of `pending_by_owner`) -- kept anyway so this
+        // test still exercises the `SiteOutcome::Unresolved`/`upgraded`
+        // counters alongside the inferred-type/diagnostic assertions below,
+        // matching what a real corpus with both kinds of work looks like.
         let before_text = "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nfunction helper(): string {\n  return \"not exported\";\n}\n\nexport class Widget {\n  count = 0;\n  describe(): string {\n    return `widget ${this.count}`;\n  }\n}\n\nconst bad: number = \"nope\";\n\n[1, 2].map((n) => n);\n";
         std::fs::write(&owner_absolute, before_text).expect("write fixture file");
         std::fs::write(workspace_root.join("package.json"), r#"{"type":"module"}"#)
@@ -3578,6 +3617,12 @@ mod tests {
             registry_snapshot_id: "registry:v4-inferred-types-test".to_string(),
             configuration_revision_id: "configuration:v4-inferred-types-test".to_string(),
             resolution_lock_id: "resolution:v4-inferred-types-test".to_string(),
+            // Run 3 (below) is preceded by a real `Changed` incremental
+            // scan, but this SAME `context` is also reused for runs 1/2
+            // (right after the cold scan) -- `None` keeps every run's file
+            // map scoped to the whole (tiny) fixture frontier, matching
+            // this test's own pre-4.1 behavior exactly.
+            touched_owners: None,
         };
 
         // --- Run 1 ---
@@ -3813,6 +3858,145 @@ mod tests {
         );
     }
 
+    /// F4 4.1: a fixture with an exported, typed function and a deliberate
+    /// type error, but NO call/heritage site at all (unlike the sibling
+    /// `inferred_types_and_diagnostics_across_two_runs_and_an_edit`
+    /// fixture, this one has no `[1, 2].map(...)`-shaped lib dispatch) --
+    /// `collect()`'s own `pending_by_owner` is verified empty below before
+    /// the pass runs. Before this task, `run_once_with_quiet_period`
+    /// returned early the instant `pending_by_owner` was empty, WITHOUT
+    /// ever reaching decision 28's inferred-types/diagnostics half -- this
+    /// test is the regression guard for that early return's removal: an
+    /// exported declaration still gets a `jsts:entity_inferred_type`/
+    /// `jsts:relation_type_of` pair and the type error still gets a
+    /// `jsts:diagnostic`, purely from the "always build file_map, always
+    /// run the checker pass" path, with zero possible sites to upgrade.
+    #[test]
+    fn residual_emits_types_and_diagnostics_with_zero_pending_sites() {
+        let Some(tsgo) = binary::discover(&fixture_root_repo()).ok() else {
+            eprintln!("skipping: tsgo binary not discoverable");
+            return;
+        };
+        drop(tsgo);
+
+        let scratch = scratch_dir("zero-pending");
+        let workspace_root = scratch.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let owner_relative = "a.ts";
+        let owner_absolute = workspace_root.join(owner_relative);
+        let text = "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nconst bad: number = \"nope\";\n";
+        std::fs::write(&owner_absolute, text).expect("write fixture file");
+        std::fs::write(workspace_root.join("package.json"), r#"{"type":"module"}"#)
+            .expect("write package.json");
+        std::fs::write(
+            workspace_root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"module":"ESNext","moduleResolution":"Bundler","target":"ES2022","strict":false,"skipLibCheck":true,"allowJs":true,"checkJs":true}}"#,
+        )
+        .expect("write tsconfig.json");
+
+        let database_path = scratch.join("workspace.sqlite");
+        let structural_root = scratch.join("structural");
+        let cas_root = scratch.join("cas");
+        let workspace_id = "workspace:v4-zero-pending-test".to_string();
+
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = WorkerState::default();
+        let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+
+        let cold_request = scan::ScanRequest {
+            request_id: "request:v4-zero-pending-cold".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: ScanScope::Full,
+            registry_snapshot_id: "registry:v4-zero-pending-test".to_string(),
+            configuration_revision_id: "configuration:v4-zero-pending-test".to_string(),
+            resolution_lock_id: "resolution:v4-zero-pending-test".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let cold_event = scan::run_with_residual(
+            cold_request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("cold scan succeeds");
+        let base_generation = match cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+
+        // Verified, not merely assumed: this fixture has zero pending
+        // call/heritage sites -- the exact precondition this test exists
+        // to exercise.
+        let store = StoreReader::open(&structural_root).expect("store opens");
+        let dicts = store.dictionaries();
+        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog opens");
+        let frontier = Frontier::load(&conn, &workspace_id).expect("frontier loads");
+        drop(conn);
+        let mut path_by_pair: HashMap<(String, String), String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            path_by_pair.insert(
+                (entry.artifact_id.clone(), entry.artifact_version_id.clone()),
+                path.clone(),
+            );
+        }
+        let owner_path = |ordinal: u32| -> Option<String> {
+            dicts
+                .artifacts
+                .get(ordinal as usize)
+                .and_then(|pair| path_by_pair.get(pair))
+                .cloned()
+        };
+        let collected = collect(&store, &dicts, &owner_path, base_generation);
+        assert!(
+            collected.pending_by_owner.is_empty(),
+            "fixture must have zero pending call/heritage sites for this test to exercise the right code path: {:?}",
+            collected.pending_by_owner
+        );
+
+        let context = ResidualContext {
+            request_id: "request:v4-zero-pending-upgrade".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            registry_snapshot_id: "registry:v4-zero-pending-test".to_string(),
+            configuration_revision_id: "configuration:v4-zero-pending-test".to_string(),
+            resolution_lock_id: "resolution:v4-zero-pending-test".to_string(),
+            touched_owners: None,
+        };
+
+        let outcome = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
+            .expect("residual pass does not error")
+            .expect(
+                "a fixture with an exported function and a type error always produces an \
+                 outcome, even with zero pending call/heritage sites",
+            );
+        eprintln!(
+            "[test] inferred_type_entities={} diagnostics_emitted={} generation={}",
+            outcome.inferred_type_entities, outcome.diagnostics_emitted, outcome.generation,
+        );
+        assert!(
+            outcome.inferred_type_entities > 0,
+            "expected at least one inferred-type entity even with zero pending sites"
+        );
+        assert!(
+            outcome.diagnostics_emitted > 0,
+            "expected the deliberate type error to still produce a compiler diagnostic"
+        );
+        assert_eq!(outcome.upgraded_sites, 0);
+        assert_eq!(outcome.external_sites, 0);
+        assert_eq!(outcome.unresolved_sites, 0);
+        assert!(outcome.generation > base_generation);
+    }
+
     fn kind_of_at<'a>(
         dicts: &'a Dictionaries,
         view: &urdira_structural_store::RecordView,
@@ -3919,11 +4103,17 @@ mod tests {
             registry_snapshot_id: "registry:n8n-residual-debug".to_string(),
             configuration_revision_id: "configuration:n8n-residual-debug".to_string(),
             resolution_lock_id: "resolution:n8n-residual-debug".to_string(),
+            touched_owners: None,
         };
         let residual_started = std::time::Instant::now();
         let outcome = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
             .expect("residual pass does not error")
-            .expect("n8n corpus has pending sites");
+            // F4 4.1: no longer conditioned on pending call/heritage sites
+            // existing -- the pass always produces an outcome once it has
+            // at least one jsts file to run against (a cold scan's
+            // `touched_owners` is `None`, so `file_map` covers the whole
+            // n8n frontier regardless of `pending.sites`).
+            .expect("residual pass always reports an outcome once file_map is non-empty");
         eprintln!(
             "[n8n_residual_pass_debug_histogram] residual pass wall={:.3}s total_ms={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={}",
             residual_started.elapsed().as_secs_f64(),

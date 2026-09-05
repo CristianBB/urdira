@@ -284,7 +284,7 @@ pub fn run(
     worker_state: &mut WorkerState,
     clock: &mut ScanClock,
     on_queryable: &mut dyn FnMut(IndexingEvent) -> Result<(), String>,
-) -> Result<IndexingEvent, ScanError> {
+) -> Result<(IndexingEvent, Vec<String>), ScanError> {
     if changed_paths.is_empty() {
         return Err(ScanError(
             "v4 WorkspaceScan{scope: Changed} requires at least one path".into(),
@@ -307,7 +307,7 @@ pub fn run(
             );
         }
         let mut structural_clock = ScanClock::start();
-        run_one(
+        let (_structural_event, mut touched_owner_paths) = run_one(
             request,
             &structural,
             conn,
@@ -320,7 +320,7 @@ pub fn run(
             on_queryable,
         )?;
         let mut content_clock = ScanClock::start();
-        return run_one(
+        let (content_event, content_touched_owner_paths) = run_one(
             request,
             &content,
             conn,
@@ -331,7 +331,11 @@ pub fn run(
             worker_state,
             &mut content_clock,
             on_queryable,
-        );
+        )?;
+        touched_owner_paths.extend(content_touched_owner_paths);
+        touched_owner_paths.sort();
+        touched_owner_paths.dedup();
+        return Ok((content_event, touched_owner_paths));
     }
     run_one(
         request,
@@ -359,7 +363,7 @@ fn run_one(
     worker_state: &mut WorkerState,
     clock: &mut ScanClock,
     on_queryable: &mut dyn FnMut(IndexingEvent) -> Result<(), String>,
-) -> Result<IndexingEvent, ScanError> {
+) -> Result<(IndexingEvent, Vec<String>), ScanError> {
     // P3-1 deliverable 2: generation counter. `Changed` on a workspace that
     // has never published a generation makes no sense (there is nothing to
     // diff against) -- the daemon should send `Full` for a brand-new
@@ -679,6 +683,21 @@ fn run_one(
         // non-JS/TS file, or a file deleted before it was ever indexed) --
         // nothing to close.
     }
+
+    // F4 4.1: every owner path this generation's own batch touched --
+    // edited/created (`affected_owner_paths`, already real paths) plus
+    // deleted (`source_delta.deleted`, also real paths -- `old_owner_
+    // ordinal`'s own first argument is `uri: &str` and is fed straight
+    // from this same list). Returned to `scan::run_with_residual` so it can
+    // scope the background residual pass's own file map to exactly the
+    // owners THIS scan could plausibly have affected, instead of the whole
+    // frontier (see `residual.rs`'s own doc comment on `ResidualContext::
+    // touched_owners` for why `pending.sites`' owners are unioned in on
+    // top of this list, not instead of it).
+    let mut touched_owner_paths: Vec<String> = affected_owner_paths.clone();
+    touched_owner_paths.extend(source_delta.deleted.iter().cloned());
+    touched_owner_paths.sort();
+    touched_owner_paths.dedup();
 
     // F1 1.1: instrumented as one block (`close_protection_ms`) -- the
     // three `by_owner` passes below (at-risk/deleted/zombie) plus
@@ -1122,7 +1141,7 @@ fn run_one(
         clock,
     );
     clock.record_snapshot(snapshot_started.elapsed());
-    result
+    result.map(|event| (event, touched_owner_paths))
 }
 
 /// UCE text digest (`sha256(tag(3) ++ varint(len) ++ bytes)`), the exact
