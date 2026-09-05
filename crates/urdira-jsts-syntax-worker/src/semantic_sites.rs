@@ -1315,13 +1315,14 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// to the module).
     pending_function_owner: Option<Option<ParamOwner>>,
     /// Whether the `VariableDeclarator` `visit_variable_declarator` is
-    /// currently walking is the FIRST declarator of its own
-    /// `VariableDeclaration` -- lane 1's plain entity pass (`lib.rs`'s
-    /// `SyntaxCollector::visit_variable_declaration`) only ever creates a
-    /// `core:value` entity for `declaration.declarations.first()`, so `const
-    /// a = 1, f = () => a;`'s `f` gets NO variable entity even though
-    /// `classify_symbol_declaration` still resolves references to it as
-    /// `DeclKind::Variable`. Set by the `visit_variable_declaration`
+    /// currently walking has a `BindingPattern::BindingIdentifier` id --
+    /// lane 1's plain entity pass (`lib.rs`'s `SyntaxCollector::
+    /// visit_variable_declaration`, 3c 2026-09-05) creates a `core:value`
+    /// entity for EVERY declarator whose `id` is a plain identifier (`const
+    /// a = 1, f = () => a;`'s `f` DOES get a variable entity, same as `a`);
+    /// only a destructuring pattern (`const [f] = ...`/`const {f} = ...`)
+    /// has no entity of its own, since `lib.rs`'s pass only ever fires for
+    /// `BindingIdentifier`. Set by the `visit_variable_declaration`
     /// override just below (one assignment per declarator, immediately
     /// before visiting it), consulted by `visit_variable_declarator` when
     /// deciding whether a directly-init'd arrow/function-expression's own
@@ -1472,15 +1473,36 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// already uses). See `emit_external_use`'s own doc comment for what
     /// pushes into this.
     external_uses: Vec<ExternalSymbolUse>,
-    /// Every import-bound symbol this walk has resolved (or given up on) so
-    /// far, keyed by oxc's `SymbolId` for the specifier's local binding.
-    /// Populated as `visit_import_specifier` is reached; consulted by
-    /// `resolve_identifier_reference` for every later USE of that binding
-    /// in the file. Import declarations are conventionally file-top, so a
-    /// single top-down walk order already covers the overwhelming majority
-    /// of real code; a genuinely out-of-order import (legal but unusual JS)
-    /// simply leaves that one usage `checker_pending` -- safe, not wrong.
-    import_bindings: HashMap<SymbolId, ReferenceResolution>,
+    /// 3a (2026-09-05): every import-bound symbol this walk has resolved (or
+    /// given up on) so far under [`resolver::ExportPolicy::FirstDeclaration`]
+    /// -- keyed by oxc's `SymbolId` for the specifier's local binding.
+    /// Populated at each of the three import-specifier sites (`visit_import_
+    /// specifier`, `visit_import_default_specifier`, `visit_import_namespace_
+    /// specifier`); consulted ONLY by `resolve_identifier_reference` for
+    /// every later plain-reference USE of that binding in the file. Split
+    /// from a single `import_bindings` map (pre-3a) into this and `import_
+    /// bindings_call` below so an overloaded/merged-declaration target
+    /// (`resolve_direct_export`'s own doc comment) can give a plain
+    /// reference and a call callee DIFFERENT answers: `FirstDeclaration`
+    /// here (matches v3's checker, 11/11 sampled clusters), the safer
+    /// `UniqueOrAmbiguous` in `import_bindings_call` (a wrong overload guess
+    /// there would fabricate a wrong `core:call` edge, never validated
+    /// against argument types). In the common (non-overloaded) case both
+    /// maps hold the IDENTICAL value -- the second, `FirstDeclaration`
+    /// resolve only actually runs when the first (`UniqueOrAmbiguous`) one
+    /// came back `Ambiguous` (see `resolve_import_binding_both_policies`).
+    /// Import declarations are conventionally file-top, so a single top-down
+    /// walk order already covers the overwhelming majority of real code; a
+    /// genuinely out-of-order import (legal but unusual JS) simply leaves
+    /// that one usage `checker_pending` -- safe, not wrong.
+    import_bindings_ref: HashMap<SymbolId, ReferenceResolution>,
+    /// 3a (2026-09-05): the `import_bindings_call` sibling of `import_
+    /// bindings_ref` above -- SAME population sites, `resolver::
+    /// ExportPolicy::UniqueOrAmbiguous` instead. Consulted ONLY by
+    /// `resolve_identifier_to_kind` (a call callee or heritage-clause
+    /// identifier). See `import_bindings_ref`'s own doc comment for the
+    /// full split rationale.
+    import_bindings_call: HashMap<SymbolId, ReferenceResolution>,
     /// P1-A (rule (f), namespace member call): every `import * as ns from
     /// "specifier"` binding this walk has seen, keyed by `ns`'s own
     /// `SymbolId`, valued by the raw module specifier text -- consulted by
@@ -1593,7 +1615,8 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             current_import_type_only: false,
             current_export_type_only: false,
             external_uses: Vec::new(),
-            import_bindings: HashMap::new(),
+            import_bindings_ref: HashMap::new(),
+            import_bindings_call: HashMap::new(),
             namespace_import_specifiers: HashMap::new(),
             namespace_reexport_targets: HashMap::new(),
             is_test_source,
@@ -1616,12 +1639,60 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// `import { type X }`; `start`/`end` are this binding's own site span,
     /// used as the `core:contains` occurrence span `emit_external_use`
     /// records.
+    /// 3a (2026-09-05): resolves `imported_name` under BOTH policies for a
+    /// `visit_import_specifier`/`visit_import_default_specifier` site,
+    /// cheaply in the common case: `resolve_import_binding` runs ONCE with
+    /// `UniqueOrAmbiguous` (the call-safe policy, always needed for `import_
+    /// bindings_call`); only when THAT came back `Pending` with the exact
+    /// `"import_binding/export:ambiguous"` reason (meaning `resolve_named_
+    /// export` itself found >1 same-named candidate at the end of the
+    /// chain -- `resolve_direct_export`'s own `several` arm) does it run a
+    /// SECOND time with `FirstDeclaration` for `import_bindings_ref`. Every
+    /// other outcome (`Resolved`, or `Pending` for any other reason) reuses
+    /// the SAME value for both -- no second call, no risk of a doubled
+    /// `emit_external_use` side effect either (that side effect only fires
+    /// on the specifier-does-not-resolve-to-a-workspace-file branch, which
+    /// returns before ever reaching `resolve_named_export`, so it is never
+    /// reached by this "ambiguous, retry" path in the first place).
+    /// Returns `(ref_resolution, call_resolution)`.
+    fn resolve_import_binding_both_policies(
+        &mut self,
+        imported_name: &str,
+        is_type: bool,
+        start: u32,
+        end: u32,
+    ) -> (ReferenceResolution, ReferenceResolution) {
+        let call_resolution = self.resolve_import_binding(
+            imported_name,
+            is_type,
+            start,
+            end,
+            resolver::ExportPolicy::UniqueOrAmbiguous,
+        );
+        let ref_resolution = match &call_resolution {
+            ReferenceResolution::Pending(reason)
+                if *reason == "import_binding/export:ambiguous" =>
+            {
+                self.resolve_import_binding(
+                    imported_name,
+                    is_type,
+                    start,
+                    end,
+                    resolver::ExportPolicy::FirstDeclaration,
+                )
+            }
+            _ => call_resolution.clone(),
+        };
+        (ref_resolution, call_resolution)
+    }
+
     fn resolve_import_binding(
         &mut self,
         imported_name: &str,
         is_type: bool,
         start: u32,
         end: u32,
+        policy: resolver::ExportPolicy,
     ) -> ReferenceResolution {
         let source_specifier = self.current_import_source.clone();
         self.resolve_named_binding_via_specifier(
@@ -1631,6 +1702,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             is_type,
             start,
             end,
+            policy,
         )
     }
 
@@ -1657,6 +1729,11 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         end: u32,
     ) -> ReferenceResolution {
         let source_specifier = self.current_export_source.clone();
+        // 3a (2026-09-05): this position (`local` in `export { a } from
+        // "./x"`) is never cached into `import_bindings_ref`/`_call` for a
+        // LATER call-site lookup -- a re-export specifier is never itself a
+        // callable binding elsewhere in THIS file -- so it is always a
+        // plain reference-shaped occurrence, `FirstDeclaration` throughout.
         self.resolve_named_binding_via_specifier(
             source_specifier.as_deref(),
             name,
@@ -1664,6 +1741,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             is_type,
             start,
             end,
+            resolver::ExportPolicy::FirstDeclaration,
         )
     }
 
@@ -1675,6 +1753,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// every degrade-to-pending outcome so the two call sites stay
     /// distinguishable downstream exactly like they were before this
     /// shared helper existed.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_named_binding_via_specifier(
         &mut self,
         source_specifier: Option<&str>,
@@ -1683,6 +1762,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         is_type: bool,
         start: u32,
         end: u32,
+        policy: resolver::ExportPolicy,
     ) -> ReferenceResolution {
         if self.jsdoc_typed_file {
             return ReferenceResolution::Pending(REASON_JSDOC_TYPED_FILE);
@@ -1755,7 +1835,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 )),
             };
         };
-        match resolver::resolve_named_export(self.ctx.files, &target_path, name) {
+        match resolver::resolve_named_export(self.ctx.files, &target_path, name, policy) {
             resolver::ExportResolution::Resolved(target_id) => {
                 // The declaration was reached through an import/re-export
                 // specifier, possibly after chasing one or more named
@@ -1905,8 +1985,17 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         else {
             return;
         };
+        // 3a: only the `Namespace` variant is ever consulted here, which
+        // `ExportPolicy` never affects either way -- `UniqueOrAmbiguous`
+        // (out of 3a's own scope: not one of the three `import_bindings`
+        // population sites) preserves this call's exact prior behavior.
         if let resolver::ExportResolution::Namespace(reexport_target) =
-            resolver::resolve_named_export(self.ctx.files, &target_path, imported_name)
+            resolver::resolve_named_export(
+                self.ctx.files,
+                &target_path,
+                imported_name,
+                resolver::ExportPolicy::UniqueOrAmbiguous,
+            )
         {
             self.namespace_reexport_targets
                 .insert(symbol_id, reexport_target);
@@ -1972,6 +2061,20 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .unwrap_or_else(|| self.module_id.clone())
     }
 
+    /// 3a (2026-09-05): whether `ident` is literally the `callee` of its own
+    /// immediate parent `CallExpression` (`f` in `f(...)`, not one of its
+    /// `arguments` -- an argument's immediate parent AST node is ALSO
+    /// reported as the `CallExpression` by `AstNodes::parent_kind`, so the
+    /// span comparison against `call.callee` is load-bearing, not
+    /// defensive). See `resolve_identifier_reference`'s own doc comment for
+    /// why this distinction exists at all.
+    fn identifier_is_a_call_callee(&self, ident: &IdentifierReference<'a>) -> bool {
+        matches!(
+            self.nodes.parent_kind(ident.node_id.get()),
+            AstKind::CallExpression(call) if call.callee.span() == ident.span
+        )
+    }
+
     fn push_site(
         &mut self,
         site_kind: SiteKind,
@@ -2002,13 +2105,35 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         };
         let flags = self.scoping.symbol_flags(symbol_id);
         if flags.is_import() {
-            // E2: this symbol is bound by an `import`; `import_bindings`
-            // carries whatever `visit_import_specifier` already resolved
-            // for it (or `None` when the import site has not been visited
-            // yet, or was a default/namespace import, both out of scope --
-            // see `resolve_import_binding`'s doc comment).
-            return self
-                .import_bindings
+            // E2: this symbol is bound by an `import`; `import_bindings_ref`/
+            // `import_bindings_call` carry whatever `visit_import_specifier`
+            // already resolved for it (or `None` when the import site has
+            // not been visited yet, or was a default/namespace import, both
+            // out of scope -- see `resolve_import_binding`'s doc comment).
+            //
+            // 3a (2026-09-05): `walk_call_expression` unconditionally
+            // re-visits its OWN callee generically (this exact function,
+            // for a bare-identifier callee) AFTER `visit_call_expression`'s
+            // own `resolve_call_target` already resolved it via `import_
+            // bindings_call` -- so a call's callee identifier is reached
+            // HERE too, not just via `const g = f;`-style plain reads. An
+            // overloaded/merged import target must give this SECOND,
+            // generic pass the SAME (conservative) answer `resolve_call_
+            // target` already gave it, never a MORE confident one from
+            // `import_bindings_ref` alone -- otherwise an ambiguous callee
+            // would leak a resolved `core:references` row even while its
+            // OWN `core:call` stays correctly pending (frozen: `semantic_
+            // sites::tests::ambiguous_multiple_declarations_in_target_stays_
+            // pending`). `identifier_is_a_call_callee` singles out exactly
+            // that one AST shape; every other import-bound identifier
+            // (`const g = f;`, a heritage clause, ...) uses `import_
+            // bindings_ref` as intended.
+            let bindings = if self.identifier_is_a_call_callee(ident) {
+                &self.import_bindings_call
+            } else {
+                &self.import_bindings_ref
+            };
+            return bindings
                 .get(&symbol_id)
                 .cloned()
                 .unwrap_or(ReferenceResolution::Pending(REASON_IMPORT_BINDING));
@@ -2061,7 +2186,9 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         let symbol_id = reference.symbol_id()?;
         let flags = self.scoping.symbol_flags(symbol_id);
         if flags.is_import() {
-            let resolution = self.import_bindings.get(&symbol_id)?;
+            // 3a: the CALL/heritage-safe policy -- `UniqueOrAmbiguous`,
+            // never a source-order guess among overload candidates.
+            let resolution = self.import_bindings_call.get(&symbol_id)?;
             let ReferenceResolution::Resolved { target_id, .. } = resolution else {
                 return None;
             };
@@ -2785,7 +2912,18 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             }
             None => self.namespace_reexport_targets.get(&symbol_id)?.clone(),
         };
-        match resolver::resolve_named_export(self.ctx.files, &target_path, member_name) {
+        // 3a: `resolve_namespace_member` is a SEPARATE mechanism from the
+        // three `import_bindings` population sites (a `ns.member` dotted
+        // access, not a bare imported identifier) and out of 3a's own
+        // scope -- `UniqueOrAmbiguous` preserves its exact prior behavior
+        // for both of its own consumers (a plain member read AND rule (f)'s
+        // call-target use, `resolve_call_target_typeflow` above).
+        match resolver::resolve_named_export(
+            self.ctx.files,
+            &target_path,
+            member_name,
+            resolver::ExportPolicy::UniqueOrAmbiguous,
+        ) {
             resolver::ExportResolution::Resolved(target_id) => Some(target_id),
             resolver::ExportResolution::Namespace(_)
             | resolver::ExportResolution::Ambiguous
@@ -3020,9 +3158,15 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 let Some(symbol_id) = reference.symbol_id() else {
                     return "member_access/other";
                 };
+                // 3a: an import-bound symbol is keyed into `_ref` and
+                // `_call` TOGETHER at every population site -- either one
+                // containing the key is proof enough that this IS an
+                // import-bound identifier (the classification this branch
+                // cares about does not depend on which policy resolved it).
                 if self.namespace_import_specifiers.contains_key(&symbol_id)
                     || self.namespace_reexport_targets.contains_key(&symbol_id)
-                    || self.import_bindings.contains_key(&symbol_id)
+                    || self.import_bindings_ref.contains_key(&symbol_id)
+                    || self.import_bindings_call.contains_key(&symbol_id)
                 {
                     return "member_access/ident:import_bound";
                 }
@@ -4367,21 +4511,32 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         // flag is the authority there).
         let is_type =
             self.current_import_type_only || specifier.import_kind == ImportOrExportKind::Type;
-        let resolution = imported_name
-            .as_deref()
-            .map(|name| {
-                self.resolve_import_binding(
-                    name,
-                    is_type,
-                    specifier.local.span.start,
-                    specifier.local.span.end,
-                )
-            })
-            .unwrap_or(ReferenceResolution::Pending(REASON_IMPORT_BINDING));
+        // 3a (2026-09-05): `ref_resolution`/`call_resolution` can differ
+        // ONLY for an overloaded/merged target (`resolve_import_binding_
+        // both_policies`'s own doc comment) -- the import specifier's OWN
+        // occurrence below always sites/reuses `call_resolution` (the
+        // pre-3a, conservative value), so this position's own behavior is
+        // BYTE-IDENTICAL to before 3a regardless of overloads (frozen:
+        // `ambiguous_multiple_declarations_in_target_stays_pending`
+        // exercises exactly this specifier shape). `ref_resolution` is
+        // cached into `import_bindings_ref` purely for a LATER plain
+        // reference elsewhere in the file to consult.
+        let (ref_resolution, call_resolution) = match imported_name.as_deref() {
+            Some(name) => self.resolve_import_binding_both_policies(
+                name,
+                is_type,
+                specifier.local.span.start,
+                specifier.local.span.end,
+            ),
+            None => (
+                ReferenceResolution::Pending(REASON_IMPORT_BINDING),
+                ReferenceResolution::Pending(REASON_IMPORT_BINDING),
+            ),
+        };
         self.site_import_binding(
             specifier.local.span.start,
             specifier.local.span.end,
-            &resolution,
+            &call_resolution,
         );
         // Found alongside `REASON_RE_EXPORT_BINDING`, same reconciliation
         // gate: `imported` (`Tool` in `import { Tool as ToolBuilder } from
@@ -4403,10 +4558,11 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         if let ModuleExportName::IdentifierName(imported) = &specifier.imported
             && imported.span != specifier.local.span
         {
-            self.site_import_binding(imported.span.start, imported.span.end, &resolution);
+            self.site_import_binding(imported.span.start, imported.span.end, &call_resolution);
         }
         if let Some(symbol_id) = specifier.local.symbol_id.get() {
-            self.import_bindings.insert(symbol_id, resolution);
+            self.import_bindings_ref.insert(symbol_id, ref_resolution);
+            self.import_bindings_call.insert(symbol_id, call_resolution);
             if let Some(name) = imported_name.as_deref() {
                 self.register_namespace_reexport(symbol_id, name);
             }
@@ -4449,7 +4605,8 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// `Pending(REASON_IMPORT_BINDING)` exactly like before -- never a
     /// guess.
     fn visit_import_default_specifier(&mut self, specifier: &ImportDefaultSpecifier<'a>) {
-        let resolution = self.resolve_import_binding(
+        // 3a: same split/site discipline as `visit_import_specifier` above.
+        let (ref_resolution, call_resolution) = self.resolve_import_binding_both_policies(
             "default",
             self.current_import_type_only,
             specifier.local.span.start,
@@ -4458,10 +4615,11 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         self.site_import_binding(
             specifier.local.span.start,
             specifier.local.span.end,
-            &resolution,
+            &call_resolution,
         );
         if let Some(symbol_id) = specifier.local.symbol_id.get() {
-            self.import_bindings.insert(symbol_id, resolution);
+            self.import_bindings_ref.insert(symbol_id, ref_resolution);
+            self.import_bindings_call.insert(symbol_id, call_resolution);
         }
         walk_import_default_specifier(self, specifier);
     }
@@ -4546,7 +4704,13 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             &resolution,
         );
         if let Some(symbol_id) = specifier.local.symbol_id.get() {
-            self.import_bindings.insert(symbol_id, resolution);
+            // 3a: this resolution never goes through `resolve_named_export`
+            // at all (name `"*"`/external-namespace lookups, never an
+            // overload candidate set), so both maps always get the SAME
+            // value here -- no policy split needed for this third site.
+            self.import_bindings_ref
+                .insert(symbol_id, resolution.clone());
+            self.import_bindings_call.insert(symbol_id, resolution);
         }
         // P1-A (rule (f)): record `ns`'s own specifier for `resolve_
         // namespace_member`/`resolve_external_namespace_member`'s later
@@ -5416,16 +5580,18 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     }
 
     /// Parameter entities, "referenced-only" variant: sets `declarator_owns_
-    /// entity` per declarator (index `0` only) before visiting it, so
-    /// `visit_variable_declarator` can tell whether ITS declarator is the
-    /// one `lib.rs`'s plain entity pass actually emits a `core:value` entity
-    /// for -- see that field's own doc comment. Otherwise identical to the
-    /// default `walk_variable_declaration` (`visit_span` is a no-op this
-    /// walker never overrides, same as every other custom-traversal override
-    /// in this file, e.g. `visit_method_definition`).
+    /// entity` per declarator before visiting it, so `visit_variable_
+    /// declarator` can tell whether ITS declarator is one `lib.rs`'s plain
+    /// entity pass actually emits a `core:value` entity for -- see that
+    /// field's own doc comment (3c, 2026-09-05: every `BindingIdentifier`
+    /// declarator owns an entity, not just the first). Otherwise identical
+    /// to the default `walk_variable_declaration` (`visit_span` is a no-op
+    /// this walker never overrides, same as every other custom-traversal
+    /// override in this file, e.g. `visit_method_definition`).
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        for (index, declarator) in declaration.declarations.iter().enumerate() {
-            self.declarator_owns_entity = index == 0;
+        for declarator in &declaration.declarations {
+            self.declarator_owns_entity =
+                matches!(declarator.id, BindingPattern::BindingIdentifier(_));
             self.visit_variable_declarator(declarator);
         }
     }
@@ -5961,6 +6127,28 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.2 == function_id && row.3 == doubled_id)
+        );
+    }
+
+    /// 3c (2026-09-05): a reference to the SECOND declarator of a comma-
+    /// separated `VariableDeclaration` (`b`, after `a`) resolves to `b`'s
+    /// own entity -- `classify_symbol_declaration`'s `VariableDeclarator`
+    /// arm already classified any `BindingIdentifier` declarator regardless
+    /// of position, so this resolver-side behavior predates 3c; what 3c
+    /// fixed is that `lib.rs` now actually PUBLISHES an entity at this same
+    /// identity key (see `tests::multi_declarator_variable_declaration_
+    /// gives_every_declarator_an_entity` in `lib.rs`, which checks lane 1),
+    /// so the two lanes now agree instead of the reference dangling.
+    #[test]
+    fn non_first_declarator_reference_resolves_to_its_own_entity() {
+        let source = "const a = 1, b = 2;\nuse(b);\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let b_start = source.find("b = 2").unwrap() as u32;
+        let b_id = declaration_id(DeclKind::Variable, "a.ts", b_start, "b");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == b_id),
+            "expected a reference resolved to {b_id}: {rows:?}"
         );
     }
 
@@ -7886,6 +8074,58 @@ mod tests {
         assert!(resolved(&semantics).is_empty());
     }
 
+    /// 3a (2026-09-05): a PLAIN reference (never called) to an overloaded
+    /// import resolves to the FIRST declaration in source order -- v3's own
+    /// checker behavior, 11/11 sampled clusters (see `resolver::resolve_
+    /// direct_export`'s own doc comment). Three same-named, same-kind
+    /// `EntityKind::Function` entities model two signatures plus their
+    /// trailing implementation (byte-identical export bindings collapse to
+    /// one via `sort()`/`dedup()` in real `lib.rs` output, matching this
+    /// fixture's single `export_binding("f", "f")`).
+    #[test]
+    fn overloaded_import_reference_resolves_to_first_declaration() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            target_file(
+                "a.ts",
+                vec![
+                    target_entity(crate::EntityKind::Function, "a.ts", 10, "f"),
+                    target_entity(crate::EntityKind::Function, "a.ts", 40, "f"),
+                    target_entity(crate::EntityKind::Function, "a.ts", 70, "f"),
+                ],
+                vec![export_binding("f", "f")],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import { f } from \"./a\";\nconst g = f;\n";
+        let semantics =
+            analyze_owner_semantics_with_context("b.ts", source, &ctx).expect("analysis succeeds");
+        // `a.ts` != `b.ts`: this reference is necessarily cross-file --
+        // `ReferenceRow::cross_file` governs a SEPARATE `core:covers`
+        // synthesis, not a field this record's own body serializes, so the
+        // path mismatch itself is the observable proof here.
+        let target_id = "jsts:function:a.ts:10:f";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference resolved to the FIRST declaration {target_id}: {rows:?}"
+        );
+        assert!(
+            semantics
+                .reference_rows
+                .iter()
+                .any(|record| record.target_id.as_deref() == Some(target_id)),
+            "expected a core:references ProposedRecord targeting {target_id}: {:?}",
+            semantics.reference_rows
+        );
+        // No call anywhere in this fixture -- `pending_call_sites`/`call_
+        // rows` (and so `pending.sites`) are untouched by this fix, exactly
+        // as the plan requires; nothing here exercises the call side at
+        // all, unlike the two frozen tests directly above.
+        assert!(semantics.call_rows.is_empty());
+    }
+
     #[test]
     fn resolves_through_a_named_reexport_one_hop() {
         let mut files = BTreeMap::new();
@@ -9766,6 +10006,40 @@ mod tests {
             assert_eq!(contains.body.to_value()["target_id"], param_id);
             assert_eq!(contains.body.to_value()["classification"], "confirmed");
         }
+    }
+
+    /// 3c (2026-09-05): a variable-bound arrow that is NOT the first
+    /// declarator of its `VariableDeclaration` (`make` here is the SECOND
+    /// declarator, after `a`) still owns its parameter's entity --
+    /// `referenced_parameters_get_entities_matching_the_reference_target_
+    /// across_owner_shapes` above only ever exercises a variable-bound arrow
+    /// as the SOLE declarator, so this is the first coverage of `declarator_
+    /// owns_entity` actually varying within one `VariableDeclaration`.
+    /// Before 3c, `declarator_owns_entity` was `index == 0`, so `count`
+    /// would have fallen back to the MODULE as its owner instead of `make`.
+    #[test]
+    fn parameter_of_a_non_first_declarators_arrow_still_owns_the_variable_not_the_module() {
+        let source = "const a = 1, make = (count) => count;\nmake(1);\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let make_id = declaration_id(
+            DeclKind::Variable,
+            "a.ts",
+            source.find("make").unwrap() as u32,
+            "make",
+        );
+        let param_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("count").unwrap() as u32,
+            "count",
+        );
+        let entity = parameter_entity(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a parameter entity for {param_id}"));
+        assert_eq!(entity.body.to_value()["parent_id"], make_id);
+        assert_eq!(entity.body.to_value()["qualified_name"], "a.ts.make.count");
+        let contains = parameter_contains(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a contains row for {param_id}"));
+        assert_eq!(contains.body.to_value()["source_id"], make_id);
     }
 
     #[test]

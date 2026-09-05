@@ -2077,8 +2077,27 @@ fn identity_type_byte(identity_type: &str) -> u8 {
 /// always a colon-joined string ending in the symbol's own name (entity
 /// ids: `jsts:{kind}:{path}:{start}:{name}`; relation ids embed both
 /// endpoints and end in a span/name segment too), so the last `:`-segment
-/// is a reasonable display name in every case this pipeline produces.
+/// is a reasonable display name in every case this pipeline produces --
+/// EXCEPT `external_module`/`external_symbol` (h3, 2026-09-05): their
+/// identity layout is `jsts:external_module:{specifier}` /
+/// `jsts:external_symbol:{specifier}#{imported_name}`
+/// (`urdira_jsts_syntax_worker::resolver::external_module_id`/
+/// `external_symbol_id`), and `specifier` itself embeds a `node:` prefix
+/// for a Node builtin (`jsts:external_module:node:fs`) -- an extra `:`
+/// the generic "last segment" rule would split on, silently dropping the
+/// `node:` prefix (`fs` instead of `node:fs`). For these two kinds only,
+/// parse by the fixed `jsts:{kind}:` layout and return EVERYTHING after
+/// it (the whole specifier, or `specifier#name` for a symbol) instead of
+/// the last `:`-segment. Every other kind keeps the original rule
+/// unchanged.
 pub(super) fn identity_key_name(identity_key: &str) -> &str {
+    if let Some(rest) = identity_key.strip_prefix("jsts:") {
+        for kind_prefix in ["external_module:", "external_symbol:"] {
+            if let Some(name) = rest.strip_prefix(kind_prefix) {
+                return name;
+            }
+        }
+    }
     identity_key.rsplit(':').next().unwrap_or(identity_key)
 }
 
@@ -2498,6 +2517,30 @@ mod tests {
             "widget"
         );
         assert_eq!(identity_key_name("no_colons"), "no_colons");
+    }
+
+    /// h3 (2026-09-05): `external_module`/`external_symbol` identities embed
+    /// a `node:`-prefixed specifier for a Node builtin
+    /// (`urdira_jsts_syntax_worker::resolver::external_module_id`/
+    /// `external_symbol_id`) -- the generic "last `:`-segment" rule would
+    /// drop that prefix (`fs` instead of `node:fs`). A non-builtin specifier
+    /// (no embedded colon) is unaffected either way.
+    #[test]
+    fn identity_key_name_keeps_node_prefix_for_external_modules() {
+        assert_eq!(identity_key_name("jsts:external_module:node:fs"), "node:fs");
+        assert_eq!(
+            identity_key_name("jsts:external_module:node:fs/promises"),
+            "node:fs/promises"
+        );
+        assert_eq!(
+            identity_key_name("jsts:external_symbol:node:fs#readFile"),
+            "node:fs#readFile"
+        );
+        assert_eq!(identity_key_name("jsts:external_module:lodash"), "lodash");
+        assert_eq!(
+            identity_key_name("jsts:external_symbol:lodash#get"),
+            "lodash#get"
+        );
     }
 
     /// Regression test for this module's hex-decoding of the kernel's own

@@ -6,8 +6,8 @@ use oxc_ast::ast::{
     ExportAllDeclaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
     ExportNamedDeclaration, ExportSpecifier, Expression, Function, FunctionType, ImportDeclaration,
     ImportDeclarationSpecifier, ImportExpression, ModuleExportName, Statement, TSEnumDeclaration,
-    TSInterfaceDeclaration, TSModuleDeclaration, TSModuleDeclarationBody, TSModuleDeclarationName,
-    TSTypeAliasDeclaration, VariableDeclaration,
+    TSExportAssignment, TSInterfaceDeclaration, TSModuleDeclaration, TSModuleDeclarationBody,
+    TSModuleDeclarationName, TSTypeAliasDeclaration, VariableDeclaration,
 };
 use oxc_ast_visit::{
     Visit,
@@ -16,8 +16,8 @@ use oxc_ast_visit::{
         walk_call_expression, walk_class, walk_export_all_declaration,
         walk_export_default_declaration, walk_export_named_declaration, walk_export_specifier,
         walk_function, walk_import_declaration, walk_import_expression, walk_ts_enum_declaration,
-        walk_ts_interface_declaration, walk_ts_module_declaration, walk_ts_type_alias_declaration,
-        walk_variable_declaration,
+        walk_ts_export_assignment, walk_ts_interface_declaration, walk_ts_module_declaration,
+        walk_ts_type_alias_declaration, walk_variable_declaration,
     },
 };
 use oxc_parser::Parser;
@@ -39,7 +39,8 @@ mod resolver;
 mod semantic_sites;
 pub use line_index::LineIndex;
 pub use resolver::{
-    AmbientModuleIndex, ConfigAsset, ExportResolution, WorkspaceResolver, resolve_named_export,
+    AmbientModuleIndex, ConfigAsset, ExportPolicy, ExportResolution, WorkspaceResolver,
+    resolve_named_export,
 };
 pub use semantic_sites::{
     HybridResolutionContext, OwnerSemantics, PendingReasonCode, PendingSiteKind,
@@ -3843,6 +3844,27 @@ fn declaration_entity_kind(declaration: &Declaration<'_>) -> Option<EntityKind> 
 /// component: T;` is reached the exact same way an `export`ed one is,
 /// just without the `ExportNamedDeclaration` wrapper) purely for `export
 /// default <identifier>` to search, never published/exposed beyond that.
+/// h1 (2026-09-05): counts every `export = <expression>` this crate saw
+/// (top-level file scope or inside an ambient module block) whose
+/// `expression` was NOT a bare identifier -- the only shape this task
+/// resolves (`export = f;`). A diagnostic aggregate only, mirroring
+/// `semantic_sites::AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL`'s own "process-
+/// wide counter, `Relaxed` ordering, reset once per scan" discipline; read
+/// via [`unsupported_export_assignment_shape_count`], reset via
+/// [`reset_unsupported_export_assignment_shape_count`].
+static UNSUPPORTED_EXPORT_ASSIGNMENT_SHAPE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// See [`UNSUPPORTED_EXPORT_ASSIGNMENT_SHAPE`]'s own doc comment.
+pub fn unsupported_export_assignment_shape_count() -> u64 {
+    UNSUPPORTED_EXPORT_ASSIGNMENT_SHAPE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// See [`UNSUPPORTED_EXPORT_ASSIGNMENT_SHAPE`]'s own doc comment.
+pub fn reset_unsupported_export_assignment_shape_count() {
+    UNSUPPORTED_EXPORT_ASSIGNMENT_SHAPE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn ambient_module_members(
     path: &str,
     body: &[Statement<'_>],
@@ -3850,6 +3872,11 @@ fn ambient_module_members(
     let mut members = Vec::new();
     let mut all_declarations = Vec::new();
     let mut default_statement = None;
+    // h1 (2026-09-05): `export = f;` inside an ambient module block --
+    // CommonJS's own default-export idiom, syntactically exclusive with
+    // `export default ...` (a `.d.ts` block never has both), so this is
+    // consulted only when `default_statement` above stayed `None`.
+    let mut export_assignment_expression = None;
     for statement in body {
         if let Some(declaration) = statement.as_declaration()
             && let Some(kind) = declaration_entity_kind(declaration)
@@ -3878,12 +3905,45 @@ fn ambient_module_members(
             Statement::ExportDefaultDeclaration(export_default) => {
                 default_statement = Some(export_default);
             }
+            Statement::TSExportAssignment(assign) => {
+                export_assignment_expression = Some(&assign.expression);
+            }
             _ => {}
         }
     }
-    let default_member = default_statement
-        .and_then(|export_default| ambient_default_member(path, export_default, &all_declarations));
+    let default_member = match default_statement {
+        Some(export_default) => ambient_default_member(path, export_default, &all_declarations),
+        None => export_assignment_expression
+            .and_then(|expression| ambient_export_assignment_member(expression, &all_declarations)),
+    };
     (members, default_member)
+}
+
+/// h1 (2026-09-05): the `AmbientModuleMember` an `export = <expression>`
+/// statement inside an ambient module block names -- mirrors
+/// `ambient_default_member`'s own `Identifier` arm exactly (same "unique
+/// match against `all_declarations` or bust" rule), since `export =
+/// identifier` is CommonJS's own spelling of the same idiom `export
+/// default identifier` covers for ES modules. Minimal scope, per the
+/// plan: only a bare identifier resolves; every other expression shape
+/// (`export = { a, b };`, `export = class {};`, ...) has no single name to
+/// point at and is counted, never guessed.
+fn ambient_export_assignment_member(
+    expression: &Expression<'_>,
+    all_declarations: &[AmbientModuleMember],
+) -> Option<AmbientModuleMember> {
+    let Expression::Identifier(ident) = expression else {
+        UNSUPPORTED_EXPORT_ASSIGNMENT_SHAPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    let matches: Vec<&AmbientModuleMember> = all_declarations
+        .iter()
+        .filter(|member| member.name == ident.name.as_str())
+        .collect();
+    match matches.as_slice() {
+        [single] => Some((*single).clone()),
+        _ => None,
+    }
 }
 
 /// Ambient module resolution task (2026-09-04): the `AmbientModuleMember`
@@ -4203,6 +4263,41 @@ impl<'a> Visit<'a> for SyntaxCollector {
         walk_export_default_declaration(self, declaration);
     }
 
+    /// h1 (2026-09-05): `export = <identifier>;` -- CommonJS's own default-
+    /// export idiom, syntactically exclusive with every ES `export ...`
+    /// form in the same file (no `TSExportAssignment` visitor existed
+    /// before this task; `file_has_top_level_module_syntax`'s own doc
+    /// comment already accounts for `TSExportAssignment` making a file a
+    /// MODULE). Only a bare identifier resolves, mirroring `visit_export_
+    /// default_declaration`'s `Identifier` arm exactly (`local_name` is the
+    /// identifier's OWN name, looked up in `entities` the same way);
+    /// pushed as `exported_name: "default"`, same as an ES `export default
+    /// someLocalThing;`, since `import x from "./this-file"` and `import x
+    /// = require("./this-file")` both resolve through the SAME `"default"`
+    /// binding lookup (`resolver::resolve_named_export`). Fires for a
+    /// TRUE top-level `export = f;` in an ordinary file AND for one
+    /// nested inside a `declare module "spec" { ... }` block (the default
+    /// recursive walk reaches it either way) -- the latter ALSO reaches
+    /// `ambient_module_members`'s own `TSExportAssignment` arm, which
+    /// builds the ambient module's OWN `default_member` for specifier-
+    /// based resolution (`import x from "spec"`); this file-level binding
+    /// is a SEPARATE, path-based lookup surface, not a duplicate of it.
+    /// Every other expression shape is ignored, counted via
+    /// `UNSUPPORTED_EXPORT_ASSIGNMENT_SHAPE`, never guessed.
+    fn visit_ts_export_assignment(&mut self, assignment: &TSExportAssignment<'a>) {
+        if let Expression::Identifier(ident) = &assignment.expression {
+            self.export_bindings.push(SyntaxExportBinding {
+                exported_name: "default".to_owned(),
+                local_name: ident.name.as_str().to_owned(),
+                source_specifier: None,
+                source_target_path: None,
+            });
+        } else {
+            UNSUPPORTED_EXPORT_ASSIGNMENT_SHAPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        walk_ts_export_assignment(self, assignment);
+    }
+
     fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
         if let Expression::StringLiteral(source) = &expression.source {
             self.push_import(
@@ -4253,10 +4348,17 @@ impl<'a> Visit<'a> for SyntaxCollector {
     }
 
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        if let Some(declarator) = declaration.declarations.first()
-            && let BindingPattern::BindingIdentifier(identifier) = &declarator.id
-        {
-            self.push_entity(identifier, EntityKind::Variable, UniversalKind::Value);
+        // 3c (2026-09-05): an entity for EVERY declarator, not just the
+        // first -- `const a = 1, b = 2;` previously left `b` with no entity
+        // at all, so any reference to `b` fell through to `REASON_
+        // UNSUPPORTED_DECLARATION_KIND` in the resolver. `SemanticWalker::
+        // visit_variable_declaration` (semantic_sites.rs) mirrors this same
+        // "one entity per BindingIdentifier declarator" rule via
+        // `declarator_owns_entity`.
+        for declarator in &declaration.declarations {
+            if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
+                self.push_entity(identifier, EntityKind::Variable, UniversalKind::Value);
+            }
         }
         walk_variable_declaration(self, declaration);
     }
@@ -4281,15 +4383,39 @@ impl<'a> Visit<'a> for SyntaxCollector {
     /// `declare module "specifier";`) is an ambient module declaration --
     /// see `AmbientModuleDeclaration`'s own doc comment. An `Identifier`-
     /// named one (`namespace X {}`/`declare namespace X {}`) names a LOCAL
-    /// binding, never a module specifier, and is deliberately left
-    /// untouched here (out of this task's scope -- `EntityKind::Namespace`
-    /// is not wired to that shape). Every declaration nested inside the
-    /// block (function/class/interface/type/enum/variable) still gets its
-    /// own entity through the ordinary recursive walk below, unaffected --
-    /// this override only ADDS the block's own namespace entity plus the
-    /// `AmbientModuleDeclaration` fact; it never replaces or skips the
-    /// default walk.
+    /// binding instead (3b, 2026-09-05): it now gets its own entity via
+    /// `push_entity` (same shape as `visit_class`/`visit_ts_enum_declaration`
+    /// above), so `import { X } from ...`/local references to the namespace
+    /// name resolve like any other module-level declaration. Every
+    /// declaration nested inside the block (function/class/interface/type/
+    /// enum/variable) still gets its own entity through the ordinary
+    /// recursive walk below, unaffected -- this override only ADDS the
+    /// block's own namespace/ambient-module entity plus (string-literal
+    /// case only) the `AmbientModuleDeclaration` fact; it never replaces or
+    /// skips the default walk.
+    ///
+    /// Known gap, not fixed here (documented per plan, not "fixed"):
+    /// nested `namespace A.B {}` desugars in oxc to `namespace A { namespace
+    /// B {} }`, so this visitor fires once per level and each produces its
+    /// own entity -- no special-casing needed, but the identity of `A` is
+    /// anchored at the OUTER declaration's identifier span, same as v3.
+    /// Declaration merging -- the same `namespace X {}` (or
+    /// `declare namespace X {}`) repeated more than once in the same file --
+    /// produces one entity PER occurrence, each with a distinct identity key
+    /// (`identity_start` differs), because `push_entity` never deduplicates
+    /// by name. Downstream, the export resolver (`resolve_direct_export`)
+    /// sees >1 candidate entity with the same `name` and the same
+    /// `EntityKind::Namespace` and reports `Ambiguous` for a bare
+    /// `import { X } from "./this-file"` of the merged name -- exactly the
+    /// same fallback merged overloaded functions already get. This is
+    /// counted in the references-parity diff, not silently absorbed; it is
+    /// not "fixed" by 3a either, since 3a's first-declaration policy is
+    /// scoped to function/method overloads, not namespace merges (which can
+    /// legitimately contribute different members per block).
     fn visit_ts_module_declaration(&mut self, declaration: &TSModuleDeclaration<'a>) {
+        if let TSModuleDeclarationName::Identifier(identifier) = &declaration.id {
+            self.push_entity(identifier, EntityKind::Namespace, UniversalKind::Type);
+        }
         if let TSModuleDeclarationName::StringLiteral(literal) = &declaration.id {
             let specifier = literal.value.as_str().to_owned();
             let namespace_entity_id = self.push_namespace_entity(
@@ -5247,6 +5373,103 @@ mod tests {
                 .iter()
                 .any(|record| record.identity_key == function_id),
             "expected a function entity {function_id}: {records:?}"
+        );
+    }
+
+    /// 3b (2026-09-05): an `Identifier`-named `TSModuleDeclaration`
+    /// (`namespace Foo {}`, here wrapped in `export`) now gets its own
+    /// `EntityKind::Namespace` entity plus a `core:contains` relation from
+    /// the file's module entity, mirroring `push_namespace_entity`'s
+    /// string-literal (ambient module) sibling above -- see that test for
+    /// the ambient-module-still-works-unchanged half of this coverage.
+    #[test]
+    fn namespace_identifier_declaration_gets_its_own_entity_and_contains_relation() {
+        let mut state = SyntaxWorkerState::default();
+        let text = "export namespace Foo {\n  export const a = 1;\n}\n";
+        let files = vec![source("ns.ts", text)];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["ns.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "ns.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let name_start = text.find("Foo").unwrap() as u32;
+        let name_end = name_start + "Foo".len() as u32;
+        let namespace_id = format!("jsts:namespace:ns.ts:{name_start}:Foo");
+        let namespace_entity = records
+            .iter()
+            .find(|record| record.identity_key == namespace_id)
+            .unwrap_or_else(|| panic!("expected a namespace entity {namespace_id}: {records:?}"));
+        assert_eq!(namespace_entity.body.to_value()["kind"], "namespace");
+        assert_eq!(namespace_entity.universal_kind, "core:type");
+        assert_eq!(namespace_entity.body.to_value()["name"], "Foo");
+
+        let module_id = stable_entity_id(EntityKind::Module, "ns.ts", 0, "ns.ts");
+        let contains_id =
+            format!("jsts:contains:ns.ts:{name_start}:{name_end}:{module_id}:{namespace_id}");
+        let contains_relation = records
+            .iter()
+            .find(|record| record.identity_key == contains_id)
+            .unwrap_or_else(|| {
+                panic!("expected a core:contains relation {contains_id}: {records:?}")
+            });
+        assert_eq!(contains_relation.universal_kind, "core:contains");
+
+        // Nested declarations inside the namespace block still get their
+        // own entity through the ordinary recursive walk, unaffected.
+        let variable_start = (text.find("const a").unwrap() + "const ".len()) as u32;
+        let variable_id = format!("jsts:variable:ns.ts:{variable_start}:a");
+        assert!(
+            records
+                .iter()
+                .any(|record| record.identity_key == variable_id),
+            "expected a variable entity {variable_id}: {records:?}"
+        );
+    }
+
+    /// 3c (2026-09-05): every declarator of a comma-separated
+    /// `VariableDeclaration` gets its own entity, not just the first --
+    /// before this fix, `b` here had NO entity at all: `use(b)`'s reference
+    /// (`semantic_sites.rs`'s `classify_symbol_declaration` already
+    /// classified a non-first `BindingIdentifier` declarator as `DeclKind::
+    /// Variable` before this task) would resolve to an identity key that no
+    /// `SyntaxEntity` this crate published ever matched -- a dangling
+    /// reference at the store level. This crate's plain `analyze`/`read_
+    /// page` only exercises lane 1 (entities); see `semantic_sites::tests::
+    /// non_first_declarator_reference_resolves_to_its_own_entity` for lane 2
+    /// (the reference resolution itself) matching this SAME identity key.
+    #[test]
+    fn multi_declarator_variable_declaration_gives_every_declarator_an_entity() {
+        let mut state = SyntaxWorkerState::default();
+        let text = "const a = 1, b = 2;\nuse(b);\n";
+        let files = vec![source("multi.ts", text)];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["multi.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "multi.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let a_start = text.find("a = 1").unwrap() as u32;
+        let a_id = format!("jsts:variable:multi.ts:{a_start}:a");
+        assert!(
+            records.iter().any(|record| record.identity_key == a_id),
+            "expected the first declarator's entity {a_id}: {records:?}"
+        );
+        let b_start = text.find("b = 2").unwrap() as u32;
+        let b_id = format!("jsts:variable:multi.ts:{b_start}:b");
+        assert!(
+            records.iter().any(|record| record.identity_key == b_id),
+            "expected the second declarator's entity {b_id}: {records:?}"
         );
     }
 
@@ -7117,6 +7340,96 @@ declare module 'markdown-it-task-lists' {
         assert_eq!(collector.export_bindings[0].exported_name, "eval-utils");
     }
 
+    // h1 (2026-09-05): `export = <identifier>;` -- CommonJS's own default-
+    // export idiom.
+
+    #[test]
+    fn export_assignment_of_an_identifier_pushes_a_default_export_binding() {
+        let collector = collect("widget.ts", "declare function f(): void;\nexport = f;\n");
+        assert_eq!(collector.export_bindings.len(), 1);
+        let binding = &collector.export_bindings[0];
+        assert_eq!(binding.exported_name, "default");
+        assert_eq!(binding.local_name, "f");
+        assert_eq!(binding.source_specifier, None);
+        assert_eq!(binding.source_target_path, None);
+    }
+
+    #[test]
+    fn export_assignment_inside_an_ambient_module_becomes_its_default_member() {
+        let text = "declare module \"x\" {\n  function f(): void;\n  export = f;\n}\n";
+        let collector = collect("plugins.d.ts", text);
+        assert_eq!(collector.ambient_modules.len(), 1);
+        let declaration = &collector.ambient_modules[0];
+        let function_start = text.find("function f").unwrap() as u32 + "function ".len() as u32;
+        let expected_id = format!("jsts:function:plugins.d.ts:{function_start}:f");
+        let default_member = declaration
+            .default_member
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected a default_member: {declaration:?}"));
+        assert_eq!(default_member.name, "f");
+        assert_eq!(default_member.entity_id, expected_id);
+        // The file-level visitor ALSO fires for this same nested node (the
+        // default recursive walk reaches it either way) -- a SEPARATE,
+        // path-based export binding, not a duplicate of the ambient
+        // module's own `default_member` above.
+        assert_eq!(collector.export_bindings.len(), 1);
+        assert_eq!(collector.export_bindings[0].local_name, "f");
+    }
+
+    #[test]
+    fn export_assignment_of_a_non_identifier_expression_is_ignored_and_counted() {
+        let before = unsupported_export_assignment_shape_count();
+        let collector = collect("widget.ts", "export = { a: 1 };\n");
+        assert!(collector.export_bindings.is_empty());
+        assert!(unsupported_export_assignment_shape_count() > before);
+    }
+
+    /// Plan's literal test scenario: an ambient module's `export = f;` plus
+    /// an importer resolves the import through the ambient module's own
+    /// namespace entity (never external) -- the per-name resolution to
+    /// `f` itself goes through `resolver::AmbientModuleIndex::resolve_
+    /// export`'s `"default"` arm (unchanged by this task, already reading
+    /// `default_member`), exercised in `resolver.rs`'s own test suite; this
+    /// integration test covers the declaration side this task actually
+    /// changed.
+    #[test]
+    fn ambient_export_assignment_import_resolves_to_the_namespace_not_external() {
+        let mut state = SyntaxWorkerState::default();
+        let declaration_text = "declare module \"x\" {\n  function f(): void;\n  export = f;\n}\n";
+        let files = vec![
+            source("plugins.d.ts", declaration_text),
+            source("a.ts", "import x from \"x\";\nx();\n"),
+        ];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["plugins.d.ts", "a.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "a.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let quote_start = declaration_text.find('"').unwrap() as u32;
+        let namespace_id = format!("jsts:namespace:plugins.d.ts:{quote_start}:x");
+        let import_relation = records
+            .iter()
+            .find(|record| record.kind == "jsts:relation_import")
+            .expect("expected an import relation record");
+        assert_eq!(import_relation.body.to_value()["target_id"], namespace_id);
+        assert_eq!(
+            import_relation.body.to_value()["classification"],
+            "confirmed"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.identity_key.starts_with("jsts:external_module:")),
+            "an ambiently-resolved specifier must never synthesize an external_module entity: {records:?}"
+        );
+    }
+
     // A5b (2026-09-05 references-parity task, bucket 1 --
     // `import_binding/export:unresolved`): a barrel doing `import { X } from
     // './x'; export { X };` (no `from` on the `export` itself) must be
@@ -7254,7 +7567,12 @@ declare module 'markdown-it-task-lists' {
             },
         );
         assert_eq!(
-            resolver::resolve_named_export(&files, "index.ts", "neverDeclared"),
+            resolver::resolve_named_export(
+                &files,
+                "index.ts",
+                "neverDeclared",
+                resolver::ExportPolicy::UniqueOrAmbiguous
+            ),
             resolver::ExportResolution::Unresolved
         );
     }

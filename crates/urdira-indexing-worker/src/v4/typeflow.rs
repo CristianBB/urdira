@@ -334,9 +334,16 @@ fn resolve_import_targets_for<'a>(
         let Some(target_path) = resolver.resolve(owning_path, specifier, available) else {
             continue;
         };
-        if let ExportResolution::Resolved(target_id) =
-            resolve_named_export(files, &target_path, imported_name)
-        {
+        // 3a (urdira-jsts-syntax-worker, 2026-09-05): `resolve_named_export`
+        // gained a policy parameter; `UniqueOrAmbiguous` reproduces this
+        // call's exact prior behavior (typeflow's own import-target
+        // resolution is unrelated to the overload/reference-vs-call split).
+        if let ExportResolution::Resolved(target_id) = resolve_named_export(
+            files,
+            &target_path,
+            imported_name,
+            urdira_jsts_syntax_worker::ExportPolicy::UniqueOrAmbiguous,
+        ) {
             import_targets.insert(key, target_id);
         }
     }

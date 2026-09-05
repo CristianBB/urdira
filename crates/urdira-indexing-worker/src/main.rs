@@ -29,9 +29,9 @@ use urdira_jsts_indexing_engine::JavascriptTypescriptEngine;
 #[cfg(test)]
 use urdira_jsts_syntax_worker::RecordBody;
 use urdira_jsts_syntax_worker::{
-    AnalysisBudgets, ConfigAssetInput, ExportResolution, FactsCursor, FactsGroupEntry,
-    HybridResolutionContext, OwnerSemantics, ProposedRecord, SiteKind, SourceInput,
-    SyntaxFileResult, SyntaxWorkerState, WorkerMessage, WorkspaceResolver,
+    AnalysisBudgets, ConfigAssetInput, ExportPolicy, ExportResolution, FactsCursor,
+    FactsGroupEntry, HybridResolutionContext, OwnerSemantics, ProposedRecord, SiteKind,
+    SourceInput, SyntaxFileResult, SyntaxWorkerState, WorkerMessage, WorkspaceResolver,
     analyze_owner_semantics_with_context, decode_config_assets, resolve_named_export,
 };
 use urdira_worker_protocol::{
@@ -924,9 +924,16 @@ fn build_typeflow_program_index(
         let Some(target_path) = resolver.resolve(owning_path, specifier, available) else {
             continue;
         };
-        if let ExportResolution::Resolved(target_id) =
-            resolve_named_export(files, &target_path, imported_name)
-        {
+        // 3a (urdira-jsts-syntax-worker, 2026-09-05): `resolve_named_export`
+        // gained a policy parameter; `UniqueOrAmbiguous` reproduces this
+        // call's exact prior behavior (v3's own typeflow import-target
+        // resolution is unrelated to the overload/reference-vs-call split).
+        if let ExportResolution::Resolved(target_id) = resolve_named_export(
+            files,
+            &target_path,
+            imported_name,
+            ExportPolicy::UniqueOrAmbiguous,
+        ) {
             import_targets.insert(key, target_id);
         }
     }
