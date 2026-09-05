@@ -1736,6 +1736,31 @@ fn member_kind_name(decl_kind: u32) -> &'static str {
         // inventing a new one, is what makes the identity strings comparable
         // at all.
         syntax_kind::VARIABLE_DECLARATION => "variable",
+        // F4 4.4: a destructured binding (`const { a } = x`/`export const
+        // { b: renamed } = x`) -- `getExportsOfModule`'s own handle for
+        // such an export points directly at the `BindingElement` node
+        // (verified live), same "variable" word `VARIABLE_DECLARATION`
+        // already uses (v3's `analyzer.ts` has no separate word for a
+        // destructured binding either).
+        syntax_kind::BINDING_ELEMENT => "variable",
+        // F4 4.4: a call/heritage target resolved to a declaration found
+        // through the SAME `try_synthesize_member_entity` "no cold-
+        // materialized entity" path, but whose declaration is one of
+        // these top-level-shaped kinds NESTED inside a namespace (v4's
+        // lane-1 entity producer, `SyntaxCollector::push_entity`, does not
+        // descend into a `namespace`/`declare namespace` body -- only the
+        // namespace declaration itself becomes a cold entity, F2 3b). Same
+        // words `push_entity`'s own top-level `EntityKind::identity_name()`
+        // uses for each kind (`urdira-jsts-syntax-worker/src/lib.rs`), so a
+        // synthesized namespace-member identity reads exactly like the
+        // top-level entity of the same kind would, not a generic
+        // `jsts:member:...`.
+        syntax_kind::FUNCTION_DECLARATION => "function",
+        syntax_kind::CLASS_DECLARATION => "class",
+        syntax_kind::INTERFACE_DECLARATION => "interface",
+        syntax_kind::TYPE_ALIAS_DECLARATION => "type",
+        syntax_kind::ENUM_DECLARATION => "enum",
+        syntax_kind::MODULE_DECLARATION => "namespace",
         _ => "member",
     }
 }

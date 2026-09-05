@@ -129,6 +129,16 @@ pub mod syntax_kind {
     /// `ModuleDeclaration` (a TypeScript `namespace`/`module` block) --
     /// from `dist/enums/syntaxKind.enum.js`.
     pub const MODULE_DECLARATION: u32 = 268;
+    /// `BindingElement` (one element of an `ObjectBindingPattern`/
+    /// `ArrayBindingPattern` destructuring pattern, e.g. `a`/`b: renamed`
+    /// in `const { a, b: renamed } = x`) -- verified live, F4 4.4 (a real
+    /// `getExportsOfModule` response for `export const { a, b: renamed } =
+    /// ...` points its `value_declaration` handle directly at a node of
+    /// this kind, for BOTH the plain and renamed element). See
+    /// `RemoteSourceFile::name_start`'s own doc comment for the child-order
+    /// convention (`[propertyName?, name, initializer?]`) this kind needs
+    /// special handling for.
+    pub const BINDING_ELEMENT: u32 = 209;
     pub const HERITAGE_CLAUSE: u32 = 299;
     pub const SOURCE_FILE: u32 = 307;
     pub const JSDOC: u32 = 315;
@@ -386,16 +396,40 @@ impl RemoteSourceFile {
     /// identifier binding).
     ///
     /// Known divergences (documented, not fixed — narrow and rare in
-    /// practice): a `ComputedPropertyName` key (`[expr]() {}`) or a
-    /// destructuring binding (`const { a, b } = x`) has no immediate
-    /// Identifier child at all, so this returns `None` for those (the
-    /// caller then falls back to the declaration's own start, matching
+    /// practice): a `ComputedPropertyName` key (`[expr]() {}`) has no
+    /// immediate Identifier child at all, so this returns `None` for that
+    /// (the caller then falls back to the declaration's own start, matching
     /// `analyzer.ts`'s `nameNode === undefined` branch) rather than the
-    /// real `.name` node's position.
+    /// real `.name` node's position. A default-value initializer that is
+    /// ITSELF a bare identifier reference on a `BindingElement` (`{a =
+    /// defaultRef}`) is also a known narrow divergence — see the
+    /// `BindingElement` branch below.
+    ///
+    /// F4 4.4: `BindingElement` (`const { a, b: renamed } = x`'s `a`/`b:
+    /// renamed` elements — verified live, `crate::node::syntax_kind::
+    /// BINDING_ELEMENT`'s own doc comment) needs the LAST identifier child,
+    /// not the first: its children are ordered `[propertyName?, name,
+    /// initializer?]`, so a plain element (`{a}`, one identifier child —
+    /// `name` itself) and a renamed one (`{b: renamed}`, two identifier
+    /// children — `propertyName` `b` then `name` `renamed`) both resolve
+    /// correctly this way, whereas the first-child rule below would
+    /// incorrectly return the renamed element's PROPERTY name (`b`) instead
+    /// of its actual local binding name (`renamed`) — confirmed live: a
+    /// real `getExportsOfModule` response for a renamed destructured export
+    /// points its `value_declaration` handle directly at the `BindingElement`
+    /// node, not the enclosing `VariableDeclaration`.
     pub fn name_start(&self, index: usize, text: &[u16]) -> Option<i32> {
+        let is_identifier =
+            |kind: u32| kind == syntax_kind::IDENTIFIER || kind == syntax_kind::PRIVATE_IDENTIFIER;
+        if self.kind(index) == syntax_kind::BINDING_ELEMENT {
+            return self
+                .children(index)
+                .into_iter()
+                .rfind(|&child| is_identifier(self.kind(child)))
+                .map(|child| self.node_start(child, text));
+        }
         for child in self.children(index) {
-            let kind = self.kind(child);
-            if kind == syntax_kind::IDENTIFIER || kind == syntax_kind::PRIVATE_IDENTIFIER {
+            if is_identifier(self.kind(child)) {
                 return Some(self.node_start(child, text));
             }
         }

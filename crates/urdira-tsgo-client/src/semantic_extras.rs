@@ -35,16 +35,21 @@
 //!   every direct child matching a member `SyntaxKind` (method/constructor/
 //!   getter/setter/property/method signature/property signature).
 //!
-//! **Known, documented gaps** (not silently diverged from v3, simply not
-//! reproduced this session): a namespace's own exported members (v3's
-//! `exportedDeclarations` is built from the FILE's module symbol only, same
-//! restriction here); a destructured export binding (`export const {a, b} =
-//! obj`, whose declaration handle is the `BindingElement`, not something
-//! this module's member-kind set recognizes at the top level -- `analyzer.
-//! ts`'s own `nameOf`/`addEntity` handle this via the general AST walk this
-//! module does not perform). Both are narrow relative to a typical corpus's
-//! dominant shapes (top-level function/class/interface/type/enum/variable
-//! plus ordinary class/interface members).
+//! **F4 4.4 (2026-09-05): namespace members.** A `namespace`/`declare
+//! namespace` export's own exported members ARE now included (recursing
+//! `getSymbolAtLocation`/`getExportsOfModule` again on the namespace's own
+//! node -- see `collect_module_exports`'s doc comment) -- this used to be a
+//! documented gap (v3's `exportedDeclarations` walk covers this; this
+//! module's file-only `getExportsOfModule` call did not).
+//!
+//! **F4 4.4: destructured export bindings.** `export const {a, b: renamed}
+//! = obj`'s `getExportsOfModule` handles point directly at a `BindingElement`
+//! node for BOTH `a` and `renamed` (verified live), which THIS module's
+//! `exported_declaration_indices` already pushed unconditionally -- the real
+//! gap was one level down, in `RemoteSourceFile::name_start` returning the
+//! wrong position for a RENAMED element (`crate::node::syntax_kind::
+//! BINDING_ELEMENT`'s own doc comment has the fix and the confirmed-live
+//! child-order convention). A plain (non-renamed) element already worked.
 
 use std::collections::HashSet;
 
@@ -152,13 +157,61 @@ fn exported_declaration_indices(
         Ok(Some(symbol)) => symbol,
         _ => return Vec::new(),
     };
-    let exports = match client.get_exports_of_module(snapshot, project, module_symbol.id) {
-        Ok(exports) => exports,
-        Err(_) => return Vec::new(),
-    };
 
     let mut seen: HashSet<usize> = HashSet::new();
     let mut indices = Vec::new();
+    collect_module_exports(
+        client,
+        snapshot,
+        project,
+        owner_path,
+        owner_file,
+        module_symbol.id,
+        None,
+        &mut seen,
+        &mut indices,
+    );
+    indices
+}
+
+/// Pushes `(index, container_index)` for every export of `module_symbol_id`
+/// that resolves to a LOCAL (`owner_path`) declaration node -- the module-
+/// level body of `exported_declaration_indices` above, factored out so it
+/// can recurse. Two containers descend beyond their own top-level entry:
+/// - a `ClassDeclaration`/`InterfaceDeclaration` export's direct member
+///   children (pre-4.4 behavior, unchanged).
+/// - F4 4.4: a `namespace`/`declare namespace` export's OWN module symbol
+///   -- a namespace is itself a module in TypeScript's type system, with
+///   its own symbol table, so its exported members are found by calling
+///   `getSymbolAtLocation`/`getExportsOfModule` AGAIN on the namespace's
+///   node, exactly the same two-RPC recipe the file level already uses,
+///   rather than a manual AST walk over the namespace's `ModuleBlock`
+///   checking `export` modifiers by hand. `container_index` on a
+///   namespace member's own entry is the NAMESPACE's index, matching
+///   `declaration_name`'s existing `"{Container}.{member}"` `display_name`
+///   convention verbatim (unchanged by this task). This recurses to
+///   arbitrary depth (a namespace member that is itself a class/interface
+///   or a nested namespace is descended into the same way), a strictly
+///   more complete generalization of "namespace members" than the plan's
+///   own one-level sketch, at no extra cost (every recursive branch is
+///   already gated behind the SAME `seen` set, so a re-exported/aliased
+///   member is never typed twice).
+#[allow(clippy::too_many_arguments)]
+fn collect_module_exports(
+    client: &TsgoClient,
+    snapshot: u64,
+    project: &str,
+    owner_path: &str,
+    owner_file: &RemoteSourceFile,
+    module_symbol_id: u64,
+    container_index: Option<usize>,
+    seen: &mut HashSet<usize>,
+    indices: &mut Vec<(usize, Option<usize>)>,
+) {
+    let exports = match client.get_exports_of_module(snapshot, project, module_symbol_id) {
+        Ok(exports) => exports,
+        Err(_) => return,
+    };
     for symbol in exports {
         let Some(handle_str) = symbol
             .value_declaration
@@ -180,9 +233,10 @@ fn exported_declaration_indices(
         if index >= owner_file.node_count() || !seen.insert(index) {
             continue;
         }
-        indices.push((index, None));
+        indices.push((index, container_index));
+        let kind = owner_file.kind(index);
         if matches!(
-            owner_file.kind(index),
+            kind,
             syntax_kind::CLASS_DECLARATION | syntax_kind::INTERFACE_DECLARATION
         ) {
             for child in owner_file.children(index) {
@@ -190,9 +244,50 @@ fn exported_declaration_indices(
                     indices.push((child, Some(index)));
                 }
             }
+        } else if kind == syntax_kind::MODULE_DECLARATION {
+            // F4 4.4: unlike a class/interface (where `getSymbolAtLocation`
+            // on the DECLARATION node itself returns its symbol directly --
+            // confirmed live for the class/interface branch above, already
+            // in production before this task), calling it on a `namespace`
+            // declaration's own node returns `null` (confirmed live while
+            // writing this branch) -- the checker instead resolves a
+            // namespace's symbol from its NAME identifier, the same way
+            // `crate::resolver`'s own declaration handles are always
+            // anchored on a name/keyword position, never a whole
+            // statement. `None` (no `Identifier` name child at all) is an
+            // ambient `declare module "string-literal" {}` -- out of scope
+            // here (that shape is handled at the syntax-worker/entity
+            // level, `push_namespace_entity`, not by this checker-driven
+            // module-export walk) -- silently skipped, not an error.
+            let name_child = owner_file
+                .children(index)
+                .into_iter()
+                .find(|&c| owner_file.kind(c) == syntax_kind::IDENTIFIER);
+            let namespace_symbol = name_child.and_then(|name_index| {
+                client
+                    .get_symbol_at_location(
+                        snapshot,
+                        project,
+                        &NodeHandle::new(name_index as u32, syntax_kind::IDENTIFIER, owner_path),
+                    )
+                    .ok()
+                    .flatten()
+            });
+            if let Some(namespace_symbol) = namespace_symbol {
+                collect_module_exports(
+                    client,
+                    snapshot,
+                    project,
+                    owner_path,
+                    owner_file,
+                    namespace_symbol.id,
+                    Some(index),
+                    seen,
+                    indices,
+                );
+            }
         }
     }
-    indices
 }
 
 /// Reads the identifier text of the node at `index` — `"constructor"` for a
