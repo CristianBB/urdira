@@ -78,7 +78,7 @@ use urdira_source_frontier::{BatchMeta, CasStore, Catalog, Delta as SourceDelta,
 use urdira_structural_store::row::{
     CATEGORY_ENTITY, CATEGORY_RELATION, DependencyRow, Dictionaries, PendingSiteRow, RecordRow,
 };
-use urdira_structural_store::{PendingSiteKey, SetKind, StoreReader};
+use urdira_structural_store::{Direction, PendingSiteKey, SetKind, StoreReader};
 use urdira_worker_protocol::{ChangeKind, ChangedPath, IndexingEvent};
 
 /// `jsts:external_module:*`/`jsts:external_symbol:*` identity prefixes --
@@ -144,7 +144,63 @@ fn is_external_entity_identity(identity_key: &[u8]) -> bool {
 /// decides its fate this generation (using its FRESH facts, not this
 /// generation-`prev_generation` snapshot), so counting it here would
 /// double-count a same-batch drop as a false protector.
+///
+/// Q5 B.1 (plan `rippling-sniffing-lake.md` Frente B, evidence `2026-09-05-
+/// v4-frentes-1-2-3-4-reopen-references-analyze-residual.md` §4/§10.3):
+/// this used to be a full `iter_visible(prev_generation)` k-way merge over
+/// every row in the store (369-414ms of the HUB-changed incremental scenario
+/// on n8n, 2.17M rows), looking for a `CATEGORY_RELATION` row whose
+/// `target_subject` happened to name an `at_risk` entity. That work is
+/// already indexed: `adj.in` (`StoreReader::adjacency(_, Direction::In,
+/// _)`) is the exact reverse `target_subject -> relation rows` index,
+/// written for every relation row unconditionally (`segment_io.rs`/
+/// `writer.rs`, not category-filtered), already visibility-aware (same
+/// `effective_valid_to` check `iter_visible` used). So instead of scanning
+/// every row looking for the handful in `at_risk`, this walks `at_risk`
+/// itself (bounded by the touched batch, never by corpus size) and asks
+/// the index directly for its inbound relations -- `O(|at_risk| x (log
+/// segments + hits))` instead of `O(corpus)`. No `Dictionaries` lookup is
+/// needed any more either: `adjacency` already resolves `subject_key ->
+/// ordinal` internally and returns fully-hydrated `RecordView`s, so the
+/// `dicts.subjects.get(target_ordinal)` reverse-lookup this used to need
+/// per candidate row disappears along with the `dicts` parameter.
+/// `adjacency` returns an empty `Vec` for a `target_record_id` absent from
+/// `subject_index` (never targeted by any relation, in this or any prior
+/// generation) -- the same "not protected" outcome the old full scan
+/// produced for that case, so the fallback is implicit, not a special
+/// case. The old implementation is kept as `#[cfg(test)]`-only oracle
+/// (`protected_external_entity_ids_by_full_scan`, unchanged) with a test
+/// (`mod tests`, below) asserting both agree, since the semantics are
+/// meant to be byte-for-byte identical -- only the traversal changed.
 fn protected_external_entity_ids(
+    store_reader: &StoreReader,
+    prev_generation: u64,
+    touched_owner_ordinals: &HashSet<u32>,
+    at_risk: &HashSet<[u8; 32]>,
+) -> HashSet<[u8; 32]> {
+    let mut protected = HashSet::with_capacity(at_risk.len());
+    for target_record_id in at_risk {
+        let still_needed = store_reader
+            .adjacency(target_record_id, Direction::In, prev_generation)
+            .into_iter()
+            .any(|view| {
+                view.category() == CATEGORY_RELATION
+                    && !touched_owner_ordinals.contains(&view.owner_artifact())
+            });
+        if still_needed {
+            protected.insert(*target_record_id);
+        }
+    }
+    protected
+}
+
+/// Pre-Q5-B.1 implementation, kept as the equivalence oracle
+/// [`tests::protected_external_entity_ids_matches_full_scan_oracle_when_a_protector_remains`]/
+/// [`tests::protected_external_entity_ids_matches_full_scan_oracle_when_nothing_protects`]
+/// check the rewritten `adj.in`-based [`protected_external_entity_ids`]
+/// against -- never called from production code any more.
+#[cfg(test)]
+fn protected_external_entity_ids_by_full_scan(
     store_reader: &StoreReader,
     prev_generation: u64,
     dicts: &Dictionaries,
@@ -759,7 +815,7 @@ fn run_one(
     }
 
     // The one-fetch-per-owner cache every pass below consumes.
-    let prev_rows_by_owner: HashMap<u32, Vec<urdira_structural_store::RecordView>> =
+    let mut prev_rows_by_owner: HashMap<u32, Vec<urdira_structural_store::RecordView>> =
         touched_owner_ordinals
             .iter()
             .map(|&ordinal| (ordinal, store_reader.by_owner(ordinal, prev_generation)))
@@ -852,13 +908,22 @@ fn run_one(
     }
     at_risk_external_entities.extend(&zombie_candidates);
 
+    // Q5 B.3: `adjacency_lookups` is exactly `at_risk_external_entities.
+    // len()` -- the rewritten `protected_external_entity_ids` (B.1) issues
+    // one `StoreReader::adjacency` call per `at_risk` id, no more, no
+    // fewer. `protection_us` times just that call, isolated from the
+    // at-risk/deleted/zombie passes that built its inputs (those are
+    // already covered, together with this, by the outer
+    // `close_protection_ms` below) -- so a bench can see how much of
+    // `close_protection_ms` this one call accounts for.
+    let protection_started = std::time::Instant::now();
     let protected_external_entities = protected_external_entity_ids(
         store_reader,
         prev_generation,
-        &base_dicts,
         &touched_owner_ordinals,
         &at_risk_external_entities,
     );
+    let protection_us = protection_started.elapsed().as_micros();
     // Every zombie candidate that found no protector must close NOW,
     // explicitly: unlike a rule-(a) at-risk identity (owned by a touched
     // owner, so simply excluding it from that owner's `prev` leaves it
@@ -870,11 +935,13 @@ fn run_one(
         .collect();
     if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() && !at_risk_external_entities.is_empty() {
         eprintln!(
-            "[urdira-indexing-worker] v4 delta DEBUG: external-entity close-protection: at_risk={} protected={} zombie_candidates={} zombie_closures={}",
+            "[urdira-indexing-worker] v4 delta DEBUG: external-entity close-protection: at_risk={} protected={} zombie_candidates={} zombie_closures={} adjacency_lookups={} protection_us={}",
             at_risk_external_entities.len(),
             protected_external_entities.len(),
             zombie_candidates.len(),
             zombie_closures.len(),
+            at_risk_external_entities.len(),
+            protection_us,
         );
     }
     clock.record_close_protection(close_protection_started.elapsed());
@@ -909,8 +976,21 @@ fn run_one(
             // it and the row stays open, untouched, exactly as some
             // earlier generation wrote it (see `protected_external_
             // entity_ids`'s own doc comment).
-            Some(ordinal) => store_reader
-                .by_owner(ordinal, prev_generation)
+            //
+            // Q5 B.2: `prev_rows_by_owner` already fetched this exact
+            // owner's previous rows once, above, for the at-risk/deleted/
+            // zombie passes (`store_reader.by_owner(ordinal,
+            // prev_generation)` -- see that map's own doc comment); `remove`
+            // moves the entry out instead of hitting the store a 4th time
+            // for the same owner. `diff_one_owner` runs from the two
+            // sequential `for` loops below (affected owners, then deleted
+            // owners) -- never in parallel, there is no `rayon` in this
+            // file -- and diffs each touched owner ordinal exactly once,
+            // so the entry is always present here and is never removed
+            // twice.
+            Some(ordinal) => prev_rows_by_owner
+                .remove(&ordinal)
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|view| !protected_external_entities.contains(&view.record_id()))
                 .collect(),
@@ -1179,5 +1259,371 @@ fn uce_varint(mut value: usize, hasher: &mut sha2::Sha256) {
         if value == 0 {
             break;
         }
+    }
+}
+
+/// Q5 B.1 equivalence tests: [`protected_external_entity_ids`] (the
+/// `adj.in`-based rewrite) must agree, set-for-set, with
+/// [`protected_external_entity_ids_by_full_scan`] (the pre-rewrite full
+/// `iter_visible` scan, kept `#[cfg(test)]`-only as the oracle) on real
+/// inputs -- not just reasoning about the code. Reuses the exact fixture
+/// scenarios `tests_e2e.rs`'s own external-entity lifecycle tests already
+/// exercise end to end (`external_module_entity_survives_deleting_one_
+/// importer_but_not_the_last_one`, `external_module_entity_survives_
+/// deleting_the_owning_importer_while_another_remains`) -- these two
+/// already cover create (cold, gen 1), delete-of-a-non-owner (gen 2 of
+/// the first scenario, a trivial `at_risk = {}` case since the deleted
+/// owner never held the shared identity), and delete-of-the-owner both
+/// while a protector remains live (protected, non-empty) and while none
+/// does (unprotected, empty after the protector itself was already closed
+/// in an earlier generation) -- rather than inventing a third fixture, per
+/// this task's instruction to grep the existing tests for `at_risk`/
+/// `zombie`/`external_contains_rows` and reuse that scenario.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v4::tests_e2e::{generation_of, run_scan, scratch_dir};
+    use urdira_structural_store::StoreReader;
+
+    /// Every live `CATEGORY_ENTITY` row (across ALL segments this
+    /// generation can see) whose identity key starts with `prefix`, plus
+    /// the `owner_artifact` ordinal one of those rows carries -- this
+    /// fixture's shared external identities are always single-owner at
+    /// any one generation (`dedupe_external_entities_across_owners` keeps
+    /// exactly one), so "the" owner is unambiguous whenever the set is
+    /// non-empty.
+    fn live_entity_ids_and_owner_by_prefix(
+        store_reader: &StoreReader,
+        generation: u64,
+        prefix: &[u8],
+    ) -> (HashSet<[u8; 32]>, Option<u32>) {
+        let mut ids = HashSet::new();
+        let mut owner = None;
+        for view in store_reader.iter_visible(generation) {
+            if view.category() == CATEGORY_ENTITY && view.identity_key().starts_with(prefix) {
+                ids.insert(view.record_id());
+                owner = Some(view.owner_artifact());
+            }
+        }
+        (ids, owner)
+    }
+
+    /// Runs both implementations with IDENTICAL inputs and asserts they
+    /// return the exact same `HashSet`.
+    fn assert_implementations_agree(
+        store_reader: &StoreReader,
+        prev_generation: u64,
+        touched_owner_ordinals: &HashSet<u32>,
+        at_risk: &HashSet<[u8; 32]>,
+    ) -> HashSet<[u8; 32]> {
+        let dicts = store_reader.dictionaries();
+        let rewritten = protected_external_entity_ids(
+            store_reader,
+            prev_generation,
+            touched_owner_ordinals,
+            at_risk,
+        );
+        let oracle = protected_external_entity_ids_by_full_scan(
+            store_reader,
+            prev_generation,
+            &dicts,
+            touched_owner_ordinals,
+            at_risk,
+        );
+        assert_eq!(
+            rewritten, oracle,
+            "adj.in-based protected_external_entity_ids must match the full-scan oracle \
+             (prev_generation={prev_generation}, touched_owner_ordinals={touched_owner_ordinals:?}, \
+             at_risk={at_risk:?})"
+        );
+        rewritten
+    }
+
+    /// Trivial branch: `at_risk` empty (e.g. a brand-new file's CREATE
+    /// never has anything previously live to protect -- `run_one`'s own
+    /// call site skips `protected_external_entity_ids` entirely for such a
+    /// path via `old_owner_ordinal` returning `None`, but the function's
+    /// own behavior on an empty `at_risk` is exercised directly here
+    /// without needing a store with any external entities at all).
+    #[test]
+    fn protected_external_entity_ids_matches_full_scan_oracle_on_empty_at_risk() {
+        let scratch_root = scratch_dir("delta-protection-equivalence-empty-store");
+        let workspace_root = scratch_root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+        let database_path = scratch_root.join("workspace.sqlite");
+        let structural_root = scratch_root.join("structural");
+        let cas_root = scratch_root.join("cas");
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = HashMap::new();
+        let cold = run_scan(
+            "request:cold",
+            "workspace:delta-protection-equivalence-empty-store",
+            &workspace_root,
+            &database_path,
+            &structural_root,
+            &cas_root,
+            urdira_worker_protocol::ScanScope::Full,
+            &mut syntax,
+            &mut worker_state,
+        );
+        assert_eq!(generation_of(&cold), 1);
+        let store_reader = StoreReader::open(&structural_root).expect("store opens");
+        let result =
+            assert_implementations_agree(&store_reader, 1, &HashSet::new(), &HashSet::new());
+        assert!(result.is_empty());
+        let _ = std::fs::remove_dir_all(&scratch_root);
+    }
+
+    /// Positive (protected) branch: reuses `tests_e2e.rs`'s
+    /// `external_module_entity_survives_deleting_the_owning_importer_
+    /// while_another_remains` fixture verbatim -- `a.ts`/`b.js` both
+    /// `import { get } from "lodash"`; cold dedup attributes the shared
+    /// `jsts:external_module:lodash`/`jsts:external_symbol:lodash#get`
+    /// pair to `a.ts` (alphabetically first). Deleting `a.ts` makes both
+    /// identities `at_risk` (the deleted-owner rule: every previous
+    /// external entity `a.ts` owned) with `touched_owner_ordinals =
+    /// {a.ts's ordinal}` -- `b.js`'s own still-live `core:contains`
+    /// relation (untouched owner) must protect both.
+    #[test]
+    fn protected_external_entity_ids_matches_full_scan_oracle_when_a_protector_remains() {
+        let scratch_root = scratch_dir("delta-protection-equivalence-protector-remains");
+        let workspace_root = scratch_root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+        std::fs::write(
+            workspace_root.join("a.ts"),
+            b"import { get } from \"lodash\";\nexport function useA() {\n  return get(1);\n}\n"
+                as &[u8],
+        )
+        .expect("write a.ts");
+        std::fs::write(
+            workspace_root.join("b.js"),
+            b"import { get } from \"lodash\";\nexport function useB() {\n  return get(2);\n}\n"
+                as &[u8],
+        )
+        .expect("write b.js");
+
+        let database_path = scratch_root.join("workspace.sqlite");
+        let structural_root = scratch_root.join("structural");
+        let cas_root = scratch_root.join("cas");
+        let workspace_id = "workspace:delta-protection-equivalence-protector-remains";
+
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = HashMap::new();
+
+        let cold = run_scan(
+            "request:cold",
+            workspace_id,
+            &workspace_root,
+            &database_path,
+            &structural_root,
+            &cas_root,
+            urdira_worker_protocol::ScanScope::Full,
+            &mut syntax,
+            &mut worker_state,
+        );
+        assert_eq!(generation_of(&cold), 1);
+
+        let store_reader_gen1 = StoreReader::open(&structural_root).expect("store opens");
+        let (module_ids, module_owner) = live_entity_ids_and_owner_by_prefix(
+            &store_reader_gen1,
+            1,
+            b"jsts:external_module:lodash",
+        );
+        let (symbol_ids, _) = live_entity_ids_and_owner_by_prefix(
+            &store_reader_gen1,
+            1,
+            b"jsts:external_symbol:lodash#get",
+        );
+        assert_eq!(
+            module_ids.len(),
+            1,
+            "cold dedup keeps exactly one module entity"
+        );
+        assert_eq!(
+            symbol_ids.len(),
+            1,
+            "cold dedup keeps exactly one symbol entity"
+        );
+        let a_ts_ordinal = module_owner.expect("the module entity has an owner at gen 1");
+        let mut at_risk = HashSet::new();
+        at_risk.extend(&module_ids);
+        at_risk.extend(&symbol_ids);
+        let mut touched = HashSet::new();
+        touched.insert(a_ts_ordinal);
+        drop(store_reader_gen1);
+
+        std::fs::remove_file(workspace_root.join("a.ts")).expect("remove a.ts");
+        let after_delete_a = run_scan(
+            "request:delete-a",
+            workspace_id,
+            &workspace_root,
+            &database_path,
+            &structural_root,
+            &cas_root,
+            urdira_worker_protocol::ScanScope::Changed {
+                paths: vec![urdira_worker_protocol::ChangedPath {
+                    path: "a.ts".to_string(),
+                    kind: ChangeKind::Deleted,
+                }],
+            },
+            &mut syntax,
+            &mut worker_state,
+        );
+        assert_eq!(generation_of(&after_delete_a), 2);
+
+        // Query with `prev_generation = 1` -- the state as it stood right
+        // before this deletion's own diff ran -- exactly the snapshot
+        // `run_one`'s real call site queries against. Both entities must
+        // come back protected: `b.js` never touched, still live.
+        let store_reader_gen2 = StoreReader::open(&structural_root).expect("store reopens");
+        let protected = assert_implementations_agree(&store_reader_gen2, 1, &touched, &at_risk);
+        assert_eq!(
+            protected, at_risk,
+            "b.js's still-live relation must protect both shared external entities"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch_root);
+    }
+
+    /// Negative (unprotected) branch: reuses `tests_e2e.rs`'s
+    /// `external_module_entity_survives_deleting_one_importer_but_not_
+    /// the_last_one` fixture verbatim across ALL THREE of its generations
+    /// -- `a.ts`/`b.ts` both import lodash; cold dedup attributes the pair
+    /// to `a.ts`. Deleting `b.ts` first (gen 2) is the trivial `at_risk =
+    /// {}` case (b.ts never owned the shared identity). Deleting `a.ts`
+    /// second (gen 3, against `prev_generation = 2`) makes both entities
+    /// `at_risk` again, but `b.ts`'s own `core:contains` relation was
+    /// already closed in gen 2 (b.ts's own diff closed every one of its
+    /// previous rows) and `a.ts`'s own relation is excluded by
+    /// `touched_owner_ordinals` -- nothing protects either identity.
+    #[test]
+    fn protected_external_entity_ids_matches_full_scan_oracle_when_nothing_protects() {
+        let scratch_root = scratch_dir("delta-protection-equivalence-nothing-protects");
+        let workspace_root = scratch_root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+        std::fs::write(
+            workspace_root.join("a.ts"),
+            b"import { get } from \"lodash\";\nexport function useA() {\n  return get(1);\n}\n"
+                as &[u8],
+        )
+        .expect("write a.ts");
+        std::fs::write(
+            workspace_root.join("b.ts"),
+            b"import { get } from \"lodash\";\nexport function useB() {\n  return get(2);\n}\n"
+                as &[u8],
+        )
+        .expect("write b.ts");
+
+        let database_path = scratch_root.join("workspace.sqlite");
+        let structural_root = scratch_root.join("structural");
+        let cas_root = scratch_root.join("cas");
+        let workspace_id = "workspace:delta-protection-equivalence-nothing-protects";
+
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = HashMap::new();
+
+        let cold = run_scan(
+            "request:cold",
+            workspace_id,
+            &workspace_root,
+            &database_path,
+            &structural_root,
+            &cas_root,
+            urdira_worker_protocol::ScanScope::Full,
+            &mut syntax,
+            &mut worker_state,
+        );
+        assert_eq!(generation_of(&cold), 1);
+
+        let store_reader_gen1 = StoreReader::open(&structural_root).expect("store opens");
+        let (module_ids, module_owner) = live_entity_ids_and_owner_by_prefix(
+            &store_reader_gen1,
+            1,
+            b"jsts:external_module:lodash",
+        );
+        let (symbol_ids, _) = live_entity_ids_and_owner_by_prefix(
+            &store_reader_gen1,
+            1,
+            b"jsts:external_symbol:lodash#get",
+        );
+        assert_eq!(
+            module_ids.len(),
+            1,
+            "cold dedup keeps exactly one module entity"
+        );
+        assert_eq!(
+            symbol_ids.len(),
+            1,
+            "cold dedup keeps exactly one symbol entity"
+        );
+        let a_ts_ordinal = module_owner.expect("the module entity has an owner at gen 1");
+        let mut at_risk = HashSet::new();
+        at_risk.extend(&module_ids);
+        at_risk.extend(&symbol_ids);
+        drop(store_reader_gen1);
+
+        // Gen 2: delete `b.ts` (never the identity's owner). `at_risk` for
+        // THIS deletion is trivially empty (b.ts never owned the shared
+        // identity) -- `touched_owner_ordinals` is irrelevant whenever
+        // `at_risk` is empty (both implementations return `{}`
+        // unconditionally), so an equivalence check with an empty set
+        // stands in for it here.
+        std::fs::remove_file(workspace_root.join("b.ts")).expect("remove b.ts");
+        let after_delete_b = run_scan(
+            "request:delete-b",
+            workspace_id,
+            &workspace_root,
+            &database_path,
+            &structural_root,
+            &cas_root,
+            urdira_worker_protocol::ScanScope::Changed {
+                paths: vec![urdira_worker_protocol::ChangedPath {
+                    path: "b.ts".to_string(),
+                    kind: ChangeKind::Deleted,
+                }],
+            },
+            &mut syntax,
+            &mut worker_state,
+        );
+        assert_eq!(generation_of(&after_delete_b), 2);
+        {
+            let store_reader_gen2 = StoreReader::open(&structural_root).expect("store reopens");
+            assert_implementations_agree(&store_reader_gen2, 1, &HashSet::new(), &HashSet::new());
+        }
+
+        // Gen 3: delete `a.ts` (the actual owner) too -- now against
+        // `prev_generation = 2`, both entities are `at_risk` (deleted-owner
+        // rule) with `touched_owner_ordinals = {a.ts's ordinal}`, but
+        // nothing protects them any more: b.ts's own relation was already
+        // closed in gen 2, and a.ts's own relation is excluded as touched.
+        std::fs::remove_file(workspace_root.join("a.ts")).expect("remove a.ts");
+        let after_delete_a = run_scan(
+            "request:delete-a",
+            workspace_id,
+            &workspace_root,
+            &database_path,
+            &structural_root,
+            &cas_root,
+            urdira_worker_protocol::ScanScope::Changed {
+                paths: vec![urdira_worker_protocol::ChangedPath {
+                    path: "a.ts".to_string(),
+                    kind: ChangeKind::Deleted,
+                }],
+            },
+            &mut syntax,
+            &mut worker_state,
+        );
+        assert_eq!(generation_of(&after_delete_a), 3);
+
+        let store_reader_gen3 = StoreReader::open(&structural_root).expect("store reopens");
+        let mut touched_a = HashSet::new();
+        touched_a.insert(a_ts_ordinal);
+        let protected = assert_implementations_agree(&store_reader_gen3, 2, &touched_a, &at_risk);
+        assert!(
+            protected.is_empty(),
+            "neither entity has a live, untouched protector once both importers are gone"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch_root);
     }
 }
