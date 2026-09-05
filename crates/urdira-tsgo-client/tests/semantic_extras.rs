@@ -1,9 +1,11 @@
 //! Integration tests for decision 28's "inferred types + compiler
 //! diagnostics" task (`crate::semantic_extras`, wired into
 //! `crate::residual_pass::ResidualPass` via `ResidualPassConfig::
-//! fetch_semantics`) — against the REAL tsgo binary (skips, printing why,
-//! rather than failing, when it is not discoverable, matching
-//! `tests/oracle_resolve.rs`'s own policy).
+//! fetch_semantics`) — against the REAL tsgo binary. C.4 (2026-09-05):
+//! every test here is `#[ignore = "requires tsgo binary (set
+//! URDIRA_TSGO_BINARY)"]` and calls `binary::discover_for_tests`, which
+//! panics (with guidance) rather than silently skipping when the binary is
+//! not discoverable.
 //!
 //! Covers:
 //! - An exported top-level function and an exported class get a checker
@@ -32,16 +34,6 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("repo root should exist")
-}
-
-fn discover_binary() -> Option<TsgoBinary> {
-    match binary::discover(&repo_root()) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            eprintln!("skipping: tsgo binary not discoverable: {e}");
-            None
-        }
-    }
 }
 
 fn lib_root_dir(binary: &TsgoBinary) -> String {
@@ -89,11 +81,11 @@ const bad: number = "nope";
 
 fn run_semantics(
     text: &'static str,
-) -> Option<(
+) -> (
     Vec<urdira_tsgo_client::residual_pass::InferredTypeResult>,
     Vec<urdira_tsgo_client::residual_pass::DiagnosticResult>,
-)> {
-    let tsgo = discover_binary()?;
+) {
+    let tsgo = binary::discover_for_tests(&repo_root());
     let mut fs = MapFs::new();
     let owner = virtual_path("a.ts");
     fs.insert(owner.clone(), text);
@@ -113,14 +105,13 @@ fn run_semantics(
     };
     let (_, stats) = ResidualPass::run_instrumented(&plan, 1, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed");
-    Some((stats.types, stats.diagnostics))
+    (stats.types, stats.diagnostics)
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn exported_function_and_class_members_are_typed_but_unexported_is_not() {
-    let Some((types, _diagnostics)) = run_semantics(A_TS) else {
-        return;
-    };
+    let (types, _diagnostics) = run_semantics(A_TS);
     assert!(!types.is_empty(), "expected at least one typed declaration");
 
     let owner = virtual_path("a.ts");
@@ -219,10 +210,9 @@ const NAMESPACE_TS: &str = r#"export namespace Utils {
 /// NOT-exported member inside the namespace is excluded, mirroring the
 /// class-member test above.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn namespace_members_are_typed_with_namespace_qualified_display_name() {
-    let Some((types, _diagnostics)) = run_semantics(NAMESPACE_TS) else {
-        return;
-    };
+    let (types, _diagnostics) = run_semantics(NAMESPACE_TS);
     assert!(!types.is_empty(), "expected at least one typed declaration");
     let names_and_starts: Vec<(i32, &str)> = types
         .iter()
@@ -260,10 +250,9 @@ fn namespace_members_are_typed_with_namespace_qualified_display_name() {
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn deliberate_type_error_produces_a_compiler_diagnostic() {
-    let Some((_types, diagnostics)) = run_semantics(A_TS) else {
-        return;
-    };
+    let (_types, diagnostics) = run_semantics(A_TS);
     assert!(
         diagnostics.iter().any(|d| d.site.compiler_code == 2322),
         "expected a TS2322 (type not assignable) diagnostic for `const bad: number = \"nope\"`; \
@@ -282,10 +271,9 @@ fn deliberate_type_error_produces_a_compiler_diagnostic() {
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn fetch_semantics_false_collects_no_types_or_diagnostics() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let mut fs = MapFs::new();
     let owner = virtual_path("a.ts");
     fs.insert(owner.clone(), A_TS);

@@ -1,9 +1,13 @@
 //! Integration tests for task P1-D-b (`crate::residual_pass` +
 //! `crate::virtual_fs::LayeredFs`/`OverlayFs` + `crate::entity_index`) —
-//! against the REAL tsgo binary (skips, printing why, rather than failing,
-//! when it is not discoverable, matching `tests/oracle_resolve.rs`'s own
-//! policy).
+//! against the REAL tsgo binary. C.4 (2026-09-05): every test here is
+//! `#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]` and calls
+//! `binary::discover_for_tests`, which panics (with guidance) rather than
+//! silently skipping when the binary is not discoverable — a test that
+//! "needs tsgo" must never report `ok` without actually exercising the RPC
+//! path (see `binary::discover_for_tests`'s own doc comment for why).
 //!
+
 //! Covers exactly the risks the task brief called out:
 //! - **Lib resolution**: `[1, 2].map(...)` resolves to a declaration inside
 //!   a real `lib.*.d.ts` file, classified `SiteOutcome::External`, not a
@@ -41,16 +45,6 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("repo root should exist")
-}
-
-fn discover_binary() -> Option<TsgoBinary> {
-    match binary::discover(&repo_root()) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            eprintln!("skipping: tsgo binary not discoverable: {e}");
-            None
-        }
-    }
 }
 
 /// The resolved platform package's `lib/` directory — holds both the
@@ -192,9 +186,7 @@ fn build_fixture() -> (
 }
 
 fn run_pass(lanes: usize) -> Vec<urdira_tsgo_client::residual_pass::ResolvedSite> {
-    let Some(tsgo) = discover_binary() else {
-        return Vec::new();
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let (fs, plan, pending_by_owner) = build_fixture();
     let config = ResidualPassConfig {
         lib_roots: vec![lib_root_dir(&tsgo)],
@@ -210,11 +202,9 @@ fn run_pass(lanes: usize) -> Vec<urdira_tsgo_client::residual_pass::ResolvedSite
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn resolves_lib_globals_external_and_cross_window_targets_workspace() {
     let results = run_pass(1);
-    if results.is_empty() {
-        return; // tsgo not available; already logged by discover_binary().
-    }
     assert_eq!(results.len(), 3, "expected exactly 3 resolved sites");
 
     let map_site = results
@@ -280,11 +270,9 @@ fn resolves_lib_globals_external_and_cross_window_targets_workspace() {
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn one_lane_and_two_lanes_agree_exactly() {
     let one_lane = run_pass(1);
-    if one_lane.is_empty() {
-        return; // tsgo not available.
-    }
     let two_lanes = run_pass(2);
     assert_eq!(
         one_lane, two_lanes,
@@ -293,11 +281,9 @@ fn one_lane_and_two_lanes_agree_exactly() {
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn entity_index_maps_a_resolved_workspace_target_back_to_a_caller_entity_id() {
     let results = run_pass(1);
-    if results.is_empty() {
-        return; // tsgo not available.
-    }
     let identifier_ref_site = results
         .iter()
         .find(|r| r.owner_path == virtual_path("a.ts") && r.site_kind == SiteKind::IdentifierRef)
@@ -345,10 +331,9 @@ fn entity_index_maps_a_resolved_workspace_target_back_to_a_caller_entity_id() {
 /// sites resolved, `truncated == true`, and `remaining_roots` names every
 /// root in the plan (nothing was ever opened) — not a stale/partial list.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn deadline_already_past_truncates_before_the_first_window() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let (fs, plan, pending_by_owner) = build_fixture();
     let config = ResidualPassConfig {
         lib_roots: vec![lib_root_dir(&tsgo)],
@@ -389,10 +374,9 @@ fn deadline_already_past_truncates_before_the_first_window() {
 /// actual invariant a truncated-then-resumed residual pass relies on
 /// (deterministically, with no dependency on real wall-clock timing).
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn splitting_the_plan_across_two_passes_matches_one_unbounded_pass() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let (fs, plan, pending_by_owner) = build_fixture();
 
     let config_for = |binary: TsgoBinary| ResidualPassConfig {
@@ -424,9 +408,7 @@ fn splitting_the_plan_across_two_passes_matches_one_unbounded_pass() {
     let first_plan = WindowPlan {
         windows: plan.windows[..1].to_vec(),
     };
-    let Some(tsgo_again) = discover_binary() else {
-        return;
-    };
+    let tsgo_again = binary::discover_for_tests(&repo_root());
     let first_config = config_for(tsgo_again);
     let mut split: Vec<_> = ResidualPass::run(
         &first_plan,
@@ -445,9 +427,7 @@ fn splitting_the_plan_across_two_passes_matches_one_unbounded_pass() {
         .flat_map(|w| w.roots.clone())
         .collect();
     let second_plan = WindowPlan::build(&remaining_roots, 1);
-    let Some(tsgo_third) = discover_binary() else {
-        return;
-    };
+    let tsgo_third = binary::discover_for_tests(&repo_root());
     let second_config = config_for(tsgo_third);
     let second = ResidualPass::run(&second_plan, 1, &pending_by_owner, fs, &second_config)
         .expect("second (resumed) pass should succeed");
@@ -598,10 +578,9 @@ fn build_intra_window_fixture() -> (
 /// pass would (the same invariant `splitting_the_plan_across_two_passes_
 /// matches_one_unbounded_pass` verifies for check point `(a)` alone).
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn intra_window_deadline_truncates_mid_semantics_fetch_and_a_resumed_pass_matches_unbounded() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let (fs, plan, pending_by_owner) = build_intra_window_fixture();
 
     let config_for =
@@ -640,9 +619,7 @@ fn intra_window_deadline_truncates_mid_semantics_fetch_and_a_resumed_pass_matche
     // window 0" component, leaving an estimate of window 1's own
     // incremental cost that is far less sensitive to spawn jitter than
     // either absolute duration alone.
-    let Some(tsgo_calibration_01) = discover_binary() else {
-        return;
-    };
+    let tsgo_calibration_01 = binary::discover_for_tests(&repo_root());
     let calibration_plan_01 = WindowPlan {
         windows: plan.windows[..2].to_vec(),
     };
@@ -665,9 +642,7 @@ fn intra_window_deadline_truncates_mid_semantics_fetch_and_a_resumed_pass_matche
 
     // Unbounded reference pass over the whole plan -- the ground truth
     // `truncated pass + resumed pass` must reproduce exactly.
-    let Some(tsgo_unbounded) = discover_binary() else {
-        return;
-    };
+    let tsgo_unbounded = binary::discover_for_tests(&repo_root());
     let unbounded_config = config_for(tsgo_unbounded, None);
     let mut unbounded = ResidualPass::run(
         &plan,
@@ -686,9 +661,7 @@ fn intra_window_deadline_truncates_mid_semantics_fetch_and_a_resumed_pass_matche
     // The real, truncated run: deadline at window 0's own calibrated
     // duration PLUS half of window 1's own incremental cost, set right
     // before THIS run starts (not before calibration).
-    let Some(tsgo_truncated) = discover_binary() else {
-        return;
-    };
+    let tsgo_truncated = binary::discover_for_tests(&repo_root());
     let deadline =
         std::time::Instant::now() + window0_duration + window1_incremental_duration.mul_f64(0.5);
     let truncated_config = config_for(tsgo_truncated, Some(deadline));
@@ -778,9 +751,7 @@ fn intra_window_deadline_truncates_mid_semantics_fetch_and_a_resumed_pass_matche
     // Resume: a second pass restricted to exactly `remaining_roots`, the
     // same shape `residual.rs::schedule`'s re-trigger builds from
     // `ResidualOutcome::remaining_roots`.
-    let Some(tsgo_resumed) = discover_binary() else {
-        return;
-    };
+    let tsgo_resumed = binary::discover_for_tests(&repo_root());
     let resumed_plan = WindowPlan::build(&remaining, remaining.len().max(1));
     let resumed_config = config_for(tsgo_resumed, None);
     let second_pass = ResidualPass::run(&resumed_plan, 1, &pending_by_owner, fs, &resumed_config)

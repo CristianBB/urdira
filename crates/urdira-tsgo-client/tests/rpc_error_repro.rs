@@ -1,11 +1,13 @@
 //! P1-D-e: controlled, standalone reproductions of each of the four
 //! hypotheses `docs/evidence/2026-09-04-v4-p1d-d-residual-diagnosis.md` §6
 //! left open for the "stale node handle" `getSymbolsAtLocations` RPC error
-//! (37% of n8n's residual-pass sites). Against the REAL tsgo binary (skips,
-//! printing why, when not discoverable -- matching `tests/oracle_resolve
-//! .rs`/`tests/residual_pass.rs`'s own policy). Each test is deliberately
-//! narrow (one hypothesis, one minimal fixture) so a failure or pass here
-//! isolates a single mechanism rather than reproducing the whole n8n corpus.
+//! (37% of n8n's residual-pass sites). Against the REAL tsgo binary. C.4
+//! (2026-09-05): every test here is `#[ignore = "requires tsgo binary (set
+//! URDIRA_TSGO_BINARY)"]` and calls `binary::discover_for_tests`, which
+//! panics (with guidance) rather than silently skipping when the binary is
+//! not discoverable. Each test is deliberately narrow (one hypothesis, one
+//! minimal fixture) so a failure or pass here isolates a single mechanism
+//! rather than reproducing the whole n8n corpus.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,16 +28,6 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("repo root should exist")
-}
-
-fn discover_binary() -> Option<TsgoBinary> {
-    match binary::discover(&repo_root()) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            eprintln!("skipping: tsgo binary not discoverable: {e}");
-            None
-        }
-    }
 }
 
 fn lib_root_dir(binary: &TsgoBinary) -> String {
@@ -88,10 +80,9 @@ fn find_utf16_span(text: &str, needle: &str, occurrence: usize) -> (i32, i32) {
 /// is real-case, "file may not be loaded" would be the naturally expected
 /// error for exactly this mismatch.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn pascal_case_owner_file_single_site_does_not_produce_rpc_error() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let mut fs = MapFs::new();
     let owner = format!("{VIRTUAL_ROOT}/HttpRequest.node.ts");
     let text = "export function run(): number {\n  return [1, 2].map((n) => n).length;\n}\n";
@@ -141,10 +132,9 @@ fn pascal_case_owner_file_single_site_does_not_produce_rpc_error() {
 /// chain, still gets its pending sites resolved -- module resolution should
 /// still see it because it is present in `files:` for its own window.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn unimported_owner_with_pending_sites_still_resolves() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let owner = format!("{VIRTUAL_ROOT}/orphan.test.ts");
     let text = "export function check(): number {\n  return [1, 2].map((n) => n).length;\n}\n";
 
@@ -206,15 +196,14 @@ fn unimported_owner_with_pending_sites_still_resolves() {
 /// RPC error -- i.e. that this failure mode is real and reachable, not
 /// hypothetical, even though `run_lane` itself does not do this.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn reusing_a_handle_from_a_released_snapshot_produces_the_stale_handle_error() {
     use urdira_tsgo_client::client::TsgoClient;
     use urdira_tsgo_client::node::NodeHandle;
     use urdira_tsgo_client::proto::{FileChanges, UpdateSnapshotParams};
     use urdira_tsgo_client::virtual_fs::OverlayFs;
 
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let owner = format!("{VIRTUAL_ROOT}/a.ts");
     let text = "export function f(): number {\n  return [1, 2].map((n) => n).length;\n}\n";
     let mut base = MapFs::new();
@@ -309,10 +298,9 @@ fn reusing_a_handle_from_a_released_snapshot_produces_the_stale_handle_error() {
 /// server-side per-request/per-file handle-table limit, this reproduces the
 /// "stale handle" error directly and lets us read off the threshold.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn huge_single_owner_batch_of_ten_thousand_call_sites() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     const N: usize = 10_000;
     // Built directly (not re-scanned with `find_all_utf16_spans`, which is
     // O(n^2) and far too slow at N=10,000): every line has an identical
@@ -416,14 +404,13 @@ fn huge_single_owner_batch_of_ten_thousand_call_sites() {
 /// whether `ResidualResolver::fetch_symbols_chunked`'s per-location retry
 /// is exercised by something concretely reproducible, not just theorized.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn out_of_range_handle_mixed_into_a_batch() {
     use urdira_tsgo_client::client::TsgoClient;
     use urdira_tsgo_client::node::NodeHandle;
     use urdira_tsgo_client::proto::UpdateSnapshotParams;
 
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let owner = format!("{VIRTUAL_ROOT}/a.ts");
     let text = "export const a = 1;\nexport const b = 2;\nexport const c = 3;\n";
     let config_json = serde_json::json!({
@@ -490,10 +477,9 @@ fn out_of_range_handle_mixed_into_a_batch() {
 /// in one owner (not merely many call SITES) reproduces persistent,
 /// individually-unrecoverable failures.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn many_distinct_declarations_referenced_once_each() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     const N: usize = 500;
     let mut text = String::new();
     for i in 0..N {
@@ -595,10 +581,9 @@ fn many_distinct_declarations_referenced_once_each() {
 /// function call (`trimPackageJson(...)`) at the very end, exactly mirroring
 /// the real file's own tail.
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn commonjs_js_file_with_unresolvable_ambient_globals_and_a_trailing_local_call() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let text = "\
 const fs = require('fs');\n\
 const path = require('path');\n\

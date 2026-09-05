@@ -166,13 +166,10 @@ fn bench_spawn_snapshot_and_resolve_1000_member_call_sites() {
         eprintln!("skipping: n8n corpus not present at the expected benchmark path");
         return;
     };
-    let tsgo = match binary::discover(&repo_root()) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: tsgo binary not discoverable: {e}");
-            return;
-        }
-    };
+    // C.4: the corpus check above still SKIPS (a real, unrelated
+    // precondition). tsgo itself is required once we get this far: PANIC
+    // (with guidance) rather than silently skip.
+    let tsgo = binary::discover_for_tests(&repo_root());
 
     let window = collect_window(&corpus_root, WINDOW_SIZE);
     assert!(

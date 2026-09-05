@@ -1,8 +1,9 @@
 //! F4 4.4 + revision fix (2026-09-05): `RemoteSourceFile::name_start`'s
 //! `BindingElement` handling (`crate::node::syntax_kind::BINDING_ELEMENT`)
-//! — against the REAL tsgo binary (skips, printing why, rather than
-//! failing, when it is not discoverable, matching `tests/oracle_resolve
-//! .rs`'s own policy).
+//! — against the REAL tsgo binary. C.4 (2026-09-05): `#[ignore =
+//! "requires tsgo binary (set URDIRA_TSGO_BINARY)"]` + `binary::
+//! discover_for_tests`, which panics (with guidance) rather than silently
+//! skipping when the binary is not discoverable.
 //!
 //! Covers every shape `name_start`'s own doc comment documents:
 //! - `{ plain }` — a plain (non-renamed, no default) element resolves to
@@ -47,16 +48,6 @@ fn repo_root() -> PathBuf {
         .expect("repo root should exist")
 }
 
-fn discover_binary() -> Option<TsgoBinary> {
-    match binary::discover(&repo_root()) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            eprintln!("skipping: tsgo binary not discoverable: {e}");
-            None
-        }
-    }
-}
-
 fn lib_root_dir(binary: &TsgoBinary) -> String {
     binary
         .path
@@ -92,10 +83,9 @@ fn binding_element_indices(file: &RemoteSourceFile) -> Vec<usize> {
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn binding_element_name_start_covers_plain_renamed_default_and_nested_shapes() {
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
     let mut fs = MapFs::new();
     let owner = format!("{VIRTUAL_ROOT}/a.ts");
     fs.insert(owner.clone(), A_TS);
