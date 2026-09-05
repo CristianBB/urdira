@@ -1315,13 +1315,14 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// to the module).
     pending_function_owner: Option<Option<ParamOwner>>,
     /// Whether the `VariableDeclarator` `visit_variable_declarator` is
-    /// currently walking is the FIRST declarator of its own
-    /// `VariableDeclaration` -- lane 1's plain entity pass (`lib.rs`'s
-    /// `SyntaxCollector::visit_variable_declaration`) only ever creates a
-    /// `core:value` entity for `declaration.declarations.first()`, so `const
-    /// a = 1, f = () => a;`'s `f` gets NO variable entity even though
-    /// `classify_symbol_declaration` still resolves references to it as
-    /// `DeclKind::Variable`. Set by the `visit_variable_declaration`
+    /// currently walking has a `BindingPattern::BindingIdentifier` id --
+    /// lane 1's plain entity pass (`lib.rs`'s `SyntaxCollector::
+    /// visit_variable_declaration`, 3c 2026-09-05) creates a `core:value`
+    /// entity for EVERY declarator whose `id` is a plain identifier (`const
+    /// a = 1, f = () => a;`'s `f` DOES get a variable entity, same as `a`);
+    /// only a destructuring pattern (`const [f] = ...`/`const {f} = ...`)
+    /// has no entity of its own, since `lib.rs`'s pass only ever fires for
+    /// `BindingIdentifier`. Set by the `visit_variable_declaration`
     /// override just below (one assignment per declarator, immediately
     /// before visiting it), consulted by `visit_variable_declarator` when
     /// deciding whether a directly-init'd arrow/function-expression's own
@@ -5416,16 +5417,18 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     }
 
     /// Parameter entities, "referenced-only" variant: sets `declarator_owns_
-    /// entity` per declarator (index `0` only) before visiting it, so
-    /// `visit_variable_declarator` can tell whether ITS declarator is the
-    /// one `lib.rs`'s plain entity pass actually emits a `core:value` entity
-    /// for -- see that field's own doc comment. Otherwise identical to the
-    /// default `walk_variable_declaration` (`visit_span` is a no-op this
-    /// walker never overrides, same as every other custom-traversal override
-    /// in this file, e.g. `visit_method_definition`).
+    /// entity` per declarator before visiting it, so `visit_variable_
+    /// declarator` can tell whether ITS declarator is one `lib.rs`'s plain
+    /// entity pass actually emits a `core:value` entity for -- see that
+    /// field's own doc comment (3c, 2026-09-05: every `BindingIdentifier`
+    /// declarator owns an entity, not just the first). Otherwise identical
+    /// to the default `walk_variable_declaration` (`visit_span` is a no-op
+    /// this walker never overrides, same as every other custom-traversal
+    /// override in this file, e.g. `visit_method_definition`).
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        for (index, declarator) in declaration.declarations.iter().enumerate() {
-            self.declarator_owns_entity = index == 0;
+        for declarator in &declaration.declarations {
+            self.declarator_owns_entity =
+                matches!(declarator.id, BindingPattern::BindingIdentifier(_));
             self.visit_variable_declarator(declarator);
         }
     }
@@ -5961,6 +5964,28 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.2 == function_id && row.3 == doubled_id)
+        );
+    }
+
+    /// 3c (2026-09-05): a reference to the SECOND declarator of a comma-
+    /// separated `VariableDeclaration` (`b`, after `a`) resolves to `b`'s
+    /// own entity -- `classify_symbol_declaration`'s `VariableDeclarator`
+    /// arm already classified any `BindingIdentifier` declarator regardless
+    /// of position, so this resolver-side behavior predates 3c; what 3c
+    /// fixed is that `lib.rs` now actually PUBLISHES an entity at this same
+    /// identity key (see `tests::multi_declarator_variable_declaration_
+    /// gives_every_declarator_an_entity` in `lib.rs`, which checks lane 1),
+    /// so the two lanes now agree instead of the reference dangling.
+    #[test]
+    fn non_first_declarator_reference_resolves_to_its_own_entity() {
+        let source = "const a = 1, b = 2;\nuse(b);\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let b_start = source.find("b = 2").unwrap() as u32;
+        let b_id = declaration_id(DeclKind::Variable, "a.ts", b_start, "b");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == b_id),
+            "expected a reference resolved to {b_id}: {rows:?}"
         );
     }
 
@@ -9766,6 +9791,40 @@ mod tests {
             assert_eq!(contains.body.to_value()["target_id"], param_id);
             assert_eq!(contains.body.to_value()["classification"], "confirmed");
         }
+    }
+
+    /// 3c (2026-09-05): a variable-bound arrow that is NOT the first
+    /// declarator of its `VariableDeclaration` (`make` here is the SECOND
+    /// declarator, after `a`) still owns its parameter's entity --
+    /// `referenced_parameters_get_entities_matching_the_reference_target_
+    /// across_owner_shapes` above only ever exercises a variable-bound arrow
+    /// as the SOLE declarator, so this is the first coverage of `declarator_
+    /// owns_entity` actually varying within one `VariableDeclaration`.
+    /// Before 3c, `declarator_owns_entity` was `index == 0`, so `count`
+    /// would have fallen back to the MODULE as its owner instead of `make`.
+    #[test]
+    fn parameter_of_a_non_first_declarators_arrow_still_owns_the_variable_not_the_module() {
+        let source = "const a = 1, make = (count) => count;\nmake(1);\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let make_id = declaration_id(
+            DeclKind::Variable,
+            "a.ts",
+            source.find("make").unwrap() as u32,
+            "make",
+        );
+        let param_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("count").unwrap() as u32,
+            "count",
+        );
+        let entity = parameter_entity(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a parameter entity for {param_id}"));
+        assert_eq!(entity.body.to_value()["parent_id"], make_id);
+        assert_eq!(entity.body.to_value()["qualified_name"], "a.ts.make.count");
+        let contains = parameter_contains(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a contains row for {param_id}"));
+        assert_eq!(contains.body.to_value()["source_id"], make_id);
     }
 
     #[test]

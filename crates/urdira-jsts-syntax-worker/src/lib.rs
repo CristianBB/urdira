@@ -4226,10 +4226,17 @@ impl<'a> Visit<'a> for SyntaxCollector {
     }
 
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        if let Some(declarator) = declaration.declarations.first()
-            && let BindingPattern::BindingIdentifier(identifier) = &declarator.id
-        {
-            self.push_entity(identifier, EntityKind::Variable, UniversalKind::Value);
+        // 3c (2026-09-05): an entity for EVERY declarator, not just the
+        // first -- `const a = 1, b = 2;` previously left `b` with no entity
+        // at all, so any reference to `b` fell through to `REASON_
+        // UNSUPPORTED_DECLARATION_KIND` in the resolver. `SemanticWalker::
+        // visit_variable_declaration` (semantic_sites.rs) mirrors this same
+        // "one entity per BindingIdentifier declarator" rule via
+        // `declarator_owns_entity`.
+        for declarator in &declaration.declarations {
+            if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
+                self.push_entity(identifier, EntityKind::Variable, UniversalKind::Value);
+            }
         }
         walk_variable_declaration(self, declaration);
     }
@@ -5299,6 +5306,47 @@ mod tests {
                 .iter()
                 .any(|record| record.identity_key == variable_id),
             "expected a variable entity {variable_id}: {records:?}"
+        );
+    }
+
+    /// 3c (2026-09-05): every declarator of a comma-separated
+    /// `VariableDeclaration` gets its own entity, not just the first --
+    /// before this fix, `b` here had NO entity at all: `use(b)`'s reference
+    /// (`semantic_sites.rs`'s `classify_symbol_declaration` already
+    /// classified a non-first `BindingIdentifier` declarator as `DeclKind::
+    /// Variable` before this task) would resolve to an identity key that no
+    /// `SyntaxEntity` this crate published ever matched -- a dangling
+    /// reference at the store level. This crate's plain `analyze`/`read_
+    /// page` only exercises lane 1 (entities); see `semantic_sites::tests::
+    /// non_first_declarator_reference_resolves_to_its_own_entity` for lane 2
+    /// (the reference resolution itself) matching this SAME identity key.
+    #[test]
+    fn multi_declarator_variable_declaration_gives_every_declarator_an_entity() {
+        let mut state = SyntaxWorkerState::default();
+        let text = "const a = 1, b = 2;\nuse(b);\n";
+        let files = vec![source("multi.ts", text)];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["multi.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "multi.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let a_start = text.find("a = 1").unwrap() as u32;
+        let a_id = format!("jsts:variable:multi.ts:{a_start}:a");
+        assert!(
+            records.iter().any(|record| record.identity_key == a_id),
+            "expected the first declarator's entity {a_id}: {records:?}"
+        );
+        let b_start = text.find("b = 2").unwrap() as u32;
+        let b_id = format!("jsts:variable:multi.ts:{b_start}:b");
+        assert!(
+            records.iter().any(|record| record.identity_key == b_id),
+            "expected the second declarator's entity {b_id}: {records:?}"
         );
     }
 
