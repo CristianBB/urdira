@@ -225,6 +225,39 @@ pub struct ResidualContext {
 /// F4 4.2: see [`ResidualContext::reschedule_count`].
 const MAX_CONSECUTIVE_RESCHEDULES: u32 = 20;
 
+/// Revision fix (2026-09-05): whether `schedule`'s truncated-attempt
+/// continuation should actually re-schedule itself. Extracted as a pure
+/// function of the four inputs that decide it (rather than inlined in
+/// `schedule`'s own closure) so a test can exercise the epoch-race fix
+/// deterministically, without spinning up a real background thread or
+/// waiting on a real quiet period/tsgo child: `current_epoch_now` and
+/// `my_epoch` are plain `u64`s a test can set up directly via
+/// [`bump_epoch`]/a fabricated mismatch, no `schedule`/`run_once` call
+/// needed at all.
+///
+/// The epoch check closes a real race: `schedule`'s own re-schedule call
+/// bumps the epoch a SECOND time for this workspace. If a genuine edit's
+/// `ScanCompleted` already called `schedule()` (bumping the epoch once)
+/// while this truncated attempt was still running its (potentially
+/// minutes-long) checker pass, re-scheduling here -- without checking the
+/// epoch first -- would bump it AGAIN, superseding that real attempt's own
+/// quiet-period wait before it ever runs: the genuine edit's own pass would
+/// see a foreign epoch and discard itself (`Ok(None)`), while this stale
+/// continuation goes on to process only `remaining_roots` computed BEFORE
+/// the edit, never re-deriving pending sites against the new generation.
+/// Refusing to re-schedule when the epoch no longer matches is correct, not
+/// a lost update: the newer `schedule()` call's own pass re-derives pending
+/// sites from the CURRENT store, a strict superset of what this stale
+/// continuation would have found.
+fn should_reschedule_truncated(
+    truncated: bool,
+    reschedule_count: u32,
+    current_epoch_now: u64,
+    my_epoch: u64,
+) -> bool {
+    truncated && current_epoch_now == my_epoch && reschedule_count < MAX_CONSECUTIVE_RESCHEDULES
+}
+
 /// Schedules (or re-schedules, superseding any still-running prior attempt
 /// for this workspace) a residual pass after `ScanCompleted` for
 /// `context.workspace_id`. Never blocks the caller -- returns immediately
@@ -283,26 +316,55 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                 // timely, the same fallback this module already relies on
                 // for a superseded attempt (a future `ScanCompleted` will
                 // re-derive and re-schedule fresh).
-                if outcome.truncated {
-                    if context.reschedule_count < MAX_CONSECUTIVE_RESCHEDULES {
-                        if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
-                            eprintln!(
-                                "[urdira-indexing-worker] v4 residual pass: re-scheduling truncated attempt {} of {} workspace={workspace_id} remaining_owners={}",
-                                context.reschedule_count + 1,
-                                MAX_CONSECUTIVE_RESCHEDULES,
-                                outcome.remaining_roots.len(),
-                            );
-                        }
-                        let mut next_context = context.clone();
-                        next_context.touched_owners = Some(outcome.remaining_roots);
-                        next_context.reschedule_count += 1;
-                        schedule(next_context, event_target);
-                    } else {
+                // Revision fix (2026-09-05): a truncated attempt's own
+                // re-schedule below calls `schedule()` again, which bumps
+                // the epoch a SECOND time for this workspace -- if a real
+                // edit's own `ScanCompleted` already called `schedule()`
+                // (bumping the epoch once) while THIS truncated attempt was
+                // still running its checker pass, re-scheduling here would
+                // bump the epoch AGAIN and supersede that real attempt's
+                // own quiet-period wait before it ever gets to run: the
+                // real edit's pass would see a foreign epoch and discard
+                // itself (`Ok(None)`), while this stale continuation goes
+                // on to process only `remaining_roots` from BEFORE the
+                // edit, never re-deriving pending sites against the new
+                // generation. Checking the epoch here, right before
+                // re-scheduling, closes that race: if it no longer matches
+                // `my_epoch`, a newer `schedule()` call (the real edit's
+                // own) has already superseded this one -- that fresh call's
+                // own pass re-derives pending sites from the CURRENT store
+                // and is a strict superset of what this stale continuation
+                // would have found, so simply not re-scheduling here is
+                // correct, not a lost update.
+                if should_reschedule_truncated(
+                    outcome.truncated,
+                    context.reschedule_count,
+                    current_epoch(&workspace_id),
+                    my_epoch,
+                ) {
+                    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
                         eprintln!(
-                            "[urdira-indexing-worker] v4 residual pass: reschedule cap ({MAX_CONSECUTIVE_RESCHEDULES}) reached workspace={workspace_id}; {} owner(s) remain pending for the next scan",
+                            "[urdira-indexing-worker] v4 residual pass: re-scheduling truncated attempt {} of {} workspace={workspace_id} remaining_owners={}",
+                            context.reschedule_count + 1,
+                            MAX_CONSECUTIVE_RESCHEDULES,
                             outcome.remaining_roots.len(),
                         );
                     }
+                    let mut next_context = context.clone();
+                    next_context.touched_owners = Some(outcome.remaining_roots);
+                    next_context.reschedule_count += 1;
+                    schedule(next_context, event_target);
+                } else if outcome.truncated && current_epoch(&workspace_id) != my_epoch {
+                    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+                        eprintln!(
+                            "[urdira-indexing-worker] v4 residual pass: truncated attempt superseded before re-scheduling workspace={workspace_id}; a newer ScanCompleted's own pass will re-derive pending sites fresh"
+                        );
+                    }
+                } else if outcome.truncated {
+                    eprintln!(
+                        "[urdira-indexing-worker] v4 residual pass: reschedule cap ({MAX_CONSECUTIVE_RESCHEDULES}) reached workspace={workspace_id}; {} owner(s) remain pending for the next scan",
+                        outcome.remaining_roots.len(),
+                    );
                 }
             }
             Ok(None) => {
@@ -3335,6 +3397,33 @@ mod tests {
         // A2's own invariant: after this migration, no visible relation
         // record may exist without a resolved `target_subject` at all.
         assert!(!is_classification_consistent(false));
+    }
+
+    /// Revision fix (2026-09-05): the epoch-race guard on `schedule`'s
+    /// truncated-attempt re-schedule. Deterministic -- no background
+    /// thread, no quiet period, no tsgo child -- because the decision is a
+    /// pure function of its four inputs (see `should_reschedule_truncated`'s
+    /// own doc comment for why it was extracted).
+    #[test]
+    fn truncated_reschedule_is_skipped_when_a_newer_scan_supersedes_it() {
+        // Same epoch (no concurrent edit landed while this attempt ran):
+        // re-schedule normally.
+        assert!(should_reschedule_truncated(true, 0, 5, 5));
+        // A newer `schedule()` call (a genuine edit's own `ScanCompleted`)
+        // bumped the epoch while this truncated attempt was running its
+        // checker pass -- the bug this fix closes: must NOT re-schedule
+        // (that would bump the epoch again and supersede the real attempt).
+        assert!(!should_reschedule_truncated(true, 0, 6, 5));
+        // Not truncated at all: never reschedule regardless of epoch.
+        assert!(!should_reschedule_truncated(false, 0, 5, 5));
+        // Reschedule cap already reached: never reschedule even on a
+        // matching epoch.
+        assert!(!should_reschedule_truncated(
+            true,
+            MAX_CONSECUTIVE_RESCHEDULES,
+            5,
+            5
+        ));
     }
 
     /// Plan 3.4: `classify_confirmed_possible` is now the ONE definition
