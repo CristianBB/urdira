@@ -652,10 +652,31 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
         const CHECKER_ONLY_RELATION_KINDS = new Set(["jsts:relation_type_of", "jsts:relation_inherits", "jsts:relation_call", "jsts:relation_implements"]);
         const v3RelationKinds = new Set(v3Relations.map((record) => record["kind"]).filter((kind): kind is string => typeof kind === "string" && !CHECKER_ONLY_RELATION_KINDS.has(kind)));
         expect(v3RelationKinds.size).toBeGreaterThan(0);
-        for (const kind of v4RelationKinds) {
-          if (CHECKER_ONLY_RELATION_KINDS.has(kind as string)) continue;
-          expect(v3RelationKinds.has(kind as string)).toBe(true);
+        const v4NonCheckerRelationKinds = new Set([...v4RelationKinds].filter((kind): kind is string => typeof kind === "string" && !CHECKER_ONLY_RELATION_KINDS.has(kind)));
+        // Plan 3.3: bidirectional parity, not just v4 subset-of-v3. A real
+        // gap this loop would have masked belongs in KNOWN_V4_RELATION_KIND_GAPS
+        // with a comment (never a silent subset relaxation) -- see that
+        // set's own doc comment.
+        for (const kind of v4NonCheckerRelationKinds) {
+          expect(v3RelationKinds.has(kind)).toBe(true);
         }
+        /** Non-checker relation kinds this fixture's v3 oracle can produce
+         * that v4's structural (oxc-only, no TypeScript checker) lane does
+         * not yet emit for the identical files -- a genuine, tracked gap,
+         * not a defect this task fixes. Empty today: verified live (see
+         * this task's evidence doc) that v4 already matches v3 exactly over
+         * the non-checker kinds for this fixture. Keep this set, rather
+         * than deleting the reverse-direction check below, so a REAL future
+         * gap fails loudly here with a name to add, instead of the subset
+         * check silently absorbing it. */
+        const KNOWN_V4_RELATION_KIND_GAPS = new Set<string>([]);
+        for (const kind of v3RelationKinds) {
+          if (KNOWN_V4_RELATION_KIND_GAPS.has(kind)) continue;
+          expect(v4NonCheckerRelationKinds.has(kind)).toBe(true);
+        }
+        expect(new Set([...v4NonCheckerRelationKinds])).toEqual(
+          new Set([...v3RelationKinds].filter((kind) => !KNOWN_V4_RELATION_KIND_GAPS.has(kind))),
+        );
 
         // The contract this task's brief calls out: v4 and v3 must find the
         // SAME named entities for the identical source files (decision 11's
@@ -670,6 +691,29 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
         // `core:type` entries, not different ones. This is expected,
         // documented scope, not a defect (see this task's evidence doc).
         expect(v3TypeNames).toEqual(expect.arrayContaining(v4TypeNames));
+
+        // Plan 3.3: bidirectional parity. v3's synthetic "inferred type of
+        // X" entries (one per class/interface, from its checker-based
+        // `jsts:structural_stage_3` lane -- see the comment above) are the
+        // ONLY documented, expected difference, so they are the only
+        // exclusion applied before checking v3's remaining (concrete) type
+        // names are ALL also found by v4 -- not just that v4 never invents
+        // extras. Any other v3-only name would be a real, undocumented gap.
+        const INFERRED_TYPE_PREFIX = "inferred type of ";
+        /** Concrete (non-synthetic) v3 type names this fixture's v4 lane
+         * does not yet find for the identical files, beyond the documented
+         * "inferred type of X" exclusion above -- tracked here, not folded
+         * into a silent subset check. Empty today: verified live (this
+         * task's evidence doc) that v4 already matches v3's concrete
+         * `core:type` set exactly for this fixture. */
+        const KNOWN_V4_TYPE_NAME_GAPS = new Set<string>([]);
+        const v3ConcreteTypeNames = new Set(
+          v3TypeNames.filter((name) => !name.startsWith(INFERRED_TYPE_PREFIX) && !KNOWN_V4_TYPE_NAME_GAPS.has(name)),
+        );
+        for (const name of v3ConcreteTypeNames) {
+          expect(v4TypeNames).toContain(name);
+        }
+        expect(new Set(v4TypeNames)).toEqual(v3ConcreteTypeNames);
       } finally {
         await v3Runtime?.stop().catch(() => undefined);
         await rm(v3DataRoot, { recursive: true, force: true });
