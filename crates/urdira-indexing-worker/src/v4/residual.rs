@@ -299,6 +299,9 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                         external_sites: outcome.external_sites,
                         unresolved_sites: outcome.unresolved_sites,
                         timings: outcome.timings,
+                        truncated: Some(outcome.truncated),
+                        windows_done: u32::try_from(outcome.windows_done).ok(),
+                        windows_total: u32::try_from(outcome.windows_total).ok(),
                     };
                     let _ = target.sender.send((
                         target.stream_id,

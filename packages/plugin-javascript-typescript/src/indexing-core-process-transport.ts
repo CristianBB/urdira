@@ -97,7 +97,7 @@ export type IndexingEvent =
    * originally triggered, fired asynchronously well after that scan's own
    * `scan_completed` -- see `onUpgradeCompleted` below, not the ordinary
    * `pending`-map resolve-once dispatch every other event uses. */
-  | { readonly kind: "upgrade_completed"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly upgraded_sites: number; readonly external_sites: number; readonly unresolved_sites: number; readonly timings: ScanTimings };
+  | { readonly kind: "upgrade_completed"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly upgraded_sites: number; readonly external_sites: number; readonly unresolved_sites: number; readonly timings: ScanTimings; readonly truncated?: boolean; readonly windows_done?: number; readonly windows_total?: number };
 
 export interface IndexingCoreProcessDescriptor {
   readonly command: string;

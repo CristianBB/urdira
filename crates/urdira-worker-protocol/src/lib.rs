@@ -426,6 +426,26 @@ pub enum IndexingEvent {
         external_sites: u64,
         unresolved_sites: u64,
         timings: ScanTimings,
+        /// F4 4.2 (revision fix, 2026-09-05): `true` if
+        /// `URDIRA_V4_RESIDUAL_BUDGET_MS`'s deadline cut this run off
+        /// before it opened every window in its own plan (`crate::v4::
+        /// residual::ResidualOutcome::truncated`, `urdira-indexing-worker`)
+        /// -- a follow-up `UpgradeCompleted` for the SAME triggering scan
+        /// may still arrive later, once the re-scheduled continuation (or
+        /// the reschedule cap) finishes. `#[serde(default)]` so an older
+        /// sender that has never heard of truncation still deserializes
+        /// (as `None`, i.e. "unknown", not "false" -- see
+        /// `windows_done`/`windows_total`'s identical rationale).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncated: Option<bool>,
+        /// F4 4.2 (revision fix): how many windows this run actually
+        /// opened, out of `windows_total` -- `None` (not `0`) for a sender
+        /// that predates this field, so a consumer can distinguish "did
+        /// not report" from "opened zero windows".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        windows_done: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        windows_total: Option<u32>,
     },
 }
 

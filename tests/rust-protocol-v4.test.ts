@@ -144,4 +144,31 @@ describe("rust-protocol-v4 (workspace_scan/queryable/scan_completed)", () => {
     };
     expect(event).toEqual(fixture["upgrade_completed"]);
   });
+
+  it("upgrade_completed event with truncation fields matches the shared fixture", () => {
+    // Revision fix (2026-09-05): F4 4.2's truncated/windows_done/windows_total
+    // fields, present this time (contrast the previous test, which covers
+    // the absent/backward-compat case).
+    const timings: ScanTimings = {
+      resolve_ms: 20_000,
+      materialize_ms: 50,
+      write_ms: 20,
+      snapshot_ms: 10,
+      total_ms: 20_080,
+    };
+    const event: IndexingEvent & { readonly kind: "upgrade_completed" } = {
+      kind: "upgrade_completed",
+      request_id: "request:scan-fixture-1",
+      operation_id: "request:scan-fixture-1",
+      generation: 2,
+      upgraded_sites: 12,
+      external_sites: 3,
+      unresolved_sites: 1,
+      timings,
+      truncated: true,
+      windows_done: 3,
+      windows_total: 10,
+    };
+    expect(event).toEqual(fixture["upgrade_completed_truncated"]);
+  });
 });

@@ -55,6 +55,9 @@ export interface RustWorkspaceScanTransport {
       readonly external_sites: number;
       readonly unresolved_sites: number;
       readonly timings: ScanTimings;
+      readonly truncated?: boolean;
+      readonly windows_done?: number;
+      readonly windows_total?: number;
     }) => void,
   ): () => void;
 }
@@ -171,6 +174,9 @@ export function onRustWorkspaceUpgradeCompleted(
       external_sites: event.external_sites,
       unresolved_sites: event.unresolved_sites,
       timings: event.timings,
+      truncated: event.truncated,
+      windows_done: event.windows_done,
+      windows_total: event.windows_total,
     });
   });
 }

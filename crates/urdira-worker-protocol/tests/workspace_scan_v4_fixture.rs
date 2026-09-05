@@ -169,6 +169,44 @@ fn upgrade_completed_fixture_decodes() {
                 total_ms: 2_600,
                 ..Default::default()
             },
+            truncated: None,
+            windows_done: None,
+            windows_total: None,
+        }
+    );
+}
+
+/// Revision fix (2026-09-05): `UpgradeCompleted` with the new truncation
+/// fields PRESENT -- round-trips through JSON with the exact same shape
+/// `upgrade_completed_truncated` in the shared fixture file uses (and
+/// `tests/rust-protocol-v4.test.ts` independently asserts against the same
+/// file), complementing `upgrade_completed_fixture_decodes` above (which
+/// covers the fields ABSENT/`None`, the backward-compat case for a sender
+/// that predates this revision fix).
+#[test]
+fn upgrade_completed_truncated_fixture_decodes() {
+    let value = fixture()["upgrade_completed_truncated"].clone();
+    let event: IndexingEvent = serde_json::from_value(value).expect("decodes");
+    assert_eq!(
+        event,
+        IndexingEvent::UpgradeCompleted {
+            request_id: "request:scan-fixture-1".into(),
+            operation_id: "request:scan-fixture-1".into(),
+            generation: 2,
+            upgraded_sites: 12,
+            external_sites: 3,
+            unresolved_sites: 1,
+            timings: ScanTimings {
+                resolve_ms: Some(20_000),
+                materialize_ms: Some(50),
+                write_ms: Some(20),
+                snapshot_ms: Some(10),
+                total_ms: 20_080,
+                ..Default::default()
+            },
+            truncated: Some(true),
+            windows_done: Some(3),
+            windows_total: Some(10),
         }
     );
 }

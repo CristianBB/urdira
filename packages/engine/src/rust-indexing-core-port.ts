@@ -78,6 +78,16 @@ export interface WorkspaceScanUpgradeCompleted {
   readonly external_sites: number;
   readonly unresolved_sites: number;
   readonly timings: ScanTimings;
+  /** F4 4.2 (revision fix, 2026-09-05): `true` if `URDIRA_V4_RESIDUAL_BUDGET_MS`'s
+   * deadline cut this run off before it opened every window in its own plan
+   * -- a follow-up `upgrade_completed` for the SAME triggering scan may
+   * still arrive later. `undefined` (not `false`) for a Rust build that
+   * predates this field, so a consumer can tell "did not report" apart
+   * from "ran to completion". */
+  readonly truncated?: boolean;
+  /** How many windows this run actually opened, out of `windows_total`. */
+  readonly windows_done?: number;
+  readonly windows_total?: number;
 }
 
 /**

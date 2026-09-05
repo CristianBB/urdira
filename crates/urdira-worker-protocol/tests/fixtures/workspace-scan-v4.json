@@ -102,5 +102,24 @@
       "snapshot_ms": 30,
       "total_ms": 2600
     }
+  },
+  "upgrade_completed_truncated": {
+    "kind": "upgrade_completed",
+    "request_id": "request:scan-fixture-1",
+    "operation_id": "request:scan-fixture-1",
+    "generation": 2,
+    "upgraded_sites": 12,
+    "external_sites": 3,
+    "unresolved_sites": 1,
+    "timings": {
+      "resolve_ms": 20000,
+      "materialize_ms": 50,
+      "write_ms": 20,
+      "snapshot_ms": 10,
+      "total_ms": 20080
+    },
+    "truncated": true,
+    "windows_done": 3,
+    "windows_total": 10
   }
 }
