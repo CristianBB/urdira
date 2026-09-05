@@ -49,6 +49,22 @@ pub fn nibble_of(record_id: &[u8; 32]) -> usize {
     (record_id[0] >> 4) as usize
 }
 
+/// A1/A2 (2026-09-05, Frente A): `true` when `URDIRA_V4_DIAG_SKIP_ENTITIES_INDEX`
+/// is set -- a DIAGNOSTIC-ONLY escape hatch used solely to measure `entities.
+/// index`'s own marginal write cost in isolation (bench comparison, see this
+/// task's evidence doc). When set, every `entities.index` builder in this
+/// crate (flat, partitioned, delta) skips its sort/serialize work entirely
+/// and writes an empty framed section (header + zero-length body, `row_count
+/// = 0`) instead of the real triples. **The resulting store's `entities.
+/// index` section is then WRONG** (empty, not just smaller) -- any query that
+/// resolves through it (`StoreReader::entity_by_owner_and_start`, and hence
+/// `urdira-indexing-worker`'s v4 residual `collect()`) would silently return
+/// nothing. A store built with this flag set must never be used for anything
+/// but this bench comparison, and never published/queried afterward.
+pub fn diag_skip_entities_index() -> bool {
+    std::env::var_os("URDIRA_V4_DIAG_SKIP_ENTITIES_INDEX").is_some()
+}
+
 /// Maps a file read-only. The only `unsafe` in this crate beyond this
 /// function's callers: `memmap2::Mmap::map` is unsafe because the mapped
 /// file could be mutated concurrently by another process, which would
@@ -464,6 +480,19 @@ pub struct HotFilesResult {
 pub struct HotAndSecondaryResult {
     pub hot: HotFilesResult,
     pub secondary: std::collections::BTreeMap<String, (u64, u64)>,
+    /// A1 (2026-09-05, Frente A): wall time of the five hot `records.*`
+    /// files' own write work (per-nibble buffer fill + `write_all_at`),
+    /// measured around the closure(s) that do it -- may overlap with
+    /// `secondary_elapsed_ms`'s own wall time (both run concurrently, see
+    /// each writer's own doc comment), so this is "how long the hot-file
+    /// phase itself took", not a component of an additive total.
+    pub hot_elapsed_ms: u64,
+    /// A1: per-secondary-array wall time (`records.by_owner`, `records.
+    /// by_name`, `records.by_kind`, `records.by_identity`, `adj.out`,
+    /// `adj.in`, `entities.index`), keyed by the same names `secondary`
+    /// uses. Measured around each array's own sort+serialize+`write_
+    /// framed_file` work.
+    pub secondary_elapsed_ms: std::collections::BTreeMap<String, u64>,
 }
 
 /// Like [`write_hot_records_files`], but also builds the six secondary
@@ -573,8 +602,12 @@ pub fn write_hot_and_secondary_files(
 
     type NibbleBuffers = (usize, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
     enum Work {
-        Hot(Vec<NibbleBuffers>),
-        Secondary(&'static str, u64, u64),
+        // A1: `elapsed_ms` = wall time of this thread's own per-nibble
+        // loop (buffer fill + `write_all_at`), one entry per spawned
+        // thread group (up to `n_threads`).
+        Hot(Vec<NibbleBuffers>, u64),
+        // A1: name, bytes, xxh3, elapsed_ms.
+        Secondary(&'static str, u64, u64, u64),
     }
 
     let outcomes: Vec<Result<Work>> = std::thread::scope(|scope| {
@@ -598,6 +631,7 @@ pub fn write_hot_and_secondary_files(
             let nibble_start = nibble_start;
 
             handles.push(scope.spawn(move || -> Result<Work> {
+                let hot_started = std::time::Instant::now();
                 let mut out = Vec::with_capacity(nibs.len());
                 for nib in nibs {
                     let start = nibble_start[nib];
@@ -694,11 +728,12 @@ pub fn write_hot_and_secondary_files(
                     ident_file.write_all_at(&ident_buf, HEADER_LEN as u64 + ident_off[start])?;
                     out.push((nib, keys_buf, meta_buf, digests_buf, body_buf, ident_buf));
                 }
-                Ok(Work::Hot(out))
+                Ok(Work::Hot(out, hot_started.elapsed().as_millis() as u64))
             }));
         }
 
         handles.push(scope.spawn(|| -> Result<Work> {
+            let t = std::time::Instant::now();
             let mut quads: Vec<(u32, u32, u32, u32)> = order
                 .iter()
                 .enumerate()
@@ -722,10 +757,16 @@ pub fn write_hot_and_secondary_files(
                 quads.len() as u64,
                 &buf,
             )?;
-            Ok(Work::Secondary("records.by_owner", bytes, xxh3))
+            Ok(Work::Secondary(
+                "records.by_owner",
+                bytes,
+                xxh3,
+                t.elapsed().as_millis() as u64,
+            ))
         }));
 
         handles.push(scope.spawn(|| -> Result<Work> {
+            let t = std::time::Instant::now();
             let mut pairs: Vec<(u32, u32)> = order
                 .iter()
                 .enumerate()
@@ -744,10 +785,16 @@ pub fn write_hot_and_secondary_files(
                 pairs.len() as u64,
                 &buf,
             )?;
-            Ok(Work::Secondary("records.by_name", bytes, xxh3))
+            Ok(Work::Secondary(
+                "records.by_name",
+                bytes,
+                xxh3,
+                t.elapsed().as_millis() as u64,
+            ))
         }));
 
         handles.push(scope.spawn(|| -> Result<Work> {
+            let t = std::time::Instant::now();
             let mut keys: Vec<(u16, u8, u16, u32)> = order
                 .iter()
                 .enumerate()
@@ -771,10 +818,16 @@ pub fn write_hot_and_secondary_files(
                 keys.len() as u64,
                 &buf,
             )?;
-            Ok(Work::Secondary("records.by_kind", bytes, xxh3))
+            Ok(Work::Secondary(
+                "records.by_kind",
+                bytes,
+                xxh3,
+                t.elapsed().as_millis() as u64,
+            ))
         }));
 
         handles.push(scope.spawn(|| -> Result<Work> {
+            let t = std::time::Instant::now();
             let mut keys: Vec<([u8; 32], u32)> = order
                 .iter()
                 .enumerate()
@@ -793,10 +846,16 @@ pub fn write_hot_and_secondary_files(
                 keys.len() as u64,
                 &buf,
             )?;
-            Ok(Work::Secondary("records.by_identity", bytes, xxh3))
+            Ok(Work::Secondary(
+                "records.by_identity",
+                bytes,
+                xxh3,
+                t.elapsed().as_millis() as u64,
+            ))
         }));
 
         handles.push(scope.spawn(|| -> Result<Work> {
+            let t = std::time::Instant::now();
             let mut quads: Vec<(u32, u32, u32, u32)> = order
                 .iter()
                 .enumerate()
@@ -821,10 +880,16 @@ pub fn write_hot_and_secondary_files(
                 quads.len() as u64,
                 &buf,
             )?;
-            Ok(Work::Secondary("adj.out", bytes, xxh3))
+            Ok(Work::Secondary(
+                "adj.out",
+                bytes,
+                xxh3,
+                t.elapsed().as_millis() as u64,
+            ))
         }));
 
         handles.push(scope.spawn(|| -> Result<Work> {
+            let t = std::time::Instant::now();
             let mut quads: Vec<(u32, u32, u32, u32)> = order
                 .iter()
                 .enumerate()
@@ -849,13 +914,21 @@ pub fn write_hot_and_secondary_files(
                 quads.len() as u64,
                 &buf,
             )?;
-            Ok(Work::Secondary("adj.in", bytes, xxh3))
+            Ok(Work::Secondary(
+                "adj.in",
+                bytes,
+                xxh3,
+                t.elapsed().as_millis() as u64,
+            ))
         }));
 
         handles.push(scope.spawn(|| -> Result<Work> {
-            let inferred_type_kind_id = inferred_type_kind_id(dicts);
-            let mut triples: Vec<(u32, u32, u32)> =
-                order
+            let t = std::time::Instant::now();
+            let (row_count, buf) = if diag_skip_entities_index() {
+                (0u64, Vec::new())
+            } else {
+                let inferred_type_kind_id = inferred_type_kind_id(dicts);
+                let mut triples: Vec<(u32, u32, u32)> = order
                     .iter()
                     .enumerate()
                     .filter_map(|(k, &i)| {
@@ -864,21 +937,44 @@ pub fn write_hot_and_secondary_files(
                             .then_some((r.owner_artifact, r.span_start_byte, k as u32))
                     })
                     .collect();
-            triples.sort_unstable();
-            let mut buf = Vec::with_capacity(triples.len() * TRIPLE_STRIDE);
-            for (a, b, c) in &triples {
-                buf.extend_from_slice(&a.to_le_bytes());
-                buf.extend_from_slice(&b.to_le_bytes());
-                buf.extend_from_slice(&c.to_le_bytes());
-            }
+                // A2 (2026-09-05): pack `(owner_artifact, span_start)` into
+                // one `u64` for the primary comparison -- a single 64-bit
+                // compare instead of two sequential 32-bit field compares
+                // -- with `ordinal` kept as an explicit secondary key so
+                // this produces EXACTLY the same total order as the old
+                // `sort_unstable()` over the full 3-tuple (ordinals are
+                // always distinct within one batch, so the old sort was
+                // already a total order; dropping ordinal from the key
+                // entirely, as a plain packed-key-only sort would, makes
+                // ties unstable and was measured to break `write_base_
+                // partitioned_matches_write_base_byte_for_byte` whenever
+                // the fixture has a real `(owner, span_start)` collision --
+                // this keeps the byte-for-byte guarantee while still
+                // shrinking the primary comparison to 8 bytes).
+                triples.sort_unstable_by_key(|t| (((t.0 as u64) << 32) | t.1 as u64, t.2));
+                let mut buf = Vec::with_capacity(triples.len() * TRIPLE_STRIDE);
+                for (a, b, c) in &triples {
+                    let mut rec = [0u8; TRIPLE_STRIDE];
+                    rec[0..4].copy_from_slice(&a.to_le_bytes());
+                    rec[4..8].copy_from_slice(&b.to_le_bytes());
+                    rec[8..12].copy_from_slice(&c.to_le_bytes());
+                    buf.extend_from_slice(&rec);
+                }
+                (triples.len() as u64, buf)
+            };
             let (bytes, xxh3) = write_framed_file(
                 entities_index_path,
                 TableId::Records,
                 generation,
-                triples.len() as u64,
+                row_count,
                 &buf,
             )?;
-            Ok(Work::Secondary("entities.index", bytes, xxh3))
+            Ok(Work::Secondary(
+                "entities.index",
+                bytes,
+                xxh3,
+                t.elapsed().as_millis() as u64,
+            ))
         }));
 
         handles
@@ -893,11 +989,21 @@ pub fn write_hot_and_secondary_files(
     let mut nibble_buffers: Vec<NibbleBuffers> = Vec::new();
     let mut secondary: std::collections::BTreeMap<String, (u64, u64)> =
         std::collections::BTreeMap::new();
+    let mut secondary_elapsed_ms: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    // A1: several `Work::Hot` entries may exist (one per spawned thread
+    // group) -- they run CONCURRENTLY, so "how long did the hot-file phase
+    // take" is the SLOWEST one, not their sum.
+    let mut hot_elapsed_ms = 0u64;
     for outcome in outcomes {
         match outcome? {
-            Work::Hot(mut v) => nibble_buffers.append(&mut v),
-            Work::Secondary(name, bytes, xxh3) => {
+            Work::Hot(mut v, elapsed_ms) => {
+                nibble_buffers.append(&mut v);
+                hot_elapsed_ms = hot_elapsed_ms.max(elapsed_ms);
+            }
+            Work::Secondary(name, bytes, xxh3, elapsed_ms) => {
                 secondary.insert(name.to_string(), (bytes, xxh3));
+                secondary_elapsed_ms.insert(name.to_string(), elapsed_ms);
             }
         }
     }
@@ -973,9 +1079,16 @@ pub fn write_hot_and_secondary_files(
         xxh3s.insert(name, hash);
     }
 
+    // A1 (2026-09-05, Frente A): per-secondary-file timing is aggregated
+    // here (`hot_elapsed_ms`/`secondary_elapsed_ms` below) but PRINTED by
+    // the caller (`writer::SegmentWriter::write_base_with_pending`), which
+    // also knows this generation's `fsync` time -- one combined grep-able
+    // line, not two separate ones from two different call depths.
     Ok(HotAndSecondaryResult {
         hot: HotFilesResult { bytes, xxh3: xxh3s },
         secondary,
+        hot_elapsed_ms,
+        secondary_elapsed_ms,
     })
 }
 
@@ -1134,8 +1247,15 @@ pub fn write_hot_and_secondary_files_partitioned(
     // header `body_xxh3` -- the SAME formula the non-partitioned `write_
     // hot_and_secondary_files` above now also uses, so both writers
     // produce byte-identical headers for the same logical rows.
-    let hot_files_work = || -> Result<Vec<[u64; 5]>> {
-        partitions
+    // A1 (2026-09-05, Frente A): `elapsed_ms` = wall time of this whole
+    // closure (every partition's buffer fill + `write_all_at` + own hash,
+    // all run concurrently via `par_iter` below) -- runs concurrently with
+    // `secondary_work` (see the `rayon::join` below), so this is "how long
+    // the hot-file phase itself took", not a component of an additive
+    // total together with `secondary_work`'s own elapsed times.
+    let hot_files_work = || -> Result<(Vec<[u64; 5]>, u64)> {
+        let hot_started = std::time::Instant::now();
+        let result: Result<Vec<[u64; 5]>> = partitions
             .par_iter()
             .enumerate()
             .map(|(nib, part)| -> Result<[u64; 5]> {
@@ -1249,12 +1369,71 @@ pub fn write_hot_and_secondary_files_partitioned(
                 ];
                 Ok(part_hashes)
             })
-            .collect()
+            .collect();
+        Ok((result?, hot_started.elapsed().as_millis() as u64))
     };
 
-    let secondary_work = || -> Result<std::collections::BTreeMap<String, (u64, u64)>> {
-        let mut secondary = std::collections::BTreeMap::new();
+    // A2 (2026-09-05, Frente A.2 lever 1): `entities.index`'s own build
+    // (sort + serialize + `write_framed_file`) used to run SEQUENTIALLY
+    // after the other six secondary arrays inside this same closure --
+    // pure queueing, since it has no data dependency on any of them. Now a
+    // sibling `rayon::join` branch of `secondary_work_rest` below, so its
+    // sort runs OVERLAPPED with `by_owner`/`by_name`/etc instead of after.
+    let secondary_work_entities_index = || -> Result<((u64, u64), u64)> {
+        let t = std::time::Instant::now();
+        let (row_count, buf) = if diag_skip_entities_index() {
+            (0u64, Vec::new())
+        } else {
+            let inferred_type_kind_id = inferred_type_kind_id(dicts);
+            let mut entities_index: Vec<(u32, u32, u32)> = partitions
+                .par_iter()
+                .enumerate()
+                .flat_map_iter(|(nib, part)| {
+                    part.iter().enumerate().filter_map(move |(local, r)| {
+                        is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id)
+                            .then_some((
+                                r.owner_artifact,
+                                r.span_start_byte,
+                                global_k(&row_base, nib, local),
+                            ))
+                    })
+                })
+                .collect();
+            // A2: see the flat writer's identical comment above -- packed
+            // `(owner, start)` primary key, `ordinal` kept as an explicit
+            // secondary key so the total order stays identical to the old
+            // `par_sort_unstable()` over the full 3-tuple.
+            entities_index.par_sort_unstable_by_key(|t| (((t.0 as u64) << 32) | t.1 as u64, t.2));
+            let mut buf = Vec::with_capacity(entities_index.len() * TRIPLE_STRIDE);
+            for (a, b, c) in &entities_index {
+                let mut rec = [0u8; TRIPLE_STRIDE];
+                rec[0..4].copy_from_slice(&a.to_le_bytes());
+                rec[4..8].copy_from_slice(&b.to_le_bytes());
+                rec[8..12].copy_from_slice(&c.to_le_bytes());
+                buf.extend_from_slice(&rec);
+            }
+            (entities_index.len() as u64, buf)
+        };
+        let (bytes, xxh3) = write_framed_file(
+            entities_index_path,
+            TableId::Records,
+            generation,
+            row_count,
+            &buf,
+        )?;
+        Ok(((bytes, xxh3), t.elapsed().as_millis() as u64))
+    };
 
+    // A1: `(secondary files' bytes/xxh3, secondary files' elapsed_ms)`.
+    type SecondaryWorkResult = (
+        std::collections::BTreeMap<String, (u64, u64)>,
+        std::collections::BTreeMap<String, u64>,
+    );
+    let secondary_work_rest = || -> Result<SecondaryWorkResult> {
+        let mut secondary = std::collections::BTreeMap::new();
+        let mut secondary_elapsed_ms = std::collections::BTreeMap::new();
+
+        let t = std::time::Instant::now();
         let mut by_owner: Vec<(u32, u32, u32, u32)> = partitions
             .par_iter()
             .enumerate()
@@ -1285,7 +1464,12 @@ pub fn write_hot_and_secondary_files_partitioned(
             &buf,
         )?;
         secondary.insert("records.by_owner".to_string(), (bytes, xxh3));
+        secondary_elapsed_ms.insert(
+            "records.by_owner".to_string(),
+            t.elapsed().as_millis() as u64,
+        );
 
+        let t = std::time::Instant::now();
         let mut by_name: Vec<(u32, u32)> = partitions
             .par_iter()
             .enumerate()
@@ -1310,7 +1494,12 @@ pub fn write_hot_and_secondary_files_partitioned(
             &buf,
         )?;
         secondary.insert("records.by_name".to_string(), (bytes, xxh3));
+        secondary_elapsed_ms.insert(
+            "records.by_name".to_string(),
+            t.elapsed().as_millis() as u64,
+        );
 
+        let t = std::time::Instant::now();
         let mut by_kind: Vec<(u16, u8, u16, u32)> = partitions
             .par_iter()
             .enumerate()
@@ -1341,7 +1530,12 @@ pub fn write_hot_and_secondary_files_partitioned(
             &buf,
         )?;
         secondary.insert("records.by_kind".to_string(), (bytes, xxh3));
+        secondary_elapsed_ms.insert(
+            "records.by_kind".to_string(),
+            t.elapsed().as_millis() as u64,
+        );
 
+        let t = std::time::Instant::now();
         let mut by_identity: Vec<([u8; 32], u32)> = partitions
             .par_iter()
             .enumerate()
@@ -1365,7 +1559,12 @@ pub fn write_hot_and_secondary_files_partitioned(
             &buf,
         )?;
         secondary.insert("records.by_identity".to_string(), (bytes, xxh3));
+        secondary_elapsed_ms.insert(
+            "records.by_identity".to_string(),
+            t.elapsed().as_millis() as u64,
+        );
 
+        let t = std::time::Instant::now();
         let mut adj_out: Vec<(u32, u32, u32, u32)> = partitions
             .par_iter()
             .enumerate()
@@ -1392,7 +1591,9 @@ pub fn write_hot_and_secondary_files_partitioned(
             &buf,
         )?;
         secondary.insert("adj.out".to_string(), (bytes, xxh3));
+        secondary_elapsed_ms.insert("adj.out".to_string(), t.elapsed().as_millis() as u64);
 
+        let t = std::time::Instant::now();
         let mut adj_in: Vec<(u32, u32, u32, u32)> = partitions
             .par_iter()
             .enumerate()
@@ -1419,38 +1620,9 @@ pub fn write_hot_and_secondary_files_partitioned(
             &buf,
         )?;
         secondary.insert("adj.in".to_string(), (bytes, xxh3));
+        secondary_elapsed_ms.insert("adj.in".to_string(), t.elapsed().as_millis() as u64);
 
-        let inferred_type_kind_id = inferred_type_kind_id(dicts);
-        let mut entities_index: Vec<(u32, u32, u32)> = partitions
-            .par_iter()
-            .enumerate()
-            .flat_map_iter(|(nib, part)| {
-                part.iter().enumerate().filter_map(move |(local, r)| {
-                    is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id).then_some((
-                        r.owner_artifact,
-                        r.span_start_byte,
-                        global_k(&row_base, nib, local),
-                    ))
-                })
-            })
-            .collect();
-        entities_index.par_sort_unstable();
-        let mut buf = Vec::with_capacity(entities_index.len() * TRIPLE_STRIDE);
-        for (a, b, c) in &entities_index {
-            buf.extend_from_slice(&a.to_le_bytes());
-            buf.extend_from_slice(&b.to_le_bytes());
-            buf.extend_from_slice(&c.to_le_bytes());
-        }
-        let (bytes, xxh3) = write_framed_file(
-            entities_index_path,
-            TableId::Records,
-            generation,
-            entities_index.len() as u64,
-            &buf,
-        )?;
-        secondary.insert("entities.index".to_string(), (bytes, xxh3));
-
-        Ok(secondary)
+        Ok((secondary, secondary_elapsed_ms))
     };
 
     // P2-2l item 4: profile `hot_files_work`/`secondary_work`/the header-
@@ -1460,10 +1632,25 @@ pub fn write_hot_and_secondary_files_partitioned(
     // `write_base_partitioned` and `write_delta_with_reader` already use.
     let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
     let hot_and_secondary_started = std::time::Instant::now();
-    let (hot_result, secondary_result) = rayon::join(hot_files_work, secondary_work);
+    // A2 (2026-09-05, Frente A.2 lever 1): three-way overlap -- the five hot
+    // files, the six "plain" secondary arrays, and `entities.index` all run
+    // concurrently (a `rayon::join` nested inside a `rayon::join`; rayon's
+    // work-stealing scheduler treats this exactly like a flat three-way
+    // fork, there is no added synchronization cost from the nesting).
+    let (hot_result, (secondary_rest_result, entities_index_result)) =
+        rayon::join(hot_files_work, || {
+            rayon::join(secondary_work_rest, secondary_work_entities_index)
+        });
     let hot_and_secondary_elapsed = hot_and_secondary_started.elapsed();
-    let per_partition_hashes = hot_result?;
-    let secondary = secondary_result?;
+    let (per_partition_hashes, hot_elapsed_ms) = hot_result?;
+    let (mut secondary, mut secondary_elapsed_ms) = secondary_rest_result?;
+    let ((entities_index_bytes, entities_index_xxh3), entities_index_elapsed_ms) =
+        entities_index_result?;
+    secondary.insert(
+        "entities.index".to_string(),
+        (entities_index_bytes, entities_index_xxh3),
+    );
+    secondary_elapsed_ms.insert("entities.index".to_string(), entities_index_elapsed_ms);
     debug_assert_eq!(per_partition_hashes.len(), N_NIBBLES);
 
     // A2: combine each file's 16 per-partition hashes (computed inline,
@@ -1524,10 +1711,16 @@ pub fn write_hot_and_secondary_files_partitioned(
             header_hash_elapsed.as_secs_f64(),
         );
     }
+    // A1: per-secondary-file timing is aggregated here but PRINTED by the
+    // caller (`writer::SegmentWriter::write_base_partitioned_with_pending`),
+    // which also knows this generation's `fsync` time -- see the flat
+    // writer's matching comment above.
 
     Ok(HotAndSecondaryResult {
         hot: HotFilesResult { bytes, xxh3: xxh3s },
         secondary,
+        hot_elapsed_ms,
+        secondary_elapsed_ms,
     })
 }
 
