@@ -4254,15 +4254,39 @@ impl<'a> Visit<'a> for SyntaxCollector {
     /// `declare module "specifier";`) is an ambient module declaration --
     /// see `AmbientModuleDeclaration`'s own doc comment. An `Identifier`-
     /// named one (`namespace X {}`/`declare namespace X {}`) names a LOCAL
-    /// binding, never a module specifier, and is deliberately left
-    /// untouched here (out of this task's scope -- `EntityKind::Namespace`
-    /// is not wired to that shape). Every declaration nested inside the
-    /// block (function/class/interface/type/enum/variable) still gets its
-    /// own entity through the ordinary recursive walk below, unaffected --
-    /// this override only ADDS the block's own namespace entity plus the
-    /// `AmbientModuleDeclaration` fact; it never replaces or skips the
-    /// default walk.
+    /// binding instead (3b, 2026-09-05): it now gets its own entity via
+    /// `push_entity` (same shape as `visit_class`/`visit_ts_enum_declaration`
+    /// above), so `import { X } from ...`/local references to the namespace
+    /// name resolve like any other module-level declaration. Every
+    /// declaration nested inside the block (function/class/interface/type/
+    /// enum/variable) still gets its own entity through the ordinary
+    /// recursive walk below, unaffected -- this override only ADDS the
+    /// block's own namespace/ambient-module entity plus (string-literal
+    /// case only) the `AmbientModuleDeclaration` fact; it never replaces or
+    /// skips the default walk.
+    ///
+    /// Known gap, not fixed here (documented per plan, not "fixed"):
+    /// nested `namespace A.B {}` desugars in oxc to `namespace A { namespace
+    /// B {} }`, so this visitor fires once per level and each produces its
+    /// own entity -- no special-casing needed, but the identity of `A` is
+    /// anchored at the OUTER declaration's identifier span, same as v3.
+    /// Declaration merging -- the same `namespace X {}` (or
+    /// `declare namespace X {}`) repeated more than once in the same file --
+    /// produces one entity PER occurrence, each with a distinct identity key
+    /// (`identity_start` differs), because `push_entity` never deduplicates
+    /// by name. Downstream, the export resolver (`resolve_direct_export`)
+    /// sees >1 candidate entity with the same `name` and the same
+    /// `EntityKind::Namespace` and reports `Ambiguous` for a bare
+    /// `import { X } from "./this-file"` of the merged name -- exactly the
+    /// same fallback merged overloaded functions already get. This is
+    /// counted in the references-parity diff, not silently absorbed; it is
+    /// not "fixed" by 3a either, since 3a's first-declaration policy is
+    /// scoped to function/method overloads, not namespace merges (which can
+    /// legitimately contribute different members per block).
     fn visit_ts_module_declaration(&mut self, declaration: &TSModuleDeclaration<'a>) {
+        if let TSModuleDeclarationName::Identifier(identifier) = &declaration.id {
+            self.push_entity(identifier, EntityKind::Namespace, UniversalKind::Type);
+        }
         if let TSModuleDeclarationName::StringLiteral(literal) = &declaration.id {
             let specifier = literal.value.as_str().to_owned();
             let namespace_entity_id = self.push_namespace_entity(
@@ -5219,6 +5243,62 @@ mod tests {
                 .iter()
                 .any(|record| record.identity_key == function_id),
             "expected a function entity {function_id}: {records:?}"
+        );
+    }
+
+    /// 3b (2026-09-05): an `Identifier`-named `TSModuleDeclaration`
+    /// (`namespace Foo {}`, here wrapped in `export`) now gets its own
+    /// `EntityKind::Namespace` entity plus a `core:contains` relation from
+    /// the file's module entity, mirroring `push_namespace_entity`'s
+    /// string-literal (ambient module) sibling above -- see that test for
+    /// the ambient-module-still-works-unchanged half of this coverage.
+    #[test]
+    fn namespace_identifier_declaration_gets_its_own_entity_and_contains_relation() {
+        let mut state = SyntaxWorkerState::default();
+        let text = "export namespace Foo {\n  export const a = 1;\n}\n";
+        let files = vec![source("ns.ts", text)];
+        let WorkerMessage::AnalysisResult { build, .. } =
+            analyze(&mut state, files, &["ns.ts"], '1')
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(build, BuildKind::Full);
+        let WorkerMessage::FactsResult { records, .. } =
+            read_page(&state, "ns.ts", None, 1_000_000, 4096)
+        else {
+            panic!("expected facts")
+        };
+        let name_start = text.find("Foo").unwrap() as u32;
+        let name_end = name_start + "Foo".len() as u32;
+        let namespace_id = format!("jsts:namespace:ns.ts:{name_start}:Foo");
+        let namespace_entity = records
+            .iter()
+            .find(|record| record.identity_key == namespace_id)
+            .unwrap_or_else(|| panic!("expected a namespace entity {namespace_id}: {records:?}"));
+        assert_eq!(namespace_entity.body.to_value()["kind"], "namespace");
+        assert_eq!(namespace_entity.universal_kind, "core:type");
+        assert_eq!(namespace_entity.body.to_value()["name"], "Foo");
+
+        let module_id = stable_entity_id(EntityKind::Module, "ns.ts", 0, "ns.ts");
+        let contains_id =
+            format!("jsts:contains:ns.ts:{name_start}:{name_end}:{module_id}:{namespace_id}");
+        let contains_relation = records
+            .iter()
+            .find(|record| record.identity_key == contains_id)
+            .unwrap_or_else(|| {
+                panic!("expected a core:contains relation {contains_id}: {records:?}")
+            });
+        assert_eq!(contains_relation.universal_kind, "core:contains");
+
+        // Nested declarations inside the namespace block still get their
+        // own entity through the ordinary recursive walk, unaffected.
+        let variable_start = (text.find("const a").unwrap() + "const ".len()) as u32;
+        let variable_id = format!("jsts:variable:ns.ts:{variable_start}:a");
+        assert!(
+            records
+                .iter()
+                .any(|record| record.identity_key == variable_id),
+            "expected a variable entity {variable_id}: {records:?}"
         );
     }
 
