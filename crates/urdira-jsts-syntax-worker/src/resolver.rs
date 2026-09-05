@@ -1611,21 +1611,50 @@ const NODE_BUILTIN_MODULES: &[&str] = &[
 /// with a subpath (`lodash/get`, `@scope/name/sub`), or an explicit
 /// `node:`-prefixed builtin -- is external.
 ///
+/// h2 (2026-09-05), narrowed by owner review: the CLOSED list of subpaths
+/// Node itself documents as importable builtin module specifiers (`fs`'s
+/// own promise API, `path`'s POSIX/Windows-specific variants, ...) -- NOT
+/// a generic "first path segment is a builtin's bare name" rule, which
+/// produced false positives for real, unrelated npm packages that happen
+/// to share a builtin's name as their own first path segment: browserify-
+/// era shim/polyfill packages (`process/browser`, `buffer/*`, `util/
+/// browser`) and ordinary subpaths of packages that are simply NAMED after
+/// a builtin (`events/events`) are real, independent npm packages with
+/// their own unrelated content, never Node's builtin module -- merging
+/// them into `node:{builtin}/...` would misattribute their entity
+/// identity. A specifier not in this list is never normalized by subpath
+/// matching alone, regardless of its first segment.
+const NODE_BUILTIN_SUBPATHS: &[&str] = &[
+    "assert/strict",
+    "dns/promises",
+    "fs/promises",
+    "path/posix",
+    "path/win32",
+    "readline/promises",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "timers/promises",
+    "util/types",
+];
+
 /// **Identity normalization**: returns the CANONICAL specifier string to
 /// build `external_module_id`/`external_symbol_id` from. A bare Node
 /// builtin (`fs`) and its explicit `node:`-prefixed form (`node:fs`) name
 /// the SAME entity (`jsts:external_module:node:fs`) -- both normalize to
-/// the `node:`-prefixed form. A bare SUBPATH of a builtin (`fs/promises`,
-/// h2 2026-09-05) normalizes the same way, full subpath included
-/// (`node:fs/promises`) -- checked by splitting at the FIRST `/` and
-/// matching only the prefix against [`NODE_BUILTIN_MODULES`], so a bare
-/// package whose own name merely CONTAINS a builtin as a prefix component
-/// of something else (`lodash/fp`: prefix `lodash` is not itself a
-/// builtin) is left untouched. Every other specifier is returned AS-IS,
-/// full subpath included: two different subpaths of the same non-builtin
-/// package (`@langchain/core` vs `@langchain/core/messages`) are two
-/// different external module entities, mirroring how two different
-/// workspace files are two different module entities.
+/// the `node:`-prefixed form. A bare subpath EXACTLY matching one of
+/// [`NODE_BUILTIN_SUBPATHS`] (`fs/promises`, h2 2026-09-05, narrowed
+/// 2026-09-05) normalizes the same way, full subpath included
+/// (`node:fs/promises`) -- an EXACT match against the closed list, never a
+/// prefix check, so a real npm package that merely shares a builtin's name
+/// as its own first path segment (`process/browser`, `buffer/*`, `util/
+/// browser`, `events/events` -- see that constant's own doc comment) is
+/// left untouched, same as any other bare/scoped specifier. Every other
+/// specifier is returned AS-IS, full subpath included: two different
+/// subpaths of the same non-builtin package (`@langchain/core` vs
+/// `@langchain/core/messages`) are two different external module
+/// entities, mirroring how two different workspace files are two
+/// different module entities.
 pub fn classify_external_specifier(specifier: &str) -> Option<String> {
     if specifier.is_empty() || specifier.starts_with('.') || specifier.starts_with('/') {
         return None;
@@ -1633,12 +1662,7 @@ pub fn classify_external_specifier(specifier: &str) -> Option<String> {
     if let Some(builtin) = specifier.strip_prefix("node:") {
         return Some(format!("node:{builtin}"));
     }
-    if NODE_BUILTIN_MODULES.contains(&specifier) {
-        return Some(format!("node:{specifier}"));
-    }
-    if let Some((prefix, _subpath)) = specifier.split_once('/')
-        && NODE_BUILTIN_MODULES.contains(&prefix)
-    {
+    if NODE_BUILTIN_MODULES.contains(&specifier) || NODE_BUILTIN_SUBPATHS.contains(&specifier) {
         return Some(format!("node:{specifier}"));
     }
     Some(specifier.to_owned())
@@ -2618,15 +2642,21 @@ mod tests {
     /// package.
     #[test]
     fn classify_external_specifier_normalizes_node_builtin_subpaths() {
+        // The 11 subpaths Node itself documents as importable builtin
+        // module specifiers -- see `NODE_BUILTIN_SUBPATHS`'s own doc
+        // comment.
         for (specifier, expected) in [
-            ("fs/promises", "node:fs/promises"),
-            ("stream/web", "node:stream/web"),
-            ("path/posix", "node:path/posix"),
-            ("util/types", "node:util/types"),
-            ("timers/promises", "node:timers/promises"),
             ("assert/strict", "node:assert/strict"),
             ("dns/promises", "node:dns/promises"),
+            ("fs/promises", "node:fs/promises"),
+            ("path/posix", "node:path/posix"),
+            ("path/win32", "node:path/win32"),
             ("readline/promises", "node:readline/promises"),
+            ("stream/consumers", "node:stream/consumers"),
+            ("stream/promises", "node:stream/promises"),
+            ("stream/web", "node:stream/web"),
+            ("timers/promises", "node:timers/promises"),
+            ("util/types", "node:util/types"),
         ] {
             assert_eq!(
                 classify_external_specifier(specifier),
@@ -2634,10 +2664,32 @@ mod tests {
                 "specifier: {specifier}"
             );
         }
-        assert_eq!(
-            classify_external_specifier("lodash/fp"),
-            Some("lodash/fp".to_owned())
-        );
+    }
+
+    /// Owner review (2026-09-05, after the first h2 cut): the exact-match
+    /// list must NOT fall back to a "first segment is a builtin name"
+    /// rule -- these are all real, unrelated npm packages (browserify-era
+    /// shims/polyfills, or a package simply named after a builtin) that
+    /// happen to share a Node builtin's bare name as their own first path
+    /// segment. None of them is in `NODE_BUILTIN_SUBPATHS`, so none is
+    /// normalized -- still classified external, just returned as-is,
+    /// same as any other bare/scoped specifier.
+    #[test]
+    fn classify_external_specifier_does_not_normalize_unrelated_packages_sharing_a_builtin_name() {
+        for specifier in [
+            "process/browser",
+            "buffer/",
+            "util/browser",
+            "events/events",
+            "lodash/fp",
+            "fs//x",
+        ] {
+            assert_eq!(
+                classify_external_specifier(specifier),
+                Some(specifier.to_owned()),
+                "specifier: {specifier}"
+            );
+        }
     }
 
     #[test]
