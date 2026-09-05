@@ -46,8 +46,8 @@
 //! out of scope here too -- see the design doc's own E2b note.
 
 use crate::{
-    AmbientModuleDeclaration, AmbientModuleMember, EntityKind, SyntaxEntity, SyntaxExportBinding,
-    SyntaxFileResult,
+    AmbientGlobalDeclaration, AmbientModuleDeclaration, AmbientModuleMember, EntityKind,
+    GlobalScope, SyntaxEntity, SyntaxExportBinding, SyntaxFileResult,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1379,6 +1379,28 @@ pub struct AmbientModuleIndex {
     /// through `by_specifier`'s literal-text match, same as before this
     /// wildcard support existed.
     patterns: Vec<(String, String, AmbientModuleDeclaration)>,
+    /// D.1 (2026-09-05, references-parity task): every workspace file's own
+    /// `SyntaxFileResult::ambient_globals`, keyed by NAME, in the same
+    /// `(declaring_path, declaration)` shape `by_specifier` uses -- see
+    /// `resolve_global`'s own doc comment for the lookup contract. Built in
+    /// `rebuild`'s SAME single pass over `files` (a `BTreeMap`, so each
+    /// name's `Vec` is naturally in ascending-path order -- `resolve_
+    /// global`'s own namespace-merge tie-break relies on exactly that
+    /// order, mirroring `resolve_direct_export`'s `FirstDeclaration`
+    /// policy).
+    globals: HashMap<String, Vec<(String, AmbientGlobalDeclaration)>>,
+    /// D.3 (2026-09-05, references-parity task): every workspace file's own
+    /// `SyntaxFileResult::namespace_members`, keyed by `(namespace_entity_id,
+    /// member_name)` -- see `resolve_namespace_member_by_name`'s own doc
+    /// comment for the lookup contract. NOT merge-aware across files: a
+    /// `namespace_entity_id` already names ONE SPECIFIC declaring file's
+    /// own block (its id embeds that file's own path), so a namespace
+    /// merged across two files only ever exposes the members declared in
+    /// whichever ONE file `resolve_qualified_namespace_path`'s own root
+    /// resolution landed on -- a real, accepted limitation (never a WRONG
+    /// answer, only a possibly-incomplete one), out of this task's stated
+    /// scope.
+    namespace_members: HashMap<(String, String), Vec<String>>,
 }
 
 impl AmbientModuleIndex {
@@ -1397,8 +1419,11 @@ impl AmbientModuleIndex {
         let mut by_specifier: HashMap<String, Vec<(String, AmbientModuleDeclaration)>> =
             HashMap::new();
         let mut patterns: Vec<(String, String, AmbientModuleDeclaration)> = Vec::new();
+        let mut globals: HashMap<String, Vec<(String, AmbientGlobalDeclaration)>> = HashMap::new();
+        let mut namespace_members: HashMap<(String, String), Vec<String>> = HashMap::new();
         let mut script_count = 0u64;
         let mut augmentation_count = 0u64;
+        let mut global_count = 0u64;
         for (path, file) in files {
             for declaration in &file.ambient_modules {
                 if declaration.is_augmentation {
@@ -1418,17 +1443,41 @@ impl AmbientModuleIndex {
                     .or_default()
                     .push((path.clone(), declaration.clone()));
             }
+            // D.1 (2026-09-05, references-parity task): `file.ambient_
+            // globals` is already fully filtered/deduped by `parse_source`
+            // (ScriptTopLevel candidates dropped for a module file,
+            // DeclareGlobal always kept) -- every remaining entry here is a
+            // real global-scope candidate, pushed in this SAME `files`
+            // iteration order (a `BTreeMap`, ascending by path).
+            for declaration in &file.ambient_globals {
+                global_count += 1;
+                globals
+                    .entry(declaration.name.clone())
+                    .or_default()
+                    .push((path.clone(), declaration.clone()));
+            }
+            // D.3 (2026-09-05, references-parity task): see
+            // `namespace_members`'s own doc comment.
+            for member in &file.namespace_members {
+                namespace_members
+                    .entry((member.namespace_entity_id.clone(), member.name.clone()))
+                    .or_default()
+                    .push(member.member_entity_id.clone());
+            }
         }
         if std::env::var_os("URDIRA_V4_DEBUG_AMBIENT_MODULES").is_some() {
             eprintln!(
-                "[AmbientModuleIndex::rebuild] script_declarations={script_count} (exact_specifiers={} wildcard_specifiers={}) module_augmentations_ignored={augmentation_count}",
+                "[AmbientModuleIndex::rebuild] script_declarations={script_count} (exact_specifiers={} wildcard_specifiers={}) module_augmentations_ignored={augmentation_count} ambient_globals={global_count} (unique_names={})",
                 by_specifier.len(),
                 patterns.len(),
+                globals.len(),
             );
         }
         Self {
             by_specifier,
             patterns,
+            globals,
+            namespace_members,
         }
     }
 
@@ -1548,6 +1597,355 @@ impl AmbientModuleIndex {
             }
         }
     }
+
+    /// D.1 (2026-09-05, references-parity task): resolve a bare identifier
+    /// `name` that reached `resolve_identifier_reference` with NO oxc scope
+    /// binding at all (`REASON_UNRESOLVED_GLOBAL`'s own condition) against
+    /// every workspace file's own ambient-global declarations. `Absent`
+    /// (no declaring file at all) is the exact same outcome as before this
+    /// task -- stays `checker_pending`. `Unique` when exactly one distinct
+    /// `entity_id` claims this name workspace-wide (either a single
+    /// declaring file, or several declaring the SAME entity -- never
+    /// happens by construction, since `entity_id` embeds the declaring
+    /// path/position, but checked via a `BTreeSet` of ids rather than a
+    /// raw count for robustness). Otherwise `Ambiguous`, UNLESS every
+    /// candidate is a namespace merge (`EntityKind::Namespace`, the
+    /// `jest`/`globalThis`-shaped case this task closes): TypeScript's own
+    /// `valueDeclaration ?? declarations[0]` rule applies there too, same
+    /// as `resolve_direct_export`'s `ExportPolicy::FirstDeclaration` (see
+    /// `first_declaration_merge_target`'s own doc comment for the single-
+    /// file version of this exact rule) -- the FIRST declaration in
+    /// `globals`' own insertion order, which is `rebuild`'s `files`
+    /// iteration order (`BTreeMap`, ascending by path) followed by each
+    /// file's own `ambient_globals` source order, i.e. "first declaring
+    /// path, first declaration in that file" -- never a guess for any
+    /// other kind mismatch (a `namespace X` merged with a `class X`, for
+    /// instance, stays `Ambiguous`: no value declaration exists to prefer
+    /// the way `resolve_direct_export`'s single-file version can).
+    ///
+    /// Two corrections found live against the n8n corpus (2026-09-05,
+    /// `refs-parity-diff-d1-full.log`), both BEFORE the rule above ever
+    /// runs:
+    ///
+    /// 1. **Never shadow a standard ECMAScript/DOM/Node global**
+    ///    (`is_standard_global_name`): `console`/`Array`/`BigInt`/
+    ///    `Navigator` each ALSO had a workspace `.d.ts` re-declaration
+    ///    somewhere (an `interface Array { ... }` merge, a browser-worker
+    ///    type shim's own `declare global { var console: ...; }`) that has
+    ///    NOTHING to do with the REST of the corpus -- v3's real answer for
+    ///    every one of 6,856 sampled sites was TypeScript's own bundled
+    ///    `lib.*.d.ts` declaration, which this crate has zero visibility
+    ///    into (`files` never contains it). Guessing the workspace
+    ///    candidate instead produced 6,856 wrong `core:references` targets
+    ///    (`v4_different_target`, a HARD gate violation) -- staying
+    ///    `Absent` for these names is the "never guess" answer, exactly
+    ///    like every unresolved-scope identifier before this task.
+    /// 2. **Package-scope proximity for a genuine cross-file namespace
+    ///    merge** (`workspace_scope_prefix`): TWO separate workspace
+    ///    packages, `packages/cli/src/jest.d.ts` and `packages/@n8n/json-
+    ///    schema-to-zod/test/jest.d.ts`, both declare `namespace jest {}`
+    ///    -- each is scoped to ITS OWN package's own TypeScript program in
+    ///    reality (separate `tsconfig.json`s), never merged workspace-wide.
+    ///    The plain "first declaring path in `BTreeMap` order" rule always
+    ///    picked the `@n8n` one (`@` sorts before `c`), wrong for every
+    ///    one of 169 sampled `packages/cli/**` referencing sites. A same-
+    ///    scope candidate (the declaring path shares `referencing_path`'s
+    ///    OWN top-level package prefix) wins when there is EXACTLY ONE
+    ///    such candidate.
+    ///
+    /// D.5 (2026-09-05, adversarial review) sharpened both corrections
+    /// further, each found live by an independent reviewer reading this
+    /// exact function:
+    ///
+    /// 1a. **The standard-global denylist must not swallow a GENUINE
+    ///     `declare global` augmentation of the real global namespace**:
+    ///     `is_standard_global_name` lists `"globalThis"` (a real
+    ///     ECMAScript intrinsic, correctly denylisted for an ORDINARY
+    ///     `var`/`interface` re-declaration -- correction 1's own
+    ///     reasoning). But `declare global { namespace globalThis {} }` is
+    ///     the CANONICAL, textbook way to add a member to `globalThis`
+    ///     ITSELF (`expression-runtime/src/runtime/index.ts`, named in
+    ///     this crate's own `SyntaxFileResult::ambient_globals` doc
+    ///     comment as one of the two corpus samples motivating D.1 in the
+    ///     first place) -- unconditionally denylisting `"globalThis"`
+    ///     made that exact named case permanently unresolvable, contrary
+    ///     to the doc comment's own claim. The denylist is now bypassed
+    ///     for a name with AT LEAST ONE `(EntityKind::Namespace,
+    ///     GlobalScope::DeclareGlobal)` candidate (a real workspace
+    ///     augmentation of the global namespace, never an ordinary script-
+    ///     top-level re-declaration of a value/interface with the same
+    ///     name) -- every other standard-global collision (`console`/
+    ///     `Array`/`BigInt`/`Navigator`, all `Variable`/`Interface`-kind
+    ///     shims, never `DeclareGlobal` namespaces) still stays `Absent`
+    ///     unconditionally.
+    /// 2a. **Never guess when the package-scope tie-break itself is
+    ///     inconclusive**: the pre-D.5 fallback for zero or more-than-one
+    ///     same-scope candidates was "first declaring path in `BTreeMap`
+    ///     order" -- itself a guess, the SAME kind correction 2 exists to
+    ///     rule out (just for a DIFFERENT tie-break input: a referencing
+    ///     file with NO package match at all, or one that matches MULTIPLE
+    ///     candidates' packages). Both now degrade to `Ambiguous` instead
+    ///     -- `Unique` is returned ONLY for the exactly-one-same-scope
+    ///     case.
+    pub fn resolve_global(&self, name: &str, referencing_path: &str) -> GlobalLookup {
+        let Some(candidates) = self.globals.get(name) else {
+            return GlobalLookup::Absent;
+        };
+        if candidates.is_empty() {
+            return GlobalLookup::Absent;
+        }
+        let is_declare_global_namespace_augmentation = candidates.iter().any(|(_, declaration)| {
+            declaration.kind == EntityKind::Namespace
+                && declaration.scope == GlobalScope::DeclareGlobal
+        });
+        if is_standard_global_name(name) && !is_declare_global_namespace_augmentation {
+            return GlobalLookup::Absent;
+        }
+        let unique_ids: BTreeSet<&str> = candidates
+            .iter()
+            .map(|(_, declaration)| declaration.entity_id.as_str())
+            .collect();
+        if let [only] = unique_ids.iter().copied().collect::<Vec<_>>().as_slice() {
+            // Every candidate mapping to this SAME `entity_id` necessarily
+            // shares the SAME declaring path too (the id is derived FROM
+            // the path) -- `candidates[0]`'s own path is as good as any.
+            return GlobalLookup::Unique {
+                entity_id: (*only).to_owned(),
+                declaring_path: candidates[0].0.clone(),
+            };
+        }
+        if candidates
+            .iter()
+            .all(|(_, declaration)| declaration.kind == EntityKind::Namespace)
+        {
+            let referencing_scope = workspace_scope_prefix(referencing_path);
+            let same_scope: Vec<&(String, AmbientGlobalDeclaration)> = candidates
+                .iter()
+                .filter(|(path, _)| workspace_scope_prefix(path) == referencing_scope)
+                .collect();
+            return match same_scope.as_slice() {
+                [only] => GlobalLookup::Unique {
+                    entity_id: only.1.entity_id.clone(),
+                    declaring_path: only.0.clone(),
+                },
+                // D.5: zero same-scope candidates (the referencing file
+                // matches none of them) or more than one (the tie-break
+                // itself cannot distinguish them) both stay `Ambiguous` --
+                // never a guess, not even "first in `BTreeMap` order".
+                _ => GlobalLookup::Ambiguous,
+            };
+        }
+        GlobalLookup::Ambiguous
+    }
+
+    /// D.3 (2026-09-05, references-parity task): resolve `member_name` as a
+    /// DIRECT `export` of `namespace_entity_id`'s own block -- the single-
+    /// segment lookup `resolve_qualified_namespace_path` (`semantic_
+    /// sites.rs`) chains once per `A.B`/`A.B.C` segment, descending into
+    /// the resolved member when it is ITSELF a namespace and there are
+    /// more segments left. `Unique` only when EXACTLY ONE `NamespaceMember`
+    /// fact named this pair (never happens twice for the SAME declaring
+    /// namespace id in practice -- a namespace body cannot legally export
+    /// the same name twice -- but checked via a `BTreeSet` of distinct ids
+    /// for robustness, same pattern `resolve_global` uses). `Absent` covers
+    /// both "no member with this name at all" and "`namespace_entity_id`
+    /// itself is not a namespace this index ever saw a body for" (e.g. an
+    /// ambient string-literal module, or a namespace declared only via the
+    /// bodyless nested-desugared form) -- both stay `checker_pending`,
+    /// never a guess either way.
+    pub fn resolve_namespace_member_by_name(
+        &self,
+        namespace_entity_id: &str,
+        member_name: &str,
+    ) -> NamespaceMemberLookup {
+        let key = (namespace_entity_id.to_owned(), member_name.to_owned());
+        let Some(candidates) = self.namespace_members.get(&key) else {
+            return NamespaceMemberLookup::Absent;
+        };
+        let unique_ids: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
+        match unique_ids.len() {
+            0 => NamespaceMemberLookup::Absent,
+            1 => NamespaceMemberLookup::Unique(candidates[0].clone()),
+            _ => NamespaceMemberLookup::Ambiguous,
+        }
+    }
+}
+
+/// Outcome of [`AmbientModuleIndex::resolve_namespace_member_by_name`] --
+/// see that method's own doc comment for the exact rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceMemberLookup {
+    Unique(String),
+    Ambiguous,
+    Absent,
+}
+
+/// D.1 correction 2 (see `resolve_global`'s own doc comment): the
+/// "workspace package" a path belongs to, approximated purely from its own
+/// text (no `WorkspaceResolver::packages` lookup -- `AmbientModuleIndex`
+/// only ever sees `SyntaxFileResult`s, never the resolver) as `packages/
+/// <name>` (or `packages/@scope/name` for an npm-scoped directory name,
+/// e.g. `packages/@n8n/json-schema-to-zod`), matching this monorepo's own
+/// pnpm-workspace.yaml convention (`packages/*`); any path NOT starting
+/// with `packages/` returns just its own first segment (e.g. `.github` for
+/// `.github/actions/x.mjs`), so a root-level script and a package source
+/// file are never considered "same scope" purely by both lacking a real
+/// package prefix (a `packages/x` scope always differs from a bare `y`
+/// scope by construction). A best-effort proximity signal, not a real
+/// tsconfig-project boundary -- used ONLY to break a tie among several
+/// REAL declaring candidates, never to manufacture a resolution that would
+/// not otherwise exist.
+fn workspace_scope_prefix(path: &str) -> &str {
+    let mut segments = path.split('/');
+    let Some(first) = segments.next() else {
+        return path;
+    };
+    if first != "packages" {
+        return first;
+    }
+    let Some(second) = segments.next() else {
+        return first;
+    };
+    let boundary = if second.starts_with('@') {
+        match segments.next() {
+            Some(third) => first.len() + 1 + second.len() + 1 + third.len(),
+            None => first.len() + 1 + second.len(),
+        }
+    } else {
+        first.len() + 1 + second.len()
+    };
+    &path[..boundary.min(path.len())]
+}
+
+/// D.1 correction 1 (see `resolve_global`'s own doc comment): identifier
+/// names TypeScript's own bundled `lib.*.d.ts` declares by default in
+/// virtually every real tsconfig (the ECMAScript intrinsics every `lib`
+/// preset from `es5` up includes, plus the handful of DOM/Node globals
+/// actually seen colliding in the n8n corpus) -- deliberately NOT an
+/// attempt at exhaustively cataloging every DOM API TypeScript's `dom` lib
+/// preset provides (this crate has no access to the real `lib.*.d.ts` set
+/// a given tsconfig resolves to, so completeness is unreachable by
+/// construction); the goal is only to keep this list a safety VALVE, never
+/// a source of new wrong answers -- a name missing from this list simply
+/// falls through to the ordinary (already-existing, harmless-if-imprecise)
+/// candidate lookup below, same risk profile as every other name before
+/// this task's D.1 correction shipped.
+///
+/// D.5 (2026-09-05, adversarial review): this list is a CURATED snapshot,
+/// validated ONLY against the n8n corpus this campaign measured against
+/// (`refs-parity-diff-*.log`) -- it is not, and is not meant to be, a
+/// complete enumeration of every name any TypeScript `lib` preset could
+/// ever provide. To extend it for a DIFFERENT corpus: re-run `scripts/
+/// v4-references-parity-diff.mjs --classify-targets 1`, look for
+/// `v4_different_target` rows whose `v4_target` is a workspace `.d.ts`
+/// re-declaration of a name whose `v3_target` is a `lib.*.d.ts` path (the
+/// exact signature the six names below were all found through), and add
+/// the colliding name as a new literal in `NAMES` -- never remove an
+/// existing entry without first confirming its own collision no longer
+/// reproduces (a removed name silently re-opens the exact wrong-answer
+/// class `is_standard_global_name` exists to close). `resolve_global`'s
+/// own `is_declare_global_namespace_augmentation` check is the ONE
+/// deliberate, structural (not name-based) exception to this list, added
+/// by D.5's own fix -- it never needs extending here.
+fn is_standard_global_name(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        // ECMAScript intrinsics (es5 through es2022).
+        "Array",
+        "ArrayBuffer",
+        "BigInt",
+        "BigInt64Array",
+        "BigUint64Array",
+        "Boolean",
+        "DataView",
+        "Date",
+        "Error",
+        "EvalError",
+        "FinalizationRegistry",
+        "Float32Array",
+        "Float64Array",
+        "Function",
+        "Int8Array",
+        "Int16Array",
+        "Int32Array",
+        "Intl",
+        "JSON",
+        "Map",
+        "Math",
+        "Number",
+        "Object",
+        "Promise",
+        "Proxy",
+        "RangeError",
+        "ReferenceError",
+        "Reflect",
+        "RegExp",
+        "Set",
+        "SharedArrayBuffer",
+        "String",
+        "Symbol",
+        "SyntaxError",
+        "TypeError",
+        "Uint8Array",
+        "Uint8ClampedArray",
+        "Uint16Array",
+        "Uint32Array",
+        "URIError",
+        "WeakMap",
+        "WeakRef",
+        "WeakSet",
+        "globalThis",
+        // Node.js core globals.
+        "Buffer",
+        "process",
+        "require",
+        "module",
+        "exports",
+        "__dirname",
+        "__filename",
+        "global",
+        // DOM/browser globals seen colliding live in the n8n corpus (2026-
+        // 09-05), plus their closest well-known relatives.
+        "console",
+        "Navigator",
+        "navigator",
+        "Window",
+        "window",
+        "document",
+        "Document",
+        "fetch",
+        "Request",
+        "Response",
+        "Headers",
+        "URL",
+        "URLSearchParams",
+        "localStorage",
+        "sessionStorage",
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "performance",
+        "crypto",
+    ];
+    NAMES.contains(&name)
+}
+
+/// Outcome of [`AmbientModuleIndex::resolve_global`] -- see that method's
+/// own doc comment for the exact rule. `Unique::declaring_path` (D.5,
+/// 2026-09-05, adversarial review) is the ambient declaration's OWN file
+/// path, straight from the index entry -- lets a caller (`semantic_
+/// sites.rs`'s `resolve_ambient_global`) compute a real `cross_file` flag
+/// (`declaring_path != referencing_path`) instead of assuming cross-file
+/// unconditionally, which was wrong for the (rare but real) same-file case
+/// -- a `declare global {}` block referenced later in that SAME file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalLookup {
+    Unique {
+        entity_id: String,
+        declaring_path: String,
+    },
+    Ambiguous,
+    Absent,
 }
 
 /// TypeScript's ambient module wildcard match: `pattern` (containing
@@ -2132,6 +2530,8 @@ mod tests {
             export_bindings,
             export_star_specifiers,
             ambient_modules: Vec::new(),
+            ambient_globals: Vec::new(),
+            namespace_members: Vec::new(),
             line_index: crate::LineIndex::from_text(""),
         }
     }

@@ -470,6 +470,16 @@ const REASON_IMPORT_BINDING: &str = "import_binding";
 const REASON_MULTIPLE_DECLARATIONS: &str = "multiple_declarations";
 const REASON_UNSUPPORTED_DECLARATION_KIND: &str = "unsupported_declaration_kind";
 const REASON_MEMBER_ACCESS: &str = "member_access";
+/// D.3 (2026-09-05, references-parity task): sub-reasons for a qualified
+/// name segment (`A.B`/`A.B.C`, `TSQualifiedName`) `resolve_qualified_
+/// namespace_path` could not resolve with certainty -- `absent` covers an
+/// unresolvable root, a segment with no matching export, or a non-last
+/// segment that resolved but is not itself a namespace to descend into;
+/// `ambiguous` covers a segment matching more than one export (should not
+/// happen for valid TypeScript -- a namespace body cannot legally export
+/// the same name twice -- but never assumed).
+const REASON_MEMBER_ACCESS_QUALIFIED_ABSENT: &str = "member_access/qualified:absent";
+const REASON_MEMBER_ACCESS_QUALIFIED_AMBIGUOUS: &str = "member_access/qualified:ambiguous";
 
 /// 2026-09-05 A5 references-parity task, Paso 0 (diagnosis only): every
 /// `Pending` outcome an `IdentifierRef` site can carry stays entirely
@@ -516,6 +526,15 @@ fn import_binding_sub_reason(base: &'static str, sub: &'static str) -> &'static 
         _ => base,
     }
 }
+
+/// D.1 (2026-09-05, references-parity task): sub-reason for a `REASON_
+/// UNRESOLVED_GLOBAL` site that DID find a name in `AmbientModuleIndex::
+/// globals` but not with certainty (`resolver::GlobalLookup::Ambiguous`) --
+/// same `/`-suffix convention `import_binding_sub_reason` already
+/// establishes. The plain, unsuffixed `REASON_UNRESOLVED_GLOBAL` stays
+/// exactly as before this task for `GlobalLookup::Absent` (no declaring
+/// file at all).
+const REASON_UNRESOLVED_GLOBAL_AMBIGUOUS: &str = "unresolved_global/ambient:ambiguous";
 const REASON_THIS_EXPRESSION: &str = "this_expression";
 const REASON_CALL_DEFERRED: &str = "call_deferred_to_e3";
 const REASON_HERITAGE_DEFERRED: &str = "heritage_deferred_to_e3";
@@ -912,6 +931,33 @@ fn target_id_kind_is_one_of(target_id: &str, allowed: &[DeclKind]) -> bool {
     allowed.iter().any(|kind| kind.identity_name() == kind_name)
 }
 
+/// D.3 (2026-09-05, references-parity task): flattens a `TSTypeName` chain
+/// (`TSQualifiedName::left`, recursive by construction -- `A.B.C` parses as
+/// `QualifiedName{ left: QualifiedName{ left: Ident(A), right: B }, right:
+/// C }`) into its ROOT `IdentifierReference` plus the ordered segment NAMES
+/// from the root down to (but never including) the outermost `right`
+/// itself -- the caller appends that one separately, since it is the ONE
+/// segment `visit_ts_qualified_name` is actually resolving for THIS call
+/// (the walk visits each nesting level of a multi-segment chain
+/// separately, once per level, so `A.B.C`'s own `visit_ts_qualified_name`
+/// calls resolve `B` then `C` independently, each flattening only as far
+/// as ITS OWN `left`). `None` for a `this`-qualified name (`this.Foo`,
+/// legal but vanishingly rare in a qualified TYPE name -- no symbol table
+/// entry to resolve a root against, never a guess).
+fn flatten_qualified_name<'s, 'a>(
+    type_name: &'s TSTypeName<'a>,
+) -> Option<(&'s IdentifierReference<'a>, Vec<String>)> {
+    match type_name {
+        TSTypeName::IdentifierReference(ident) => Some((ident, Vec::new())),
+        TSTypeName::QualifiedName(inner) => {
+            let (root, mut segments) = flatten_qualified_name(&inner.left)?;
+            segments.push(inner.right.name.as_str().to_owned());
+            Some((root, segments))
+        }
+        TSTypeName::ThisExpression(_) => None,
+    }
+}
+
 struct ReferenceRow {
     start: u32,
     end: u32,
@@ -1126,6 +1172,15 @@ type HeritageClauseEntry = (u32, u32, Result<(String, String), &'static str>);
 enum ReferenceResolution {
     Resolved { target_id: String, cross_file: bool },
     Pending(&'static str),
+}
+
+/// D.3 (2026-09-05, references-parity task): `resolve_root_namespace`'s
+/// outcome -- see that method's own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootNamespaceLookup {
+    Unique(String),
+    Ambiguous,
+    Absent,
 }
 
 /// Ambient module resolution task (2026-09-04): `resolve_external_
@@ -2092,16 +2147,49 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         });
     }
 
+    /// D.1 (2026-09-05, references-parity task): what `resolve_identifier_
+    /// reference`'s two `REASON_UNRESOLVED_GLOBAL` degrade points now do
+    /// BEFORE giving up -- consult `AmbientModuleIndex::resolve_global`
+    /// (workspace-wide, built once by the caller from every file's own
+    /// `ambient_globals`) for `name`. `Unique` resolves with certainty --
+    /// `cross_file` (D.5, 2026-09-05, adversarial review: the pre-D.5
+    /// `true` unconditionally was wrong for a `declare global {}` block
+    /// referenced again LATER IN THAT SAME FILE) is the real comparison
+    /// against the declaration's own `declaring_path`, straight from the
+    /// index entry. `Ambiguous` degrades to the SAME `checker_pending`
+    /// disposition, just a more specific reason string for the histogram.
+    /// `Absent` is the exact unsuffixed `REASON_UNRESOLVED_GLOBAL` this
+    /// call site always returned before this task -- byte-identical
+    /// outcome for every name with no ambient global declaration anywhere
+    /// in the workspace.
+    fn resolve_ambient_global(&self, name: &str) -> ReferenceResolution {
+        match self.ctx.ambient_index.resolve_global(name, &self.path) {
+            resolver::GlobalLookup::Unique {
+                entity_id,
+                declaring_path,
+            } => ReferenceResolution::Resolved {
+                target_id: entity_id,
+                cross_file: declaring_path != self.path,
+            },
+            resolver::GlobalLookup::Ambiguous => {
+                ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL_AMBIGUOUS)
+            }
+            resolver::GlobalLookup::Absent => {
+                ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL)
+            }
+        }
+    }
+
     fn resolve_identifier_reference(&self, ident: &IdentifierReference<'a>) -> ReferenceResolution {
         if self.jsdoc_typed_file {
             return ReferenceResolution::Pending(REASON_JSDOC_TYPED_FILE);
         }
         let Some(reference_id) = ident.reference_id.get() else {
-            return ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL);
+            return self.resolve_ambient_global(&ident.name);
         };
         let reference = self.scoping.get_reference(reference_id);
         let Some(symbol_id) = reference.symbol_id() else {
-            return ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL);
+            return self.resolve_ambient_global(&ident.name);
         };
         let flags = self.scoping.symbol_flags(symbol_id);
         if flags.is_import() {
@@ -3127,7 +3215,110 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         // callee branch (rule (f)) already closes for a CALLED member
         // (`ns.fn(...)`); this reuses the identical mechanism for an
         // uncalled member read, never a new heuristic.
-        self.resolve_namespace_member(&expr.object, expr.property.name.as_str())
+        if let Some(target_id) =
+            self.resolve_namespace_member(&expr.object, expr.property.name.as_str())
+        {
+            return Some(target_id);
+        }
+        // D.5 (2026-09-05, adversarial review): `Ns.Member` in VALUE
+        // position where `Ns` is a LOCAL namespace or one imported BY
+        // NAME (as opposed to `import * as ns`/a namespace re-export,
+        // both already covered by `resolve_namespace_member` above) --
+        // D.3 wired this qualified-path resolver into `visit_ts_qualified_
+        // name` (TYPE position, `TSQualifiedName`) but never into this
+        // VALUE-position sibling, even though both shapes name the exact
+        // same kind of target and share the identical root-classification
+        // rule (`resolve_root_namespace`). A single-segment path (just
+        // `expr.property`'s own name) -- multi-level VALUE-position access
+        // (`A.B.C` as an expression) reaches here once per level through
+        // the SAME recursive `StaticMemberExpression` walk, each call
+        // seeing only its own outermost segment, mirroring `visit_ts_
+        // qualified_name`'s own one-level-per-call contract.
+        let Expression::Identifier(root) = &expr.object else {
+            return None;
+        };
+        let segment = expr.property.name.as_str().to_owned();
+        self.resolve_qualified_namespace_path(root, &[segment])
+    }
+
+    /// D.4 (2026-09-05, references-parity task, diagnosis only -- no
+    /// functional change, same pattern as A5 Paso 0 below): for a
+    /// `call_chain`-shaped `member_access` site (the receiver `object` is
+    /// itself a call/member/chain expression), which HOP `type_of_
+    /// expression(object)` bottoms out at: `root_untyped` (the innermost
+    /// receiver -- an identifier, or a callee that is neither a plain
+    /// identifier nor `<receiver>.<name>` -- never typed at all),
+    /// `receiver_not_entity` (the innermost receiver typed, but to a
+    /// union/promise/array/`this`-relative shape `as_entity` cannot reduce
+    /// to a single container), `member_unknown` (the receiver IS a single
+    /// entity, but the member/call name is not on its member table at
+    /// all), `return_unknown` (the member/call IS on the table, but ITS
+    /// OWN declared/inferred return type is what actually failed to
+    /// resolve -- the reason `type_of_expression` itself gives up one
+    /// level higher than this function inspects), `generic_erased` (a
+    /// computed/chain wrapper, or a call whose callee is neither a plain
+    /// identifier nor a member expression -- `ReturnType<typeof ..>`-
+    /// shaped or similar, this crate's own generic-erasure boundary). A
+    /// STRUCTURAL diagnostic built directly from the AST/typeflow index
+    /// (never a byte-for-byte re-trace of `type_of_expression`'s own full
+    /// recursive decision tree -- that function's real fixed-point/
+    /// `ThisType`/generic-erasure interactions are considerably richer),
+    /// used ONLY to produce the corpus-wide `call_chain/<hop>` histogram
+    /// this task's own D.4 needs to pick (or rule out) a top-1 fix
+    /// category -- never consulted by the actual resolution path, changes
+    /// nothing observable outside this crate's own debug dump/tests.
+    fn call_chain_hop_reason(&self, object: &Expression<'a>) -> &'static str {
+        let Some(index) = self.ctx.typeflow_index else {
+            return "member_access/call_chain/root_untyped";
+        };
+        let (receiver, member_name, is_call) = match object {
+            Expression::CallExpression(call) => match &call.callee {
+                Expression::Identifier(ident) => {
+                    // A bare call `f(...)`: the "receiver" IS `f` itself --
+                    // typed (a known function) or not.
+                    return if self
+                        .resolve_identifier_to_kind(ident, &[DeclKind::Function])
+                        .is_some()
+                    {
+                        "member_access/call_chain/return_unknown"
+                    } else {
+                        "member_access/call_chain/root_untyped"
+                    };
+                }
+                Expression::StaticMemberExpression(member) => {
+                    (&member.object, member.property.name.as_str(), true)
+                }
+                _ => return "member_access/call_chain/generic_erased",
+            },
+            Expression::StaticMemberExpression(member) => {
+                (&member.object, member.property.name.as_str(), false)
+            }
+            Expression::ComputedMemberExpression(_) | Expression::ChainExpression(_) => {
+                return "member_access/call_chain/generic_erased";
+            }
+            _ => return "member_access/call_chain/generic_erased",
+        };
+        let Some((value, _rule)) = self.type_of_expression(receiver) else {
+            return "member_access/call_chain/root_untyped";
+        };
+        let Some((entity_id, is_static)) = Self::as_entity(&value) else {
+            return "member_access/call_chain/receiver_not_entity";
+        };
+        let found = if is_call {
+            !matches!(
+                index.members(&entity_id, member_name, is_static),
+                urdira_jsts_typeflow::MemberLookup::None
+            )
+        } else {
+            index
+                .member_type_ref(&entity_id, member_name, is_static)
+                .is_some()
+        };
+        if found {
+            "member_access/call_chain/return_unknown"
+        } else {
+            "member_access/call_chain/member_unknown"
+        }
     }
 
     /// 2026-09-05 A5 references-parity task, Paso 0 (diagnosis only): the
@@ -3149,14 +3340,34 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             Expression::CallExpression(_)
             | Expression::StaticMemberExpression(_)
             | Expression::ComputedMemberExpression(_)
-            | Expression::ChainExpression(_) => "member_access/call_chain",
+            | Expression::ChainExpression(_) => self.call_chain_hop_reason(object),
             Expression::Identifier(ident) => {
                 let Some(reference_id) = ident.reference_id.get() else {
                     return "member_access/other";
                 };
                 let reference = self.scoping.get_reference(reference_id);
                 let Some(symbol_id) = reference.symbol_id() else {
-                    return "member_access/other";
+                    // D.5 (2026-09-05, adversarial review): an unresolved-
+                    // global root (no oxc scope binding at all) is exactly
+                    // the precondition `resolve_root_namespace`'s own
+                    // ambient-global fallback needs -- if THIS identifier,
+                    // treated as a qualified-name root, is genuinely
+                    // ambiguous there (two+ ambient globals of this name,
+                    // none a clean namespace-merge winner), surface the
+                    // SAME `qualified:ambiguous` sub-reason `resolve_
+                    // qualified_name_segment`'s own `TSQualifiedName` path
+                    // uses, instead of the generic `other` -- diagnostic
+                    // precision only, `resolve_static_member_reference`'s
+                    // own `resolve_qualified_namespace_path` attempt
+                    // already failed by the time this runs either way.
+                    return if matches!(
+                        self.resolve_root_namespace(ident),
+                        RootNamespaceLookup::Ambiguous
+                    ) {
+                        REASON_MEMBER_ACCESS_QUALIFIED_AMBIGUOUS
+                    } else {
+                        "member_access/other"
+                    };
                 };
                 // 3a: an import-bound symbol is keyed into `_ref` and
                 // `_call` TOGETHER at every population site -- either one
@@ -3370,7 +3581,23 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         };
         let reference = self.scoping.get_reference(reference_id);
         let Some(symbol_id) = reference.symbol_id() else {
-            return "unresolved_global";
+            // D.1 (2026-09-05, references-parity task): same ambient-global
+            // consultation `resolve_ambient_global` performs for the actual
+            // resolution, so this DIAGNOSTIC classifier (member_access's
+            // own receiver-shape histogram, `member_access_sub_reason`)
+            // never keeps calling a now-resolvable receiver "unresolved" --
+            // `resolve_identifier_reference` itself already resolves these,
+            // this call site only decides how the (rarer) surrounding
+            // member-access site is CLASSIFIED for the histogram.
+            return match self
+                .ctx
+                .ambient_index
+                .resolve_global(ident.name.as_str(), &self.path)
+            {
+                resolver::GlobalLookup::Unique { .. } => "unresolved_global_ambient_resolved",
+                resolver::GlobalLookup::Ambiguous => "unresolved_global_ambient_ambiguous",
+                resolver::GlobalLookup::Absent => "unresolved_global",
+            };
         };
         let flags = self.scoping.symbol_flags(symbol_id);
         if flags.is_import() {
@@ -3970,6 +4197,189 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             pending_sites,
             sites_digest,
             jsdoc_typed_file: self.jsdoc_typed_file,
+        }
+    }
+    /// D.3: what `visit_ts_qualified_name` resolves `name.right` to, or the
+    /// specific pending reason to fall back to. `jsdoc_typed_file` is
+    /// checked first, matching every other hand-rolled resolution in this
+    /// file. A `this`-qualified root (`flatten_qualified_name` returning
+    /// `None`) stays the plain, unsuffixed `REASON_MEMBER_ACCESS` --
+    /// exactly what this call site emitted unconditionally before this
+    /// task, for the one shape this mechanism was never going to reach
+    /// anyway.
+    fn resolve_qualified_name_segment(&self, name: &TSQualifiedName<'a>) -> ReferenceResolution {
+        if self.jsdoc_typed_file {
+            return ReferenceResolution::Pending(REASON_JSDOC_TYPED_FILE);
+        }
+        let Some((root, mut segments)) = flatten_qualified_name(&name.left) else {
+            return ReferenceResolution::Pending(
+                self.identifier_pending_reason(REASON_MEMBER_ACCESS),
+            );
+        };
+        segments.push(name.right.name.as_str().to_owned());
+        match self.resolve_qualified_namespace_path(root, &segments) {
+            Some(target_id) => ReferenceResolution::Resolved {
+                target_id,
+                // Same simplification `resolve_ambient_global` already
+                // makes (see that function's own doc comment) rather than
+                // compare `self.path` against the resolved member's own
+                // declaring path.
+                cross_file: true,
+            },
+            None => ReferenceResolution::Pending(self.qualified_name_pending_reason(root)),
+        }
+    }
+
+    /// D.3: `REASON_MEMBER_ACCESS_QUALIFIED_AMBIGUOUS` when re-resolving
+    /// JUST the root (ignoring every segment) would itself report
+    /// `Ambiguous` some segment along the chain (an approximation -- the
+    /// AMBIGUITY could equally be a later segment's, never a full re-trace
+    /// here -- but distinguishing exactly WHICH hop failed is diagnostic-
+    /// only value this task's own numeric criteria do not require);
+    /// `REASON_MEMBER_ACCESS_QUALIFIED_ABSENT` otherwise. Gated on
+    /// `jsdoc_typed_file` the same way every other reason constant already
+    /// is (`identifier_pending_reason`).
+    fn qualified_name_pending_reason(&self, root: &IdentifierReference<'a>) -> &'static str {
+        let reason = if matches!(
+            self.resolve_root_namespace(root),
+            RootNamespaceLookup::Ambiguous
+        ) {
+            REASON_MEMBER_ACCESS_QUALIFIED_AMBIGUOUS
+        } else {
+            REASON_MEMBER_ACCESS_QUALIFIED_ABSENT
+        };
+        self.identifier_pending_reason(reason)
+    }
+
+    /// D.3: resolve `root` (the LEFTMOST identifier of a qualified name
+    /// chain) to a namespace entity id, then descend through `segments` in
+    /// order via `NamespaceMember` facts (`resolver::AmbientModuleIndex::
+    /// resolve_namespace_member_by_name`), requiring every NON-LAST segment
+    /// to ITSELF resolve to a namespace (to keep descending) -- the LAST
+    /// segment's own resolved member id (of ANY kind) is the final answer.
+    /// `None` at any hop -- root unresolved/ambiguous, a segment absent/
+    /// ambiguous, or a non-last segment resolving to something that is not
+    /// itself a namespace -- never a guess.
+    fn resolve_qualified_namespace_path(
+        &self,
+        root: &IdentifierReference<'a>,
+        segments: &[String],
+    ) -> Option<String> {
+        let RootNamespaceLookup::Unique(mut current_namespace_id) =
+            self.resolve_root_namespace(root)
+        else {
+            return None;
+        };
+        let last_index = segments.len().checked_sub(1)?;
+        for (index, segment) in segments.iter().enumerate() {
+            let is_last = index == last_index;
+            match self
+                .ctx
+                .ambient_index
+                .resolve_namespace_member_by_name(&current_namespace_id, segment)
+            {
+                resolver::NamespaceMemberLookup::Unique(member_id) => {
+                    if is_last {
+                        return Some(member_id);
+                    }
+                    if !target_id_kind_is_one_of(&member_id, &[DeclKind::Namespace]) {
+                        return None;
+                    }
+                    current_namespace_id = member_id;
+                }
+                resolver::NamespaceMemberLookup::Ambiguous
+                | resolver::NamespaceMemberLookup::Absent => return None,
+            }
+        }
+        None
+    }
+
+    /// D.3: the ROOT identifier of a qualified-name chain, classified as a
+    /// namespace: a SAME-FILE local namespace or a named-import binding
+    /// resolving to one (`resolve_identifier_to_kind`, already covers
+    /// both, `UniqueOrAmbiguous` policy -- consistent with `resolve_call_
+    /// target`'s own use of the same function for a heritage/call target),
+    /// falling back to an AMBIENT GLOBAL namespace (D.1, `jest`/
+    /// `globalThis`-shaped) when the identifier has no oxc scope binding at
+    /// all. `Ambiguous` is surfaced separately from `Absent` ONLY for the
+    /// ambient-global fallback (the only one of the two `resolve_
+    /// identifier_to_kind`/`resolve_global` this function calls that
+    /// itself distinguishes the two -- `resolve_identifier_to_kind`
+    /// collapses everything doubtful to `None`).
+    fn resolve_root_namespace(&self, root: &IdentifierReference<'a>) -> RootNamespaceLookup {
+        if let Some(target_id) = self.resolve_identifier_to_kind(root, &[DeclKind::Namespace]) {
+            return RootNamespaceLookup::Unique(target_id);
+        }
+        if root.reference_id.get().is_some() {
+            let reference = self
+                .scoping
+                .get_reference(root.reference_id.get().expect("checked"));
+            if reference.symbol_id().is_some() {
+                // A bound (non-global) symbol that `resolve_identifier_to_
+                // kind` already tried and failed to classify as a
+                // namespace -- never an ambient global (those are, by
+                // definition, names with NO scope binding at all).
+                return RootNamespaceLookup::Absent;
+            }
+        }
+        match self
+            .ctx
+            .ambient_index
+            .resolve_global(&root.name, &self.path)
+        {
+            resolver::GlobalLookup::Unique { entity_id, .. }
+                if target_id_kind_is_one_of(&entity_id, &[DeclKind::Namespace]) =>
+            {
+                RootNamespaceLookup::Unique(entity_id)
+            }
+            resolver::GlobalLookup::Ambiguous => RootNamespaceLookup::Ambiguous,
+            _ => RootNamespaceLookup::Absent,
+        }
+    }
+
+    /// D.3: shared emission for a resolved-or-pending qualified-name
+    /// segment -- mirrors `visit_identifier_reference`'s own `Resolved`/
+    /// `Pending` handling, minus the parameter/catch-binding "referenced-
+    /// only" bookkeeping (a namespace member's own target id is never one
+    /// of those two kinds).
+    fn finish_qualified_name_segment(
+        &mut self,
+        start: u32,
+        end: u32,
+        resolution: ReferenceResolution,
+    ) {
+        match resolution {
+            ReferenceResolution::Resolved {
+                target_id,
+                cross_file,
+            } => {
+                self.push_site(
+                    SiteKind::IdentifierRef,
+                    start,
+                    end,
+                    SiteDisposition::RustResolved,
+                    None,
+                );
+                let source_id = self.current_owner();
+                if source_id != target_id {
+                    self.reference_rows.push(ReferenceRow {
+                        start,
+                        end,
+                        source_id,
+                        target_id,
+                        cross_file,
+                    });
+                }
+            }
+            ReferenceResolution::Pending(reason) => {
+                self.push_site(
+                    SiteKind::IdentifierRef,
+                    start,
+                    end,
+                    SiteDisposition::CheckerPending,
+                    Some(reason),
+                );
+            }
         }
     }
 }
@@ -4925,14 +5335,19 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         walk_static_member_expression(self, expr);
     }
 
+    /// D.3 (2026-09-05, references-parity task): before this task, EVERY
+    /// `TSQualifiedName` segment (`A.B`/`A.B.C`, e.g. `jest.Mocked<T>`/
+    /// `ListQuery.Options['filter']`) stayed unconditionally `checker_
+    /// pending` -- oxc gives `right` (the segment span this call resolves)
+    /// no `IdentifierReference`/symbol at all, so nothing in the ordinary
+    /// scope-based machinery could ever touch it. `resolve_qualified_
+    /// namespace_path` closes the case where `left` names a KNOWN
+    /// namespace (local, imported by name, or an ambient global -- D.1)
+    /// and `right` is one of that namespace's own directly-`export`ed
+    /// members (D.3's own `NamespaceMember` facts).
     fn visit_ts_qualified_name(&mut self, name: &TSQualifiedName<'a>) {
-        self.push_site(
-            SiteKind::IdentifierRef,
-            name.right.span.start,
-            name.right.span.end,
-            SiteDisposition::CheckerPending,
-            Some(self.identifier_pending_reason(REASON_MEMBER_ACCESS)),
-        );
+        let resolution = self.resolve_qualified_name_segment(name);
+        self.finish_qualified_name_segment(name.right.span.start, name.right.span.end, resolution);
         walk_ts_qualified_name(self, name);
     }
 
@@ -7474,6 +7889,7 @@ mod tests {
                     crate::EntityKind::Function => "function",
                     crate::EntityKind::Class => "class",
                     crate::EntityKind::Variable => "variable",
+                    crate::EntityKind::Namespace => "namespace",
                     other => panic!("unhandled entity kind in test helper: {other:?}"),
                 }
             ),
@@ -7508,6 +7924,8 @@ mod tests {
             export_bindings,
             export_star_specifiers: Vec::new(),
             ambient_modules: Vec::new(),
+            ambient_globals: Vec::new(),
+            namespace_members: Vec::new(),
             line_index: crate::LineIndex::from_text(""),
         }
     }
@@ -7521,6 +7939,65 @@ mod tests {
         let mut result = target_file(path, Vec::new(), Vec::new());
         result.ambient_modules = ambient_modules;
         result
+    }
+
+    /// D.1 (2026-09-05, references-parity task): same as `target_file`
+    /// above, with an explicit `ambient_globals` list.
+    fn target_file_with_globals(
+        path: &str,
+        ambient_globals: Vec<crate::AmbientGlobalDeclaration>,
+    ) -> crate::SyntaxFileResult {
+        let mut result = target_file(path, Vec::new(), Vec::new());
+        result.ambient_globals = ambient_globals;
+        result
+    }
+
+    fn ambient_global(
+        kind: crate::EntityKind,
+        path: &str,
+        start: u32,
+        name: &str,
+        scope: crate::GlobalScope,
+    ) -> crate::AmbientGlobalDeclaration {
+        let kind_word = match kind {
+            crate::EntityKind::Namespace => "namespace",
+            crate::EntityKind::Interface => "interface",
+            crate::EntityKind::Type => "type",
+            crate::EntityKind::Variable => "variable",
+            crate::EntityKind::Function => "function",
+            crate::EntityKind::Class => "class",
+            crate::EntityKind::Enum => "enum",
+            other => panic!("unhandled entity kind in test helper: {other:?}"),
+        };
+        crate::AmbientGlobalDeclaration {
+            name: name.to_owned(),
+            entity_id: format!("jsts:{kind_word}:{path}:{start}:{name}"),
+            kind,
+            scope,
+        }
+    }
+
+    /// D.3 (2026-09-05, references-parity task): same as `target_file`
+    /// above, with an explicit `namespace_members` list.
+    fn target_file_with_namespace_members(
+        path: &str,
+        namespace_members: Vec<crate::NamespaceMember>,
+    ) -> crate::SyntaxFileResult {
+        let mut result = target_file(path, Vec::new(), Vec::new());
+        result.namespace_members = namespace_members;
+        result
+    }
+
+    fn namespace_member(
+        namespace_entity_id: &str,
+        name: &str,
+        member_entity_id: &str,
+    ) -> crate::NamespaceMember {
+        crate::NamespaceMember {
+            namespace_entity_id: namespace_entity_id.to_owned(),
+            name: name.to_owned(),
+            member_entity_id: member_entity_id.to_owned(),
+        }
     }
 
     /// Build a `HybridResolutionContext` over a single available path
@@ -7841,6 +8318,508 @@ mod tests {
                 .iter()
                 .any(|record| record.identity_key == target_id),
             "expected an external_symbol entity row for {target_id}"
+        );
+    }
+
+    // -- D.1 (2026-09-05, references-parity task): ambient globals -----
+
+    /// A script `.d.ts` file (no top-level `import`/`export`) declaring
+    /// `namespace jest {}` at its own top level: a consumer referencing
+    /// `jest` in TYPE position (`jest.Mock`, a `TSQualifiedName` whose root
+    /// reaches `resolve_identifier_reference` through the default
+    /// `visit_ts_type_name` walk, same as an ordinary value reference) now
+    /// resolves to the namespace declaration instead of staying
+    /// `REASON_UNRESOLVED_GLOBAL` forever. Regression fixture for the 193
+    /// n8n `unresolved_global x namespace` rows this closes (`jest.Mocked<T>`/
+    /// `jest.Mock`, `docs/evidence/2026-09-05-v4-frentes-1-2-3-4-reopen-
+    /// references-analyze-residual.md` §10.7).
+    #[test]
+    fn script_top_level_namespace_resolves_a_qualified_type_reference_from_another_file() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "let m: jest.Mock;\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:namespace:jest.d.ts:10:jest";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+        let jest_start = source.find("jest").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != jest_start),
+            "the `jest` root of the qualified type name must not stay pending: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    /// A `declare global { var foo: number; }` block: `foo`, referenced
+    /// from ANOTHER file, resolves to the declaration inside the block --
+    /// no spurious `global`-named entity is ever created (the block's own
+    /// `TSModuleBlock` has no nameable identifier at all; only ITS
+    /// CHILDREN become ambient-global candidates, via `visit_ts_global_
+    /// declaration`'s flat, one-level scan).
+    #[test]
+    fn declare_global_block_member_resolves_from_another_file() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "globals.ts".to_owned(),
+            target_file_with_globals(
+                "globals.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Variable,
+                    "globals.ts",
+                    30,
+                    "foo",
+                    crate::GlobalScope::DeclareGlobal,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "function use() {\n  return foo + 1;\n}\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let target_id = "jsts:variable:globals.ts:30:foo";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+    }
+
+    /// D.5 (2026-09-05, adversarial review) regression fixture:
+    /// `resolve_ambient_global` used to hardcode `cross_file: true`
+    /// unconditionally -- wrong for a `declare global {}` block referenced
+    /// again LATER IN THAT SAME FILE. Observed indirectly through `core:
+    /// covers` derivation (`cross_file` is never serialized into the
+    /// reference row's own body -- `finish`'s own doc comment): a TEST-
+    /// CONTAINER owner (`is_test: true`, `test_container_owner_file`)
+    /// synthesizes a `core:covers` row ONLY for a `cross_file` reference
+    /// (`declare_global_block_member_resolves_from_another_file`'s own
+    /// cross-file case would, if it used a test-container owner); a same-
+    /// file `declare global` self-reference must synthesize NONE.
+    #[test]
+    fn declare_global_self_reference_in_the_declaring_test_file_is_not_cross_file() {
+        let mut declaring_file = test_container_owner_file("globals.ts");
+        declaring_file.ambient_globals = vec![ambient_global(
+            crate::EntityKind::Variable,
+            "globals.ts",
+            30,
+            "foo",
+            crate::GlobalScope::DeclareGlobal,
+        )];
+        let mut files = BTreeMap::new();
+        files.insert("globals.ts".to_owned(), declaring_file);
+        let ctx = helper_ctx(files);
+        let source = "function use() {\n  return foo + 1;\n}\n";
+        let semantics = analyze_owner_semantics_with_context("globals.ts", source, &ctx)
+            .expect("analysis succeeds");
+        let target_id = "jsts:variable:globals.ts:30:foo";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == target_id),
+            "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+        assert!(
+            covers(&semantics).is_empty(),
+            "a same-file ambient-global reference must not synthesize a core:covers row: {:?}",
+            covers(&semantics)
+        );
+    }
+
+    /// Two SCRIPT files each declaring `namespace jest {}` at their own top
+    /// level (a real, if unusual, cross-file declaration merge -- e.g. two
+    /// separate `.d.ts` files both augmenting the same ambient namespace),
+    /// neither sharing the referencing file's own package scope: stays
+    /// `Ambiguous` (D.5) -- see `resolve_global`'s own doc comment for why
+    /// a `BTreeMap`-path-order "first declaration" guess was wrong here.
+    #[test]
+    fn two_files_declaring_the_same_namespace_with_no_scope_match_stays_ambiguous() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a-jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "a-jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "a-jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        files.insert(
+            "z-jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "z-jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "z-jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        // D.5 (2026-09-05, adversarial review): neither top-level path
+        // shares a `packages/...` scope with the referencing file below,
+        // so ZERO candidates match its own package -- `resolve_global`
+        // used to fall back to "first declaring path in `BTreeMap` order"
+        // here (a guess), now correctly stays `Ambiguous` -- never a
+        // guess. See `two_namespace_packages_prefer_the_referencing_
+        // files_own_package` for the EXACTLY-ONE-in-scope case (`Unique`).
+        assert_eq!(
+            ctx.ambient_index.resolve_global("jest", "consumer.ts"),
+            resolver::GlobalLookup::Ambiguous,
+            "zero same-scope candidates must never guess (BTreeMap order or otherwise)"
+        );
+    }
+
+    /// D.5 (2026-09-05, adversarial review): companion to the test above
+    /// for the OTHER inconclusive case -- TWO candidates both share the
+    /// referencing file's OWN package scope (not zero, but still not
+    /// exactly one) -- also `Ambiguous`, never a guess at which of the two
+    /// same-package declarations to prefer.
+    #[test]
+    fn two_files_declaring_the_same_namespace_in_the_referencers_own_package_stays_ambiguous() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "packages/cli/src/a-jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/cli/src/a-jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "packages/cli/src/a-jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        files.insert(
+            "packages/cli/src/z-jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/cli/src/z-jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "packages/cli/src/z-jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global(
+                "jest",
+                "packages/cli/src/__tests__/active-executions.test.ts"
+            ),
+            resolver::GlobalLookup::Ambiguous,
+            "two same-package candidates must never guess which one wins"
+        );
+    }
+
+    /// D.1 correction 2 (2026-09-05, found live against the n8n corpus):
+    /// two DIFFERENT workspace packages each declare `namespace jest {}`
+    /// (`packages/cli/src/jest.d.ts`, `packages/@n8n/json-schema-to-zod/
+    /// test/jest.d.ts`) -- a referencing file resolves to the declaration
+    /// in ITS OWN package, never the other one, even though `@n8n` sorts
+    /// before `cli` in `BTreeMap` order (the naive rule this corrects).
+    /// Regression fixture for 169 n8n `packages/cli/**` sites that resolved
+    /// to the wrong package's `jest` namespace before this fix.
+    #[test]
+    fn two_namespace_packages_prefer_the_referencing_files_own_package() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "packages/@n8n/json-schema-to-zod/test/jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/@n8n/json-schema-to-zod/test/jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "packages/@n8n/json-schema-to-zod/test/jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        files.insert(
+            "packages/cli/src/jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/cli/src/jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "packages/cli/src/jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global(
+                "jest",
+                "packages/cli/src/__tests__/active-executions.test.ts"
+            ),
+            resolver::GlobalLookup::Unique {
+                entity_id: "jsts:namespace:packages/cli/src/jest.d.ts:10:jest".to_owned(),
+                declaring_path: "packages/cli/src/jest.d.ts".to_owned(),
+            },
+            "expected the referencing file's OWN package (packages/cli) to win over BTreeMap order"
+        );
+        assert_eq!(
+            ctx.ambient_index
+                .resolve_global("jest", "packages/@n8n/json-schema-to-zod/test/some.test.ts"),
+            resolver::GlobalLookup::Unique {
+                entity_id: "jsts:namespace:packages/@n8n/json-schema-to-zod/test/jest.d.ts:10:jest"
+                    .to_owned(),
+                declaring_path: "packages/@n8n/json-schema-to-zod/test/jest.d.ts".to_owned(),
+            },
+            "expected the OTHER package's own referencing file to resolve to ITS OWN jest.d.ts"
+        );
+    }
+
+    /// D.1 correction 1 (2026-09-05, found live against the n8n corpus):
+    /// a workspace `.d.ts` re-declaring a well-known standard global
+    /// (`console`, here) never wins -- `resolve_global` stays `Absent`
+    /// regardless of how many workspace files declare it, matching v3's
+    /// real answer (TypeScript's own bundled `lib.*.d.ts`, invisible to
+    /// this crate). Regression fixture for 6,856 n8n sites (`Array`/
+    /// `console`/`BigInt`/`Navigator`) that resolved to a workspace shim
+    /// instead of staying pending before this fix.
+    #[test]
+    fn standard_global_names_never_resolve_through_the_ambient_index() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "packages/frontend/editor-ui/src/worker/globals.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/frontend/editor-ui/src/worker/globals.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Variable,
+                    "packages/frontend/editor-ui/src/worker/globals.d.ts",
+                    30,
+                    "console",
+                    crate::GlobalScope::DeclareGlobal,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global("console", "a.ts"),
+            resolver::GlobalLookup::Absent
+        );
+    }
+
+    /// D.5 (2026-09-05, adversarial review) regression fixture: unlike
+    /// `console` above (a `Variable`-kind shim, correctly denylisted),
+    /// `declare global { namespace globalThis { ... } }` is a genuine
+    /// workspace augmentation of the REAL global namespace -- the exact
+    /// corpus sample (`expression-runtime/src/runtime/index.ts`) named in
+    /// `SyntaxFileResult::ambient_globals`'s own doc comment as one of the
+    /// two cases motivating D.1. `globalThis.X` must resolve to it, not
+    /// stay `Absent` the way the plain denylist check would have left it.
+    #[test]
+    fn declare_global_namespace_augmentation_of_global_this_resolves() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "expression-runtime/src/runtime/index.ts".to_owned(),
+            target_file_with_globals(
+                "expression-runtime/src/runtime/index.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "expression-runtime/src/runtime/index.ts",
+                    30,
+                    "globalThis",
+                    crate::GlobalScope::DeclareGlobal,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global("globalThis", "a.ts"),
+            resolver::GlobalLookup::Unique {
+                entity_id: "jsts:namespace:expression-runtime/src/runtime/index.ts:30:globalThis"
+                    .to_owned(),
+                declaring_path: "expression-runtime/src/runtime/index.ts".to_owned(),
+            }
+        );
+    }
+
+    // The companion case -- the SAME `namespace jest {}` declared at a
+    // file's top level, but that file ALSO has `export {}` (module syntax)
+    // -- exercises `parse_source`'s own post-walk filter directly and
+    // lives in `lib.rs`'s own `mod tests`
+    // (`namespace_in_a_module_file_never_enters_the_ambient_global_index`),
+    // where `parse_source`/`DecodedSource` are actually visible; this
+    // module only sees the already-filtered `SyntaxFileResult` shape.
+
+    // -- D.3 (2026-09-05, references-parity task): qualified names -------
+
+    /// `namespace ListQuery { export interface Options {} }` + a SAME-FILE
+    /// reference `ListQuery.Options` (type position, `TSQualifiedName`):
+    /// the `Options` segment resolves to the interface, closing the exact
+    /// `member_access/bare` shape the plan's own evidence sample names
+    /// (`ListQuery.Options['filter']`, the indexed-access wrapper itself
+    /// irrelevant to reference resolution -- it has no identifier of its
+    /// own to resolve).
+    #[test]
+    fn qualified_name_resolves_a_direct_export_of_a_local_namespace() {
+        let source =
+            "namespace ListQuery {\n  export interface Options {}\n}\nlet x: ListQuery.Options;\n";
+        let namespace_start = source.find("ListQuery").unwrap() as u32;
+        let options_start = source.find("Options").unwrap() as u32;
+        let namespace_id = format!("jsts:namespace:a.ts:{namespace_start}:ListQuery");
+        let options_id = format!("jsts:interface:a.ts:{options_start}:Options");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            target_file_with_namespace_members(
+                "a.ts",
+                vec![namespace_member(&namespace_id, "Options", &options_id)],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == options_id),
+            "expected a reference row targeting {options_id}, got {rows:?}"
+        );
+        let usage_start = source.rfind("Options").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .all(|site| site.start_utf16 != usage_start),
+            "the ListQuery.Options usage must not stay pending: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    /// Two levels: `namespace ListQueryDb { export namespace Workflow {
+    /// export interface Plain {} } }` -- `ListQueryDb.Workflow.Plain`
+    /// descends through TWO `NamespaceMember` hops (`Workflow` itself is a
+    /// namespace-kind member of `ListQueryDb`, `Plain` an interface-kind
+    /// member of `Workflow`).
+    #[test]
+    fn qualified_name_resolves_two_levels_of_nested_namespace_members() {
+        let source = "namespace ListQueryDb {\n  export namespace Workflow {\n    export interface Plain {}\n  }\n}\nlet y: ListQueryDb.Workflow.Plain;\n";
+        let db_start = source.find("ListQueryDb").unwrap() as u32;
+        let workflow_start = source.find("Workflow").unwrap() as u32;
+        let plain_start = source.find("Plain").unwrap() as u32;
+        let db_id = format!("jsts:namespace:a.ts:{db_start}:ListQueryDb");
+        let workflow_id = format!("jsts:namespace:a.ts:{workflow_start}:Workflow");
+        let plain_id = format!("jsts:interface:a.ts:{plain_start}:Plain");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            target_file_with_namespace_members(
+                "a.ts",
+                vec![
+                    namespace_member(&db_id, "Workflow", &workflow_id),
+                    namespace_member(&workflow_id, "Plain", &plain_id),
+                ],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == plain_id),
+            "expected a reference row targeting {plain_id}, got {rows:?}"
+        );
+    }
+
+    /// A namespace imported BY NAME (`import { ListQuery } from "./lq"`,
+    /// not `import * as`) -- the root resolves through `resolve_
+    /// identifier_to_kind`'s own import-binding branch (already wired for
+    /// ANY `DeclKind`, F2b's own namespace export-binding work makes the
+    /// import chain itself resolve to a namespace target), then the SAME
+    /// `NamespaceMember` lookup as the local case.
+    #[test]
+    fn qualified_name_resolves_a_member_of_a_namespace_imported_by_name() {
+        let lq_source = "export namespace ListQuery {\n  export interface Options {}\n}\n";
+        let namespace_start = lq_source.find("ListQuery").unwrap() as u32;
+        let options_start = lq_source.find("Options").unwrap() as u32;
+        let namespace_id = format!("jsts:namespace:lq.ts:{namespace_start}:ListQuery");
+        let options_id = format!("jsts:interface:lq.ts:{options_start}:Options");
+        let mut files = BTreeMap::new();
+        files.insert("lq.ts".to_owned(), {
+            let mut file = target_file(
+                "lq.ts",
+                vec![target_entity(
+                    crate::EntityKind::Namespace,
+                    "lq.ts",
+                    namespace_start,
+                    "ListQuery",
+                )],
+                vec![export_binding("ListQuery", "ListQuery")],
+            );
+            file.namespace_members = vec![namespace_member(&namespace_id, "Options", &options_id)];
+            file
+        });
+        let ctx = helper_ctx(files);
+        let user_source = "import { ListQuery } from \"./lq\";\nlet x: ListQuery.Options;\n";
+        let semantics = analyze_owner_semantics_with_context("user.ts", user_source, &ctx)
+            .expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == options_id),
+            "expected a reference row targeting {options_id}, got {rows:?}"
+        );
+    }
+
+    /// D.5 (2026-09-05, adversarial review): `Ns.Member` in VALUE position
+    /// (a plain read, `StaticMemberExpression`, not the TYPE-position
+    /// `TSQualifiedName` D.3's own tests cover) where `Ns` is a LOCAL
+    /// namespace -- `resolve_static_member_reference` was never wired to
+    /// `resolve_qualified_namespace_path` at all, so this exact shape
+    /// stayed pending even after D.3 shipped.
+    #[test]
+    fn value_position_qualified_name_resolves_a_direct_export_of_a_local_namespace() {
+        let source = "namespace ListQuery {\n  export function getAll() {}\n}\nconst x = ListQuery.getAll;\n";
+        let namespace_start = source.find("ListQuery").unwrap() as u32;
+        let function_start = source.find("getAll").unwrap() as u32;
+        let namespace_id = format!("jsts:namespace:a.ts:{namespace_start}:ListQuery");
+        let function_id = format!("jsts:function:a.ts:{function_start}:getAll");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            target_file_with_namespace_members(
+                "a.ts",
+                vec![namespace_member(&namespace_id, "getAll", &function_id)],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == function_id),
+            "expected a reference row targeting {function_id}, got {rows:?}"
         );
     }
 
@@ -8539,6 +9518,85 @@ mod tests {
             ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
         };
         (ctx, index)
+    }
+
+    // -- D.4 (2026-09-05, references-parity task): call_chain hop diagnosis
+
+    /// `root_untyped`: the innermost receiver (`x`, an unannotated
+    /// parameter) never types at all.
+    #[test]
+    fn call_chain_hop_reason_classifies_an_untyped_root_receiver() {
+        let source = "function use(x) {\n  return x.method().value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let reasons: Vec<&str> = semantics
+            .pending_sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect();
+        assert!(
+            reasons.contains(&"member_access/call_chain/root_untyped"),
+            "reasons: {reasons:?}"
+        );
+    }
+
+    /// `member_unknown`: the receiver types to a known class, but the
+    /// called member is not on its table at all.
+    #[test]
+    fn call_chain_hop_reason_classifies_an_unknown_member_on_a_typed_receiver() {
+        let source = "class Foo {\n  bar(): Foo {\n    return this;\n  }\n}\nfunction use(): Foo {\n  return new Foo().missing().value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let reasons: Vec<&str> = semantics
+            .pending_sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect();
+        assert!(
+            reasons.contains(&"member_access/call_chain/member_unknown"),
+            "reasons: {reasons:?}"
+        );
+    }
+
+    /// `return_unknown`: the called member IS on the receiver's table, but
+    /// ITS OWN return type does not resolve (an unannotated, un-inferable
+    /// method body).
+    #[test]
+    fn call_chain_hop_reason_classifies_a_known_member_with_an_unresolved_return_type() {
+        let source = "class Foo {\n  bar() {\n    return Math.random();\n  }\n}\nfunction use(): Foo {\n  return new Foo().bar().value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let reasons: Vec<&str> = semantics
+            .pending_sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect();
+        assert!(
+            reasons.contains(&"member_access/call_chain/return_unknown"),
+            "reasons: {reasons:?}"
+        );
+    }
+
+    /// `generic_erased`: a computed-member wrapper (`arr[0]`) as the
+    /// receiver -- this crate's own generic/computed-access boundary.
+    #[test]
+    fn call_chain_hop_reason_classifies_a_computed_member_receiver_as_generic_erased() {
+        let source = "function use(arr) {\n  return arr[0].value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let reasons: Vec<&str> = semantics
+            .pending_sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect();
+        assert!(
+            reasons.contains(&"member_access/call_chain/generic_erased"),
+            "reasons: {reasons:?}"
+        );
     }
 
     #[test]

@@ -391,6 +391,19 @@ fn collect_needed_imports_for_summary<'s>(
     for variable in &summary.variables {
         collect_type_ref_import(&summary.path, &variable.type_ref, out);
     }
+    // D.2b (2026-09-05, references-parity task): `type X = ImportedFoo`
+    // (or `type X = { a: ImportedFoo }`, `type X = ImportedFoo[]`, ...) --
+    // `type_aliases` was added to `DeclSummary` by D.2 (typeflow's own
+    // `build_alias_targets`/`resolve_type_ref_chasing_aliases`) but this
+    // needed-imports scan never visited it, so an alias whose RHS names an
+    // import had no `import_targets` entry to resolve against and stayed
+    // pending forever regardless of D.2's own de-aliasing logic being
+    // otherwise correct -- found live against the n8n corpus
+    // (`ObservationLogReflectorMemory = BuiltObservationLogStore`,
+    // `packages/@n8n/agents/src/runtime/observation-log-reflector.ts`).
+    for alias in &summary.type_aliases {
+        collect_type_ref_import(&summary.path, &alias.target, out);
+    }
 }
 
 /// Byte-identical helper to `main.rs`'s own `collect_heritage_import` (see
@@ -624,6 +637,91 @@ mod tests {
                 urdira_jsts_typeflow::MemberLookup::One(_)
             ),
             "Foo.greet must resolve through the (re-pointed) extends chain, not silently drop it: {incremental_greet:?}"
+        );
+    }
+
+    /// D.2b (2026-09-05, references-parity task) regression fixture:
+    /// `export type Memory = Base` where `Base` is IMPORTED from another
+    /// file. Before this fix, `collect_needed_imports_for_summary` never
+    /// scanned `DeclSummary::type_aliases`, so `import_targets` never got
+    /// the `(alias.ts, "./iface", "Base")` triple `urdira_jsts_typeflow`'s
+    /// own `build_alias_targets` needs to de-alias `Memory` -- `Opts.
+    /// memory`'s own member type (used via `const { memory } = opts` at
+    /// the syntax-worker layer, out of this crate's own scope to exercise
+    /// directly) stayed unresolved forever regardless of D.2's de-aliasing
+    /// logic in `urdira-jsts-typeflow` being otherwise correct. Reduced to
+    /// 3 files from the real n8n sample that found this live
+    /// (`ObservationLogReflectorMemory = BuiltObservationLogStore`,
+    /// `packages/@n8n/agents/src/runtime/observation-log-reflector.ts`).
+    #[test]
+    fn imported_type_alias_target_is_reachable_through_the_needed_imports_scan() {
+        let dir = scratch_dir("typeflow-alias-import-closure");
+        let iface_blob = dir.join("iface.blob");
+        let alias_blob = dir.join("alias.blob");
+        let user_blob = dir.join("user.blob");
+        let text_iface = "export interface Base {\n  getActive(): number;\n}\n";
+        let text_alias = "import { Base } from './iface';\nexport type Memory = Base;\nexport interface Opts {\n  memory: Memory;\n}\n";
+        let text_user = "import { Opts } from './alias';\nexport function use(opts: Opts) {\n  const { memory } = opts;\n  return memory.getActive();\n}\n";
+
+        let sources = vec![
+            owner("iface.ts", &iface_blob, text_iface),
+            owner("alias.ts", &alias_blob, text_alias),
+            owner("user.ts", &user_blob, text_user),
+        ];
+
+        // `resolve_import_targets_for` needs REAL `export_bindings` (built
+        // by the real `SyntaxWorkerState::analyze`, the same production
+        // entry `v4/analyze.rs::run_scoped` calls) to close `Memory`'s own
+        // `import { Base } from './iface'` chain -- `TypeflowCache` alone
+        // (`DeclSummary`-only) never builds `export_bindings` itself, and
+        // an EMPTY `files` map (every other test in this module uses one,
+        // since none of them assert a cross-file import actually closing)
+        // would make `resolve_named_export` fail regardless of this fix.
+        let mut syntax_state = urdira_jsts_syntax_worker::SyntaxWorkerState::default();
+        let project_key = "typeflow-alias-import-closure".to_owned();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        syntax_state
+            .analyze(
+                "test:analyze".to_owned(),
+                "test:analyze".to_owned(),
+                project_key.clone(),
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
+                vec![
+                    "iface.ts".to_owned(),
+                    "alias.ts".to_owned(),
+                    "user.ts".to_owned(),
+                ],
+                sources.clone(),
+                Vec::new(),
+                urdira_worker_protocol::AuthoritativeChangeSet::Full,
+                urdira_jsts_syntax_worker::AnalysisBudgets {
+                    max_output_bytes: 64 * 1024 * 1024,
+                    max_files: 16,
+                    max_source_bytes: u32::MAX,
+                    enforce_output_bytes: false,
+                },
+                &cancelled,
+            )
+            .expect("syntax analyze succeeds");
+        let files = syntax_state
+            .project_files(&project_key)
+            .expect("project files present")
+            .clone();
+
+        let mut cache = TypeflowCache::build_full(&sources).expect("build_full succeeds");
+        assert_eq!(cache.summary_count(), 3);
+
+        let base_id = cache.summaries["iface.ts"].interfaces[0].entity_id.clone();
+        let opts_id = cache.summaries["alias.ts"].interfaces[0].entity_id.clone();
+
+        let resolver = WorkspaceResolver::build(&[]);
+        let available: BTreeSet<String> = files.keys().cloned().collect();
+        let index = cache.build_index(&resolver, &available, &files);
+        assert_eq!(
+            index.member_type_ref(&opts_id, "memory", false),
+            Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(base_id)),
+            "Opts.memory (aliased to an IMPORTED Base) must resolve through the needed-imports scan"
         );
     }
 }
