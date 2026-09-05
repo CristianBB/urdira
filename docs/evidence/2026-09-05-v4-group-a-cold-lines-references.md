@@ -131,8 +131,9 @@ Comparación con las rondas previas de la campaña (una corrida de referencia po
 | **final / ola 3 (`7c9eb6d`, mediana de 3)** | **25.000** | **26,95 s** | **6,22 GB** | **1,8 GB** |
 
 Las tres raíces (`records`/`dependency`/`graph`) son byte-idénticas en las 3 corridas de esta sesión:
-`records=sha256:d01ffa009f0b6104aaf5577f7964c9e49bec6d46e011929794c5bf2f55bae8fc` (idéntica a base-0 y
-al oráculo v3), `dependency=sha256:d76ff317ab6214ab78fb06bc3ec7a3fca3899417aa0ed8cdbc3090cdd8fbf987`,
+`records=sha256:d01ffa009f0b6104aaf5577f7964c9e49bec6d46e011929794c5bf2f55bae8fc` (idéntica a la de
+ola2-1 `06beecf`; NO a la de base-0 `sha256:f948974e…`, que cambió legítimamente en las olas 1 y 2 al
+añadirse referencias nuevas — A5/A5b — y que la paridad §6 valida contra el oráculo v3), `dependency=sha256:d76ff317ab6214ab78fb06bc3ec7a3fca3899417aa0ed8cdbc3090cdd8fbf987`,
 `graph=sha256:6023a587b9b0c0ca8ec6980db930cba4fc56085baf527cdd97ce4cdfaf48a951`; `metric` sigue en
 cero-hash. La lectura directa: A3b (kernel de body tipado) no cambia el contenido, solo la ruta interna
 de cómputo — coherente con el commit ("byte-identical... raíz de records sin cambio") y con que el
