@@ -815,7 +815,7 @@ fn run_one(
     }
 
     // The one-fetch-per-owner cache every pass below consumes.
-    let prev_rows_by_owner: HashMap<u32, Vec<urdira_structural_store::RecordView>> =
+    let mut prev_rows_by_owner: HashMap<u32, Vec<urdira_structural_store::RecordView>> =
         touched_owner_ordinals
             .iter()
             .map(|&ordinal| (ordinal, store_reader.by_owner(ordinal, prev_generation)))
@@ -964,8 +964,21 @@ fn run_one(
             // it and the row stays open, untouched, exactly as some
             // earlier generation wrote it (see `protected_external_
             // entity_ids`'s own doc comment).
-            Some(ordinal) => store_reader
-                .by_owner(ordinal, prev_generation)
+            //
+            // Q5 B.2: `prev_rows_by_owner` already fetched this exact
+            // owner's previous rows once, above, for the at-risk/deleted/
+            // zombie passes (`store_reader.by_owner(ordinal,
+            // prev_generation)` -- see that map's own doc comment); `remove`
+            // moves the entry out instead of hitting the store a 4th time
+            // for the same owner. `diff_one_owner` runs from the two
+            // sequential `for` loops below (affected owners, then deleted
+            // owners) -- never in parallel, there is no `rayon` in this
+            // file -- and diffs each touched owner ordinal exactly once,
+            // so the entry is always present here and is never removed
+            // twice.
+            Some(ordinal) => prev_rows_by_owner
+                .remove(&ordinal)
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|view| !protected_external_entities.contains(&view.record_id()))
                 .collect(),
