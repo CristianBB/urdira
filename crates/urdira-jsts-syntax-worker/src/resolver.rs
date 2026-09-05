@@ -1600,7 +1600,42 @@ impl AmbientModuleIndex {
     /// other kind mismatch (a `namespace X` merged with a `class X`, for
     /// instance, stays `Ambiguous`: no value declaration exists to prefer
     /// the way `resolve_direct_export`'s single-file version can).
-    pub fn resolve_global(&self, name: &str) -> GlobalLookup {
+    ///
+    /// Two corrections found live against the n8n corpus (2026-09-05,
+    /// `refs-parity-diff-d1-full.log`), both BEFORE the rule above ever
+    /// runs:
+    ///
+    /// 1. **Never shadow a standard ECMAScript/DOM/Node global**
+    ///    (`is_standard_global_name`): `console`/`Array`/`BigInt`/
+    ///    `Navigator` each ALSO had a workspace `.d.ts` re-declaration
+    ///    somewhere (an `interface Array { ... }` merge, a browser-worker
+    ///    type shim's own `declare global { var console: ...; }`) that has
+    ///    NOTHING to do with the REST of the corpus -- v3's real answer for
+    ///    every one of 6,856 sampled sites was TypeScript's own bundled
+    ///    `lib.*.d.ts` declaration, which this crate has zero visibility
+    ///    into (`files` never contains it). Guessing the workspace
+    ///    candidate instead produced 6,856 wrong `core:references` targets
+    ///    (`v4_different_target`, a HARD gate violation) -- staying
+    ///    `Absent` for these names is the "never guess" answer, exactly
+    ///    like every unresolved-scope identifier before this task.
+    /// 2. **Package-scope proximity for a genuine cross-file namespace
+    ///    merge** (`workspace_scope_prefix`): TWO separate workspace
+    ///    packages, `packages/cli/src/jest.d.ts` and `packages/@n8n/json-
+    ///    schema-to-zod/test/jest.d.ts`, both declare `namespace jest {}`
+    ///    -- each is scoped to ITS OWN package's own TypeScript program in
+    ///    reality (separate `tsconfig.json`s), never merged workspace-wide.
+    ///    The plain "first declaring path in `BTreeMap` order" rule always
+    ///    picked the `@n8n` one (`@` sorts before `c`), wrong for every
+    ///    one of 169 sampled `packages/cli/**` referencing sites. Before
+    ///    falling back to that rule, a same-scope candidate (the declaring
+    ///    path shares `referencing_path`'s OWN top-level package prefix)
+    ///    wins when there is EXACTLY ONE such candidate -- conservative:
+    ///    zero or more-than-one same-scope candidates fall through to the
+    ///    unchanged `BTreeMap`-order rule rather than guess further.
+    pub fn resolve_global(&self, name: &str, referencing_path: &str) -> GlobalLookup {
+        if is_standard_global_name(name) {
+            return GlobalLookup::Absent;
+        }
         let Some(candidates) = self.globals.get(name) else {
             return GlobalLookup::Absent;
         };
@@ -1618,10 +1653,151 @@ impl AmbientModuleIndex {
             .iter()
             .all(|(_, declaration)| declaration.kind == EntityKind::Namespace)
         {
+            let referencing_scope = workspace_scope_prefix(referencing_path);
+            let same_scope: Vec<&(String, AmbientGlobalDeclaration)> = candidates
+                .iter()
+                .filter(|(path, _)| workspace_scope_prefix(path) == referencing_scope)
+                .collect();
+            if let [only] = same_scope.as_slice() {
+                return GlobalLookup::Unique(only.1.entity_id.clone());
+            }
             return GlobalLookup::Unique(candidates[0].1.entity_id.clone());
         }
         GlobalLookup::Ambiguous
     }
+}
+
+/// D.1 correction 2 (see `resolve_global`'s own doc comment): the
+/// "workspace package" a path belongs to, approximated purely from its own
+/// text (no `WorkspaceResolver::packages` lookup -- `AmbientModuleIndex`
+/// only ever sees `SyntaxFileResult`s, never the resolver) as `packages/
+/// <name>` (or `packages/@scope/name` for an npm-scoped directory name,
+/// e.g. `packages/@n8n/json-schema-to-zod`), matching this monorepo's own
+/// pnpm-workspace.yaml convention (`packages/*`); any path NOT starting
+/// with `packages/` returns just its own first segment (e.g. `.github` for
+/// `.github/actions/x.mjs`), so a root-level script and a package source
+/// file are never considered "same scope" purely by both lacking a real
+/// package prefix (a `packages/x` scope always differs from a bare `y`
+/// scope by construction). A best-effort proximity signal, not a real
+/// tsconfig-project boundary -- used ONLY to break a tie among several
+/// REAL declaring candidates, never to manufacture a resolution that would
+/// not otherwise exist.
+fn workspace_scope_prefix(path: &str) -> &str {
+    let mut segments = path.split('/');
+    let Some(first) = segments.next() else {
+        return path;
+    };
+    if first != "packages" {
+        return first;
+    }
+    let Some(second) = segments.next() else {
+        return first;
+    };
+    let boundary = if second.starts_with('@') {
+        match segments.next() {
+            Some(third) => first.len() + 1 + second.len() + 1 + third.len(),
+            None => first.len() + 1 + second.len(),
+        }
+    } else {
+        first.len() + 1 + second.len()
+    };
+    &path[..boundary.min(path.len())]
+}
+
+/// D.1 correction 1 (see `resolve_global`'s own doc comment): identifier
+/// names TypeScript's own bundled `lib.*.d.ts` declares by default in
+/// virtually every real tsconfig (the ECMAScript intrinsics every `lib`
+/// preset from `es5` up includes, plus the handful of DOM/Node globals
+/// actually seen colliding in the n8n corpus) -- deliberately NOT an
+/// attempt at exhaustively cataloging every DOM API TypeScript's `dom` lib
+/// preset provides (this crate has no access to the real `lib.*.d.ts` set
+/// a given tsconfig resolves to, so completeness is unreachable by
+/// construction); the goal is only to keep this list a safety VALVE, never
+/// a source of new wrong answers -- a name missing from this list simply
+/// falls through to the ordinary (already-existing, harmless-if-imprecise)
+/// candidate lookup below, same risk profile as every other name before
+/// this task's D.1 correction shipped.
+fn is_standard_global_name(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        // ECMAScript intrinsics (es5 through es2022).
+        "Array",
+        "ArrayBuffer",
+        "BigInt",
+        "BigInt64Array",
+        "BigUint64Array",
+        "Boolean",
+        "DataView",
+        "Date",
+        "Error",
+        "EvalError",
+        "FinalizationRegistry",
+        "Float32Array",
+        "Float64Array",
+        "Function",
+        "Int8Array",
+        "Int16Array",
+        "Int32Array",
+        "Intl",
+        "JSON",
+        "Map",
+        "Math",
+        "Number",
+        "Object",
+        "Promise",
+        "Proxy",
+        "RangeError",
+        "ReferenceError",
+        "Reflect",
+        "RegExp",
+        "Set",
+        "SharedArrayBuffer",
+        "String",
+        "Symbol",
+        "SyntaxError",
+        "TypeError",
+        "Uint8Array",
+        "Uint8ClampedArray",
+        "Uint16Array",
+        "Uint32Array",
+        "URIError",
+        "WeakMap",
+        "WeakRef",
+        "WeakSet",
+        "globalThis",
+        // Node.js core globals.
+        "Buffer",
+        "process",
+        "require",
+        "module",
+        "exports",
+        "__dirname",
+        "__filename",
+        "global",
+        // DOM/browser globals seen colliding live in the n8n corpus (2026-
+        // 09-05), plus their closest well-known relatives.
+        "console",
+        "Navigator",
+        "navigator",
+        "Window",
+        "window",
+        "document",
+        "Document",
+        "fetch",
+        "Request",
+        "Response",
+        "Headers",
+        "URL",
+        "URLSearchParams",
+        "localStorage",
+        "sessionStorage",
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "performance",
+        "crypto",
+    ];
+    NAMES.contains(&name)
 }
 
 /// Outcome of [`AmbientModuleIndex::resolve_global`] -- see that method's

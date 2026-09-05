@@ -2116,7 +2116,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// returned before this task -- byte-identical outcome for every name
     /// with no ambient global declaration anywhere in the workspace.
     fn resolve_ambient_global(&self, name: &str) -> ReferenceResolution {
-        match self.ctx.ambient_index.resolve_global(name) {
+        match self.ctx.ambient_index.resolve_global(name, &self.path) {
             resolver::GlobalLookup::Unique(target_id) => ReferenceResolution::Resolved {
                 target_id,
                 cross_file: true,
@@ -3416,7 +3416,11 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // `resolve_identifier_reference` itself already resolves these,
             // this call site only decides how the (rarer) surrounding
             // member-access site is CLASSIFIED for the histogram.
-            return match self.ctx.ambient_index.resolve_global(ident.name.as_str()) {
+            return match self
+                .ctx
+                .ambient_index
+                .resolve_global(ident.name.as_str(), &self.path)
+            {
                 resolver::GlobalLookup::Unique(_) => "unresolved_global_ambient_resolved",
                 resolver::GlobalLookup::Ambiguous => "unresolved_global_ambient_ambiguous",
                 resolver::GlobalLookup::Absent => "unresolved_global",
@@ -8051,10 +8055,105 @@ mod tests {
             ),
         );
         let ctx = helper_ctx(files);
+        // Neither top-level path shares a `packages/...` scope with the
+        // referencing file below, so `resolve_global`'s package-scope
+        // proximity correction never distinguishes them here -- this
+        // exercises the FALLBACK rule (`BTreeMap` path order), unaffected
+        // by that correction. See `two_namespace_packages_prefer_the_
+        // referencing_files_own_package` for the proximity rule itself.
         assert_eq!(
-            ctx.ambient_index.resolve_global("jest"),
+            ctx.ambient_index.resolve_global("jest", "consumer.ts"),
             resolver::GlobalLookup::Unique("jsts:namespace:a-jest.d.ts:10:jest".to_owned()),
             "expected the FIRST declaring path (BTreeMap order) to win"
+        );
+    }
+
+    /// D.1 correction 2 (2026-09-05, found live against the n8n corpus):
+    /// two DIFFERENT workspace packages each declare `namespace jest {}`
+    /// (`packages/cli/src/jest.d.ts`, `packages/@n8n/json-schema-to-zod/
+    /// test/jest.d.ts`) -- a referencing file resolves to the declaration
+    /// in ITS OWN package, never the other one, even though `@n8n` sorts
+    /// before `cli` in `BTreeMap` order (the naive rule this corrects).
+    /// Regression fixture for 169 n8n `packages/cli/**` sites that resolved
+    /// to the wrong package's `jest` namespace before this fix.
+    #[test]
+    fn two_namespace_packages_prefer_the_referencing_files_own_package() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "packages/@n8n/json-schema-to-zod/test/jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/@n8n/json-schema-to-zod/test/jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "packages/@n8n/json-schema-to-zod/test/jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        files.insert(
+            "packages/cli/src/jest.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/cli/src/jest.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Namespace,
+                    "packages/cli/src/jest.d.ts",
+                    10,
+                    "jest",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global(
+                "jest",
+                "packages/cli/src/__tests__/active-executions.test.ts"
+            ),
+            resolver::GlobalLookup::Unique(
+                "jsts:namespace:packages/cli/src/jest.d.ts:10:jest".to_owned()
+            ),
+            "expected the referencing file's OWN package (packages/cli) to win over BTreeMap order"
+        );
+        assert_eq!(
+            ctx.ambient_index
+                .resolve_global("jest", "packages/@n8n/json-schema-to-zod/test/some.test.ts"),
+            resolver::GlobalLookup::Unique(
+                "jsts:namespace:packages/@n8n/json-schema-to-zod/test/jest.d.ts:10:jest".to_owned()
+            ),
+            "expected the OTHER package's own referencing file to resolve to ITS OWN jest.d.ts"
+        );
+    }
+
+    /// D.1 correction 1 (2026-09-05, found live against the n8n corpus):
+    /// a workspace `.d.ts` re-declaring a well-known standard global
+    /// (`console`, here) never wins -- `resolve_global` stays `Absent`
+    /// regardless of how many workspace files declare it, matching v3's
+    /// real answer (TypeScript's own bundled `lib.*.d.ts`, invisible to
+    /// this crate). Regression fixture for 6,856 n8n sites (`Array`/
+    /// `console`/`BigInt`/`Navigator`) that resolved to a workspace shim
+    /// instead of staying pending before this fix.
+    #[test]
+    fn standard_global_names_never_resolve_through_the_ambient_index() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "packages/frontend/editor-ui/src/worker/globals.d.ts".to_owned(),
+            target_file_with_globals(
+                "packages/frontend/editor-ui/src/worker/globals.d.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Variable,
+                    "packages/frontend/editor-ui/src/worker/globals.d.ts",
+                    30,
+                    "console",
+                    crate::GlobalScope::DeclareGlobal,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        assert_eq!(
+            ctx.ambient_index.resolve_global("console", "a.ts"),
+            resolver::GlobalLookup::Absent
         );
     }
 
