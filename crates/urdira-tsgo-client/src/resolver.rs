@@ -156,8 +156,55 @@ impl<'a> ResidualResolver<'a> {
     /// output order is unaffected, this is purely an internal traversal
     /// optimization, mirroring why `analyzer.ts`'s own Rust caller sorts
     /// `pending_sites` by `start` before the walk.
+    ///
+    /// Thin wrapper over [`Self::resolve_with_deadline`] with `deadline:
+    /// None` (never skips an owner group) — kept as the STABLE, always-
+    /// complete API every existing caller/test uses.
     pub fn resolve(&mut self, sites: &[PendingSite]) -> Vec<Resolution> {
+        let (attempted, skipped) = self.resolve_with_deadline(sites, None);
+        debug_assert!(
+            skipped.is_empty(),
+            "resolve_with_deadline(.., None) must never skip an owner group"
+        );
         let mut results: Vec<Option<Resolution>> = vec![None; sites.len()];
+        for (index, resolution) in attempted {
+            results[index] = Some(resolution);
+        }
+        results
+            .into_iter()
+            .map(|r| r.expect("every site index is assigned exactly once"))
+            .collect()
+    }
+
+    /// C.1 budget-overshoot fix (2026-09-05, live n8n finding): like
+    /// [`Self::resolve`], but checks `deadline` (if any) BETWEEN owner
+    /// groups — never mid-group (a group's own `resolve_owner_group` call,
+    /// including its batched `getSymbolsAtLocations` RPCs, always finishes
+    /// once started, exactly like `residual_pass.rs::run_lane`'s own check
+    /// points `(a)`/`(b)`). Diagnosed live: a single owner group's
+    /// `resolve_owner_group` call routinely took multiple seconds on the
+    /// n8n corpus (up to ~10.9s observed, `v4-fold/q5-residual/
+    /// schedule5.log`'s own per-window `resolve_ms`), the actual cause of
+    /// `checker_ms` overshooting `URDIRA_V4_RESIDUAL_BUDGET_MS` by several
+    /// seconds — NOT `updateSnapshot` (its own `snapshot_ms` stayed under
+    /// ~0.8s per window in the same run).
+    ///
+    /// Returns `(attempted, skipped_owners)`: `attempted` is `(site index
+    /// in `sites`, Resolution)` pairs for every site whose OWNER GROUP was
+    /// reached before the deadline (owners are visited in the same sorted
+    /// order `resolve` always used, so this is deterministic); `skipped_
+    /// owners` lists every owner path (sorted) whose group was never
+    /// started at all. The caller (`residual_pass.rs::run_lane`) treats a
+    /// non-empty `skipped_owners` exactly like check points `(a)`/`(b)`:
+    /// every root of the current window goes to `remaining_roots` (the
+    /// already-resolved ones too — cheap to re-attempt next round, see
+    /// that call site's own comment for why re-resolving an already-closed
+    /// `pending.sites` row is idempotent) and no further windows open.
+    pub fn resolve_with_deadline(
+        &mut self,
+        sites: &[PendingSite],
+        deadline: Option<std::time::Instant>,
+    ) -> (Vec<(usize, Resolution)>, Vec<String>) {
         let mut by_owner: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, site) in sites.iter().enumerate() {
             by_owner
@@ -167,18 +214,29 @@ impl<'a> ResidualResolver<'a> {
         }
         let mut owners: Vec<&str> = by_owner.keys().copied().collect();
         owners.sort_unstable();
+
+        let mut attempted: Vec<(usize, Resolution)> = Vec::with_capacity(sites.len());
+        let mut skipped_owners: Vec<String> = Vec::new();
+        let mut past_deadline = false;
         for owner_path in owners {
+            if !past_deadline
+                && let Some(d) = deadline
+                && std::time::Instant::now() >= d
+            {
+                past_deadline = true;
+            }
+            if past_deadline {
+                skipped_owners.push(owner_path.to_string());
+                continue;
+            }
             let mut indices = by_owner.remove(owner_path).unwrap();
             indices.sort_by_key(|&i| sites[i].start);
             let resolved = self.resolve_owner_group(owner_path, &indices, sites);
-            for (position, index) in indices.iter().enumerate() {
-                results[*index] = Some(resolved[position].clone());
+            for (position, &index) in indices.iter().enumerate() {
+                attempted.push((index, resolved[position].clone()));
             }
         }
-        results
-            .into_iter()
-            .map(|r| r.expect("every site index is assigned exactly once"))
-            .collect()
+        (attempted, skipped_owners)
     }
 
     fn resolve_owner_group(
@@ -647,7 +705,7 @@ mod tests {
     //! entirely valid batch and assert the fallback isolates it correctly.
 
     use super::*;
-    use crate::binary::{self, TsgoBinary};
+    use crate::binary;
     use crate::client::TsgoClient;
     use crate::proto::UpdateSnapshotParams;
     use crate::virtual_fs::MapFs;
@@ -659,16 +717,6 @@ mod tests {
             .join("..")
             .canonicalize()
             .expect("repo root should exist")
-    }
-
-    fn discover_binary() -> Option<TsgoBinary> {
-        match binary::discover(&repo_root()) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                eprintln!("skipping: tsgo binary not discoverable: {e}");
-                None
-            }
-        }
     }
 
     const ROOT: &str = "/workspace";
@@ -694,8 +742,8 @@ mod tests {
         owner_text: Arc<Vec<u16>>,
     }
 
-    fn spawn_fixture() -> Option<Fixture> {
-        let tsgo = discover_binary()?;
+    fn spawn_fixture() -> Fixture {
+        let tsgo = binary::discover_for_tests(&repo_root());
         let owner = format!("{ROOT}/a.ts");
         let text = FIXTURE_TEXT;
         let config_json = serde_json::json!({
@@ -715,41 +763,42 @@ mod tests {
         fs.insert(CONFIG_PATH, config_json);
         let fs: Arc<dyn VirtualFs> = Arc::new(fs);
 
-        let mut client = TsgoClient::spawn(&tsgo, ROOT, fs).ok()?;
-        client.initialize().ok()?;
+        let mut client = TsgoClient::spawn(&tsgo, ROOT, fs).expect("tsgo should spawn");
+        client.initialize().expect("tsgo should initialize");
         let params = UpdateSnapshotParams {
             open_projects: vec![CONFIG_PATH.to_string()],
             ..Default::default()
         };
-        let snapshot = client.update_snapshot(&params).ok()?;
+        let snapshot = client
+            .update_snapshot(&params)
+            .expect("updateSnapshot should succeed");
         let project = snapshot
             .projects
             .iter()
-            .find(|p| p.config_file_name == CONFIG_PATH)?
+            .find(|p| p.config_file_name == CONFIG_PATH)
+            .expect("the fixture's own project should be present")
             .id
             .clone();
         let owner_text = Arc::new(to_utf16(text));
-        Some(Fixture {
+        Fixture {
             client,
             snapshot: snapshot.snapshot,
             project,
             owner,
             owner_text,
-        })
+        }
     }
 
     #[test]
+    #[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
     fn fetch_symbols_chunked_isolates_one_bad_handle_from_many_good_ones() {
-        let Some(Fixture {
+        let Fixture {
             client,
             snapshot,
             project,
             owner,
             owner_text,
-        }) = spawn_fixture()
-        else {
-            return;
-        };
+        } = spawn_fixture();
         let source = client
             .get_source_file(snapshot, &project, &owner)
             .expect("getSourceFile should succeed")
@@ -819,17 +868,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
     fn fetch_symbols_chunked_all_good_handles_need_no_fallback() {
-        let Some(Fixture {
+        let Fixture {
             client,
             snapshot,
             project,
             owner,
             owner_text,
-        }) = spawn_fixture()
-        else {
-            return;
-        };
+        } = spawn_fixture();
         let source = client
             .get_source_file(snapshot, &project, &owner)
             .expect("getSourceFile should succeed")

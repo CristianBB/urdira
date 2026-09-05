@@ -446,6 +446,16 @@ pub enum IndexingEvent {
         windows_done: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         windows_total: Option<u32>,
+        /// C.3: wall-clock milliseconds of the checker pass itself
+        /// (`crate::v4::residual::ResidualOutcome::checker_ms`,
+        /// `urdira-indexing-worker` -- `ResidualPass::run_instrumented`
+        /// alone, not materialize/write/fsync/snapshot) -- distinct from
+        /// `timings.total_ms`, which includes all of those. `#[serde(default)]`
+        /// so an older sender that predates this field still deserializes
+        /// (as `None`, not `0`), same rationale as `windows_done`/
+        /// `windows_total`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checker_ms: Option<u64>,
     },
 }
 

@@ -88,6 +88,11 @@ export interface WorkspaceScanUpgradeCompleted {
   /** How many windows this run actually opened, out of `windows_total`. */
   readonly windows_done?: number;
   readonly windows_total?: number;
+  /** C.3: wall-clock milliseconds of the checker pass itself
+   * (`ResidualPass::run_instrumented` alone, not materialize/write/fsync/
+   * snapshot) -- distinct from `timings.total_ms`, which includes all of
+   * those. `undefined` for a Rust build that predates this field. */
+  readonly checker_ms?: number;
 }
 
 /**

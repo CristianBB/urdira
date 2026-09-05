@@ -13,8 +13,12 @@
 //! resolution sequence, all against the real checker. Everything else is
 //! unit-tested against hand-built data (see `src/*.rs`'s own `#[cfg(test)]`
 //! modules) precisely so this one test's absence (no `node`/tsgo available)
-//! does not leave the crate untested — it skips (printing why) rather than
-//! failing when either is missing.
+//! does not leave the crate untested. C.4 (2026-09-05): `node` unavailable
+//! stays a genuine skip (the independent oracle script needs it, unrelated
+//! to this crate's own tsgo RPC path); tsgo unavailable is now
+//! `#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]` +
+//! `binary::discover_for_tests` (panics with guidance), never a silent
+//! `ok`.
 //!
 //! Fixtures:
 //! - `tests/fixtures/codebases/typescript/task-planner/src` (this repo's
@@ -38,7 +42,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use serde_json::Value;
-use urdira_tsgo_client::binary::{self, TsgoBinary};
+use urdira_tsgo_client::binary;
 use urdira_tsgo_client::client::TsgoClient;
 use urdira_tsgo_client::proto::UpdateSnapshotParams;
 use urdira_tsgo_client::resolver::{PendingSite, ResidualResolver, Resolution, SiteKind};
@@ -229,28 +233,22 @@ fn run_oracle(source_dir: &Path, sites: &[OracleSite]) -> Vec<Value> {
         .clone()
 }
 
-fn discover_binary() -> Option<TsgoBinary> {
-    match binary::discover(&repo_root()) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            eprintln!("skipping: tsgo binary not discoverable: {e}");
-            None
-        }
-    }
-}
-
 /// Runs `sites` (this crate's `ResidualResolver`) against `source_dir` and
 /// returns one `Resolution` per site, alongside the oracle's own JSON
 /// results for the same sites — both computed from independently-derived
 /// spans/positions over the identical fixture text.
+///
+/// C.4 (2026-09-05): the tsgo binary is required (`binary::
+/// discover_for_tests` panics with guidance if missing -- callers carry
+/// `#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]`); `node`
+/// on `PATH` (for the independent oracle script) stays a genuine skip --
+/// unrelated to tsgo discovery, out of this hygiene item's scope.
 fn resolve_and_compare(source_dir: &Path, oracle_sites: &[OracleSite]) {
     if !node_available() {
         eprintln!("skipping: node not on PATH");
         return;
     }
-    let Some(tsgo) = discover_binary() else {
-        return;
-    };
+    let tsgo = binary::discover_for_tests(&repo_root());
 
     let (fs, root_names) = build_fixture(source_dir);
     let fs: Arc<dyn VirtualFs> = Arc::new(fs);
@@ -417,6 +415,7 @@ fn byte_offset_of_utf16(text: &str, utf16_offset: i32) -> usize {
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn oracle_resolve_task_planner_sites() {
     let source_dir = repo_root().join("tests/fixtures/codebases/typescript/task-planner/src");
     let sites = [
@@ -467,6 +466,7 @@ fn oracle_resolve_task_planner_sites() {
 }
 
 #[test]
+#[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
 fn oracle_resolve_mini_alias_and_constructor_sites() {
     let source_dir = crate_root().join("tests/fixtures/mini");
     let sites = [

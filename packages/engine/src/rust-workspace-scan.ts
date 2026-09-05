@@ -58,6 +58,7 @@ export interface RustWorkspaceScanTransport {
       readonly truncated?: boolean;
       readonly windows_done?: number;
       readonly windows_total?: number;
+      readonly checker_ms?: number;
     }) => void,
   ): () => void;
 }
@@ -176,12 +177,14 @@ export function onRustWorkspaceUpgradeCompleted(
       timings: event.timings,
       // `exactOptionalPropertyTypes`: omit the key entirely rather than
       // assigning `undefined` to it -- a sender that predates F4 4.2's
-      // truncation fields never sets these, and `WorkspaceScanUpgradeCompleted`'s
-      // own optional fields (`truncated?`/`windows_done?`/`windows_total?`)
-      // mean "absent", not "present with value undefined".
+      // truncation fields (or C.3's `checker_ms`) never sets these, and
+      // `WorkspaceScanUpgradeCompleted`'s own optional fields
+      // (`truncated?`/`windows_done?`/`windows_total?`/`checker_ms?`) mean
+      // "absent", not "present with value undefined".
       ...(event.truncated !== undefined ? { truncated: event.truncated } : {}),
       ...(event.windows_done !== undefined ? { windows_done: event.windows_done } : {}),
       ...(event.windows_total !== undefined ? { windows_total: event.windows_total } : {}),
+      ...(event.checker_ms !== undefined ? { checker_ms: event.checker_ms } : {}),
     });
   });
 }

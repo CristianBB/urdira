@@ -172,6 +172,7 @@ fn upgrade_completed_fixture_decodes() {
             truncated: None,
             windows_done: None,
             windows_total: None,
+            checker_ms: None,
         }
     );
 }
@@ -207,6 +208,7 @@ fn upgrade_completed_truncated_fixture_decodes() {
             truncated: Some(true),
             windows_done: Some(3),
             windows_total: Some(10),
+            checker_ms: Some(19_500),
         }
     );
 }

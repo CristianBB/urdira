@@ -270,6 +270,35 @@ pub fn discover(repo_root: &Path) -> Result<TsgoBinary, DiscoverError> {
     })
 }
 
+/// C.4: the test-only counterpart to [`discover`] that PANICS (with
+/// guidance) instead of silently skipping when a tsgo binary is not
+/// discoverable. Every test in this crate (and `urdira-indexing-worker`'s
+/// residual tests) that needs a real tsgo child process used to do `let
+/// Some(tsgo) = discover_binary() else { return }` -- a test that "needs
+/// tsgo" but simply is not run at all whenever the binary happens to be
+/// missing (a worktree without `node_modules`, `URDIRA_TSGO_BINARY` unset)
+/// reports as `test ... ok` either way, so a real regression in the tsgo
+/// RPC path can silently stop being exercised without any signal in
+/// `cargo test`'s own summary line (see docs/evidence/2026-09-05-v4-
+/// frentes-1-2-3-4-reopen-references-analyze-residual.md §11's "Trampas"
+/// section, discovered live during that session).
+///
+/// Callers pair this with `#[ignore = "requires tsgo binary (set
+/// URDIRA_TSGO_BINARY)"]` on the test itself: `cargo test` without the
+/// binary available shows the test as `ignored` (an honest, visible
+/// signal, distinct from `ok`), and `cargo test -- --ignored` with
+/// `URDIRA_TSGO_BINARY` set (or a real `node_modules` in `repo_root`)
+/// actually runs it, panicking loudly if discovery STILL fails (a
+/// misconfigured invocation, not a legitimate skip).
+pub fn discover_for_tests(repo_root: &Path) -> TsgoBinary {
+    discover(repo_root).unwrap_or_else(|e| {
+        panic!(
+            "tsgo binary not discoverable: {e}. Set URDIRA_TSGO_BINARY=<path to lib/tsc> or run \
+             pnpm install"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

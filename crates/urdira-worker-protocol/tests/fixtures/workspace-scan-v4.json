@@ -120,6 +120,7 @@
     },
     "truncated": true,
     "windows_done": 3,
-    "windows_total": 10
+    "windows_total": 10,
+    "checker_ms": 19500
   }
 }

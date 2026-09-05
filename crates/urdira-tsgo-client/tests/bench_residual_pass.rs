@@ -267,13 +267,12 @@ fn bench_residual_pass_over_a_2000_owner_window_plan() {
         eprintln!("skipping: n8n corpus not present at the expected benchmark path");
         return;
     };
-    let tsgo = match binary::discover(&repo_root()) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: tsgo binary not discoverable: {e}");
-            return;
-        }
-    };
+    // C.4: a bench genuinely missing its own corpus/heavier-benchmark
+    // preconditions above still SKIPS -- those are real, unrelated
+    // opt-outs. tsgo itself is required once we get this far: PANIC (with
+    // guidance) rather than silently skip, matching every other test in
+    // this crate.
+    let tsgo = binary::discover_for_tests(&repo_root());
 
     let owner_files = collect_owner_cut(&corpus_root, OWNER_CUT);
     assert!(

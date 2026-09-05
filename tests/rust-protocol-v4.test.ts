@@ -168,6 +168,7 @@ describe("rust-protocol-v4 (workspace_scan/queryable/scan_completed)", () => {
       truncated: true,
       windows_done: 3,
       windows_total: 10,
+      checker_ms: 19_500,
     };
     expect(event).toEqual(fixture["upgrade_completed_truncated"]);
   });
