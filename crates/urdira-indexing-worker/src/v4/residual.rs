@@ -5506,12 +5506,18 @@ mod tests {
 
         // F4 4.1/4.2's own correctness gate (§7 of the 2026-09-05
         // evidence): a truncated-then-resumed chain must publish EXACTLY
-        // what one unbounded pass would -- 161,794, independently
-        // RE-VERIFIED against `n8n_residual_pass_debug_histogram` on this
-        // exact build/corpus (`v4-fold/q5-residual/histogram-unbounded.log`:
-        // confirmed_combined=161794, inferred_type_entities=41042,
-        // diagnostics_emitted=248193, wall 59.2s -- all four match the
-        // plan's own cited baseline exactly). Zero tolerance.
+        // what one unbounded pass would. Reference refreshed after the Q5
+        // D merge (2026-09-06, `v4-fold/q5-meas/histogram-unbounded.log`):
+        // D added reference records, which shifted the unbounded pass's
+        // own confirmed_combined from 161,794 to **161,807**;
+        // inferred_type_entities is unchanged at 41,042. RE-VERIFIED
+        // against `n8n_residual_pass_debug_histogram` on this exact
+        // build/corpus: confirmed_combined=161807,
+        // inferred_type_entities=41042, diagnostics_emitted=248193, wall
+        // 55.8s. The pre-D baseline (161,794) below is kept verbatim as
+        // historical record of the C.5/C.6/C.7 investigation, which
+        // remains valid at the window sizes it was measured; only the
+        // live target (`REFERENCE_CONFIRMED_COMBINED` below) moved.
         //
         // C.5 fix (2026-09-05, adversarial-review finding): the `49d2760`
         // fix above (`candidate_owners_for_pass`) narrowed a continuation's
@@ -5594,7 +5600,16 @@ mod tests {
              are per-root, independent of window composition), so unlike confirmed_combined \
              there is no known source of legitimate variance here"
         );
-        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_794;
+        // Refreshed 2026-09-06 after Q5 D merge (`test(v4): refresh
+        // schedule-harness reference constants after Q5 D merge`): D added
+        // reference records, moving the unbounded pass's own
+        // confirmed_combined from 161,794 to 161,807 (re-verified,
+        // `v4-fold/q5-meas/histogram-unbounded.log`). The +-4 tolerance and
+        // its rationale (schedule7=+2, schedule8=+0 against the pre-D
+        // baseline; w256/w512/w1024 unbounded all agreed at the pre-D
+        // baseline, partition effect refuted by C.6) are unchanged -- only
+        // the live target shifted with the reference-record count.
+        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_807;
         const CONFIRMED_COMBINED_TOLERANCE: u64 = 4;
         let confirmed_combined_diff =
             final_confirmed_combined.abs_diff(REFERENCE_CONFIRMED_COMBINED);
@@ -5603,10 +5618,10 @@ mod tests {
             "confirmed_combined after schedule() fully converges via truncate-then-resume \
              ({final_confirmed_combined}) must be within {CONFIRMED_COMBINED_TOLERANCE} of the \
              unbounded pass's own figure ({REFERENCE_CONFIRMED_COMBINED}) -- got a difference \
-             of {confirmed_combined_diff}, larger than every difference observed so far \
-             (schedule7=+2, schedule8=+0; w256/w512/w1024 unbounded all=161794, partition \
-             effect refuted by C.6). The source of a +-2 drift has NOT been identified -- this \
-             is an owner decision pending, do not widen this bound further without new evidence"
+             of {confirmed_combined_diff}. Reference refreshed post-Q5-D-merge to 161,807 (was \
+             161,794); the +-2 drift documented pre-D (schedule7/schedule8) is still the known \
+             source of variance -- this is an owner decision pending, do not widen this bound \
+             further without new evidence"
         );
     }
 
