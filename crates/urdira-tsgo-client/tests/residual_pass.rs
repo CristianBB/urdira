@@ -464,3 +464,337 @@ fn splitting_the_plan_across_two_passes_matches_one_unbounded_pass() {
          unbounded pass over the whole plan would"
     );
 }
+
+const INTRA_WINDOW_CALL_TS: &str = r#"export function run(): number {
+  return [1, 2].map((n) => n).length;
+}
+"#;
+
+/// Number of no-pending-site filler roots in window 1 -- large enough that
+/// their aggregate semantics-fetch cost dominates the fixed per-lane
+/// startup cost (child process spawn + `initialize()`, ~200ms on this
+/// machine, paid once by window 0) by a comfortable margin, giving check
+/// point `(b)`'s calibrated deadline many roots' worth of room to land
+/// strictly between two of them rather than exactly at a window boundary.
+const FILLER_ROOT_COUNT: usize = 500;
+
+/// One filler root's content: `n` exported functions/interfaces (`n` in
+/// the name only to keep every file's text distinct enough that `tsgo`
+/// cannot short-circuit identical parses) -- real semantic surface for
+/// `fetch_exported_types`/`fetch_owner_diagnostics` to walk, unlike a
+/// single trivial declaration, so each root's own fetch cost is non-
+/// negligible relative to system-clock/RPC jitter.
+fn filler_text(seed: usize) -> String {
+    let mut text = String::new();
+    for i in 0..12 {
+        text.push_str(&format!(
+            "export function value_{seed}_{i}(input: number): number {{\n  return input + {i};\n}}\n\n"
+        ));
+        text.push_str(&format!(
+            "export interface Shape_{seed}_{i} {{\n  x: number;\n  y: number;\n  label: string;\n}}\n\n"
+        ));
+    }
+    text
+}
+
+/// Builds the fixture for
+/// `intra_window_deadline_truncates_mid_semantics_fetch_and_a_resumed_
+/// pass_matches_unbounded`: window 0 = `a.ts` alone (the ONLY file with a
+/// real pending call site, used for calibration too), window 1 =
+/// `FILLER_ROOT_COUNT` filler roots with NO pending sites of their own
+/// (wide and heavy enough to give check point `(b)` many places to land
+/// strictly between two roots), window 2 = `f.ts` alone (structurally
+/// identical to `a.ts`, so it always has real call/heritage work left for
+/// the resumed pass). Windows are built BY HAND rather than via
+/// `WindowPlan::build` (which only produces uniform-size windows), since
+/// this fixture deliberately needs window 1 wider than windows 0/2.
+fn build_intra_window_fixture() -> (
+    Arc<dyn VirtualFs>,
+    WindowPlan,
+    BTreeMap<String, Vec<PendingSite>>,
+) {
+    let mut fs = MapFs::new();
+    fs.insert(virtual_path("a.ts"), INTRA_WINDOW_CALL_TS);
+    let filler_names: Vec<String> = (0..FILLER_ROOT_COUNT)
+        .map(|i| format!("filler_{i:03}.ts"))
+        .collect();
+    for (i, name) in filler_names.iter().enumerate() {
+        fs.insert(virtual_path(name), filler_text(i));
+    }
+    fs.insert(virtual_path("f.ts"), INTRA_WINDOW_CALL_TS);
+    fs.insert(virtual_path("package.json"), r#"{"type":"module"}"#);
+    let fs: Arc<dyn VirtualFs> = Arc::new(fs);
+
+    let plan = WindowPlan {
+        windows: vec![
+            urdira_tsgo_client::residual_pass::Window {
+                index: 0,
+                roots: vec![virtual_path("a.ts")],
+            },
+            urdira_tsgo_client::residual_pass::Window {
+                index: 1,
+                roots: filler_names.iter().map(|n| virtual_path(n)).collect(),
+            },
+            urdira_tsgo_client::residual_pass::Window {
+                index: 2,
+                roots: vec![virtual_path("f.ts")],
+            },
+        ],
+    };
+
+    let (map_start_a, map_end_a) = find_utf16_span(INTRA_WINDOW_CALL_TS, "[1, 2].map((n) => n)", 1);
+    let (map_start_f, map_end_f) = find_utf16_span(INTRA_WINDOW_CALL_TS, "[1, 2].map((n) => n)", 1);
+
+    let pending_by_owner = BTreeMap::from([
+        (
+            virtual_path("a.ts"),
+            vec![PendingSite {
+                owner_path: virtual_path("a.ts"),
+                start: map_start_a,
+                end: map_end_a,
+                kind: SiteKind::Call,
+                reason: "lib_member_call".to_string(),
+            }],
+        ),
+        (
+            virtual_path("f.ts"),
+            vec![PendingSite {
+                owner_path: virtual_path("f.ts"),
+                start: map_start_f,
+                end: map_end_f,
+                kind: SiteKind::Call,
+                reason: "lib_member_call".to_string(),
+            }],
+        ),
+    ]);
+
+    (fs, plan, pending_by_owner)
+}
+
+/// C.1's core correctness property, CALIBRATED rather than hard-coded.
+/// Deviates from the plan's own simplest recipe ("measure window 1 alone,
+/// deadline = 1.5x that") in ONE respect, found live while writing this
+/// test: on this machine, a fresh `TsgoClient` spawn + `initialize()`
+/// handshake (paid once per lane, before window 0 even opens) dominates
+/// window 0's own wall time and varies by HUNDREDS of milliseconds between
+/// independent process spawns (observed 211ms and 632ms for the identical
+/// window-0-alone fixture, back to back) -- while the checker's own
+/// STEADY-STATE per-root cost, once warm, is only a few milliseconds. A
+/// naive "1.5x window 0's absolute duration" deadline is therefore
+/// dominated by spawn jitter, not by real per-root work, and lands
+/// unpredictably. This test instead measures window 1's own INCREMENTAL
+/// cost by DIFFERENCING two calibration runs (`run(window 0 alone)` vs.
+/// `run(window 0 + window 1)`), which cancels out most of the absolute
+/// spawn-time offset (both runs pay a similar, if not identical, spawn
+/// cost), then makes window 1 wide/heavy enough (`FILLER_ROOT_COUNT`
+/// filler roots) that half of its own incremental cost is a multi-second
+/// margin -- comfortably larger than the spawn-jitter residual left after
+/// differencing -- so the calibrated deadline reliably lands strictly
+/// BETWEEN two of window 1's roots (check point `(b)`) rather than at a
+/// window boundary (check point `(a)`) or past the end of the whole plan.
+/// Verifies both halves of C.1: `WindowStats::partial` on the cut-off
+/// window, and that a resumed pass over exactly `remaining_roots` plus the
+/// truncated pass's own output publishes byte-for-byte what one unbounded
+/// pass would (the same invariant `splitting_the_plan_across_two_passes_
+/// matches_one_unbounded_pass` verifies for check point `(a)` alone).
+#[test]
+fn intra_window_deadline_truncates_mid_semantics_fetch_and_a_resumed_pass_matches_unbounded() {
+    let Some(tsgo) = discover_binary() else {
+        return;
+    };
+    let (fs, plan, pending_by_owner) = build_intra_window_fixture();
+
+    let config_for =
+        |binary: TsgoBinary, deadline: Option<std::time::Instant>| -> ResidualPassConfig {
+            ResidualPassConfig {
+                lib_roots: vec![lib_root_dir(&binary)],
+                binary,
+                root: VIRTUAL_ROOT.to_string(),
+                project_config_path: CONFIG_PATH.to_string(),
+                compiler_options: compiler_options(),
+                fetch_semantics: true,
+                deadline,
+            }
+        };
+
+    // Calibration point 1: window 0 alone (`a.ts`) -- dominated by this
+    // spawn's own client-startup cost.
+    let calibration_plan_0 = WindowPlan {
+        windows: plan.windows[..1].to_vec(),
+    };
+    let calibration_config_0 = config_for(tsgo, None);
+    let calibration_0_start = std::time::Instant::now();
+    let _ = ResidualPass::run(
+        &calibration_plan_0,
+        1,
+        &pending_by_owner,
+        Arc::clone(&fs),
+        &calibration_config_0,
+    )
+    .expect("calibration pass over window 0 alone should succeed");
+    let window0_duration = calibration_0_start.elapsed();
+
+    // Calibration point 2: window 0 + window 1 together, a SEPARATE spawn
+    // -- its own startup cost is not identical to calibration point 1's,
+    // but differencing the two still cancels most of the shared "startup +
+    // window 0" component, leaving an estimate of window 1's own
+    // incremental cost that is far less sensitive to spawn jitter than
+    // either absolute duration alone.
+    let Some(tsgo_calibration_01) = discover_binary() else {
+        return;
+    };
+    let calibration_plan_01 = WindowPlan {
+        windows: plan.windows[..2].to_vec(),
+    };
+    let calibration_config_01 = config_for(tsgo_calibration_01, None);
+    let calibration_01_start = std::time::Instant::now();
+    let _ = ResidualPass::run(
+        &calibration_plan_01,
+        1,
+        &pending_by_owner,
+        Arc::clone(&fs),
+        &calibration_config_01,
+    )
+    .expect("calibration pass over window 0 + window 1 should succeed");
+    let window01_duration = calibration_01_start.elapsed();
+    let window1_incremental_duration = window01_duration.saturating_sub(window0_duration);
+    eprintln!(
+        "[intra_window_deadline] calibration: window0={window0_duration:?} \
+         window0+1={window01_duration:?} window1_incremental={window1_incremental_duration:?}"
+    );
+
+    // Unbounded reference pass over the whole plan -- the ground truth
+    // `truncated pass + resumed pass` must reproduce exactly.
+    let Some(tsgo_unbounded) = discover_binary() else {
+        return;
+    };
+    let unbounded_config = config_for(tsgo_unbounded, None);
+    let mut unbounded = ResidualPass::run(
+        &plan,
+        1,
+        &pending_by_owner,
+        Arc::clone(&fs),
+        &unbounded_config,
+    )
+    .expect("unbounded pass should succeed");
+    unbounded.sort_by(|a, b| {
+        a.owner_path
+            .cmp(&b.owner_path)
+            .then(a.start_utf16.cmp(&b.start_utf16))
+    });
+
+    // The real, truncated run: deadline at window 0's own calibrated
+    // duration PLUS half of window 1's own incremental cost, set right
+    // before THIS run starts (not before calibration).
+    let Some(tsgo_truncated) = discover_binary() else {
+        return;
+    };
+    let deadline =
+        std::time::Instant::now() + window0_duration + window1_incremental_duration.mul_f64(0.5);
+    let truncated_config = config_for(tsgo_truncated, Some(deadline));
+    let (mut first_pass, stats) = ResidualPass::run_instrumented(
+        &plan,
+        1,
+        &pending_by_owner,
+        Arc::clone(&fs),
+        &truncated_config,
+    )
+    .expect("a truncated pass is still Ok, never an error");
+    eprintln!(
+        "[intra_window_deadline] truncated={} windows_done={} remaining_roots={}",
+        stats.truncated,
+        stats.windows.len(),
+        stats.remaining_roots.len()
+    );
+
+    assert!(
+        stats.truncated,
+        "expected the calibrated deadline to truncate the pass"
+    );
+    assert_eq!(
+        stats.windows.len(),
+        2,
+        "window 0 and window 1 should have opened; window 2 should never open: {:?}",
+        stats.windows
+    );
+    assert!(
+        !stats.windows[0].partial,
+        "window 0 (calibration reference) should complete fully before the deadline: {:?}",
+        stats.windows[0]
+    );
+    assert!(
+        stats.windows[1].partial,
+        "window 1 should be cut off mid-semantics-loop (check point (b)), not fully done: {:?}",
+        stats.windows[1]
+    );
+
+    let filler_roots: Vec<String> = plan.windows[1].roots.clone();
+    let mut remaining = stats.remaining_roots.clone();
+    remaining.sort();
+    assert!(
+        !remaining.is_empty(),
+        "at least f.ts (window 2, never opened) must be in remaining_roots"
+    );
+    assert!(
+        remaining.len() <= filler_roots.len() + 1,
+        "remaining_roots can be at most window 1's {} roots + window 2's 1 root: {remaining:?}",
+        filler_roots.len()
+    );
+    // Landing strictly BETWEEN two roots of window 1 (check point (b), not
+    // a window boundary) means at least one filler root was processed
+    // (present in `stats.types`/`stats.diagnostics`, absent from
+    // `remaining`) and at least one was not (present in `remaining`) --
+    // the calibration's whole point. If EVERY filler root ended up in
+    // `remaining`, the deadline landed at window 1's own start (a
+    // mis-calibration indistinguishable from check point (a)); if NONE
+    // did, window 1 finished fully and the truncation must have happened
+    // at check point (a) for window 2 instead -- either way the `partial`
+    // assertion above already catches it, but this pins down *why*.
+    let filler_remaining = remaining
+        .iter()
+        .filter(|r| filler_roots.contains(r))
+        .count();
+    assert!(
+        filler_remaining > 0 && filler_remaining < filler_roots.len(),
+        "expected the deadline to land strictly between two filler roots of window 1: \
+         {filler_remaining}/{} filler roots remaining, remaining={remaining:?}",
+        filler_roots.len()
+    );
+    assert!(
+        remaining.contains(&virtual_path("f.ts")),
+        "window 2 never opened -- f.ts must always be in remaining_roots: {remaining:?}"
+    );
+    assert!(
+        !remaining.contains(&virtual_path("a.ts")),
+        "window 0 completed fully -- a.ts must never be in remaining_roots: {remaining:?}"
+    );
+    for root in &remaining {
+        assert!(
+            root == &virtual_path("f.ts") || filler_roots.contains(root),
+            "unexpected root in remaining_roots: {root}"
+        );
+    }
+
+    // Resume: a second pass restricted to exactly `remaining_roots`, the
+    // same shape `residual.rs::schedule`'s re-trigger builds from
+    // `ResidualOutcome::remaining_roots`.
+    let Some(tsgo_resumed) = discover_binary() else {
+        return;
+    };
+    let resumed_plan = WindowPlan::build(&remaining, remaining.len().max(1));
+    let resumed_config = config_for(tsgo_resumed, None);
+    let second_pass = ResidualPass::run(&resumed_plan, 1, &pending_by_owner, fs, &resumed_config)
+        .expect("resumed pass should succeed");
+
+    first_pass.extend(second_pass);
+    first_pass.sort_by(|a, b| {
+        a.owner_path
+            .cmp(&b.owner_path)
+            .then(a.start_utf16.cmp(&b.start_utf16))
+    });
+    assert_eq!(
+        unbounded, first_pass,
+        "a truncated pass plus a resumed pass over remaining_roots must publish exactly what \
+         one unbounded pass over the whole plan would"
+    );
+}

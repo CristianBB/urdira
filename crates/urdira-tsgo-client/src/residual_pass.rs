@@ -184,15 +184,22 @@ pub struct ResidualPassConfig {
     /// so a caller that only wants call/heritage resolution (a bench, or a
     /// test exercising just that half) pays no extra RPC cost.
     pub fetch_semantics: bool,
-    /// F4 4.2: a wall-clock point past which `run_lane` stops opening new
-    /// windows — checked at the START of each window iteration (a window
-    /// already in flight always finishes; this never aborts a partially-
-    /// resolved `updateSnapshot`/resolve call). `None` means unbounded (the
-    /// pre-4.2 behavior, and `URDIRA_V4_RESIDUAL_BUDGET_MS=0`'s meaning).
-    /// Every lane checks against the SAME `Instant` (computed once by the
-    /// caller before spawning lanes), not a per-lane budget — a slow lane
-    /// stopping early does not entitle a fast lane to keep going past the
-    /// shared wall-clock cutoff.
+    /// F4 4.2 (revised C.1, 2026-09-05): a wall-clock point past which
+    /// `run_lane` stops doing new work. Contract: **the deadline is checked
+    /// at the start of each window, and again between roots of the
+    /// semantics fetch** — never mid-RPC (an `updateSnapshot`/`resolve`/
+    /// single-root semantics fetch already in flight always finishes; this
+    /// never aborts one). The maximum overrun past the cutoff is therefore
+    /// one tsgo request (tens of milliseconds), not one whole window
+    /// (~1-2s on the n8n corpus, `WindowPlan::DEFAULT_WINDOW_SIZE` = 512
+    /// owners × 4 semantics requests each) — the pre-C.1 behavior only
+    /// checked at the START of each window (see `run_lane`'s two check
+    /// points, tagged `(a)` and `(b)` in its own comments). `None` means
+    /// unbounded (the pre-4.2 behavior, and `URDIRA_V4_RESIDUAL_BUDGET_MS=0`'s
+    /// meaning). Every lane checks against the SAME `Instant` (computed
+    /// once by the caller before spawning lanes), not a per-lane budget —
+    /// a slow lane stopping early does not entitle a fast lane to keep
+    /// going past the shared wall-clock cutoff.
     pub deadline: Option<Instant>,
 }
 
@@ -245,6 +252,15 @@ pub struct WindowStats {
     /// present only when the `ps` sampling succeeded (e.g. absent on a
     /// platform without a `ps -o rss=` equivalent).
     pub child_rss_kb: Option<u64>,
+    /// C.1: `true` if this window's call/heritage resolution completed but
+    /// its semantics fetch (`ResidualPassConfig::fetch_semantics`) did NOT
+    /// finish every root before `deadline` was hit (check point `(b)` in
+    /// `run_lane`) — never set for a window truncated at check point `(a)`
+    /// (that window is never opened at all, so it gets no `WindowStats`
+    /// entry in the first place). `false` for every window that ran to
+    /// completion (the common case, and the only possibility when
+    /// `deadline` is `None`).
+    pub partial: bool,
 }
 
 /// One typed declaration site, with the owner file it belongs to —
@@ -401,6 +417,14 @@ fn sample_rss_kb(pid: u32) -> Option<u64> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
+/// C.1: `true` once `config.deadline` (if any) has passed. Extracted so
+/// both check points `(a)` and `(b)` in `run_lane` share the exact same
+/// test (a monotonic clock only moves forward, so there is no risk of the
+/// two points disagreeing about whether the deadline has passed).
+fn past_deadline(config: &ResidualPassConfig) -> bool {
+    config.deadline.is_some_and(|d| Instant::now() >= d)
+}
+
 /// Runs one lane's contiguous block of windows sequentially against one
 /// long-lived `TsgoClient`, returning both its resolved sites and its own
 /// per-window telemetry.
@@ -436,14 +460,13 @@ fn run_lane(
         std::collections::HashMap::new();
 
     let mut previous_snapshot: Option<u64> = None;
-    for (position, window) in windows.iter().enumerate() {
-        // F4 4.2: checked at the START of the window, never mid-window --
-        // a window already open always finishes its own `updateSnapshot` +
-        // resolve + (if enabled) semantics fetch before this lane looks at
-        // the clock again.
-        if let Some(deadline) = config.deadline
-            && Instant::now() >= deadline
-        {
+    'windows: for (position, window) in windows.iter().enumerate() {
+        // C.1 check point (a): checked at the START of the window, before
+        // `updateSnapshot` is even called -- a window not yet opened costs
+        // nothing to skip. If this fires, the ENTIRE window (every root in
+        // it) counts as not done: nothing in it was resolved, so all of its
+        // roots go to `remaining_roots` exactly like the pre-C.1 behavior.
+        if past_deadline(config) {
             stats.truncated = true;
             for remaining in &windows[position..] {
                 stats
@@ -510,6 +533,7 @@ fn run_lane(
             snapshot_ms,
             sites_resolved: window_sites.len(),
             child_rss_kb: sample_rss_kb(client.pid()),
+            partial: false,
         });
 
         // Decision 28's "inferred types + compiler diagnostics" task: on
@@ -521,7 +545,36 @@ fn run_lane(
         // calls yet still have exported declarations needing a type (see
         // `ResidualPassConfig::fetch_semantics`'s own doc comment).
         if config.fetch_semantics {
-            for root in &window.roots {
+            for (root_index, root) in window.roots.iter().enumerate() {
+                // C.1 check point (b): checked at the START of each root's
+                // own semantics fetch, never mid-RPC -- a root already
+                // being fetched always finishes. This window's call/
+                // heritage resolution (above) has ALREADY completed and
+                // stays in `out` untouched (see `ResidualPassConfig::
+                // deadline`'s doc comment and `residual.rs`'s
+                // `materialize`, which only closes owners present in THIS
+                // pass's `types_by_owner`/`diagnostics_by_owner` -- a
+                // root's call/heritage sites and its semantics are
+                // published independently, so publishing one without the
+                // other duplicates nothing on the follow-up pass). Only the
+                // roots from this index onward (in this window) plus every
+                // window after this one (never opened) are unfinished.
+                if past_deadline(config) {
+                    stats.truncated = true;
+                    for remaining_root in &window.roots[root_index..] {
+                        stats.remaining_roots.push(remaining_root.clone());
+                    }
+                    for remaining_window in &windows[position + 1..] {
+                        stats
+                            .remaining_roots
+                            .extend(remaining_window.roots.iter().cloned());
+                    }
+                    if let Some(last) = stats.windows.last_mut() {
+                        last.partial = true;
+                    }
+                    let _ = client.release(snapshot.snapshot);
+                    break 'windows;
+                }
                 let Ok(Some(owner_file)) =
                     client.get_source_file(snapshot.snapshot, &project, root)
                 else {
