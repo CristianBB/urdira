@@ -1267,24 +1267,16 @@ fn resolve_direct_export(
                 resolved_ids.insert(single.id.clone());
             }
             several => {
-                // 3a: several same-named candidates -- a real overload set
-                // (every candidate the SAME `EntityKind::Function` or the
-                // same `EntityKind::Method`) resolves to the earliest
-                // declaration under `FirstDeclaration`; anything else (a
-                // kind mismatch, or `UniqueOrAmbiguous`) stays `Ambiguous`,
-                // never a guess.
-                let first_kind = several[0].kind;
-                let is_overload_shape =
-                    matches!(first_kind, EntityKind::Function | EntityKind::Method)
-                        && several.iter().all(|entity| entity.kind == first_kind);
-                if policy == ExportPolicy::FirstDeclaration && is_overload_shape {
-                    let first = several
-                        .iter()
-                        .min_by_key(|entity| entity.start)
-                        .expect("several is non-empty");
-                    resolved_ids.insert(first.id.clone());
-                } else {
-                    return ExportResolution::Ambiguous;
+                // 3a/3b follow-up: several same-named candidates -- see
+                // `first_declaration_merge_target`'s own doc comment for
+                // the three shapes recognized under `FirstDeclaration`.
+                // `UniqueOrAmbiguous` (the call-target policy) never picks
+                // among candidates, unconditionally `Ambiguous`.
+                match (policy, first_declaration_merge_target(several)) {
+                    (ExportPolicy::FirstDeclaration, Some(target)) => {
+                        resolved_ids.insert(target.id.clone());
+                    }
+                    _ => return ExportResolution::Ambiguous,
                 }
             }
         }
@@ -1293,6 +1285,60 @@ fn resolve_direct_export(
         1 => ExportResolution::Resolved(resolved_ids.into_iter().next().expect("checked len")),
         _ => ExportResolution::Ambiguous,
     }
+}
+
+/// 3a/3b follow-up (2026-09-05, n8n-parity): which of `candidates` (2+
+/// same-named top-level entities) a PLAIN reference resolves to under
+/// [`ExportPolicy::FirstDeclaration`] -- mirrors TypeScript's own
+/// `valueDeclaration ?? declarations[0]` rule for a merged symbol. `None`
+/// for any shape that is not a real, unambiguous TypeScript declaration
+/// merge, so the caller stays `Ambiguous` rather than guess. Three shapes
+/// recognized, checked in order:
+/// 1. Every candidate the SAME `EntityKind::Function` or the SAME
+///    `EntityKind::Method` (an overload set, A5b's own 11/11 sample) --
+///    the earliest in source order (lowest `start`).
+/// 2. Every candidate `EntityKind::Namespace` (the same `namespace X {}`
+///    declared more than once in the same file -- `visit_ts_module_
+///    declaration`'s own doc comment) -- the earliest in source order,
+///    same rule as an overload set.
+/// 3. Exactly one candidate is `EntityKind::Class`/`Function`/`Enum` (a
+///    "value" declaration) and every OTHER candidate is `EntityKind::
+///    Namespace` -- TypeScript's own supported class/function/enum +
+///    namespace merge (`export class Foo {} export namespace Foo { ... }`,
+///    common in n8n for attaching static-like members/nested types) --
+///    resolves to the VALUE declaration, regardless of source order: a
+///    plain reference, `instanceof`, and construction all mean the value
+///    side, never the namespace's own type-only declaration. Two or more
+///    non-namespace candidates (a genuine name COLLISION, not a supported
+///    merge -- e.g. `const X` next to `namespace X`) is NOT this shape and
+///    falls through to `None`.
+fn first_declaration_merge_target<'e>(candidates: &[&'e SyntaxEntity]) -> Option<&'e SyntaxEntity> {
+    let first_kind = candidates.first()?.kind;
+    if matches!(first_kind, EntityKind::Function | EntityKind::Method)
+        && candidates.iter().all(|entity| entity.kind == first_kind)
+    {
+        return candidates.iter().copied().min_by_key(|entity| entity.start);
+    }
+    if candidates
+        .iter()
+        .all(|entity| entity.kind == EntityKind::Namespace)
+    {
+        return candidates.iter().copied().min_by_key(|entity| entity.start);
+    }
+    let non_namespace: Vec<&SyntaxEntity> = candidates
+        .iter()
+        .copied()
+        .filter(|entity| entity.kind != EntityKind::Namespace)
+        .collect();
+    if let [value] = non_namespace.as_slice()
+        && matches!(
+            value.kind,
+            EntityKind::Class | EntityKind::Function | EntityKind::Enum
+        )
+    {
+        return Some(value);
+    }
+    None
 }
 
 /// Ambient module resolution task (2026-09-04): the workspace-wide index of
@@ -2231,6 +2277,101 @@ mod tests {
                 "f",
                 ExportPolicy::UniqueOrAmbiguous
             ),
+            ExportResolution::Ambiguous
+        );
+    }
+
+    /// n8n-parity follow-up (2026-09-05): `export namespace Cfg { ... }`
+    /// alone (no merge) now resolves through the ordinary `[single]` path
+    /// -- the bug was `declaration_export_names` (lib.rs) never pushing an
+    /// export binding for it AT ALL, so `direct`/`reexport` were both
+    /// empty and this fell to `Unresolved` regardless of `matches.as_
+    /// slice()`'s own logic here. Fixed at the `lib.rs` layer; this test
+    /// only proves the resolver side already handles a lone `Namespace`
+    /// entity correctly once given a binding (see `lib.rs`'s own
+    /// `export_namespace_declaration_pushes_a_direct_export_binding` for
+    /// the actual regression fix).
+    #[test]
+    fn resolve_named_export_resolves_a_single_exported_namespace() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            file(
+                "a.ts",
+                vec![entity(EntityKind::Namespace, "a.ts", 17, "Cfg")],
+                vec![binding("Cfg", "Cfg", None, None)],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "Cfg", ExportPolicy::FirstDeclaration),
+            ExportResolution::Resolved("jsts:namespace:a.ts:17:Cfg".to_owned())
+        );
+        // The call-target policy resolves it too -- a SINGLE candidate is
+        // never ambiguous under either policy.
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "Cfg", ExportPolicy::UniqueOrAmbiguous),
+            ExportResolution::Resolved("jsts:namespace:a.ts:17:Cfg".to_owned())
+        );
+    }
+
+    /// n8n-parity follow-up (2026-09-05): `export class Foo {} export
+    /// namespace Foo { ... }` -- TypeScript's own supported class+namespace
+    /// merge (common in n8n for attaching nested types/static-like members)
+    /// -- a PLAIN reference resolves to the VALUE declaration (the class),
+    /// mirroring `valueDeclaration ?? declarations[0]`, regardless of
+    /// source order: the namespace entity here has the LOWER `start` (10 <
+    /// 50) yet the class still wins.
+    #[test]
+    fn resolve_named_export_class_namespace_merge_resolves_to_the_value_declaration() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            file(
+                "a.ts",
+                vec![
+                    entity(EntityKind::Namespace, "a.ts", 10, "Foo"),
+                    entity(EntityKind::Class, "a.ts", 50, "Foo"),
+                ],
+                vec![binding("Foo", "Foo", None, None)],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "Foo", ExportPolicy::FirstDeclaration),
+            ExportResolution::Resolved("jsts:class:a.ts:50:Foo".to_owned())
+        );
+        // The call-target policy is UNAFFECTED by this fix -- still
+        // unconditionally `Ambiguous` for more than one candidate.
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "Foo", ExportPolicy::UniqueOrAmbiguous),
+            ExportResolution::Ambiguous
+        );
+    }
+
+    /// n8n-parity follow-up (2026-09-05): the SAME `namespace Cfg {}`
+    /// declared twice in one file (no value declaration at all) resolves
+    /// to the FIRST one in source order under `FirstDeclaration` -- the
+    /// same rule an overloaded function already gets, generalized to a
+    /// pure namespace merge.
+    #[test]
+    fn resolve_named_export_repeated_namespace_merge_resolves_to_the_first_declaration() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            file(
+                "a.ts",
+                vec![
+                    entity(EntityKind::Namespace, "a.ts", 50, "Cfg"),
+                    entity(EntityKind::Namespace, "a.ts", 10, "Cfg"),
+                ],
+                vec![binding("Cfg", "Cfg", None, None)],
+            ),
+        );
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "Cfg", ExportPolicy::FirstDeclaration),
+            ExportResolution::Resolved("jsts:namespace:a.ts:10:Cfg".to_owned())
+        );
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "Cfg", ExportPolicy::UniqueOrAmbiguous),
             ExportResolution::Ambiguous
         );
     }
