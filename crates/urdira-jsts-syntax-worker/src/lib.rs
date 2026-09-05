@@ -3384,9 +3384,11 @@ impl SyntaxCollector {
     }
 
     /// Direct-declaration export names (E2): `export function/class/const/
-    /// let/var/interface/type/enum <name>`. Multiple names for a single
-    /// `export const a = 1, b = 2;` -- one binding per declarator, matching
-    /// `entities`' own one-entity-per-declarator granularity.
+    /// let/var/interface/type/enum/namespace <name>` (the `Identifier`-
+    /// named namespace form only -- see `declaration_export_names`'s own
+    /// doc comment). Multiple names for a single `export const a = 1, b =
+    /// 2;` -- one binding per declarator, matching `entities`' own
+    /// one-entity-per-declarator granularity.
     fn push_direct_export_names(&mut self, names: Vec<(u32, String)>) {
         for (_, name) in names {
             self.export_bindings.push(SyntaxExportBinding {
@@ -3759,15 +3761,32 @@ fn declaration_export_names(declaration: &Declaration<'_>) -> Vec<(u32, String)>
             enum_declaration.id.span.start,
             enum_declaration.id.name.as_str().to_owned(),
         )],
-        // `TSModuleDeclaration` (namespace, now `EntityKind::Namespace` as
-        // of the 2026-09-04 ambient module resolution task -- but a direct
-        // `export namespace X {}`/`export declare module "x" {}` never
-        // reaches `declaration_export_names` at all: `visit_ts_module_
-        // declaration` below handles that node directly, unconditionally,
-        // regardless of whether it is wrapped in `export`, so folding it in
-        // HERE too would double-count it) and `TSImportEqualsDeclaration`
-        // (still genuinely out of `EntityKind`'s scope) are left out
-        // deliberately, not an oversight.
+        // 3b/n8n-parity fix (2026-09-05): `export namespace X {}` (an
+        // `Identifier`-named `TSModuleDeclaration`) DOES need an entry
+        // here -- the stale claim this comment used to make ("`visit_ts_
+        // module_declaration` handles it directly, so folding it in here
+        // would double-count it") confused the ENTITY push (`push_entity`,
+        // unconditional, unaffected by the `export` wrapper) with the
+        // EXPORT BINDING this function builds (a completely separate list,
+        // `self.export_bindings`, that NOTHING else ever pushed to for a
+        // namespace) -- `import { Cfg } from "./a"` where `a.ts` has
+        // `export namespace Cfg { ... }` stayed `Unresolved` forever
+        // (`export_bindings` had no entry to even try `resolve_direct_
+        // export` against), found live against the n8n corpus (505 sites,
+        // `import_binding/export:unresolved` bucketed by target kind
+        // `namespace`) despite the entity itself existing since 3b. The
+        // STRING-LITERAL form (`export declare module "x" { ... }`) is
+        // UNCHANGED -- that one really is resolved a different way
+        // entirely (`AmbientModuleIndex`/specifier matching, never by a
+        // plain `import`-by-name), so it stays excluded here.
+        Declaration::TSModuleDeclaration(module) => match &module.id {
+            TSModuleDeclarationName::Identifier(identifier) => {
+                vec![(identifier.span.start, identifier.name.as_str().to_owned())]
+            }
+            TSModuleDeclarationName::StringLiteral(_) => Vec::new(),
+        },
+        // `TSImportEqualsDeclaration` (still genuinely out of `EntityKind`'s
+        // scope) is left out deliberately, not an oversight.
         _ => Vec::new(),
     }
 }
@@ -4385,33 +4404,45 @@ impl<'a> Visit<'a> for SyntaxCollector {
     /// named one (`namespace X {}`/`declare namespace X {}`) names a LOCAL
     /// binding instead (3b, 2026-09-05): it now gets its own entity via
     /// `push_entity` (same shape as `visit_class`/`visit_ts_enum_declaration`
-    /// above), so `import { X } from ...`/local references to the namespace
-    /// name resolve like any other module-level declaration. Every
-    /// declaration nested inside the block (function/class/interface/type/
-    /// enum/variable) still gets its own entity through the ordinary
-    /// recursive walk below, unaffected -- this override only ADDS the
-    /// block's own namespace/ambient-module entity plus (string-literal
-    /// case only) the `AmbientModuleDeclaration` fact; it never replaces or
-    /// skips the default walk.
+    /// above) AND (3b/n8n-parity follow-up, same date) an export binding via
+    /// `declaration_export_names`'s own `TSModuleDeclaration` arm, reached
+    /// through `visit_export_named_declaration`'s direct-declaration branch
+    /// -- so `import { X } from "./this-file"` where `X` names an exported
+    /// namespace now actually resolves (505 n8n sites,
+    /// `import_binding/export:unresolved` bucketed by target kind
+    /// `namespace`, stayed unresolved even after 3b's own entity landed,
+    /// because nothing ever registered the export binding a plain
+    /// name-based `import` lookup needs). Every declaration nested inside
+    /// the block (function/class/interface/type/enum/variable) still gets
+    /// its own entity through the ordinary recursive walk below, unaffected
+    /// -- this override only ADDS the block's own namespace/ambient-module
+    /// entity plus (string-literal case only) the `AmbientModuleDeclaration`
+    /// fact; it never replaces or skips the default walk.
     ///
-    /// Known gap, not fixed here (documented per plan, not "fixed"):
-    /// nested `namespace A.B {}` desugars in oxc to `namespace A { namespace
-    /// B {} }`, so this visitor fires once per level and each produces its
-    /// own entity -- no special-casing needed, but the identity of `A` is
-    /// anchored at the OUTER declaration's identifier span, same as v3.
-    /// Declaration merging -- the same `namespace X {}` (or
-    /// `declare namespace X {}`) repeated more than once in the same file --
-    /// produces one entity PER occurrence, each with a distinct identity key
-    /// (`identity_start` differs), because `push_entity` never deduplicates
-    /// by name. Downstream, the export resolver (`resolve_direct_export`)
-    /// sees >1 candidate entity with the same `name` and the same
-    /// `EntityKind::Namespace` and reports `Ambiguous` for a bare
-    /// `import { X } from "./this-file"` of the merged name -- exactly the
-    /// same fallback merged overloaded functions already get. This is
-    /// counted in the references-parity diff, not silently absorbed; it is
-    /// not "fixed" by 3a either, since 3a's first-declaration policy is
-    /// scoped to function/method overloads, not namespace merges (which can
-    /// legitimately contribute different members per block).
+    /// Known gap, not fixed here: nested `namespace A.B {}` desugars in oxc
+    /// to `namespace A { namespace B {} }`, so this visitor fires once per
+    /// level and each produces its own entity -- no special-casing needed,
+    /// but the identity of `A` is anchored at the OUTER declaration's
+    /// identifier span, same as v3.
+    ///
+    /// Declaration merging (3b/n8n-parity follow-up): the export resolver
+    /// (`resolver::resolve_direct_export`) now resolves TWO merge shapes for
+    /// a PLAIN reference (`ExportPolicy::FirstDeclaration`), matching v3's
+    /// own `valueDeclaration ?? declarations[0]` rule: (1) the same
+    /// `namespace X {}` repeated more than once in the same file (each
+    /// occurrence its own entity, `push_entity` never deduplicates by name)
+    /// resolves to the FIRST one in source order, exactly like an
+    /// overloaded function; (2) a namespace merged with EXACTLY ONE
+    /// class/function/enum declaration of the same name (`export class Foo
+    /// {} export namespace Foo { ... }`, TypeScript's own supported merge
+    /// shape -- very common in n8n) resolves to the VALUE declaration
+    /// (class/function/enum), regardless of source order, since that is the
+    /// declaration real references/`instanceof`/construction actually mean.
+    /// Anything else (two DIFFERENT non-namespace kinds sharing a name, or
+    /// more than one non-namespace candidate) is not a real TypeScript merge
+    /// shape and stays `Ambiguous`, never a guess. The CALL-target policy
+    /// (`UniqueOrAmbiguous`) is unaffected either way -- see `resolve_direct_
+    /// export`'s own doc comment for the full mechanism.
     fn visit_ts_module_declaration(&mut self, declaration: &TSModuleDeclaration<'a>) {
         if let TSModuleDeclarationName::Identifier(identifier) = &declaration.id {
             self.push_entity(identifier, EntityKind::Namespace, UniversalKind::Type);
@@ -7292,6 +7323,89 @@ declare module 'markdown-it-task-lists' {
         let mut collector = SyntaxCollector::new(path, source_text.encode_utf16().count() as u32);
         collector.visit_program(&parsed.program);
         collector
+    }
+
+    // n8n-parity follow-up (2026-09-05): `export namespace X {}` must push
+    // a direct export binding, not just an entity -- root cause of 505
+    // n8n sites staying `import_binding/export:unresolved` (kind
+    // `namespace`) even after 3b's own entity landed.
+
+    #[test]
+    fn export_namespace_declaration_pushes_a_direct_export_binding() {
+        // The nested `export const x = 1;` ALSO reaches `visit_export_
+        // named_declaration`'s own direct-declaration branch through the
+        // default recursive walk (this crate has no scoping concept for
+        // export bindings any more than it does for entities -- same
+        // pre-existing, documented limitation `visit_ts_module_
+        // declaration`'s own doc comment notes for entities), so it pushes
+        // its OWN unrelated `{x, x}` binding too; only the `Cfg` binding
+        // itself is this test's concern.
+        let collector = collect("a.ts", "export namespace Cfg {\n  export const x = 1;\n}\n");
+        let cfg_bindings: Vec<_> = collector
+            .export_bindings
+            .iter()
+            .filter(|binding| binding.exported_name == "Cfg")
+            .collect();
+        assert_eq!(
+            cfg_bindings.len(),
+            1,
+            "bindings: {:?}",
+            collector.export_bindings
+        );
+        assert_eq!(cfg_bindings[0].local_name, "Cfg");
+        assert_eq!(cfg_bindings[0].source_specifier, None);
+    }
+
+    #[test]
+    fn export_class_namespace_merge_pushes_one_deduplicated_export_binding_for_each_declaration() {
+        // Both `export class Foo {}` and `export namespace Foo { ... }`
+        // push a BYTE-IDENTICAL `SyntaxExportBinding { exported_name:
+        // "Foo", local_name: "Foo", .. }` -- `parse_source`'s own post-
+        // collection `sort()`/`dedup()` collapses them to one, exactly
+        // like two overloaded `export function f` bindings already do
+        // (this crate's own `collect()` test helper runs BEFORE that
+        // dedup pass, so both raw entries are visible here). The nested
+        // `export const y = 1;` pushes its own unrelated `{y, y}` binding,
+        // same pre-existing scoping gap as the test right above.
+        let collector = collect(
+            "a.ts",
+            "export class Foo {}\nexport namespace Foo {\n  export const y = 1;\n}\n",
+        );
+        let foo_bindings: Vec<_> = collector
+            .export_bindings
+            .iter()
+            .filter(|binding| binding.exported_name == "Foo")
+            .collect();
+        assert_eq!(
+            foo_bindings.len(),
+            2,
+            "bindings: {:?}",
+            collector.export_bindings
+        );
+        assert!(
+            foo_bindings
+                .iter()
+                .all(|binding| binding.local_name == "Foo" && binding.source_specifier.is_none()),
+            "bindings: {:?}",
+            foo_bindings
+        );
+    }
+
+    /// Defensive: `declaration_export_names`'s `TSModuleDeclaration` arm
+    /// only extracts a name for the `Identifier` form -- a STRING-LITERAL-
+    /// named one wrapped in `export` (oxc parses this permissively at the
+    /// syntax level even though it is not meaningful TypeScript -- an
+    /// ambient module declaration is never itself `export`ed) still stays
+    /// `Vec::new()`, so this documents the fallback is intentional, not an
+    /// oversight.
+    #[test]
+    fn export_wrapped_ambient_string_literal_module_is_not_a_direct_export_name() {
+        let collector = collect("a.ts", "export declare module \"specifier\" {}\n");
+        assert!(
+            collector.export_bindings.is_empty(),
+            "bindings: {:?}",
+            collector.export_bindings
+        );
     }
 
     // P1-B: `export * as X from "spec"` lane-1 widening.
