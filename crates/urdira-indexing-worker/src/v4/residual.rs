@@ -2528,6 +2528,75 @@ fn count_classification_mismatches(
     mismatches
 }
 
+/// The two families [`classify_confirmed_possible`] distinguishes: v4's
+/// checker-free structural lane can only ever produce a call site or a
+/// heritage (`extends`/`implements`) site as pending/possible -- every
+/// other relation kind is out of scope for this classification.
+/// `#[cfg(test)]`: both this task's call sites (`print_confirmed_possible_
+/// histogram` here, `tests_e2e.rs`'s `inspect_store_record_histogram`) are
+/// `#[ignore]`d manual diagnostics, not production code -- see `collect`'s
+/// own doc comment for the actual production ground truth
+/// (`pending.sites`), which this classification does not feed.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SiteFamily {
+    Call,
+    Heritage,
+}
+
+/// Plan 3.4 (this task): the ONE classification `print_confirmed_possible_
+/// histogram` below and `tests_e2e.rs`'s `inspect_store_record_histogram`
+/// both trust to split a visible `core:call`/`core:inherits`/`core:
+/// implements` relation record into "confirmed" or "possible" -- extracted
+/// here (rather than reimplemented a second time in `tests_e2e.rs`, which
+/// used to duplicate it purely because `residual` was otherwise opaque to
+/// it) so both call sites can never drift apart again.
+///
+/// `target_subject().is_some()` alone does NOT distinguish confirmed from
+/// possible: P2-2i (2026-09-04) started emitting a relation record with
+/// `classification: "possible"` for every pending call/heritage site TOO,
+/// each carrying its own tentative `target_subject` -- tagged separately
+/// via the `core:indirect` facet bit (`materialize.rs`'s `FACET_ORDER`
+/// assigns the bit; a P2-2j candidate row always carries it).
+/// A row with no `target_subject` at all should not exist any more for
+/// these three kinds post-A2 ([`is_classification_consistent`]'s own
+/// invariant), so this only needs to separate "has a target and is not
+/// tagged possible" (confirmed) from "has a target and IS tagged possible"
+/// (possible); a target-less row is treated as possible too, defensively,
+/// rather than panicking on an invariant this function does not itself
+/// enforce.
+///
+/// Returns `None` for anything outside `CATEGORY_RELATION` or these three
+/// universal kinds.
+#[cfg(test)]
+pub(crate) fn classify_confirmed_possible(
+    view: &urdira_structural_store::RecordView,
+    dicts: &Dictionaries,
+) -> Option<(SiteFamily, bool)> {
+    if view.category() != CATEGORY_RELATION {
+        return None;
+    }
+    let universal_kind = dicts
+        .universal_kinds
+        .get(view.universal_kind_id() as usize)
+        .map(String::as_str)
+        .unwrap_or("");
+    let family = match universal_kind {
+        "core:call" => SiteFamily::Call,
+        "core:inherits" | "core:implements" => SiteFamily::Heritage,
+        _ => return None,
+    };
+    let indirect_bit = dicts
+        .facet_names
+        .iter()
+        .position(|name| name == "core:indirect");
+    let is_candidate = indirect_bit
+        .map(|bit| (view.facets() & (1u64 << bit)) != 0)
+        .unwrap_or(false);
+    let confirmed = view.target_subject().is_some() && !is_candidate;
+    Some((family, confirmed))
+}
+
 /// P1-D-d deliverable 1: an opt-in (`URDIRA_V4_RESIDUAL_DEBUG=1`) reason
 /// histogram + a bounded sample dump for one residual pass, printed to
 /// stderr right before the upgrade batch is published. Never allocated
@@ -2960,6 +3029,119 @@ mod tests {
         // A2's own invariant: after this migration, no visible relation
         // record may exist without a resolved `target_subject` at all.
         assert!(!is_classification_consistent(false));
+    }
+
+    /// Plan 3.4: `classify_confirmed_possible` is now the ONE definition
+    /// both `print_confirmed_possible_histogram` (this module) and
+    /// `tests_e2e.rs`'s `inspect_store_record_histogram` call -- which
+    /// trivially makes their two call sites agree with EACH OTHER by
+    /// construction, but says nothing about whether the shared function
+    /// itself still computes what both of them independently reasoned it
+    /// should. This test is that independent check: it re-derives the
+    /// confirmed/possible split for every visible relation record in a
+    /// real cold-scanned store via a SEPARATE, deliberately-duplicated-
+    /// only-here reimplementation of the pre-extraction logic (the exact
+    /// two ad hoc versions this task's own evidence found had already
+    /// started to drift -- see `classify_confirmed_possible`'s own doc
+    /// comment), and asserts the shared function agrees on every single
+    /// record. A future edit to `classify_confirmed_possible` that
+    /// silently changes its semantics fails this test, not just a manual
+    /// eyeball of two `eprintln!`s.
+    #[test]
+    fn classify_confirmed_possible_matches_an_independently_reasoned_reimplementation() {
+        let scratch = scratch_dir("classify-parity");
+        let workspace_root = fixture_root();
+        assert!(
+            workspace_root.is_dir(),
+            "shared fixture missing at {workspace_root:?}"
+        );
+        let database_path = scratch.join("workspace.sqlite");
+        let structural_root = scratch.join("structural");
+        let cas_root = scratch.join("cas");
+        let request = scan::ScanRequest {
+            request_id: "request:classify-confirmed-possible-parity".to_string(),
+            workspace_id: "workspace:classify-confirmed-possible-parity".to_string(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: urdira_worker_protocol::ScanScope::Full,
+            registry_snapshot_id: "registry:classify-confirmed-possible-parity".to_string(),
+            configuration_revision_id: "configuration:classify-confirmed-possible-parity"
+                .to_string(),
+            resolution_lock_id: "resolution:classify-confirmed-possible-parity".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = WorkerState::default();
+        let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+        // Residual is opt-in (`URDIRA_V4_RESIDUAL`, default off) -- this
+        // deliberately exercises the cold-only classification (both
+        // confirmed rows the cold producer emits directly and possible/
+        // candidate rows it emits for pending sites), not the post-
+        // residual-upgrade population; the classification rule under test
+        // does not depend on which generation produced a row.
+        let cold_event = scan::run_with_residual(
+            request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("cold scan succeeds");
+        let generation = match cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+
+        let store = StoreReader::open(&structural_root).expect("store reopens");
+        let dicts = store.dictionaries();
+        let indirect_bit = dicts
+            .facet_names
+            .iter()
+            .position(|name| name == "core:indirect")
+            .expect("FACET_ORDER (materialize.rs) always registers core:indirect");
+        let mut checked = 0u64;
+        for view in store.iter_visible(generation) {
+            // Independent reimplementation (route B): the exact rule
+            // `print_confirmed_possible_histogram` used before this task
+            // extracted `classify_confirmed_possible` out of it, written
+            // fresh here rather than copy-pasted, on purpose.
+            let expected = if view.category() != CATEGORY_RELATION {
+                None
+            } else {
+                let universal_kind = dicts
+                    .universal_kinds
+                    .get(view.universal_kind_id() as usize)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let family = match universal_kind {
+                    "core:call" => Some(SiteFamily::Call),
+                    "core:inherits" | "core:implements" => Some(SiteFamily::Heritage),
+                    _ => None,
+                };
+                family.map(|family| {
+                    let is_candidate = (view.facets() & (1u64 << indirect_bit)) != 0;
+                    (family, view.target_subject().is_some() && !is_candidate)
+                })
+            };
+            // Route A: the shared function both production call sites use.
+            let actual = classify_confirmed_possible(&view, &dicts);
+            assert_eq!(
+                expected,
+                actual,
+                "classify_confirmed_possible disagreed with the independent reimplementation for record {:?}",
+                view.identity_key(),
+            );
+            checked += 1;
+        }
+        // The shared task-planner fixture is known (see the sibling e2e
+        // test above) to produce both call and heritage sites, confirmed
+        // and possible -- a `checked == 0` run would mean this test
+        // silently exercised nothing.
+        assert!(checked > 0, "expected at least one visible record");
     }
 
     static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -4185,45 +4367,35 @@ mod tests {
     /// this evidence doc uses for cold/after/v3 alike -- a Rust-side,
     /// metadata-only `StoreReader::iter_visible` scan (no
     /// `@urdira/canonical` body decode at all), splitting `core:call` and
-    /// `core:inherits`/`core:implements` by `target_subject().is_some()`
-    /// (a possible row never has one, a confirmed row always does -- the
-    /// exact same structural test `residual.rs`'s own `collect` already
-    /// trusts for correctness, not merely for this diagnostic). Printing
-    /// this at both the cold generation and the post-upgrade generation of
-    /// the SAME corpus checkout/worker binary in the SAME test run
-    /// eliminates the cross-session drift the P1-D-c evidence doc could
-    /// not rule out for its own 96,847-vs-64,931 discrepancy.
+    /// `core:inherits`/`core:implements` via [`classify_confirmed_possible`]
+    /// (plan 3.4: this task extracted that classification out of this
+    /// function's own former `target_subject().is_some()`-only body so
+    /// `tests_e2e.rs`'s `inspect_store_record_histogram` -- which used to
+    /// reimplement a similar but NOT identical, facet-bit-aware version of
+    /// this same split because `residual` was otherwise opaque to it --
+    /// shares the exact same code instead of drifting from it). See that
+    /// function's own doc comment for why `target_subject().is_some()`
+    /// alone stopped being sufficient after P2-2i (2026-09-04): this
+    /// function's numbers for `*_possible` were effectively always ~0
+    /// before that fix, since a possible/candidate row carries a target
+    /// too and this function had no way to tell it apart from a genuinely
+    /// confirmed one. Printing this at both the cold generation and the
+    /// post-upgrade generation of the SAME corpus checkout/worker binary in
+    /// the SAME test run eliminates the cross-session drift the P1-D-c
+    /// evidence doc could not rule out for its own 96,847-vs-64,931
+    /// discrepancy.
     fn print_confirmed_possible_histogram(label: &str, structural_root: &Path, generation: u64) {
         let store = StoreReader::open(structural_root).expect("store reopens for histogram");
         let dicts = store.dictionaries();
         let (mut call_confirmed, mut call_possible) = (0u64, 0u64);
         let (mut heritage_confirmed, mut heritage_possible) = (0u64, 0u64);
         for view in store.iter_visible(generation) {
-            if view.category() != CATEGORY_RELATION {
-                continue;
-            }
-            let universal_kind = dicts
-                .universal_kinds
-                .get(view.universal_kind_id() as usize)
-                .map(String::as_str)
-                .unwrap_or("");
-            let confirmed = view.target_subject().is_some();
-            match universal_kind {
-                "core:call" => {
-                    if confirmed {
-                        call_confirmed += 1;
-                    } else {
-                        call_possible += 1;
-                    }
-                }
-                "core:inherits" | "core:implements" => {
-                    if confirmed {
-                        heritage_confirmed += 1;
-                    } else {
-                        heritage_possible += 1;
-                    }
-                }
-                _ => {}
+            match classify_confirmed_possible(&view, &dicts) {
+                Some((SiteFamily::Call, true)) => call_confirmed += 1,
+                Some((SiteFamily::Call, false)) => call_possible += 1,
+                Some((SiteFamily::Heritage, true)) => heritage_confirmed += 1,
+                Some((SiteFamily::Heritage, false)) => heritage_possible += 1,
+                None => {}
             }
         }
         eprintln!(
