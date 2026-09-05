@@ -1626,8 +1626,17 @@ pub fn pending_site_key_at(arr: &[u8], i: usize) -> PendingSiteKey {
 /// (`&self.keys[HEADER_LEN..]`, `header_and_data(&self.keys)`, ...); since
 /// `SectionSource` derefs to `[u8]` exactly like `Mmap` already did, none
 /// of that decoding code needed to change -- only the field type.
+///
+/// F1 1.2: `File` wraps an `Arc<Mmap>` (not a bare `Mmap`) so the whole
+/// type is cheaply `Clone` (an `Arc` bump either way) -- `StoreInner::
+/// extend`'s incremental reopen reconstructs every PREVIOUS segment with
+/// freshly fused closures maps by cloning its `SectionSource` fields
+/// rather than re-mmapping/re-scanning them, and that clone needs to work
+/// for a base (`Dir`-backed, `File`) segment exactly as cheaply as for a
+/// delta (`Container`-backed) one.
+#[derive(Clone)]
 pub enum SectionSource {
-    File(Mmap),
+    File(Arc<Mmap>),
     Container {
         mmap: Arc<Mmap>,
         start: usize,

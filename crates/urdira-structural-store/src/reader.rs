@@ -79,6 +79,14 @@ pub enum Direction {
 /// so every accessor below (`key_at`, `meta_row`, ...) keeps indexing
 /// plain byte slices exactly as it did when every field was an `Mmap`
 /// directly (`SectionSource` derefs to `[u8]`).
+/// F1 1.2: `Clone` (all fields are cheap to clone: `SectionSource`/`Arc<
+/// HashMap>` are `Arc` bumps, the `valid_*_sorted` `Vec<u32>`s are plain
+/// memcpys) so `StoreInner::extend` can rebuild a PREVIOUS generation's
+/// `Segment` with freshly fused closures maps without re-scanning
+/// `records.meta`/`deps.meta` (see `StoreInner::extend`'s own doc comment
+/// for the correctness reason this rebuild -- not a bare `Arc::clone` of
+/// the old `Segment` -- is required).
+#[derive(Clone)]
 pub(crate) struct Segment {
     pub generation: u64,
     pub keys: SectionSource,
@@ -129,8 +137,8 @@ pub(crate) struct Segment {
     pub pending_closures: Arc<HashMap<PendingSiteKey, u32>>,
 }
 
-fn open_data(dir: &Path, name: &str) -> Result<Mmap> {
-    mmap_file(&dir.join(name))
+fn open_data(dir: &Path, name: &str) -> Result<Arc<Mmap>> {
+    Ok(Arc::new(mmap_file(&dir.join(name))?))
 }
 
 impl Segment {
@@ -785,6 +793,15 @@ pub(crate) struct StoreInner {
     /// 2026-09-03-v4-p3-2-incremental-residuals.md`).
     pub dep_owner_index: HashMap<u32, Vec<(usize, usize)>>,
     pub record_closures: Arc<HashMap<[u8; 32], u32>>,
+    /// F1 1.2: mirrors `record_closures` -- the SAME merged `Arc` every
+    /// segment's own `dep_closures` field holds (see `load`'s `Arc::
+    /// clone` fan-out). Kept at this level (not just per-`Segment`) so
+    /// `StoreInner::extend` can fuse it without fishing an arbitrary
+    /// segment's copy back out.
+    pub dep_closures: Arc<HashMap<[u8; 32], u32>>,
+    /// F1 1.2: mirrors `record_closures`/`dep_closures` for `closures.
+    /// pending`.
+    pub pending_closures: Arc<HashMap<PendingSiteKey, u32>>,
     pub closure_valid_to_sorted: Vec<u32>,
     pub dep_closure_valid_to_sorted: Vec<u32>,
     pub manifest_mtime: std::time::SystemTime,
@@ -1027,6 +1044,234 @@ impl StoreInner {
             subject_index,
             dep_owner_index,
             record_closures,
+            dep_closures,
+            pending_closures,
+            closure_valid_to_sorted,
+            dep_closure_valid_to_sorted,
+            manifest_mtime,
+            reader_guard,
+        })
+    }
+
+    /// F1 1.2: incremental reopen. `reopen_if_changed` calls this instead
+    /// of [`Self::load`] whenever `fresh_manifest` is confirmed (by the
+    /// caller) to be a byte-identical PREFIX extension of `prev`'s own
+    /// manifest -- same `base`, same leading `deltas`, only `new_delta_
+    /// names` appended (normally exactly one: this process's own just-
+    /// published generation). Avoids `load`'s full re-open (base included):
+    /// every previously-open segment's mmap/`SectionSource`s/`valid_*_
+    /// sorted` are REUSED, not re-scanned; only the new delta(s) pay
+    /// `Segment::open`'s per-row parse, and the sample xxh3 verification
+    /// checks only the newest new segment's `keys` (the base's own bytes
+    /// were already verified whenever THIS process first opened it).
+    ///
+    /// **Correctness trap (do not "simplify" this away):**
+    /// [`Segment::effective_valid_to`]/[`Segment::deps_effective_valid_to`]
+    /// read `self.record_closures`/`self.dep_closures` -- a field FIXED
+    /// on the `Segment` at `Segment::open` time, not looked up on
+    /// `StoreInner` at query time. Every segment produced by ONE `load`/
+    /// `extend` call is handed the SAME `Arc<HashMap>` (see the `Arc::
+    /// clone` fan-out both here and in `load`), so `is_visible`'s
+    /// verdict for a record living in the BASE can depend on a closure
+    /// entry written by a delta published many generations later (a new
+    /// delta can close a record that lives in an older segment). A naive
+    /// incremental reopen that only builds a `Segment` for the NEW
+    /// delta(s) and reuses the OLD `Arc<Segment>`s for everything else
+    /// would silently keep serving each old segment's STALE closures map
+    /// forever -- any record closed by generation G+1 (or later) would
+    /// stay visible past its real `valid_to` for every already-open
+    /// segment. The fix: every previous segment is rebuilt (`Segment`'s
+    /// `#[derive(Clone)]`, see its own doc comment) with the freshly
+    /// fused closures `Arc`s substituted in -- cheap (every other field
+    /// is a `SectionSource`/`Vec<u32>` clone, an `Arc` bump or a plain
+    /// memcpy, never a re-scan of `records.meta`/`deps.meta`), but
+    /// mandatory. `reopen_incremental_matches_fresh_open`,
+    /// `reopen_falls_back_on_non_prefix_manifest`, and a dedicated test
+    /// that closes a BASE record via a new delta and compares `is_
+    /// visible`/`by_owner`/`iter_visible` between the incremental and a
+    /// from-scratch `StoreReader::open` all guard this.
+    fn extend(
+        prev: &Arc<StoreInner>,
+        dir: &Path,
+        fresh_manifest: Manifest,
+        manifest_mtime: std::time::SystemTime,
+        new_delta_names: &[String],
+    ) -> Result<Self> {
+        // 1. Open the new delta container(s) only -- oldest of the new
+        //    ones first, matching `load`'s "locations" ordering convention
+        //    (base first, deltas oldest-to-newest) for the closures/dicts
+        //    fold below.
+        let mut new_locations: Vec<OpenedLocation> = Vec::with_capacity(new_delta_names.len());
+        for name in new_delta_names {
+            let path = dir.join(name);
+            let (mmap, _generation, ranges) = container::open_container(&path)?;
+            new_locations.push(OpenedLocation::Container { path, mmap, ranges });
+        }
+
+        // 2. Fuse closures: start from `prev`'s already-merged maps (an
+        //    `Arc` bump-then-clone-the-map -- O(existing closures count),
+        //    not O(corpus)) and fold each new delta's OWN closures.* on
+        //    top, in the SAME oldest-to-newest order `load` uses (a later
+        //    delta's entry for the same key wins, via `HashMap::insert`).
+        let mut record_closures = (*prev.record_closures).clone();
+        let mut dep_closures = (*prev.dep_closures).clone();
+        let mut pending_closures = (*prev.pending_closures).clone();
+        for loc in &new_locations {
+            let records_bytes =
+                optional_section_bytes(loc, "closures.records", SectionId::ClosuresRecords)?;
+            for (k, v) in load_closures(records_bytes)? {
+                record_closures.insert(k, v);
+            }
+            let deps_bytes = optional_section_bytes(loc, "closures.deps", SectionId::ClosuresDeps)?;
+            for (k, v) in load_closures(deps_bytes)? {
+                dep_closures.insert(k, v);
+            }
+            let pending_bytes =
+                optional_section_bytes(loc, "closures.pending", SectionId::ClosuresPending)?;
+            for (k, v) in load_pending_closures(pending_bytes)? {
+                pending_closures.insert(k, v);
+            }
+        }
+        let record_closures = Arc::new(record_closures);
+        let dep_closures = Arc::new(dep_closures);
+        let pending_closures = Arc::new(pending_closures);
+
+        // 3. Dicts/subjects: append-only (`Dictionaries::append`'s own doc
+        //    comment) -- start from a clone of `prev.dicts` instead of
+        //    `Dictionaries::default()`, fold only the NEW deltas' own
+        //    `dict.bin`/`subjects.keys` on top. Mirrors `load`'s own
+        //    "`dicts.append` during the loop, `dicts.subjects = subjects`
+        //    after" split for the same reason: `dict.bin` never itself
+        //    carries `subjects` (that lives in the separate `subjects.
+        //    keys` file), so `append`'s own `self.subjects.extend(..)` is
+        //    always a no-op in practice; `subjects` is folded explicitly
+        //    here instead of via `Dictionaries::append`.
+        let mut dicts = prev.dicts.clone();
+        let subjects_before = dicts.subjects.len();
+        let mut new_subjects: Vec<[u8; 32]> = Vec::new();
+        for loc in &new_locations {
+            let dict_bytes = optional_section_bytes(loc, "dict.bin", SectionId::DictBin)?;
+            let (add, _) = load_dict_file(dict_bytes)?;
+            dicts.append(&add);
+            let subjects_bytes =
+                optional_section_bytes(loc, "subjects.keys", SectionId::SubjectsKeys)?;
+            new_subjects.extend(load_subjects_file(subjects_bytes)?);
+        }
+        dicts.subjects.extend(new_subjects.iter().copied());
+        let mut subject_index = prev.subject_index.clone();
+        for (i, k) in new_subjects.iter().enumerate() {
+            subject_index.insert(*k, (subjects_before + i) as u32);
+        }
+
+        // 4. New segments for the new delta(s) only -- `Segment::open`
+        //    scans just that segment's own `records.meta`/`deps.meta`
+        //    (O(new delta rows), not O(corpus)).
+        let mut new_segments: Vec<Arc<Segment>> = Vec::with_capacity(new_locations.len());
+        for loc in &new_locations {
+            new_segments.push(Arc::new(Segment::open(
+                loc,
+                Arc::clone(&record_closures),
+                Arc::clone(&dep_closures),
+                Arc::clone(&pending_closures),
+            )?));
+        }
+        new_segments.reverse(); // newest-first among themselves.
+
+        // Sample-verify only the newest NEW segment's `keys` (plan §1.2
+        // step 3): the base's own bytes were already verified the first
+        // time this process opened it (`load`'s own sample-verify block),
+        // and every carried-forward segment's `SectionSource`s below are
+        // untouched bytes, not re-read from disk.
+        if let Some(newest_new) = new_segments.first() {
+            let (_, newest_keys_data) = header_and_data(&newest_new.keys)?;
+            let newest_row_boundaries = nibble_row_boundaries(newest_keys_data);
+            verify_xxh3_partitioned_stride(
+                &newest_new.keys,
+                &newest_row_boundaries,
+                KEYS_STRIDE,
+                "newest/records.keys",
+            )?;
+        }
+
+        // 5. Rebuild EVERY previous segment with the fused closures (see
+        //    this function's own doc comment for why this is mandatory,
+        //    not an optimization to skip) -- `Segment: Clone` makes every
+        //    other field an `Arc` bump or a `Vec<u32>` memcpy.
+        let mut carried_segments: Vec<Arc<Segment>> = Vec::with_capacity(prev.segments.len());
+        for seg in &prev.segments {
+            let mut carried = (**seg).clone();
+            carried.record_closures = Arc::clone(&record_closures);
+            carried.dep_closures = Arc::clone(&dep_closures);
+            carried.pending_closures = Arc::clone(&pending_closures);
+            carried_segments.push(Arc::new(carried));
+        }
+
+        // `segments` convention: newest delta first, base last (same as
+        // `load`). The new segments are newer than every carried one.
+        let new_segment_count = new_segments.len();
+        let mut segments = new_segments;
+        segments.extend(carried_segments);
+
+        // 6. `dep_owner_index`: every PREVIOUS `(segment_index, ordinal)`
+        //    pair shifts by `+new_segment_count` (the new segments now
+        //    occupy indices `[0, new_segment_count)`) -- a plain integer
+        //    bump per entry, not a re-parse of any `deps.meta` byte, then
+        //    the new segments' own rows are indexed exactly as `load`
+        //    does (same `u32le(seg.deps_meta_row(..), OWNER_ARTIFACT)`
+        //    read, just scoped to the new segments instead of every
+        //    segment in the store).
+        let mut dep_owner_index: HashMap<u32, Vec<(usize, usize)>> = prev
+            .dep_owner_index
+            .iter()
+            .map(|(&owner, entries)| {
+                (
+                    owner,
+                    entries
+                        .iter()
+                        .map(|&(idx, ord)| (idx + new_segment_count, ord))
+                        .collect(),
+                )
+            })
+            .collect();
+        for (segment_index, seg) in segments[..new_segment_count].iter().enumerate() {
+            for ordinal in 0..seg.deps_n {
+                let owner_artifact = u32le(seg.deps_meta_row(ordinal), deps_meta::OWNER_ARTIFACT);
+                dep_owner_index
+                    .entry(owner_artifact)
+                    .or_default()
+                    .push((segment_index, ordinal));
+            }
+        }
+
+        // 7. `closure_valid_to_sorted`/`dep_closure_valid_to_sorted`:
+        //    re-derived from the (small, closures-only) fused maps -- cheap
+        //    relative to everything else here, plan §1.2 step 2.
+        let mut closure_valid_to_sorted: Vec<u32> = record_closures.values().copied().collect();
+        closure_valid_to_sorted.sort_unstable();
+        let mut dep_closure_valid_to_sorted: Vec<u32> = dep_closures.values().copied().collect();
+        dep_closure_valid_to_sorted.sort_unstable();
+
+        // 8. Refcount: register a marker naming the FULL new segment list.
+        //    `prev`'s own `ReaderGuard` unregisters itself via `Drop` once
+        //    the caller drops its last `Arc<StoreInner>` reference to
+        //    `prev` (the same "swap the `Arc`, let the old one's guard
+        //    drop naturally" protocol `reopen_if_changed` already relies
+        //    on for the full-`load` path -- no explicit "unregister" call
+        //    exists or is needed).
+        let mut segment_names: Vec<String> = vec![fresh_manifest.base.clone()];
+        segment_names.extend(fresh_manifest.deltas.iter().cloned());
+        let reader_guard = crate::refcount::register(dir, &segment_names)?;
+
+        Ok(StoreInner {
+            dir: dir.to_path_buf(),
+            manifest: fresh_manifest,
+            segments,
+            dicts,
+            subject_index,
+            dep_owner_index,
+            record_closures,
+            dep_closures,
+            pending_closures,
             closure_valid_to_sorted,
             dep_closure_valid_to_sorted,
             manifest_mtime,
@@ -1060,6 +1305,27 @@ impl StoreInner {
         }
         None
     }
+}
+
+/// F1 1.2: returns `Some(new_delta_names)` when `fresh` is a byte-
+/// identical PREFIX extension of `current` -- same `base`, same `format`,
+/// `current.deltas` is an exact leading slice of `fresh.deltas` -- so
+/// [`StoreInner::extend`] is safe to use instead of a full [`StoreInner
+/// ::load`]. `None` for anything else (a new `base` from compaction, a
+/// format change, a shorter or diverging delta list, or literally no new
+/// deltas at all despite the mtime bump) -- the caller falls back to
+/// `load` in every one of those cases, exactly the pre-F1-1.2 behavior.
+fn new_delta_suffix(current: &Manifest, fresh: &Manifest) -> Option<Vec<String>> {
+    if current.format != fresh.format || current.base != fresh.base {
+        return None;
+    }
+    if fresh.deltas.len() < current.deltas.len() {
+        return None;
+    }
+    if fresh.deltas[..current.deltas.len()] != current.deltas[..] {
+        return None;
+    }
+    Some(fresh.deltas[current.deltas.len()..].to_vec())
 }
 
 /// A handle onto an open structural store. Cheap to `clone` (an `Arc`
@@ -1102,6 +1368,17 @@ impl StoreReader {
     /// if so, atomically swaps in a freshly mapped snapshot. Returns
     /// whether a reload happened. Cheap when nothing changed (one
     /// `stat`).
+    ///
+    /// F1 1.2: when the fresh manifest is a byte-identical PREFIX
+    /// extension of the currently-held one (see [`new_delta_suffix`]),
+    /// goes through [`StoreInner::extend`] instead of a full [`StoreInner
+    /// ::load`] -- the common case for `crates/urdira-indexing-worker`'s
+    /// `v4::delta::run_one`, which calls this once per `Changed` scan and
+    /// (being the SAME process that just published the prior generation)
+    /// always sees exactly its own new delta appended. Any other shape of
+    /// change (a new base -- compaction; a non-prefix delta list; a
+    /// format/mtime change carrying zero new deltas) falls back to the
+    /// full `load`, unchanged from before this task.
     pub fn reopen_if_changed(&self) -> Result<bool> {
         let current = self.snapshot();
         let manifest_path = current.dir.join("MANIFEST");
@@ -1112,7 +1389,17 @@ impl StoreReader {
         if mtime <= current.manifest_mtime {
             return Ok(false);
         }
-        let fresh = StoreInner::load(&current.dir)?;
+        let fresh_manifest = Manifest::read(&manifest_path)?;
+        let fresh = match new_delta_suffix(&current.manifest, &fresh_manifest) {
+            Some(new_delta_names) if !new_delta_names.is_empty() => StoreInner::extend(
+                &current,
+                &current.dir,
+                fresh_manifest,
+                mtime,
+                &new_delta_names,
+            )?,
+            _ => StoreInner::load(&current.dir)?,
+        };
         let new_prefault = spawn_prefault(&fresh);
         *self.inner.lock().expect("store mutex poisoned") = Arc::new(fresh);
         *self.prefault.lock().expect("prefault mutex poisoned") = new_prefault;
