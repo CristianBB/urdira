@@ -65,6 +65,13 @@ pub fn run_with_residual(
 
     let mut conn = catalog::open_and_ensure_schema(&database_path)?;
 
+    // F4 4.1: `None` for a `Full` scan (cold: the residual pass's own file
+    // map covers the whole frontier, same as before this task) and
+    // `Some(touched_owner_paths)` for a `Changed` scan -- `delta::run`
+    // already computes this exact list (edited/created + deleted owner
+    // paths) for the external-entity close-protection pass, so this just
+    // carries it one level up rather than re-deriving it.
+    let mut touched_owner_paths: Option<Vec<String>> = None;
     let result = match request.scope.clone() {
         ScanScope::Full => run_full(
             &request,
@@ -88,7 +95,11 @@ pub fn run_with_residual(
             worker_state,
             &mut clock,
             on_queryable,
-        ),
+        )
+        .map(|(event, touched)| {
+            touched_owner_paths = Some(touched);
+            event
+        }),
     };
 
     // P1-D-c: opt-in for now (default off). Every existing test/tool
@@ -111,6 +122,8 @@ pub fn run_with_residual(
                 registry_snapshot_id: request.registry_snapshot_id.clone(),
                 configuration_revision_id: request.configuration_revision_id.clone(),
                 resolution_lock_id: request.resolution_lock_id.clone(),
+                touched_owners: touched_owner_paths,
+                reschedule_count: 0,
             },
             residual_events,
         );

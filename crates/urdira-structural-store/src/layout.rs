@@ -16,12 +16,25 @@ pub const HEADER_MAGIC: &[u8; 4] = b"URD4";
 /// written at format 4 fails to open with a clear error (`FileHeader::
 /// decode` below); the daemon reindexes from scratch. See `identity_codec`'s
 /// module doc for the mechanism this format bump enables.
-pub const HEADER_FORMAT: u16 = 5;
+///
+/// F4 4.3 (2026-09-05): bumped 5->6 for the new `entities.index` section
+/// (`container::SectionId::EntitiesIndex`, `TRIPLE_STRIDE` below) -- every
+/// base and delta this crate writes now carries it unconditionally, so a
+/// format-5 store (written before this section existed) must fail to open
+/// rather than silently serve `StoreReader::entity_by_owner_and_start`
+/// lookups against a section that was never written. Same "no migration,
+/// clear error, daemon reindexes from scratch" contract as the 4->5 bump --
+/// see `docs/decisions/26-v4-structural-store.md`'s amendment for the
+/// section's on-disk layout.
+pub const HEADER_FORMAT: u16 = 6;
 
 pub const KEYS_STRIDE: usize = 32;
 pub const DIGESTS_STRIDE: usize = 160; // record_digest, body_digest, identity_id, identity_key_digest, previous_record_id
 pub const META_STRIDE: usize = 96;
 pub const PAIR2_STRIDE: usize = 8; // (u32, u32) -- by_name
+/// F4 4.3: `(owner_artifact u32, span_start u32, ordinal u32)` -- `entities.
+/// index`, sorted by `(owner_artifact, span_start)`.
+pub const TRIPLE_STRIDE: usize = 12;
 pub const VALIDITY_QUAD_STRIDE: usize = 16; // (u32, u32, u32, u32) -- by_owner / adj.out / adj.in (inline validity)
 pub const BY_KIND_STRIDE: usize = 9; // (u16, u8, u16, u32)
 pub const BY_IDENTITY_STRIDE: usize = 36; // (32B digest, u32)

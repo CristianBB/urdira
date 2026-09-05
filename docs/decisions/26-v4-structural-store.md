@@ -87,9 +87,10 @@ not yet the plan's own `<data_root>/workspaces/<ws>/` subdirectory — see
 ### Per-table files and the 64-byte header
 
 Every segment file except `MANIFEST`/`MANIFEST.next` starts with a common
-64-byte header, little-endian: magic `"URD4"` (4 B), `format` (`u16` = `5`
-as of the 2026-09-05 "group A" campaign, `4` before it — see the format-bump
-note below), `table_id` (`u16`: `Records=1`, `Dependencies=2`, `Dict=3`,
+64-byte header, little-endian: magic `"URD4"` (4 B), `format` (`u16` = `6`
+as of the 2026-09-05 "frente 4" residual-tsgo session (`entities.index`,
+below), `5` from the "group A" campaign earlier the same day, `4` before it
+— see the format-bump note below), `table_id` (`u16`: `Records=1`, `Dependencies=2`, `Dict=3`,
 `SubjectsKeys=4`, `PendingSites=5`), `row_count` (`u64`), `generation`
 (`u64`), `xxh3` of the data region after byte 64 (`u64`), 32 B reserved. For
 the five hot `records.*` sections (`records.keys`/`records.meta`/
@@ -114,6 +115,7 @@ the partitioned write (`crates/urdira-structural-store/src/segment_io.rs`).
 | `records.by_kind` | `(universal_kind_id u16, category u8, kind_id u16, ordinal u32)`, sorted | 9 |
 | `records.by_identity` | `(identity_key_digest 32 B, ordinal u32)`, sorted; includes closed rows (identity chaining) | 36 |
 | `adj.out` / `adj.in` | `(subject_ordinal u32, valid_from u32, valid_to u32, ordinal u32)`, sorted, **inline validity** | 16 |
+| `entities.index` | `(owner_artifact u32, span_start u32, ordinal u32)`, sorted by `(owner_artifact, span_start)`, no inline validity — since the 2026-09-05 "frente 4" session (F4 4.3); mandatory in every base/delta this crate writes (format 6), unlike `pending.sites`/`dict.bin`/etc.'s "absent if empty" convention. Exactly the `CATEGORY_ENTITY` rows, excluding `jsts:entity_inferred_type` (an inferred-type row deliberately shares its declaration's own `(owner, start)` key — see `segment_io::is_entities_index_row`) | 12 |
 | `deps.keys` | `dependency_id` (32 B), sorted — a deliberate addition beyond the plan's own sketch (a delta's `closures.deps` needs a standalone key to name which dependency edge closed) | 32 |
 | `deps.meta` | `record_ordinal u32` (`u32::MAX` = the bare `record:` sentinel v3-data quirk), `owner_artifact u32`, `owner_version u32`, `dep_artifact u32`, `dep_version u32`, `role u8`, `valid_from u32`, `valid_to u32` (29 B used, 32 B stride) | 32 |
 | `deps.reverse` | `(dep_artifact u32, ordinal u32)`, sorted | 8 |
@@ -144,6 +146,68 @@ diagnostic/v3-converted identities, or a relation whose endpoint is not
 resolvable) still need `RAW`. See `docs/evidence/
 2026-09-05-v4-group-a-cold-lines-references.md` §4 for the measured
 byte-size effect (`records.ident` 611 MB → 9 MB).
+
+**`entities.index` as a persisted section (F4 4.3, format bump 5→6, no
+migration).** Before this, mapping a residual pass's resolved call/heritage
+TARGET (an `(owner_path, name_identifier_start)` pair) back to a store
+entity required `urdira-indexing-worker`'s `v4::residual::collect` to run a
+full `iter_visible(generation)` scan of the WHOLE corpus on every residual
+attempt, filtering to `CATEGORY_ENTITY` and excluding `jsts:entity_
+inferred_type` (an inferred-type row deliberately carries the SAME `path`/
+`start` as the declaration it types, so it must never win that key's slot —
+see the exclusion's own rationale, unchanged by this section). This section
+makes that lookup O(sites) instead of O(corpus): a sorted array of
+`(owner_artifact u32, span_start u32, ordinal u32)` triples, written
+alongside `by_name` in both the base writers
+(`segment_io::write_hot_and_secondary_files[_partitioned]`) and the delta
+writer (`writer::build_delta_sections`), filtered by the same rule
+(`segment_io::is_entities_index_row`/`inferred_type_kind_id`) so all three
+writers apply the exclusion identically. Read side: `StoreReader::entity_
+by_owner_and_start(owner, start, generation)` binary-searches each
+segment's own array for the key — `(owner_artifact, span_start)` is
+expected unique among LIVE rows (enforced at write time by the inferred-
+type exclusion, not by any uniqueness check across every historical row a
+segment's array may still list), so a genuine collision among several
+still-live entities at the exact same span (observed once in the shared
+`task-planner` fixture, at `(owner, start=0)` — a pre-existing imprecision,
+not introduced by this section) is resolved DETERMINISTICALLY rather than
+by "whichever candidate the binary search range happens to enumerate
+first" (the original P4-review draft of this rule, replaced before this
+decision's text settled — revision fix, 2026-09-05): every segment is
+scanned (not just the newest), and among every VISIBLE candidate sharing
+the key the winner is picked by, in order, (1) the greatest `valid_from`
+(the most recently OPENED row), (2) on a tie, the NEWEST segment
+(`StoreInner::segments`' own newest-first ordering), (3) on a further tie
+(two rows in the very same segment's own key range), the greatest
+`ordinal`. This is arbitrary but STABLE across repeated calls against the
+same snapshot, unlike an order that depends on binary-search/sort
+internals — see `crates/urdira-structural-store/tests/entities_index_test
+.rs::entity_by_owner_and_start_breaks_ties_deterministically` for both
+tie-break levels exercised directly, and `urdira-indexing-worker`'s
+`entities_index_section_and_scan_agree_on_the_shared_fixture` for the
+real fixture's own collision resolving identically through both the
+`entities.index` section and the pre-4.3 full-scan path. The section is
+**mandatory** in every base/delta this crate
+writes from format 6 onward (unlike `pending.sites`/`dict.bin`/etc.'s
+"absent when empty" convention) — `container::open_container` already
+treats an unknown `SectionId` in a container's TOC as a hard error, so a
+format-6 reader opening a format-5 store (missing the section entirely)
+would otherwise silently degrade rather than fail cleanly; the format bump
+(`layout::HEADER_FORMAT` 5→6, `Manifest::format` 5→6) makes that a same
+clear-error-then-reindex contract the 4→5 bump already established, not a
+new kind of failure mode. `urdira-tsgo-client::entity_index::EntityIndex`
+itself (the generic, reusable `(path, name_start) -> id` in-memory index)
+is UNCHANGED — still exactly what `urdira-tsgo-client`'s own tests build
+directly from caller-supplied triples, with no dependency on this crate at
+all (adding one would have inverted that crate's documented "does no I/O,
+holds no store reference" boundary). The adapter lives instead in
+`urdira-indexing-worker::v4::residual` as a private `EntityLookup` enum:
+`Section` (default) resolves `path` to an `owner_artifact` ordinal via the
+same `Frontier`-derived reverse map every other lookup in that module
+builds, then calls `entity_by_owner_and_start` directly; `Scan` (`URDIRA_
+V4_ENTITY_INDEX=scan`) keeps building the old `EntityIndex` from a full
+scan, for comparison/debugging only. `collect()`'s own cost is therefore
+now O(pending sites + owners in the frontier), not O(corpus).
 
 **Two documented deviations from the plan's literal byte layout**: `facets`
 is `u64` (the plan's table specified `u32`; the shipped crate widened it per
@@ -273,8 +337,8 @@ durable before the root pointing at it, and `BucketedMerkleSet::write_slots`
 coalesces touched slots into contiguous ranges (decision 27). Measured
 steady-edit `write_ms` 39-71 ms (hub edit 126 ms), `container_fsync` flat at
 6-9 ms regardless of row count; empty `closures.*`/`dict.bin`/`subjects.keys`
-sections are skipped (P3-3 §4). The mandatory 14 hot files per base are
-unchanged.
+sections are skipped (P3-3 §4). The mandatory hot-file count per base grew
+from 14 to 15 with `entities.index` (F4 4.3, below); otherwise unchanged.
 
 **Write-path bandwidth finding (P2-2l, §18.4).** With per-phase timers on a
 representative cold run (`n = 2,831,264`, `records.body` 978 MB,

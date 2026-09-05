@@ -129,6 +129,16 @@ pub mod syntax_kind {
     /// `ModuleDeclaration` (a TypeScript `namespace`/`module` block) --
     /// from `dist/enums/syntaxKind.enum.js`.
     pub const MODULE_DECLARATION: u32 = 268;
+    /// `BindingElement` (one element of an `ObjectBindingPattern`/
+    /// `ArrayBindingPattern` destructuring pattern, e.g. `a`/`b: renamed`
+    /// in `const { a, b: renamed } = x`) -- verified live, F4 4.4 (a real
+    /// `getExportsOfModule` response for `export const { a, b: renamed } =
+    /// ...` points its `value_declaration` handle directly at a node of
+    /// this kind, for BOTH the plain and renamed element). See
+    /// `RemoteSourceFile::name_start`'s own doc comment for the child-order
+    /// convention (`[propertyName?, name, initializer?]`) this kind needs
+    /// special handling for.
+    pub const BINDING_ELEMENT: u32 = 209;
     pub const HERITAGE_CLAUSE: u32 = 299;
     pub const SOURCE_FILE: u32 = 307;
     pub const JSDOC: u32 = 315;
@@ -386,16 +396,56 @@ impl RemoteSourceFile {
     /// identifier binding).
     ///
     /// Known divergences (documented, not fixed — narrow and rare in
-    /// practice): a `ComputedPropertyName` key (`[expr]() {}`) or a
-    /// destructuring binding (`const { a, b } = x`) has no immediate
-    /// Identifier child at all, so this returns `None` for those (the
-    /// caller then falls back to the declaration's own start, matching
+    /// practice): a `ComputedPropertyName` key (`[expr]() {}`) has no
+    /// immediate Identifier child at all, so this returns `None` for that
+    /// (the caller then falls back to the declaration's own start, matching
     /// `analyzer.ts`'s `nameNode === undefined` branch) rather than the
-    /// real `.name` node's position.
+    /// real `.name` node's position. A NESTED destructuring rename whose
+    /// `name` is itself a binding pattern, not an Identifier (`{a: {b}}` —
+    /// the property `a` renamed-and-destructured into `{b}`) falls back to
+    /// the propertyName's own position (`a`'s), same as the pre-F4-4.4
+    /// behavior for this shape — a future task could descend into the
+    /// nested pattern for a more precise position.
+    ///
+    /// F4 4.4: `BindingElement` (`const { a, b: renamed } = x`'s `a`/`b:
+    /// renamed` elements — verified live, `crate::node::syntax_kind::
+    /// BINDING_ELEMENT`'s own doc comment) needs special handling: its
+    /// children are ordered `[propertyName?, name, initializer?]`, and
+    /// naively taking "the last Identifier child" (this function's first
+    /// cut at this fix) breaks a default-value initializer that is ITSELF a
+    /// bare identifier reference (`{a = defaultRef}` has children `[name
+    /// a, initializer defaultRef]` — TWO identifier children, and "last"
+    /// wrongly picks `defaultRef`). The reliable signal is not child COUNT
+    /// but the literal source text: a rename is exactly the case where the
+    /// first identifier child is immediately followed (past trivia) by a
+    /// `:` token (`{b: renamed}` — `b` then `:` then `renamed`); a plain
+    /// element, renamed or not, whose first identifier is followed by
+    /// anything else (`}`, `,`, `=`) means that FIRST identifier already
+    /// IS the bound name (`{a}`, `{a = defaultRef}`). Only when the `:`
+    /// signal fires AND a second identifier child actually exists (not the
+    /// nested-pattern case above) does this return the second child's
+    /// position instead of the first's.
     pub fn name_start(&self, index: usize, text: &[u16]) -> Option<i32> {
+        let is_identifier =
+            |kind: u32| kind == syntax_kind::IDENTIFIER || kind == syntax_kind::PRIVATE_IDENTIFIER;
+        if self.kind(index) == syntax_kind::BINDING_ELEMENT {
+            let identifier_children: Vec<usize> = self
+                .children(index)
+                .into_iter()
+                .filter(|&child| is_identifier(self.kind(child)))
+                .collect();
+            let &first = identifier_children.first()?;
+            let after_first = skip_trivia(text, self.end(first) as usize, false);
+            let is_renamed = text.get(after_first).copied() == Some(u16::from(b':'));
+            let chosen = if is_renamed {
+                identifier_children.get(1).copied().unwrap_or(first)
+            } else {
+                first
+            };
+            return Some(self.node_start(chosen, text));
+        }
         for child in self.children(index) {
-            let kind = self.kind(child);
-            if kind == syntax_kind::IDENTIFIER || kind == syntax_kind::PRIVATE_IDENTIFIER {
+            if is_identifier(self.kind(child)) {
                 return Some(self.node_start(child, text));
             }
         }

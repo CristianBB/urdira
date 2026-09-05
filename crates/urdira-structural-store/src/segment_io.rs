@@ -33,7 +33,7 @@
 use crate::error::{Result, store_err};
 use crate::identity_codec::{self, BatchIndex, IDENTITY_LAYOUT_RAW};
 use crate::layout::*;
-use crate::row::{Dictionaries, NONE_U32, PendingSiteKey, RecordRow};
+use crate::row::{CATEGORY_ENTITY, Dictionaries, NONE_U32, PendingSiteKey, RecordRow};
 use crate::xxh;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -492,6 +492,7 @@ pub fn write_hot_and_secondary_files(
     by_identity_path: &Path,
     adj_out_path: &Path,
     adj_in_path: &Path,
+    entities_index_path: &Path,
 ) -> Result<HotAndSecondaryResult> {
     let n = order.len();
 
@@ -851,6 +852,35 @@ pub fn write_hot_and_secondary_files(
             Ok(Work::Secondary("adj.in", bytes, xxh3))
         }));
 
+        handles.push(scope.spawn(|| -> Result<Work> {
+            let inferred_type_kind_id = inferred_type_kind_id(dicts);
+            let mut triples: Vec<(u32, u32, u32)> =
+                order
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, &i)| {
+                        let r = &rows[i as usize];
+                        is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id)
+                            .then_some((r.owner_artifact, r.span_start_byte, k as u32))
+                    })
+                    .collect();
+            triples.sort_unstable();
+            let mut buf = Vec::with_capacity(triples.len() * TRIPLE_STRIDE);
+            for (a, b, c) in &triples {
+                buf.extend_from_slice(&a.to_le_bytes());
+                buf.extend_from_slice(&b.to_le_bytes());
+                buf.extend_from_slice(&c.to_le_bytes());
+            }
+            let (bytes, xxh3) = write_framed_file(
+                entities_index_path,
+                TableId::Records,
+                generation,
+                triples.len() as u64,
+                &buf,
+            )?;
+            Ok(Work::Secondary("entities.index", bytes, xxh3))
+        }));
+
         handles
             .into_iter()
             .map(|h| {
@@ -998,6 +1028,7 @@ pub fn write_hot_and_secondary_files_partitioned(
     by_identity_path: &Path,
     adj_out_path: &Path,
     adj_in_path: &Path,
+    entities_index_path: &Path,
 ) -> Result<HotAndSecondaryResult> {
     assert_eq!(
         partitions.len(),
@@ -1389,6 +1420,36 @@ pub fn write_hot_and_secondary_files_partitioned(
         )?;
         secondary.insert("adj.in".to_string(), (bytes, xxh3));
 
+        let inferred_type_kind_id = inferred_type_kind_id(dicts);
+        let mut entities_index: Vec<(u32, u32, u32)> = partitions
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(nib, part)| {
+                part.iter().enumerate().filter_map(move |(local, r)| {
+                    is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id).then_some((
+                        r.owner_artifact,
+                        r.span_start_byte,
+                        global_k(&row_base, nib, local),
+                    ))
+                })
+            })
+            .collect();
+        entities_index.par_sort_unstable();
+        let mut buf = Vec::with_capacity(entities_index.len() * TRIPLE_STRIDE);
+        for (a, b, c) in &entities_index {
+            buf.extend_from_slice(&a.to_le_bytes());
+            buf.extend_from_slice(&b.to_le_bytes());
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+        let (bytes, xxh3) = write_framed_file(
+            entities_index_path,
+            TableId::Records,
+            generation,
+            entities_index.len() as u64,
+            &buf,
+        )?;
+        secondary.insert("entities.index".to_string(), (bytes, xxh3));
+
         Ok(secondary)
     };
 
@@ -1546,6 +1607,58 @@ pub fn by_kind_range(
 
 pub fn by_kind_ordinal_at(arr: &[u8], i: usize) -> u32 {
     u32le(arr, i * BY_KIND_STRIDE + 5)
+}
+
+/// F4 4.3: range over an `entities.index` array `(owner_artifact u32,
+/// span_start u32, ordinal u32)` sorted by `(owner_artifact, span_start)`.
+/// Returns `[lo, hi)` row indices -- ordinarily 0 or 1 wide (an owner's
+/// entity producer never emits two live `CATEGORY_ENTITY` rows starting at
+/// the same byte within one generation; see `entities_index_triples`'s own
+/// doc comment for the one exclusion this relies on), never assumed to be
+/// exactly 1 by the caller.
+pub fn triple_key_range(arr: &[u8], owner_artifact: u32, span_start: u32) -> (usize, usize) {
+    let n = arr.len() / TRIPLE_STRIDE;
+    let key_of = |i: usize| -> (u32, u32) {
+        let base = i * TRIPLE_STRIDE;
+        (u32le(arr, base), u32le(arr, base + 4))
+    };
+    let target = (owner_artifact, span_start);
+    let lo = lower_bound(n, |i| key_of(i).cmp(&target));
+    let hi = upper_bound(n, |i| key_of(i).cmp(&target));
+    (lo, hi)
+}
+
+pub fn triple_ordinal_at(arr: &[u8], i: usize) -> u32 {
+    u32le(arr, i * TRIPLE_STRIDE + 8)
+}
+
+/// F4 4.3: `dicts.kinds`' ordinal for `"jsts:entity_inferred_type"`, if this
+/// batch's dictionaries have interned it at all. Shared by every
+/// `entities.index` builder ([`write_hot_and_secondary_files`],
+/// [`write_hot_and_secondary_files_partitioned`], and `writer::
+/// build_delta_sections`) so the exclusion rule (an inferred-type row
+/// deliberately shares its declaration's own `(owner, start)` key, and must
+/// never win that slot in the index -- see `crate::identity_codec`'s A3a-fix
+/// note, and `urdira-indexing-worker`'s `v4::residual::collect`, whose
+/// identical exclusion this section replaces at read time) lives in exactly
+/// one place instead of three copies of the same string comparison.
+pub fn inferred_type_kind_id(dicts: &Dictionaries) -> Option<u16> {
+    dicts
+        .kinds
+        .iter()
+        .position(|k| k == "jsts:entity_inferred_type")
+        .map(|i| i as u16)
+}
+
+/// F4 4.3: `true` for exactly the rows `entities.index` carries -- a
+/// `CATEGORY_ENTITY` row whose `kind_id` is not `inferred_type_kind_id`.
+#[inline]
+pub fn is_entities_index_row(
+    category: u8,
+    kind_id: u16,
+    inferred_type_kind_id: Option<u16>,
+) -> bool {
+    category == CATEGORY_ENTITY && Some(kind_id) != inferred_type_kind_id
 }
 
 pub fn by_identity_range(arr: &[u8], digest: &[u8; 32]) -> (usize, usize) {

@@ -192,6 +192,70 @@ pub struct ResidualContext {
     pub registry_snapshot_id: String,
     pub configuration_revision_id: String,
     pub resolution_lock_id: String,
+    /// F4 4.1: which owner paths this run should build its `VirtualFs`/
+    /// window plan around, ON TOP OF every owner that currently has an
+    /// open `pending.sites` row (`collect()` always includes those,
+    /// unconditionally -- see `run_once_with_quiet_period`'s own doc
+    /// comment on `candidate_owners`). `None` for a `Full`/cold scan: the
+    /// whole `Frontier` is in scope, exactly as before this task (a fresh
+    /// store has no prior generation's owners to narrow against, and a
+    /// forced full rescan should re-check everything). `Some(paths)` for a
+    /// `Changed` scan: `delta::run`'s own `touched_owner_paths` (edited/
+    /// created + deleted owners, already computed for that scan's
+    /// external-entity close-protection pass) -- bounds the pass to a
+    /// small window instead of paying for every jsts file in the workspace
+    /// on every single edit, the dominant cost this task's own plan
+    /// diagnosed (`residual_pass.rs::run_lane`'s `fetch_semantics` fetch
+    /// runs for every window root regardless of pending sites).
+    pub touched_owners: Option<Vec<String>>,
+    /// F4 4.2: how many times [`schedule`] has already re-triggered itself
+    /// for a truncated (deadline-cut) attempt at the SAME base generation
+    /// -- `0` for the run any `ScanCompleted`/test caller starts fresh;
+    /// incremented by [`schedule`] each time it re-schedules a follow-up
+    /// restricted to `ResidualOutcome::remaining_roots`. Capped at
+    /// [`MAX_CONSECUTIVE_RESCHEDULES`] so a workspace whose residual work
+    /// never drains within its own budget cannot spawn an unbounded chain
+    /// of background tsgo passes -- past the cap, `schedule` stops
+    /// re-triggering and leaves the remaining roots' pending sites open for
+    /// the NEXT real `ScanCompleted` to pick up fresh (same fallback this
+    /// module already relies on for a superseded attempt).
+    pub reschedule_count: u32,
+}
+
+/// F4 4.2: see [`ResidualContext::reschedule_count`].
+const MAX_CONSECUTIVE_RESCHEDULES: u32 = 20;
+
+/// Revision fix (2026-09-05): whether `schedule`'s truncated-attempt
+/// continuation should actually re-schedule itself. Extracted as a pure
+/// function of the four inputs that decide it (rather than inlined in
+/// `schedule`'s own closure) so a test can exercise the epoch-race fix
+/// deterministically, without spinning up a real background thread or
+/// waiting on a real quiet period/tsgo child: `current_epoch_now` and
+/// `my_epoch` are plain `u64`s a test can set up directly via
+/// [`bump_epoch`]/a fabricated mismatch, no `schedule`/`run_once` call
+/// needed at all.
+///
+/// The epoch check closes a real race: `schedule`'s own re-schedule call
+/// bumps the epoch a SECOND time for this workspace. If a genuine edit's
+/// `ScanCompleted` already called `schedule()` (bumping the epoch once)
+/// while this truncated attempt was still running its (potentially
+/// minutes-long) checker pass, re-scheduling here -- without checking the
+/// epoch first -- would bump it AGAIN, superseding that real attempt's own
+/// quiet-period wait before it ever runs: the genuine edit's own pass would
+/// see a foreign epoch and discard itself (`Ok(None)`), while this stale
+/// continuation goes on to process only `remaining_roots` computed BEFORE
+/// the edit, never re-deriving pending sites against the new generation.
+/// Refusing to re-schedule when the epoch no longer matches is correct, not
+/// a lost update: the newer `schedule()` call's own pass re-derives pending
+/// sites from the CURRENT store, a strict superset of what this stale
+/// continuation would have found.
+fn should_reschedule_truncated(
+    truncated: bool,
+    reschedule_count: u32,
+    current_epoch_now: u64,
+    my_epoch: u64,
+) -> bool {
+    truncated && current_epoch_now == my_epoch && reschedule_count < MAX_CONSECUTIVE_RESCHEDULES
 }
 
 /// Schedules (or re-schedules, superseding any still-running prior attempt
@@ -207,7 +271,7 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
         match run_once(&context, my_epoch) {
             Ok(Some(outcome)) => {
                 eprintln!(
-                    "[urdira-indexing-worker] v4 residual pass complete workspace={workspace_id} generation={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={} total_ms={}",
+                    "[urdira-indexing-worker] v4 residual pass complete workspace={workspace_id} generation={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={} total_ms={} truncated={} windows={}/{}",
                     outcome.generation,
                     outcome.upgraded_sites,
                     outcome.external_sites,
@@ -216,8 +280,17 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                     outcome.type_of_relations,
                     outcome.diagnostics_emitted,
                     outcome.timings.total_ms,
+                    outcome.truncated,
+                    outcome.windows_done,
+                    outcome.windows_total,
                 );
-                if let Some(target) = event_target {
+                // F4 4.2: send the wire event BEFORE deciding whether to
+                // re-schedule -- `event_target` (not `Clone`-free -- see
+                // its own struct) is only borrowed here so the SAME sender
+                // can still be moved into a follow-up `schedule` call below
+                // without this attempt's own caller ever seeing two
+                // `UpgradeCompleted` events collapsed into one `Option`.
+                if let Some(target) = event_target.as_ref() {
                     let event = IndexingEvent::UpgradeCompleted {
                         request_id: context.request_id.clone(),
                         operation_id: context.request_id.clone(),
@@ -226,10 +299,75 @@ pub fn schedule(context: ResidualContext, event_target: Option<ResidualEventTarg
                         external_sites: outcome.external_sites,
                         unresolved_sites: outcome.unresolved_sites,
                         timings: outcome.timings,
+                        truncated: Some(outcome.truncated),
+                        windows_done: u32::try_from(outcome.windows_done).ok(),
+                        windows_total: u32::try_from(outcome.windows_total).ok(),
                     };
-                    let _ = target
-                        .sender
-                        .send((target.stream_id, target.cancellation_id, event));
+                    let _ = target.sender.send((
+                        target.stream_id,
+                        target.cancellation_id.clone(),
+                        event,
+                    ));
+                }
+                // F4 4.2: the deadline cut this run off before it opened
+                // every window in its own plan -- re-trigger a follow-up
+                // pass restricted to exactly the roots it never got to,
+                // same epoch-supersede/quiet-period machinery as any other
+                // `schedule` call, up to `MAX_CONSECUTIVE_RESCHEDULES`
+                // consecutive attempts. Past the cap, the remaining roots'
+                // pending sites simply stay open -- correct, if less
+                // timely, the same fallback this module already relies on
+                // for a superseded attempt (a future `ScanCompleted` will
+                // re-derive and re-schedule fresh).
+                // Revision fix (2026-09-05): a truncated attempt's own
+                // re-schedule below calls `schedule()` again, which bumps
+                // the epoch a SECOND time for this workspace -- if a real
+                // edit's own `ScanCompleted` already called `schedule()`
+                // (bumping the epoch once) while THIS truncated attempt was
+                // still running its checker pass, re-scheduling here would
+                // bump the epoch AGAIN and supersede that real attempt's
+                // own quiet-period wait before it ever gets to run: the
+                // real edit's pass would see a foreign epoch and discard
+                // itself (`Ok(None)`), while this stale continuation goes
+                // on to process only `remaining_roots` from BEFORE the
+                // edit, never re-deriving pending sites against the new
+                // generation. Checking the epoch here, right before
+                // re-scheduling, closes that race: if it no longer matches
+                // `my_epoch`, a newer `schedule()` call (the real edit's
+                // own) has already superseded this one -- that fresh call's
+                // own pass re-derives pending sites from the CURRENT store
+                // and is a strict superset of what this stale continuation
+                // would have found, so simply not re-scheduling here is
+                // correct, not a lost update.
+                if should_reschedule_truncated(
+                    outcome.truncated,
+                    context.reschedule_count,
+                    current_epoch(&workspace_id),
+                    my_epoch,
+                ) {
+                    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+                        eprintln!(
+                            "[urdira-indexing-worker] v4 residual pass: re-scheduling truncated attempt {} of {} workspace={workspace_id} remaining_owners={}",
+                            context.reschedule_count + 1,
+                            MAX_CONSECUTIVE_RESCHEDULES,
+                            outcome.remaining_roots.len(),
+                        );
+                    }
+                    let mut next_context = context.clone();
+                    next_context.touched_owners = Some(outcome.remaining_roots);
+                    next_context.reschedule_count += 1;
+                    schedule(next_context, event_target);
+                } else if outcome.truncated && current_epoch(&workspace_id) != my_epoch {
+                    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+                        eprintln!(
+                            "[urdira-indexing-worker] v4 residual pass: truncated attempt superseded before re-scheduling workspace={workspace_id}; a newer ScanCompleted's own pass will re-derive pending sites fresh"
+                        );
+                    }
+                } else if outcome.truncated {
+                    eprintln!(
+                        "[urdira-indexing-worker] v4 residual pass: reschedule cap ({MAX_CONSECUTIVE_RESCHEDULES}) reached workspace={workspace_id}; {} owner(s) remain pending for the next scan",
+                        outcome.remaining_roots.len(),
+                    );
                 }
             }
             Ok(None) => {
@@ -263,6 +401,20 @@ pub struct ResidualOutcome {
     /// Newly opened `jsts:diagnostic` rows this run.
     pub diagnostics_emitted: u64,
     pub timings: ScanTimings,
+    /// F4 4.2: `true` if `URDIRA_V4_RESIDUAL_BUDGET_MS`'s deadline cut this
+    /// run off before every window in its own plan was opened. `schedule`
+    /// re-triggers a follow-up pass restricted to `remaining_roots` when
+    /// this is `true` (capped at `MAX_CONSECUTIVE_RESCHEDULES` consecutive
+    /// re-schedules -- see `ResidualContext::reschedule_count`).
+    pub truncated: bool,
+    /// F4 4.2: store-relative owner paths (the `workspace_root` virtual
+    /// prefix already stripped) this run never got to open a window for --
+    /// empty unless `truncated` is `true`.
+    pub remaining_roots: Vec<String>,
+    /// F4 4.2: how many windows this run actually opened, out of the plan's
+    /// own total (`windows_total`) -- equal when `truncated` is `false`.
+    pub windows_done: usize,
+    pub windows_total: usize,
 }
 
 /// Runs one residual pass to completion and, if anything upgraded,
@@ -320,26 +472,39 @@ fn run_once_with_quiet_period(
             .cloned()
     };
 
-    let collected = collect(&store, &dicts, &owner_path, base_generation);
-    if collected.pending_by_owner.is_empty() {
-        // Genuine completion, not a supersede: nothing was pending, so
-        // there is nothing further to run for this generation. Report it
-        // (rather than `Ok(None)`, this module's "superseded, stay
-        // silent" signal) so a caller like `schedule` can still emit
-        // `UpgradeCompleted` -- the daemon's own status lane needs SOME
-        // terminal signal per generation to know a residual attempt
-        // finished, even an attempt that found nothing to do (see
-        // `packages/daemon/src/runtime.ts`'s `v4SemanticUpgradeState`).
-        return Ok(Some(ResidualOutcome {
-            generation: base_generation,
-            upgraded_sites: 0,
-            external_sites: 0,
-            unresolved_sites: 0,
-            inferred_type_entities: 0,
-            type_of_relations: 0,
-            diagnostics_emitted: 0,
-            timings: ScanClock::start().completed_timings(),
-        }));
+    // F4 4.3: `URDIRA_V4_ENTITY_INDEX=scan` opts back into the pre-4.3 full
+    // `iter_visible` scan, purely to compare against the default `entities.
+    // index` section path (see `EntityLookup`'s own doc comment) -- read
+    // ONCE here, not inside `collect` itself, so a test can exercise both
+    // strategies directly without needing `std::env::set_var` (forbidden:
+    // this crate is `#![forbid(unsafe_code)]`).
+    let force_entity_scan = std::env::var_os("URDIRA_V4_ENTITY_INDEX")
+        .is_some_and(|v| v == std::ffi::OsStr::new("scan"));
+    let collected = collect(
+        &store,
+        &dicts,
+        &owner_path,
+        &frontier,
+        base_generation,
+        force_entity_scan,
+    );
+    // F4 4.1: no more global early-return on "zero pending sites" -- decision
+    // 28's inferred-types/diagnostics half of this pass (below) has always
+    // been able to produce work (a newly-exported declaration needing a
+    // type, a fresh compiler diagnostic) independent of whether ANY
+    // call/heritage site is still pending, so gating the entire pass on
+    // `pending_by_owner` silently starved that half whenever a corpus (or a
+    // fixture) happened to have zero outstanding possible sites. `has_sites`
+    // is kept only for the debug log below -- every downstream step already
+    // tolerates an empty `pending_by_owner` (`run_lane`'s `pending_by_owner.
+    // get(root)` is a plain `Option`, and the inferred-types/diagnostics
+    // loop near the end of this function does not consult it at all).
+    let has_sites = !collected.pending_by_owner.is_empty();
+    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        eprintln!(
+            "[urdira-indexing-worker] v4 residual: has_sites={has_sites} touched_owners={:?}",
+            context.touched_owners,
+        );
     }
 
     let binary = discover_binary(&context.workspace_root).map_err(|error| {
@@ -371,10 +536,31 @@ fn run_once_with_quiet_period(
     // mismatch when correlating a resolved `WorkspaceTarget.path` back to
     // this pass's own maps -- see this task's evidence doc for the exact
     // scope of this gap and why it was not fixed this session.
+    // F4 4.1: the exact set of owner paths this run's `VirtualFs`/window
+    // plan is scoped to -- `None` (cold, or an explicit forced full rescan)
+    // means "every jsts owner in the frontier", the same as before this
+    // task. `Some(...)` unions `context.touched_owners` (the owners THIS
+    // scan's own batch touched) with every owner that currently has an
+    // open pending site (`collected.pending_by_owner`'s keys) -- a pending
+    // call/heritage site must stay reachable across passes until it
+    // resolves even if its owner was not part of the batch that triggered
+    // this particular run.
+    let candidate_owners: Option<std::collections::BTreeSet<String>> =
+        context.touched_owners.as_ref().map(|touched| {
+            let mut set: std::collections::BTreeSet<String> = touched.iter().cloned().collect();
+            set.extend(collected.pending_by_owner.keys().cloned());
+            set
+        });
+
     let workspace_root = VIRTUAL_ROOT.to_string();
     let mut file_map: BTreeMap<String, String> = BTreeMap::new();
     for (path, entry) in &frontier.present {
         if !is_jsts_source_path(path) {
+            continue;
+        }
+        if let Some(owners) = &candidate_owners
+            && !owners.contains(path)
+        {
             continue;
         }
         let source_input = urdira_jsts_syntax_worker::SourceInput {
@@ -419,6 +605,30 @@ fn run_once_with_quiet_period(
         pending_by_owner.insert(virtual_path, sites);
     }
 
+    // F4 4.2: `URDIRA_V4_RESIDUAL_BUDGET_MS` bounds how long this ONE
+    // `ResidualPass::run_instrumented` call may keep opening new windows --
+    // default 20s for an incremental run (`context.touched_owners` is
+    // `Some(...)`, a small window already), 120s for a cold run (`None`,
+    // the whole frontier); `0` means unbounded (`deadline: None`), matching
+    // the pre-4.2 behavior exactly. An explicit env value applies to BOTH
+    // shapes of run -- there is deliberately no separate incremental/cold
+    // override, since a caller setting this at all almost certainly wants
+    // one number for both (a bench, or a deployment capping worst-case
+    // latency regardless of trigger).
+    const DEFAULT_INCREMENTAL_BUDGET_MS: u64 = 20_000;
+    const DEFAULT_COLD_BUDGET_MS: u64 = 120_000;
+    let default_budget_ms = if context.touched_owners.is_none() {
+        DEFAULT_COLD_BUDGET_MS
+    } else {
+        DEFAULT_INCREMENTAL_BUDGET_MS
+    };
+    let budget_ms = std::env::var("URDIRA_V4_RESIDUAL_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default_budget_ms);
+    let deadline = (budget_ms > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(budget_ms));
+
     let config = ResidualPassConfig {
         binary,
         root: workspace_root.clone(),
@@ -453,6 +663,7 @@ fn run_once_with_quiet_period(
         // resolution -- see `ResidualPassConfig::fetch_semantics`'s own doc
         // comment.
         fetch_semantics: true,
+        deadline,
     };
 
     let (resolved, pass_stats) =
@@ -468,6 +679,31 @@ fn run_once_with_quiet_period(
     }
     if debug_enabled {
         print_diagnostic_code_histogram(&pass_stats.diagnostics);
+    }
+
+    // F4 4.2: `pass_stats.remaining_roots` is in `run_lane`'s own virtual-
+    // path form (`{workspace_root}/{store_path}`) -- convert back to
+    // store-relative paths here, the same shape `ResidualContext::
+    // touched_owners` expects, so `schedule` can hand them straight to a
+    // follow-up `ResidualContext` without this module's caller needing to
+    // know about the virtual root at all.
+    let windows_done = pass_stats.windows.len();
+    let windows_total = pass_stats.windows_total;
+    let truncated = pass_stats.truncated;
+    let remaining_owner_paths: Vec<String> = pass_stats
+        .remaining_roots
+        .iter()
+        .filter_map(|virtual_path| {
+            virtual_path
+                .strip_prefix(&workspace_root)
+                .map(|p| p.trim_start_matches('/').to_string())
+        })
+        .collect();
+    if truncated && std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        eprintln!(
+            "[urdira-indexing-worker] v4 residual: deadline hit, windows_done={windows_done}/{windows_total} remaining_owners={}",
+            remaining_owner_paths.len(),
+        );
     }
 
     if current_epoch(&context.workspace_id) != my_epoch {
@@ -603,7 +839,6 @@ fn run_once_with_quiet_period(
                         collected
                             .entities
                             .lookup(target_store_path, *name_start_utf16)
-                            .and_then(decode_hex32)
                     });
                 // `(record_id, identity_key text)` for the target, from
                 // whichever of the two sources actually has it -- an
@@ -803,10 +1038,8 @@ fn run_once_with_quiet_period(
 
             for typed in types_by_owner.get(virtual_owner).into_iter().flatten() {
                 let site = &typed.site;
-                let existing_record_id = collected
-                    .entities
-                    .lookup(&real_path, site.name_start_utf16)
-                    .and_then(decode_hex32);
+                let existing_record_id =
+                    collected.entities.lookup(&real_path, site.name_start_utf16);
                 let entity_info: Option<([u8; 32], String)> = match existing_record_id {
                     Some(id) => store.get_visible(&id, publish_generation).map(|view| {
                         (
@@ -982,6 +1215,10 @@ fn run_once_with_quiet_period(
             type_of_relations: 0,
             diagnostics_emitted: 0,
             timings: clock.completed_timings(),
+            truncated,
+            remaining_roots: remaining_owner_paths,
+            windows_done,
+            windows_total,
         }));
     }
 
@@ -1141,6 +1378,10 @@ fn run_once_with_quiet_period(
         type_of_relations,
         diagnostics_emitted,
         timings: clock.completed_timings(),
+        truncated,
+        remaining_roots: remaining_owner_paths,
+        windows_done,
+        windows_total,
     }))
 }
 
@@ -1210,10 +1451,76 @@ struct PendingMeta {
     relation_kind: &'static str,
 }
 
-struct Collected {
+struct Collected<'a> {
     pending_by_owner: BTreeMap<String, Vec<PendingSite>>,
     by_site: HashMap<String, PendingMeta>,
-    entities: EntityIndex,
+    entities: EntityLookup<'a>,
+}
+
+/// F4 4.3: replaces the pre-4.3 full-`iter_visible` scan (`EntityIndex::
+/// build(entity_entries)`, O(corpus)) with a lazy adapter over the store's
+/// own persisted `entities.index` section (`StoreReader::entity_by_owner_
+/// and_start`, O(sites)) by default. `URDIRA_V4_ENTITY_INDEX=scan` keeps
+/// the old full-scan `EntityIndex` path available for comparison/debugging
+/// (see `entities_index_section_and_scan_agree_on_the_shared_fixture`).
+enum EntityLookup<'a> {
+    /// `URDIRA_V4_ENTITY_INDEX=scan`: `urdira_tsgo_client::entity_index::
+    /// EntityIndex`, eagerly built from a full `iter_visible` scan of every
+    /// `CATEGORY_ENTITY` record (excluding `jsts:entity_inferred_type` --
+    /// see this module's own doc comment on that exclusion, still true
+    /// here), exactly what this module did before F4 4.3.
+    Scan(EntityIndex),
+    /// Default: resolves `path` to an `owner_artifact` ordinal (the same
+    /// `Frontier`-derived reverse map `owner_path`'s own callers already
+    /// build, kept local to this enum instead) then a single
+    /// `entity_by_owner_and_start` binary search per site --
+    /// `real_path_by_lower` is this variant's OWN copy of the exact
+    /// fallback `EntityIndex::lookup` always had (tsgo's `useCaseSensitive
+    /// FileNames: false` behavior lowercases a resolved declaration's
+    /// path -- see `run_once_with_quiet_period`'s `real_path_by_lower` for
+    /// the fuller writeup), built once here from the same `Frontier`
+    /// rather than reusing that outer map, so `collect()` stays a
+    /// self-contained function callable with nothing but a store+dicts+
+    /// frontier snapshot (as every existing test call site already has).
+    Section {
+        store: &'a StoreReader,
+        owner_ordinal_by_path: HashMap<String, u32>,
+        real_path_by_lower: HashMap<String, String>,
+        generation: u64,
+    },
+}
+
+impl EntityLookup<'_> {
+    /// Same contract `EntityIndex::lookup` always had (exact match, then a
+    /// lowercased-path fallback), except it returns the raw `record_id`
+    /// bytes directly instead of a hex string a caller must then `decode_
+    /// hex32` itself -- `EntityLookup` never had a reason to round-trip
+    /// through hex at all in the `Section` case (`entity_by_owner_and_
+    /// start` already returns a `RecordView`); `Scan` decodes once here so
+    /// both variants share one return type.
+    fn lookup(&self, path: &str, name_start_utf16: i32) -> Option<[u8; 32]> {
+        match self {
+            EntityLookup::Scan(index) => {
+                index.lookup(path, name_start_utf16).and_then(decode_hex32)
+            }
+            EntityLookup::Section {
+                store,
+                owner_ordinal_by_path,
+                real_path_by_lower,
+                generation,
+            } => {
+                let start = u32::try_from(name_start_utf16).ok()?;
+                let owner = owner_ordinal_by_path.get(path).copied().or_else(|| {
+                    real_path_by_lower
+                        .get(&path.to_ascii_lowercase())
+                        .and_then(|real| owner_ordinal_by_path.get(real).copied())
+                })?;
+                store
+                    .entity_by_owner_and_start(owner, start, *generation)
+                    .map(|view| view.record_id())
+            }
+        }
+    }
 }
 
 /// A2 (pending.sites migration): pending sites now come straight from the
@@ -1222,10 +1529,10 @@ struct Collected {
 /// subject().is_none()` relations -- there is no such relation any more to
 /// filter for (see this module's own doc comment, "Store access without a
 /// body decoder", for why every field this function needs is still a plain
-/// metadata column, never a body decode). The entity index is UNCHANGED: it
-/// still needs a full `iter_visible` scan of every entity-category record
-/// (`entities.index` is still not a real table -- P2-2i deliverable 2's own
-/// remaining scope, unaffected by this task).
+/// metadata column, never a body decode). F4 4.3: the entity index no
+/// longer needs a full `iter_visible` scan either (see `EntityLookup`'s own
+/// doc comment) -- `collect()`'s own cost is now O(pending sites + owners
+/// in the frontier), not O(corpus).
 ///
 /// **Known regression versus the pre-migration `collect()`** (reported, not
 /// silently fixed): the old implementation recovered a call site's
@@ -1240,55 +1547,94 @@ struct Collected {
 /// SKIPPED here (never sent to the checker at all), same as it always was
 /// for a heritage site missing the (never-implemented) text fallback, but
 /// now ALSO true for a member-owner call site P1-D-f specifically fixed.
-fn collect(
-    store: &StoreReader,
+/// `force_scan` is a plain parameter (not an env-var read inside this
+/// function) specifically so a test can call both entity-index strategies
+/// directly, side by side, in-process -- this crate is `#![forbid(unsafe_
+/// code)]`, so a test cannot itself call `std::env::set_var` to toggle
+/// `URDIRA_V4_ENTITY_INDEX` between two calls. Production has exactly one
+/// call site (`run_once_with_quiet_period`), which reads the env var once
+/// and passes the result in here.
+fn collect<'a>(
+    store: &'a StoreReader,
     dicts: &Dictionaries,
     owner_path: &dyn Fn(u32) -> Option<String>,
+    frontier: &Frontier,
     generation: u64,
-) -> Collected {
+    force_scan: bool,
+) -> Collected<'a> {
     let mut pending_by_owner: BTreeMap<String, Vec<PendingSite>> = BTreeMap::new();
     let mut by_site: HashMap<String, PendingMeta> = HashMap::new();
-    let mut entity_entries: Vec<(String, i32, String)> = Vec::new();
 
-    for view in store.iter_visible(generation) {
-        if view.category() == CATEGORY_ENTITY {
-            // Decision 28's "inferred types" task: a `jsts:entity_inferred_
-            // type` record deliberately carries the SAME `path`/`start`/
-            // `end` as the declaration it types (matching v3's own
-            // `semanticTypeRecords` recipe, verified byte-for-byte against
-            // the oracle -- see `build_inferred_type_rows`'s doc comment).
-            // For a class/interface member with no leading modifier
-            // keyword, that span's OWN start coincides EXACTLY with the
-            // member declaration's own name-identifier start (the key
-            // `EntityIndex` uses) -- e.g. `count = 0;`/`describe() {}`. If
-            // such an inferred-type entity were included here, it would
-            // collide with the very declaration it types in `EntityIndex`'s
-            // `(path, start)` key space, and (depending on iteration order)
-            // could WIN that slot -- corrupting every future lookup of the
-            // real declaration into pointing at its own inferred-type
-            // entity instead (confirmed live: `inferred_types_and_
-            // diagnostics_across_two_runs_and_an_edit`'s run 2 produced a
-            // `type_of` relation whose `source_id` was itself a `jsts:
-            // inferred-type:...` identity, not the declaration's, before
-            // this exclusion). An inferred-type entity is never a valid
-            // call/heritage TARGET or `type_of` SOURCE lookup result, so
-            // excluding it here is always correct, not merely a workaround.
-            let Some(kind) = dicts.kinds.get(view.kind_id() as usize) else {
-                continue;
-            };
-            if kind == "jsts:entity_inferred_type" {
-                continue;
+    let entities = if force_scan {
+        let mut entity_entries: Vec<(String, i32, String)> = Vec::new();
+        for view in store.iter_visible(generation) {
+            if view.category() == CATEGORY_ENTITY {
+                // Decision 28's "inferred types" task: a `jsts:entity_
+                // inferred_type` record deliberately carries the SAME
+                // `path`/`start`/`end` as the declaration it types
+                // (matching v3's own `semanticTypeRecords` recipe, verified
+                // byte-for-byte against the oracle -- see `build_inferred_
+                // type_rows`'s doc comment). For a class/interface member
+                // with no leading modifier keyword, that span's OWN start
+                // coincides EXACTLY with the member declaration's own
+                // name-identifier start (the key this index uses) -- e.g.
+                // `count = 0;`/`describe() {}`. If such an inferred-type
+                // entity were included here, it would collide with the
+                // very declaration it types in this index's `(path,
+                // start)` key space, and (depending on iteration order)
+                // could WIN that slot -- corrupting every future lookup of
+                // the real declaration into pointing at its own
+                // inferred-type entity instead (confirmed live:
+                // `inferred_types_and_diagnostics_across_two_runs_and_an_
+                // edit`'s run 2 produced a `type_of` relation whose
+                // `source_id` was itself a `jsts:inferred-type:...`
+                // identity, not the declaration's, before this exclusion).
+                // An inferred-type entity is never a valid call/heritage
+                // TARGET or `type_of` SOURCE lookup result, so excluding it
+                // here is always correct, not merely a workaround. The
+                // `Section` variant below enforces the SAME rule at write
+                // time instead (`segment_io::is_entities_index_row`).
+                let Some(kind) = dicts.kinds.get(view.kind_id() as usize) else {
+                    continue;
+                };
+                if kind == "jsts:entity_inferred_type" {
+                    continue;
+                }
+                let Some(path) = owner_path(view.owner_artifact()) else {
+                    continue;
+                };
+                entity_entries.push((
+                    path,
+                    view.span_start_byte() as i32,
+                    materialize::hex_encode(&view.record_id()),
+                ));
             }
-            let Some(path) = owner_path(view.owner_artifact()) else {
-                continue;
-            };
-            entity_entries.push((
-                path,
-                view.span_start_byte() as i32,
-                materialize::hex_encode(&view.record_id()),
-            ));
         }
-    }
+        EntityLookup::Scan(EntityIndex::build(entity_entries))
+    } else {
+        let pair_to_ordinal: HashMap<(String, String), u32> = dicts
+            .artifacts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, pair)| (pair.clone(), ordinal as u32))
+            .collect();
+        let mut owner_ordinal_by_path: HashMap<String, u32> = HashMap::new();
+        let mut real_path_by_lower: HashMap<String, String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            real_path_by_lower.insert(path.to_ascii_lowercase(), path.clone());
+            if let Some(&ordinal) =
+                pair_to_ordinal.get(&(entry.artifact_id.clone(), entry.artifact_version_id.clone()))
+            {
+                owner_ordinal_by_path.insert(path.clone(), ordinal);
+            }
+        }
+        EntityLookup::Section {
+            store,
+            owner_ordinal_by_path,
+            real_path_by_lower,
+            generation,
+        }
+    };
 
     for view in store.iter_visible_pending_sites(generation) {
         let (site_kind, relation_kind): (SiteKind, &'static str) = match view.site_kind() {
@@ -1349,7 +1695,7 @@ fn collect(
     Collected {
         pending_by_owner,
         by_site,
-        entities: EntityIndex::build(entity_entries),
+        entities,
     }
 }
 
@@ -1455,6 +1801,31 @@ fn member_kind_name(decl_kind: u32) -> &'static str {
         // inventing a new one, is what makes the identity strings comparable
         // at all.
         syntax_kind::VARIABLE_DECLARATION => "variable",
+        // F4 4.4: a destructured binding (`const { a } = x`/`export const
+        // { b: renamed } = x`) -- `getExportsOfModule`'s own handle for
+        // such an export points directly at the `BindingElement` node
+        // (verified live), same "variable" word `VARIABLE_DECLARATION`
+        // already uses (v3's `analyzer.ts` has no separate word for a
+        // destructured binding either).
+        syntax_kind::BINDING_ELEMENT => "variable",
+        // F4 4.4: a call/heritage target resolved to a declaration found
+        // through the SAME `try_synthesize_member_entity` "no cold-
+        // materialized entity" path, but whose declaration is one of
+        // these top-level-shaped kinds NESTED inside a namespace (v4's
+        // lane-1 entity producer, `SyntaxCollector::push_entity`, does not
+        // descend into a `namespace`/`declare namespace` body -- only the
+        // namespace declaration itself becomes a cold entity, F2 3b). Same
+        // words `push_entity`'s own top-level `EntityKind::identity_name()`
+        // uses for each kind (`urdira-jsts-syntax-worker/src/lib.rs`), so a
+        // synthesized namespace-member identity reads exactly like the
+        // top-level entity of the same kind would, not a generic
+        // `jsts:member:...`.
+        syntax_kind::FUNCTION_DECLARATION => "function",
+        syntax_kind::CLASS_DECLARATION => "class",
+        syntax_kind::INTERFACE_DECLARATION => "interface",
+        syntax_kind::TYPE_ALIAS_DECLARATION => "type",
+        syntax_kind::ENUM_DECLARATION => "enum",
+        syntax_kind::MODULE_DECLARATION => "namespace",
         _ => "member",
     }
 }
@@ -3031,6 +3402,33 @@ mod tests {
         assert!(!is_classification_consistent(false));
     }
 
+    /// Revision fix (2026-09-05): the epoch-race guard on `schedule`'s
+    /// truncated-attempt re-schedule. Deterministic -- no background
+    /// thread, no quiet period, no tsgo child -- because the decision is a
+    /// pure function of its four inputs (see `should_reschedule_truncated`'s
+    /// own doc comment for why it was extracted).
+    #[test]
+    fn truncated_reschedule_is_skipped_when_a_newer_scan_supersedes_it() {
+        // Same epoch (no concurrent edit landed while this attempt ran):
+        // re-schedule normally.
+        assert!(should_reschedule_truncated(true, 0, 5, 5));
+        // A newer `schedule()` call (a genuine edit's own `ScanCompleted`)
+        // bumped the epoch while this truncated attempt was running its
+        // checker pass -- the bug this fix closes: must NOT re-schedule
+        // (that would bump the epoch again and supersede the real attempt).
+        assert!(!should_reschedule_truncated(true, 0, 6, 5));
+        // Not truncated at all: never reschedule regardless of epoch.
+        assert!(!should_reschedule_truncated(false, 0, 5, 5));
+        // Reschedule cap already reached: never reschedule even on a
+        // matching epoch.
+        assert!(!should_reschedule_truncated(
+            true,
+            MAX_CONSECUTIVE_RESCHEDULES,
+            5,
+            5
+        ));
+    }
+
     /// Plan 3.4: `classify_confirmed_possible` is now the ONE definition
     /// both `print_confirmed_possible_histogram` (this module) and
     /// `tests_e2e.rs`'s `inspect_store_record_histogram` call -- which
@@ -3144,6 +3542,191 @@ mod tests {
         assert!(checked > 0, "expected at least one visible record");
     }
 
+    /// F4 4.3: `collect()`'s two entity-index strategies must agree on
+    /// every lookup a residual pass could ever make, driven from the SAME
+    /// cold-scanned store -- `force_scan=false` (default, the persisted
+    /// `entities.index` section) against `force_scan=true` (the pre-4.3
+    /// full `iter_visible` scan, kept only for this comparison). Also
+    /// confirms the OTHER half of `Collected` (`pending_by_owner`) is
+    /// completely unaffected by which entity strategy ran alongside it.
+    #[test]
+    fn entities_index_section_and_scan_agree_on_the_shared_fixture() {
+        let scratch = scratch_dir("entities-index-parity");
+        let workspace_root = fixture_root();
+        assert!(
+            workspace_root.is_dir(),
+            "shared fixture missing at {workspace_root:?}"
+        );
+        let database_path = scratch.join("workspace.sqlite");
+        let structural_root = scratch.join("structural");
+        let cas_root = scratch.join("cas");
+        let workspace_id = "workspace:entities-index-parity".to_string();
+        let request = scan::ScanRequest {
+            request_id: "request:entities-index-parity".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: urdira_worker_protocol::ScanScope::Full,
+            registry_snapshot_id: "registry:entities-index-parity".to_string(),
+            configuration_revision_id: "configuration:entities-index-parity".to_string(),
+            resolution_lock_id: "resolution:entities-index-parity".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = WorkerState::default();
+        let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+        let cold_event = scan::run_with_residual(
+            request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("cold scan succeeds");
+        let generation = match cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+
+        let store = StoreReader::open(&structural_root).expect("store opens");
+        let dicts = store.dictionaries();
+        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog opens");
+        let frontier = Frontier::load(&conn, &workspace_id).expect("frontier loads");
+        drop(conn);
+        let mut path_by_pair: HashMap<(String, String), String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            path_by_pair.insert(
+                (entry.artifact_id.clone(), entry.artifact_version_id.clone()),
+                path.clone(),
+            );
+        }
+        let owner_path = |ordinal: u32| -> Option<String> {
+            dicts
+                .artifacts
+                .get(ordinal as usize)
+                .and_then(|pair| path_by_pair.get(pair))
+                .cloned()
+        };
+
+        let via_section = collect(&store, &dicts, &owner_path, &frontier, generation, false);
+        let via_scan = collect(&store, &dicts, &owner_path, &frontier, generation, true);
+
+        // The pending-site half of `Collected` does not depend on the
+        // entity-index strategy at all -- same owners, same counts.
+        let section_pending: usize = via_section.pending_by_owner.values().map(Vec::len).sum();
+        let scan_pending: usize = via_scan.pending_by_owner.values().map(Vec::len).sum();
+        assert_eq!(section_pending, scan_pending);
+        assert_eq!(
+            via_section.pending_by_owner.keys().collect::<Vec<_>>(),
+            via_scan.pending_by_owner.keys().collect::<Vec<_>>()
+        );
+
+        // Every live, non-inferred-type entity in the store must resolve
+        // to the SAME record_id through both strategies -- grouped by
+        // `(path, start)` first (rather than asserted per-view directly)
+        // because this fixture, like any real corpus, has a handful of
+        // GENUINE key collisions (more than one visible entity reporting
+        // the same `(owner, span_start)`, e.g. every top-level declaration
+        // in a file whose `push_entity` recipe reports `start == 0` for
+        // some kind this fixture happens to exercise) -- an existing,
+        // orthogonal imprecision this task does not fix. Revision fix
+        // (2026-09-05): `StoreReader::entity_by_owner_and_start` now picks
+        // a DETERMINISTIC winner among candidates sharing a key (greatest
+        // `valid_from`, then newest segment, then greatest `ordinal` --
+        // see its own doc comment), so this test now requires an AMBIGUOUS
+        // key to resolve to that SAME specific candidate through BOTH
+        // strategies, not merely "some" candidate: `store.entity_by_owner_
+        // and_start` is used directly as the oracle (the `Section` variant
+        // of `EntityLookup` is a thin wrapper over it, so agreeing with it
+        // is definitional for that side; the real cross-check is that
+        // `Scan` -- a completely independent, hash-map-based
+        // implementation -- lands on the exact same record_id too, which
+        // it does for THIS fixture because both algorithms reduce to
+        // "greatest record_id among the tied candidates" for a
+        // single-generation, single-segment cold scan: `entities.index`'s
+        // `ordinal` is the row's own position in `compute_order`'s
+        // record_id-ascending sort, and `EntityIndex::build`'s hash-map
+        // "last write wins" is fed by `store.iter_visible`'s own
+        // record_id-ascending k-way merge -- not a coincidence expected to
+        // hold across every possible store shape, only asserted here for
+        // this specific single-segment fixture).
+        let inferred_type_kind_id = dicts
+            .kinds
+            .iter()
+            .position(|k| k == "jsts:entity_inferred_type");
+        // `(owner_artifact, every candidate record_id seen at that key)`,
+        // keyed by `(path, start)` -- a local alias only to satisfy
+        // clippy's `type_complexity` lint, no behavior change.
+        type CandidatesByKey = HashMap<(String, i32), (u32, Vec<[u8; 32]>)>;
+        let mut candidates_by_key: CandidatesByKey = HashMap::new();
+        for view in store.iter_visible(generation) {
+            if view.category() != CATEGORY_ENTITY {
+                continue;
+            }
+            if Some(view.kind_id() as usize) == inferred_type_kind_id {
+                continue;
+            }
+            let Some(path) = owner_path(view.owner_artifact()) else {
+                continue;
+            };
+            let start = view.span_start_byte() as i32;
+            let entry = candidates_by_key
+                .entry((path, start))
+                .or_insert_with(|| (view.owner_artifact(), Vec::new()));
+            entry.1.push(view.record_id());
+        }
+        assert!(
+            !candidates_by_key.is_empty(),
+            "expected at least one visible entity in the shared fixture"
+        );
+        let mut checked_unambiguous = 0u64;
+        let mut ambiguous_keys = 0u64;
+        for ((path, start), (owner_ordinal, candidates)) in &candidates_by_key {
+            let section_hit = via_section.entities.lookup(path, *start);
+            let scan_hit = via_scan.entities.lookup(path, *start);
+            let expected = store
+                .entity_by_owner_and_start(*owner_ordinal, *start as u32, generation)
+                .map(|view| view.record_id());
+            assert!(
+                expected.is_some_and(|id| candidates.contains(&id)),
+                "entity_by_owner_and_start's own deterministic pick for {path}:{start} is not \
+                 among the candidates it should be choosing from: {expected:?}"
+            );
+            assert_eq!(
+                section_hit, expected,
+                "entities.index section path disagreed with entity_by_owner_and_start's own \
+                 deterministic pick for {path}:{start}"
+            );
+            assert_eq!(
+                scan_hit, expected,
+                "full-scan path did not converge on the SAME deterministic pick as \
+                 entity_by_owner_and_start for {path}:{start} -- got {scan_hit:?}, expected {expected:?}"
+            );
+            if candidates.len() == 1 {
+                checked_unambiguous += 1;
+            } else {
+                ambiguous_keys += 1;
+            }
+        }
+        eprintln!(
+            "[test] entities_index_section_and_scan_agree: unambiguous_keys={checked_unambiguous} ambiguous_keys={ambiguous_keys}"
+        );
+        assert!(
+            checked_unambiguous > 0,
+            "expected at least one unambiguous (path, start) key in the shared fixture"
+        );
+        assert!(
+            ambiguous_keys > 0,
+            "expected the shared fixture's known genuine key collision to still be present -- \
+             if this now fails, the collision may have been fixed upstream; update this test's \
+             own doc comment accordingly rather than deleting the ambiguous-key assertions"
+        );
+    }
+
     static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn scratch_dir(label: &str) -> PathBuf {
@@ -3228,6 +3811,10 @@ mod tests {
             registry_snapshot_id: "registry:v4-residual-test".to_string(),
             configuration_revision_id: "configuration:v4-residual-test".to_string(),
             resolution_lock_id: "resolution:v4-residual-test".to_string(),
+            // Simulates the trigger a cold `Full` scan would build (see
+            // `scan::run_with_residual`): the whole frontier is in scope.
+            touched_owners: None,
+            reschedule_count: 0,
         };
 
         // Count possible call/heritage rows before the residual pass runs,
@@ -3252,7 +3839,14 @@ mod tests {
                 .and_then(|pair| path_by_pair.get(pair))
                 .cloned()
         };
-        let collected = collect(&store, &dicts, &owner_path, base_generation);
+        let collected = collect(
+            &store,
+            &dicts,
+            &owner_path,
+            &frontier,
+            base_generation,
+            false,
+        );
         let pending_before: usize = collected.pending_by_owner.values().map(Vec::len).sum();
 
         let result = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
@@ -3515,12 +4109,13 @@ mod tests {
         // The `[1, 2].map((n) => n)` call is deliberate: it is the SAME
         // "guaranteed pending call site" shape `tests/residual_pass.rs`
         // uses (a lib.d.ts `Array.prototype` method E1-E3/typeflow cannot
-        // resolve without a real checker) -- without at least one pending
-        // call/heritage site, `collect()` returns an empty
-        // `pending_by_owner` and `run_once_with_quiet_period` bails out
-        // BEFORE ever reaching the checker pass at all (this module's own
-        // early-return doc comment), so the inferred-type/diagnostic half
-        // this test exercises would never run either.
+        // resolve without a real checker). F4 4.1 removed the early return
+        // that used to make a call/heritage site load-bearing for the
+        // inferred-types/diagnostics half of this test too (that half now
+        // runs regardless of `pending_by_owner`) -- kept anyway so this
+        // test still exercises the `SiteOutcome::Unresolved`/`upgraded`
+        // counters alongside the inferred-type/diagnostic assertions below,
+        // matching what a real corpus with both kinds of work looks like.
         let before_text = "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nfunction helper(): string {\n  return \"not exported\";\n}\n\nexport class Widget {\n  count = 0;\n  describe(): string {\n    return `widget ${this.count}`;\n  }\n}\n\nconst bad: number = \"nope\";\n\n[1, 2].map((n) => n);\n";
         std::fs::write(&owner_absolute, before_text).expect("write fixture file");
         std::fs::write(workspace_root.join("package.json"), r#"{"type":"module"}"#)
@@ -3578,6 +4173,13 @@ mod tests {
             registry_snapshot_id: "registry:v4-inferred-types-test".to_string(),
             configuration_revision_id: "configuration:v4-inferred-types-test".to_string(),
             resolution_lock_id: "resolution:v4-inferred-types-test".to_string(),
+            // Run 3 (below) is preceded by a real `Changed` incremental
+            // scan, but this SAME `context` is also reused for runs 1/2
+            // (right after the cold scan) -- `None` keeps every run's file
+            // map scoped to the whole (tiny) fixture frontier, matching
+            // this test's own pre-4.1 behavior exactly.
+            touched_owners: None,
+            reschedule_count: 0,
         };
 
         // --- Run 1 ---
@@ -3813,6 +4415,153 @@ mod tests {
         );
     }
 
+    /// F4 4.1: a fixture with an exported, typed function and a deliberate
+    /// type error, but NO call/heritage site at all (unlike the sibling
+    /// `inferred_types_and_diagnostics_across_two_runs_and_an_edit`
+    /// fixture, this one has no `[1, 2].map(...)`-shaped lib dispatch) --
+    /// `collect()`'s own `pending_by_owner` is verified empty below before
+    /// the pass runs. Before this task, `run_once_with_quiet_period`
+    /// returned early the instant `pending_by_owner` was empty, WITHOUT
+    /// ever reaching decision 28's inferred-types/diagnostics half -- this
+    /// test is the regression guard for that early return's removal: an
+    /// exported declaration still gets a `jsts:entity_inferred_type`/
+    /// `jsts:relation_type_of` pair and the type error still gets a
+    /// `jsts:diagnostic`, purely from the "always build file_map, always
+    /// run the checker pass" path, with zero possible sites to upgrade.
+    #[test]
+    fn residual_emits_types_and_diagnostics_with_zero_pending_sites() {
+        let Some(tsgo) = binary::discover(&fixture_root_repo()).ok() else {
+            eprintln!("skipping: tsgo binary not discoverable");
+            return;
+        };
+        drop(tsgo);
+
+        let scratch = scratch_dir("zero-pending");
+        let workspace_root = scratch.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let owner_relative = "a.ts";
+        let owner_absolute = workspace_root.join(owner_relative);
+        let text = "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nconst bad: number = \"nope\";\n";
+        std::fs::write(&owner_absolute, text).expect("write fixture file");
+        std::fs::write(workspace_root.join("package.json"), r#"{"type":"module"}"#)
+            .expect("write package.json");
+        std::fs::write(
+            workspace_root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"module":"ESNext","moduleResolution":"Bundler","target":"ES2022","strict":false,"skipLibCheck":true,"allowJs":true,"checkJs":true}}"#,
+        )
+        .expect("write tsconfig.json");
+
+        let database_path = scratch.join("workspace.sqlite");
+        let structural_root = scratch.join("structural");
+        let cas_root = scratch.join("cas");
+        let workspace_id = "workspace:v4-zero-pending-test".to_string();
+
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = WorkerState::default();
+        let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+
+        let cold_request = scan::ScanRequest {
+            request_id: "request:v4-zero-pending-cold".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: ScanScope::Full,
+            registry_snapshot_id: "registry:v4-zero-pending-test".to_string(),
+            configuration_revision_id: "configuration:v4-zero-pending-test".to_string(),
+            resolution_lock_id: "resolution:v4-zero-pending-test".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let cold_event = scan::run_with_residual(
+            cold_request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("cold scan succeeds");
+        let base_generation = match cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+
+        // Verified, not merely assumed: this fixture has zero pending
+        // call/heritage sites -- the exact precondition this test exists
+        // to exercise.
+        let store = StoreReader::open(&structural_root).expect("store opens");
+        let dicts = store.dictionaries();
+        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog opens");
+        let frontier = Frontier::load(&conn, &workspace_id).expect("frontier loads");
+        drop(conn);
+        let mut path_by_pair: HashMap<(String, String), String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            path_by_pair.insert(
+                (entry.artifact_id.clone(), entry.artifact_version_id.clone()),
+                path.clone(),
+            );
+        }
+        let owner_path = |ordinal: u32| -> Option<String> {
+            dicts
+                .artifacts
+                .get(ordinal as usize)
+                .and_then(|pair| path_by_pair.get(pair))
+                .cloned()
+        };
+        let collected = collect(
+            &store,
+            &dicts,
+            &owner_path,
+            &frontier,
+            base_generation,
+            false,
+        );
+        assert!(
+            collected.pending_by_owner.is_empty(),
+            "fixture must have zero pending call/heritage sites for this test to exercise the right code path: {:?}",
+            collected.pending_by_owner
+        );
+
+        let context = ResidualContext {
+            request_id: "request:v4-zero-pending-upgrade".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            registry_snapshot_id: "registry:v4-zero-pending-test".to_string(),
+            configuration_revision_id: "configuration:v4-zero-pending-test".to_string(),
+            resolution_lock_id: "resolution:v4-zero-pending-test".to_string(),
+            touched_owners: None,
+            reschedule_count: 0,
+        };
+
+        let outcome = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
+            .expect("residual pass does not error")
+            .expect(
+                "a fixture with an exported function and a type error always produces an \
+                 outcome, even with zero pending call/heritage sites",
+            );
+        eprintln!(
+            "[test] inferred_type_entities={} diagnostics_emitted={} generation={}",
+            outcome.inferred_type_entities, outcome.diagnostics_emitted, outcome.generation,
+        );
+        assert!(
+            outcome.inferred_type_entities > 0,
+            "expected at least one inferred-type entity even with zero pending sites"
+        );
+        assert!(
+            outcome.diagnostics_emitted > 0,
+            "expected the deliberate type error to still produce a compiler diagnostic"
+        );
+        assert_eq!(outcome.upgraded_sites, 0);
+        assert_eq!(outcome.external_sites, 0);
+        assert_eq!(outcome.unresolved_sites, 0);
+        assert!(outcome.generation > base_generation);
+    }
+
     fn kind_of_at<'a>(
         dicts: &'a Dictionaries,
         view: &urdira_structural_store::RecordView,
@@ -3919,11 +4668,18 @@ mod tests {
             registry_snapshot_id: "registry:n8n-residual-debug".to_string(),
             configuration_revision_id: "configuration:n8n-residual-debug".to_string(),
             resolution_lock_id: "resolution:n8n-residual-debug".to_string(),
+            touched_owners: None,
+            reschedule_count: 0,
         };
         let residual_started = std::time::Instant::now();
         let outcome = run_once_with_quiet_period(&context, 0, std::time::Duration::ZERO)
             .expect("residual pass does not error")
-            .expect("n8n corpus has pending sites");
+            // F4 4.1: no longer conditioned on pending call/heritage sites
+            // existing -- the pass always produces an outcome once it has
+            // at least one jsts file to run against (a cold scan's
+            // `touched_owners` is `None`, so `file_map` covers the whole
+            // n8n frontier regardless of `pending.sites`).
+            .expect("residual pass always reports an outcome once file_map is non-empty");
         eprintln!(
             "[n8n_residual_pass_debug_histogram] residual pass wall={:.3}s total_ms={} upgraded={} external={} unresolved={} inferred_type_entities={} type_of_relations={} diagnostics_emitted={}",
             residual_started.elapsed().as_secs_f64(),

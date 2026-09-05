@@ -109,6 +109,7 @@ fn run_semantics(
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
         fetch_semantics: true,
+        deadline: None,
     };
     let (_, stats) = ResidualPass::run_instrumented(&plan, 1, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed");
@@ -203,6 +204,61 @@ fn exported_function_and_class_members_are_typed_but_unexported_is_not() {
     );
 }
 
+const NAMESPACE_TS: &str = r#"export namespace Utils {
+  export function double(n: number): number {
+    return n * 2;
+  }
+  export const factor = 2;
+  function hidden(): void {}
+}
+"#;
+
+/// F4 4.4: an exported `namespace`'s own exported members (a function and a
+/// `const`) get typed with a `"{Namespace}.{member}"` `display_name`, the
+/// same convention an exported class's members already use — and a
+/// NOT-exported member inside the namespace is excluded, mirroring the
+/// class-member test above.
+#[test]
+fn namespace_members_are_typed_with_namespace_qualified_display_name() {
+    let Some((types, _diagnostics)) = run_semantics(NAMESPACE_TS) else {
+        return;
+    };
+    assert!(!types.is_empty(), "expected at least one typed declaration");
+    let names_and_starts: Vec<(i32, &str)> = types
+        .iter()
+        .map(|t| (t.site.name_start_utf16, t.site.display_name.as_str()))
+        .collect();
+
+    let double_start = NAMESPACE_TS.find("double").unwrap();
+    let double_start_utf16 = NAMESPACE_TS[..double_start].encode_utf16().count() as i32;
+    let double_site = types
+        .iter()
+        .find(|t| t.site.name_start_utf16 == double_start_utf16)
+        .unwrap_or_else(|| {
+            panic!("expected namespace member `double` to be typed; got {names_and_starts:?}")
+        });
+    assert_eq!(double_site.site.display_name, "Utils.double");
+
+    let factor_start = NAMESPACE_TS.find("factor").unwrap();
+    let factor_start_utf16 = NAMESPACE_TS[..factor_start].encode_utf16().count() as i32;
+    let factor_site = types
+        .iter()
+        .find(|t| t.site.name_start_utf16 == factor_start_utf16)
+        .unwrap_or_else(|| {
+            panic!("expected namespace member `factor` to be typed; got {names_and_starts:?}")
+        });
+    assert_eq!(factor_site.site.display_name, "Utils.factor");
+
+    let hidden_start = NAMESPACE_TS.find("hidden").unwrap();
+    let hidden_start_utf16 = NAMESPACE_TS[..hidden_start].encode_utf16().count() as i32;
+    assert!(
+        names_and_starts
+            .iter()
+            .all(|(start, _)| *start != hidden_start_utf16),
+        "unexported namespace member `hidden` must not be typed; got {names_and_starts:?}"
+    );
+}
+
 #[test]
 fn deliberate_type_error_produces_a_compiler_diagnostic() {
     let Some((_types, diagnostics)) = run_semantics(A_TS) else {
@@ -244,6 +300,7 @@ fn fetch_semantics_false_collects_no_types_or_diagnostics() {
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
         fetch_semantics: false,
+        deadline: None,
     };
     let (_, stats) = ResidualPass::run_instrumented(&plan, 1, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed");

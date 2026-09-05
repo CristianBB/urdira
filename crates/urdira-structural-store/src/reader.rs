@@ -100,6 +100,13 @@ pub(crate) struct Segment {
     pub by_identity: SectionSource,
     pub adj_out: SectionSource,
     pub adj_in: SectionSource,
+    /// F4 4.3: `(owner_artifact, span_start, ordinal)` triples over this
+    /// segment's own `CATEGORY_ENTITY` rows (excluding `jsts:entity_
+    /// inferred_type`) -- MANDATORY, like `by_name`/`by_owner` (never
+    /// `Option`), because every base/delta this crate writes now carries it
+    /// unconditionally (`HEADER_FORMAT` 6). See `StoreReader::
+    /// entity_by_owner_and_start`.
+    pub entities_index: SectionSource,
     pub deps_keys: SectionSource,
     pub deps_meta: SectionSource,
     pub deps_reverse: SectionSource,
@@ -213,6 +220,7 @@ impl Segment {
         let by_identity = section("records.by_identity", SectionId::RecordsByIdentity)?;
         let adj_out = section("adj.out", SectionId::AdjOut)?;
         let adj_in = section("adj.in", SectionId::AdjIn)?;
+        let entities_index = section("entities.index", SectionId::EntitiesIndex)?;
         let deps_keys = section("deps.keys", SectionId::DepsKeys)?;
         let (deps_header, _) = header_and_data(&deps_keys)?;
         let deps_n = deps_header.row_count as usize;
@@ -267,6 +275,7 @@ impl Segment {
             by_identity,
             adj_out,
             adj_in,
+            entities_index,
             deps_keys,
             deps_meta,
             deps_reverse,
@@ -1494,6 +1503,75 @@ impl StoreReader {
         out
     }
 
+    /// F4 4.3: `entities.index` lookup -- exactly the `(owner_path ->
+    /// owner_artifact ordinal, span_start_byte) -> record_id` correlation
+    /// `urdira-tsgo-client::entity_index::EntityIndex` used to build from a
+    /// full `iter_visible` scan (`urdira-indexing-worker`'s `v4::residual::
+    /// collect`), now O(sites) via a per-segment binary search instead of
+    /// O(corpus). `(owner_artifact, span_start)` is expected unique among
+    /// LIVE rows within one segment's own entity population (the `jsts:
+    /// entity_inferred_type` exclusion at write time exists specifically to
+    /// keep it that way, see `segment_io::is_entities_index_row`'s doc
+    /// comment) -- but a genuine collision among several still-live
+    /// entities at the exact same span DOES occur in practice (confirmed
+    /// live: the shared `task-planner` fixture has exactly one, at
+    /// `start=0`, a pre-existing imprecision this section does not
+    /// introduce). This function scans EVERY segment (not "first segment
+    /// hit wins") and, among every VISIBLE candidate sharing the key,
+    /// deterministically picks the one with the greatest `valid_from`
+    /// (the most recently OPENED row); ties broken by the NEWEST segment
+    /// (`inner.segments`' own newest-first ordering); ties still remaining
+    /// (two rows in the very same segment's own key range, both visible,
+    /// both opened at the same `valid_from`) broken by the greater
+    /// `ordinal`. This rule is arbitrary but STABLE across repeated calls
+    /// against the same store snapshot (unlike an unordered "first hit in
+    /// whatever order the binary search range happens to enumerate"),
+    /// matching decision 26's amendment. See `docs/decisions/
+    /// 26-v4-structural-store.md`'s `entities.index` section for the same
+    /// rule spelled out at the format level.
+    pub fn entity_by_owner_and_start(
+        &self,
+        owner: u32,
+        start: u32,
+        generation: u64,
+    ) -> Option<RecordView> {
+        let inner = self.snapshot();
+        // `(valid_from, newest-segment-first rank, ordinal)` -- compared
+        // with a plain tuple `>` so "greatest wins" reads directly off the
+        // doc comment's own tie-break order. `seg_rank` is the REVERSE of
+        // `inner.segments`' own index (segment 0 is newest) so a smaller
+        // segment index -- newer -- compares as a LARGER `seg_rank`.
+        let segment_count = inner.segments.len();
+        let mut best: Option<(u32, usize, usize, RecordView)> = None;
+        for (seg_index, seg) in inner.segments.iter().enumerate() {
+            let seg_rank = segment_count - seg_index;
+            let data = &seg.entities_index[HEADER_LEN..];
+            let (lo, hi) = triple_key_range(data, owner, start);
+            for i in lo..hi {
+                let ord = triple_ordinal_at(data, i) as usize;
+                let view = RecordView {
+                    segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
+                    ordinal: ord,
+                };
+                if !view.is_visible(generation) {
+                    continue;
+                }
+                let candidate_key = (view.valid_from(), seg_rank, ord);
+                let is_better = match &best {
+                    None => true,
+                    Some((valid_from, rank, ordinal, _)) => {
+                        candidate_key > (*valid_from, *rank, *ordinal)
+                    }
+                };
+                if is_better {
+                    best = Some((candidate_key.0, candidate_key.1, candidate_key.2, view));
+                }
+            }
+        }
+        best.map(|(_, _, _, view)| view)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn by_kind(
         &self,
@@ -1945,9 +2023,9 @@ impl StoreReader {
             // (`write_base`/`write_base_partitioned`/`build_delta_
             // sections`) -- verified together via `verify_records_hot_
             // partitioned`, which re-derives the nibble boundaries from
-            // `keys`/`meta` themselves. The other 9 mandatory sections are
-            // never partitioned, so they keep the plain whole-data
-            // `verify_xxh3`.
+            // `keys`/`meta` themselves. The other 10 mandatory sections
+            // (9 pre-F4-4.3, plus `entities.index`) are never partitioned,
+            // so they keep the plain whole-data `verify_xxh3`.
             verify_records_hot_partitioned(
                 &seg.keys,
                 &seg.meta,
@@ -1963,6 +2041,7 @@ impl StoreReader {
                 ("records.by_identity", &seg.by_identity),
                 ("adj.out", &seg.adj_out),
                 ("adj.in", &seg.adj_in),
+                ("entities.index", &seg.entities_index),
                 ("deps.keys", &seg.deps_keys),
                 ("deps.meta", &seg.deps_meta),
                 ("deps.reverse", &seg.deps_reverse),

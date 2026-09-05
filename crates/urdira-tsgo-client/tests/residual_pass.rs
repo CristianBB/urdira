@@ -203,6 +203,7 @@ fn run_pass(lanes: usize) -> Vec<urdira_tsgo_client::residual_pass::ResolvedSite
         project_config_path: CONFIG_PATH.to_string(),
         compiler_options: compiler_options(),
         fetch_semantics: false,
+        deadline: None,
     };
     ResidualPass::run(&plan, lanes, &pending_by_owner, fs, &config)
         .expect("residual pass should succeed")
@@ -334,4 +335,132 @@ fn entity_index_maps_a_resolved_workspace_target_back_to_a_caller_entity_id() {
         Some(entity_id.as_str())
     );
     assert_eq!(index.lookup(path, 999_999), None);
+}
+
+/// F4 4.2: a `deadline` already in the past — deterministic regardless of
+/// how long `updateSnapshot`/resolve actually take (a monotonic clock only
+/// moves forward, so `Instant::now() >= deadline` is guaranteed true the
+/// very first time `run_lane` checks it, before it ever opens window 0).
+/// Verifies `run_instrumented`'s own truncation reporting end to end: zero
+/// sites resolved, `truncated == true`, and `remaining_roots` names every
+/// root in the plan (nothing was ever opened) — not a stale/partial list.
+#[test]
+fn deadline_already_past_truncates_before_the_first_window() {
+    let Some(tsgo) = discover_binary() else {
+        return;
+    };
+    let (fs, plan, pending_by_owner) = build_fixture();
+    let config = ResidualPassConfig {
+        lib_roots: vec![lib_root_dir(&tsgo)],
+        binary: tsgo,
+        root: VIRTUAL_ROOT.to_string(),
+        project_config_path: CONFIG_PATH.to_string(),
+        compiler_options: compiler_options(),
+        fetch_semantics: false,
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+    };
+    let (resolved, stats) =
+        ResidualPass::run_instrumented(&plan, 1, &pending_by_owner, fs, &config)
+            .expect("a truncated pass is still Ok, never an error");
+    assert!(
+        resolved.is_empty(),
+        "no window should have opened at all: {resolved:?}"
+    );
+    assert!(stats.truncated, "expected the pass to report truncation");
+    assert_eq!(stats.windows.len(), 0, "no window telemetry recorded");
+    assert_eq!(stats.windows_total, 3);
+    let mut remaining = stats.remaining_roots.clone();
+    remaining.sort();
+    let mut expected: Vec<String> = plan.windows.iter().flat_map(|w| w.roots.clone()).collect();
+    expected.sort();
+    assert_eq!(
+        remaining, expected,
+        "every root should still be pending -- nothing was ever opened"
+    );
+}
+
+/// F4 4.2's core correctness property ("dos pases publican lo mismo que
+/// uno sin cota"): splitting the SAME 3-window fixture into a first pass
+/// over only window 0's roots and a follow-up pass over the remaining two
+/// windows' roots (exactly what `residual.rs::schedule`'s re-trigger does
+/// with `ResidualOutcome::remaining_roots`) must produce the identical
+/// resolved-site set as one unbounded pass over the whole plan — proving
+/// the window/plan abstraction is split-order-independent, which is the
+/// actual invariant a truncated-then-resumed residual pass relies on
+/// (deterministically, with no dependency on real wall-clock timing).
+#[test]
+fn splitting_the_plan_across_two_passes_matches_one_unbounded_pass() {
+    let Some(tsgo) = discover_binary() else {
+        return;
+    };
+    let (fs, plan, pending_by_owner) = build_fixture();
+
+    let config_for = |binary: TsgoBinary| ResidualPassConfig {
+        lib_roots: vec![lib_root_dir(&binary)],
+        binary,
+        root: VIRTUAL_ROOT.to_string(),
+        project_config_path: CONFIG_PATH.to_string(),
+        compiler_options: compiler_options(),
+        fetch_semantics: false,
+        deadline: None,
+    };
+
+    let unbounded_config = config_for(tsgo);
+    let mut unbounded = ResidualPass::run(
+        &plan,
+        1,
+        &pending_by_owner,
+        Arc::clone(&fs),
+        &unbounded_config,
+    )
+    .expect("unbounded pass should succeed");
+    unbounded.sort_by(|a, b| {
+        a.owner_path
+            .cmp(&b.owner_path)
+            .then(a.start_utf16.cmp(&b.start_utf16))
+    });
+
+    // "First generation": only window 0 (`a.ts`).
+    let first_plan = WindowPlan {
+        windows: plan.windows[..1].to_vec(),
+    };
+    let Some(tsgo_again) = discover_binary() else {
+        return;
+    };
+    let first_config = config_for(tsgo_again);
+    let mut split: Vec<_> = ResidualPass::run(
+        &first_plan,
+        1,
+        &pending_by_owner,
+        Arc::clone(&fs),
+        &first_config,
+    )
+    .expect("first (window-0-only) pass should succeed");
+
+    // "Second generation": exactly the remaining roots (`b.ts`, `c.ts`) --
+    // the same shape `residual.rs::schedule`'s re-trigger builds from
+    // `ResidualOutcome::remaining_roots`.
+    let remaining_roots: Vec<String> = plan.windows[1..]
+        .iter()
+        .flat_map(|w| w.roots.clone())
+        .collect();
+    let second_plan = WindowPlan::build(&remaining_roots, 1);
+    let Some(tsgo_third) = discover_binary() else {
+        return;
+    };
+    let second_config = config_for(tsgo_third);
+    let second = ResidualPass::run(&second_plan, 1, &pending_by_owner, fs, &second_config)
+        .expect("second (resumed) pass should succeed");
+    split.extend(second);
+    split.sort_by(|a, b| {
+        a.owner_path
+            .cmp(&b.owner_path)
+            .then(a.start_utf16.cmp(&b.start_utf16))
+    });
+
+    assert_eq!(
+        unbounded, split,
+        "two passes (window 0, then the remaining windows) must publish exactly what one \
+         unbounded pass over the whole plan would"
+    );
 }
