@@ -118,10 +118,34 @@ use super::scan::ScanRequest;
 use super::timings::ScanClock;
 use super::{ScanError, catalog};
 
-/// The Node analyzer's own default window size -- unchanged here, this
-/// pass has no reason to diverge from the value already tuned for tsgo
-/// project size.
-const WINDOW_SIZE: usize = WindowPlan::DEFAULT_WINDOW_SIZE;
+/// The Node analyzer's own default window size -- unchanged for any real
+/// caller, this pass has no reason to diverge from the value already
+/// tuned for tsgo project size.
+///
+/// C.6 (2026-09-05, diagnostic only): `URDIRA_V4_RESIDUAL_WINDOW_SIZE`
+/// overrides it, to test the hypothesis that a call/heritage site's own
+/// resolution can depend on which OTHER roots share its window (tsgo's
+/// program for a window is rooted at exactly `files: window.roots`; a
+/// file present in `file_map`/`VirtualFs` but not reachable by imports
+/// from THOSE roots is invisible to that window's own checker instance,
+/// even though the same file would be reachable from a DIFFERENT window
+/// composition). Never read outside this function -- no production code
+/// path is meant to change window size, this exists purely so `n8n_
+/// residual_pass_debug_histogram` can be re-run at a different window
+/// size and compared against the `WindowPlan::DEFAULT_WINDOW_SIZE`
+/// baseline (`docs/evidence`-bound logs: `v4-fold/q5-residual/histogram-
+/// unbounded-w{256,1024}.log`). Parsed as `u64` (matching `WindowPlan::
+/// build`'s own `window_size: usize` parameter after a `usize::try_from`)
+/// and rejected (falls back to the default) if zero or unparsable --
+/// `WindowPlan::build` itself asserts `window_size > 0`.
+fn window_size() -> usize {
+    std::env::var("URDIRA_V4_RESIDUAL_WINDOW_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(WindowPlan::DEFAULT_WINDOW_SIZE)
+}
 
 /// Fixed, all-lowercase synthetic root every virtual path this pass builds
 /// is rooted under -- see `run_once_with_quiet_period`'s own comment on
@@ -778,7 +802,7 @@ fn run_once_with_quiet_period(
         None => file_map.keys().cloned().collect(),
     };
     sorted_roots.sort();
-    let plan = WindowPlan::build(&sorted_roots, WINDOW_SIZE);
+    let plan = WindowPlan::build(&sorted_roots, window_size());
 
     // Re-key `pending_by_owner` under the same absolute virtual paths the
     // window plan/VirtualFs use.
@@ -5477,6 +5501,34 @@ mod tests {
         // visible set (propagated unchanged through the whole chain),
         // while only the window plan narrows -- see both functions' own
         // doc comments for the full mechanism.
+        //
+        // C.6 diagnostic (2026-09-05): after the C.5 fix, the chain's own
+        // `confirmed_combined` still lands at 161,796 (+2 over the 161,794
+        // reference) on a real run (`schedule7.log`). Hypothesis tested:
+        // tsgo's program for a window is rooted at exactly `files: window.
+        // roots`, so a site's resolution could depend on which OTHER
+        // roots happen to share its window -- a continuation re-chunks
+        // the remaining roots into DIFFERENT window compositions than an
+        // unbounded pass would use, so if this were true, an unbounded
+        // pass run at a DIFFERENT window size should ALSO differ from
+        // 161,794. Tested directly via `window_size()`'s diagnostic
+        // override, unbounded, on this exact corpus/build:
+        // `URDIRA_V4_RESIDUAL_WINDOW_SIZE=256` ->
+        // `v4-fold/q5-residual/histogram-unbounded-w256.log`:
+        // confirmed_combined=161794 (0 diff); `=1024` ->
+        // `-w1024.log`: confirmed_combined=161794 (0 diff). Both equal
+        // the 512-window reference EXACTLY -- `upgraded`
+        // (56297/56297/56297) and `inferred_type_entities`
+        // (41042/41042/41042) are ALSO window-size-invariant. The
+        // hypothesis is REFUTED for `confirmed_combined`: this call/
+        // heritage-resolution figure does not depend on window
+        // composition at any tested size, so the chain's own +2 is NOT a
+        // partition effect and the assert below stays EXACT, unrelaxed
+        // (interesting side finding, unrelated to this assert:
+        // `diagnostics_emitted` is NOT window-size-invariant --
+        // 248481/248193/248187 at window sizes 256/512/1024 -- a real,
+        // separate partition effect for compiler diagnostics specifically,
+        // reported for the owner's own awareness, not acted on here).
         let final_confirmed_combined =
             print_confirmed_possible_histogram("FINAL", &structural_root, last.generation);
         assert_eq!(
