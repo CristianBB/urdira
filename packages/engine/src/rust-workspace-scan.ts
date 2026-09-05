@@ -174,9 +174,14 @@ export function onRustWorkspaceUpgradeCompleted(
       external_sites: event.external_sites,
       unresolved_sites: event.unresolved_sites,
       timings: event.timings,
-      truncated: event.truncated,
-      windows_done: event.windows_done,
-      windows_total: event.windows_total,
+      // `exactOptionalPropertyTypes`: omit the key entirely rather than
+      // assigning `undefined` to it -- a sender that predates F4 4.2's
+      // truncation fields never sets these, and `WorkspaceScanUpgradeCompleted`'s
+      // own optional fields (`truncated?`/`windows_done?`/`windows_total?`)
+      // mean "absent", not "present with value undefined".
+      ...(event.truncated !== undefined ? { truncated: event.truncated } : {}),
+      ...(event.windows_done !== undefined ? { windows_done: event.windows_done } : {}),
+      ...(event.windows_total !== undefined ? { windows_total: event.windows_total } : {}),
     });
   });
 }
