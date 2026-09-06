@@ -1909,6 +1909,168 @@ describe("CanonicalRecordQueryDataPort semantic_coverage view", () => {
   });
 });
 
+// Plan 2026-09-06 (Frente S-A): `semantic_document_status` real counts on the
+// coverage view, plus `core:semantic_affected_page`'s bidirectional keyset
+// pagination over the affected (status <> 'covered') set.
+describe("CanonicalRecordQueryDataPort semantic_document_status real counts + core:semantic_affected_page", () => {
+  async function insertStatusRow(opened: OpenedWorkspace, provider: ResolvedSemanticProvider, row: { readonly grain: "artifact" | "entity"; readonly documentId: string; readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly status: string; readonly reasonCodes?: readonly string[] }): Promise<void> {
+    await opened.database.run(
+      `INSERT INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [workspace.workspace_id, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest, row.grain, row.documentId, row.artifactId, row.artifactVersionId, row.displayPath, row.status, JSON.stringify(row.reasonCodes ?? []), row.status === "covered" ? 1 : 0, 1, now],
+    );
+  }
+
+  function affectedPageOperation(args: Readonly<Record<string, unknown>>): { readonly operation_id: string; readonly result_streams: readonly string[]; readonly arguments: unknown; readonly scope: QueryScope } {
+    return { operation_id: "core:semantic_affected_page", result_streams: ["semantic_affected_artifacts"], arguments: args, scope };
+  }
+
+  interface AffectedPageValue {
+    readonly affected_artifact_set_id: string;
+    readonly total: number;
+    readonly artifacts: readonly { readonly artifact_id: string; readonly display_path: string; readonly coverage_status: string; readonly reason_codes: readonly string[] }[];
+    readonly next_cursor?: string;
+    readonly previous_cursor?: string;
+    readonly has_next: boolean;
+    readonly has_previous: boolean;
+  }
+
+  /** `core:semantic_affected_page` emits exactly ONE stream item -- the whole `SemanticAffectedArtifactPage` (see `trySemanticAffectedPage`'s own doc comment for why: the cursor round-trips through this operation's OWN `cursor` argument, never the generic per-stream continuation, so it must be readable from the result). */
+  function affectedPage(evaluation: { readonly streams: Readonly<Record<string, readonly unknown[]>> }): AffectedPageValue {
+    const items = evaluation.streams["semantic_affected_artifacts"] as readonly { readonly value: AffectedPageValue }[];
+    expect(items).toHaveLength(1);
+    return items[0]!.value;
+  }
+
+  it("reports real unsupported/failed artifact counts and exact entity counts from semantic_document_status, overriding the inferred pre-status-table arithmetic", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      await insertSemanticArtifactVersion(opened, { artifactId: "art-a", versionId: "artv-a", path: "src/a.ts", byteLength: 10, validFromGeneration: 1 });
+      await putSemanticVector(opened, provider, { artifactId: "art-a", versionId: "artv-a", text: "document text for a" });
+      await insertStatusRow(opened, provider, { grain: "artifact", documentId: "artv-a", artifactId: "art-a", artifactVersionId: "artv-a", displayPath: "src/a.ts", status: "covered" });
+      await insertStatusRow(opened, provider, { grain: "artifact", documentId: "artv-fail", artifactId: "art-fail", artifactVersionId: "artv-fail", displayPath: "src/fail.ts", status: "failed", reasonCodes: ["provider_error:vector_write_failed"] });
+      await insertStatusRow(opened, provider, { grain: "entity", documentId: "entity-1", artifactId: "art-a", artifactVersionId: "artv-a", displayPath: "src/a.ts", status: "covered" });
+      await insertStatusRow(opened, provider, { grain: "entity", documentId: "entity-2", artifactId: "art-a", artifactVersionId: "artv-a", displayPath: "src/a.ts", status: "unsupported", reasonCodes: ["unsupported_kind"] });
+      await markSemanticIndexState(opened, 1, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+
+      const evaluation = await dataPort.execute(semanticOperation("core:search_semantic"));
+      const coverage = coverageView(evaluation);
+      expect(coverage).toMatchObject({ failed_artifact_count: 1, entity_count: 2, covered_entity_count: 1 });
+      expect(coverage["affected_artifact_set_id"]).toEqual(expect.stringMatching(/^sha256:/));
+      expect(coverage["affected_artifact_page"]).toMatchObject({ total: 2 });
+    });
+  });
+
+  it("pages forward and backward with keyset cursors over the affected set, never mixing pages", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      // Five affected artifact-grain documents, seeded out of display_path
+      // order so a bug sorting by insertion order rather than
+      // (display_path, artifact_id, document_id) would be caught.
+      const paths = ["src/c.ts", "src/a.ts", "src/e.ts", "src/b.ts", "src/d.ts"];
+      for (const path of paths) {
+        const id = path.replace("src/", "").replace(".ts", "");
+        await insertStatusRow(opened, provider, { grain: "artifact", documentId: `artv-${id}`, artifactId: `art-${id}`, artifactVersionId: `artv-${id}`, displayPath: path, status: "pending", reasonCodes: ["pending_embed"] });
+      }
+      // A current marker (no vectors need to exist) is enough to make the
+      // index "available" -- these tests exercise the affected-page path,
+      // not materialization progress itself.
+      await markSemanticIndexState(opened, 1, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+
+      // A caller cannot know the set id in advance -- the first request
+      // comes from a coverage view, exactly like a real agent would (via
+      // search_semantic's own embedded first page), never hand-computed.
+      const coverage = coverageView(await dataPort.execute(semanticOperation("core:search_semantic")));
+      const setId = coverage["affected_artifact_set_id"] as string;
+
+      const page1 = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, limit: 2 })));
+      expect(page1.total).toBe(5);
+      expect(page1.artifacts.map((item) => item.display_path)).toEqual(["src/a.ts", "src/b.ts"]);
+      expect(page1.has_next).toBe(true);
+      expect(page1.has_previous).toBe(false);
+      expect(page1.next_cursor).toBeDefined();
+      expect(page1.previous_cursor).toBeUndefined();
+
+      const page2 = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, cursor: page1.next_cursor, limit: 2 })));
+      expect(page2.artifacts.map((item) => item.display_path)).toEqual(["src/c.ts", "src/d.ts"]);
+      expect(page2.has_next).toBe(true);
+      expect(page2.has_previous).toBe(true);
+      expect(page2.previous_cursor).toBeDefined();
+
+      const page3 = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, cursor: page2.next_cursor, limit: 2 })));
+      expect(page3.artifacts.map((item) => item.display_path)).toEqual(["src/e.ts"]);
+      expect(page3.has_next).toBe(false);
+
+      // Walk backward from page 2's own previous_cursor: must land back on
+      // exactly page 1's documents.
+      const backToPage1 = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, cursor: page2.previous_cursor, limit: 2 })));
+      expect(backToPage1.artifacts.map((item) => item.display_path)).toEqual(page1.artifacts.map((item) => item.display_path));
+      expect(backToPage1.has_previous).toBe(false);
+
+      // Re-fetching the first page from a fresh continuation-less call must
+      // agree with the embedded first page byte-for-byte (stability).
+      const refetchedFirst = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, limit: 2 })));
+      expect(refetchedFirst).toEqual(page1);
+    });
+  });
+
+  it("rejects a stale affected_artifact_set_id/cursor with core:affected_set_stale rather than ever mixing sets", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      await insertStatusRow(opened, provider, { grain: "artifact", documentId: "artv-a", artifactId: "art-a", artifactVersionId: "artv-a", displayPath: "src/a.ts", status: "pending" });
+      await markSemanticIndexState(opened, 1, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+      const coverage1 = coverageView(await dataPort.execute(semanticOperation("core:search_semantic")));
+      const staleSetId = coverage1["affected_artifact_set_id"] as string;
+
+      // The set changes: a new affected document appears.
+      await insertStatusRow(opened, provider, { grain: "artifact", documentId: "artv-b", artifactId: "art-b", artifactVersionId: "artv-b", displayPath: "src/b.ts", status: "pending" });
+
+      await expect(dataPort.execute(affectedPageOperation({ affected_artifact_set_id: staleSetId, limit: 10 }))).rejects.toMatchObject({
+        code: "core:affected_set_stale",
+        details: { current_set_id: expect.stringMatching(/^sha256:/) },
+      });
+
+      // The CURRENT set id (a fresh, correct argument) still succeeds --
+      // proves the rejection above was specifically about staleness, not a
+      // broken happy path.
+      const currentCoverage = coverageView(await dataPort.execute(semanticOperation("core:search_semantic")));
+      const currentSetId = currentCoverage["affected_artifact_set_id"] as string;
+      expect(currentSetId).not.toBe(staleSetId);
+      const currentPage = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: currentSetId, limit: 10 })));
+      expect(currentPage.total).toBe(2);
+    });
+  });
+
+  it("is stable: two consecutive requests against unchanged data produce the identical affected_artifact_set_id and page contents", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      await insertStatusRow(opened, provider, { grain: "artifact", documentId: "artv-a", artifactId: "art-a", artifactVersionId: "artv-a", displayPath: "src/a.ts", status: "pending" });
+      await insertStatusRow(opened, provider, { grain: "artifact", documentId: "artv-b", artifactId: "art-b", artifactVersionId: "artv-b", displayPath: "src/b.ts", status: "excluded", reasonCodes: ["oversized"] });
+      await markSemanticIndexState(opened, 1, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+
+      const first = coverageView(await dataPort.execute(semanticOperation("core:search_semantic")));
+      const second = coverageView(await dataPort.execute(semanticOperation("core:search_semantic")));
+      expect(first["affected_artifact_set_id"]).toBe(second["affected_artifact_set_id"]);
+      expect(first["affected_artifact_page"]).toEqual(second["affected_artifact_page"]);
+
+      const setId = first["affected_artifact_set_id"] as string;
+      const page1 = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, limit: 10 })));
+      const page2 = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, limit: 10 })));
+      expect(page1).toEqual(page2);
+      expect(page1.artifacts.map((item) => item.coverage_status)).toEqual(["pending", "excluded"]);
+    });
+  });
+});
+
+
 describe("CanonicalRecordQueryDataPort core:search_hybrid", () => {
   async function seedHybridWorkspace(opened: OpenedWorkspace, provider: ResolvedSemanticProvider): Promise<void> {
     await seedThreeDocumentWorkspace(opened, provider);

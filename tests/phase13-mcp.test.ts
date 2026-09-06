@@ -856,6 +856,81 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(text.match(/coverage:/g)).toHaveLength(1);
   });
 
+  // Plan 2026-09-06 (Frente S-A, §4.3): `semantic_coverage`'s raw
+  // `SemanticCoverageView` renders as one `coverage: covered a/b · pending
+  // · failed · excluded (set …; next: <cursor>)` line, never the generic
+  // `compactPreview` fallback a non-bundle-shaped `primary_result` would
+  // otherwise fall through to.
+  it("renders semantic_coverage as one covered/pending/failed/excluded line naming the affected set and next cursor", async () => {
+    const call = vi.fn(async () => success({
+      query_execution_id: "execution-1",
+      streams: {
+        candidates: { items: [], has_next: false, has_previous: false },
+        semantic_coverage: {
+          items: [{
+            value: {
+              semantic_index_binding_id: "sha256:binding", materialization_state: "degraded",
+              artifact_count: 14120, covered_artifact_count: 13980, pending_artifact_count: 90, excluded_artifact_count: 48, unsupported_artifact_count: 2, failed_artifact_count: 2,
+              affected_artifact_count: 142, affected_artifact_set_id: "sha256:abcdef0123456789affectedsetid",
+              affected_artifact_page: { affected_artifact_set_id: "sha256:abcdef0123456789affectedsetid", artifacts: [], total: 142, next_cursor: "eyJzZXQiOiJzaGEyNTY6YWJjZGVmMDEyMzQ1Njc4OSJ9", has_next: true, has_previous: false },
+            },
+            stable_sort_key: "unclassified sha256:binding",
+          }],
+          has_next: false, has_previous: false,
+        },
+      },
+      completeness: { overall_status: "complete", dimensions: [] },
+    }));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    const result = await definition.invoke({
+      request_type: "query",
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: "payment retry", query_class: "natural_text" } } },
+    });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toContain("coverage: covered 13,980/14,120 · pending 90 · failed 2 · excluded 50");
+    expect(text).toContain("set sha256:abcdef012...");
+    expect(text).toContain("next: eyJzZXQiOiJzaGEy...");
+    expect(text.match(/coverage:/g)).toHaveLength(1);
+  });
+
+  // Plan 2026-09-06 (Frente S-A, §4.3): `core:semantic_affected_page`'s
+  // single-item `SemanticAffectedArtifactPage` renders as a header plus one
+  // `path (status: reason)` line per artifact, plus a MORE line naming the
+  // continuation cursor when there is a next page.
+  it("renders core:semantic_affected_page as one path (status: reason) line per affected document, with a MORE line for the next cursor", async () => {
+    const call = vi.fn(async () => success({
+      query_execution_id: "execution-1",
+      streams: {
+        semantic_affected_artifacts: {
+          items: [{
+            value: {
+              affected_artifact_set_id: "sha256:abcdef0123456789affectedsetid",
+              artifacts: [
+                { artifact_id: "art-a", artifact_version_id: "artv-a", display_path: "src/a.ts", coverage_status: "pending", reason_codes: ["pending_embed"], diagnostic_record_ids: [] },
+                { artifact_id: "art-b", artifact_version_id: "artv-b", display_path: "src/b.ts", coverage_status: "excluded", reason_codes: ["oversized"], diagnostic_record_ids: [] },
+              ],
+              total: 3, next_cursor: "eyJzZXQiOiJzaGEyNTY6YWJjZGVmMDEyMzQ1Njc4OSJ9", has_next: true, has_previous: false,
+            },
+            stable_sort_key: "unclassified sha256:abcdef0123456789affectedsetid",
+          }],
+          has_next: false, has_previous: false,
+        },
+      },
+      completeness: { overall_status: "complete", dimensions: [] },
+    }));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    const result = await definition.invoke({
+      request_type: "query",
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:semantic_affected_page", arguments: { affected_artifact_set_id: "sha256:abcdef0123456789affectedsetid" } } },
+    });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toContain("# 3 affected documents");
+    expect(text).toContain("src/a.ts (pending: pending_embed)");
+    expect(text).toContain("src/b.ts (excluded: oversized)");
+    expect(text).toContain("MORE: call core:semantic_affected_page again");
+    expect(text).toContain("cursor=eyJzZXQiOiJzaGEy...");
+  });
+
   it("renders an index_status page as a few compact lines per workspace", async () => {
     const call = vi.fn(async () => success({
       workspaces: [{

@@ -1015,8 +1015,80 @@ function describeLine(body: JsonRecord, span: JsonRecord | undefined): string | 
   );
 }
 
+/** `n.toLocaleString("en-US")` for the comma-grouped counts `semantic_coverage`'s rendered line uses (plan 2026-09-06, §4.3: `"covered 13,980/14,120"`). */
+function formatCount(value: number): string {
+  return value.toLocaleString("en-US");
+}
+
+/** Truncates an opaque id/cursor to the same `16 chars + "..."` convention `renderQueryPageText`'s own `MORE:` line already uses, so every truncated token in this renderer looks the same. */
+function truncateToken(value: string): string {
+  return value.length > 16 ? `${value.slice(0, 16)}...` : value;
+}
+
+/**
+ * Plan 2026-09-06 (Frente S-A, §4.3): `core:search_semantic`/`core:search_hybrid`'s
+ * `semantic_coverage` stream carries one raw `SemanticCoverageView` per item
+ * (never a `ResultBundle`-shaped record) -- `buildStreamResultSets` (this
+ * file) wraps it as `primary_result` unchanged, so `describeBundle`'s
+ * generic path/line/name extraction below would otherwise see an empty body
+ * and fall through to an unhelpful `compactPreview` label. Renders exactly
+ * the plan's own template: `coverage: covered a/b · pending · failed ·
+ * excluded (set …; next: <cursor>)` -- `excluded` folds in
+ * `unsupported_artifact_count` (decided in implementation: the plan's own
+ * concrete example names only four buckets, and "unsupported" is, from an
+ * agent's perspective, one more reason a document will never be covered,
+ * the same as "excluded").
+ */
+function describeSemanticCoverage(view: JsonRecord): BundleDescriptor {
+  const covered = typeof view["covered_artifact_count"] === "number" ? view["covered_artifact_count"] : 0;
+  const total = typeof view["artifact_count"] === "number" ? view["artifact_count"] : 0;
+  const pending = typeof view["pending_artifact_count"] === "number" ? view["pending_artifact_count"] : 0;
+  const failed = typeof view["failed_artifact_count"] === "number" ? view["failed_artifact_count"] : 0;
+  const excluded = (typeof view["excluded_artifact_count"] === "number" ? view["excluded_artifact_count"] : 0) + (typeof view["unsupported_artifact_count"] === "number" ? view["unsupported_artifact_count"] : 0);
+  const setId = firstNonEmptyString(view["affected_artifact_set_id"]);
+  const page = isRecord(view["affected_artifact_page"]) ? view["affected_artifact_page"] as JsonRecord : undefined;
+  const nextCursor = page !== undefined ? firstNonEmptyString(page["next_cursor"]) : undefined;
+  const setSuffix = setId !== undefined ? ` (set ${truncateToken(setId)}${nextCursor !== undefined ? `; next: ${truncateToken(nextCursor)}` : ""})` : "";
+  return { label: `coverage: covered ${formatCount(covered)}/${formatCount(total)} · pending ${formatCount(pending)} · failed ${formatCount(failed)} · excluded ${formatCount(excluded)}${setSuffix}`, isMatchStyle: false };
+}
+
+/** One `path (status: reason)` line for a `SemanticAffectedArtifactView`, shared by `describeSemanticAffectedPage` below. */
+function formatAffectedArtifactLine(view: JsonRecord): string {
+  const path = firstNonEmptyString(view["display_path"]) ?? "?";
+  const status = firstNonEmptyString(view["coverage_status"]) ?? "affected";
+  const reasons = Array.isArray(view["reason_codes"]) ? (view["reason_codes"] as unknown[]).filter((entry): entry is string => typeof entry === "string") : [];
+  const reasonSuffix = reasons.length > 0 ? `: ${reasons.join(", ")}` : "";
+  return `${path} (${status}${reasonSuffix})`;
+}
+
+/**
+ * Plan 2026-09-06 (Frente S-A, §4.3): `core:semantic_affected_page`'s
+ * `semantic_affected_artifacts` stream carries exactly ONE item -- the
+ * complete `SemanticAffectedArtifactPage` (`trySemanticAffectedPage`'s own
+ * doc comment explains why: its cursor round-trips through this operation's
+ * OWN `cursor` argument, never the generic per-stream continuation). One
+ * `BundleDescriptor` can only hold one rendered line, so this renders the
+ * WHOLE page as one multi-line label (a header, one `path (status: reason)`
+ * line per artifact per the plan's own template, and -- when there is
+ * more -- a line naming the next-page cursor); a label with embedded
+ * newlines already prints correctly (see `formatDescriptorLine`'s own
+ * snippet-indentation branch, which does the same thing for a different
+ * reason).
+ */
+function describeSemanticAffectedPage(view: JsonRecord): BundleDescriptor {
+  const artifacts = Array.isArray(view["artifacts"]) ? view["artifacts"] as JsonRecord[] : [];
+  const total = typeof view["total"] === "number" ? view["total"] : artifacts.length;
+  const lines = [`# ${formatCount(total)} affected document${total === 1 ? "" : "s"}`, ...artifacts.map(formatAffectedArtifactLine)];
+  if (view["has_next"] === true && typeof view["next_cursor"] === "string") {
+    lines.push(`MORE: call core:semantic_affected_page again with the same affected_artifact_set_id and cursor=${truncateToken(view["next_cursor"])}`);
+  }
+  return { label: lines.join("\n"), isMatchStyle: false };
+}
+
 function describeBundle(bundle: JsonRecord, resultSetLabel: string): BundleDescriptor {
   const primary = isRecord(bundle["primary_result"]) ? bundle["primary_result"] as JsonRecord : {};
+  if (resultSetLabel === "semantic_coverage" && typeof primary["materialization_state"] === "string") return describeSemanticCoverage(primary);
+  if (resultSetLabel === "semantic_affected_artifacts" && Array.isArray(primary["artifacts"])) return describeSemanticAffectedPage(primary);
   // Defensive support for the fully-typed `PrimaryResultView` union
   // (`{ result_type: "entity", subject, record: { payload, kind, ... } }`)
   // alongside the flat `recordValue()` shape everything actually emits today.
@@ -1490,13 +1562,14 @@ const operationAgentUses: Readonly<Record<string, string>> = {
   "core:compare": "Compare two explicitly role-bound workspace snapshots; it requires comparison scope.",
   "core:build_context": "Build a bounded task context from a task statement, optional seeds, and explicit facets; prefer urdira_context for the readiness-aware wrapper.",
   "core:index_status": "Read status inside an already scoped query; use urdira_index_status for global workspace discovery and the initial query_scope.",
+  "core:semantic_affected_page": "Page through artifacts not covered by semantic search (use the cursors from semantic_coverage).",
 };
 
 const operationWorkflowGroups: readonly { readonly title: string; readonly ids: readonly string[] }[] = [
   { title: "Find a starting point", ids: ["core:find_artifacts", "core:search_text", "core:search_semantic", "core:search_hybrid", "core:resolve_symbol", "core:discover_definitions", "core:find_records"] },
   { title: "Understand structure and relationships", ids: ["core:get_outline", "core:find_references", "core:expand_relations", "core:find_paths"] },
   { title: "Read, assess, and plan", ids: ["core:get_source", "core:find_related_tests", "core:inspect_architecture", "core:analyze_impact", "core:compare", "core:build_context"] },
-  { title: "Inspect scoped status", ids: ["core:index_status"] },
+  { title: "Inspect scoped status", ids: ["core:index_status", "core:semantic_affected_page"] },
 ];
 
 function buildInstructions(): string {

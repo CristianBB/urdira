@@ -583,11 +583,11 @@ describe("Task 2 contract registries", () => {
   });
 
   it("keeps the initial core registry counts aligned with the approved registries", () => {
-    expect(operationRegistry).toHaveLength(18);
+    expect(operationRegistry).toHaveLength(19);
     expect(recipeRegistry).toHaveLength(11);
     expect(canonicalSchemaRegistry).toHaveLength(49);
     expect(comparatorRegistry).toHaveLength(18);
-    expect(operationErrorRegistry).toHaveLength(48);
+    expect(operationErrorRegistry).toHaveLength(49);
     expect(Object.keys(generatedJsonSchemaRegistry)).toHaveLength(49);
     expect(Object.values(generatedJsonSchemaRegistry).every((schema) => schema.$schema === "https://json-schema.org/draft/2020-12/schema")).toBe(true);
     expect(operationDefinitions.every((operation) => operation.operation_id && operation.operation_version && operation.argument_schema_id)).toBe(true);
@@ -1243,7 +1243,7 @@ describe("Schema IR validation and JSON Schema generation", () => {
       ...diagnosticDefinitions.map((entry) => ({ code: entry.code, schema: entry.payload_schema })),
       ...candidateIssueDefinitions.map((entry) => ({ code: entry.issue_code, schema: entry.payload_schema })),
     ];
-    expect(definitions).toHaveLength(96);
+    expect(definitions).toHaveLength(97);
     for (const { code, schema } of definitions) {
       const descriptions = Object.values(schema.properties).map((property) => property.description);
       expect(descriptions.every((description) => description.length > 0)).toBe(true);

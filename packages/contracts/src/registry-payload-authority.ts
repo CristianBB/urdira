@@ -1556,6 +1556,9 @@ export const authoritativePayloadMetadata = {
   "core:cursor_expired.expired_at": {
     "description": "The `expired_at` is the closed detail value for `core:cursor_expired`; normative emission trigger: The cursor's execution lifetime has ended. (source: protocol/core-operation-error-codes.md)."
   },
+  "core:affected_set_stale.current_set_id": {
+    "description": "The `current_set_id` is the closed detail value for `core:affected_set_stale`; normative emission trigger: a `core:semantic_affected_page` request's `affected_artifact_set_id` argument, or its decoded cursor's own embedded set id, does not match the workspace's CURRENT affected-document set id -- the request is rejected outright rather than ever serving a mixed or partial page. (source: docs/decisions/06-semantic-search-ranking.md)."
+  },
   "core:query_execution_evicted.query_execution_id": {
     "description": "The `query_execution_id` is the closed detail value for `core:query_execution_evicted`; normative emission trigger: The execution expired early under an explicitly advertised emergency-eviction policy. (source: protocol/core-operation-error-codes.md)."
   },

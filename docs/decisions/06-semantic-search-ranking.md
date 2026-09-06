@@ -353,3 +353,56 @@ Evaluation datasets, metrics, acceptance thresholds, performance budgets, and pr
 ## Completion criteria
 
 This decision is architecturally complete. A concrete release is acceptable only when its immutable model pack and ranking-profile registry pass the semantic, deterministic, resource, and privacy gates defined by the dependent specifications.
+
+## Amendment 2026-09-06 (Frente S-A): affected-artifact pagination implementation
+
+§"Materialization and coverage" above pins the SHAPE (`SemanticCoverageView`'s
+counts and page, bidirectional pagination) but left the concrete mechanism
+open. This amendment documents what shipped:
+
+- **Source of truth**: a per-document status table (`semantic_document_status`,
+  one row per `(workspace_id, profile_id, executable_binding_id,
+  document_grain, document_id)`) that the semantic reconciler
+  (`packages/engine/src/semantic-reconciler.ts`) writes in the SAME
+  enumeration that already visits every candidate document for embedding --
+  `covered` lands in the same transaction as the vector commit
+  (`putVectors`'s `extraCommands`); `pending`/`excluded`/`unsupported`/`failed`
+  are written as each document is classified. A document whose underlying
+  artifact version or entity record stops being visible has its status row
+  deleted, never left stale. `affected` is exactly `status <> 'covered'`.
+- **Real counts**: `buildSemanticCoverageView` (`packages/engine/src/canonical-query-data-port.ts`)
+  reads `unsupported_artifact_count`/`failed_artifact_count` and the entity
+  counts from a `GROUP BY document_grain, status` aggregate over this table
+  (`semantic_document_status_counts`) instead of inferring them from the
+  vector set; `artifact_count`/`covered_artifact_count`/`pending_artifact_count`/
+  `excluded_artifact_count` keep their pre-existing inferred arithmetic
+  unchanged.
+- **`affected_artifact_set_id`**: `sha256` over `{binding_id, generation,
+  profile_id, executable_binding_id, total, keys_digest}`, where `keys_digest`
+  is a streamed digest (`digestCanonicalArray`, `@urdira/canonical`) over the
+  affected set's `(display_path, artifact_id, document_id)` keys in their own
+  sort order -- one pass over `semantic_document_status WHERE status <>
+  'covered' ORDER BY display_path, artifact_id, document_id`. The set id
+  changes if, and only if, the affected population or its order changes.
+- **Cursor (R11)**: a stateless, self-contained, base64url-encoded JSON object
+  `{set, k: [display_path, artifact_id, document_id], dir: "next"|"prev"}` --
+  never the generic execution-scoped `request_type: continuation` mechanism
+  (that cursor is tied to a `query_execution_id` and a 15-minute manifest
+  store entry; this one is tied only to the data). A request whose
+  `affected_artifact_set_id` argument, or whose cursor's own embedded `set`,
+  disagrees with the CURRENTLY computed set id is rejected with
+  `core:affected_set_stale{current_set_id}` before any page is sliced --
+  never a mixed or partial page.
+- **Continuation operation**: `core:semantic_affected_page` (`affected_artifact_set_id`,
+  optional `cursor`, optional `limit`) returns exactly ONE result-stream item
+  whose value is the complete `SemanticAffectedArtifactPage` (artifacts,
+  `total`, `next_cursor`/`previous_cursor`, `has_next`/`has_previous`) --
+  deliberately not one item per artifact, precisely because its cursor lives
+  in this operation's own argument, not in the generic per-stream page
+  metadata the engine would otherwise attach.
+- **Embedded first page**: `core:search_semantic`/`core:search_hybrid`'s own
+  `semantic_coverage` view embeds the first page (`limit = min(response_budget.max_items,
+  20)`, using the plan's own upper bound directly since `response_budget`
+  does not reach the canonical query port layer) so an agent can act on
+  `affected_artifact_page` without an extra round trip, then page further
+  with `core:semantic_affected_page`.

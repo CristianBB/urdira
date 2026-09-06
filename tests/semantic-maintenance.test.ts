@@ -612,6 +612,169 @@ describe("reconcileSemanticProjection", () => {
   });
 });
 
+// Plan 2026-09-06 (Frente S-A): `semantic_document_status` is the source of
+// truth for "which documents are affected (not covered)" -- written by the
+// SAME enumeration the artifact/entity passes above already run, in the
+// same transaction as each committed vector (`putVectors`'s own
+// `extraCommands`), never a separate pass.
+describe("reconcileSemanticProjection: semantic_document_status (plan 2026-09-06, Frente S-A)", () => {
+  type StatusRow = {
+    readonly document_grain: string;
+    readonly document_id: string;
+    readonly artifact_id: string;
+    readonly artifact_version_id: string;
+    readonly display_path: string;
+    readonly status: string;
+    readonly reason_codes: string;
+    readonly segment_count: number;
+    readonly generation: number;
+  };
+
+  async function statusRows(opened: WorkspaceDatabase, workspaceId: string, profileId: string, executableBindingId: string): Promise<readonly StatusRow[]> {
+    return opened.database.all<StatusRow>(
+      "SELECT document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? ORDER BY document_grain, document_id",
+      [workspaceId, profileId, executableBindingId],
+    );
+  }
+
+  it("writes a covered status row (empty reason_codes, segment_count 1) for each freshly embedded document, in the same pass as the vector commit", async () => {
+    const workspaceId = "ws-semantic-status-covered";
+    const provider = createLocalHashProvider();
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1", text: "function parseStatusCoveredContent() {}", validFromGeneration: 1, displayPath: "src/covered.ts" });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+
+      const rows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const artifactRow = rows.find((row) => row.document_grain === "artifact" && row.document_id === "artv-1");
+      expect(artifactRow).toMatchObject({ artifact_id: "art-1", artifact_version_id: "artv-1", display_path: "src/covered.ts", status: "covered", reason_codes: "[]", segment_count: 1, generation: 1 });
+    });
+  });
+
+  it("writes excluded status rows for a binary version and an oversized version, without ever counting them toward inserted/skipped_* (a separate bulk classification pass, not the missing-vector loop)", async () => {
+    const workspaceId = "ws-semantic-status-excluded";
+    const provider = createLocalHashProvider();
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedBinaryVersion(opened, cas, workspaceId, "art-bin", "artv-bin", 1);
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-big", artifactVersionId: "artv-big", text: "function oversizedStatusContent() {}", validFromGeneration: 1 });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, max_document_bytes: 4 });
+      expect(result.skipped_oversized).toBe(1);
+
+      const rows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const binaryRow = rows.find((row) => row.document_id === "artv-bin");
+      const oversizedRow = rows.find((row) => row.document_id === "artv-big");
+      expect(binaryRow).toMatchObject({ status: "excluded", reason_codes: JSON.stringify(["binary"]) });
+      expect(oversizedRow).toMatchObject({ status: "excluded", reason_codes: JSON.stringify(["oversized"]) });
+    });
+  });
+
+  it("writes a failed status row with a provider_error reason code when the provider throws, and flips it to covered once the provider recovers", async () => {
+    const workspaceId = "ws-semantic-status-failed";
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls <= 2) return new Response("boom", { status: 500 });
+      return new Response(JSON.stringify({ data: [{ embedding: [0, 1, 0, 0] }] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test/v1/embed", model: "status-failed-model", dimensions: 4, fetch_impl: fetchImpl });
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-flaky", artifactVersionId: "artv-flaky", text: "function flakyStatusContent() {}", validFromGeneration: 1 });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      const first = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(first.failed).toBe(1);
+      const failedRows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const failedRow = failedRows.find((row) => row.document_id === "artv-flaky");
+      expect(failedRow?.status).toBe("failed");
+      expect(JSON.parse(failedRow?.reason_codes ?? "[]")).toEqual([expect.stringMatching(/^provider_error:/)]);
+
+      const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(second.inserted).toBe(1);
+      const coveredRows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const coveredRow = coveredRows.find((row) => row.document_id === "artv-flaky");
+      expect(coveredRow).toMatchObject({ status: "covered", reason_codes: "[]" });
+    });
+  });
+
+  it("deletes a pending document's status row once its underlying artifact version closes without ever being embedded", async () => {
+    const workspaceId = "ws-semantic-status-orphan";
+    const provider = createLocalHashProvider();
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      // No embeddable token -> permanently "excluded", never covered -- the
+      // exact "pending/excluded document whose source disappears" case the
+      // orphan sweep (not the stale-close loops, which only look at
+      // vector_projection_rows) exists to catch.
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-empty", artifactVersionId: "artv-empty", text: "   \n\t  ", validFromGeneration: 1 });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      const beforeClose = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(beforeClose.find((row) => row.document_id === "artv-empty")).toMatchObject({ status: "excluded" });
+
+      await closeVersion(opened, "artv-empty", 2);
+      await setCurrentGeneration(opened, workspaceId, 2);
+      await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      const afterClose = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(afterClose.find((row) => row.document_id === "artv-empty")).toBeUndefined();
+    });
+  });
+
+  it("backfills covered status rows from pre-existing vector_projection_rows for a sidecar that predates this table, on the very next pass even when the marker already says complete (fast path)", async () => {
+    const workspaceId = "ws-semantic-status-backfill";
+    const provider = createLocalHashProvider();
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-legacy", artifactVersionId: "artv-legacy", text: "function legacyBackfillContent() {}", validFromGeneration: 1, displayPath: "src/legacy.ts" });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const engineDatabase = asEngineWorkspaceDatabase(opened);
+      await reconcileSemanticProjection({ database: engineDatabase, workspace_id: workspaceId, content: cas, provider });
+
+      // Simulate a pre-plan sidecar: the vector row (and completion marker)
+      // already exist, but wipe the status table clean -- exactly what a
+      // sidecar written by a pre-`semantic_document_status` build of this
+      // reconciler would look like.
+      await opened.database.run("DELETE FROM semantic_document_status WHERE workspace_id = ?", [workspaceId]);
+      expect(await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)).toHaveLength(0);
+
+      // The marker still matches exactly (generation/profile/binding/grains/
+      // policy unchanged), so this hits the FAST PATH, not the slow path's
+      // own per-document writes -- the backfill must therefore happen there.
+      const result = await reconcileSemanticProjection({ database: engineDatabase, workspace_id: workspaceId, content: cas, provider });
+      expect(result.marker_written).toBe(true);
+      expect(result.inserted).toBe(0);
+
+      const rows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const restored = rows.find((row) => row.document_id === "artv-legacy");
+      expect(restored).toMatchObject({ status: "covered", artifact_id: "art-legacy", display_path: "src/legacy.ts" });
+    });
+  });
+
+  it("classifies a whole-file/module entity record as unsupported and an eligible entity as covered, both under document_grain 'entity' keyed by the record id", async () => {
+    const workspaceId = "ws-semantic-status-entity";
+    const provider = createLocalHashProvider();
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      const functionBody = `function statusEntityContent() { /* ${ENTITY_SPAN_PADDING} */ return 1; }`;
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-owner", artifactVersionId: "artv-owner", text: functionBody, validFromGeneration: 1, displayPath: "src/owner.ts" });
+      await seedEntityRecord(opened, workspaceId, {
+        recordId: "entity-eligible-1", recordKind: "jsts:entity_callable", ownerArtifactId: "art-owner", ownerArtifactVersionId: "artv-owner", validFromGeneration: 1,
+        body: { kind: "function", name: "statusEntityContent", start: 0, end: functionBody.length },
+      });
+      await seedEntityRecord(opened, workspaceId, {
+        recordId: "entity-container-1", recordKind: "jsts:entity_container", ownerArtifactId: "art-owner", ownerArtifactVersionId: "artv-owner", validFromGeneration: 1,
+        body: { kind: "module", name: "owner.ts", start: 0, end: functionBody.length },
+      });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+
+      const rows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const eligibleRow = rows.find((row) => row.document_grain === "entity" && row.document_id === "entity-eligible-1");
+      const containerRow = rows.find((row) => row.document_grain === "entity" && row.document_id === "entity-container-1");
+      expect(eligibleRow).toMatchObject({ status: "covered", artifact_id: "art-owner", artifact_version_id: "artv-owner" });
+      expect(containerRow).toMatchObject({ status: "unsupported", reason_codes: JSON.stringify(["unsupported_kind"]) });
+    });
+  });
+});
+
 // Decision 17: entity-grain semantic documents. `reconcileSemanticProjection`
 // grows a SECOND pass alongside the artifact pass above -- these tests cover
 // eligibility, identity survival across a reused record, marker backfill for
