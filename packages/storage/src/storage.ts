@@ -21,6 +21,7 @@ import { WorkspaceCandidateRepository, frozenCandidateBaseTupleDigest, normalize
 import { buildCandidatePublicationPlan, buildCompatibilityPublicationPlan, buildPublicationTransactionCommands, publicationTransactionCommands, type ProjectionSetDigestCorpusEntry, type RecordSetDigestCorpusEntry } from "./publication-authority.js";
 import { WorkspaceProjectionOccurrenceRepository } from "./projection-occurrences.js";
 import { ByteBoundaryTelemetry } from "./byte-telemetry.js";
+import { removeWorkspaceFootprint, workspaceFootprintEntries } from "./workspace-footprint.js";
 
 export interface DurableStorageOptions {
   readonly rootDir: string;
@@ -334,6 +335,33 @@ function workspaceHasOpenHandles(filename: string): boolean {
   return (workspaceHandleCounts.get(resolve(filename)) ?? 0) > 0;
 }
 
+/**
+ * v4 (plan §6, Frente H): exposed so the daemon's orphan-purge RPC
+ * (`core:workspace_orphans_purge`, `packages/daemon/src/runtime.ts`) can
+ * defensively re-check, at the moment of deletion, that the specific
+ * `<safeId>.sqlite` a caller asked to purge is not this process's own
+ * in-flight `WorkspaceDatabase` handle for some OTHER, still-registered
+ * workspace whose id happens to sanitize to the same `safeId` (or a
+ * workspace mid-registration under that path) -- the same handle-count
+ * bookkeeping `purgeWorkspace` itself already consults below.
+ */
+export function isWorkspaceDatabaseFileOpen(filename: string): boolean {
+  return workspaceHasOpenHandles(filename);
+}
+
+/**
+ * v4 (plan §6, Frente H): the exact sanitization
+ * `InstallationCatalog.defaultWorkspacePath` applies to a workspace id to
+ * derive its on-disk `safeId`, exposed so the daemon's orphan sweep
+ * (`packages/daemon/src/orphan-sweep.ts`) can compute the SAME set of
+ * "known" safe ids (from `WorkspaceRegistry.listIncludingRemoved()`) that
+ * this catalog would resolve each registered/removed-but-in-grace workspace
+ * to, without duplicating the regex.
+ */
+export function workspaceSafeId(workspaceId: string): string {
+  return workspaceId.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
 function forgetWorkspaceDatabase(filename: string): void {
   const key = resolve(filename);
   if (workspaceHasOpenHandles(key)) return;
@@ -342,11 +370,17 @@ function forgetWorkspaceDatabase(filename: string): void {
   workspaceProjectionDigestCorpora.delete(key);
 }
 
-async function removeWorkspaceDatabaseFiles(filename: string): Promise<void> {
-  // SQLite may leave WAL/SHM or rollback-journal sidecars behind even after
-  // the last connection closes.  Remove only the exact catalogued database
-  // and its exact SQLite sidecars; never recurse over the workspace root.
-  for (const suffix of ["", "-wal", "-shm", "-journal"] as const) await rm(`${filename}${suffix}`, { force: true });
+/**
+ * The `safeId` (`workspaceSafeId`'s doc comment) a database path's own
+ * basename yields once its `.sqlite` suffix is stripped -- the same `name`
+ * `recreateOutdatedWorkspaceDatabase` derives, kept in sync here rather than
+ * re-deriving it from the workspace id: a relocated database's directory
+ * (`installation_workspace_relocations`) need not be `<rootDir>/workspaces`,
+ * but its footprint siblings are always colocated with it regardless.
+ */
+function basenameWithoutSqliteSuffix(databasePath: string): string {
+  const fileName = basename(databasePath);
+  return fileName.endsWith(".sqlite") ? fileName.slice(0, -".sqlite".length) : fileName;
 }
 
 interface WorkspaceRegistrationRow extends Record<string, unknown> {
@@ -631,9 +665,24 @@ export class InstallationCatalog {
 
   /**
    * Permanently removes a logically removed workspace after the recovery
-   * grace period. The database is deleted before its catalog tombstone so a
-   * crash can leave only a retryable tombstone, never an untracked database.
-   * Shared CAS objects are intentionally left to the installation-wide GC.
+   * grace period. Deletion order (R16, plan §6 Frente H): every sidecar
+   * first -- the native `.structural/` directory, the Rust scan `.sidecar/`
+   * directory, the lexical/semantic sidecar databases, and the writer-lock
+   * marker -- THEN the catalog `.sqlite` database itself (and its WAL/SHM/
+   * rollback-journal siblings), and only after that the catalog tombstone
+   * row. A crash at any point along this order always leaves a state the
+   * daemon's orphan sweep (`packages/daemon/src/orphan-sweep.ts`) can
+   * classify and an operator can retry purging: sidecars-without-a-database
+   * or a database-without-a-tombstone are both still-registered-workspace
+   * shaped (nothing untracked appears BEFORE the tombstone is gone), never
+   * the reverse (a tombstoned workspace whose database or sidecars silently
+   * survive, undiscoverable because nothing in the catalog still names
+   * them). This used to delete only the four catalog-database files, leaving
+   * `.structural/`, the sidecar databases, and `.sidecar/` behind on every
+   * purge -- the actual root cause of on-disk orphans this frente's sweep
+   * now surfaces; the `keep_database: true` / entries-filtered-to-`"database"`
+   * two-step below is the fix. Shared CAS objects are intentionally left to
+   * the installation-wide GC.
    */
   async purgeWorkspace(workspaceId: string, now = new Date().toISOString(), force = false): Promise<{ readonly workspace_id: string; readonly purged: true; readonly database_path: string }> {
     return await this.writer.run(async () => {
@@ -655,7 +704,24 @@ export class InstallationCatalog {
       }
       const references = await this.workspacePurgeReferences(registration, now);
       if (references.length > 0) throw new StorageError("storage:workspace_references_active", `Workspace ${workspaceId} still has active durable references: ${references.join(", ")}.`, { references: references.join(",") });
-      await removeWorkspaceDatabaseFiles(registration.database_path);
+      // Order (R16, see this method's own doc comment): sidecars +
+      // `.structural/` + `.sidecar/` FIRST (`keep_database: true` skips the
+      // four catalog-database files), THEN the database itself. The catalog
+      // tombstone row (below, in the same transaction that already removes
+      // the lease/relocation rows) is the last thing to go. The writer-lock
+      // marker itself is deliberately excluded from this sweep -- THIS call
+      // is holding it (`mutationLock`, acquired above) for the exact
+      // duration of this method, and `acquireWorkspaceMutationLock`'s own
+      // `release()` (the `finally` block below) already unlinks it once
+      // every other step here has finished; unlinking it mid-hold would let
+      // a concurrent `acquireWorkspaceMutationLock` on the same path
+      // immediately "succeed" against a lock this method still believes it
+      // owns.
+      const footprintDirectory = dirname(registration.database_path);
+      const footprintSafeId = basenameWithoutSqliteSuffix(registration.database_path);
+      const footprint = workspaceFootprintEntries(footprintDirectory, footprintSafeId).filter((entry) => entry.kind !== "lock");
+      await removeWorkspaceFootprint(footprint, { keep_database: true });
+      await removeWorkspaceFootprint(footprint.filter((entry) => entry.kind === "database"), { keep_database: false });
       await this.database.transaction([
         { kind: "run", sql: "DELETE FROM installation_workspace_relocations WHERE workspace_id = ?", params: [workspaceId] },
         { kind: "run", sql: "DELETE FROM installation_workspace_leases WHERE workspace_id = ?", params: [workspaceId] },
@@ -991,8 +1057,7 @@ export class InstallationCatalog {
    * opens it and takes the v4 branch instead of initializing v3 on top of it.
    */
   defaultWorkspacePath(workspaceId: string): string {
-    const safeId = workspaceId.replace(/[^A-Za-z0-9._-]/g, "_");
-    return join(this.rootDir, "workspaces", `${safeId}.sqlite`);
+    return join(this.rootDir, "workspaces", `${workspaceSafeId(workspaceId)}.sqlite`);
   }
 }
 

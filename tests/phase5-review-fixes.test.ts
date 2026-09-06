@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -185,6 +185,58 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
       await expect(access(`${registered.database_path}-wal`)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(access(`${registered.database_path}-shm`)).rejects.toMatchObject({ code: "ENOENT" });
       expect(await storage.catalog.database.get("SELECT workspace_id FROM installation_workspaces WHERE workspace_id = ?", [workspaceA.workspace_id])).toBeUndefined();
+    });
+  });
+
+  it("purge leaves no footprint restos: structural/, sidecar/, and lexical/semantic sidecar databases are all gone (plan §6 Frente H, R16)", async () => {
+    await withStorage(async (_root, storage) => {
+      const registered = await storage.catalog.registerWorkspace(workspaceB);
+      await storage.catalog.database.run("UPDATE installation_workspaces SET removed_at = ? WHERE workspace_id = ?", ["2026-08-09T00:00:00.000000000Z", workspaceB.workspace_id]);
+      const name = registered.database_path.slice(0, -".sqlite".length);
+      // The full footprint a real workspace can accumulate -- BEFORE this
+      // frente's fix, `purgeWorkspace` deleted only the four
+      // `<name>.sqlite{,-wal,-shm,-journal}` files below, leaving every one
+      // of the following behind as an undiscoverable orphan.
+      // Empty, not garbage text: `workspacePurgeReferences` below opens the
+      // real (valid) workspace database read-only before this test's own
+      // purge call, and a NON-empty, non-SQLite-format `-journal` sibling
+      // makes SQLite treat it as a hot journal needing rollback recovery on
+      // open -- which a read-only open cannot perform ("attempt to write a
+      // readonly database"). An empty rollback-journal file is what SQLite
+      // itself leaves behind after a clean commit in rollback-journal mode,
+      // so it is inert to open under any mode.
+      await writeFile(`${registered.database_path}-journal`, "");
+      // A stale writer-lock marker left by a DIFFERENT, already-dead process
+      // (a PID guaranteed not to exist, so `acquireWorkspaceMutationLock`'s
+      // existing dead-owner recovery -- not this frente's footprint removal,
+      // which deliberately excludes the "lock" kind, see `purgeWorkspace`'s
+      // doc comment -- reclaims it before this call's own lock acquisition).
+      await writeFile(`${registered.database_path}.urdira-writer.lock`, "999999999\n");
+      await mkdir(`${name}.structural`, { recursive: true });
+      await writeFile(`${name}.structural/MANIFEST`, "{}");
+      await writeFile(`${name}.lexical.sqlite`, "lex");
+      await writeFile(`${name}.lexical.sqlite-wal`, "lex-wal");
+      await writeFile(`${name}.semantic.sqlite`, "sem");
+      await writeFile(`${name}.semantic.sqlite-shm`, "sem-shm");
+      await mkdir(`${name}.sidecar`, { recursive: true });
+      await writeFile(`${name}.sidecar/scan-state`, "{}");
+
+      await expect(storage.catalog.purgeWorkspace(workspaceB.workspace_id, "2026-08-10T00:00:01.000000000Z")).resolves.toMatchObject({ purged: true });
+
+      for (const leftover of [
+        registered.database_path,
+        `${registered.database_path}-journal`,
+        `${registered.database_path}.urdira-writer.lock`,
+        `${name}.structural`,
+        `${name}.lexical.sqlite`,
+        `${name}.lexical.sqlite-wal`,
+        `${name}.semantic.sqlite`,
+        `${name}.semantic.sqlite-shm`,
+        `${name}.sidecar`,
+      ]) {
+        await expect(access(leftover), leftover).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      expect(await storage.catalog.database.get("SELECT workspace_id FROM installation_workspaces WHERE workspace_id = ?", [workspaceB.workspace_id])).toBeUndefined();
     });
   });
 

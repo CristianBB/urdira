@@ -17,11 +17,17 @@ describe("recreateOutdatedWorkspaceDatabase", () => {
     await writeFile(databasePath, "db");
     await writeFile(`${databasePath}-wal`, "wal");
     await writeFile(`${databasePath}-shm`, "shm");
+    await writeFile(`${databasePath}-journal`, "journal");
     await writeFile(`${databasePath}.urdira-writer.lock`, "lock");
     await mkdir(join(workspacesDir, "workspace_abc.structural"), { recursive: true });
     await writeFile(join(workspacesDir, "workspace_abc.structural", "MANIFEST"), "{}");
     await writeFile(join(workspacesDir, "workspace_abc.lexical.sqlite"), "lex");
     await writeFile(join(workspacesDir, "workspace_abc.semantic.sqlite"), "sem");
+    // v4 (plan §6, Frente H): the Rust scan sidecar directory -- previously
+    // missing entirely from this function's own candidate list, the actual
+    // gap `workspace-footprint.ts`'s shared list fixes.
+    await mkdir(join(workspacesDir, "workspace_abc.sidecar"), { recursive: true });
+    await writeFile(join(workspacesDir, "workspace_abc.sidecar", "scan-state"), "{}");
     // Not created: workspace_abc.lexical.sqlite-wal/-shm, semantic -wal/-shm --
     // absence of an optional sidecar sibling must not fail the move.
 
@@ -39,7 +45,9 @@ describe("recreateOutdatedWorkspaceDatabase", () => {
     expect([...result.movedPaths].sort()).toEqual([
       join(result.staleDirectory, "workspace_abc.lexical.sqlite"),
       join(result.staleDirectory, "workspace_abc.semantic.sqlite"),
+      join(result.staleDirectory, "workspace_abc.sidecar"),
       join(result.staleDirectory, "workspace_abc.sqlite"),
+      join(result.staleDirectory, "workspace_abc.sqlite-journal"),
       join(result.staleDirectory, "workspace_abc.sqlite-shm"),
       join(result.staleDirectory, "workspace_abc.sqlite-wal"),
       join(result.staleDirectory, "workspace_abc.sqlite.urdira-writer.lock"),
@@ -49,11 +57,14 @@ describe("recreateOutdatedWorkspaceDatabase", () => {
     // Nothing left at the original location.
     await expect(stat(databasePath)).rejects.toThrow();
     await expect(stat(`${databasePath}-wal`)).rejects.toThrow();
+    await expect(stat(`${databasePath}-journal`)).rejects.toThrow();
+    await expect(stat(join(workspacesDir, "workspace_abc.sidecar"))).rejects.toThrow();
 
     // Everything survives, unmodified, under the stale directory.
     expect(await readFile(join(result.staleDirectory, "workspace_abc.sqlite"), "utf8")).toBe("db");
     expect(await readFile(join(result.staleDirectory, "workspace_abc.lexical.sqlite"), "utf8")).toBe("lex");
     expect(await readFile(join(result.staleDirectory, "workspace_abc.structural", "MANIFEST"), "utf8")).toBe("{}");
+    expect(await readFile(join(result.staleDirectory, "workspace_abc.sidecar", "scan-state"), "utf8")).toBe("{}");
 
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("workspace:abc");

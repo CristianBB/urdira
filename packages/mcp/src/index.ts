@@ -1275,6 +1275,17 @@ function renderIndexStatusText(page: JsonRecord): string {
     const plugins = Array.isArray(workspace["plugins"]) ? workspace["plugins"] as JsonRecord[] : [];
     if (plugins.length > 0) lines.push(`  plugins: ${plugins.length}`);
   }
+  // v4 (plan §6, Frente H): a single, installation-wide hint line -- not
+  // per-workspace -- whenever the daemon's startup/last-refresh orphan
+  // sweep (`core:index_status`'s `orphaned_workspace_data`, daemon
+  // `runtime.ts`) found leftover on-disk data no registered workspace owns
+  // any more. Silent when `count` is 0 or the field is absent (a daemon
+  // with no durable storage configured at all never populates it).
+  const orphanedWorkspaceData = isRecord(page["orphaned_workspace_data"]) ? page["orphaned_workspace_data"] as JsonRecord : undefined;
+  if (typeof orphanedWorkspaceData?.["count"] === "number" && orphanedWorkspaceData["count"] > 0) {
+    const bytes = typeof orphanedWorkspaceData["bytes"] === "number" ? ` (${Math.round(orphanedWorkspaceData["bytes"] / (1024 * 1024))} MB)` : "";
+    lines.push(`orphaned workspace data: ${orphanedWorkspaceData["count"]} set(s)${bytes} -- run "urdira workspace orphans" to review`);
+  }
   return lines.join("\n");
 }
 

@@ -1,10 +1,11 @@
 import { chmod, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
-import { createDurableStorage, isOutdatedWorkspaceError, readStructuralStore, recreateOutdatedWorkspaceDatabase, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
+import { createDurableStorage, isOutdatedWorkspaceError, isWorkspaceDatabaseFileOpen, readStructuralStore, recreateOutdatedWorkspaceDatabase, removeWorkspaceFootprint, workspaceFootprintEntries, workspaceSafeId, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase, type WorkspaceFootprintEntry } from "@urdira/storage";
+import { sweepWorkspaceDataDir, type OrphanReport } from "./orphan-sweep.js";
 import { existsSync } from "node:fs";
 import { runIndexPackExportInThread } from "./index-pack-export-thread.js";
 import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-thread.js";
@@ -448,6 +449,18 @@ export interface DaemonStatus {
   readonly restart_leases: number;
   /** P3-5 (plan §6.1's daemon-latency item): epoch ms this daemon process's `runtime.ts` module loaded at -- see its own doc comment (`DAEMON_START_EPOCH_MS`) for what an external caller uses this for. */
   readonly daemon_epoch_ms_offset: number;
+  /**
+   * v4 (plan §6, Frente H): the most recently computed orphan sweep's
+   * summary (`OrphanReport.orphans`, see `orphan-sweep.ts`) -- refreshed at
+   * startup and by every `core:workspace_orphans_list`/
+   * `core:workspace_orphans_purge` call, never recomputed on every
+   * `core:status` call (a live re-sweep is cheap but not free, and
+   * `core:status` is polled far more often than either of those). Absent
+   * when this daemon has no workspace registry/durable storage configured
+   * at all (the same condition `orphaned_workspace_data`-producing RPCs
+   * below are gated on).
+   */
+  readonly orphaned_workspace_data?: { readonly count: number; readonly bytes: number };
 }
 
 function workspaceDigest(value: string): string {
@@ -2371,6 +2384,14 @@ export class DaemonRuntime {
     // `core:daemon_stop`/`core:daemon_restart` handlers, which are defined
     // (as part of the IPC `handler` closure) before that instance exists.
     let runtimeHandle: DaemonRuntime | undefined;
+    // v4 (plan §6, Frente H): the most recently computed orphan sweep,
+    // refreshed at startup (below) and by `core:workspace_orphans_list`/
+    // `core:workspace_orphans_purge` -- see `DaemonStatus.orphaned_workspace_data`'s
+    // own doc comment for why `core:status` reads this cached value instead
+    // of re-sweeping on every call.
+    let latestOrphanReport: OrphanReport | undefined;
+    const workspacesDataDir = join(options.data_root, "workspaces");
+    const knownWorkspaceSafeIds = (): ReadonlySet<string> => new Set((options.workspace_registry?.listIncludingRemoved() ?? []).map((workspace) => workspaceSafeId(workspace.workspace_id)));
     try {
       const previousDescriptor = await descriptor.read();
       if (previousDescriptor && (previousDescriptor.endpoint !== paths.endpoint || (process.platform !== "win32" && previousDescriptor.owner_uid !== (process.getuid?.() ?? 0)))) throw new DaemonError("core:daemon_recovery_failed", "Existing daemon endpoint descriptor is not owned by this user or root.");
@@ -2439,6 +2460,27 @@ export class DaemonRuntime {
       if (indexingStorage) {
         const counts = indexingStorage.workspaceFormatCounts;
         console.error(`[urdira] startup: ${counts.v3} v3 workspace(s), ${counts.v4} v4 workspace(s) registered under ${options.data_root} (new workspaces default to v4; set URDIRA_V4=0 to opt out)`);
+      }
+      // v4 (plan §6, Frente H): a startup orphan sweep of `<data_root>/
+      // workspaces` -- catches leftovers from BEFORE `purgeWorkspace`'s
+      // full-footprint fix (see its own doc comment) as well as anything a
+      // crashed process left mid-operation. Never allowed to fail startup:
+      // any error (a permissions issue, an unexpected `readdir` failure --
+      // `sweepWorkspaceDataDir` already treats a missing directory as "no
+      // orphans", not an error) is caught and logged here, exactly like
+      // R15 requires, so a broken sweep degrades to "no `orphaned_workspace_data`
+      // this life" rather than blocking every other workspace from ever
+      // becoming queryable.
+      if (indexingStorage && options.workspace_registry) {
+        try {
+          latestOrphanReport = await sweepWorkspaceDataDir({ workspacesDir: workspacesDataDir, knownSafeIds: knownWorkspaceSafeIds() });
+          if (latestOrphanReport.orphans.length > 0) {
+            const bytes = latestOrphanReport.orphans.reduce((sum, group) => sum + group.total_bytes, 0);
+            console.warn(`[urdira] ${latestOrphanReport.orphans.length} orphaned workspace data set(s) (${Math.round(bytes / (1024 * 1024))} MB) under ${workspacesDataDir}; run "urdira workspace orphans" to review`);
+          }
+        } catch (error) {
+          console.error(`[urdira] startup orphan sweep failed (continuing without it): ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       // `core:query`/`core:query_continue` reuse `indexingStorage` to open
       // (and cache, per `acquireWorkspaceQueryEngine` above) the target
@@ -3836,7 +3878,7 @@ export class DaemonRuntime {
         // SAME clock, rather than being limited to poll-granularity timing.
         // Additive: not part of `DaemonStatus`'s declared shape, so this is
         // a widening cast, not a type change.
-        if (request.call === "core:status") return { state: "ready", pid: process.pid, engine_build_id: options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: rpcCapabilities, endpoint: paths.endpoint, active_jobs: scheduler.activeCount, restart_leases: scheduler.restartLeaseCount, daemon_epoch_ms_offset: DAEMON_START_EPOCH_MS } satisfies DaemonStatus;
+        if (request.call === "core:status") return { state: "ready", pid: process.pid, engine_build_id: options.engine_build_id, private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION, rpc_capabilities: rpcCapabilities, endpoint: paths.endpoint, active_jobs: scheduler.activeCount, restart_leases: scheduler.restartLeaseCount, daemon_epoch_ms_offset: DAEMON_START_EPOCH_MS, ...(latestOrphanReport === undefined ? {} : { orphaned_workspace_data: { count: latestOrphanReport.orphans.length, bytes: latestOrphanReport.orphans.reduce((sum, group) => sum + group.total_bytes, 0) } }) } satisfies DaemonStatus;
         if (request.call === "core:index_status" && options.workspace_status) return options.workspace_status(request, context);
         if (request.call === "core:index_status" && options.workspace_registry) {
           const payload = request.payload !== null && typeof request.payload === "object" ? request.payload as { readonly api_version?: unknown; readonly workspace_ids?: unknown; readonly workspace_root?: unknown } : {};
@@ -3859,12 +3901,20 @@ export class DaemonRuntime {
               : undefined;
             return { workspace_id: workspace.workspace_id, codebase_id: workspace.codebase_id, project_name: administrative["project_name"], workspace_label: administrative["workspace_label"], workspace_kind: administrative["workspace_kind"], display_root: basename(workspace.display_root), ...(administrative["vcs_state"] === undefined ? {} : { vcs_state: administrative["vcs_state"] }), workspace_status: workspace.status, startup_phase: workspace.status === "registering" ? "reconciling_sources" : readiness.source_ready && !readiness.structural_ready ? "publishing_structural" : "ready", ...(workspace.current_snapshot_id === undefined ? {} : { current_snapshot_id: workspace.current_snapshot_id }), freshness_status: workspaceFreshnessStatus(workspace), ...(workspace.last_scan_error === undefined ? {} : { last_scan_error_code: workspace.last_scan_error }), ...(workspace.last_scan_error_at === undefined ? {} : { last_scan_error_at: workspace.last_scan_error_at }), plugins: pluginStatus.plugins, capabilities: pluginStatus.capabilities, structural_progress: pluginStatus.structural_progress, semantic_materializations: semanticMaterializations.get(workspace.workspace_id) === undefined ? [] : [semanticMaterializations.get(workspace.workspace_id)!], configuration_issues: [], ...readinessPayload(readiness), ...(v4Timeline === undefined ? {} : { last_scan_timeline: relativeTimeline(v4Timeline) }), ...v4StatusFields(readiness, semanticMaterializations.get(workspace.workspace_id), v4LastScanSummaries.get(workspace.workspace_id), v4Timeline) };
           };
-          if (apiVersion === 3 && workspaceIds.length === 0 && payload.workspace_root === undefined) return { workspaces: await Promise.all(options.workspace_registry.list().map(buildStatusView)) };
+          // v4 (plan §6, Frente H): the same cached sweep `core:status`
+          // reads (see `DaemonStatus.orphaned_workspace_data`'s doc comment
+          // for why this is the last sweep, not a live re-sweep) --
+          // `urdira_index_status` is the MCP tool an agent already always
+          // calls first, so surfacing it here (rather than inventing a
+          // separate lookup) is what actually reaches the renderer
+          // (`renderIndexStatusText`, `@urdira/mcp`).
+          const orphanedWorkspaceDataField = latestOrphanReport === undefined ? {} : { orphaned_workspace_data: { count: latestOrphanReport.orphans.length, bytes: latestOrphanReport.orphans.reduce((sum, group) => sum + group.total_bytes, 0) } };
+          if (apiVersion === 3 && workspaceIds.length === 0 && payload.workspace_root === undefined) return { workspaces: await Promise.all(options.workspace_registry.list().map(buildStatusView)), ...orphanedWorkspaceDataField };
           const resolution = resolveIndexStatusRequest(options.workspace_registry, { api_version: apiVersion, workspace_ids: workspaceIds, ...(typeof payload.workspace_root === "string" ? { workspace_root: payload.workspace_root } : {}) });
           if ("error" in resolution) throw new DaemonError(resolution.error.code, "Workspace index status is unavailable.", resolution.error.details);
           const workspace = options.workspace_registry.get(resolution.workspace_id);
-          if (workspace === undefined) return { workspaces: [] };
-          return { workspaces: [await buildStatusView(workspace)] };
+          if (workspace === undefined) return { workspaces: [], ...orphanedWorkspaceDataField };
+          return { workspaces: [await buildStatusView(workspace)], ...orphanedWorkspaceDataField };
         }
         const queryStorage = indexingStorage;
         if ((request.call === "core:query" || request.call === "core:query_continue") && options.workspace_registry && queryStorage && cursorCache) {
@@ -4217,6 +4267,43 @@ export class DaemonRuntime {
             finally { await database.close().catch(() => undefined); }
           }
           return { ...purged, collection_pending: survivor === undefined, ...(collection === undefined ? {} : { collection }) };
+        }
+        // v4 (plan §6, Frente H): read-only, no-confirmation re-sweep -- the
+        // CLI's `urdira workspace orphans` routes here through `MUTATING_COMMANDS`'s
+        // `directCommand` bypass (`@urdira/cli`) purely to reuse its
+        // preview/dispatch plumbing, not because this call mutates
+        // anything.
+        if (options.workspace_registry && indexingStorage && request.call === "core:workspace_orphans_list") {
+          latestOrphanReport = await sweepWorkspaceDataDir({ workspacesDir: workspacesDataDir, knownSafeIds: knownWorkspaceSafeIds() });
+          return { orphans: latestOrphanReport.orphans, retained_stale: latestOrphanReport.retained_stale, in_progress: latestOrphanReport.in_progress };
+        }
+        if (options.workspace_registry && indexingStorage && request.call === "core:workspace_orphans_purge") {
+          const payload = requestRecord(request.payload);
+          const requestedSafeIds = Array.isArray(payload["args"]) ? payload["args"].filter((value): value is string => typeof value === "string") : [];
+          const values = requestRecord(payload["values"]);
+          const all = values["all"] === "true";
+          if (!all && requestedSafeIds.length === 0) throw new DaemonError("core:ipc_request_invalid", "core:workspace_orphans_purge requires --all or at least one safe_id.");
+          const knownSafeIds = knownWorkspaceSafeIds();
+          const report = await sweepWorkspaceDataDir({ workspacesDir: workspacesDataDir, knownSafeIds });
+          latestOrphanReport = report;
+          const candidates = all ? report.orphans : report.orphans.filter((group) => requestedSafeIds.includes(group.safe_id));
+          const purged: string[] = [];
+          let bytesFreed = 0;
+          for (const group of candidates) {
+            // Defensive re-check (R15): a race between the sweep above and
+            // this loop (a concurrent `core:workspace_add` re-registering
+            // the same safe id, or a query opening a handle against it)
+            // must never delete a now-live workspace's files just because
+            // the report captured it a moment earlier as an orphan.
+            if (knownSafeIds.has(group.safe_id)) continue;
+            if (isWorkspaceDatabaseFileOpen(join(workspacesDataDir, `${group.safe_id}.sqlite`))) continue;
+            const entries: WorkspaceFootprintEntry[] = group.entries.map((entry) => ({ path: entry.path, kind: entry.kind, is_directory: entry.kind === "structural" || entry.kind === "sidecar" }));
+            await removeWorkspaceFootprint(entries, { keep_database: false });
+            purged.push(group.safe_id);
+            bytesFreed += group.total_bytes;
+          }
+          latestOrphanReport = await sweepWorkspaceDataDir({ workspacesDir: workspacesDataDir, knownSafeIds: knownWorkspaceSafeIds() });
+          return { purged, bytes_freed: bytesFreed, remaining: latestOrphanReport.orphans };
         }
         if (options.workspace_registry && request.call === "core:workspace_configure") {
           const payload = requestRecord(request.payload);

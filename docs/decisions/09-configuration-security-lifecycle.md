@@ -169,3 +169,59 @@ Release tests cover malicious repository configuration, path traversal, symlink 
 ## Completion criteria
 
 The defaults prevent accidental scope expansion or data disclosure while preserving predictable local indexing behavior. Implementation acceptance requires the security verification suite above on every supported platform.
+
+## Amendment 2026-09-06 (plan `generic-waddling-hartmanis.md` §6, Frente H: orphaned workspace data)
+
+`workspace purge`'s "physical deletion" (Removal and data deletion, above) previously deleted only
+the catalog `.sqlite` database and its exact `-wal`/`-shm`/`-journal` SQLite sidecars
+(`removeWorkspaceDatabaseFiles`, `packages/storage/src/storage.ts`) -- never the native
+`.structural/` store directory, the Rust scan `.sidecar/` directory, or the TypeScript lexical/
+semantic sidecar databases, even though every one of those can exist for a workspace that ever
+completed a scan. Every purge before this amendment therefore left a full set of these files
+behind, permanently: nothing in the catalog names them any more (the tombstone row is gone), so
+they were invisible to any query and undiscoverable without a manual filesystem audit.
+
+Fixed by centralizing the on-disk footprint into one list (`workspaceFootprintEntries`,
+`packages/storage/src/workspace-footprint.ts`) that `purgeWorkspace`, the outdated-database
+move-aside helper (`recreateOutdatedWorkspaceDatabase`, which had the same gap -- missing the
+rollback-journal file and the `.sidecar/` directory from its own hand-rolled candidate list -- now
+fixed the same way), and the daemon's new orphan sweep all read from. `purgeWorkspace`'s deletion
+order is now: every sidecar (`.structural/`, `.sidecar/`, the lexical/semantic sidecar databases)
+first, THEN the catalog database and its SQLite siblings, and only then (unchanged) the catalog
+tombstone row -- so a crash at any point during a purge always leaves a state shaped like "still a
+registered/tombstoned workspace" (sidecars-without-a-database, or a database-without-a-tombstone),
+never the reverse (a tombstoned workspace whose files silently survive with nothing left to name
+them). The workspace's own writer-lock marker is deliberately excluded from this sweep: the purge
+call itself holds that lock for its own duration, and `acquireWorkspaceMutationLock`'s existing
+`release()` step already unlinks it once every other step has finished -- unlinking it mid-hold
+would let a concurrent lock acquisition on the same path "succeed" against a lock this call still
+believes it owns.
+
+A new daemon-side orphan sweep (`sweepWorkspaceDataDir`, `packages/daemon/src/orphan-sweep.ts`)
+runs once at every daemon startup (right after durable storage opens, before crash recovery) and on
+demand via two new administrative RPCs, to surface -- and, on explicit confirmation, delete --
+whatever this gap (or any crashed operation) already left under `<data_root>/workspaces`:
+
+- `core:workspace_orphans_list`: re-sweeps and returns `{orphans, retained_stale, in_progress}`.
+  Every top-level entry under `workspaces/` is grouped by the footprint id its longest recognized
+  suffix implies. `retained_stale` (a `<id>.v3.stale-<timestamp>` move-aside directory) is never a
+  purge candidate, unconditionally -- it is deliberately preserved recovery evidence. `in_progress`
+  (a `<id>....fork-staging-<uuid>` copy-then-rename staging directory, `forkV4StructuralStore`) is
+  excluded only while under an hour old; older than that, it graduates to `orphans` regardless of
+  whether its id is otherwise "known" (a fork's target workspace is normally already registered
+  while the fork runs -- age, not registration, is what makes a staging leftover stale). Everything
+  else is an orphan unless its id is registered or removed-but-within-the-24-hour-grace-period
+  (`WorkspaceRegistry.listIncludingRemoved()`).
+- `core:workspace_orphans_purge {safe_ids?, all?}`: re-sweeps, defensively re-checks each requested
+  id against the current known-id set and against this process's own open-handle bookkeeping
+  (`isWorkspaceDatabaseFileOpen`) immediately before deleting, deletes with the same
+  `removeWorkspaceFootprint` primitive `purgeWorkspace` uses, re-sweeps again, and returns
+  `{purged, bytes_freed, remaining}`. Never deletes without an explicit `--confirm` at the CLI
+  layer (`urdira workspace orphans purge [--all | <safe_id>...]`, gated exactly like `workspace
+  purge`); `urdira workspace orphans` itself is read-only and needs neither `--dry-run` nor
+  `--confirm`.
+
+A sweep failure never blocks daemon startup (caught and logged); `core:status` and
+`core:index_status` both gain an `orphaned_workspace_data: {count, bytes}` field reflecting the
+most recently completed sweep (not a fresh one per status call), and the MCP `urdira_index_status`
+renderer adds one hint line when `count > 0`.

@@ -1,7 +1,7 @@
 import { AGENT_CLIENTS, agentStatus, installAgent, normalizeAgentClient, runAgentHook, uninstallAgent, type AgentClient } from "./agent-integration.js";
 export * from "./agent-integration.js";
 
-export type CliCommandName = "status" | "query" | "index" | "start" | "stop" | "restart" | "workspace-list" | "workspace-show" | "workspace-add" | "workspace-remove" | "workspace-purge" | "workspace-configure" | "codebase-list" | "codebase-create" | "codebase-rename" | "codebase-assign" | "codebase-unassign" | "codebase-remove" | "config-set" | "repair" | "gc" | "reindex" | "index-pack-export" | "agent-status" | "agent-install" | "agent-uninstall" | "agent-hook";
+export type CliCommandName = "status" | "query" | "index" | "start" | "stop" | "restart" | "workspace-list" | "workspace-show" | "workspace-add" | "workspace-remove" | "workspace-purge" | "workspace-configure" | "workspace-orphans" | "workspace-orphans-purge" | "codebase-list" | "codebase-create" | "codebase-rename" | "codebase-assign" | "codebase-unassign" | "codebase-remove" | "config-set" | "repair" | "gc" | "reindex" | "index-pack-export" | "agent-status" | "agent-install" | "agent-uninstall" | "agent-hook";
 // `index-pack-export` (docs/decisions/23-index-pack.md) never mutates
 // `workspace_registry` or any published generation -- it only writes a pack
 // file to local disk -- but it is routed through the MUTATING_COMMANDS
@@ -13,7 +13,16 @@ export type CliCommandName = "status" | "query" | "index" | "start" | "stop" | "
 // `workspace-add --index-pack <path>` (see that option below), since import
 // is only ever valid on a genuinely fresh, never-scanned workspace -- which
 // `workspace-add` is the only command that creates.
-export const MUTATING_COMMANDS = ["start", "stop", "restart", "workspace-add", "workspace-remove", "workspace-purge", "workspace-configure", "codebase-create", "codebase-rename", "codebase-assign", "codebase-unassign", "codebase-remove", "config-set", "repair", "gc", "reindex", "index-pack-export"] as const satisfies ReadonlyArray<CliCommandName>;
+// `workspace-orphans` (plan §6, Frente H) rides the same `MUTATING_COMMANDS`
+// preview/dispatch plumbing as `start`/`stop`/`restart` purely to reuse it
+// (`adminCall` lookup, `directCommand` no-confirm-required bypass below) --
+// it is documented as "administrative" in its own descriptor because it
+// always re-sweeps the data root before answering rather than reading a
+// cached value, but it deletes nothing and never mutates the registry, so
+// it needs neither `--dry-run` nor `--confirm`. `workspace-orphans-purge` IS
+// genuinely destructive and follows the ordinary `--dry-run`/`--confirm`
+// gate every other destructive command here does.
+export const MUTATING_COMMANDS = ["start", "stop", "restart", "workspace-add", "workspace-remove", "workspace-purge", "workspace-configure", "workspace-orphans", "workspace-orphans-purge", "codebase-create", "codebase-rename", "codebase-assign", "codebase-unassign", "codebase-remove", "config-set", "repair", "gc", "reindex", "index-pack-export"] as const satisfies ReadonlyArray<CliCommandName>;
 const READ_ONLY_COMMANDS = ["status", "query", "index", "workspace-list", "workspace-show", "codebase-list", "agent-status"] as const satisfies ReadonlyArray<CliCommandName>;
 const ALL_COMMANDS = new Set<CliCommandName>([...READ_ONLY_COMMANDS, ...MUTATING_COMMANDS, "agent-install", "agent-uninstall", "agent-hook"]);
 
@@ -47,7 +56,7 @@ const arg = (name: string, description: string, required = true): CliCommandDesc
 /** Authoritative, closed command catalog consumed by both the terminal parser and the local web UI. */
 export const CLI_COMMAND_CATALOG: readonly CliCommandDescriptor[] = [
   descriptor("status", "Status", "query", "read_only", "none", [], ["json", "debug-timing"]), descriptor("index", "Index status", "query", "read_only", "none", [], ["workspace", "json", "debug-timing"]), descriptor("query", "Query", "query", "read_only", "none", [], ["payload", "workspace", "json", "debug-timing"]),
-  descriptor("workspace-list", "List workspaces", "workspace", "read_only", "none", [], ["json", "debug-timing"]), descriptor("workspace-show", "Show workspace", "workspace", "read_only", "none", [arg("workspace", "Workspace identifier")], ["json", "debug-timing"]), descriptor("workspace-add", "Add workspace", "workspace", "administrative", "proposal", [arg("path", "Workspace directory")], ["path", "payload", "proposal-id", "index-pack", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-configure", "Configure workspace", "workspace", "administrative", "proposal", [arg("workspace", "Workspace identifier")], ["payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-remove", "Remove workspace", "workspace", "administrative", "destructive", [arg("workspace", "Workspace identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-purge", "Purge workspace", "workspace", "administrative", "destructive", [arg("workspace", "Removed workspace identifier")], ["payload", "dry-run", "confirm", "json", "debug-timing"]),
+  descriptor("workspace-list", "List workspaces", "workspace", "read_only", "none", [], ["json", "debug-timing"]), descriptor("workspace-show", "Show workspace", "workspace", "read_only", "none", [arg("workspace", "Workspace identifier")], ["json", "debug-timing"]), descriptor("workspace-add", "Add workspace", "workspace", "administrative", "proposal", [arg("path", "Workspace directory")], ["path", "payload", "proposal-id", "index-pack", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-configure", "Configure workspace", "workspace", "administrative", "proposal", [arg("workspace", "Workspace identifier")], ["payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-remove", "Remove workspace", "workspace", "administrative", "destructive", [arg("workspace", "Workspace identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-purge", "Purge workspace", "workspace", "administrative", "destructive", [arg("workspace", "Removed workspace identifier")], ["payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-orphans", "List orphaned workspace data", "workspace", "administrative", "none", [], ["json", "debug-timing"]), descriptor("workspace-orphans-purge", "Purge orphaned workspace data", "workspace", "administrative", "destructive", [], ["all", "dry-run", "confirm", "json", "debug-timing"]),
   descriptor("codebase-list", "List codebases", "codebase", "read_only", "none", [], ["json", "debug-timing"]), descriptor("codebase-create", "Create codebase", "codebase", "administrative", "proposal", [arg("display_name", "Project display name")], ["vcs-identity", "dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-rename", "Rename project", "codebase", "administrative", "proposal", [arg("codebase", "Codebase identifier"), arg("display_name", "New project display name")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-assign", "Assign workspace", "codebase", "administrative", "proposal", [arg("workspace", "Workspace identifier"), arg("codebase", "Codebase identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-unassign", "Unassign workspace", "codebase", "administrative", "proposal", [arg("workspace", "Workspace identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-remove", "Remove codebase", "codebase", "administrative", "destructive", [arg("codebase", "Codebase identifier")], ["dry-run", "confirm", "json", "debug-timing"]),
   descriptor("start", "Start daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("stop", "Stop daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("restart", "Restart daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("mcp", "MCP service", "service", "service_active", "none"), descriptor("web", "Web service", "service", "service_active", "none"),
   descriptor("config-set", "Set configuration", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "value", "payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("repair", "Repair", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("gc", "Collect garbage", "maintenance", "administrative", "proposal", [], ["payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("reindex", "Reindex", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "dry-run", "confirm", "json", "debug-timing"]), descriptor("index-pack-export", "Export index pack", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier"), arg("out", "Output file", false)], ["workspace", "out", "require-git-clean", "dry-run", "confirm", "json", "debug-timing"]),
@@ -63,7 +72,7 @@ export interface CliDaemonClient { readonly call: (call: string, payload: unknow
 export interface CliDependencies { readonly client: CliDaemonClient; readonly preview_admin?: (command: CliCommand) => Promise<unknown>; readonly execute_admin?: (command: CliCommand, preview: unknown) => Promise<unknown>; readonly prompt?: (question: string) => Promise<string | boolean>; readonly read_stdin?: () => Promise<string>; readonly home_directory?: string; }
 export interface CliResult { readonly exit_code: number; readonly data: unknown; readonly stdout: string; }
 
-const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "payload", "proposal-id", "workspace", "workspace-root", "path", "value", "vcs-identity", "engine-build-id", "client", "scope", "index-pack", "out", "require-git-clean"]);
+const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "payload", "proposal-id", "workspace", "workspace-root", "path", "value", "vcs-identity", "engine-build-id", "client", "scope", "index-pack", "out", "require-git-clean", "all"]);
 // --debug-timing is a process/runtime diagnostic switch, not part of any
 // request payload. It is therefore accepted uniformly on read-only commands
 // as well as lifecycle/admin commands; the app entrypoint consumes it before
@@ -89,7 +98,13 @@ function parsePayload(value: string): unknown { try { return JSON.parse(value); 
 
 export function parseCliArgs(argv: ReadonlyArray<string>): CliCommand {
   let [rawName, ...tokens] = argv;
-  if (rawName === "workspace" || rawName === "codebase" || rawName === "config" || rawName === "daemon") {
+  if (rawName === "workspace" && tokens[0] === "orphans") {
+    // Two-level subcommand (`workspace orphans` / `workspace orphans
+    // purge`), unlike every other `workspace <action>` verb below which is
+    // exactly one token -- consume one extra token only when it is "purge".
+    rawName = tokens[1] === "purge" ? "workspace-orphans-purge" : "workspace-orphans";
+    tokens = tokens.slice(tokens[1] === "purge" ? 2 : 1);
+  } else if (rawName === "workspace" || rawName === "codebase" || rawName === "config" || rawName === "daemon") {
     const action = tokens[0];
     const normalized = rawName === "workspace" && (action === "list" || action === "show" || action === "add" || action === "remove" || action === "purge" || action === "configure") ? `workspace-${action}` : rawName === "codebase" && (action === "list" || action === "create" || action === "rename" || action === "assign" || action === "unassign" || action === "remove") ? `codebase-${action}` : rawName === "config" && action === "set" ? "config-set" : rawName === "daemon" && (action === "start" || action === "stop" || action === "restart") ? action : undefined;
     if (normalized) { rawName = normalized; tokens = tokens.slice(1); }
@@ -111,6 +126,13 @@ export function parseCliArgs(argv: ReadonlyArray<string>): CliCommand {
     if (name === "dry-run") { if (inline !== undefined) throw new CliError("cli:option_invalid", "--dry-run does not take a value."); dryRun = true; continue; }
     if (name === "confirm") { if (inline !== undefined) throw new CliError("cli:option_invalid", "--confirm does not take a value."); confirm = true; continue; }
     if (name === "debug-timing") { if (inline !== undefined) throw new CliError("cli:option_invalid", "--debug-timing does not take a value."); debugTiming = true; continue; }
+    // `--all` (`workspace orphans purge --all`, plan §6 Frente H): a bare
+    // boolean flag exactly like the four above, not a value-taking option
+    // like `--require-git-clean` -- recorded in `values` (rather than a
+    // dedicated `CliOptions` field, since only this one command reads it)
+    // so `core:workspace_orphans_purge`'s daemon handler sees it the same
+    // way it sees every other free-form `--name value` option.
+    if (name === "all") { if (inline !== undefined) throw new CliError("cli:option_invalid", "--all does not take a value."); values["all"] = "true"; continue; }
     const value = inline ?? tokens[++index]; if (value === undefined || value.startsWith("--")) throw new CliError("cli:option_invalid", `Option --${name} requires a value.`);
     if (name === "payload") payload = parsePayload(value); else if (name === "proposal-id") proposalId = value; else values[name] = value;
   }
@@ -118,7 +140,7 @@ export function parseCliArgs(argv: ReadonlyArray<string>): CliCommand {
   return { name: rawName as CliCommandName, args, options: { json, dry_run: dryRun, confirm, debug_timing: debugTiming, ...(payload === undefined ? {} : { payload }), ...(proposalId === undefined ? {} : { proposal_id: proposalId }), values } };
 }
 
-const adminCall: Readonly<Record<(typeof MUTATING_COMMANDS)[number], string>> = { start: "core:daemon_start", stop: "core:daemon_stop", restart: "core:daemon_restart", "workspace-add": "core:workspace_add", "workspace-remove": "core:workspace_remove", "workspace-purge": "core:workspace_purge", "workspace-configure": "core:workspace_configure", "codebase-create": "core:codebase_create", "codebase-rename": "core:codebase_rename", "codebase-assign": "core:codebase_assign", "codebase-unassign": "core:codebase_unassign", "codebase-remove": "core:codebase_remove", "config-set": "core:configuration_set", repair: "core:repair", gc: "core:garbage_collect", reindex: "core:reindex", "index-pack-export": "core:index_pack_export" };
+const adminCall: Readonly<Record<(typeof MUTATING_COMMANDS)[number], string>> = { start: "core:daemon_start", stop: "core:daemon_stop", restart: "core:daemon_restart", "workspace-add": "core:workspace_add", "workspace-remove": "core:workspace_remove", "workspace-purge": "core:workspace_purge", "workspace-configure": "core:workspace_configure", "workspace-orphans": "core:workspace_orphans_list", "workspace-orphans-purge": "core:workspace_orphans_purge", "codebase-create": "core:codebase_create", "codebase-rename": "core:codebase_rename", "codebase-assign": "core:codebase_assign", "codebase-unassign": "core:codebase_unassign", "codebase-remove": "core:codebase_remove", "config-set": "core:configuration_set", repair: "core:repair", gc: "core:garbage_collect", reindex: "core:reindex", "index-pack-export": "core:index_pack_export" };
 // Owner decision 2026-08-13 (docs/decisions/18-semantic-model-pack.md
 // Outcome): a configure RPC that provisioned the embedding model must print
 // a clear notice, never download silently. `resultPayload` is whatever an
@@ -154,6 +176,45 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 function padColumn(value: string, width: number): string {
   return value.length >= width ? value : value + " ".repeat(width - value.length);
+}
+
+/**
+ * v4 (plan §6, Frente H): one `urdira workspace orphans[/purge]` row per
+ * orphaned data set (`OrphanGroup`, `@urdira/daemon`'s `orphan-sweep.ts`),
+ * `--json` bypasses this entirely (see the two call sites below) exactly
+ * like `formatIndexStatusTable`.
+ */
+function formatOrphanTable(groups: unknown): string {
+  const rows = Array.isArray(groups) ? groups.filter(isPlainRecord) : [];
+  if (rows.length === 0) return "no orphaned workspace data found";
+  const headers = ["SAFE_ID", "BYTES", "ENTRIES", "KIND"] as const;
+  const tableRows = rows.map((group) => {
+    const safeId = typeof group["safe_id"] === "string" ? group["safe_id"] : "?";
+    const bytes = typeof group["total_bytes"] === "number" ? String(group["total_bytes"]) : "0";
+    const entries = Array.isArray(group["entries"]) ? group["entries"].filter(isPlainRecord) : [];
+    const kinds = [...new Set(entries.map((entry) => typeof entry["kind"] === "string" ? entry["kind"] : "unknown"))];
+    return [safeId, bytes, String(entries.length), kinds.join(",")];
+  });
+  const widths = headers.map((header, column) => Math.max(header.length, ...tableRows.map((row) => row[column]!.length)));
+  const renderRow = (cells: readonly string[]): string => cells.map((cell, column) => padColumn(cell, widths[column]!)).join("  ").trimEnd();
+  return [renderRow(headers), ...tableRows.map(renderRow)].join("\n");
+}
+
+/** Non-`--json` rendering for `workspace-orphans`/`workspace-orphans-purge`; `undefined` for every other command (the caller falls back to the raw JSON payload). */
+function formatOrphanCommandResult(mutationName: string, resultPayload: unknown): string | undefined {
+  const record = isPlainRecord(resultPayload) ? resultPayload : {};
+  if (mutationName === "workspace-orphans") {
+    const lines = [formatOrphanTable(record["orphans"])];
+    if (Array.isArray(record["retained_stale"]) && record["retained_stale"].length > 0) lines.push(`retained_stale: ${record["retained_stale"].length} (never purged automatically -- see docs on outdated-database recovery)`);
+    if (Array.isArray(record["in_progress"]) && record["in_progress"].length > 0) lines.push(`in_progress: ${record["in_progress"].length} (fork staging under an hour old)`);
+    return lines.join("\n");
+  }
+  if (mutationName === "workspace-orphans-purge") {
+    const purged = Array.isArray(record["purged"]) ? record["purged"] : [];
+    const bytesFreed = typeof record["bytes_freed"] === "number" ? record["bytes_freed"] : 0;
+    return [`purged ${purged.length} orphaned data set(s), freed ${bytesFreed} bytes`, formatOrphanTable(record["remaining"])].join("\n");
+  }
+  return undefined;
 }
 
 /**
@@ -299,7 +360,12 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
     // The command itself is the user's intent; neither operation needs a
     // second --confirm acknowledgement. A dry-run remains available when a
     // caller explicitly wants the lifecycle proposal without executing it.
-    const directCommand = mutationName === "start" || mutationName === "stop" || mutationName === "restart";
+    // `workspace-orphans` (plan §6, Frente H) joins this list for the same
+    // reason: it is a read-only re-sweep, not a mutation, so it should
+    // never require `--dry-run`/`--confirm` either -- unlike its
+    // `workspace-orphans-purge` sibling, which stays on the normal
+    // destructive gate below.
+    const directCommand = mutationName === "start" || mutationName === "stop" || mutationName === "restart" || mutationName === "workspace-orphans";
     if (mutationName === "workspace-add" && command.args.length === 0 && command.options.values["path"] === undefined && command.options.values["workspace_root"] === undefined) {
       throw new CliError("cli:command_invalid", "workspace add requires a workspace path.");
     }
@@ -336,7 +402,12 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
     const result = dependencies.execute_admin ? await dependencies.execute_admin(command, preview) : await dependencies.client.call(adminCall[mutationName], { args: command.args, values: command.options.values, ...(command.options.proposal_id === undefined ? {} : { proposal_id: command.options.proposal_id }), ...(command.options.payload === undefined ? {} : { payload: command.options.payload }), ...selectionFields, confirmed: command.options.confirm, preview });
     const resultPayload = "outcome" in (result as object) ? (result as { readonly payload?: unknown; readonly error?: unknown }).payload ?? (result as { readonly error?: unknown }).error ?? result : result;
     const data = { dry_run: false, confirmed: true, command: mutationName, preview, result: resultPayload };
-    return { exit_code: "outcome" in (result as object) && (result as { readonly outcome: string }).outcome !== "success" ? 1 : 0, data, stdout: output(data, command.options.json, semanticModelNotice(resultPayload)) };
+    // `data` (returned to a scripted caller via `CliResult.data`) always
+    // stays the full envelope above -- only `stdout`'s human-terminal
+    // rendering swaps in the orphan table, exactly like `formatIndexStatusTable`
+    // does for `urdira index` further below.
+    const rendered = !command.options.json ? formatOrphanCommandResult(mutationName, resultPayload) ?? data : data;
+    return { exit_code: "outcome" in (result as object) && (result as { readonly outcome: string }).outcome !== "success" ? 1 : 0, data, stdout: output(rendered, command.options.json, semanticModelNotice(resultPayload)) };
   }
   const call = command.name === "status" ? "core:status"
     : command.name === "index" ? "core:index_status"
