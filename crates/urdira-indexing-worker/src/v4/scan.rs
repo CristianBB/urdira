@@ -8,7 +8,29 @@ use super::residual::{self, ResidualContext, ResidualEventTarget};
 use super::{ScanError, catalog, delta, publish, state::WorkerState, timings::ScanClock};
 use std::path::{Path, PathBuf};
 use urdira_jsts_syntax_worker::SyntaxWorkerState;
-use urdira_worker_protocol::{IndexingEvent, ScanPriority, ScanScope};
+use urdira_source_frontier::{Delta as SourceDelta, Frontier};
+use urdira_structural_store::to_prefixed_hex;
+use urdira_worker_protocol::{
+    ChangeKind, ChangedPath, IndexingEvent, ReconcileMode, ReconcileSummary, ScanPriority,
+    ScanRoots, ScanScope,
+};
+
+/// Frente E (plan `generic-waddling-hartmanis.md` §0 R1, §2.2): fraction of
+/// the frontier a reconcile's authoritative delta may touch before
+/// `run_reconcile` gives up on the incremental (`delta::run`) path and
+/// republishes through the full pipeline instead (`run_full_from`) -- T
+/// moves WHICH pipeline does the work, never the resulting Merkle roots
+/// (both branches are diffed against the exact same authoritative
+/// enumeration). Override for the threshold-calibration harness (plan
+/// §2.6) and for tests that want to force one branch deterministically.
+pub const RECONCILE_DELTA_THRESHOLD: f64 = 0.25;
+
+fn reconcile_threshold() -> f64 {
+    std::env::var("URDIRA_V4_RECONCILE_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(RECONCILE_DELTA_THRESHOLD)
+}
 
 pub struct ScanRequest {
     pub request_id: String,
@@ -100,6 +122,36 @@ pub fn run_with_residual(
             touched_owner_paths = Some(touched);
             event
         }),
+        ScanScope::Reconcile => run_reconcile(
+            &request,
+            // R1/R2 test hooks read here, ONCE, at this crate's one
+            // production call site -- `run_reconcile` itself takes them as
+            // plain parameters (not env reads) specifically so
+            // `tests_e2e.rs` can call it directly with different values
+            // side by side in one process: this crate is `#![forbid(unsafe_
+            // code)]` (`main.rs:1`), and `std::env::set_var`/`remove_var`
+            // are `unsafe fn` -- a test cannot toggle these env vars itself
+            // (same reasoning as `residual.rs::collect`'s `force_scan`
+            // parameter for `URDIRA_V4_ENTITY_INDEX`).
+            reconcile_threshold(),
+            std::env::var_os("URDIRA_V4_RECONCILE_FAIL_DELTA").is_some(),
+            // No production env var for this one -- it is a test-only hook
+            // (see `run_with_failure_injection`'s doc comment); production
+            // always passes `false`.
+            false,
+            &mut conn,
+            &workspace_root,
+            &structural_root,
+            &cas_root,
+            syntax,
+            worker_state,
+            &mut clock,
+            on_queryable,
+        )
+        .map(|(event, touched)| {
+            touched_owner_paths = touched;
+            event
+        }),
     };
 
     // P1-D-c: opt-in for now (default off). Every existing test/tool
@@ -133,6 +185,12 @@ pub fn run_with_residual(
     result
 }
 
+/// `ScanScope::Full` entry point: computes the next generation, then
+/// performs ONE authoritative walk (`catalog::enumerate` + `catalog::diff`)
+/// before handing off to [`run_full_from`] -- which also serves the
+/// reconcile cold path (`run_reconcile`, below) with an enumeration it
+/// already has in hand, so this crate never walks the same tree twice for
+/// one `WorkspaceScan` request.
 #[allow(clippy::too_many_arguments)]
 fn run_full(
     request: &ScanRequest,
@@ -152,7 +210,62 @@ fn run_full(
     // daemon's own "reindex from scratch" path) now correctly continues
     // from that workspace's real current generation instead of colliding
     // on `source_observation_batches`' primary key.
-    let generation = catalog::read_current_generation(conn, &request.workspace_id)? + 1;
+    //
+    // Adversarial-review hardening (Frente E, 2026-09-06):
+    // `read_current_generation` alone reads only the PUBLISHED pointer
+    // (`workspace_current_state`); `read_highest_applied_generation`'s own
+    // doc comment explains why that can be stale after a crash mid-scan
+    // (`Catalog::apply` commits before `publish_delta`/`publish_cold` ever
+    // runs) -- the daemon's own crash-recovery sweep
+    // (`packages/daemon/src/runtime.ts`'s "a workspace left `indexing` by a
+    // prior process life") retries exactly such a workspace with a fresh
+    // `Full` scan, which is this function. Byte-identical to the old
+    // behavior whenever the two counters agree (the overwhelmingly common
+    // case: `publish` always follows `apply` within the same successful
+    // request), and closes the SAME `source_observation_batches`
+    // primary-key collision `run_reconcile`'s cold fallback fix
+    // (`catalog.rs`) closes for the reconcile-specific path.
+    let generation = catalog::read_highest_applied_generation(conn, &request.workspace_id)? + 1;
+    let enumeration = catalog::enumerate(workspace_root, cas_root)?;
+    let (frontier, delta) = catalog::diff(conn, &request.workspace_id, &enumeration.observations)?;
+    run_full_from(
+        request,
+        conn,
+        structural_root,
+        cas_root,
+        syntax,
+        worker_state,
+        clock,
+        on_queryable,
+        generation,
+        enumeration,
+        frontier,
+        delta,
+    )
+}
+
+/// Shared tail of a `Full` scan and a reconcile's cold fallback (plan §2.2):
+/// takes an authoritative `(enumeration, frontier, delta)` triple -- already
+/// walked and diffed by the caller (`run_full`, or `run_reconcile` below) --
+/// and runs `apply_full -> analyze -> materialize -> publish` exactly like
+/// the pre-Frente-E `run_full` always did (this function's body is that
+/// function's tail, unchanged, just parameterized over its catalog inputs
+/// instead of computing them itself).
+#[allow(clippy::too_many_arguments)]
+fn run_full_from(
+    request: &ScanRequest,
+    conn: &mut rusqlite::Connection,
+    structural_root: &Path,
+    cas_root: &Path,
+    syntax: &mut SyntaxWorkerState,
+    worker_state: &mut WorkerState,
+    clock: &mut ScanClock,
+    on_queryable: &mut dyn FnMut(IndexingEvent) -> Result<(), String>,
+    generation: i64,
+    enumeration: catalog::Enumeration,
+    frontier: Frontier,
+    delta: SourceDelta,
+) -> Result<IndexingEvent, ScanError> {
     let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
     if debug_timing {
         eprintln!(
@@ -162,11 +275,12 @@ fn run_full(
     }
 
     let catalog_started = std::time::Instant::now();
-    let mut outcome = catalog::run_full_scan(
+    let mut outcome = catalog::run_full_scan_with_enumeration(
         conn,
         &request.workspace_id,
-        workspace_root,
-        cas_root,
+        enumeration,
+        frontier,
+        &delta,
         generation,
     )?;
     // P2-2h item 2: pull the background CAS write queue out of `outcome`
@@ -308,6 +422,7 @@ fn run_full(
                 snapshot_id,
                 roots,
                 mut timings,
+                reconcile,
             } => {
                 timings.fsync_ms = Some(timings.fsync_ms.unwrap_or(0) + cas_join_ms);
                 timings.total_ms += cas_join_ms;
@@ -318,6 +433,7 @@ fn run_full(
                     snapshot_id,
                     roots,
                     timings,
+                    reconcile,
                 }
             }
             other => other,
@@ -358,4 +474,357 @@ fn run_full(
         );
     }
     result
+}
+
+/// `ScanScope::Reconcile` (Frente E, plan §2.2): an event-driven "unknown
+/// extent of change" signal (a git branch switch, a lost watcher batch, a
+/// provider reset) that -- unlike `Changed`, which trusts the caller's own
+/// path list -- ALWAYS re-derives the delta from an authoritative walk
+/// (plan §0's invariant: "el reconcile usa SIEMPRE la enumeración
+/// autoritativa completa, nunca la pista del watcher"). What that delta's
+/// SIZE decides is only which pipeline republishes it:
+/// - empty (`n == 0`): a no-op, `ReconcileMode::Noop` -- nothing new to
+///   publish, the caller gets back the CURRENT generation's own roots.
+/// - small (`n <= T * frontier_size`): `delta::run` republishes exactly the
+///   touched owners, `ReconcileMode::Delta`.
+/// - large, or the delta attempt fails outright: the full pipeline
+///   (`run_full_from`) republishes the WHOLE authoritative enumeration,
+///   `ReconcileMode::Cold` (`fell_back_to_cold: true` only in the failure
+///   case, plan §0 R2).
+///
+/// Every branch is diffed against the SAME authoritative enumeration this
+/// function performs up front, so `T` can only move which pipeline runs,
+/// never the resulting Merkle roots -- the exact property
+/// `tests_e2e.rs`'s `reconcile_*_roots_match_a_from_scratch_scan_of_the_
+/// mutated_tree`/`reconcile_batches_match_cold_at_*` tests hold both
+/// branches to.
+///
+/// Returns `touched_owner_paths` the same way `run_with_residual`'s other
+/// two scopes do (see that function's own doc comment): `Some(touched)` for
+/// `Delta` (the residual pass can scope itself to exactly what changed),
+/// `None` for `Cold` (the residual pass's own full file map already covers
+/// the whole frontier), `Some(vec![])` for `Noop` (nothing to re-schedule).
+///
+/// `threshold`/`inject_delta_failure` are plain parameters, not env reads
+/// inside this function -- this crate is `#![forbid(unsafe_code)]`
+/// (`main.rs:1`) and `std::env::set_var`/`remove_var` are `unsafe fn`, so a
+/// test cannot toggle `URDIRA_V4_RECONCILE_THRESHOLD`/`URDIRA_V4_RECONCILE_
+/// FAIL_DELTA` itself (same reasoning as `residual.rs::collect`'s
+/// `force_scan` parameter for `URDIRA_V4_ENTITY_INDEX`). Production has
+/// exactly one call site (`run_with_residual`'s `ScanScope::Reconcile` arm),
+/// which reads both env vars once and passes the results in here;
+/// `tests_e2e.rs`'s `reconcile_batches_match_cold_at_1_5_10_25_50_percent`/
+/// `reconcile_falls_back_to_cold_when_delta_fails` call this function
+/// directly with explicit values instead -- `pub`, not `pub(super)`, for the
+/// same reason `catalog::run_full_scan` etc. are: this binary crate has no
+/// library target, so `pub` only ever means "visible elsewhere in this same
+/// binary" (`tests_e2e.rs` included), never a published API surface.
+#[allow(clippy::too_many_arguments)]
+pub fn run_reconcile(
+    request: &ScanRequest,
+    threshold: f64,
+    inject_delta_failure: bool,
+    inject_delta_failure_after_apply: bool,
+    conn: &mut rusqlite::Connection,
+    workspace_root: &Path,
+    structural_root: &Path,
+    cas_root: &Path,
+    syntax: &mut SyntaxWorkerState,
+    worker_state: &mut WorkerState,
+    clock: &mut ScanClock,
+    on_queryable: &mut dyn FnMut(IndexingEvent) -> Result<(), String>,
+) -> Result<(IndexingEvent, Option<Vec<String>>), ScanError> {
+    let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
+    let current_generation = catalog::read_current_generation(conn, &request.workspace_id)?;
+    if current_generation == 0 {
+        return Err(ScanError(
+            "v4 WorkspaceScan{scope: Reconcile} requires a prior generation; send scope: Full for a new workspace"
+                .into(),
+        ));
+    }
+
+    let enumeration = catalog::enumerate(workspace_root, cas_root)?;
+    let walk_elapsed = enumeration.walk_elapsed;
+    let (frontier, delta) = catalog::diff(conn, &request.workspace_id, &enumeration.observations)?;
+
+    let added = delta.added.len() as u64;
+    let changed = delta.changed.len() as u64;
+    let deleted = delta.deleted.len() as u64;
+    let touched_count = added + changed + deleted;
+    let frontier_size = frontier.present.len() as u64;
+
+    if debug_timing {
+        eprintln!(
+            "[urdira-indexing-worker] v4 reconcile: added={added} changed={changed} deleted={deleted} frontier={frontier_size} threshold={threshold} walk={:.3}s",
+            walk_elapsed.as_secs_f64(),
+        );
+    }
+
+    // R3: an empty authoritative delta is a no-op -- nothing new to
+    // publish, the current generation's own roots stand. Still closes the
+    // CAS write queue this call's own walk started (nothing to write for
+    // an unchanged tree, but every queue this module spawns must be joined
+    // exactly once).
+    if touched_count == 0 {
+        enumeration.cas_write_queue.join().map_err(|error| {
+            ScanError(format!(
+                "v4 reconcile: background CAS write queue failed: {error}"
+            ))
+        })?;
+        let generation_u64 = u64::try_from(current_generation)
+            .map_err(|_| ScanError("generation must be non-negative".into()))?;
+        let roots = read_generation_roots(conn, current_generation)?;
+        let summary = ReconcileSummary {
+            mode: ReconcileMode::Noop,
+            added,
+            changed,
+            deleted,
+            frontier_size,
+            threshold,
+            fell_back_to_cold: false,
+        };
+        let event = IndexingEvent::ScanCompleted {
+            request_id: request.request_id.clone(),
+            operation_id: request.request_id.clone(),
+            generation: generation_u64,
+            snapshot_id: format!("snapshot:{}:{current_generation}", request.workspace_id),
+            roots,
+            timings: clock.completed_timings(),
+            reconcile: Some(summary),
+        };
+        return Ok((event, Some(Vec::new())));
+    }
+
+    // Adversarial-review hardening: same reasoning as `run_full`'s own
+    // generation computation, above -- `read_highest_applied_generation`
+    // rather than the bare published pointer, so a reconcile reached via the
+    // daemon's crash-recovery sweep (retrying a workspace a prior process
+    // left `indexing`) cannot collide with a generation a crashed scan's own
+    // `Catalog::apply` already committed but never published. Byte-identical
+    // to `current_generation + 1` whenever the two counters agree.
+    let next_generation =
+        catalog::read_highest_applied_generation(conn, &request.workspace_id)? + 1;
+
+    if (touched_count as f64) <= threshold * (frontier_size as f64) {
+        // Small delta: republish exactly the touched owners through the
+        // existing `Changed` pipeline (`delta::run` never inspects
+        // `request.scope` -- see that module's own `run`/`run_one`, which
+        // only read `request.workspace_id`/`request.request_id` -- so the
+        // ORIGINAL request, still carrying `scope: Reconcile`, is passed
+        // through unchanged).
+        let paths: Vec<ChangedPath> = delta
+            .added
+            .iter()
+            .map(|observation| ChangedPath {
+                path: observation.normalized_uri.clone(),
+                kind: ChangeKind::Created,
+            })
+            .chain(delta.changed.iter().map(|observation| ChangedPath {
+                path: observation.normalized_uri.clone(),
+                kind: ChangeKind::Modified,
+            }))
+            .chain(delta.deleted.iter().map(|uri| ChangedPath {
+                path: uri.clone(),
+                kind: ChangeKind::Deleted,
+            }))
+            .collect();
+        // The blobs this call's own authoritative walk just queued are
+        // already durably in CAS by the time `delta::run` below performs
+        // its OWN (synchronous, path-scoped) `Walker::observe_paths` --
+        // that call re-reads/re-hashes the same handful of touched paths
+        // regardless, so this queue is drained and closed here rather than
+        // threaded any further.
+        enumeration.cas_write_queue.join().map_err(|error| {
+            ScanError(format!(
+                "v4 reconcile: background CAS write queue failed: {error}"
+            ))
+        })?;
+
+        // R2 test hook: forces the delta attempt below to fail, exercising
+        // the cold-fallback branch without needing a real corruption.
+        let delta_result = if inject_delta_failure {
+            Err(ScanError(
+                "v4 reconcile: injected delta failure (URDIRA_V4_RECONCILE_FAIL_DELTA)".into(),
+            ))
+        } else {
+            // Adversarial-review addition: `inject_delta_failure_after_apply`
+            // (always `false` in production -- `run_with_residual`'s own
+            // `ScanScope::Reconcile` arm never sets it) lets a test make
+            // THIS call fail AFTER its own `Catalog::apply` already
+            // committed `current_generation + 1`'s SQLite rows, unlike
+            // `inject_delta_failure` above which never reaches `delta::run`
+            // at all. See `run_with_failure_injection`'s doc comment and the
+            // cold-fallback's generation computation below, which this hook
+            // exists to regression-test.
+            delta::run_with_failure_injection(
+                request,
+                &paths,
+                conn,
+                workspace_root,
+                structural_root,
+                cas_root,
+                syntax,
+                worker_state,
+                clock,
+                on_queryable,
+                inject_delta_failure_after_apply,
+            )
+        };
+
+        match delta_result {
+            Ok((event, touched)) => {
+                let summary = ReconcileSummary {
+                    mode: ReconcileMode::Delta,
+                    added,
+                    changed,
+                    deleted,
+                    frontier_size,
+                    threshold,
+                    fell_back_to_cold: false,
+                };
+                return Ok((with_reconcile_summary(event, summary), Some(touched)));
+            }
+            Err(error) => {
+                // R2: never a partial generation -- fall back to cold in
+                // THIS SAME request. `delta::run`'s own `Catalog::apply`
+                // may already have advanced the SQLite frontier before
+                // whatever failed downstream, so the fallback re-walks and
+                // re-diffs from scratch rather than reusing this
+                // function's now-possibly-stale `frontier`/`delta`.
+                eprintln!(
+                    "[urdira-indexing-worker] v4 reconcile: delta failed: {error}; falling back to cold"
+                );
+                // Adversarial-review fix: NOT `read_current_generation(..) +
+                // 1` -- that reads only the PUBLISHED pointer, which the
+                // failed `delta::run` attempt may already have outrun (its
+                // own `Catalog::apply` commits before `publish_delta` ever
+                // runs). See `read_highest_applied_generation`'s doc comment
+                // for why reusing a generation number `delta::run` already
+                // wrote catalog rows for would fail this very fallback on a
+                // `source_observation_batches` primary-key collision.
+                let cold_generation =
+                    catalog::read_highest_applied_generation(conn, &request.workspace_id)? + 1;
+                let enumeration2 = catalog::enumerate(workspace_root, cas_root)?;
+                let (frontier2, delta2) =
+                    catalog::diff(conn, &request.workspace_id, &enumeration2.observations)?;
+                let event = run_full_from(
+                    request,
+                    conn,
+                    structural_root,
+                    cas_root,
+                    syntax,
+                    worker_state,
+                    clock,
+                    on_queryable,
+                    cold_generation,
+                    enumeration2,
+                    frontier2,
+                    delta2,
+                )?;
+                let summary = ReconcileSummary {
+                    mode: ReconcileMode::Cold,
+                    added,
+                    changed,
+                    deleted,
+                    frontier_size,
+                    threshold,
+                    fell_back_to_cold: true,
+                };
+                return Ok((with_reconcile_summary(event, summary), None));
+            }
+        }
+    }
+
+    // Large delta: finish the SAME authoritative enumeration through the
+    // full pipeline -- no second walk.
+    let event = run_full_from(
+        request,
+        conn,
+        structural_root,
+        cas_root,
+        syntax,
+        worker_state,
+        clock,
+        on_queryable,
+        next_generation,
+        enumeration,
+        frontier,
+        delta,
+    )?;
+    let summary = ReconcileSummary {
+        mode: ReconcileMode::Cold,
+        added,
+        changed,
+        deleted,
+        frontier_size,
+        threshold,
+        fell_back_to_cold: false,
+    };
+    Ok((with_reconcile_summary(event, summary), None))
+}
+
+/// Attaches `summary` to `event`'s `reconcile` field when it is a
+/// `ScanCompleted` (the only terminal event `run_reconcile`'s callees --
+/// `delta::run`/`run_full_from` -- ever return on success). Both of those
+/// are shared pipelines with no reconcile-specific knowledge (`Changed`/
+/// `Full` scans construct the identical event shape with `reconcile: None`),
+/// so this patches the field on after the fact rather than threading a
+/// reconcile-only parameter through either one.
+fn with_reconcile_summary(event: IndexingEvent, summary: ReconcileSummary) -> IndexingEvent {
+    match event {
+        IndexingEvent::ScanCompleted {
+            request_id,
+            operation_id,
+            generation,
+            snapshot_id,
+            roots,
+            timings,
+            ..
+        } => IndexingEvent::ScanCompleted {
+            request_id,
+            operation_id,
+            generation,
+            snapshot_id,
+            roots,
+            timings,
+            reconcile: Some(summary),
+        },
+        other => other,
+    }
+}
+
+/// Reads back the Merkle roots `merkle_roots` holds for `generation` (plan
+/// §0 R3: a reconcile no-op reports the CURRENT generation's own roots, not
+/// a freshly computed set) -- the same four `set_kind`s
+/// `publish.rs::write_snapshot_transaction` always writes
+/// (`records`/`dependency`/`graph`/`metric`).
+fn read_generation_roots(
+    conn: &rusqlite::Connection,
+    generation: i64,
+) -> Result<ScanRoots, ScanError> {
+    let root_for = |set_kind: &str| -> Result<String, ScanError> {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT root FROM merkle_roots WHERE set_kind = ?1 AND generation = ?2",
+                rusqlite::params![set_kind, generation],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                ScanError(format!(
+                    "v4 reconcile: reading {set_kind} root for generation {generation} failed: {error}"
+                ))
+            })?;
+        let array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            ScanError(format!(
+                "v4 reconcile: {set_kind} root for generation {generation} is not 32 bytes"
+            ))
+        })?;
+        Ok(to_prefixed_hex(&array))
+    };
+    Ok(ScanRoots {
+        records: root_for("records")?,
+        dependency: root_for("dependency")?,
+        graph: root_for("graph")?,
+        metric: root_for("metric")?,
+    })
 }

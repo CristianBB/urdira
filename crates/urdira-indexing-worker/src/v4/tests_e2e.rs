@@ -3237,6 +3237,1103 @@ fn incremental_rename_via_delete_then_create_in_two_generations_matches_a_from_s
     let _ = std::fs::remove_dir_all(&oracle_root);
 }
 
+// ---------------------------------------------------------------------
+// Frente E (plan `generic-waddling-hartmanis.md` §2.4): `ScanScope::
+// Reconcile`. Every test below holds the SAME paridad Merkle bloqueante
+// invariant the `incremental_*` family above holds for `Changed`: whichever
+// pipeline a reconcile actually runs (`Delta` or `Cold`), its roots must be
+// byte-identical to a from-scratch cold scan of the SAME mutated tree.
+// `threshold`/`inject_delta_failure` are passed explicitly (never via
+// `std::env::set_var`, forbidden in this `#![forbid(unsafe_code)]` binary)
+// so these tests can force one branch deterministically regardless of this
+// tiny fixture's own size -- see `scan::run_reconcile`'s own doc comment.
+// ---------------------------------------------------------------------
+
+/// Runs one `ScanScope::Reconcile` request directly against
+/// `scan::run_reconcile` (not through `scan::run_with_residual`/`run_scan`,
+/// which would read `URDIRA_V4_RECONCILE_THRESHOLD`/`URDIRA_V4_RECONCILE_
+/// FAIL_DELTA` from the environment -- unusable here, see this section's own
+/// header comment) and returns its terminal event alongside
+/// `touched_owner_paths`.
+#[allow(clippy::too_many_arguments)]
+fn run_reconcile_scan(
+    request_id: &str,
+    workspace_id: &str,
+    workspace_root: &Path,
+    database_path: &Path,
+    structural_root: &Path,
+    cas_root: &Path,
+    threshold: f64,
+    inject_delta_failure: bool,
+    syntax: &mut SyntaxWorkerState,
+    worker_state: &mut super::state::WorkerState,
+) -> (IndexingEvent, Option<Vec<String>>) {
+    let request = scan::ScanRequest {
+        request_id: request_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        database_path: database_path.to_string_lossy().into_owned(),
+        structural_root: structural_root.to_string_lossy().into_owned(),
+        cas_root: cas_root.to_string_lossy().into_owned(),
+        sidecar_root: structural_root
+            .parent()
+            .unwrap()
+            .join("sidecar")
+            .to_string_lossy()
+            .into_owned(),
+        scope: ScanScope::Reconcile,
+        registry_snapshot_id: "registry:v4-e2e-test".to_string(),
+        configuration_revision_id: "configuration:v4-e2e-test".to_string(),
+        resolution_lock_id: "resolution:v4-e2e-test".to_string(),
+        deadline_ms: None,
+        priority: ScanPriority::Interactive,
+    };
+    let mut conn =
+        catalog::open_and_ensure_schema(database_path).expect("catalog opens for reconcile");
+    let mut clock = ScanClock::start();
+    let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+    scan::run_reconcile(
+        &request,
+        threshold,
+        inject_delta_failure,
+        false,
+        &mut conn,
+        workspace_root,
+        structural_root,
+        cas_root,
+        syntax,
+        worker_state,
+        &mut clock,
+        &mut on_queryable,
+    )
+    .expect("scan::run_reconcile succeeds")
+}
+
+/// Sibling of [`run_reconcile_scan`] for the "hard case" R2 variant: forces
+/// the delta attempt to fail AFTER its own `Catalog::apply` has already
+/// committed a generation's SQLite rows (not before, like
+/// `inject_delta_failure` above) -- see `delta::run_with_failure_injection`
+/// and `catalog::read_highest_applied_generation`'s doc comments.
+#[allow(clippy::too_many_arguments)]
+fn run_reconcile_scan_after_apply_failure(
+    request_id: &str,
+    workspace_id: &str,
+    workspace_root: &Path,
+    database_path: &Path,
+    structural_root: &Path,
+    cas_root: &Path,
+    threshold: f64,
+    syntax: &mut SyntaxWorkerState,
+    worker_state: &mut super::state::WorkerState,
+) -> (IndexingEvent, Option<Vec<String>>) {
+    let request = scan::ScanRequest {
+        request_id: request_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        database_path: database_path.to_string_lossy().into_owned(),
+        structural_root: structural_root.to_string_lossy().into_owned(),
+        cas_root: cas_root.to_string_lossy().into_owned(),
+        sidecar_root: structural_root
+            .parent()
+            .unwrap()
+            .join("sidecar")
+            .to_string_lossy()
+            .into_owned(),
+        scope: ScanScope::Reconcile,
+        registry_snapshot_id: "registry:v4-e2e-test".to_string(),
+        configuration_revision_id: "configuration:v4-e2e-test".to_string(),
+        resolution_lock_id: "resolution:v4-e2e-test".to_string(),
+        deadline_ms: None,
+        priority: ScanPriority::Interactive,
+    };
+    let mut conn =
+        catalog::open_and_ensure_schema(database_path).expect("catalog opens for reconcile");
+    let mut clock = ScanClock::start();
+    let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+    scan::run_reconcile(
+        &request,
+        threshold,
+        false,
+        true,
+        &mut conn,
+        workspace_root,
+        structural_root,
+        cas_root,
+        syntax,
+        worker_state,
+        &mut clock,
+        &mut on_queryable,
+    )
+    .expect("scan::run_reconcile succeeds")
+}
+
+fn reconcile_summary_of(event: &IndexingEvent) -> urdira_worker_protocol::ReconcileSummary {
+    match event {
+        IndexingEvent::ScanCompleted { reconcile, .. } => reconcile
+            .clone()
+            .expect("reconcile scope must report a ReconcileSummary"),
+        other => panic!("expected ScanCompleted, got {other:?}"),
+    }
+}
+
+/// R3: an empty authoritative delta is a no-op -- same generation, same
+/// roots as the cold scan that published them, `reconcile.mode == Noop`,
+/// and `touched_owner_paths == Some(vec![])` (nothing for the residual pass
+/// to re-schedule).
+#[test]
+fn reconcile_noop_keeps_generation_and_roots() {
+    let scratch_root = scratch_dir("reconcile-noop");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-noop",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+    let cold_roots = roots_of(&cold);
+
+    // Nothing on disk changes between the cold scan and the reconcile.
+    let (reconciled, touched) = run_reconcile_scan(
+        "request:reconcile-noop",
+        "workspace:v4-e2e-reconcile-noop",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        scan::RECONCILE_DELTA_THRESHOLD,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&reconciled),
+        1,
+        "a no-op reconcile must not publish a new generation"
+    );
+    assert_eq!(roots_of(&reconciled), cold_roots);
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Noop);
+    assert_eq!(summary.added, 0);
+    assert_eq!(summary.changed, 0);
+    assert_eq!(summary.deleted, 0);
+    assert!(!summary.fell_back_to_cold);
+    assert_eq!(touched, Some(Vec::new()));
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
+/// Plan §2.4: a small CREATE, forced through the `Delta` pipeline
+/// (`threshold: 1.0` guarantees `n <= T * frontier_size` regardless of this
+/// fixture's own tiny size) -- roots and pending sites must match a
+/// from-scratch oracle scan of the identically mutated tree, and
+/// `reconcile.mode == Delta`.
+#[test]
+fn reconcile_create_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
+    let scratch_root = scratch_dir("reconcile-create");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-create",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let created_relative = "src/domain/urdira-harness-reconcile-created.ts";
+    std::fs::write(
+        workspace_root.join(created_relative),
+        "export function urdiraHarnessReconcileCreated_marker1() {\n  return \"marker1\";\n}\n",
+    )
+    .expect("write created file");
+
+    let (reconciled, touched) = run_reconcile_scan(
+        "request:reconcile-create",
+        "workspace:v4-e2e-reconcile-create",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        1.0,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&reconciled), 2);
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Delta);
+    assert_eq!(summary.added, 1);
+    assert_eq!(summary.changed, 0);
+    assert_eq!(summary.deleted, 0);
+    assert!(!summary.fell_back_to_cold);
+    assert_eq!(
+        touched,
+        Some(vec![created_relative.to_string()]),
+        "Delta mode must report exactly the touched owner path"
+    );
+
+    let oracle_root = scratch_dir("reconcile-create-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-reconcile-create-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let reconciled_roots = roots_of(&reconciled);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(reconciled_roots.records, oracle_roots.records);
+    assert_eq!(reconciled_roots.dependency, oracle_roots.dependency);
+    assert_eq!(reconciled_roots.graph, oracle_roots.graph);
+
+    let reconciled_pending = pending_site_set(
+        &structural_root,
+        &database_path,
+        "workspace:v4-e2e-reconcile-create",
+    );
+    let oracle_pending = pending_site_set(
+        &oracle_structural,
+        &oracle_database,
+        "workspace:v4-e2e-reconcile-create-oracle",
+    );
+    assert_eq!(reconciled_pending, oracle_pending);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Plan §2.4: a small MODIFY, forced through `Delta`. Unlike the create/
+/// delete/rename siblings above, a content EDIT going through `Delta`
+/// (`delta::run` -> `diff.rs::diff_owner`) does NOT match an independent
+/// from-scratch oracle by design -- decision 11's documented "replacement"
+/// chaining (`record_id = H(digest, predecessor)` for an identity that
+/// persists with a changed digest, e.g. `jsts:entity_container`'s `end`
+/// shifting with the file's byte length) never matches the kernel's plain
+/// `record_id = sha256(digest)` a from-scratch oracle always uses -- the
+/// EXACT property `incremental_edit_produces_a_self_consistent_incremental_
+/// merkle_update` (above) already establishes for the `Changed` scope, and
+/// `reconcile`'s `Delta` branch is that same `delta::run` call underneath.
+/// (Confirmed NOT to be a reconcile-specific gap: a content edit through
+/// the `Cold` pipeline instead -- no prior-generation chaining there at all
+/// -- DOES match an independent oracle exactly, verified live while
+/// diagnosing this.) So this test holds `Delta`'s only real guarantees
+/// instead: (1) the reconciled roots equal a from-scratch REBUILD over the
+/// store's own final visible key set (`recompute_roots_from_scratch`,
+/// `lifecycle.verify`'s own primitive); (2) every unrelated record keeps
+/// its exact prior id.
+#[test]
+fn reconcile_modify_produces_a_self_consistent_incremental_merkle_update() {
+    let scratch_root = scratch_dir("reconcile-modify");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-modify",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+    let reader1 = StoreReader::open(&structural_root).expect("reader opens after cold");
+    let mut records_before: std::collections::HashMap<[u8; 32], [u8; 32]> =
+        std::collections::HashMap::new();
+    for view in reader1.iter_visible(1) {
+        records_before.insert(view.identity_key_digest(), view.record_id());
+    }
+    drop(reader1);
+
+    let modified_relative = "src/domain/task.ts";
+    let modified_absolute = workspace_root.join(modified_relative);
+    let mut text = std::fs::read_to_string(&modified_absolute).expect("read modified file");
+    text.push_str("\n// urdira-harness-reconcile-modify marker\n");
+    std::fs::write(&modified_absolute, text).expect("write modified file");
+
+    let (reconciled, touched) = run_reconcile_scan(
+        "request:reconcile-modify",
+        "workspace:v4-e2e-reconcile-modify",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        1.0,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&reconciled), 2);
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Delta);
+    assert_eq!(summary.added, 0);
+    assert_eq!(summary.changed, 1);
+    assert_eq!(summary.deleted, 0);
+    assert_eq!(touched, Some(vec![modified_relative.to_string()]));
+
+    let reconciled_roots = roots_of(&reconciled);
+    let reader2 = StoreReader::open(&structural_root).expect("reader opens after reconcile");
+    let generation2 = reader2.generation();
+    assert_eq!(generation2, 2);
+    let (records_root_from_scratch, dependency_root_from_scratch) =
+        urdira_structural_store::recompute_roots_from_scratch(&reader2, generation2)
+            .expect("recompute_roots_from_scratch succeeds");
+    assert_eq!(
+        reconciled_roots.records,
+        urdira_structural_store::to_prefixed_hex(&records_root_from_scratch),
+        "the reconciled records root must equal a from-scratch rebuild over the SAME final key set"
+    );
+    assert_eq!(
+        reconciled_roots.dependency,
+        urdira_structural_store::to_prefixed_hex(&dependency_root_from_scratch),
+        "the reconciled dependency root must equal a from-scratch rebuild over the SAME final key set"
+    );
+    let graph_entries: Vec<_> = reader2
+        .iter_visible(generation2)
+        .filter(|view| view.category() == urdira_structural_store::row::CATEGORY_RELATION)
+        .map(|view| (view.record_id(), view.record_digest()))
+        .collect();
+    let graph_root_from_scratch =
+        urdira_structural_store::BucketedMerkleSet::from_sorted(&graph_entries)
+            .expect("graph merkle build succeeds")
+            .root();
+    assert_eq!(
+        reconciled_roots.graph,
+        urdira_structural_store::to_prefixed_hex(&graph_root_from_scratch),
+        "the reconciled graph root must equal a from-scratch rebuild over the SAME final key set"
+    );
+
+    let mut unchanged_checked = 0;
+    for view in reader2.iter_visible(generation2) {
+        if let Some(&prior_id) = records_before.get(&view.identity_key_digest())
+            && prior_id == view.record_id()
+        {
+            unchanged_checked += 1;
+        }
+    }
+    assert!(
+        unchanged_checked > 100,
+        "most of generation 1's records must survive this edit with their exact prior id \
+         (got {unchanged_checked}); a reconcile Delta should not reopen/rechain unrelated records"
+    );
+    drop(reader2);
+
+    // Adversarial-review addition (2026-09-06): the self-consistency checks
+    // above (`recompute_roots_from_scratch`, the manual `graph_entries`
+    // rebuild) only prove the persisted Merkle roots match a recomputation
+    // over this store's OWN row set -- they cannot catch a bug that put the
+    // WRONG rows in that set to begin with. `records` is legitimately
+    // excluded from an independent-oracle comparison (decision 11's
+    // predecessor chaining, this test's own doc comment above) -- but
+    // `dependency`/`graph`/pending sites carry no such chaining (dependency
+    // rows are re-materialized wholesale per touched owner, relation/graph
+    // records key on subject/target IDENTITY, not the volatile chained
+    // `record_id`, and pending sites are keyed by `(owner_artifact, start,
+    // end, site_kind)`), so THESE must equal an independent from-scratch
+    // scan of the identically-mutated tree exactly -- verified empirically
+    // live (a throwaway probe against this exact fixture/mutation showed
+    // `dependency`/`graph`/pending-site-count all equal an independent
+    // oracle while only `records` differed, confirming the chaining gap is
+    // scoped to `records` alone, not a wider graph/dependency integrity
+    // bug).
+    let oracle_root = scratch_dir("reconcile-modify-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-reconcile-modify-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(
+        reconciled_roots.dependency, oracle_roots.dependency,
+        "a content edit must not disturb the dependency root vs an independent oracle: \
+         dependency identity carries no record_id chaining"
+    );
+    assert_eq!(
+        reconciled_roots.graph, oracle_roots.graph,
+        "a content edit must not disturb the graph root vs an independent oracle: \
+         relation/graph identity is keyed on subject/target IDENTITY, not the chained record_id"
+    );
+    let reconciled_pending = pending_site_set(
+        &structural_root,
+        &database_path,
+        "workspace:v4-e2e-reconcile-modify",
+    );
+    let oracle_pending = pending_site_set(
+        &oracle_structural,
+        &oracle_database,
+        "workspace:v4-e2e-reconcile-modify-oracle",
+    );
+    assert_eq!(
+        reconciled_pending, oracle_pending,
+        "a content edit must not disturb the pending-site set vs an independent oracle"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Plan §2.4: a pure DELETE, forced through `Delta`.
+#[test]
+fn reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
+    let scratch_root = scratch_dir("reconcile-delete");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-delete",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let deleted_relative = "src/repository/in-memory-task-repository.ts";
+    std::fs::remove_file(workspace_root.join(deleted_relative)).expect("delete file");
+
+    let (reconciled, touched) = run_reconcile_scan(
+        "request:reconcile-delete",
+        "workspace:v4-e2e-reconcile-delete",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        1.0,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&reconciled), 2);
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Delta);
+    assert_eq!(summary.added, 0);
+    assert_eq!(summary.changed, 0);
+    assert_eq!(summary.deleted, 1);
+    assert_eq!(touched, Some(vec![deleted_relative.to_string()]));
+
+    let oracle_root = scratch_dir("reconcile-delete-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-reconcile-delete-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let reconciled_roots = roots_of(&reconciled);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(reconciled_roots.records, oracle_roots.records);
+    assert_eq!(reconciled_roots.dependency, oracle_roots.dependency);
+    assert_eq!(reconciled_roots.graph, oracle_roots.graph);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Plan §2.4: a RENAME (a same-generation delete+create pair with no
+/// modified entries, `Delta::compute`'s own authoritative diff derives
+/// BOTH from the walk -- reconcile never receives a rename hint from a
+/// watcher), forced through `Delta`.
+#[test]
+fn reconcile_rename_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
+    let scratch_root = scratch_dir("reconcile-rename");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-rename",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let old_relative = "src/domain/errors.ts";
+    let new_relative = "src/domain/errors-reconcile-renamed.ts";
+    std::fs::rename(
+        workspace_root.join(old_relative),
+        workspace_root.join(new_relative),
+    )
+    .expect("rename succeeds");
+
+    let (reconciled, touched) = run_reconcile_scan(
+        "request:reconcile-rename",
+        "workspace:v4-e2e-reconcile-rename",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        1.0,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&reconciled), 2);
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Delta);
+    assert_eq!(summary.added, 1);
+    assert_eq!(summary.changed, 0);
+    assert_eq!(summary.deleted, 1);
+    let mut touched = touched.expect("Delta mode reports touched owner paths");
+    touched.sort();
+    assert_eq!(
+        touched,
+        vec![new_relative.to_string(), old_relative.to_string()]
+    );
+
+    let oracle_root = scratch_dir("reconcile-rename-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-reconcile-rename-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let reconciled_roots = roots_of(&reconciled);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(reconciled_roots.records, oracle_roots.records);
+    assert_eq!(reconciled_roots.dependency, oracle_roots.dependency);
+    assert_eq!(reconciled_roots.graph, oracle_roots.graph);
+
+    let reconciled_pending = pending_site_set(
+        &structural_root,
+        &database_path,
+        "workspace:v4-e2e-reconcile-rename",
+    );
+    let oracle_pending = pending_site_set(
+        &oracle_structural,
+        &oracle_database,
+        "workspace:v4-e2e-reconcile-rename-oracle",
+    );
+    assert_eq!(reconciled_pending, oracle_pending);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Plan §2.4/§0 R1: sweeps batch sizes `⌈p * N⌉` (`N` = this fixture's own
+/// 8-file `.ts` inventory) over `p ∈ {1, 5, 10, 25, 50}%`, mutating that
+/// many files, and republishes the SAME mutated tree twice -- once forced
+/// through `Delta` (`threshold: 1.0`) and once forced through `Cold`
+/// (`threshold: 0.0`) -- against independent scratch copies. Both must
+/// match a from-scratch oracle scan of the identically mutated tree
+/// exactly: `T` only ever decides WHICH pipeline runs, never the resulting
+/// roots.
+///
+/// **Decided in implementation, deviating from the plan's literal "90%
+/// comment added" mutation recipe**: a CREATE at each batch size, not a
+/// content EDIT to an existing file. Diagnosed live while writing this
+/// family (see `reconcile_modify_produces_a_self_consistent_incremental_
+/// merkle_update`'s own doc comment and `full_scan_twice_in_the_same_
+/// process_matches_a_from_scratch_oracle`): a content edit's `Delta`
+/// branch legitimately chains an existing identity's `record_id` per
+/// decision 11, which by design never matches an independent from-scratch
+/// oracle -- true of `Changed` today, inherited by `reconcile`'s `Delta`
+/// branch unchanged, NOT a reconcile-specific gap. A pure CREATE has no
+/// prior identity to chain against on EITHER branch, so it is the correct
+/// choice for a test whose whole point is oracle-parity across both
+/// branches at once; content-edit batches are exactly what `scripts/v4-
+/// reconcile-threshold.mjs` (plan §2.6, real n8n corpus) exercises instead,
+/// where wall-clock measurement -- not root parity -- is the point, and a
+/// `delta`-vs-`cold` comparison at `T=1.0`/`T=0.0` on the SAME edit-heavy
+/// mutation is expected to (and, per this finding, will) diverge on any
+/// touched file's own chained record while still validating everything
+/// else; that script's own "abortar si no" gate should compare its DELTA
+/// run's roots against its OWN COLD run (both mutated identically), never
+/// against a fully independent oracle, for exactly this reason. (This
+/// fixture is also far too small for the percentages themselves to be
+/// meaningful load figures -- that calibration is the threshold script's
+/// job -- this test only proves the parity invariant holds at several
+/// distinct batch sizes.)
+#[test]
+fn reconcile_batches_match_cold_at_1_5_10_25_50_percent() {
+    let total = 8_usize;
+
+    for fraction in [0.01_f64, 0.05, 0.10, 0.25, 0.50] {
+        let touched_count = ((fraction * total as f64).ceil() as usize).max(1);
+        let pct = (fraction * 100.0) as u32;
+        let label = format!("reconcile-batch-{pct:02}pct");
+        // TS identifiers cannot contain `-`; `pct` (a plain integer) is
+        // used inside the generated source text instead of `label` itself.
+        let mutate = |workspace_root: &Path| {
+            for index in 0..touched_count {
+                let relative = format!("src/domain/urdira-harness-{label}-created-{index}.ts");
+                std::fs::write(
+                    workspace_root.join(&relative),
+                    format!(
+                        "export function urdiraHarness_batch_{pct}pct_created_{index}() {{\n  return {index};\n}}\n"
+                    ),
+                )
+                .expect("write created file");
+            }
+        };
+
+        // Forced Delta.
+        let delta_scratch = scratch_dir(&format!("{label}-delta"));
+        let delta_workspace = delta_scratch.join("workspace");
+        copy_dir_recursive(&fixture_root(), &delta_workspace);
+        let delta_database = delta_scratch.join("workspace.sqlite");
+        let delta_structural = delta_scratch.join("structural");
+        let delta_cas = delta_scratch.join("cas");
+        let mut delta_syntax = SyntaxWorkerState::default();
+        let mut delta_state: super::state::WorkerState = std::collections::HashMap::new();
+        let delta_workspace_id = format!("workspace:v4-e2e-{label}-delta");
+        let cold = run_scan(
+            "request:cold",
+            &delta_workspace_id,
+            &delta_workspace,
+            &delta_database,
+            &delta_structural,
+            &delta_cas,
+            ScanScope::Full,
+            &mut delta_syntax,
+            &mut delta_state,
+        );
+        assert_eq!(generation_of(&cold), 1);
+        mutate(&delta_workspace);
+        let (delta_event, _) = run_reconcile_scan(
+            "request:reconcile-delta",
+            &delta_workspace_id,
+            &delta_workspace,
+            &delta_database,
+            &delta_structural,
+            &delta_cas,
+            1.0,
+            false,
+            &mut delta_syntax,
+            &mut delta_state,
+        );
+        assert_eq!(generation_of(&delta_event), 2);
+        assert_eq!(
+            reconcile_summary_of(&delta_event).mode,
+            urdira_worker_protocol::ReconcileMode::Delta,
+            "fraction={fraction} touched={touched_count}"
+        );
+
+        // Forced Cold, same mutations, independent copy.
+        let cold_scratch = scratch_dir(&format!("{label}-cold"));
+        let cold_workspace = cold_scratch.join("workspace");
+        copy_dir_recursive(&fixture_root(), &cold_workspace);
+        let cold_database = cold_scratch.join("workspace.sqlite");
+        let cold_structural = cold_scratch.join("structural");
+        let cold_cas = cold_scratch.join("cas");
+        let mut cold_syntax = SyntaxWorkerState::default();
+        let mut cold_state: super::state::WorkerState = std::collections::HashMap::new();
+        let cold_workspace_id = format!("workspace:v4-e2e-{label}-cold");
+        let cold_gen1 = run_scan(
+            "request:cold",
+            &cold_workspace_id,
+            &cold_workspace,
+            &cold_database,
+            &cold_structural,
+            &cold_cas,
+            ScanScope::Full,
+            &mut cold_syntax,
+            &mut cold_state,
+        );
+        assert_eq!(generation_of(&cold_gen1), 1);
+        mutate(&cold_workspace);
+        let (cold_event, _) = run_reconcile_scan(
+            "request:reconcile-cold",
+            &cold_workspace_id,
+            &cold_workspace,
+            &cold_database,
+            &cold_structural,
+            &cold_cas,
+            0.0,
+            false,
+            &mut cold_syntax,
+            &mut cold_state,
+        );
+        assert_eq!(generation_of(&cold_event), 2);
+        assert_eq!(
+            reconcile_summary_of(&cold_event).mode,
+            urdira_worker_protocol::ReconcileMode::Cold,
+            "fraction={fraction} touched={touched_count}"
+        );
+
+        // From-scratch oracle of the identically mutated tree.
+        let oracle_scratch = scratch_dir(&format!("{label}-oracle"));
+        let oracle_workspace = oracle_scratch.join("workspace");
+        copy_dir_recursive(&fixture_root(), &oracle_workspace);
+        mutate(&oracle_workspace);
+        let oracle_database = oracle_scratch.join("workspace.sqlite");
+        let oracle_structural = oracle_scratch.join("structural");
+        let oracle_cas = oracle_scratch.join("cas");
+        let mut oracle_syntax = SyntaxWorkerState::default();
+        let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+        let oracle_event = run_scan(
+            "request:oracle",
+            &format!("workspace:v4-e2e-{label}-oracle"),
+            &oracle_workspace,
+            &oracle_database,
+            &oracle_structural,
+            &oracle_cas,
+            ScanScope::Full,
+            &mut oracle_syntax,
+            &mut oracle_state,
+        );
+        assert_eq!(generation_of(&oracle_event), 1);
+
+        let delta_roots = roots_of(&delta_event);
+        let cold_roots = roots_of(&cold_event);
+        let oracle_roots = roots_of(&oracle_event);
+        assert_eq!(
+            delta_roots.records, oracle_roots.records,
+            "fraction={fraction} touched={touched_count}: delta records root vs oracle"
+        );
+        assert_eq!(
+            delta_roots.dependency, oracle_roots.dependency,
+            "fraction={fraction} touched={touched_count}: delta dependency root vs oracle"
+        );
+        assert_eq!(
+            delta_roots.graph, oracle_roots.graph,
+            "fraction={fraction} touched={touched_count}: delta graph root vs oracle"
+        );
+        assert_eq!(
+            cold_roots.records, oracle_roots.records,
+            "fraction={fraction} touched={touched_count}: cold records root vs oracle"
+        );
+        assert_eq!(
+            cold_roots.dependency, oracle_roots.dependency,
+            "fraction={fraction} touched={touched_count}: cold dependency root vs oracle"
+        );
+        assert_eq!(
+            cold_roots.graph, oracle_roots.graph,
+            "fraction={fraction} touched={touched_count}: cold graph root vs oracle"
+        );
+
+        let _ = std::fs::remove_dir_all(&delta_scratch);
+        let _ = std::fs::remove_dir_all(&cold_scratch);
+        let _ = std::fs::remove_dir_all(&oracle_scratch);
+    }
+}
+
+/// Plan §0 R2: the `Delta` attempt fails (injected) -- the SAME request
+/// must fall back to `Cold` rather than surface a partial generation.
+/// Exactly one new generation is published (`read_current_generation ==
+/// 2`, not 3: the failed `Delta` attempt's own `Catalog::apply` publishes
+/// generation 2's CATALOG row before `delta::run` fails deeper in its own
+/// pipeline, and the fallback's `run_full_from` re-walks and republishes
+/// that SAME generation 2 -- never a generation 3).
+#[test]
+fn reconcile_falls_back_to_cold_when_delta_fails() {
+    let scratch_root = scratch_dir("reconcile-fail-delta");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-fail-delta",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let created_relative = "src/domain/urdira-harness-reconcile-fail-delta-created.ts";
+    std::fs::write(
+        workspace_root.join(created_relative),
+        "export function urdiraHarnessReconcileFailDeltaCreated_marker1() {\n  return \"marker1\";\n}\n",
+    )
+    .expect("write created file");
+
+    let (reconciled, touched) = run_reconcile_scan(
+        "request:reconcile-fail-delta",
+        "workspace:v4-e2e-reconcile-fail-delta",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        1.0,
+        true,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Cold);
+    assert!(summary.fell_back_to_cold);
+    assert!(
+        touched.is_none(),
+        "Cold mode reports no touched owner scope"
+    );
+
+    let conn =
+        catalog::open_and_ensure_schema(&database_path).expect("catalog reopens after fallback");
+    assert_eq!(
+        catalog::read_current_generation(&conn, "workspace:v4-e2e-reconcile-fail-delta")
+            .expect("reads current generation"),
+        2,
+        "the fallback must publish exactly one new generation, never a partial one"
+    );
+    drop(conn);
+
+    let oracle_root = scratch_dir("reconcile-fail-delta-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-reconcile-fail-delta-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let reconciled_roots = roots_of(&reconciled);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(reconciled_roots.records, oracle_roots.records);
+    assert_eq!(reconciled_roots.dependency, oracle_roots.dependency);
+    assert_eq!(reconciled_roots.graph, oracle_roots.graph);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Adversarial-review addition (2026-09-06): the "hard case" R2's own doc
+/// comment names but `reconcile_falls_back_to_cold_when_delta_fails` (above)
+/// does not actually exercise -- that test's `inject_delta_failure` never
+/// even calls `delta::run`, so `delta::run`'s own `Catalog::apply` never
+/// commits anything for the generation the fallback recomputes. This test
+/// instead lets `delta::run` genuinely commit `Catalog::apply` for
+/// `current_generation + 1` and THEN fails, deeper in the same pipeline,
+/// before `publish_delta` ever runs -- reproducing a real crash/error window
+/// (materialize, `diff_owner`, the hybrid lane, or the structural segment
+/// write can all genuinely fail) that leaves `source_index_state.
+/// current_generation` ahead of `workspace_current_state.current_generation`
+/// (`catalog::read_highest_applied_generation`'s own doc comment explains
+/// why the two can disagree). Before the fix, the fallback recomputed
+/// `read_current_generation(..) + 1` -- the SAME generation number
+/// `delta::run`'s aborted attempt already committed rows for -- and its own
+/// `apply_full` failed a second time on a `source_observation_batches`
+/// primary-key collision, turning R2's "never a partial generation" into an
+/// unrecoverable `Err` with generation `current_generation + 1` permanently
+/// stuck (uncollectable: unpublished, but blocking every future retry from
+/// reusing its number). This asserts the actual required behavior: the
+/// fallback succeeds, publishes exactly ONE new generation (skipping past
+/// the number the aborted attempt already consumed), and its roots match a
+/// from-scratch oracle of the mutated tree.
+#[test]
+fn reconcile_falls_back_to_cold_when_delta_fails_after_catalog_apply() {
+    let scratch_root = scratch_dir("reconcile-fail-delta-after-apply");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-fail-delta-after-apply",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let created_relative = "src/domain/urdira-harness-reconcile-fail-delta-after-apply-created.ts";
+    std::fs::write(
+        workspace_root.join(created_relative),
+        "export function urdiraHarnessReconcileFailDeltaAfterApplyCreated_marker1() {\n  return \"marker1\";\n}\n",
+    )
+    .expect("write created file");
+
+    let (reconciled, touched) = run_reconcile_scan_after_apply_failure(
+        "request:reconcile-fail-delta-after-apply",
+        "workspace:v4-e2e-reconcile-fail-delta-after-apply",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        1.0,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Cold);
+    assert!(summary.fell_back_to_cold);
+    assert!(
+        touched.is_none(),
+        "Cold mode reports no touched owner scope"
+    );
+
+    let conn =
+        catalog::open_and_ensure_schema(&database_path).expect("catalog reopens after fallback");
+    // The aborted `delta::run` attempt already committed `Catalog::apply`
+    // for generation 2 (source_index_state) before failing; the fallback
+    // must skip past it and publish generation 3, never collide on 2 and
+    // never leave `workspace_current_state` pointing at anything but a
+    // fully-published generation.
+    assert_eq!(
+        catalog::read_current_generation(
+            &conn,
+            "workspace:v4-e2e-reconcile-fail-delta-after-apply"
+        )
+        .expect("reads published current generation"),
+        3,
+        "the fallback must publish past the generation the aborted delta attempt already committed"
+    );
+    drop(conn);
+
+    let oracle_root = scratch_dir("reconcile-fail-delta-after-apply-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-reconcile-fail-delta-after-apply-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let reconciled_roots = roots_of(&reconciled);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(reconciled_roots.records, oracle_roots.records);
+    assert_eq!(reconciled_roots.dependency, oracle_roots.dependency);
+    assert_eq!(reconciled_roots.graph, oracle_roots.graph);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
 /// Counts the currently-visible entity records under `identity_key`
 /// `prefix` -- used below to check the external module/symbol identity's
 /// live-record count directly against the store, generation over
@@ -5099,4 +6196,199 @@ fn n8n_population_floors() {
     );
 
     let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
+/// Frente E regression test for a latent bug this front's own reconcile
+/// work discovered (2026-09-06), OUTSIDE the `ScanScope::Reconcile` code
+/// path entirely: a SECOND `ScanScope::Full` scan of an already-published
+/// workspace, in the SAME long-lived worker process (the exact scenario
+/// `catalog::read_current_generation`'s P3-1 "generation = current + 1" fix
+/// says it supports, and the scenario `core:reindex` against an already-
+/// `ready` v4 workspace has ALWAYS sent -- see `packages/daemon/src/
+/// runtime.ts`'s pre-Frente-E scope decision, unconditional `full` whenever
+/// `requestedUris === undefined`), used to silently DROP every unchanged
+/// owner's records from the republished generation: `analyze::run_scoped`
+/// built `ColdAnalysis.owners` from `syntax.analyze`'s own `affected_files`,
+/// which that shared syntax-worker's internal membership fast path can
+/// narrow to just the genuinely new/changed paths even when the caller
+/// passed `AuthoritativeChangeSet::Full` -- correct for `run_incremental`
+/// (an untouched owner's existing rows stay open, no diff needed) but wrong
+/// for `run_cold`, whose `materialize_cold_partitioned`/`write_base_
+/// partitioned` publish a COMPLETE replacement base snapshot from exactly
+/// that owner list. Fixed in `analyze::run_scoped` (`if is_full_change_set
+/// { affected_paths = ... }`): a `Full` caller now always gets every
+/// present path back. This test reproduced the bug live before that fix
+/// (a lone new file's own 3 records republished, the other 280 silently
+/// gone) and guards against a regression -- `reconcile`'s own Cold branch
+/// (`run_full_from`, invoked both for "large delta" and the R2 fallback)
+/// depends on this exact fix to hold its own oracle-parity invariant.
+#[test]
+fn full_scan_twice_in_the_same_process_matches_a_from_scratch_oracle() {
+    let scratch_root = scratch_dir("full-twice");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-full-twice",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    std::fs::write(
+        workspace_root.join("src/domain/urdira-harness-full-twice-created.ts"),
+        "export function urdiraHarnessFullTwiceCreated() {\n  return 1;\n}\n",
+    )
+    .expect("write created file");
+
+    let second_full = run_scan(
+        "request:second-full",
+        "workspace:v4-e2e-full-twice",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&second_full), 2);
+
+    let oracle_root = scratch_dir("full-twice-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-full-twice-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let second_roots = roots_of(&second_full);
+    let oracle_roots = roots_of(&oracle);
+    dump_records_set_diff(
+        &structural_root,
+        generation_of(&second_full),
+        &oracle_structural,
+        generation_of(&oracle),
+    );
+    assert_eq!(second_roots.records, oracle_roots.records, "records");
+    assert_eq!(
+        second_roots.dependency, oracle_roots.dependency,
+        "dependency"
+    );
+    assert_eq!(second_roots.graph, oracle_roots.graph, "graph");
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Companion to `full_scan_twice_in_the_same_process_matches_a_from_scratch_
+/// oracle`, with a content EDIT instead of a CREATE: confirms decision 11's
+/// chaining (`reconcile_modify_produces_a_self_consistent_incremental_
+/// merkle_update`'s own doc comment) is specific to the `Delta`/`Changed`
+/// pipeline's `diff_owner` -- the `Cold` pipeline has no notion of a prior
+/// generation to chain against at all, so a content edit through it matches
+/// an independent from-scratch oracle exactly, same as a create/delete
+/// does. This is the finding that justified using CREATE (not edit) as
+/// `reconcile_batches_match_cold_at_1_5_10_25_50_percent`'s mutation --
+/// verified live here, not merely asserted in that test's doc comment.
+#[test]
+fn full_scan_twice_with_a_content_edit_matches_a_from_scratch_oracle() {
+    let scratch_root = scratch_dir("debug-full-twice-edit");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:debug-full-twice-edit",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let modified_relative = "src/domain/task.ts";
+    let modified_absolute = workspace_root.join(modified_relative);
+    let mut text = std::fs::read_to_string(&modified_absolute).expect("read modified file");
+    text.push_str("\n// urdira-debug-full-twice-edit marker\n");
+    std::fs::write(&modified_absolute, text).expect("write modified file");
+
+    let second_full = run_scan(
+        "request:second-full",
+        "workspace:debug-full-twice-edit",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&second_full), 2);
+
+    let oracle_root = scratch_dir("debug-full-twice-edit-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:debug-full-twice-edit-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let second_roots = roots_of(&second_full);
+    let oracle_roots = roots_of(&oracle);
+    dump_records_set_diff(
+        &structural_root,
+        generation_of(&second_full),
+        &oracle_structural,
+        generation_of(&oracle),
+    );
+    assert_eq!(second_roots.records, oracle_roots.records, "records");
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
 }

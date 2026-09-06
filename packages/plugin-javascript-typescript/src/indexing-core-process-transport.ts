@@ -43,8 +43,21 @@ export interface ChangedPath {
   readonly path: string;
   readonly kind: ChangedPathKind;
 }
-export type ScanScope = { readonly kind: "full" } | { readonly kind: "changed"; readonly paths: readonly ChangedPath[] };
+export type ScanScope = { readonly kind: "full" } | { readonly kind: "changed"; readonly paths: readonly ChangedPath[] } | { readonly kind: "reconcile" };
 export type ScanPriority = "interactive" | "background";
+/** Frente E (plan `generic-waddling-hartmanis.md` §2.1): mirrors Rust's
+ * `ReconcileMode`/`ReconcileSummary` -- see `rust-indexing-core-port.ts`'s
+ * own copy of these two types for the field-by-field explanation. */
+export type ReconcileMode = "noop" | "delta" | "cold";
+export interface ReconcileSummary {
+  readonly mode: ReconcileMode;
+  readonly added: number;
+  readonly changed: number;
+  readonly deleted: number;
+  readonly frontier_size: number;
+  readonly threshold: number;
+  readonly fell_back_to_cold: boolean;
+}
 export interface ScanTimings {
   readonly catalog_ms?: number;
   readonly parse_ms?: number;
@@ -89,9 +102,9 @@ export type IndexingEvent =
   | { readonly kind: "source_index_rolled_back"; readonly request_id: string; readonly operation_id: string }
   | { readonly kind: "error"; readonly request_id: string; readonly code: string; readonly message: string }
   /** v4: segments are on page cache, `MANIFEST.next` written; not durable yet. */
-  | { readonly kind: "queryable"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly manifest_path: string; readonly timings: ScanTimings }
+  | { readonly kind: "queryable"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly manifest_path: string; readonly timings: ScanTimings; readonly reconcile?: ReconcileSummary }
   /** v4 terminal event for `workspace_scan`, kept distinct from `completed` (v3-shaped, closed). */
-  | { readonly kind: "scan_completed"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly snapshot_id: string; readonly roots: ScanRoots; readonly timings: ScanTimings }
+  | { readonly kind: "scan_completed"; readonly request_id: string; readonly operation_id: string; readonly generation: number; readonly snapshot_id: string; readonly roots: ScanRoots; readonly timings: ScanTimings; readonly reconcile?: ReconcileSummary }
   /** P1-D-c (decision 28): the background residual TypeScript-checker pass
    * finished for the workspace the `request_id`/`operation_id` scan
    * originally triggered, fired asynchronously well after that scan's own

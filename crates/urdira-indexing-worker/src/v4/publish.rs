@@ -252,6 +252,7 @@ pub fn publish_cold(
         generation: generation_u64,
         manifest_path: manifest_path.to_string_lossy().into_owned(),
         timings: queryable_timings,
+        reconcile: None,
     })
     .map_err(ScanError)?;
 
@@ -285,6 +286,7 @@ pub fn publish_cold(
         snapshot_id,
         roots,
         timings: clock.completed_timings(),
+        reconcile: None,
     })
 }
 
@@ -407,6 +409,7 @@ pub fn publish_cold_partitioned(
         generation: generation_u64,
         manifest_path: manifest_path.to_string_lossy().into_owned(),
         timings: queryable_timings,
+        reconcile: None,
     })
     .map_err(ScanError)?;
 
@@ -438,6 +441,7 @@ pub fn publish_cold_partitioned(
         snapshot_id,
         roots,
         timings: clock.completed_timings(),
+        reconcile: None,
     })
 }
 
@@ -748,6 +752,7 @@ pub fn publish_delta_with_kind(
         snapshot_id,
         roots,
         timings: clock.completed_timings(),
+        reconcile: None,
     })
 }
 

@@ -438,3 +438,90 @@ writes unresolved call/heritage sites to the `pending.sites` side table instead 
 records; the P1-D-h "classification mismatch repair" became a drop-to-pending-site rule
 (`target_not_interned`). Stage-4 numbers in this document predate that change; the current n8n
 composition and timings are in the evidence page above (§3, §5, §9, §10).
+
+## Amendment 2026-09-06 (Frente E, plan `generic-waddling-hartmanis.md` §2): `ScanScope::Reconcile`
+
+A third `ScanScope` variant, alongside `Full` and `Changed`. Where `Changed`
+trusts the caller's own path list, `Reconcile` carries no data at all and
+never does: `crates/urdira-indexing-worker/src/v4/scan.rs::run_reconcile`
+ALWAYS performs a fresh authoritative walk (`catalog::enumerate` +
+`catalog::diff`, the same primitives `Full` itself now composes from) before
+deciding anything — never the watcher's own hint about what changed. This is
+the event-driven counterpart to a git branch switch, a lost/coalesced
+watcher batch, or a periodic reconciliation-sweep tick: every one of those
+signals the daemon as "requestedUris === undefined" (`watchers.ts`'s own
+diagnostic: `branch_changed`/`events_lost`/`provider_reset` all set
+`changedUris = undefined`), which used to mean "send `Full`" unconditionally
+and now means "send `Reconcile`" unless the caller explicitly forces `Full`
+(`packages/daemon/src/runtime.ts`'s `forceFullScans`, populated by
+`core:reindex` and the outdated-workspace-format recovery sweep).
+
+**Invariants** (held by `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`'s
+`reconcile_*` test family, same paridad-Merkle-bloqueante bar the
+`incremental_*` family already holds `Changed` to):
+
+- The authoritative delta's measured size (`added + changed + deleted` vs.
+  the frontier's total present count) decides ONLY which pipeline
+  republishes it — the cheaper `Changed`-shaped one (`delta::run`) below a
+  threshold `T` (`RECONCILE_DELTA_THRESHOLD = 0.25`, override
+  `URDIRA_V4_RECONCILE_THRESHOLD`), the `Full`-shaped one
+  (`run_full_from`, sharing the SAME enumeration already walked — no second
+  walk) at or above it. Both branches, and a from-scratch cold scan of the
+  identically mutated tree, produce byte-identical `records`/`dependency`/
+  `graph` Merkle roots for any create/delete/rename mutation. A content
+  EDIT's `Delta` branch is the one documented exception, inherited
+  unchanged from `Changed`/decision 11: a "replacement" identity legitimately
+  chains its `record_id`, which by design never matches an independent
+  from-scratch oracle — this was already true of `Changed` and is NOT a
+  reconcile-specific gap (verified directly: the SAME edit through the
+  `Cold` pipeline instead matches oracle exactly, since cold materialize has
+  no notion of a prior generation to chain against at all).
+- An empty delta (`n == 0`) is a no-op: no new generation, `ScanCompleted`
+  reports the CURRENT generation's own roots (read back from `merkle_roots`),
+  `reconcile.mode == "noop"`.
+- If the `Delta` attempt fails, the SAME request falls back to `Cold`
+  in-line — never a partial generation. The fallback re-walks (the SQLite
+  frontier may have advanced past what this call's own earlier walk saw, if
+  `delta::run`'s own `Catalog::apply` committed before failing deeper in its
+  pipeline) rather than reusing a possibly-stale enumeration.
+  `reconcile.fell_back_to_cold` distinguishes this from a size-driven `Cold`
+  decision. Test hook: `URDIRA_V4_RECONCILE_FAIL_DELTA` (read once at
+  `scan::run_with_residual`'s single production call site and passed to
+  `run_reconcile` as a plain parameter — this crate is `#![forbid(unsafe_
+  code)]`, and `std::env::set_var` is `unsafe`, so a test cannot toggle it
+  itself; same reasoning applies to the `threshold` parameter).
+- `ScanCompleted`/`Queryable` gain an optional `reconcile: ReconcileSummary`
+  field (`mode`, `added`/`changed`/`deleted`/`frontier_size`, the effective
+  `threshold`, `fell_back_to_cold`) — absent for `Full`/`Changed`,
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` so an older
+  binary on either side of the wire still round-trips. Surfaced at
+  `core:index_status.last_scan.reconcile` and rendered by the MCP
+  `urdira_index_status` text renderer as `reconcile/<mode> (+added ~changed
+  -deleted of frontier_size)`.
+
+**Bug found and fixed as a direct consequence of writing this front's own
+`Cold`-branch parity tests** (not a reconcile-specific defect: it affects
+`ScanScope::Full` on its own, whenever the SAME long-lived worker process
+runs a second `Full` scan of an already-published workspace — exactly what
+`core:reindex` against a `ready` v4 workspace has always sent, and what
+`reconcile`'s own `Cold` branch — both the "large delta" and R2-fallback
+cases — now also sends): `analyze::run_scoped`'s `AuthoritativeChangeSet::
+Full` case built `ColdAnalysis.owners` from `syntax.analyze`'s own
+`affected_files`, which that shared syntax-worker's internal incremental/
+membership fast path can narrow to just the genuinely new/changed paths on
+a WARM `syntax` project, regardless of the caller having asked for `Full` —
+harmless for `run_incremental` (an untouched owner's existing rows are left
+alone, correct for a diff publish) but silently wrong for `run_cold`,
+whose `materialize_cold_partitioned`/`write_base_partitioned` publish a
+COMPLETE replacement base snapshot from exactly that owner list: every
+owner narrowed away was dropped from the new generation outright, not left
+untouched. Reproduced live before the fix (a lone new file's own 3 records
+republished a generation whose `records` root reflected only those,
+silently discarding the other ~280 pre-existing records) and fixed by
+forcing full path coverage whenever `change_set` was `Full`, independent of
+what `analyze()`'s own fast path decided — regression-tested by
+`tests_e2e.rs::full_scan_twice_in_the_same_process_matches_a_from_scratch_
+oracle` (and its content-edit sibling, confirming the `Cold` pipeline never
+chains). This closes part of Open item 8 above ("existing-workspace
+migration is unaddressed") for the specific "repeated `Full` on a live
+worker" sub-case; the broader migration story is unchanged.

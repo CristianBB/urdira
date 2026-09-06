@@ -103,6 +103,7 @@ fn queryable_fixture_decodes() {
                 total_ms: 5_320,
                 ..Default::default()
             },
+            reconcile: None,
         }
     );
 }
@@ -140,6 +141,7 @@ fn scan_completed_fixture_decodes() {
                 total_ms: 5_800,
                 ..Default::default()
             },
+            reconcile: None,
         }
     );
 }

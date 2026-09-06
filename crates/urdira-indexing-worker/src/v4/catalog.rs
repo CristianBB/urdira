@@ -86,6 +86,61 @@ pub fn read_current_generation(conn: &Connection, workspace_id: &str) -> Result<
     })
 }
 
+/// Frente E adversarial-review fix: the HIGHEST generation number any
+/// `Catalog::apply` call has ever committed for `workspace_id`, whether or
+/// not that generation ever went on to publish -- `MAX` of
+/// `source_index_state.current_generation` (updated INSIDE `Catalog::
+/// apply`'s own transaction, `upsert_source_index_state`) and
+/// `workspace_current_state.current_generation` ([`read_current_generation`],
+/// above, updated only later, by `publish::publish_delta`/`publish_cold`).
+/// Those two normally agree (`publish` always follows `apply` within the
+/// same successful request), so every EXISTING caller of
+/// `read_current_generation` keeps using it unchanged -- this is for exactly
+/// one new caller: `scan::run_reconcile`'s cold-fallback branch, reached
+/// only after `delta::run` has already returned an `Err`. If that failure
+/// happened AFTER `delta::run`'s own `run_one` committed `Catalog::apply`
+/// for `current_generation + 1` but BEFORE `publish_delta` ran (a real
+/// window: everything between those two calls -- materialize, diff_owner,
+/// the hybrid lane, the structural segment write -- is fallible), then
+/// `source_index_state.current_generation` already reads `current_generation
+/// + 1` while `workspace_current_state.current_generation` still reads the
+/// OLD value. Naively computing the fallback's next generation as
+/// `read_current_generation(..) + 1` in that window reuses the SAME
+/// generation number `delta::run`'s own (aborted) attempt already committed
+/// rows for -- `apply_full`'s own `Catalog::apply` would then try to
+/// `INSERT` a `source_observation_batches` row whose `observation_batch_id`
+/// (deterministic from `(workspace_id, generation)`, see
+/// `urdira_source_frontier::ids::observation_batch_id`) already exists,
+/// failing the SQLite transaction on a primary-key collision -- turning "R2:
+/// never leave a partial generation" into "R2: the recovery attempt itself
+/// fails, leaving generation `current_generation + 1` UNPUBLISHED forever
+/// (unreachable by any future request, since every future attempt recomputes
+/// the SAME colliding number)". Using the higher of the two counters here
+/// means the fallback always picks a genuinely free generation number,
+/// regardless of how far the aborted attempt got. See
+/// `reconcile_falls_back_to_cold_when_delta_fails_after_catalog_apply`
+/// (`tests_e2e.rs`) for the regression this closes.
+pub fn read_highest_applied_generation(
+    conn: &Connection,
+    workspace_id: &str,
+) -> Result<i64, ScanError> {
+    let published = read_current_generation(conn, workspace_id)?;
+    let applied = conn
+        .query_row(
+            "SELECT current_generation FROM source_index_state WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0))
+        .map_err(|error| {
+            ScanError(format!(
+                "v4 catalog: reading source_index_state.current_generation failed: {error}"
+            ))
+        })?;
+    Ok(published.max(applied))
+}
+
 /// Restores `synchronous=NORMAL` after the cold catalog transaction
 /// (`run_full_scan`, above) has committed -- see `open_and_ensure_schema`'s
 /// doc comment for why `synchronous=OFF` was safe for that transaction
@@ -125,50 +180,31 @@ pub struct CatalogScanOutcome {
     pub cas_write_queue: Option<CasWriteQueue>,
 }
 
-/// Runs a full (cold) catalog scan: walk `workspace_root`, queue every
-/// observed file's bytes for a background CAS write under `cas_root`
-/// (joined later by the caller, see [`CatalogScanOutcome::cas_write_queue`]),
-/// diff against the (empty, for a brand new workspace) frontier, and apply
-/// the resulting delta in one SQLite transaction. Returns the updated
-/// in-memory `Frontier` -- callers read `frontier.present` for the final
-/// `(uri -> artifact_id/version_id/content_hash/byte_length)` map used to
-/// build syntax-worker inputs (`analyze.rs`).
-pub fn run_full_scan(
-    conn: &mut Connection,
-    workspace_id: &str,
-    workspace_root: &Path,
-    cas_root: &Path,
-    generation: i64,
-) -> Result<CatalogScanOutcome, ScanError> {
+/// Authoritative walk + CAS-put phase of a full/cold catalog scan, split
+/// out of `run_full_scan` (Frente E, plan §2.2) so a reconcile scan
+/// (`scan::run_reconcile`) can perform ONE authoritative walk, measure the
+/// resulting delta against the frontier, and -- only if that delta turns
+/// out to be large enough to warrant it -- finish the SAME enumeration
+/// through [`run_full_scan_with_enumeration`], without ever walking the
+/// tree twice for one `WorkspaceScan` request.
+pub struct Enumeration {
+    pub observations: Vec<Observation>,
+    /// Not yet joined -- see [`CatalogScanOutcome::cas_write_queue`]'s own
+    /// doc comment for why this stays open across `diff`/measurement and
+    /// is only drained once the caller knows what it is going to do with
+    /// this enumeration.
+    pub cas_write_queue: CasWriteQueue,
+    pub walk_elapsed: Duration,
+}
+
+/// Walks `workspace_root`, queuing every observed file's bytes for a
+/// background CAS write under `cas_root` (joined later by the caller). See
+/// the removed `run_full_scan`'s original comment (preserved on
+/// [`run_full_scan_with_enumeration`], below) for why the CAS worker pool is
+/// sized at full available parallelism with an 8,192-item capacity.
+pub fn enumerate(workspace_root: &Path, cas_root: &Path) -> Result<Enumeration, ScanError> {
     let cas_store = CasStore::open(cas_root)
         .map_err(|error| ScanError(format!("failed to open CAS root {cas_root:?}: {error}")))?;
-    // P2-2h item 2 / P2-2j item 5 fix: a dedicated pool (NOT rayon's shared
-    // global pool -- see `CasWriteQueue::spawn`'s doc comment). Originally
-    // sized at HALF the available parallelism with a 512-item capacity;
-    // measured live on n8n's 20,149-file corpus
-    // (`v4::tests_e2e::n8n_catalog_walk_diagnosis`) that this UNDERSIZED
-    // the queue badly enough to make the walk itself pay for it: a bare
-    // `Walker::enumerate` with no CAS at all takes 0.6-1.0s (matching the
-    // P2-2a bench this task's brief cites), but with the ORIGINAL 5-worker/
-    // 512-capacity queue the SAME walk took 2.5-3.6s -- almost the entire
-    // gap the task brief asked to explain was `submit`'s own backpressure
-    // wait (`CasWriteQueue::submit`'s doc comment: "Blocks only while the
-    // queue is at capacity"), not the walk/hash work itself. `put_if_
-    // absent` does no `fsync` (open+write+rename only, confirmed by reading
-    // it directly), so more CAS worker threads than physical cores is safe
-    // (each spends most of its time blocked on a write/rename syscall, not
-    // competing for CPU with the walker's own lstat/read/sha256 work) --
-    // using the FULL available parallelism (not half) plus a much larger
-    // capacity lets the walk return almost as fast as the no-CAS case
-    // (measured: 0.9-1.0s), moving the actual disk-write work into
-    // `CasWriteQueue::join` -- which `scan.rs`'s orchestrator already runs
-    // fully overlapped with `analyze`/`materialize`/`publish` (several
-    // seconds of CPU-bound work), not on the walk's own critical path.
-    // Capacity 8,192 is still bounded (item 4's RSS gate): at n8n's typical
-    // per-file size this is tens of MiB of buffered bytes at most, nowhere
-    // near the 3 GiB budget, while comfortably covering corpora larger than
-    // n8n's own 20k files without falling back into the old backpressure
-    // regime.
     let cas_worker_count = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(4);
@@ -183,10 +219,44 @@ pub fn run_full_scan(
     let observations: Vec<Observation> =
         Walker::enumerate(workspace_root, &rules, &gitignore, Some(cas_sink))?;
     let walk_elapsed = walk_started.elapsed();
+    Ok(Enumeration {
+        observations,
+        cas_write_queue,
+        walk_elapsed,
+    })
+}
 
-    let apply_started = Instant::now();
-    let mut frontier = Frontier::load(conn, workspace_id)?;
-    let delta = Delta::compute(&frontier, &observations);
+/// Diffs an authoritative `observations` enumeration (from [`enumerate`])
+/// against `workspace_id`'s current SQLite-backed frontier. Read-only --
+/// unlike [`apply_full`], this never mutates the catalog, so a caller (like
+/// `scan::run_reconcile`) can call it purely to MEASURE a delta's size
+/// before deciding what to do with it.
+pub fn diff(
+    conn: &Connection,
+    workspace_id: &str,
+    observations: &[Observation],
+) -> Result<(Frontier, Delta), ScanError> {
+    let frontier = Frontier::load(conn, workspace_id)?;
+    let delta = Delta::compute(&frontier, observations);
+    Ok((frontier, delta))
+}
+
+/// Applies an already-computed `(frontier, delta)` pair to SQLite in one
+/// transaction, as a complete/authoritative batch (`BatchMeta{full_scan:
+/// true}`, matching plan §4.1's "cold: todo es `added`" -- also correct for
+/// the reconcile cold path, whose `delta` is itself computed from a full
+/// authoritative enumeration). Mutates `frontier` in place exactly like
+/// `Catalog::apply` always has; the returned [`CatalogScanOutcome`]'s
+/// `walk_elapsed`/`cas_write_queue` are left at their defaults -- callers
+/// that have those (i.e. every current caller, via
+/// [`run_full_scan_with_enumeration`]) patch them in afterwards.
+pub fn apply_full(
+    conn: &mut Connection,
+    workspace_id: &str,
+    mut frontier: Frontier,
+    delta: &Delta,
+    generation: i64,
+) -> Result<CatalogScanOutcome, ScanError> {
     let now = super::now_iso8601();
     let batch_meta = BatchMeta {
         source_provider_binding_id: format!("urdira:v4-directory-walker:{workspace_id}"),
@@ -200,24 +270,10 @@ pub fn run_full_scan(
         conn,
         workspace_id,
         &mut frontier,
-        &delta,
+        delta,
         generation,
         &batch_meta,
     )?;
-    let apply_elapsed = apply_started.elapsed();
-
-    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
-        eprintln!(
-            "[urdira-indexing-worker] v4 catalog: walk={:.3}s apply={:.3}s observations={} added={} changed={} deleted={}",
-            walk_elapsed.as_secs_f64(),
-            apply_elapsed.as_secs_f64(),
-            observations.len(),
-            applied.added,
-            applied.changed,
-            applied.deleted,
-        );
-    }
-
     Ok(CatalogScanOutcome {
         frontier,
         added: applied.added,
@@ -225,10 +281,113 @@ pub fn run_full_scan(
         deleted: applied.deleted,
         observation_batch_id: applied.observation_batch_id,
         source_state_digest: applied.source_state_digest,
-        walk_elapsed,
-        apply_elapsed,
-        cas_write_queue: Some(cas_write_queue),
+        walk_elapsed: Duration::default(),
+        apply_elapsed: Duration::default(),
+        cas_write_queue: None,
     })
+}
+
+/// Runs a full (cold) catalog scan: walk `workspace_root` (see
+/// [`enumerate`]), diff against the (empty, for a brand new workspace)
+/// frontier (see [`diff`]), and apply the resulting delta in one SQLite
+/// transaction (see [`apply_full`]). Returns the updated in-memory
+/// `Frontier` -- callers read `frontier.present` for the final `(uri ->
+/// artifact_id/version_id/content_hash/byte_length)` map used to build
+/// syntax-worker inputs (`analyze.rs`).
+///
+/// Frente E (plan §2.2): `scan::run_full` no longer calls this directly --
+/// it now calls [`enumerate`] + [`diff`] itself (the same two calls
+/// `scan::run_reconcile` needs before it can decide whether to finish
+/// through the `Changed` or `Full` pipeline) and hands the result to
+/// [`run_full_scan_with_enumeration`], so one authoritative walk is shared
+/// by both entry points. This composed function is kept, unchanged, as
+/// `tests_e2e.rs`'s pre-existing single-call oracle/comparison path (same
+/// reasoning as `publish::publish_cold`'s own `#[cfg_attr(not(test), ...)]`
+/// -- hence the identical attribute here).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn run_full_scan(
+    conn: &mut Connection,
+    workspace_id: &str,
+    workspace_root: &Path,
+    cas_root: &Path,
+    generation: i64,
+) -> Result<CatalogScanOutcome, ScanError> {
+    let enumeration = enumerate(workspace_root, cas_root)?;
+    let (frontier, delta) = diff(conn, workspace_id, &enumeration.observations)?;
+    run_full_scan_with_enumeration(
+        conn,
+        workspace_id,
+        enumeration,
+        frontier,
+        &delta,
+        generation,
+    )
+}
+
+/// Frente E (plan §2.2): finishes an authoritative `(enumeration, frontier,
+/// delta)` triple -- already walked and diffed by the caller (`run_full_
+/// scan`, above, or a reconcile scan's cold branch, `scan::run_reconcile`)
+/// -- through [`apply_full`], then patches the CAS write queue and walk
+/// timing the caller's own [`enumerate`] call produced back onto the
+/// result, so this reads identically to `run_full_scan`'s own outcome
+/// regardless of which caller built the enumeration.
+///
+/// P2-2h item 2 / P2-2j item 5 fix (CAS worker sizing, unchanged by this
+/// split): a dedicated pool (NOT rayon's shared global pool -- see
+/// `CasWriteQueue::spawn`'s doc comment). Originally sized at HALF the
+/// available parallelism with a 512-item capacity; measured live on n8n's
+/// 20,149-file corpus (`v4::tests_e2e::n8n_catalog_walk_diagnosis`) that
+/// this UNDERSIZED the queue badly enough to make the walk itself pay for
+/// it: a bare `Walker::enumerate` with no CAS at all takes 0.6-1.0s
+/// (matching the P2-2a bench this task's brief cites), but with the
+/// ORIGINAL 5-worker/512-capacity queue the SAME walk took 2.5-3.6s --
+/// almost the entire gap the task brief asked to explain was `submit`'s own
+/// backpressure wait (`CasWriteQueue::submit`'s doc comment: "Blocks only
+/// while the queue is at capacity"), not the walk/hash work itself.
+/// `put_if_absent` does no `fsync` (open+write+rename only, confirmed by
+/// reading it directly), so more CAS worker threads than physical cores is
+/// safe (each spends most of its time blocked on a write/rename syscall,
+/// not competing for CPU with the walker's own lstat/read/sha256 work) --
+/// using the FULL available parallelism (not half) plus a much larger
+/// capacity lets the walk return almost as fast as the no-CAS case
+/// (measured: 0.9-1.0s), moving the actual disk-write work into
+/// `CasWriteQueue::join` -- which `scan.rs`'s orchestrator already runs
+/// fully overlapped with `analyze`/`materialize`/`publish` (several seconds
+/// of CPU-bound work), not on the walk's own critical path. Capacity 8,192
+/// is still bounded (item 4's RSS gate): at n8n's typical per-file size
+/// this is tens of MiB of buffered bytes at most, nowhere near the 3 GiB
+/// budget, while comfortably covering corpora larger than n8n's own 20k
+/// files without falling back into the old backpressure regime.
+pub fn run_full_scan_with_enumeration(
+    conn: &mut Connection,
+    workspace_id: &str,
+    enumeration: Enumeration,
+    frontier: Frontier,
+    delta: &Delta,
+    generation: i64,
+) -> Result<CatalogScanOutcome, ScanError> {
+    let apply_started = Instant::now();
+    let mut outcome = apply_full(conn, workspace_id, frontier, delta, generation)?;
+    let apply_elapsed = apply_started.elapsed();
+    let walk_elapsed = enumeration.walk_elapsed;
+    let observation_count = enumeration.observations.len();
+    outcome.walk_elapsed = walk_elapsed;
+    outcome.apply_elapsed = apply_elapsed;
+    outcome.cas_write_queue = Some(enumeration.cas_write_queue);
+
+    if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
+        eprintln!(
+            "[urdira-indexing-worker] v4 catalog: walk={:.3}s apply={:.3}s observations={} added={} changed={} deleted={}",
+            walk_elapsed.as_secs_f64(),
+            apply_elapsed.as_secs_f64(),
+            observation_count,
+            outcome.added,
+            outcome.changed,
+            outcome.deleted,
+        );
+    }
+
+    Ok(outcome)
 }
 
 #[cfg(test)]

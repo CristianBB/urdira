@@ -231,15 +231,66 @@ pub struct ChangedPath {
 
 /// `Full` re-derives the entire catalog/structural set from a from-scratch
 /// walk (plan §4.1's "cold: todo es `added`"). `Changed` names an exact set
-/// of edited/created/deleted paths for an incremental scan (plan §6);
-/// `crates/urdira-indexing-worker/src/v4` may reject `Changed` with an
-/// `unsupported_scope` error until the P3 delta path lands (see that
-/// module's `scan.rs`), while still parsing/round-tripping it here.
+/// of edited/created/deleted paths for an incremental scan (plan §6).
+/// `Reconcile` (Frente E, plan `generic-waddling-hartmanis.md` §2.1) carries
+/// no data at all: unlike `Changed`, it never trusts a caller-supplied path
+/// list -- `crates/urdira-indexing-worker/src/v4/scan.rs::run_reconcile`
+/// ALWAYS re-derives the delta from a fresh authoritative walk, the same
+/// one `Full` performs, then republishes it through whichever pipeline
+/// (`Changed`'s or `Full`'s own) is cheaper for the delta's measured size --
+/// see that function's own doc comment for the exact decision rule and the
+/// `reconcile` field below for what it reports back.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ScanScope {
     Full,
     Changed { paths: Vec<ChangedPath> },
+    Reconcile,
+}
+
+/// Which of `Reconcile`'s two republish pipelines actually ran (or neither,
+/// for `Noop`) -- see `ReconcileSummary`'s own doc comment.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileMode {
+    /// The authoritative delta was empty: no new generation was published,
+    /// `ScanCompleted` reports the CURRENT generation's own roots.
+    Noop,
+    /// The delta was small enough (`added+changed+deleted <= threshold *
+    /// frontier_size`) to republish through the `Changed` pipeline.
+    Delta,
+    /// The delta was large enough to republish through the `Full` pipeline
+    /// instead -- either because it crossed `threshold` directly, or
+    /// because the `Delta` attempt failed and this is the same request's
+    /// fallback (`fell_back_to_cold: true` in that case).
+    Cold,
+}
+
+/// Reported on `IndexingEvent::ScanCompleted`/`IndexingEvent::Queryable`
+/// only for a `ScanScope::Reconcile` request (`crates/urdira-indexing-
+/// worker/src/v4/scan.rs::run_reconcile`) -- absent (`None`) for `Full`/
+/// `Changed`. `added`/`changed`/`deleted`/`frontier_size` are the
+/// AUTHORITATIVE delta this reconcile measured (before deciding which
+/// pipeline to run), never the watcher's own hint; `threshold` is the
+/// effective `T` this call used (the `URDIRA_V4_RECONCILE_THRESHOLD`
+/// override, or the built-in default) so a caller/evidence log never has
+/// to re-derive it from environment state that may since have changed.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileSummary {
+    pub mode: ReconcileMode,
+    pub added: u64,
+    pub changed: u64,
+    pub deleted: u64,
+    pub frontier_size: u64,
+    /// Effective `T` (`RECONCILE_DELTA_THRESHOLD` or its env override) --
+    /// `f64`, so `ReconcileSummary` (and therefore `IndexingEvent`) derives
+    /// `PartialEq` only, not `Eq`.
+    pub threshold: f64,
+    /// `true` only for the R2 fallback path: the `Delta` pipeline was
+    /// attempted and failed, and this `Cold` result is the SAME request's
+    /// recovery, not a size-driven decision.
+    pub fell_back_to_cold: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -314,7 +365,12 @@ pub struct ScanRoots {
     pub metric: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+// `Eq` (not just `PartialEq`) dropped by Frente E: `Queryable`/`ScanCompleted`
+// now carry `reconcile: Option<ReconcileSummary>`, and `ReconcileSummary`
+// holds an `f64` (`threshold`), which has no `Eq` impl (NaN). Every existing
+// `assert_eq!`/round-trip test against `IndexingEvent` only ever needed
+// `PartialEq`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IndexingEvent {
     HandshakeAck {
@@ -395,6 +451,15 @@ pub enum IndexingEvent {
         generation: u64,
         manifest_path: String,
         timings: ScanTimings,
+        /// Frente E: populated only for a `ScanScope::Reconcile` request
+        /// whose caller chose to decorate this milestone too -- absent
+        /// (`None`) for `Full`/`Changed`, and, today, also absent on the
+        /// reconcile path's own live `Queryable` (only its terminal
+        /// `ScanCompleted` is decorated; see `scan.rs::run_reconcile`'s doc
+        /// comment). `#[serde(default, ...)]` so an older sender that
+        /// predates this field still deserializes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reconcile: Option<ReconcileSummary>,
     },
     /// v4 terminal event for `WorkspaceScan` (kept distinct from `Completed`
     /// rather than extending it: `Completed`'s fields are v3-candidate-
@@ -408,6 +473,12 @@ pub enum IndexingEvent {
         snapshot_id: String,
         roots: ScanRoots,
         timings: ScanTimings,
+        /// Frente E: `Some(...)` only for a `ScanScope::Reconcile` request
+        /// (`scan.rs::run_reconcile`) -- absent (`None`) for `Full`/
+        /// `Changed`. `#[serde(default, ...)]` so an older sender that
+        /// predates this field still deserializes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reconcile: Option<ReconcileSummary>,
     },
     /// P1-D-c: the background residual TypeScript-checker pass (decision 28)
     /// finished for one workspace and, if it upgraded at least one site,
@@ -1150,6 +1221,7 @@ mod tests {
                 total_ms: 5_320,
                 ..Default::default()
             },
+            reconcile: None,
         };
         let encoded = serde_json::to_vec(&queryable).unwrap();
         assert_eq!(
@@ -1179,6 +1251,7 @@ mod tests {
                 total_ms: 5_800,
                 ..Default::default()
             },
+            reconcile: None,
         };
         let encoded = serde_json::to_vec(&completed).unwrap();
         assert_eq!(
