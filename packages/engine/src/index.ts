@@ -337,6 +337,7 @@ export {
   exportIndexPack,
   exportV4IndexPack,
   importV4IndexPack,
+  IndexPackExportRaceError,
   INDEX_PACK_SCHEMA_VERSION,
   V4_INDEX_PACK_FORMAT,
   V4_INDEX_PACK_SCHEMA_VERSION,

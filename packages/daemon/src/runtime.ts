@@ -2196,14 +2196,45 @@ interface RunV4WorkspaceScanInput {
  * calls essentially never hit in practice.
  */
 async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: string, workspaceId: string): Promise<boolean> {
-  const stagingDatabasePath = `${paths.database_path}.import-staging-${randomUUID()}`;
-  const stagingStructuralRoot = structuralStoreDirFor(stagingDatabasePath);
-  const stagingSidecarRoot = sidecarScanDirFor(stagingDatabasePath);
+  // Adversarial-review fix (plan §7.1, R15/R17 cross-check): the staging
+  // suffix MUST be appended onto each REAL final path, not derived by
+  // running `structuralStoreDirFor`/`sidecarScanDirFor` on the already-
+  // suffixed staging DATABASE path. The latter (the original shape here)
+  // produced `<db>.import-staging-<uuid>.structural`/`...sidecar` -- which
+  // does NOT match `orphan-sweep.ts`'s `IMPORT_STAGING_SUFFIX_PATTERN`
+  // (anchored on the name ENDING in `.import-staging-<uuid>`) and instead
+  // falls through to the generic `WORKSPACE_FOOTPRINT_SUFFIXES` match on
+  // bare `.structural`/`.sidecar`, which strips only THAT suffix and
+  // yields a bogus, never-registered safe_id (`<db>.import-staging-<uuid>`)
+  // classified as an immediate orphan -- category `"footprint"`, NOT
+  // `"staging"`, so it gets NONE of the one-hour `in_progress` grace a
+  // staging root needs. A concurrent `workspace-orphans-purge --confirm`
+  // (or any future automatic sweep) could delete an import's staging
+  // structural/sidecar directory while this function is still copying
+  // into it or about to `rename` it -- a real corruption/crash window, not
+  // just a stray disk leak. Appending the same suffix directly onto
+  // `paths.structural_root`/`paths.sidecar_root` (mirroring exactly how
+  // `forkV4StructuralStore` builds `<safeId>.structural.fork-staging-
+  // <uuid>`, per `orphan-sweep.ts`'s own doc comment) keeps the recognized
+  // shape `<safeId>.structural.import-staging-<uuid>` /
+  // `<safeId>.sidecar.import-staging-<uuid>` -- see the matching
+  // `IMPORT_STAGING_SUFFIX_PATTERN` fix in `orphan-sweep.ts`.
+  const stagingSuffix = `.import-staging-${randomUUID()}`;
+  const stagingDatabasePath = `${paths.database_path}${stagingSuffix}`;
+  const stagingStructuralRoot = `${paths.structural_root}${stagingSuffix}`;
+  const stagingSidecarRoot = `${paths.sidecar_root}${stagingSuffix}`;
   const cleanupStaging = async (): Promise<void> => {
     await rm(stagingDatabasePath, { force: true }).catch(() => undefined);
     await rm(stagingStructuralRoot, { recursive: true, force: true }).catch(() => undefined);
     await rm(stagingSidecarRoot, { recursive: true, force: true }).catch(() => undefined);
   };
+  // Adversarial-review fault injection (plan §7.1 review, mirrors R2's
+  // `URDIRA_V4_RECONCILE_FAIL_DELTA` convention): lets
+  // `tests/phase-daemon-v4-index-pack.test.ts` deterministically exercise
+  // the "second/third rename in the atomic swap fails" window without
+  // relying on a real filesystem fault. Never read outside a test process
+  // (an operator's env would need to set this by name on purpose).
+  const failAfterRename = process.env["URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME"];
   try {
     const imported = await importV4IndexPack({
       packPath,
@@ -2218,7 +2249,9 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
       return false;
     }
     await rename(stagingStructuralRoot, paths.structural_root);
+    if (failAfterRename === "structural") throw new Error("URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME=structural (test-injected failure)");
     if (existsSync(stagingSidecarRoot)) await rename(stagingSidecarRoot, paths.sidecar_root);
+    if (failAfterRename === "sidecar") throw new Error("URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME=sidecar (test-injected failure)");
     // Stale `-wal`/`-shm`/`-journal` siblings of the bootstrap database this
     // import is about to replace belong to the OLD (about-to-be-discarded)
     // file -- clearing them first means the freshly-renamed-in catalog is
@@ -2227,6 +2260,25 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
     await rename(stagingDatabasePath, paths.database_path);
     return true;
   } catch (error) {
+    // NOTE (self-healing, verified live by
+    // `tests/phase-daemon-v4-index-pack.test.ts`'s fault-injection tests):
+    // if the structural (and/or sidecar) rename above already landed
+    // before this catch runs, `paths.structural_root`/`paths.sidecar_root`
+    // now hold the DONOR's files while `paths.database_path` is still the
+    // untouched, generation-0 bootstrap catalog -- `cleanupStaging` cannot
+    // undo an already-completed rename (its own staging source path is
+    // gone). This is NOT a stuck/corrupt state: the caller (`runV4WorkspaceScan`)
+    // falls back to a `full` scope because `importedFromIndexPack` stays
+    // `false`, and a full scan's publish pipeline unconditionally rewrites
+    // `MANIFEST` and every fixed-name file it lists (`records.tree`/
+    // `dependency.tree`/... -- `urdira-structural-store`'s `merkle::persist`
+    // overwrites those paths in place, never conditionally) for the
+    // catalog's own new generation, regardless of whatever donor content
+    // was left on disk. Readers only ever resolve through `MANIFEST`
+    // (`reader.rs`), so the donor leftovers are inert once superseded --
+    // at most an orphaned-segment-file disk cost (compaction, which would
+    // reclaim that, is not wired into any live scan path today), never a
+    // MANIFEST/generation mismatch a query could observe.
     console.error(`[urdira] v4 index pack import for ${workspaceId} threw, falling back to a full scan:`, error);
     await cleanupStaging();
     return false;

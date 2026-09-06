@@ -202,7 +202,7 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
 
   // Decidido en implementación (criterio (b), fidelidad por delante de
   // milisegundos): `URDIRA_DEBUG_TIMING=1` live evidence showed the FIRST
-  // reconcile after a cross-machine import always lands in `mode: "cold"`,
+  // reconcile after a cross-machine import today lands in `mode: "cold"`,
   // never `"noop"`/`"delta"`, EVEN for a byte-identical donor tree --
   // `crates/urdira-source-frontier/src/walker.rs`'s `metadata_digest` hashes
   // `byte_length, ctime_ms, device, inode, mode, mtime_ms` (its own doc
@@ -222,15 +222,18 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
   // below via find_references parity) -- it is a real, load-bearing
   // discovery that R17's "reconcile absorbs the donor/local difference"
   // optimization currently degrades to the same cost as `full` on every
-  // real cross-machine import, EVERY time, deterministically. Fixing the
-  // walker's equivalence rule to be content-hash-only (dropping the
-  // metadata_digest requirement, which duplicates no performance benefit
-  // today since the walker always computes both fields regardless) would
-  // very likely restore `noop`/`delta` here -- but `delta.rs`/`walker.rs`
-  // belong to Frente E's already-merged, disjoint file zone (plan §1's ola-1
-  // table), not P-1's; changing shared incremental-scan equivalence
-  // semantics is out of this frente's scope and risk budget. Recorded as a
-  // follow-up for Frente E ownership, not silently masked here.
+  // real cross-machine import, EVERY time, deterministically.
+  //
+  // Adversarial-review note: a SEPARATE, parallel frente is fixing the
+  // walker's equivalence rule (`Delta::compute` moving to a content-hash-
+  // only comparison) precisely to restore `noop`/`delta` here -- deliberately
+  // NOT this frente's file zone (`delta.rs`/`walker.rs` belong to Frente
+  // E's already-merged, disjoint zone, plan §1's ola-1 table). So this
+  // assertion is intentionally NOT pinned to `"cold"`: it accepts either
+  // `"noop"` (once that fix lands, since the tree really is byte-identical)
+  // or `"cold"` (today's behavior) -- the load-bearing guarantee this test
+  // protects is `last_scan.kind === "reconcile"` (never `"full"`) plus the
+  // find_references parity below, not which mode reconcile happens to pick.
   it("workspace-add --index-pack over a byte-identical tree ends ready via reconcile (not full), and matches the donor's find_references", async () => {
     const originalV4Flag = process.env["URDIRA_V4"];
     const donor = await startV4Daemon("nd");
@@ -259,7 +262,7 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
       // itself ends up choosing (see this test's own doc comment above for
       // why that is `cold` today).
       expect(status.last_scan?.kind).toBe("reconcile");
-      expect(status.last_scan?.reconcile?.mode).toBe("cold");
+      expect(["noop", "cold"]).toContain(status.last_scan?.reconcile?.mode);
       expect(status.last_scan?.reconcile?.fell_back_to_cold).toBe(false);
 
       const donorResolved = await queryStreams(donor.client, donorWorkspaceId, "core:resolve_symbol", { reference: "InvalidTaskTransitionError", resolution_scope: "exports" });
@@ -323,8 +326,12 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
       const status = await pollUntilReady(importer.client, importerWorkspaceId);
       expect(status.workspace_status).toBe("ready");
       // Same P-1 wiring guarantee as the identical-tree test: `reconcile`,
-      // never `full`, on this first-scan-with-a-pending-pack.
+      // never `full`, on this first-scan-with-a-pending-pack. Mode: `"delta"`
+      // once the parallel content-hash-only equivalence fix (see the
+      // identical-tree test's doc comment) lands, `"cold"` today -- same
+      // "not pinned to today's behavior" reasoning as that test.
       expect(status.last_scan?.kind).toBe("reconcile");
+      expect(["delta", "cold"]).toContain(status.last_scan?.reconcile?.mode);
 
       const markerResolved = await queryStreams(importer.client, importerWorkspaceId, "core:resolve_symbol", { reference: "ImportPackDeltaMarkerError", resolution_scope: "exports" });
       const markerDecl = (markerResolved["declarations"]?.items ?? []).map((item) => item.value as Record<string, unknown>);
@@ -377,6 +384,84 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
       expect(status.workspace_status).toBe("ready");
       expect(status.last_scan?.kind).toBe("full");
     } finally {
+      if (originalV4Flag === undefined) delete process.env["URDIRA_V4"]; else process.env["URDIRA_V4"] = originalV4Flag;
+      await donor.stop();
+      await importer.stop();
+      await rm(donorRoot, { recursive: true, force: true });
+      await rm(importerRoot, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  // Adversarial-review addition (plan §7.1 review, item 1): the atomic
+  // "swap staging into place" step is really THREE independent `rename`
+  // calls (structural, then sidecar, then the catalog database) --
+  // `importPendingV4IndexPack`'s own doc comment (`packages/daemon/src/
+  // runtime.ts`) argues that a failure between the FIRST and LAST of those
+  // renames is still safe: `paths.structural_root` ends up holding the
+  // donor's files while `paths.database_path` is untouched (still the
+  // pristine, generation-0 bootstrap catalog), and the `full` scan the
+  // caller falls back to (because `importedFromIndexPack` stays `false`)
+  // unconditionally rewrites `MANIFEST` and every fixed-name structural
+  // file (`records.tree`/`dependency.tree`/...) for its OWN new
+  // generation, superseding the stale donor content a reader could ever
+  // observe through `MANIFEST`. This test verifies that claim empirically
+  // rather than trusting the doc comment: forces the failure right after
+  // the structural rename lands (`URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME=
+  // structural`, a review-added fault-injection hook mirroring Frente E's
+  // own `URDIRA_V4_RECONCILE_FAIL_DELTA` convention) and confirms the
+  // workspace still reaches `ready` via an honest `full` scan whose
+  // structural query results reflect the IMPORTER's OWN tree, not a
+  // corrupted mix of donor and local state.
+  it("workspace-add --index-pack that fails between the structural and database renames still self-heals via a full scan", async () => {
+    const originalV4Flag = process.env["URDIRA_V4"];
+    const originalFailAfterRename = process.env["URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME"];
+    const donor = await startV4Daemon("rd");
+    const importer = await startV4Daemon("ri");
+    const donorRoot = await seedWorkspaceTree("rd");
+    const importerRoot = await seedWorkspaceTree("ri");
+    try {
+      process.env["URDIRA_V4"] = "1";
+      const donorAdded = await donor.client.call("core:workspace_add", { args: [donorRoot], confirmed: true });
+      expect(donorAdded.outcome).toBe("success");
+      const donorWorkspaceId = (donorAdded.payload as { readonly workspace_id: string }).workspace_id;
+      await pollUntilReady(donor.client, donorWorkspaceId);
+
+      const packPath = join(donor.dataRoot, "mid-rename-failure.urdira-index-pack-v4");
+      const exportResult = await donor.client.call("core:index_pack_export", { args: [donorWorkspaceId, packPath], confirmed: true });
+      expect(exportResult.outcome).toBe("success");
+
+      // A local-only symbol the donor's frozen snapshot never saw -- proves
+      // the eventual `ready` workspace is genuinely re-derived from the
+      // importer's own tree, not left serving stale/mixed donor structural
+      // state left behind by the partially-completed rename sequence.
+      const changedFile = join(importerRoot, "domain", "errors.ts");
+      await writeFile(changedFile, `${await readFile(changedFile, "utf8")}\nexport class MidRenameFailureSelfHealMarkerError extends Error {}\n`, "utf8");
+
+      process.env["URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME"] = "structural";
+      const importerAdded = await importer.client.call("core:workspace_add", { args: [importerRoot], values: { "index-pack": packPath }, confirmed: true });
+      expect(importerAdded.outcome).toBe("success");
+      const importerWorkspaceId = (importerAdded.payload as { readonly workspace_id: string }).workspace_id;
+      const status = await pollUntilReady(importer.client, importerWorkspaceId);
+      expect(status.workspace_status).toBe("ready");
+      // The injected failure happened AFTER `isFirstScan` was already
+      // decided but BEFORE the import could report success, so the caller
+      // falls back to the ordinary first-scan `full` scope -- never
+      // `reconcile` (that only follows a successful import).
+      expect(status.last_scan?.kind).toBe("full");
+
+      const markerResolved = await queryStreams(importer.client, importerWorkspaceId, "core:resolve_symbol", { reference: "MidRenameFailureSelfHealMarkerError", resolution_scope: "exports" });
+      const markerDecl = (markerResolved["declarations"]?.items ?? []).map((item) => item.value as Record<string, unknown>);
+      expect(markerDecl.length).toBeGreaterThan(0);
+      expect(recordName(markerDecl[0]!)).toBe("MidRenameFailureSelfHealMarkerError");
+
+      // A symbol from the DONOR's tree that the importer's own tree also
+      // has (both were copied from the same fixture) must still resolve
+      // correctly too -- confirms the republished generation is a complete,
+      // coherent re-derivation, not a partial/degraded one.
+      const baselineResolved = await queryStreams(importer.client, importerWorkspaceId, "core:resolve_symbol", { reference: "InvalidTaskTransitionError", resolution_scope: "exports" });
+      expect((baselineResolved["declarations"]?.items ?? []).length).toBeGreaterThan(0);
+    } finally {
+      if (originalFailAfterRename === undefined) delete process.env["URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME"]; else process.env["URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME"] = originalFailAfterRename;
       if (originalV4Flag === undefined) delete process.env["URDIRA_V4"]; else process.env["URDIRA_V4"] = originalV4Flag;
       await donor.stop();
       await importer.stop();
