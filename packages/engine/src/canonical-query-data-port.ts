@@ -1542,8 +1542,59 @@ function sourceArtifactRecord(workspaceId: string, row: { readonly artifact_id: 
   };
 }
 
-function item(record: CanonicalQueryRecord, classification: "confirmed" | "possible" = "confirmed"): QueryStreamItem {
-  return { value: recordValue(record, classification), stable_sort_key: `${classification}\0${record.identity_key ?? record.record_id}` };
+/**
+ * Plan 2026-09-06 (Frente N, §5.1): per-operation inline-snippet policy for
+ * structural/discovery bundles that, before this plan, never carried a
+ * source preview at all (only `core:get_source`/`core:search_text` did --
+ * this file's own diagnosis, and `packages/mcp/src/index.ts`'s
+ * `describeBundle`, both note this). "line" hydrates the exact source line
+ * the record's own span covers (`sourceSnippet`'s new `"line"` mode, below);
+ * "signature" hydrates the record's opening line (the pre-existing
+ * `"signature"` mode, called here with `context_lines: 0`). Both share
+ * `INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET` (R13: 200 chars/bundle) and one
+ * `INLINE_SNIPPET_TOTAL_BUDGET` per operation call (R13: 50 x 200 = 10k <
+ * 20k -- mirrors `DEFAULT_QUERY_OPTIONS.snippets.max_total_characters` in
+ * packages/mcp/src/index.ts, since none of these three operations has a
+ * `source`-style argument of its own to carry a caller override through
+ * `OperationInvocation.arguments` -- the same reason
+ * `tryBuildContextPushdown`, above, already hardcodes its own 20,000
+ * character budget instead of reading one from the caller).
+ *
+ * Table (decided in implementation for the entries the plan's own wording
+ * left ambiguous):
+ *  - `core:find_references` -> "line", applied to the `references` stream
+ *    only (the reference occurrence itself, exactly "la línea del span de
+ *    la referencia" per the plan). `owners` (the deduplicated declaring
+ *    entities) is left unsnippeted: cheaply re-fetchable via
+ *    `core:get_outline`/`core:get_source`, and outside the plan's own
+ *    wording.
+ *  - `core:get_outline` -> "signature", LEVEL-0 members only (direct
+ *    children of the requested container -- "solo la raíz" per the plan):
+ *    a deeper `depth` can return hundreds of nested members, well past the
+ *    tens-of-bundles cost accounting R13 assumes.
+ *  - `core:search_hybrid` / `core:search_semantic` -> "line" over
+ *    `semantic_evidence.matched_segment.start_char` once Frente S-B
+ *    populates it, else "signature" (`hydrateSemanticCandidates`, below).
+ *    S-B has not landed in this worktree, so this always takes the
+ *    "signature" fallback today.
+ *  - `core:locate_implementation` (a recipe, not a primitive operation --
+ *    see its entry in `packages/contracts/src/registries.ts`): decided in
+ *    implementation -- its `implementations` stream is exactly
+ *    `core:search_hybrid`'s own (kind-filtered) candidate objects
+ *    (`search:core:search_hybrid@1 -> implementations:filter`, a
+ *    pass-through filter with no re-fetch), so it inherits
+ *    `core:search_hybrid`'s policy automatically with no separate wiring;
+ *    its `sources` stream is `core:get_source` with its own pre-existing,
+ *    much larger `mode:"relevant"` snippet configuration and is unaffected
+ *    by this table. `packages/engine/src/recipe-executor.ts` is not in
+ *    Frente N's file list and is not touched.
+ */
+const INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET = 200;
+const INLINE_SNIPPET_TOTAL_BUDGET = 20_000;
+
+function item(record: CanonicalQueryRecord, classification: "confirmed" | "possible" = "confirmed", snippet?: SourceSnippetValue): QueryStreamItem {
+  const value = recordValue(record, classification);
+  return { value: snippet === undefined ? value : { ...value, optional_source_snippets: [snippet] }, stable_sort_key: `${classification}\0${record.identity_key ?? record.record_id}` };
 }
 
 function relationClassification(record: CanonicalQueryRecord): "confirmed" | "possible" {
@@ -1875,6 +1926,29 @@ function lineEnd(text: string, index: number): number {
   return newline === -1 ? text.length : newline + 1;
 }
 
+// Adversarial review 2026-09-06 (Frente N): `sourceSnippet`'s two truncation
+// points below (`maxCharactersPerSnippet`, `remainingBudget`) previously cut
+// with a plain `String.prototype.slice(0, limit)`. For any line whose
+// content puts a UTF-16 surrogate pair (an astral character -- most emoji,
+// some CJK extension characters) exactly on that boundary, a plain slice
+// keeps the high surrogate and drops its low surrogate, leaving a lone
+// (unpaired) surrogate in `snippet.text`. That string round-trips through
+// JSON fine (JSON allows unpaired surrogates as `\uXXXX` escapes) but is
+// invalid Unicode text once decoded by a consumer that enforces well-formed
+// UTF-16/UTF-8 (a strict `TextEncoder`/`JSON.parse` reviver, a terminal that
+// rejects WTF-8, `Buffer.from(text, "utf8")` substituting U+FFFD, ...) --
+// exactly the "line >200 chars" truncation case Frente N's adversarial
+// review asked to check "¿corta en medio de un code point UTF-16
+// surrogate?" for. `codePointBefore`/`codePointAt` above already apply the
+// identical one-unit backup for glob-pattern matching; this mirrors that.
+function truncateWithoutSplittingSurrogatePair(text: string, limit: number): string {
+  if (limit >= text.length) return text;
+  if (limit <= 0) return "";
+  const trailing = text.charCodeAt(limit - 1);
+  const boundary = trailing >= 0xd800 && trailing <= 0xdbff ? limit - 1 : limit;
+  return text.slice(0, boundary);
+}
+
 function lineNumberAt(text: string, index: number): number {
   let line = 1;
   for (let cursor = 0; cursor < index; cursor += 1) if (text[cursor] === "\n") line += 1;
@@ -1892,7 +1966,7 @@ function extendSpanForContext(text: string, start: number, end: number, contextL
   return { start: extendedStart, end: extendedEnd };
 }
 
-async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: QueryScope, record: CanonicalQueryRecord, mode: "signature" | "relevant" | "body", maxCharactersPerSnippet: number, contextLines: number, remainingBudget: number): Promise<SourceSnippetValue | undefined> {
+async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: QueryScope, record: CanonicalQueryRecord, mode: "signature" | "relevant" | "body" | "line", maxCharactersPerSnippet: number, contextLines: number, remainingBudget: number): Promise<SourceSnippetValue | undefined> {
   if (remainingBudget <= 0) return undefined;
   const file = await snapshots.artifact_text?.(scope, record.owner_artifact_version_id);
   if (file === undefined) return undefined;
@@ -1914,11 +1988,19 @@ async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: Query
     const newline = text.indexOf("\n", start);
     coreEnd = newline === -1 || newline >= end ? end : newline;
   }
-  const { start: sliceStart, end: sliceEnd } = extendSpanForContext(text, start, coreEnd, contextLines);
+  // Plan 2026-09-06 (Frente N, SNIPPET_POLICY): "line" always renders the
+  // FULL source line the span starts on -- not merely `[start, coreEnd)`
+  // (which, for a reference occurrence, is often just the identifier
+  // token) -- regardless of `contextLines` (inline policy snippets always
+  // call this with `contextLines: 0`, since "one more line of context"
+  // would defeat R13's one-line-per-bundle budget accounting).
+  const { start: sliceStart, end: sliceEnd } = mode === "line"
+    ? { start: lineStart(text, start), end: lineEnd(text, Math.max(coreEnd - 1, start)) }
+    : extendSpanForContext(text, start, coreEnd, contextLines);
   let snippetText = text.slice(sliceStart, sliceEnd);
   let truncated = false;
-  if (snippetText.length > maxCharactersPerSnippet) { snippetText = snippetText.slice(0, maxCharactersPerSnippet); truncated = true; }
-  if (snippetText.length > remainingBudget) { snippetText = snippetText.slice(0, remainingBudget); truncated = true; }
+  if (snippetText.length > maxCharactersPerSnippet) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, maxCharactersPerSnippet); truncated = true; }
+  if (snippetText.length > remainingBudget) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, remainingBudget); truncated = true; }
   const useStoredLines = contextLines === 0 && canonicalSpan !== undefined;
   return {
     text: snippetText,
@@ -2355,9 +2437,10 @@ function coverageItem(view: EntitySemanticCoverageView): QueryStreamItem {
 }
 
 /** Candidate stream item for both `core:search_semantic` and `core:search_hybrid` -- the registry pins both operations' `candidates` stream to `possible`-only (`registries.ts`), so unlike `item()` above there is no `confirmed` case to branch on. `rank` is always the FINAL, post-hydration output position (1-based, contiguous, no gaps even if some ranked ids failed to hydrate) -- never a fusion-internal or exact-scan-internal rank, which could contain gaps once un-hydratable ids are dropped. */
-function semanticCandidateItem(record: CanonicalQueryRecord, rank: number): QueryStreamItem {
+function semanticCandidateItem(record: CanonicalQueryRecord, rank: number, snippet?: SourceSnippetValue): QueryStreamItem {
   const identity = record.identity_key ?? record.record_id;
-  return { value: recordValue(record, "possible"), stable_sort_key: `possible\0${String(rank).padStart(6, "0")}\0${identity}` };
+  const value = recordValue(record, "possible");
+  return { value: snippet === undefined ? value : { ...value, optional_source_snippets: [snippet] }, stable_sort_key: `possible\0${String(rank).padStart(6, "0")}\0${identity}` };
 }
 
 /**
@@ -2485,17 +2568,32 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const seen = new Set<string>([container.identity_key ?? container.record_id]);
       let frontier = [container];
       const members: CanonicalQueryRecord[] = [];
+      // Plan 2026-09-06 (Frente N, SNIPPET_POLICY): tracks which members were
+      // discovered at level 0 (direct children of `container`) -- exactly
+      // "solo la raíz" -- so the snippet hydration loop below can skip
+      // deeper-nested members instead of paying for (and returning) a
+      // snippet on every one of a potentially large `depth > 1` outline.
+      const rootLevelKeys = new Set<string>();
       for (let level = 0; level < depth; level += 1) {
         const next: CanonicalQueryRecord[] = [];
         for (const parent of frontier) for (const child of contains.get(parent) ?? []) {
           const key = child.identity_key ?? child.record_id;
-          if (!seen.has(key)) { seen.add(key); members.push(child); next.push(child); }
+          if (!seen.has(key)) { seen.add(key); members.push(child); next.push(child); if (level === 0) rootLevelKeys.add(key); }
         }
         frontier = next;
       }
       const inScopeIdentityKeys = new Set<string>([container.identity_key ?? container.record_id, ...members.map((record) => record.identity_key ?? record.record_id)]);
       const pendingSites = await this.pendingSitesStreamForOutline(operation.scope, container, inScopeIdentityKeys);
-      return evaluated({ members: members.map((record) => item(record)), pending_sites: pendingSites });
+      let remainingOutlineSnippetBudget = INLINE_SNIPPET_TOTAL_BUDGET;
+      const memberItems: QueryStreamItem[] = [];
+      for (const record of members) {
+        const key = record.identity_key ?? record.record_id;
+        if (!rootLevelKeys.has(key)) { memberItems.push(item(record)); continue; }
+        const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "signature", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, remainingOutlineSnippetBudget);
+        if (snippet !== undefined) remainingOutlineSnippetBudget -= snippet.text.length;
+        memberItems.push(item(record, "confirmed", snippet));
+      }
+      return evaluated({ members: memberItems, pending_sites: pendingSites });
     }
     if (operation.operation_id === "core:find_references") {
       const target = resolveSelectorsToRecords(args["target"] === undefined ? [] : [args["target"]], maps)[0];
@@ -2504,7 +2602,14 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         const source = relationEndpoints(record, maps.by_any_id).source;
         return source === undefined ? [] : [source];
       });
-      return evaluated({ references: relations.map((record) => item(record, relationClassification(record))), owners: [...new Map(owners.map((record) => [record.record_id, record])).values()].map((record) => item(record)) });
+      let remainingReferenceSnippetBudget = INLINE_SNIPPET_TOTAL_BUDGET;
+      const referenceItems: QueryStreamItem[] = [];
+      for (const record of relations) {
+        const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "line", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, remainingReferenceSnippetBudget);
+        if (snippet !== undefined) remainingReferenceSnippetBudget -= snippet.text.length;
+        referenceItems.push(item(record, relationClassification(record), snippet));
+      }
+      return evaluated({ references: referenceItems, owners: [...new Map(owners.map((record) => [record.record_id, record])).values()].map((record) => item(record)) });
     }
     if (operation.operation_id === "core:expand_relations") {
       const rootRecords = resolveSelectorsToRecords(args["subjects"], maps);
@@ -3174,9 +3279,18 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const byVersionId = new Map(hydratedArtifacts.map((record) => [record.owner_artifact_version_id, record]));
     const byRecordId = new Map(hydratedEntities.map((record) => [record.record_id, record]));
     const items: QueryStreamItem[] = [];
+    // Plan 2026-09-06 (Frente N, SNIPPET_POLICY): "line" over
+    // `semantic_evidence.matched_segment.start_char` once Frente S-B
+    // populates it on `rankedEntries`, else "signature" -- `rankedEntries`
+    // carries no segment offset in this worktree (S-B not merged here), so
+    // this always takes the "signature" branch today.
+    let remainingCandidateSnippetBudget = INLINE_SNIPPET_TOTAL_BUDGET;
     for (const entry of rankedEntries) {
       const record = entry.grain === "entity" ? byRecordId.get(entry.id) : byVersionId.get(entry.id);
-      if (record !== undefined) items.push(semanticCandidateItem(record, items.length + 1));
+      if (record === undefined) continue;
+      const snippet = await sourceSnippet(this.snapshots, scope, record, "signature", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, remainingCandidateSnippetBudget);
+      if (snippet !== undefined) remainingCandidateSnippetBudget -= snippet.text.length;
+      items.push(semanticCandidateItem(record, items.length + 1, snippet));
     }
     return items;
   }
