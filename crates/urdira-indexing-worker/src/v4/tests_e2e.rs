@@ -4677,3 +4677,213 @@ fn dump_call_bodies_cold_only(structural_root: &Path, generation: u64, out_path:
         rows.len()
     );
 }
+
+/// F.1 "guard ⊇" (2026-09-06, flecos v4 plan §3.1/§3.2): a cold scan of the
+/// n8n corpus through the REAL production entrypoint (`run_scan`,
+/// `ScanScope::Full`, same as `n8n_cold_scan_for_external_entities_
+/// measurement` above) must never REGRESS below the population floors this
+/// test hard-codes -- one direction of the "v4 ⊇ v3" invariant (the other
+/// direction, "v4 ⊆ v3" / `different == 0`, is `scripts/v4-references-
+/// parity-diff.mjs`/`v4-call-parity-diff.mjs`). Each floor is `0.99 ×` an
+/// ACCEPTED n8n population figure (plan §0 rule R5, table §3.2, sourced from
+/// `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`
+/// §10.2 round 3 and the Q5 evidence's own references-parity numbers) --
+/// `jsts:entity_parameter`'s floor is PROVISIONAL (`74,021`, `0.99 ×
+/// 74,769`, the REFERENCED-only population this task's own F.2 change
+/// obsoletes) until a real n8n measurement of the "every declaration"
+/// population re-pins it (F.3, ola 2) -- expected to only ever go UP, since
+/// F.2 strictly adds unreferenced-parameter entities on top of the old
+/// population, never removes any.
+///
+/// Counts by `kind` (the language-specific string stored in `Dictionaries::
+/// kinds`, e.g. `jsts:entity_parameter` -- NOT `universal_kind`, which would
+/// collapse e.g. every `jsts:entity_callable` AND `jsts:entity_type` member
+/// signature under `core:callable`/`core:type` alike) for every entity/
+/// relation population in table §3.2, plus `external_module`/
+/// `external_symbol` (identified by `identity_key` PREFIX, same recipe
+/// `visible_entity_count_with_prefix` above already uses -- their own `kind`
+/// string is derived from `universal_kind` via `proposal_entity_record`, so
+/// it never literally reads `"external_module"`/`"external_symbol"`) and the
+/// total visible record count.
+///
+/// Writes a `kind\tcount` TSV to `URDIRA_V4_POPULATION_DUMP` (if set) for
+/// `scripts/v4-population-parity.mjs --v4-populations <that path>` to diff
+/// against a v3 database's own `record_occurrences` counts.
+///
+/// `#[ignore]`d (needs a real corpus, minutes of wall time, and should run
+/// with the machine at rest -- never alongside another benchmark). Runbook:
+/// ```text
+/// URDIRA_TSGO_BINARY=<repo>/node_modules/.pnpm/@typescript+typescript-darwin-arm64@7.0.2/node_modules/@typescript/typescript-darwin-arm64/lib/tsc \
+/// URDIRA_V4_N8N_CORPUS=<path to an n8n checkout/copy> \
+/// URDIRA_V4_POPULATION_DUMP=/tmp/n8n-populations.tsv \
+/// cargo test -p urdira-indexing-worker --release \
+///   v4::tests_e2e::n8n_population_floors -- --ignored --nocapture
+/// ```
+/// (`URDIRA_V4_N8N_DATA` is accepted for symmetry with the other n8n
+/// diagnostics' documented env surface but unused here -- this test always
+/// scans into a fresh scratch data dir via `scratch_copy_of_n8n_corpus`,
+/// deleted on success, so a prior scan's data root is never reused or left
+/// behind for this particular check.)
+#[test]
+#[ignore]
+fn n8n_population_floors() {
+    let Ok(corpus) = std::env::var("URDIRA_V4_N8N_CORPUS") else {
+        eprintln!("set URDIRA_V4_N8N_CORPUS=<path> to run this diagnostic");
+        return;
+    };
+    let _ = std::env::var("URDIRA_V4_N8N_DATA"); // accepted, unused -- see doc comment
+    let workspace_root = scratch_copy_of_n8n_corpus("n8n-population-floors", &corpus);
+    let scratch_root = workspace_root
+        .parent()
+        .expect("scratch workspace has a parent scratch root")
+        .to_path_buf();
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:n8n-population-floors";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+    let cold_started = std::time::Instant::now();
+    let event = run_scan(
+        "request:n8n-population-floors",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    eprintln!(
+        "[n8n_population_floors] cold scan wall={:.1}s",
+        cold_started.elapsed().as_secs_f64()
+    );
+    let generation = generation_of(&event);
+    assert_eq!(generation, 1, "this test asserts a COLD-generation fact");
+
+    let reader = StoreReader::open(&structural_root).expect("StoreReader opens");
+    let dicts = reader.dictionaries();
+
+    let mut kind_counts: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut total_records: u64 = 0;
+    let mut external_module_count: u64 = 0;
+    let mut external_symbol_count: u64 = 0;
+    for view in reader.iter_visible(generation) {
+        total_records += 1;
+        let kind = dicts
+            .kinds
+            .get(view.kind_id() as usize)
+            .cloned()
+            .unwrap_or_default();
+        *kind_counts.entry(kind).or_insert(0) += 1;
+        if view.category() == urdira_structural_store::row::CATEGORY_ENTITY {
+            let identity_key = view.identity_key();
+            if identity_key.starts_with(b"jsts:external_module:") {
+                external_module_count += 1;
+            } else if identity_key.starts_with(b"jsts:external_symbol:") {
+                external_symbol_count += 1;
+            }
+        }
+    }
+    let count_of = |kind: &str| -> u64 { *kind_counts.get(kind).unwrap_or(&0) };
+
+    // Table §3.2 floors (`0.99 ×` the accepted figure, R5).
+    const FLOOR_ENTITY_CALLABLE: u64 = 29_921;
+    const FLOOR_ENTITY_CONTAINER: u64 = 14_847;
+    const FLOOR_ENTITY_PARAMETER: u64 = 74_021; // provisional, see doc comment
+    const FLOOR_ENTITY_TYPE: u64 = 14_047;
+    const FLOOR_ENTITY_VARIABLE: u64 = 238_491;
+    const FLOOR_RELATION_CONTAINS: u64 = 396_483;
+    const FLOOR_RELATION_REFERENCES: u64 = 1_205_324;
+    const FLOOR_EXTERNAL_MODULE: u64 = 905;
+    const FLOOR_EXTERNAL_SYMBOL: u64 = 3_780;
+    const FLOOR_RECORDS_TOTAL: u64 = 2_165_060;
+
+    let kind_checks: [(&str, u64); 7] = [
+        ("jsts:entity_callable", FLOOR_ENTITY_CALLABLE),
+        ("jsts:entity_container", FLOOR_ENTITY_CONTAINER),
+        ("jsts:entity_parameter", FLOOR_ENTITY_PARAMETER),
+        ("jsts:entity_type", FLOOR_ENTITY_TYPE),
+        ("jsts:entity_variable", FLOOR_ENTITY_VARIABLE),
+        ("jsts:relation_contains", FLOOR_RELATION_CONTAINS),
+        ("jsts:relation_references", FLOOR_RELATION_REFERENCES),
+    ];
+
+    println!();
+    println!("=== n8n population floors (cold, generation {generation}) ===");
+    for (kind, floor) in kind_checks {
+        let count = count_of(kind);
+        println!(
+            "  {kind:<28} {count:>10} (floor {floor:>10}) {}",
+            if count >= floor { "OK" } else { "FAIL" }
+        );
+    }
+    println!(
+        "  {:<28} {external_module_count:>10} (floor {FLOOR_EXTERNAL_MODULE:>10}) {}",
+        "external_module",
+        if external_module_count >= FLOOR_EXTERNAL_MODULE {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  {:<28} {external_symbol_count:>10} (floor {FLOOR_EXTERNAL_SYMBOL:>10}) {}",
+        "external_symbol",
+        if external_symbol_count >= FLOOR_EXTERNAL_SYMBOL {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  {:<28} {total_records:>10} (floor {FLOOR_RECORDS_TOTAL:>10}) {}",
+        "records_total",
+        if total_records >= FLOOR_RECORDS_TOTAL {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
+    if let Ok(dump_path) = std::env::var("URDIRA_V4_POPULATION_DUMP") {
+        use std::io::Write;
+        let file = std::fs::File::create(&dump_path)
+            .unwrap_or_else(|error| panic!("create population dump {dump_path}: {error}"));
+        let mut writer = std::io::BufWriter::new(file);
+        for (kind, count) in &kind_counts {
+            writeln!(writer, "{kind}\t{count}").expect("write population dump line");
+        }
+        writeln!(writer, "external_module\t{external_module_count}")
+            .expect("write population dump line");
+        writeln!(writer, "external_symbol\t{external_symbol_count}")
+            .expect("write population dump line");
+        writeln!(writer, "records_total\t{total_records}").expect("write population dump line");
+        writer.flush().expect("flush population dump");
+        eprintln!("[n8n_population_floors] wrote population TSV -> {dump_path}");
+    }
+
+    for (kind, floor) in kind_checks {
+        let count = count_of(kind);
+        assert!(
+            count >= floor,
+            "{kind} population regressed below its floor: {count} < {floor}"
+        );
+    }
+    assert!(
+        external_module_count >= FLOOR_EXTERNAL_MODULE,
+        "external_module population regressed below its floor: {external_module_count} < {FLOOR_EXTERNAL_MODULE}"
+    );
+    assert!(
+        external_symbol_count >= FLOOR_EXTERNAL_SYMBOL,
+        "external_symbol population regressed below its floor: {external_symbol_count} < {FLOOR_EXTERNAL_SYMBOL}"
+    );
+    assert!(
+        total_records >= FLOOR_RECORDS_TOTAL,
+        "total record count regressed below its floor: {total_records} < {FLOOR_RECORDS_TOTAL}"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
