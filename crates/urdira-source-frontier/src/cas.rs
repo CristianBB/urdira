@@ -4,12 +4,13 @@
 //! shard>/<62 hex rest>`, one flat file per blob, stamped with a `.layout`
 //! marker (`packages/storage/src/cas.ts`'s `CAS_LAYOUT_VERSION = "2"`).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 const LAYOUT_MARKER_FILENAME: &str = ".layout";
 const LAYOUT_VERSION: &str = "2";
@@ -170,6 +171,17 @@ impl CasStore {
         if target.is_file() {
             return Ok(target);
         }
+        // Diagnostic-only: widens the window between a `CasWriteQueue`
+        // worker picking up an item and the blob actually landing on disk,
+        // so a test can reliably observe `CasWrittenSignal::wait_written`
+        // blocking a concurrent reader instead of racing a write that is
+        // normally microseconds long. See `diagnostic_write_delay`'s own
+        // doc comment; zero-cost (one `OnceLock` check, no sleep) unless a
+        // developer explicitly sets `URDIRA_DIAGNOSTIC_CAS_DELAY_MS`.
+        let delay = diagnostic_write_delay();
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         // No `create_dir_all` here: `CasStore::open` already pre-created
         // every one of the 256 possible shard directories (see its doc
         // comment) -- one `mkdir`-shaped syscall per file, on every cold
@@ -219,6 +231,21 @@ impl CasPut for CasStore {
     }
 }
 
+/// Memory cost of the completion registry (`seen`/`written`/`failed`
+/// below), added by this task on top of `CasWriteQueue`'s pre-existing
+/// `seen` dedup set: roughly one extra `String` (a `sha256:<64 hex>`
+/// content hash, ~71 bytes plus `HashSet`/`HashMap` bucket overhead) per
+/// distinct file for the scan's lifetime, since a hash moves from `seen`
+/// into `written` (or `failed`) on completion but is never REMOVED from
+/// `seen` -- `submit`'s own dedup check and a late `wait_written` call for
+/// an already-completed hash both still need to find it there. On n8n's
+/// corpus (~15k JS/TS owners after non-source config assets are excluded)
+/// that is on the order of two retained hash strings per owner for the
+/// scan's duration -- roughly 2 MiB total, negligible next to this
+/// pipeline's other per-scan structures (`SyntaxWorkerState`'s parsed ASTs,
+/// `TypeflowCache`'s `DeclSummary`s) and reclaimed the instant
+/// `CasWriteQueue`/every `CasWrittenSignal` clone of it is dropped at the
+/// end of the scan that owns it.
 struct QueueState {
     items: VecDeque<(String, Vec<u8>)>,
     /// Dedupes by content hash at submission time (item 2: "dedupe by
@@ -227,10 +254,144 @@ struct QueueState {
     /// re-write the same bytes once per occurrence. `put_if_absent`'s own
     /// `target.is_file()` check already dedupes AFTER a write lands, but
     /// checking here avoids ever cloning/queueing the duplicate bytes in
-    /// the first place.
+    /// the first place. Doubles as the completion registry's "known hash"
+    /// set: every hash [`CasWrittenSignal::wait_written`] can legitimately
+    /// be asked about was inserted here first, at `submit` time --  a hash
+    /// never submitted to this queue instance is not in `seen` either, and
+    /// `wait_written` returns an immediate error for it rather than
+    /// blocking (see that method's doc comment).
     seen: HashSet<String>,
+    /// Every content hash whose `put_if_absent` call has RETURNED
+    /// successfully -- whether that call actually wrote new bytes or found
+    /// the blob already durable from a prior scan/process (`put_if_absent`'s
+    /// `target.is_file()` fast path): either way the blob is now guaranteed
+    /// present on disk, which is the only thing a waiter cares about. A
+    /// worker inserts here (never removes) immediately before releasing
+    /// this lock and notifying `CasWriteQueue::written_cond`.
+    written: HashSet<String>,
+    /// Content hashes whose `put_if_absent` call returned `Err`, keyed to a
+    /// `Display`-rendered copy of that error (`CasError` itself is not
+    /// `Clone` -- `std::io::Error` isn't -- so the first worker to observe
+    /// the failure renders it to a `String` once, here, for any waiter to
+    /// read back; the ORIGINAL typed `CasError` is separately kept in
+    /// `error` below for `join`'s existing contract). A hash in `failed` is
+    /// also in `seen` (inserted at submit time) but never moves to
+    /// `written`.
+    failed: HashMap<String, String>,
     closed: bool,
     error: Option<CasError>,
+}
+
+/// Surfaced by [`CasWrittenSignal::wait_written`] instead of blocking
+/// forever or silently returning success.
+#[derive(Debug)]
+pub enum CasWaitError {
+    /// `wait_written` was asked about a content hash this queue instance
+    /// never received a `submit` call for -- either a caller bug (waiting
+    /// on the wrong hash) or a hash that predates this queue (a PRIOR
+    /// scan's blob, already durable, never resubmitted this scan): either
+    /// way, blocking would hang forever with no worker ever going to
+    /// complete it, so this is returned immediately instead of waiting for
+    /// the timeout.
+    UnknownHash(String),
+    /// The write itself failed (`put_if_absent` returned `Err`) -- carries
+    /// that error's `Display` text (see `QueueState::failed`'s doc comment
+    /// for why this is a rendered `String`, not the original `CasError`).
+    WriteFailed(String),
+    /// Neither written nor failed within the requested timeout -- the
+    /// safety-net case the doc comment on [`CasWrittenSignal::wait_written`]
+    /// describes as "never hit in practice".
+    Timeout(String),
+}
+
+impl std::fmt::Display for CasWaitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CasWaitError::UnknownHash(hash) => {
+                write!(formatter, "CAS write queue: never submitted: {hash}")
+            }
+            CasWaitError::WriteFailed(message) => {
+                write!(formatter, "CAS write queue: write failed: {message}")
+            }
+            CasWaitError::Timeout(hash) => {
+                write!(formatter, "CAS write queue: timed out waiting for {hash}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CasWaitError {}
+
+/// A cheap `Arc`-backed handle to a [`CasWriteQueue`]'s completion registry
+/// only -- not `submit`/`join` (a caller with just a `CasWrittenSignal`
+/// cannot enqueue more work or drain the queue, only ask "is this hash's
+/// blob durable yet"). Cloning is O(1) (two `Arc::clone`s); every clone
+/// observes the SAME underlying queue's state, so a signal handed to
+/// `analyze::run_cold` (via `scan.rs`) sees writes land as the SAME
+/// background workers `CasWriteQueue::spawn` started for that scan produce
+/// them.
+#[derive(Clone)]
+pub struct CasWrittenSignal {
+    state: Arc<Mutex<QueueState>>,
+    written_cond: Arc<Condvar>,
+}
+
+impl CasWrittenSignal {
+    /// Blocks the calling thread until `content_hash`'s write has been
+    /// observed to finish (successfully or not) by this queue, or until
+    /// `timeout` elapses. Returns immediately (no lock contention beyond
+    /// one `Mutex::lock`) in the overwhelmingly common case: the blob was
+    /// already written by the time the reader gets here, since
+    /// `CasWriteQueue`'s worker pool starts draining the instant the walk
+    /// begins and a cold scan's own catalog-apply + `analyze()` parse pass
+    /// (both CPU-bound, no CAS I/O) already give it a head start before the
+    /// first `read_owner_source_text` call.
+    ///
+    /// `timeout` is a safety net, not a expected code path -- 60s (this
+    /// crate's caller passes) is comfortably above any observed write
+    /// latency even under heavy scheduler contention (the exact scenario
+    /// `read_blob_with_retry`'s old 200x5ms/1s ceiling used to bound); a
+    /// content hash that was genuinely never submitted to this queue
+    /// (`CasWaitError::UnknownHash`) is rejected immediately instead of
+    /// waiting out the full timeout, since no worker will ever complete it
+    /// -- see `QueueState::seen`'s doc comment for what "submitted" means
+    /// here.
+    pub fn wait_written(&self, content_hash: &str, timeout: Duration) -> Result<(), CasWaitError> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if guard.written.contains(content_hash) {
+                return Ok(());
+            }
+            if let Some(message) = guard.failed.get(content_hash) {
+                return Err(CasWaitError::WriteFailed(message.clone()));
+            }
+            if !guard.seen.contains(content_hash) {
+                return Err(CasWaitError::UnknownHash(content_hash.to_string()));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(CasWaitError::Timeout(content_hash.to_string()));
+            }
+            let (next_guard, wait_result) = self
+                .written_cond
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard = next_guard;
+            // A timed-out wait does not necessarily mean `content_hash`
+            // itself is still pending -- another hash's completion could
+            // have spuriously woken this thread just before the deadline.
+            // The loop re-checks `written`/`failed`/`seen` unconditionally
+            // on every iteration regardless of `wait_result`, so a missed
+            // notification never causes an incorrect early return; a
+            // GENUINE timeout is caught by the `now >= deadline` check
+            // above on the next iteration.
+            let _ = wait_result;
+        }
+    }
 }
 
 /// A bounded-capacity, multi-consumer queue of pending CAS writes, backed
@@ -248,6 +409,14 @@ pub struct CasWriteQueue {
     state: Arc<Mutex<QueueState>>,
     not_empty: Arc<Condvar>,
     not_full: Arc<Condvar>,
+    /// Signaled by a worker every time it records a hash into
+    /// `QueueState::written`/`failed` (see the worker loop in [`Self::spawn`]).
+    /// Kept separate from `not_empty`/`not_full` (rather than overloading
+    /// one of those) so a [`CasWrittenSignal::wait_written`] waiter is never
+    /// spuriously woken by ordinary queue traffic (an unrelated `submit`/
+    /// `pop_front`) and, conversely, so a completion never has to also
+    /// notify the producer/consumer condvars it has nothing to do with.
+    written_cond: Arc<Condvar>,
     capacity: usize,
     workers: Vec<JoinHandle<()>>,
 }
@@ -264,11 +433,14 @@ impl CasWriteQueue {
         let state = Arc::new(Mutex::new(QueueState {
             items: VecDeque::with_capacity(capacity.min(1024)),
             seen: HashSet::new(),
+            written: HashSet::new(),
+            failed: HashMap::new(),
             closed: false,
             error: None,
         }));
         let not_empty = Arc::new(Condvar::new());
         let not_full = Arc::new(Condvar::new());
+        let written_cond = Arc::new(Condvar::new());
         let worker_count = worker_count.max(1);
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
@@ -276,6 +448,7 @@ impl CasWriteQueue {
             let state = Arc::clone(&state);
             let not_empty = Arc::clone(&not_empty);
             let not_full = Arc::clone(&not_full);
+            let written_cond = Arc::clone(&written_cond);
             workers.push(std::thread::spawn(move || {
                 loop {
                     let (content_hash, bytes) = {
@@ -293,12 +466,27 @@ impl CasWriteQueue {
                                 .unwrap_or_else(|poison| poison.into_inner());
                         }
                     };
-                    if let Err(error) = store.put_if_absent(&bytes, &content_hash) {
+                    // Recorded regardless of success/failure (item 1 of this
+                    // task's brief: "on error record the error so the
+                    // waiter can surface it instead of hanging") -- a
+                    // waiter blocked in `CasWrittenSignal::wait_written`
+                    // must be released either way, not just on success.
+                    let result = store.put_if_absent(&bytes, &content_hash);
+                    {
                         let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
-                        if guard.error.is_none() {
-                            guard.error = Some(error);
+                        match result {
+                            Ok(_) => {
+                                guard.written.insert(content_hash);
+                            }
+                            Err(error) => {
+                                guard.failed.insert(content_hash, error.to_string());
+                                if guard.error.is_none() {
+                                    guard.error = Some(error);
+                                }
+                            }
                         }
                     }
+                    written_cond.notify_all();
                 }
             }));
         }
@@ -307,8 +495,23 @@ impl CasWriteQueue {
             state,
             not_empty,
             not_full,
+            written_cond,
             capacity: capacity.max(1),
             workers,
+        }
+    }
+
+    /// A cheap, `Sync`-safe handle onto this queue's completion registry
+    /// only (see [`CasWrittenSignal`]'s own doc comment for exactly what it
+    /// can and cannot do) -- callable at any point after `spawn`, including
+    /// while the queue is still actively draining. Does not consume or
+    /// borrow-lock `self` beyond the two `Arc::clone`s, so a caller can hold
+    /// both this signal and the queue itself (to `submit`/eventually `join`
+    /// it) at the same time.
+    pub fn signal(&self) -> CasWrittenSignal {
+        CasWrittenSignal {
+            state: Arc::clone(&self.state),
+            written_cond: Arc::clone(&self.written_cond),
         }
     }
 
@@ -395,6 +598,31 @@ impl CasPut for CasWriteQueue {
 /// thread's `ThreadId` (belt-and-suspenders — not required for uniqueness
 /// given the counter, but keeps the name legible for debugging which thread
 /// wrote it).
+/// Reads `URDIRA_DIAGNOSTIC_CAS_DELAY_MS` once (`OnceLock`, not once per
+/// `put_if_absent` call) and caches the parsed duration for the life of the
+/// process. Unset (the default for every production run and almost every
+/// test) parses to `Duration::ZERO`, which `put_if_absent` checks with an
+/// `is_zero()` branch before ever calling `Instant`/`sleep` machinery --
+/// this is a plain env lookup cached behind an atomic-once flag, not a
+/// per-write cost. Deliberately kept (not deleted after the bug it helped
+/// diagnose was fixed): it is the only practical way to widen the CAS
+/// write queue's normally-microseconds-wide submit-to-durable window on
+/// demand, which the reproduction test below
+/// (`analyze_one`/`TypeflowCache::build_full`'s callers in
+/// `urdira-indexing-worker` also use it, via `cargo test ...
+/// -- --ignored` style forced-delay runs) needs to prove `CasWrittenSignal::
+/// wait_written` actually blocks instead of returning early by luck.
+fn diagnostic_write_delay() -> Duration {
+    static DELAY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("URDIRA_DIAGNOSTIC_CAS_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_default()
+    })
+}
+
 fn unique_temp_name() -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -566,6 +794,161 @@ mod tests {
         fs::write(dir.join(".layout"), "1").unwrap();
         let error = CasStore::open(&dir).unwrap_err();
         assert!(matches!(error, CasError::LayoutMismatch { .. }));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let mut hash = String::from("sha256:");
+        for byte in hasher.finalize() {
+            use std::fmt::Write as _;
+            let _ = write!(&mut hash, "{byte:02x}");
+        }
+        hash
+    }
+
+    /// Serializes every test in this module that touches
+    /// `URDIRA_DIAGNOSTIC_CAS_DELAY_MS`, mirroring `urdira-tsgo-client`'s
+    /// `binary::tests::ENV_LOCK` (same hazard, spelled out there in full:
+    /// this env var is process-global state, but Rust's default test
+    /// harness runs every `#[test]` fn in this module as a separate THREAD
+    /// within the SAME process). Every test that sets/removes this var
+    /// must hold this lock for its full set-run-remove sequence. This
+    /// crate (unlike `urdira-indexing-worker`, `#![forbid(unsafe_code)]`)
+    /// permits `unsafe`, which is what lets a test set this var directly
+    /// rather than requiring an external shell invocation.
+    static DELAY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Cas write queue task item 4(a): submits many blobs to a queue whose
+    /// underlying store has been slowed down (`URDIRA_DIAGNOSTIC_CAS_DELAY_
+    /// MS`), then waits on the LAST submitted hash from a second thread and
+    /// confirms two things: (1) the blob is genuinely not yet on disk right
+    /// after `submit` returns (proving the delay actually widened the
+    /// window, not that the write was already done by coincidence), and
+    /// (2) `wait_written` does not return `Ok` until the blob is actually
+    /// durable on disk.
+    #[test]
+    fn wait_written_blocks_until_the_slow_stores_last_blob_is_durable() {
+        let _delay_guard = DELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // SAFETY: serialized against every other test in this module that
+        // touches `URDIRA_DIAGNOSTIC_CAS_DELAY_MS`, via `DELAY_ENV_LOCK`.
+        unsafe {
+            std::env::set_var("URDIRA_DIAGNOSTIC_CAS_DELAY_MS", "40");
+        }
+
+        let dir = temp_dir("wait-written");
+        let store = CasStore::open(&dir).unwrap();
+        let queue = CasWriteQueue::spawn(store, 2, 64);
+        let signal = queue.signal();
+
+        const BLOB_COUNT: usize = 16;
+        let mut hashes = Vec::with_capacity(BLOB_COUNT);
+        for index in 0..BLOB_COUNT {
+            let bytes = format!("wait-written-payload-{index}").into_bytes();
+            let hash = sha256_of(&bytes);
+            queue.submit(&hash, bytes);
+            hashes.push(hash);
+        }
+        let last_hash = hashes.last().cloned().expect("BLOB_COUNT > 0");
+        let last_path = queue
+            .root()
+            .join(object_relative_path(&last_hash).expect("valid digest"));
+
+        // With 2 workers, 16 items, and a 40ms artificial delay per write,
+        // draining the whole queue takes >= 8 * 40ms = 320ms -- the last
+        // item cannot possibly be durable this soon after `submit` returns
+        // (which itself only blocks on queue capacity, never on I/O).
+        assert!(
+            !last_path.is_file(),
+            "the slow store finished implausibly fast -- this test's timing assumption is broken"
+        );
+
+        let waiter = {
+            let signal = signal.clone();
+            let last_hash = last_hash.clone();
+            std::thread::spawn(move || signal.wait_written(&last_hash, Duration::from_secs(10)))
+        };
+        let result = waiter.join().expect("waiter thread does not panic");
+
+        // SAFETY: same `DELAY_ENV_LOCK` guard as above.
+        unsafe {
+            std::env::remove_var("URDIRA_DIAGNOSTIC_CAS_DELAY_MS");
+        }
+
+        result.expect("wait_written must succeed once the slow store finishes");
+        assert!(
+            last_path.is_file(),
+            "wait_written returned Ok before the blob was actually written to disk"
+        );
+
+        queue
+            .join()
+            .expect("queue join succeeds with no write errors");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Item 4(b): a content hash this queue never received a `submit` call
+    /// for must fail immediately, never block out the full timeout.
+    #[test]
+    fn wait_written_on_unknown_hash_returns_error_immediately() {
+        let dir = temp_dir("wait-unknown");
+        let store = CasStore::open(&dir).unwrap();
+        let queue = CasWriteQueue::spawn(store, 1, 8);
+        let signal = queue.signal();
+
+        let started = std::time::Instant::now();
+        let result = signal.wait_written(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            Duration::from_secs(30),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(CasWaitError::UnknownHash(_))),
+            "expected UnknownHash, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "an unknown hash must not wait anywhere near the 30s timeout, took {elapsed:?}"
+        );
+
+        queue
+            .join()
+            .expect("queue join succeeds (nothing was ever submitted)");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Item 4(c): a write that fails (here, an intentionally malformed
+    /// content hash `put_if_absent` rejects with `CasError::InvalidDigest`
+    /// before touching the filesystem at all) must be surfaced to a waiter
+    /// as `CasWaitError::WriteFailed`, not silently hang or report success
+    /// -- and the SAME failure must still reach `join`'s existing contract.
+    #[test]
+    fn wait_written_surfaces_a_write_error_to_the_waiter() {
+        let dir = temp_dir("wait-error");
+        let store = CasStore::open(&dir).unwrap();
+        let queue = CasWriteQueue::spawn(store, 1, 8);
+        let signal = queue.signal();
+
+        let bad_hash = "not-a-valid-content-hash";
+        queue.submit(bad_hash, b"whatever".to_vec());
+
+        let result = signal.wait_written(bad_hash, Duration::from_secs(5));
+        assert!(
+            matches!(result, Err(CasWaitError::WriteFailed(_))),
+            "expected WriteFailed, got {result:?}"
+        );
+
+        let join_result = queue.join();
+        assert!(
+            join_result.is_err(),
+            "join must also surface the same write error, not swallow it now that a waiter already saw it"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

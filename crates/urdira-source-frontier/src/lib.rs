@@ -21,7 +21,7 @@ pub mod ids;
 pub mod inclusion;
 pub mod walker;
 
-pub use cas::{CasPut, CasStore, CasWriteQueue};
+pub use cas::{CasPut, CasStore, CasWaitError, CasWriteQueue, CasWrittenSignal};
 pub use catalog::{AppliedCatalog, BatchMeta, Catalog};
 pub use delta::Delta;
 pub use frontier::{Frontier, FrontierEntry};

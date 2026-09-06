@@ -65,6 +65,7 @@ use urdira_jsts_syntax_worker::{
 use urdira_jsts_typeflow::{
     DeclSummary, DeferredReturnShape, HeritageTarget, ProgramIndex, RawTypeRef, ReturnEntityRef,
 };
+use urdira_source_frontier::CasWrittenSignal;
 
 /// Per-file `DeclSummary` cache, kept in `v4::state::WorkspaceState` across
 /// `WorkspaceScan` commands for one workspace (same lifetime as
@@ -129,12 +130,23 @@ impl TypeflowCache {
     /// file` this used to call, whose `pending_*` bookkeeping only ever
     /// mattered for `build_index`'s WARM branch, never exercised right
     /// after `build_full`).
-    pub fn build_full(files: &[SourceInput]) -> Result<Self, ScanError> {
+    ///
+    /// `cas_signal`: `Some` when THIS call may race a still-draining
+    /// `CasWriteQueue` from the SAME scan (`analyze::run_cold`'s own call,
+    /// the only racy one -- see `read_owner_source_text`'s doc comment for
+    /// the full reasoning); `None` for `delta.rs`'s first-scan-after-restart
+    /// fallback call, whose blobs were already written synchronously
+    /// earlier in that same function, and for every test call site that
+    /// writes its fixture blobs directly.
+    pub fn build_full(
+        files: &[SourceInput],
+        cas_signal: Option<&CasWrittenSignal>,
+    ) -> Result<Self, ScanError> {
         let mut cache = TypeflowCache::default();
         let extracted: Vec<(&str, Result<Option<DeclSummary>, ScanError>)> = files
             .par_iter()
             .map(|owner| {
-                let outcome = read_owner_source_text(owner).map(|text| {
+                let outcome = read_owner_source_text(owner, cas_signal).map(|text| {
                     urdira_jsts_typeflow::extract_decl_summary(&owner.path, &text).ok()
                 });
                 (owner.path.as_str(), outcome)
@@ -155,7 +167,10 @@ impl TypeflowCache {
     /// recompute it from scratch", the same rule `state::SourceCache::
     /// apply_delta` already applies to its own two maps.
     pub fn replace_file_from_owner(&mut self, owner: &SourceInput) -> Result<(), ScanError> {
-        let text = read_owner_source_text(owner)?;
+        // `None`: this method is only called from `delta.rs`'s incremental
+        // path, whose CAS blobs are already written synchronously before
+        // this call happens (see `read_owner_source_text`'s doc comment).
+        let text = read_owner_source_text(owner, None)?;
         self.replace_file(&owner.path, &text);
         Ok(())
     }
@@ -537,15 +552,21 @@ mod tests {
         let text_a = "import { Base } from './b'; export class Foo extends Base {}";
         let text_b = "export class Base {}";
 
-        let mut cache_a = TypeflowCache::build_full(&[
-            owner("a.ts", &a_blob, text_a),
-            owner("b.ts", &b_blob, text_b),
-        ])
+        let mut cache_a = TypeflowCache::build_full(
+            &[
+                owner("a.ts", &a_blob, text_a),
+                owner("b.ts", &b_blob, text_b),
+            ],
+            None,
+        )
         .expect("build_full succeeds");
-        let mut cache_b = TypeflowCache::build_full(&[
-            owner("a.ts", &a_blob, text_a),
-            owner("b.ts", &b_blob, text_b),
-        ])
+        let mut cache_b = TypeflowCache::build_full(
+            &[
+                owner("a.ts", &a_blob, text_a),
+                owner("b.ts", &b_blob, text_b),
+            ],
+            None,
+        )
         .expect("build_full succeeds");
         assert_eq!(cache_a.summary_count(), 2);
         assert_eq!(cache_b.summary_count(), 2);
@@ -601,10 +622,13 @@ mod tests {
         let text_b_v1 = "export class Base {}";
         let text_b_v2 = "\n\nexport class Base {}";
 
-        let mut cache = TypeflowCache::build_full(&[
-            owner("a.ts", &a_blob, text_a),
-            owner("b.ts", &b_blob, text_b_v1),
-        ])
+        let mut cache = TypeflowCache::build_full(
+            &[
+                owner("a.ts", &a_blob, text_a),
+                owner("b.ts", &b_blob, text_b_v1),
+            ],
+            None,
+        )
         .expect("build_full succeeds");
 
         let resolver = WorkspaceResolver::build(&[]);
@@ -622,10 +646,13 @@ mod tests {
         let incremental_index = cache.build_index(&resolver, &available, &files);
         let incremental_greet = incremental_index.members(&foo_id, "greet", false);
 
-        let mut fresh = TypeflowCache::build_full(&[
-            owner("a.ts", &a_blob, text_a),
-            owner("b.ts", &b_blob, text_b_v2),
-        ])
+        let mut fresh = TypeflowCache::build_full(
+            &[
+                owner("a.ts", &a_blob, text_a),
+                owner("b.ts", &b_blob, text_b_v2),
+            ],
+            None,
+        )
         .expect("build_full succeeds");
         let fresh_index = fresh.build_index(&resolver, &available, &files);
         let fresh_greet = fresh_index.members(&foo_id, "greet", false);
@@ -709,7 +736,7 @@ mod tests {
             .expect("project files present")
             .clone();
 
-        let mut cache = TypeflowCache::build_full(&sources).expect("build_full succeeds");
+        let mut cache = TypeflowCache::build_full(&sources, None).expect("build_full succeeds");
         assert_eq!(cache.summary_count(), 3);
 
         let base_id = cache.summaries["iface.ts"].interfaces[0].entity_id.clone();

@@ -181,6 +181,15 @@ fn run_full(
         .cas_write_queue
         .take()
         .expect("run_full_scan always populates cas_write_queue");
+    // Targeted-wait fix: a cheap `Arc`-backed handle onto the queue's own
+    // completion registry (see `CasWrittenSignal`'s doc comment,
+    // `urdira-source-frontier`'s `cas.rs`), threaded into `analyze::
+    // run_cold` below so `read_owner_source_text` can wait for the EXACT
+    // blob it needs instead of polling `std::fs::read` on `NotFound`
+    // (the old `read_blob_with_retry`, removed). Cloning this out now (the
+    // queue is still actively draining) does not affect `cas_write_queue`
+    // itself -- `submit`/`join` still work normally on it below.
+    let cas_signal = cas_write_queue.signal();
     // See `catalog::open_and_ensure_schema`'s doc comment: the cold
     // catalog transaction just above ran with `synchronous=OFF` for
     // speed (journal_mode stays `WAL` throughout, so concurrent readers
@@ -217,6 +226,7 @@ fn run_full(
         &request.workspace_id,
         syntax,
         clock,
+        &cas_signal,
     )?;
     let run_cold_elapsed = run_cold_started.elapsed();
     if debug_timing {

@@ -769,7 +769,14 @@ fn run_once_with_quiet_period(
             source_blob_path: blob_path(cas_root, &entry.content_hash)?,
             byte_length: usize::try_from(entry.byte_length).unwrap_or(usize::MAX),
         };
-        if let Ok(text) = read_owner_source_text(&source_input) {
+        // `None`: this background pass runs strictly after its owning
+        // scan's `ScanCompleted` (itself strictly after that scan's own
+        // `cas_write_queue.join()`, see `scan::run_full`), so every blob it
+        // reads here -- from this scan or an earlier one -- is already
+        // durable; there is no live queue to wait on. See
+        // `read_owner_source_text`'s own doc comment for the full
+        // reasoning.
+        if let Ok(text) = read_owner_source_text(&source_input, None) {
             file_map.insert(format!("{workspace_root}/{path}"), text);
         }
     }

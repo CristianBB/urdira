@@ -615,8 +615,13 @@ fn run_one(
             }
         }
         None => {
+            // `None` (no `CasWrittenSignal`): every blob `files_vec()` names
+            // was already written synchronously above (`Walker::observe_
+            // paths(..., Some(&cas))`, a bare `CasStore`, not a background
+            // queue) -- see `read_owner_source_text`'s own doc comment.
             workspace_state.typeflow_cache = Some(super::typeflow::TypeflowCache::build_full(
                 &source_cache_ref.files_vec(),
+                None,
             )?);
         }
     }

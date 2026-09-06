@@ -32,6 +32,7 @@ use urdira_jsts_syntax_worker::{
     analyze_owner_semantics_with_context, decode_config_assets,
     reset_ambiguous_ambient_would_be_external_count,
 };
+use urdira_source_frontier::CasWrittenSignal;
 use urdira_source_frontier::cas::object_relative_path;
 use urdira_source_frontier::frontier::Frontier;
 pub use urdira_worker_protocol::AuthoritativeChangeSet;
@@ -126,47 +127,66 @@ pub(crate) fn blob_path(cas_root: &Path, content_hash: &str) -> Result<String, S
 /// artifact: `cargo test -p urdira-indexing-worker` with default (parallel)
 /// test threads intermittently failed
 /// `incremental_{create,delete}_roots_match_a_from_scratch_scan_of_the_
-/// mutated_tree` with exactly `std::io::ErrorKind::NotFound` here, on a
-/// SINGLE test running with no other test concurrently in flight, once the
-/// background write was artificially delayed -- proof this is not a shared-
-/// scratch-directory collision between tests (each test's `cas_root` is
-/// already unique), but an intra-scan ordering hazard between this read and
-/// its own scan's still-draining write queue, whose probability rises with
-/// system-wide scheduler contention (many parallel test processes/threads
-/// competing for the same cores). Retrying briefly on `NotFound` closes the
-/// window at zero cost in the overwhelmingly common case (the blob is
-/// already there on the first try) while giving a delayed background writer
-/// a bounded chance to catch up: 200 attempts x 5ms = at most 1s of extra
-/// wait, comfortably above any write latency observed even under heavy
-/// contention, and small next to a cold scan's total wall time. A `NotFound`
-/// that persists past the ceiling still surfaces as the same fatal error as
-/// before (a genuinely missing/corrupt blob is a real bug, not something to
-/// paper over indefinitely).
-fn read_blob_with_retry(path: &Path) -> std::io::Result<Vec<u8>> {
-    const MAX_ATTEMPTS: u32 = 200;
-    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
-    let mut attempt = 0u32;
-    loop {
-        match std::fs::read(path) {
-            Ok(bytes) => return Ok(bytes),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound && attempt < MAX_ATTEMPTS =>
-            {
-                attempt += 1;
-                std::thread::sleep(RETRY_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
+/// mutated_tree` with exactly `std::io::ErrorKind::NotFound` here, once the
+/// background write was artificially delayed. An earlier fix (954a942)
+/// closed this by retrying `std::fs::read` on `NotFound` up to 200 times
+/// (5ms apart, ~1s ceiling) -- correct, but blind: every cold scan paid
+/// SOME chance of a multi-millisecond stall on a blob that was, in fact,
+/// already being written by a known, waitable background worker, and a
+/// slow/contended write still had to be rediscovered by polling rather
+/// than being woken the instant it actually finished.
+///
+/// The fix now is targeted: `catalog::run_full_scan`'s `CasWriteQueue`
+/// exposes a [`CasWrittenSignal`] (`Arc`-cheap, `urdira-source-frontier`'s
+/// `cas.rs`) that a worker thread marks complete -- via a `Mutex`+`Condvar`
+/// completion registry, not polling -- the instant its own `put_if_absent`
+/// call returns (success OR error; see that type's own doc comment for the
+/// full mechanism, including the "never submitted" and "write failed"
+/// cases). [`read_owner_source_text`] calls `wait_written` on that signal
+/// (60s timeout, a safety net never expected to trigger) before ever
+/// touching the filesystem, so a reader either finds the blob already
+/// durable (the common case, zero extra cost beyond one `Mutex::lock`) or
+/// is woken the instant the specific write it is waiting on completes --
+/// no fixed retry ceiling, no blind polling interval.
+pub(crate) const CAS_WRITE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Reads and hash-verifies an owner's source bytes (same check as
 /// `main.rs`'s private `read_owner_source_text`, main.rs:817-833 -- this is
 /// an independent copy for the same isolation reason as the predicates
 /// above). `pub(crate)`: `v4::typeflow` also needs this to read a changed
 /// owner's text when (re)building its `DeclSummary` (P2-2e).
-pub(crate) fn read_owner_source_text(owner: &SourceInput) -> Result<String, ScanError> {
-    let bytes = read_blob_with_retry(Path::new(&owner.source_blob_path)).map_err(|error| {
+///
+/// `cas_signal` is `Some` exactly when a `CasWriteQueue` for THIS scan may
+/// still be draining in the background when this call happens -- today,
+/// that is only `run_cold`'s own call chain (`TypeflowCache::build_full`
+/// and `analyze_one`, both invoked while the cold scan's queue has been
+/// taken out of `CatalogScanOutcome` but not yet `join`ed, see
+/// `scan::run_full`'s own doc comment for why the join is deliberately
+/// deferred). `None` for every caller whose blobs are already known
+/// durable: `delta.rs`'s incremental path writes CAS blobs SYNCHRONOUSLY
+/// (`Walker::observe_paths(..., Some(&cas_store))`, a bare `CasStore`, not
+/// a `CasWriteQueue` -- confirmed by reading `delta.rs` directly) before
+/// `analyze::run_incremental` is ever called, so there is no queue to wait
+/// on; `residual.rs`'s background pass runs strictly after its owning
+/// scan's `ScanCompleted` (which itself is strictly after that scan's own
+/// `cas_write_queue.join()`, see `scan::run_full`), so every blob it reads
+/// was written (by that scan, or an earlier one) long before the pass
+/// starts.
+pub(crate) fn read_owner_source_text(
+    owner: &SourceInput,
+    cas_signal: Option<&CasWrittenSignal>,
+) -> Result<String, ScanError> {
+    if let Some(signal) = cas_signal {
+        signal
+            .wait_written(&owner.content_digest, CAS_WRITE_WAIT_TIMEOUT)
+            .map_err(|error| {
+                ScanError(format!(
+                    "cannot read source blob for {}: {error}",
+                    owner.path
+                ))
+            })?;
+    }
+    let bytes = std::fs::read(&owner.source_blob_path).map_err(|error| {
         ScanError(format!(
             "cannot read source blob for {}: {error}",
             owner.path
@@ -314,6 +334,7 @@ fn exported_surface(file: &SyntaxFileResult) -> BTreeSet<ExportedSurfaceEntry> {
     surface
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_scoped(
     files: Vec<SourceInput>,
     config_assets: Vec<ConfigAssetInput>,
@@ -322,6 +343,7 @@ pub fn run_scoped(
     change_set: AuthoritativeChangeSet,
     clock: &mut ScanClock,
     typeflow: &mut super::typeflow::TypeflowCache,
+    cas_signal: Option<&CasWrittenSignal>,
 ) -> Result<ColdAnalysis, ScanError> {
     if files.is_empty() {
         return Ok(ColdAnalysis { owners: Vec::new() });
@@ -667,7 +689,7 @@ pub fn run_scoped(
         reset_ambiguous_ambient_would_be_external_count();
     }
     let hybrid_call_started = std::time::Instant::now();
-    let hybrid_results = run_hybrid_semantics(&hybrid_owners, &ctx)?;
+    let hybrid_results = run_hybrid_semantics(&hybrid_owners, &ctx, cas_signal)?;
     if debug_timing {
         eprintln!(
             "[urdira-indexing-worker] v4 resolve hybrid_semantics: {:.3}s affected_paths={} hybrid_owners={}",
@@ -865,6 +887,7 @@ pub fn run_cold(
     workspace_id: &str,
     syntax: &mut SyntaxWorkerState,
     clock: &mut ScanClock,
+    cas_signal: &CasWrittenSignal,
 ) -> Result<
     (
         ColdAnalysis,
@@ -876,7 +899,8 @@ pub fn run_cold(
     let cache = super::state::SourceCache::build_full(frontier, cas_root)?;
     let files_vec = cache.files_vec();
     let typeflow_build_started = std::time::Instant::now();
-    let mut typeflow_cache = super::typeflow::TypeflowCache::build_full(&files_vec)?;
+    let mut typeflow_cache =
+        super::typeflow::TypeflowCache::build_full(&files_vec, Some(cas_signal))?;
     if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
         eprintln!(
             "[urdira-indexing-worker] v4 typeflow build_full (DeclSummary extraction, {} files): {:.3}s",
@@ -892,6 +916,7 @@ pub fn run_cold(
         AuthoritativeChangeSet::Full,
         clock,
         &mut typeflow_cache,
+        Some(cas_signal),
     )?;
     Ok((analysis, cache, typeflow_cache))
 }
@@ -921,6 +946,11 @@ pub fn run_incremental(
     clock: &mut ScanClock,
     typeflow: &mut super::typeflow::TypeflowCache,
 ) -> Result<ColdAnalysis, ScanError> {
+    // `None`: `delta::run` (this function's only production caller) writes
+    // every changed path's CAS blob SYNCHRONOUSLY, via a bare `CasStore`
+    // (`Walker::observe_paths(..., Some(&cas_store))`), before this is ever
+    // called -- there is no background queue to wait on here. See
+    // `read_owner_source_text`'s own doc comment for the full reasoning.
     run_scoped(
         files,
         config_assets,
@@ -931,6 +961,7 @@ pub fn run_incremental(
         },
         clock,
         typeflow,
+        None,
     )
 }
 
@@ -944,18 +975,20 @@ pub fn run_incremental(
 fn run_hybrid_semantics(
     owners: &[&SourceInput],
     ctx: &HybridResolutionContext<'_>,
+    cas_signal: Option<&CasWrittenSignal>,
 ) -> Result<Vec<(String, urdira_jsts_syntax_worker::OwnerSemantics)>, ScanError> {
     owners
         .par_iter()
-        .map(|owner| analyze_one(owner, ctx))
+        .map(|owner| analyze_one(owner, ctx, cas_signal))
         .collect()
 }
 
 fn analyze_one(
     owner: &SourceInput,
     ctx: &HybridResolutionContext<'_>,
+    cas_signal: Option<&CasWrittenSignal>,
 ) -> Result<(String, urdira_jsts_syntax_worker::OwnerSemantics), ScanError> {
-    let text = read_owner_source_text(owner)?;
+    let text = read_owner_source_text(owner, cas_signal)?;
     let semantics =
         analyze_owner_semantics_with_context(&owner.path, &text, ctx).map_err(|error| {
             ScanError(format!(

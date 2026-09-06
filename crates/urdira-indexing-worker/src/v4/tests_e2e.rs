@@ -93,12 +93,18 @@ fn run_cold_scan(scratch: &Path) -> ColdScanOutput {
 
     let mut clock = ScanClock::start();
     let mut syntax = urdira_jsts_syntax_worker::SyntaxWorkerState::default();
+    let cas_signal = outcome
+        .cas_write_queue
+        .as_ref()
+        .expect("run_full_scan always populates cas_write_queue")
+        .signal();
     let (analysis, _source_cache, _typeflow_cache) = analyze::run_cold(
         &outcome.frontier,
         &cas_root,
         "workspace:v4-e2e-test",
         &mut syntax,
         &mut clock,
+        &cas_signal,
     )
     .expect("analyze succeeds");
     assert!(!analysis.owners.is_empty(), "no JS/TS owners were analyzed");
@@ -1337,12 +1343,18 @@ fn unaffected_transitive_importer_produces_identical_records_across_an_increment
 
     let mut clock = ScanClock::start();
     let mut syntax = SyntaxWorkerState::default();
+    let cas_signal = outcome
+        .cas_write_queue
+        .as_ref()
+        .expect("run_full_scan always populates cas_write_queue")
+        .signal();
     let (cold_analysis, _cache, _typeflow_cache) = analyze::run_cold(
         &outcome.frontier,
         &cas_root,
         workspace_id,
         &mut syntax,
         &mut clock,
+        &cas_signal,
     )
     .expect("cold analyze succeeds");
     let cold_a_records: Vec<urdira_jsts_syntax_worker::ProposedRecord> = cold_analysis
@@ -1470,8 +1482,9 @@ fn unaffected_transitive_importer_produces_identical_records_across_an_increment
             .expect("source cache builds"),
     );
     let source_cache = workspace_state.source_cache.as_ref().unwrap();
-    let mut typeflow_cache = super::typeflow::TypeflowCache::build_full(&source_cache.files_vec())
-        .expect("typeflow cache builds");
+    let mut typeflow_cache =
+        super::typeflow::TypeflowCache::build_full(&source_cache.files_vec(), None)
+            .expect("typeflow cache builds");
 
     let mut incremental_clock = ScanClock::start();
     let incremental_analysis = analyze::run_incremental(
@@ -1706,12 +1719,18 @@ fn surface_unchanged_edit_narrows_the_affected_closure_to_the_literal_edit() {
 
     let mut clock = ScanClock::start();
     let mut syntax = SyntaxWorkerState::default();
+    let cas_signal = outcome
+        .cas_write_queue
+        .as_ref()
+        .expect("run_full_scan always populates cas_write_queue")
+        .signal();
     let (cold_analysis, _cache, _typeflow_cache) = analyze::run_cold(
         &outcome.frontier,
         &cas_root,
         workspace_id,
         &mut syntax,
         &mut clock,
+        &cas_signal,
     )
     .expect("cold analyze succeeds");
     let materialized =
@@ -1810,8 +1829,9 @@ fn surface_unchanged_edit_narrows_the_affected_closure_to_the_literal_edit() {
             .expect("source cache builds"),
     );
     let source_cache = workspace_state.source_cache.as_ref().unwrap();
-    let mut typeflow_cache = super::typeflow::TypeflowCache::build_full(&source_cache.files_vec())
-        .expect("typeflow cache builds");
+    let mut typeflow_cache =
+        super::typeflow::TypeflowCache::build_full(&source_cache.files_vec(), None)
+            .expect("typeflow cache builds");
 
     let mut incremental_clock = ScanClock::start();
     let incremental_analysis = analyze::run_incremental(
@@ -4156,12 +4176,18 @@ fn n8n_references_parity_debug_dump() {
 
     let mut clock = ScanClock::start();
     let mut syntax = SyntaxWorkerState::default();
+    let cas_signal = outcome
+        .cas_write_queue
+        .as_ref()
+        .expect("run_full_scan always populates cas_write_queue")
+        .signal();
     let (analysis, _source_cache, _typeflow_cache) = analyze::run_cold(
         &outcome.frontier,
         &cas_root,
         workspace_id,
         &mut syntax,
         &mut clock,
+        &cas_signal,
     )
     .expect("analyze succeeds");
     eprintln!(
