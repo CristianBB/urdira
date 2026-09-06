@@ -1463,8 +1463,13 @@ export interface ExportV4IndexPackOptions {
   readonly now?: () => string;
 }
 
-/** Thrown by `exportV4IndexPack` when the catalog's `current_generation` changed between the start and the end of the export (a concurrent scan published mid-export) -- see that function's doc comment. */
-export class IndexPackExportRaceError extends Error {}
+/** Thrown by `exportV4IndexPack` when the catalog's `current_generation` changed between the start and the end of the export (a concurrent scan published mid-export) -- see that function's doc comment. An explicit `name` (the default `Error` subclass leaves `.name === "Error"`) matters here because this error crosses a `node:worker_threads` boundary as a plain serialized `{ name, message, code }` (`index-pack-export-v4-worker-thread.ts`'s `errorDetails`/`index-pack-export-v4-thread.ts`'s `threadError`) before `core:index_pack_export`'s handler (`packages/daemon/src/runtime.ts`) can decide whether to retry -- without a distinguishing name that decision would have no reliable signal to key off besides matching the message string. */
+export class IndexPackExportRaceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IndexPackExportRaceError";
+  }
+}
 
 async function readV4CurrentGeneration(databasePath: string, workspaceId: string): Promise<number> {
   const database = await openSqliteDatabase({ filename: databasePath, read_only: true });

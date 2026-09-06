@@ -652,6 +652,49 @@ function waitForReadinessChanged(workspaceId: string, timeoutMs: number, signal:
   });
 }
 
+/** `core:index_pack_export` (Frente P-1 fix, 2026-09-06): the bound on how
+ * long the handler waits for `scanInFlight` to clear -- both for the initial
+ * gate (a scan that has already called `registry.markReady` but not yet run
+ * its own `scanInFlight.delete`) and between retries of an actual export
+ * race. Generous relative to the measured live window (2-15ms) so it easily
+ * absorbs a genuinely busy but SHORT scan tail too, while still bounded well
+ * under a typical request timeout so a truly long-running concurrent scan
+ * (a real edit-triggered reconcile) surfaces the ordinary lifecycle error
+ * instead of hanging the RPC. Always additionally capped at the request's
+ * own `deadline_at`. */
+const INDEX_PACK_EXPORT_SCAN_SETTLE_WAIT_MS = 10_000;
+/** `core:index_pack_export`: how many times to retry the whole export from
+ * scratch after `exportV4IndexPack` reports `IndexPackExportRaceError` (its
+ * own end-of-walk generation check found a concurrent scan published mid-
+ * export) before giving up and surfacing the race to the caller. */
+const INDEX_PACK_EXPORT_MAX_ATTEMPTS = 3;
+
+/**
+ * Waits, bounded by `deadlineMs`, for `scanInFlight` to stop containing
+ * `workspaceId` -- used by `core:index_pack_export` (Frente P-1 fix,
+ * 2026-09-06) so a request that lands in the brief window between
+ * `workspace.status` flipping to `"ready"` (`registry.markReady`, inside
+ * `runV4WorkspaceScan`) and that SAME scan's `scanInFlight.delete` a little
+ * later (the scan job's own cleanup -- e.g. closing its now-unused
+ * `WorkspaceDatabase` handle -- is a real, awaited disk operation, not free)
+ * does not fail outright for a scan that has, in truth, already published
+ * its final generation. Also doubles as the wait between export attempts
+ * when a GENUINE concurrent scan republished mid-walk
+ * (`IndexPackExportRaceError`): the same bounded polling loop, reused rather
+ * than duplicated, covers both cases. Returns `true` once no scan is in
+ * flight, `false` if the deadline (or the caller's abort signal) was hit
+ * first while a scan was still running.
+ */
+async function waitForScanSettled(workspaceId: string, scanInFlight: ReadonlySet<string>, signal: AbortSignal, deadlineMs: number): Promise<boolean> {
+  while (scanInFlight.has(workspaceId)) {
+    if (signal.aborted) return false;
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) return false;
+    await waitForReadinessChanged(workspaceId, Math.max(1, Math.min(500, remainingMs)), signal);
+  }
+  return true;
+}
+
 function queryFreshnessWait(payload: unknown): { readonly requested: boolean; readonly timeoutMs: number } {
   const request = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
   const options = request["options"] !== null && typeof request["options"] === "object" && !Array.isArray(request["options"]) ? request["options"] as Record<string, unknown> : {};
@@ -4428,7 +4471,28 @@ export class DaemonRuntime {
           // pins `status` to `"indexing"` first). Exporting mid-scan would
           // read a `merkle_roots`/`snapshots` row for a generation whose
           // `structural/` files a concurrent scan is still rewriting.
-          if (scanInFlight.has(workspace.workspace_id)) throw new DaemonError("core:workspace_lifecycle", "Workspace has a scan in progress; index pack export requires no scan in flight.");
+          //
+          // Fix (2026-09-06, live evidence in
+          // `tests/phase-daemon-v4-index-pack.test.ts`): rejecting the very
+          // instant `scanInFlight` is observed true is too eager. `registry
+          // .markReady` (inside `runV4WorkspaceScan`) flips `workspace.status`
+          // to `"ready"` several lines BEFORE that same scan's own
+          // `scanInFlight.delete` runs -- the scan job's `finally` still has
+          // to close its (by then unused) per-scan `WorkspaceDatabase` handle,
+          // a real, awaited disk operation. Measured live: ~2-15ms. A caller
+          // that polls `core:index_status` until `"ready"` and immediately
+          // calls `core:index_pack_export` next (exactly what `workspace-add
+          // --index-pack`'s donor-export step does, and what this suite's own
+          // `pollUntilReady` does) can land inside that window and see a scan
+          // "in progress" that has, in truth, already produced its final,
+          // consistent generation. Waiting (bounded -- so a genuinely
+          // long-running concurrent scan still surfaces the lifecycle error
+          // below instead of hanging the whole RPC) for `scanInFlight` to
+          // clear turns that spurious failure into a few-millisecond delay.
+          const scanSettleDeadlineMs = Math.min(Date.now() + INDEX_PACK_EXPORT_SCAN_SETTLE_WAIT_MS, Date.parse(context.deadline_at));
+          if (!(await waitForScanSettled(workspace.workspace_id, scanInFlight, context.signal, scanSettleDeadlineMs))) {
+            throw new DaemonError("core:workspace_lifecycle", "Workspace has a scan in progress; index pack export requires no scan in flight.");
+          }
           const requireGitClean = values["require-git-clean"] === "true";
           // v4 (native structural store) branches to a completely different
           // export container (`exportV4IndexPack`, a single gzip file of
@@ -4441,14 +4505,39 @@ export class DaemonRuntime {
           const structuralStoreKind = await readStructuralStore(structuralStoreDatabase.database).finally(() => structuralStoreDatabase.close().catch(() => undefined));
           if (structuralStoreKind === "native") {
             const databasePath = indexingStorage.defaultWorkspaceDatabasePath(workspace.workspace_id);
-            const resultV4 = await runIndexPackExportV4InThread({
-              database_path: databasePath,
-              structural_root: structuralStoreDirFor(databasePath),
-              sidecar_root: sidecarScanDirFor(databasePath),
-              workspace_id: workspace.workspace_id,
-              out_path: outPath,
-              ...(requireGitClean ? { require_git_clean: true, canonical_root: workspace.canonical_root } : {}),
-            });
+            // `exportV4IndexPack` (inside the worker thread) independently
+            // guards against a concurrent scan publishing a NEW generation
+            // while the export's own file walk is in flight -- it re-reads
+            // `current_generation` after the walk and throws
+            // `IndexPackExportRaceError` (name preserved across the thread
+            // boundary, see that class's doc comment) if it moved. That is a
+            // genuine race distinct from the gate above (a second scan that
+            // started AFTER the wait above already cleared): retry the whole
+            // export from scratch, waiting for the new scan to settle first,
+            // up to `INDEX_PACK_EXPORT_MAX_ATTEMPTS` times, before finally
+            // surfacing the race to the caller. Every attempt that succeeds
+            // is, by that same internal check, a single consistent
+            // generation's worth of `roots`/`structural/` files -- there is
+            // no separate re-verification to do here.
+            let resultV4: Awaited<ReturnType<typeof runIndexPackExportV4InThread>> | undefined;
+            for (let attempt = 1; ; attempt++) {
+              try {
+                resultV4 = await runIndexPackExportV4InThread({
+                  database_path: databasePath,
+                  structural_root: structuralStoreDirFor(databasePath),
+                  sidecar_root: sidecarScanDirFor(databasePath),
+                  workspace_id: workspace.workspace_id,
+                  out_path: outPath,
+                  ...(requireGitClean ? { require_git_clean: true, canonical_root: workspace.canonical_root } : {}),
+                });
+                break;
+              } catch (error) {
+                const isRace = error instanceof Error && error.name === "IndexPackExportRaceError";
+                if (!isRace || attempt >= INDEX_PACK_EXPORT_MAX_ATTEMPTS) throw error;
+                const retryDeadlineMs = Math.min(Date.now() + INDEX_PACK_EXPORT_SCAN_SETTLE_WAIT_MS, Date.parse(context.deadline_at));
+                await waitForScanSettled(workspace.workspace_id, scanInFlight, context.signal, retryDeadlineMs);
+              }
+            }
             return { workspace_id: workspace.workspace_id, out_path: resultV4.pack_path, generation: resultV4.manifest.generation, bytes: (await stat(resultV4.pack_path)).size, roots: resultV4.manifest.roots };
           }
           // The export runs in its own worker thread with its own storage

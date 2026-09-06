@@ -186,7 +186,7 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
 
       const packPath = join(donor.dataRoot, "export.urdira-index-pack-v4");
       const exported = await donor.client.call("core:index_pack_export", { args: [workspaceId, packPath], confirmed: true });
-      expect(exported.outcome).toBe("success");
+      expect(exported.outcome, JSON.stringify(exported)).toBe("success");
       const payload = exported.payload as { readonly out_path: string; readonly generation: number; readonly bytes: number; readonly roots: Readonly<Record<string, string>> };
       expect(payload.out_path).toBe(packPath);
       expect(payload.generation).toBeGreaterThan(0);
@@ -249,7 +249,7 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
 
       const packPath = join(donor.dataRoot, "noop.urdira-index-pack-v4");
       const exportResult = await donor.client.call("core:index_pack_export", { args: [donorWorkspaceId, packPath], confirmed: true });
-      expect(exportResult.outcome).toBe("success");
+      expect(exportResult.outcome, JSON.stringify(exportResult)).toBe("success");
 
       const importerAdded = await importer.client.call("core:workspace_add", { args: [importerRoot], values: { "index-pack": packPath }, confirmed: true });
       expect(importerAdded.outcome).toBe("success");
@@ -310,7 +310,7 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
 
       const packPath = join(donor.dataRoot, "delta.urdira-index-pack-v4");
       const exportResult = await donor.client.call("core:index_pack_export", { args: [donorWorkspaceId, packPath], confirmed: true });
-      expect(exportResult.outcome).toBe("success");
+      expect(exportResult.outcome, JSON.stringify(exportResult)).toBe("success");
 
       // A real, queryable content change in the IMPORTER's own tree (not the
       // donor's, whose pack is already frozen): a NEW exported class the
@@ -428,7 +428,7 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
 
       const packPath = join(donor.dataRoot, "mid-rename-failure.urdira-index-pack-v4");
       const exportResult = await donor.client.call("core:index_pack_export", { args: [donorWorkspaceId, packPath], confirmed: true });
-      expect(exportResult.outcome).toBe("success");
+      expect(exportResult.outcome, JSON.stringify(exportResult)).toBe("success");
 
       // A local-only symbol the donor's frozen snapshot never saw -- proves
       // the eventual `ready` workspace is genuinely re-derived from the
