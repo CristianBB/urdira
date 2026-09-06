@@ -115,13 +115,58 @@ pub(crate) fn blob_path(cas_root: &Path, content_hash: &str) -> Result<String, S
     Ok(cas_root.join(relative).to_string_lossy().into_owned())
 }
 
+/// A cold scan's `CasWriteQueue` (`catalog::run_full_scan`) is deliberately
+/// joined only after `publish::publish_cold`/`publish_cold_partitioned`
+/// returns (see `scan::run_full`'s own doc comment: writes are meant to
+/// overlap analyze/materialize/publish's CPU-bound work, not sit on the
+/// walk's critical path). That means a background worker can still be
+/// mid-write for a given owner's blob when [`read_owner_source_text`] below
+/// tries to read it -- a genuine, reproduced (`URDIRA_DIAGNOSTIC_CAS_DELAY_MS`-
+/// forced, then confirmed at natural timing) race, not a test-fixture
+/// artifact: `cargo test -p urdira-indexing-worker` with default (parallel)
+/// test threads intermittently failed
+/// `incremental_{create,delete}_roots_match_a_from_scratch_scan_of_the_
+/// mutated_tree` with exactly `std::io::ErrorKind::NotFound` here, on a
+/// SINGLE test running with no other test concurrently in flight, once the
+/// background write was artificially delayed -- proof this is not a shared-
+/// scratch-directory collision between tests (each test's `cas_root` is
+/// already unique), but an intra-scan ordering hazard between this read and
+/// its own scan's still-draining write queue, whose probability rises with
+/// system-wide scheduler contention (many parallel test processes/threads
+/// competing for the same cores). Retrying briefly on `NotFound` closes the
+/// window at zero cost in the overwhelmingly common case (the blob is
+/// already there on the first try) while giving a delayed background writer
+/// a bounded chance to catch up: 200 attempts x 5ms = at most 1s of extra
+/// wait, comfortably above any write latency observed even under heavy
+/// contention, and small next to a cold scan's total wall time. A `NotFound`
+/// that persists past the ceiling still surfaces as the same fatal error as
+/// before (a genuinely missing/corrupt blob is a real bug, not something to
+/// paper over indefinitely).
+fn read_blob_with_retry(path: &Path) -> std::io::Result<Vec<u8>> {
+    const MAX_ATTEMPTS: u32 = 200;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+    let mut attempt = 0u32;
+    loop {
+        match std::fs::read(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && attempt < MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Reads and hash-verifies an owner's source bytes (same check as
 /// `main.rs`'s private `read_owner_source_text`, main.rs:817-833 -- this is
 /// an independent copy for the same isolation reason as the predicates
 /// above). `pub(crate)`: `v4::typeflow` also needs this to read a changed
 /// owner's text when (re)building its `DeclSummary` (P2-2e).
 pub(crate) fn read_owner_source_text(owner: &SourceInput) -> Result<String, ScanError> {
-    let bytes = std::fs::read(&owner.source_blob_path).map_err(|error| {
+    let bytes = read_blob_with_retry(Path::new(&owner.source_blob_path)).map_err(|error| {
         ScanError(format!(
             "cannot read source blob for {}: {error}",
             owner.path
