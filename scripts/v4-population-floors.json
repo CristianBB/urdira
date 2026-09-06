@@ -1,0 +1,65 @@
+{
+  "_generated": "2026-09-06, flecos-v4 F.1 (plan §3.1/§3.2). `floor` = 0.99 x the accepted n8n figure (plan §0 rule R5). `ratio` = 0.99 x the v4/v3 ratio observed between the accepted n8n figures (plan §3.2, ronda-3 evidence) and v3's own oracle kind histogram in docs/evidence/2026-09-02-v4-p0-s4-promotion-gap.md ('Top record_occurrences.kind by count') -- that v3 dump is a DIFFERENT corpus/run than the v4 ronda-3 figures, so the ratio is explicitly provisional, per the plan's own wording ('ratios provisionales'), not a same-scan cross-check. `ratio: 0` means 'no ratio gate for this row, only the absolute floor is enforced' -- see each entry's own `_note` for why.",
+  "kinds": {
+    "jsts:entity_callable": {
+      "floor": 29921,
+      "ratio": 1.8846,
+      "v3_kind": "jsts:entity_callable",
+      "_note": "v4 accepted 30,224 / v3 15,879 = 1.9036; ratio stored at 0.99x = 1.8846."
+    },
+    "jsts:entity_container": {
+      "floor": 14847,
+      "ratio": 1.0543,
+      "v3_kind": "jsts:entity_container",
+      "_note": "v4 accepted 14,997 / v3 14,082 = 1.0650; ratio stored at 0.99x = 1.0543."
+    },
+    "jsts:entity_parameter": {
+      "floor": 74021,
+      "ratio": 0,
+      "v3_kind": null,
+      "_note": "v3 never materialized a standalone parameter-entity population (absent from the 2026-09-02 v3 oracle's own top-kind-by-count table) -- this is a v4-only population added 2026-09-04, no ratio derivable, hence 0. The floor itself is PROVISIONAL (0.99x 74,769, the OLD 'referenced-only' accepted figure) until F.2's own n8n measurement (plan §0 rule R5) re-pins it to 0.99x the freshly measured 'every declaration' population -- expected to only go UP, since F.2 strictly adds unreferenced-parameter entities on top of the old population."
+    },
+    "jsts:entity_type": {
+      "floor": 14047,
+      "ratio": 1.1086,
+      "v3_kind": "jsts:entity_type",
+      "_note": "v4 accepted 14,189 / v3 12,671 = 1.1198; ratio stored at 0.99x = 1.1086."
+    },
+    "jsts:entity_variable": {
+      "floor": 238491,
+      "ratio": 1.1255,
+      "v3_kind": "jsts:entity_variable",
+      "_note": "v4 accepted 240,900 / v3 211,909 = 1.1368; ratio stored at 0.99x = 1.1255."
+    },
+    "jsts:relation_contains": {
+      "floor": 396483,
+      "ratio": 1.6489,
+      "v3_kind": "jsts:relation_contains",
+      "_note": "v4 accepted 400,488 / v3 240,459 = 1.6655; ratio stored at 0.99x = 1.6489."
+    },
+    "jsts:relation_references": {
+      "floor": 1205324,
+      "ratio": 1.0853,
+      "v3_kind": "jsts:relation_references",
+      "_note": "v4 accepted 1,217,499 / v3 1,110,576 = 1.0963; ratio stored at 0.99x = 1.0853."
+    },
+    "external_module": {
+      "floor": 905,
+      "ratio": 0,
+      "v3_kind": null,
+      "_note": "v4-only population (2026-09-04 external package/symbol entities task) -- v3 has no external-module entity kind at all, no ratio derivable."
+    },
+    "external_symbol": {
+      "floor": 3780,
+      "ratio": 0,
+      "v3_kind": null,
+      "_note": "same as external_module: v4-only population, no v3 analog, no ratio derivable."
+    },
+    "records_total": {
+      "floor": 2165060,
+      "ratio": 0,
+      "v3_kind": null,
+      "_note": "v3's own record_occurrences total (docs/evidence/2026-09-02-v4-p0-s4-promotion-gap.md: 3,192,089) mixes in ~697k residual-diagnostic rows from a FULLY-residualized snapshot, while v4's accepted total is a COLD (pre-residual) count -- not a comparable denominator. The script still prints v3's raw total for reference (queried directly, ignoring v3_kind) but skips the ratio gate (ratio 0); only the absolute floor is enforced for this row."
+    }
+  }
+}

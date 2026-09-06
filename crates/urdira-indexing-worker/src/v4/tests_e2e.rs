@@ -590,6 +590,450 @@ fn cold_scan_materializes_referenced_parameter_entities_and_resolves_their_targe
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// F.2 fidelity fixture (2026-09-06, flecos v4 plan §3.3): EVERY declared
+/// identifier-pattern parameter must materialize a `jsts:entity_parameter`
+/// entity now, regardless of whether the body ever references it -- see
+/// `OwnerSemantics::parameter_entity_rows`'s own doc comment (`urdira-jsts-
+/// syntax-worker::semantic_sites`) for the "every declaration" rule this
+/// test guards as a CI regression net. Before this task, only
+/// `cold_scan_materializes_referenced_parameter_entities_and_resolves_their_
+/// target_subject` (above) existed, and it only ever exercised REFERENCED
+/// parameters -- an unread one (`b` here, `y` here) would previously have
+/// produced NO entity at all, exactly the gap `get_outline` cannot tolerate.
+/// Exercises three owner shapes in one fixture: a plain function declaration
+/// (`f(a, b, c)`, `b` never read), a class method (`Box::m(x, y)`, `y` never
+/// read), and a destructured arrow parameter (`make`) that must still
+/// produce NOTHING -- `classify_symbol_declaration`'s `FormalParameter` arm
+/// only ever resolves a simple `BindingIdentifier` pattern, unaffected by
+/// this task.
+#[test]
+fn cold_scan_materializes_every_declared_parameter_in_declaration_order_whether_or_not_referenced()
+{
+    let scratch = scratch_dir("every-parameter");
+    let workspace_root = scratch.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+    let source = concat!(
+        "function f(a, b, c) {\n",
+        "  return a + c;\n",
+        "}\n",
+        "\n",
+        "class Box {\n",
+        "  m(x, y) {\n",
+        "    return x;\n",
+        "  }\n",
+        "}\n",
+        "\n",
+        "const make = ({ first, second }) => first;\n",
+    );
+    std::fs::write(workspace_root.join("params.ts"), source).expect("write params.ts");
+
+    let database_path = scratch.join("workspace.sqlite");
+    let structural_root = scratch.join("structural");
+    let cas_root = scratch.join("cas");
+    let workspace_id = "workspace:every-parameter";
+
+    let mut conn = catalog::open_and_ensure_schema(&database_path).expect("schema opens");
+    let outcome = catalog::run_full_scan(&mut conn, workspace_id, &workspace_root, &cas_root, 1)
+        .expect("cold catalog scan succeeds");
+    catalog::restore_steady_state_pragmas(&conn).expect("restoring pragmas succeeds");
+
+    let mut clock = ScanClock::start();
+    let mut syntax = SyntaxWorkerState::default();
+    let cas_signal = outcome
+        .cas_write_queue
+        .as_ref()
+        .expect("run_full_scan always populates cas_write_queue")
+        .signal();
+    let (cold_analysis, _cache, _typeflow_cache) = analyze::run_cold(
+        &outcome.frontier,
+        &cas_root,
+        workspace_id,
+        &mut syntax,
+        &mut clock,
+        &cas_signal,
+    )
+    .expect("cold analyze succeeds");
+
+    let materialized =
+        materialize::materialize_cold(cold_analysis.owners).expect("materialize succeeds");
+    let request = scan::ScanRequest {
+        request_id: "request:every-parameter".to_string(),
+        workspace_id: workspace_id.to_string(),
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        database_path: database_path.to_string_lossy().into_owned(),
+        structural_root: structural_root.to_string_lossy().into_owned(),
+        cas_root: cas_root.to_string_lossy().into_owned(),
+        sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+        scope: ScanScope::Full,
+        registry_snapshot_id: "registry:every-parameter".to_string(),
+        configuration_revision_id: "configuration:every-parameter".to_string(),
+        resolution_lock_id: "resolution:every-parameter".to_string(),
+        deadline_ms: None,
+        priority: ScanPriority::Interactive,
+    };
+    let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+    publish::publish_cold(
+        &mut conn,
+        &request,
+        &structural_root,
+        1,
+        &outcome,
+        materialized,
+        &mut clock,
+        &mut on_queryable,
+    )
+    .expect("publish succeeds");
+
+    let reader =
+        StoreReader::open(&structural_root).expect("StoreReader opens the published store");
+    let generation = reader.generation();
+    assert_eq!(generation, 1, "this test asserts a COLD-generation fact");
+    let dicts = reader.dictionaries();
+
+    // Collect every `jsts:entity_parameter` entity, keyed by its own
+    // one-letter name (the identity key's final `:`-delimited segment),
+    // along with its own record id (for `core:contains`/`core:references`
+    // target lookups below) and span start (for the declaration-order
+    // assertion).
+    struct Found {
+        record_id: [u8; 32],
+        start: u32,
+    }
+    let mut by_name: std::collections::BTreeMap<&'static str, Found> = Default::default();
+    for view in reader.iter_visible(generation) {
+        if view.category() != urdira_structural_store::row::CATEGORY_ENTITY {
+            continue;
+        }
+        let identity_key = view.identity_key();
+        if !identity_key.starts_with(b"jsts:parameter:") {
+            continue;
+        }
+        for name in ["a", "b", "c", "x", "y"] {
+            if identity_key.ends_with(format!(":{name}").as_bytes()) {
+                by_name.insert(
+                    name,
+                    Found {
+                        record_id: view.record_id(),
+                        start: view.span_start_byte(),
+                    },
+                );
+            }
+        }
+    }
+    for name in ["a", "b", "c", "x", "y"] {
+        assert!(
+            by_name.contains_key(name),
+            "expected a jsts:entity_parameter for {name:?}, found: {:?}",
+            by_name.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Declaration order within each callable: `a` before `b` before `c`
+    // (function `f`), `x` before `y` (method `Box::m`) -- `b`/`y` are never
+    // referenced, yet still materialize AND still sort correctly.
+    assert!(
+        by_name["a"].start < by_name["b"].start,
+        "expected a's span to start before b's"
+    );
+    assert!(
+        by_name["b"].start < by_name["c"].start,
+        "expected b's span to start before c's"
+    );
+    assert!(
+        by_name["x"].start < by_name["y"].start,
+        "expected x's span to start before y's"
+    );
+
+    // Every one of the five has a `core:contains` row from SOME parent
+    // targeting it (the exact `parent_id` resolution rule is already pinned
+    // by the unit tests in `semantic_sites.rs`; this fixture only guards the
+    // population/order invariant end-to-end through a real cold scan).
+    let contains_target = |target_record_id: &[u8; 32]| -> bool {
+        reader.iter_visible(generation).any(|view| {
+            if view.category() != urdira_structural_store::row::CATEGORY_RELATION {
+                return false;
+            }
+            let universal_kind = dicts
+                .universal_kinds
+                .get(view.universal_kind_id() as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            if universal_kind != "core:contains" {
+                return false;
+            }
+            let Some(target_subject) = view.target_subject() else {
+                return false;
+            };
+            dicts.subjects.get(target_subject as usize) == Some(target_record_id)
+        })
+    };
+    for name in ["a", "b", "c", "x", "y"] {
+        assert!(
+            contains_target(&by_name[name].record_id),
+            "expected a core:contains row targeting parameter {name:?}"
+        );
+    }
+
+    // `a`/`c` are referenced in the body -- a `core:references` relation
+    // must still resolve to each, exactly as it did before this task (the
+    // "referenced-only" filter that used to gate ENTITY materialization
+    // never gated reference resolution itself).
+    let references_target = |target_record_id: &[u8; 32]| -> bool {
+        reader.iter_visible(generation).any(|view| {
+            if view.category() != urdira_structural_store::row::CATEGORY_RELATION {
+                return false;
+            }
+            let universal_kind = dicts
+                .universal_kinds
+                .get(view.universal_kind_id() as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            if universal_kind != "core:references" {
+                return false;
+            }
+            let Some(target_subject) = view.target_subject() else {
+                return false;
+            };
+            dicts.subjects.get(target_subject as usize) == Some(target_record_id)
+        })
+    };
+    for name in ["a", "c"] {
+        assert!(
+            references_target(&by_name[name].record_id),
+            "expected a core:references relation resolved to parameter {name:?}"
+        );
+    }
+
+    // Destructured arrow parameter (`{ first, second }`) never materializes
+    // an entity at all -- unaffected by this task (only a simple identifier-
+    // pattern parameter, `classify_symbol_declaration`'s `FormalParameter`
+    // arm, is ever a candidate).
+    let has_destructured_entity = reader.iter_visible(generation).any(|view| {
+        view.category() == urdira_structural_store::row::CATEGORY_ENTITY
+            && (view.identity_key().ends_with(b":first")
+                || view.identity_key().ends_with(b":second"))
+    });
+    assert!(
+        !has_destructured_entity,
+        "a destructured arrow parameter must never materialize a parameter entity"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Adversarial-review addition (2026-09-06, flecos v4 plan §3.3, incremental
+/// path): F.2 made EVERY declared parameter materialize an entity, cold AND
+/// incremental (both funnel through the SAME `analyze::run_scoped`, see its
+/// call sites in `run_cold`/`run_incremental`) -- but no existing test
+/// exercised the specific "EDIT that adds a brand-new, NEVER-referenced
+/// parameter to an existing owner" shape end-to-end through `ScanScope::
+/// Changed`. The generic `incremental_create_roots_match_a_from_scratch_
+/// scan_of_the_mutated_tree` family only ever adds/deletes/renames whole
+/// FILES, which never exercises record CHAINING (a brand-new identity's
+/// first-ever occurrence always uses the cold `record_id = sha256(digest)`
+/// recipe on both sides, incremental and oracle alike -- see decision 11).
+/// An in-place CONTENT edit of an EXISTING owner is different: any record
+/// whose digest changes across the edit (here, the file's own `jsts:
+/// module:...` container entity, whose digest embeds the file's length/
+/// content per `incremental_edit_produces_a_self_consistent_incremental_
+/// merkle_update`'s own doc comment) legitimately CHAINS (`record_id =
+/// H(digest || predecessor)`), so it can never be compared against an
+/// independent from-scratch oracle scan of the same final tree (that
+/// oracle's own chain history differs -- IT sees this identity for the
+/// first time ever, so it always assigns the cold recipe instead). This
+/// test therefore follows the SAME self-consistency pattern `incremental_
+/// edit_produces_a_self_consistent_incremental_merkle_update` already
+/// established (recompute the roots from the store's own final visible key
+/// set, rather than diffing against an unrelated oracle history), while
+/// directly asserting what an "open record never closed" leak (a stale
+/// generation-1 parameter record surviving alongside its generation-2
+/// replacement) would actually break: the FINAL live parameter-entity count
+/// for this owner is exactly two (`a`, `b`), each with exactly one live
+/// `core:contains` row from the function, never three (which a leaked
+/// stale generation-1 `a`-only-shaped record would produce).
+#[test]
+fn incremental_edit_adding_an_unreferenced_parameter_is_self_consistent() {
+    let scratch_root = scratch_dir("incremental-edit-unused-param");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    // A harness-owned file (never referenced from the rest of the fixture,
+    // same discipline `incremental_create_*` uses for its own created file)
+    // so this test's own mutation cannot perturb any OTHER test's asserted
+    // record counts for the shared fixture tree.
+    let edited_relative = "src/domain/urdira-harness-param-edit.ts";
+    let edited_absolute = workspace_root.join(edited_relative);
+    std::fs::write(
+        &edited_absolute,
+        "export function urdiraHarnessParamEdit_marker1(a) {\n  return a;\n}\n",
+    )
+    .expect("write initial harness file");
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-edit-unused-param",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+    let reader1 = StoreReader::open(&structural_root).expect("reader opens after cold");
+    let mut records_before: std::collections::HashMap<[u8; 32], [u8; 32]> =
+        std::collections::HashMap::new();
+    for view in reader1.iter_visible(1) {
+        records_before.insert(view.identity_key_digest(), view.record_id());
+    }
+    drop(reader1);
+
+    // Edit in place: add a SECOND parameter, `b`, that the body never reads
+    // -- exactly the case F.2 now materializes an entity for.
+    std::fs::write(
+        &edited_absolute,
+        "export function urdiraHarnessParamEdit_marker1(a, b) {\n  return a;\n}\n",
+    )
+    .expect("rewrite harness file with an added unreferenced parameter");
+
+    let incremental = run_scan(
+        "request:incremental-edit-unused-param",
+        "workspace:v4-e2e-edit-unused-param",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: edited_relative.to_string(),
+                kind: ChangeKind::Modified,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&incremental), 2);
+    let incremental_roots = roots_of(&incremental);
+
+    // Property 1 (same as `incremental_edit_produces_a_self_consistent_
+    // incremental_merkle_update`): the incrementally-updated roots equal a
+    // from-scratch rebuild over the STORE'S OWN final visible key set.
+    let reader2 = StoreReader::open(&structural_root).expect("reader opens after incremental");
+    let generation2 = reader2.generation();
+    assert_eq!(generation2, 2);
+    let (records_root_from_scratch, dependency_root_from_scratch) =
+        urdira_structural_store::recompute_roots_from_scratch(&reader2, generation2)
+            .expect("recompute_roots_from_scratch succeeds");
+    assert_eq!(
+        incremental_roots.records,
+        urdira_structural_store::to_prefixed_hex(&records_root_from_scratch),
+        "the incrementally-updated records root must equal a from-scratch rebuild over the SAME final key set"
+    );
+    assert_eq!(
+        incremental_roots.dependency,
+        urdira_structural_store::to_prefixed_hex(&dependency_root_from_scratch),
+        "the incrementally-updated dependency root must equal a from-scratch rebuild over the SAME final key set"
+    );
+    let graph_entries: Vec<_> = reader2
+        .iter_visible(generation2)
+        .filter(|view| view.category() == urdira_structural_store::row::CATEGORY_RELATION)
+        .map(|view| (view.record_id(), view.record_digest()))
+        .collect();
+    let graph_root_from_scratch =
+        urdira_structural_store::BucketedMerkleSet::from_sorted(&graph_entries)
+            .expect("graph merkle build succeeds")
+            .root();
+    assert_eq!(
+        incremental_roots.graph,
+        urdira_structural_store::to_prefixed_hex(&graph_root_from_scratch),
+        "the incrementally-updated graph root must equal a from-scratch rebuild over the SAME final key set"
+    );
+
+    // Property 2: every OTHER record (not this owner's own container/
+    // members, which legitimately chain across this edit) keeps its exact
+    // prior id -- same invariant the sibling self-consistency test checks.
+    let mut unchanged_checked = 0;
+    for view in reader2.iter_visible(generation2) {
+        if let Some(&prior_id) = records_before.get(&view.identity_key_digest())
+            && prior_id == view.record_id()
+        {
+            unchanged_checked += 1;
+        }
+    }
+    assert!(
+        unchanged_checked > 100,
+        "most of generation 1's records must survive this edit with their exact prior id \
+         (got {unchanged_checked}); an edit to one file should not reopen/rechain unrelated records"
+    );
+
+    // Property 3 (the actual leak check this test exists for): exactly TWO
+    // live `jsts:entity_parameter` entities for this owner post-edit -- `a`
+    // (unchanged/chained) and `b` (brand new) -- never three, which a
+    // leaked stale generation-1 `a`-only-shaped record would produce, and
+    // never one, which would mean `b` silently failed to materialize.
+    let param_prefix = format!("jsts:parameter:{edited_relative}:");
+    let live_param_count =
+        visible_entity_count_with_prefix(&structural_root, param_prefix.as_bytes());
+    assert_eq!(
+        live_param_count, 2,
+        "expected exactly the `a`/`b` parameter entities live after the incremental edit, got {live_param_count}"
+    );
+
+    // Property 4: each of the two live parameter entities has EXACTLY one
+    // live `core:contains` row from the function -- not zero (a dangling
+    // entity `get_outline` would never reach) and not two (a duplicate
+    // `contains` row from an unclosed generation-1 copy).
+    let dicts = reader2.dictionaries();
+    let contains_count_for = |target_record_id: &[u8; 32]| -> usize {
+        reader2
+            .iter_visible(generation2)
+            .filter(|view| {
+                if view.category() != urdira_structural_store::row::CATEGORY_RELATION {
+                    return false;
+                }
+                let universal_kind = dicts
+                    .universal_kinds
+                    .get(view.universal_kind_id() as usize)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if universal_kind != "core:contains" {
+                    return false;
+                }
+                let Some(target_subject) = view.target_subject() else {
+                    return false;
+                };
+                dicts.subjects.get(target_subject as usize) == Some(target_record_id)
+            })
+            .count()
+    };
+    let param_record_ids: Vec<[u8; 32]> = reader2
+        .iter_visible(generation2)
+        .filter(|view| {
+            view.category() == urdira_structural_store::row::CATEGORY_ENTITY
+                && view.identity_key().starts_with(param_prefix.as_bytes())
+        })
+        .map(|view| view.record_id())
+        .collect();
+    assert_eq!(param_record_ids.len(), 2);
+    for record_id in &param_record_ids {
+        assert_eq!(
+            contains_count_for(record_id),
+            1,
+            "expected exactly one live core:contains row targeting each parameter entity"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
 #[test]
 fn cold_scan_is_deterministic_across_two_independent_runs() {
     let scratch_a = scratch_dir("determinism-a");
@@ -4445,4 +4889,214 @@ fn dump_call_bodies_cold_only(structural_root: &Path, generation: u64, out_path:
         "[dump_call_bodies_cold_only] generation={generation} rows={} confirmed(target_subject)={confirmed_flag_count} -> {out_path:?}",
         rows.len()
     );
+}
+
+/// F.1 "guard ⊇" (2026-09-06, flecos v4 plan §3.1/§3.2): a cold scan of the
+/// n8n corpus through the REAL production entrypoint (`run_scan`,
+/// `ScanScope::Full`, same as `n8n_cold_scan_for_external_entities_
+/// measurement` above) must never REGRESS below the population floors this
+/// test hard-codes -- one direction of the "v4 ⊇ v3" invariant (the other
+/// direction, "v4 ⊆ v3" / `different == 0`, is `scripts/v4-references-
+/// parity-diff.mjs`/`v4-call-parity-diff.mjs`). Each floor is `0.99 ×` an
+/// ACCEPTED n8n population figure (plan §0 rule R5, table §3.2, sourced from
+/// `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`
+/// §10.2 round 3 and the Q5 evidence's own references-parity numbers) --
+/// `jsts:entity_parameter`'s floor is PROVISIONAL (`74,021`, `0.99 ×
+/// 74,769`, the REFERENCED-only population this task's own F.2 change
+/// obsoletes) until a real n8n measurement of the "every declaration"
+/// population re-pins it (F.3, ola 2) -- expected to only ever go UP, since
+/// F.2 strictly adds unreferenced-parameter entities on top of the old
+/// population, never removes any.
+///
+/// Counts by `kind` (the language-specific string stored in `Dictionaries::
+/// kinds`, e.g. `jsts:entity_parameter` -- NOT `universal_kind`, which would
+/// collapse e.g. every `jsts:entity_callable` AND `jsts:entity_type` member
+/// signature under `core:callable`/`core:type` alike) for every entity/
+/// relation population in table §3.2, plus `external_module`/
+/// `external_symbol` (identified by `identity_key` PREFIX, same recipe
+/// `visible_entity_count_with_prefix` above already uses -- their own `kind`
+/// string is derived from `universal_kind` via `proposal_entity_record`, so
+/// it never literally reads `"external_module"`/`"external_symbol"`) and the
+/// total visible record count.
+///
+/// Writes a `kind\tcount` TSV to `URDIRA_V4_POPULATION_DUMP` (if set) for
+/// `scripts/v4-population-parity.mjs --v4-populations <that path>` to diff
+/// against a v3 database's own `record_occurrences` counts.
+///
+/// `#[ignore]`d (needs a real corpus, minutes of wall time, and should run
+/// with the machine at rest -- never alongside another benchmark). Runbook:
+/// ```text
+/// URDIRA_TSGO_BINARY=<repo>/node_modules/.pnpm/@typescript+typescript-darwin-arm64@7.0.2/node_modules/@typescript/typescript-darwin-arm64/lib/tsc \
+/// URDIRA_V4_N8N_CORPUS=<path to an n8n checkout/copy> \
+/// URDIRA_V4_POPULATION_DUMP=/tmp/n8n-populations.tsv \
+/// cargo test -p urdira-indexing-worker --release \
+///   v4::tests_e2e::n8n_population_floors -- --ignored --nocapture
+/// ```
+/// (`URDIRA_V4_N8N_DATA` is accepted for symmetry with the other n8n
+/// diagnostics' documented env surface but unused here -- this test always
+/// scans into a fresh scratch data dir via `scratch_copy_of_n8n_corpus`,
+/// deleted on success, so a prior scan's data root is never reused or left
+/// behind for this particular check.)
+#[test]
+#[ignore]
+fn n8n_population_floors() {
+    let Ok(corpus) = std::env::var("URDIRA_V4_N8N_CORPUS") else {
+        eprintln!("set URDIRA_V4_N8N_CORPUS=<path> to run this diagnostic");
+        return;
+    };
+    let _ = std::env::var("URDIRA_V4_N8N_DATA"); // accepted, unused -- see doc comment
+    let workspace_root = scratch_copy_of_n8n_corpus("n8n-population-floors", &corpus);
+    let scratch_root = workspace_root
+        .parent()
+        .expect("scratch workspace has a parent scratch root")
+        .to_path_buf();
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:n8n-population-floors";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+    let cold_started = std::time::Instant::now();
+    let event = run_scan(
+        "request:n8n-population-floors",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    eprintln!(
+        "[n8n_population_floors] cold scan wall={:.1}s",
+        cold_started.elapsed().as_secs_f64()
+    );
+    let generation = generation_of(&event);
+    assert_eq!(generation, 1, "this test asserts a COLD-generation fact");
+
+    let reader = StoreReader::open(&structural_root).expect("StoreReader opens");
+    let dicts = reader.dictionaries();
+
+    let mut kind_counts: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut total_records: u64 = 0;
+    let mut external_module_count: u64 = 0;
+    let mut external_symbol_count: u64 = 0;
+    for view in reader.iter_visible(generation) {
+        total_records += 1;
+        let kind = dicts
+            .kinds
+            .get(view.kind_id() as usize)
+            .cloned()
+            .unwrap_or_default();
+        *kind_counts.entry(kind).or_insert(0) += 1;
+        if view.category() == urdira_structural_store::row::CATEGORY_ENTITY {
+            let identity_key = view.identity_key();
+            if identity_key.starts_with(b"jsts:external_module:") {
+                external_module_count += 1;
+            } else if identity_key.starts_with(b"jsts:external_symbol:") {
+                external_symbol_count += 1;
+            }
+        }
+    }
+    let count_of = |kind: &str| -> u64 { *kind_counts.get(kind).unwrap_or(&0) };
+
+    // Table §3.2 floors (`0.99 ×` the accepted figure, R5).
+    const FLOOR_ENTITY_CALLABLE: u64 = 29_921;
+    const FLOOR_ENTITY_CONTAINER: u64 = 14_847;
+    const FLOOR_ENTITY_PARAMETER: u64 = 74_021; // provisional, see doc comment
+    const FLOOR_ENTITY_TYPE: u64 = 14_047;
+    const FLOOR_ENTITY_VARIABLE: u64 = 238_491;
+    const FLOOR_RELATION_CONTAINS: u64 = 396_483;
+    const FLOOR_RELATION_REFERENCES: u64 = 1_205_324;
+    const FLOOR_EXTERNAL_MODULE: u64 = 905;
+    const FLOOR_EXTERNAL_SYMBOL: u64 = 3_780;
+    const FLOOR_RECORDS_TOTAL: u64 = 2_165_060;
+
+    let kind_checks: [(&str, u64); 7] = [
+        ("jsts:entity_callable", FLOOR_ENTITY_CALLABLE),
+        ("jsts:entity_container", FLOOR_ENTITY_CONTAINER),
+        ("jsts:entity_parameter", FLOOR_ENTITY_PARAMETER),
+        ("jsts:entity_type", FLOOR_ENTITY_TYPE),
+        ("jsts:entity_variable", FLOOR_ENTITY_VARIABLE),
+        ("jsts:relation_contains", FLOOR_RELATION_CONTAINS),
+        ("jsts:relation_references", FLOOR_RELATION_REFERENCES),
+    ];
+
+    println!();
+    println!("=== n8n population floors (cold, generation {generation}) ===");
+    for (kind, floor) in kind_checks {
+        let count = count_of(kind);
+        println!(
+            "  {kind:<28} {count:>10} (floor {floor:>10}) {}",
+            if count >= floor { "OK" } else { "FAIL" }
+        );
+    }
+    println!(
+        "  {:<28} {external_module_count:>10} (floor {FLOOR_EXTERNAL_MODULE:>10}) {}",
+        "external_module",
+        if external_module_count >= FLOOR_EXTERNAL_MODULE {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  {:<28} {external_symbol_count:>10} (floor {FLOOR_EXTERNAL_SYMBOL:>10}) {}",
+        "external_symbol",
+        if external_symbol_count >= FLOOR_EXTERNAL_SYMBOL {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  {:<28} {total_records:>10} (floor {FLOOR_RECORDS_TOTAL:>10}) {}",
+        "records_total",
+        if total_records >= FLOOR_RECORDS_TOTAL {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
+    if let Ok(dump_path) = std::env::var("URDIRA_V4_POPULATION_DUMP") {
+        use std::io::Write;
+        let file = std::fs::File::create(&dump_path)
+            .unwrap_or_else(|error| panic!("create population dump {dump_path}: {error}"));
+        let mut writer = std::io::BufWriter::new(file);
+        for (kind, count) in &kind_counts {
+            writeln!(writer, "{kind}\t{count}").expect("write population dump line");
+        }
+        writeln!(writer, "external_module\t{external_module_count}")
+            .expect("write population dump line");
+        writeln!(writer, "external_symbol\t{external_symbol_count}")
+            .expect("write population dump line");
+        writeln!(writer, "records_total\t{total_records}").expect("write population dump line");
+        writer.flush().expect("flush population dump");
+        eprintln!("[n8n_population_floors] wrote population TSV -> {dump_path}");
+    }
+
+    for (kind, floor) in kind_checks {
+        let count = count_of(kind);
+        assert!(
+            count >= floor,
+            "{kind} population regressed below its floor: {count} < {floor}"
+        );
+    }
+    assert!(
+        external_module_count >= FLOOR_EXTERNAL_MODULE,
+        "external_module population regressed below its floor: {external_module_count} < {FLOOR_EXTERNAL_MODULE}"
+    );
+    assert!(
+        external_symbol_count >= FLOOR_EXTERNAL_SYMBOL,
+        "external_symbol population regressed below its floor: {external_symbol_count} < {FLOOR_EXTERNAL_SYMBOL}"
+    );
+    assert!(
+        total_records >= FLOOR_RECORDS_TOTAL,
+        "total record count regressed below its floor: {total_records} < {FLOOR_RECORDS_TOTAL}"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
 }
