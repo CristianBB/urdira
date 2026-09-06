@@ -1239,4 +1239,114 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(firstText).toBe(secondText);
     expect(firstText).toContain("    | doStuff(x);");
   });
+
+  // Adversarial review 2026-09-06 (task item 1): the exact case named in the
+  // review brief -- 50 bundles, each carrying a 200-character snippet (50 x
+  // 200 = 10,000 chars, R13's own "50 x 200 = 10k < 20k" arithmetic), under
+  // a tight `max_characters: 6000` that forces BOTH shedding stages (first
+  // every bundle's snippet, then whole trailing bundles) to fire in one
+  // request, not just one or the other. Confirms: (a) the final text fits
+  // the budget, (b) `TRUNCATED` reflects the real dropped-item count and
+  // recomputes deterministically, and (c) two identical calls produce byte-
+  // identical text (no ordering/Map-iteration nondeterminism creeping in
+  // once both shedding stages are exercised together).
+  it("50 bundles x 200-char snippets under max_characters:6000 sheds snippets then whole bundles, and stays deterministic", async () => {
+    // A real 200-character source line is not mostly whitespace, so the
+    // fixture snippet below fills its full 200 characters with visible
+    // content -- `formatDescriptorLine`'s compact-snippet branch trims each
+    // line, and trailing spaces (an earlier draft of this test used
+    // `" ".repeat(...)` padding) would silently trim away almost the whole
+    // fixture, defeating the "50 x 200 = 10k" case entirely. The path is
+    // realistically long (a deep monorepo path, not `src/file-N.ts`) so that
+    // even after every snippet is shed (stage 1), the 50 bare descriptor
+    // lines alone still exceed `max_characters: 6000` -- forcing stage 2
+    // (whole-bundle dropping) to also fire in the same request, which is
+    // the actual point of this test (verified empirically below, not just
+    // asserted by construction).
+    const pathFor = (index: number): string => `src/apps/web/src/components/workspace/panels/dashboard/deeply/nested/sibling/module/group/file-${index}.ts`;
+    const snippetFor = (index: number): string => `callSiteNumber${index}_${"x".repeat(200)}`.slice(0, 200);
+    const buildStreams = () => ({
+      references: {
+        items: Array.from({ length: 50 }, (_unused, index) => ({
+          stable_sort_key: String(index).padStart(3, "0"),
+          value: {
+            subject_type: "relation",
+            record_id: `rel-${index}`,
+            universal_kind: "core:call",
+            kind: "jsts:relation_call",
+            classification: "confirmed",
+            body: { path: pathFor(index) },
+            source_span: { artifact_version_id: `artv-${index}`, start_byte: "0", end_byte: "10", start_line: "1", end_line: "1" },
+            optional_source_snippets: [{ text: snippetFor(index), span: { artifact_version_id: `artv-${index}`, start_byte: "0", end_byte: "10", start_line: "1", end_line: "1" }, truncated: false, redacted: false, redactions: [] }],
+          },
+        })),
+        has_next: false, has_previous: false,
+      },
+    });
+    // Every fixture snippet is exactly 200 characters, all visible (no
+    // trailing whitespace to be trimmed away) -- the literal "50 x 200 =
+    // 10k" case R13/the review brief describe.
+    expect(buildStreams().references.items.every((item) => item.value.optional_source_snippets[0]!.text.length === 200)).toBe(true);
+
+    const invokeOnce = async (options?: { readonly maxCharacters?: number; readonly snippetLines?: number }): Promise<string> => {
+      const call = vi.fn(async () => success({ query_execution_id: "execution-50x200", streams: buildStreams(), completeness: { overall_status: "complete", dimensions: [] } }));
+      const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+      const result = await definition.invoke({
+        request_type: "query",
+        ...(options?.snippetLines === undefined ? {} : { snippet_lines: options.snippetLines }),
+        query: {
+          api_version: 3,
+          scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+          expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } },
+          ...(options?.maxCharacters === undefined ? {} : { options: { response_budget: { max_characters: options.maxCharacters } } }),
+        },
+      });
+      return (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    };
+
+    // Empirical preconditions (not assumed): (1) fully unbudgeted, all 50
+    // snippets rendered, must exceed 6000 -- otherwise this isn't a
+    // shedding case at all; (2) even with every snippet line suppressed
+    // (`snippet_lines: 0` -- the same final byte shape as `shedToBudget`'s
+    // stage-1 snippet strip, since the renderer treats both identically:
+    // `formatDescriptorLine` never emits a "    | " line when there is
+    // nothing to show), the 50 bare descriptor lines alone must ALSO
+    // exceed 6000 -- otherwise stage 1 alone would already satisfy the
+    // budget and stage 2 (whole-bundle dropping) would never fire.
+    const unbudgeted = await invokeOnce();
+    const bareDescriptorsOnly = await invokeOnce({ snippetLines: 0 });
+    expect(unbudgeted.length).toBeGreaterThan(6000);
+    expect(bareDescriptorsOnly.length).toBeGreaterThan(6000);
+
+    const first = await invokeOnce({ maxCharacters: 6000 });
+    const second = await invokeOnce({ maxCharacters: 6000 });
+
+    // (a) Fits the budget.
+    expect(first.length).toBeLessThanOrEqual(6000);
+    // (c) Deterministic: identical input, byte-identical output, both calls.
+    expect(first).toBe(second);
+    // (b) Both shedding stages fired: EVERY snippet is gone (stage 1) AND
+    // at least one whole bundle was dropped from the tail (stage 2) -- the
+    // empirical preconditions above prove stage 1 alone could not have
+    // been enough.
+    expect(first).not.toContain("    | ");
+    expect(first).not.toContain("callSiteNumber");
+    const truncationMatch = /^TRUNCATED: dropped (\d+) items? \(response_budget\)$/m.exec(first);
+    expect(truncationMatch).not.toBeNull();
+    const droppedCount = Number(truncationMatch![1]);
+    expect(droppedCount).toBeGreaterThan(0);
+    expect(droppedCount).toBeLessThan(50);
+    // The surviving reference count (50 - dropped) matches how many
+    // locator lines actually remain in the text -- `TRUNCATED`'s count and
+    // the real rendered content agree exactly, and this is recomputed
+    // fresh each call (not a stale count carried over), which is exactly
+    // why (c)'s determinism check above matters.
+    const locatorPattern = /file-(\d+)\.ts/g;
+    const survivingIndices = [...first.matchAll(locatorPattern)].map((match) => Number(match[1]));
+    expect(survivingIndices.length).toBe(50 - droppedCount);
+    // Whole bundles are dropped from the TAIL (highest index first): the
+    // surviving set is exactly the first (50 - droppedCount) items, in
+    // order -- never a scattered subset.
+    expect(survivingIndices).toEqual(Array.from({ length: survivingIndices.length }, (_unused, index) => index));
+  });
 });

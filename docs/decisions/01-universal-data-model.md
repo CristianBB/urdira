@@ -6894,6 +6894,18 @@ model, plus the engine-side hydration it renders.
   (`shedToBudget`) is unchanged and already drops every bundle's
   `optional_source_snippets` (compact or full) before it ever drops a whole
   bundle.
+- **Cost caveat (adversarial review 2026-09-06, decided per §0's performance
+  criterion)**: `snippet_lines: 0` is render-only. Because it never reaches
+  the engine (see above), a `0` call still pays the full SNIPPET_POLICY
+  hydration cost server-side (the `artifact_text` CAS read/decode per
+  distinct artifact, subject to the LRU) -- it only omits the `    | ` line
+  from the rendered text. A caller optimizing for query latency/CAS traffic
+  rather than response size gets no benefit from `snippet_lines: 0` today.
+  Threading a true no-hydration signal through to the engine was considered
+  and rejected in this amendment for the same reason `snippet_lines` itself
+  stays outside `response_budget` (it would need a fifth field re-admitted
+  at all four payload-construction sites); revisit only if a future
+  measurement shows the hydration cost matters enough to justify that.
 - **Acceptance (R14, pending)**: whether `snippet_lines` defaults to 1 or to
   0 (opt-in) is decided by a benchmark comparison (2 corridas of the
   text+policy arm with snippets ON vs. the existing 3 corridas of that arm

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -1067,6 +1067,257 @@ describe("CanonicalRecordQueryDataPort SNIPPET_POLICY inline snippets (plan 2026
     const withSnippetsEvaluation = await withContent.execute(operation);
     expect((withSnippetsEvaluation.streams["references"] ?? []).length).toBe(50);
     console.info(`[Frente N p95] find_references x50: baseline=${baseline.toFixed(2)}ms with_snippets=${withSnippets.toFixed(2)}ms delta=${(withSnippets - baseline).toFixed(2)}ms`);
+  });
+
+  // Adversarial review 2026-09-06: the implementer's own p95 test above
+  // stubs `artifact_text` with a synchronous in-memory template literal --
+  // it never touches a disk, so it cannot show what a real CAS read costs
+  // (the concern the plan's §5.1.2 "p95 of find_references" line and R13's
+  // performance criterion actually care about). This measures REAL
+  // `fs.readFile` cost: 50 distinct fixture files written to a temp
+  // directory on disk (cold OS page cache for each -- freshly written,
+  // never read before this test), `artifact_text` doing a genuine
+  // `readFile` per distinct artifact (within `TEXT_CACHE_LIMIT`'s 64-entry
+  // cap, so the LRU never evicts and this measures pure read cost, not
+  // eviction thrash). No hard threshold: this is the orientative number the
+  // plan's R13 evidence record asks for, logged via `console.info`.
+  it("measures the added cost of find_references snippet hydration against REAL on-disk files for 50 distinct artifacts (orientative, not a gate)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-snippet-real-disk-"));
+    try {
+      const fileTextFor = (index: number): string => `// file ${index}\nfunction caller${index}() {\n  target(${index});\n}\n`;
+      const pathFor = (index: number): string => join(root, `caller-${index}.ts`);
+      const records: CanonicalQueryRecord[] = [
+        { record_id: "rec-target", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-target", owner_artifact_version_id: "artv-target", facets: [], body: { path: "src/target.ts", start: 0, end: 6, name: "target" } },
+      ];
+      for (let index = 0; index < 50; index += 1) {
+        const text = fileTextFor(index);
+        await writeFile(pathFor(index), text, "utf-8");
+        const callStart = text.indexOf(`target(${index})`);
+        const callEnd = callStart + `target(${index})`.length;
+        records.push({ record_id: `rec-caller-${index}`, workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: `art-${index}`, owner_artifact_version_id: `artv-${index}`, facets: [], body: { path: `src/caller-${index}.ts`, name: `caller${index}` } });
+        records.push({
+          record_id: `rec-call-${index}`, workspace_id: workspace.workspace_id, category: "relation", kind: "jsts:relation_call", universal_kind: "core:call",
+          owner_artifact_id: `art-${index}`, owner_artifact_version_id: `artv-${index}`, facets: [],
+          body: { source_id: `rec-caller-${index}`, target_id: "rec-target", classification: "confirmed" },
+          primary_source_span: { artifact_version_id: `artv-${index}`, start_byte: String(callStart), end_byte: String(callEnd), start_line: "3", end_line: "3" },
+        });
+      }
+      const operation = { operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "symbol", name: "target" } }, scope };
+      const freshPortWithDisk = (): CanonicalRecordQueryDataPort => new CanonicalRecordQueryDataPort(stubPort({
+        records: async () => records,
+        artifact_text: async (_scope, artifactVersionId) => {
+          const match = /^artv-(\d+)$/.exec(artifactVersionId);
+          if (match === null) return undefined;
+          const bytes = await readFile(pathFor(Number(match[1])));
+          return { text: new TextDecoder("utf-8").decode(bytes) };
+        },
+      }));
+      const freshPortWithoutDisk = (): CanonicalRecordQueryDataPort => new CanonicalRecordQueryDataPort(stubPort({ records: async () => records, artifact_text: async () => undefined }));
+
+      // A fresh port per timed sample: `textCache` is per-instance, so this
+      // always exercises a cold cache -- 50 real `readFile` calls per
+      // `with_disk` sample, not 49 cache hits after the first one.
+      const baselineSamples: number[] = [];
+      const withDiskSamples: number[] = [];
+      let lastWithDiskEvaluation: Awaited<ReturnType<CanonicalRecordQueryDataPort["execute"]>> | undefined;
+      for (let run = 0; run < 5; run += 1) {
+        const startBaseline = performance.now();
+        await freshPortWithoutDisk().execute(operation);
+        baselineSamples.push(performance.now() - startBaseline);
+        const startWithDisk = performance.now();
+        lastWithDiskEvaluation = await freshPortWithDisk().execute(operation);
+        withDiskSamples.push(performance.now() - startWithDisk);
+      }
+      expect((lastWithDiskEvaluation?.streams["references"] ?? []).length).toBe(50);
+      const meanBaseline = baselineSamples.reduce((sum, value) => sum + value, 0) / baselineSamples.length;
+      const meanWithDisk = withDiskSamples.reduce((sum, value) => sum + value, 0) / withDiskSamples.length;
+      console.info(`[Frente N real-disk] find_references x50, 5 cold-port runs: baseline_mean=${meanBaseline.toFixed(2)}ms with_disk_mean=${meanWithDisk.toFixed(2)}ms delta=${(meanWithDisk - meanBaseline).toFixed(2)}ms all_baseline=${baselineSamples.map((v) => v.toFixed(1)).join(",")} all_with_disk=${withDiskSamples.map((v) => v.toFixed(1)).join(",")}`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // Adversarial review 2026-09-06: `sourceSnippet`'s two truncation points
+  // (`maxCharactersPerSnippet`, `remainingBudget`) used to cut with a plain
+  // `slice(0, limit)`. A line whose 200th character is the low half of a
+  // UTF-16 surrogate pair (an astral character, e.g. an emoji) would be cut
+  // between the pair's two units, leaving a lone/unpaired surrogate in the
+  // returned snippet text. Fixed by `truncateWithoutSplittingSurrogatePair`
+  // (canonical-query-data-port.ts); this proves the fix: a line built so the
+  // pair straddles exactly the 200-character boundary.
+  it("core:find_references truncation never splits a UTF-16 surrogate pair at the 200-character snippet boundary", async () => {
+    const astral = "\u{1F600}"; // U+1F600, a surrogate pair (2 UTF-16 code units): "😀".
+    expect(astral.length).toBe(2);
+    // 199 plain ASCII characters, then the astral pair starting at index 199
+    // (occupying indices 199-200) -- so a naive `slice(0, 200)` lands
+    // exactly between the pair's high and low surrogate.
+    const prefix = "x".repeat(199);
+    const line = `${prefix}${astral}tail\n`;
+    const fileText = `${line}`;
+    const callRecord: CanonicalQueryRecord = {
+      record_id: "rec-caller", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", facets: [], body: { path: "src/a.ts", name: "caller" },
+    };
+    const targetRecord: CanonicalQueryRecord = {
+      record_id: "rec-target", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-target", owner_artifact_version_id: "artv-target", facets: [], body: { path: "src/target.ts", start: 0, end: 1, name: "target" },
+    };
+    const relation: CanonicalQueryRecord = {
+      record_id: "rec-call", workspace_id: workspace.workspace_id, category: "relation", kind: "jsts:relation_call", universal_kind: "core:call",
+      owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", facets: [],
+      body: { source_id: "rec-caller", target_id: "rec-target", classification: "confirmed" },
+      // Span sits at the very start of the line so "line" mode's line
+      // slice is exactly `[0, line.length)` -- the whole line, > 200 chars.
+      primary_source_span: { artifact_version_id: "artv-1", start_byte: "0", end_byte: "1", start_line: "1", end_line: "1" },
+    };
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [callRecord, targetRecord, relation],
+      artifact_text: async (_scope, artifactVersionId) => artifactVersionId === "artv-1" ? { text: fileText } : undefined,
+    }));
+    const evaluation = await port.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "symbol", name: "target" } }, scope });
+    const references = (evaluation.streams["references"] ?? []) as readonly { readonly value: unknown }[];
+    expect(references).toHaveLength(1);
+    const value = references[0]!.value as { optional_source_snippets?: readonly { text: string; truncated: boolean }[] };
+    const snippet = value.optional_source_snippets?.[0];
+    expect(snippet).toBeDefined();
+    expect(snippet!.truncated).toBe(true);
+    // The critical assertion: no lone/unpaired surrogate anywhere in the
+    // returned text (would throw on the strict round-trip below otherwise).
+    for (let index = 0; index < snippet!.text.length; index += 1) {
+      const code = snippet!.text.charCodeAt(index);
+      if (code >= 0xd800 && code <= 0xdbff) expect(snippet!.text.charCodeAt(index + 1)).toBeGreaterThanOrEqual(0xdc00);
+      if (code >= 0xdc00 && code <= 0xdfff) expect(snippet!.text.charCodeAt(index - 1)).toBeLessThanOrEqual(0xdbff);
+    }
+    // Round-trips through strict UTF-8 encode/decode without producing the
+    // U+FFFD replacement character a lone surrogate would force.
+    const roundTripped = new TextDecoder("utf-8").decode(new TextEncoder().encode(snippet!.text));
+    expect(roundTripped).not.toContain("�");
+    // Either the pair survived whole (199 + 2 = 201 > 200, so the fix backs
+    // off to 199 chars) or it was correctly excluded -- never a bare 200
+    // that would have split it.
+    expect(snippet!.text.length === 199 || snippet!.text.length === 201).toBe(true);
+  });
+
+  // Adversarial review 2026-09-06: CRLF line endings. `lineEnd` searches for
+  // "\n" only, so the returned "line" text includes the trailing "\r" as
+  // part of the slice -- proves that's harmless (the raw span/text fields
+  // carry it, same as any other mode already would for a CRLF file; the MCP
+  // compact renderer's `.trim()` strips it before display, covered in
+  // tests/phase13-mcp.test.ts).
+  it("core:find_references \"line\" mode on a CRLF file returns the correct line, trailing CR included in the raw text field", async () => {
+    const fileText = "function caller() {\r\n  target();\r\n}\r\n";
+    const callStart = fileText.indexOf("target();");
+    const callEnd = callStart + "target();".length;
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [
+        { record_id: "rec-caller", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", facets: [], body: { path: "src/a.ts", name: "caller" } },
+        { record_id: "rec-target", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-target", owner_artifact_version_id: "artv-target", facets: [], body: { path: "src/target.ts", start: 0, end: 1, name: "target" } },
+        {
+          record_id: "rec-call", workspace_id: workspace.workspace_id, category: "relation", kind: "jsts:relation_call", universal_kind: "core:call",
+          owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", facets: [],
+          body: { source_id: "rec-caller", target_id: "rec-target", classification: "confirmed" },
+          primary_source_span: { artifact_version_id: "artv-1", start_byte: String(callStart), end_byte: String(callEnd), start_line: "2", end_line: "2" },
+        },
+      ],
+      artifact_text: async (_scope, artifactVersionId) => artifactVersionId === "artv-1" ? { text: fileText } : undefined,
+    }));
+    const evaluation = await port.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "symbol", name: "target" } }, scope });
+    const references = (evaluation.streams["references"] ?? []) as readonly { readonly value: unknown }[];
+    const value = references[0]!.value as { optional_source_snippets?: readonly { text: string }[] };
+    const snippet = value.optional_source_snippets?.[0];
+    expect(snippet).toBeDefined();
+    expect(snippet!.text).toBe("  target();\r\n");
+    expect(snippet!.text).not.toContain("function caller");
+    expect(snippet!.text).not.toContain("}");
+  });
+
+  // Adversarial review 2026-09-06: span on the LAST line of a file that has
+  // no trailing newline at all -- `lineEnd`'s `text.indexOf("\n", index)`
+  // must fall back to `text.length`, not misbehave/loop/return -1 downstream.
+  it("core:find_references \"line\" mode on a span at end-of-file with no trailing newline returns the final (unterminated) line exactly", async () => {
+    const fileText = "function caller() {\n  target();\n}"; // no trailing \n
+    const callStart = fileText.indexOf("target();");
+    const callEnd = callStart + "target();".length;
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [
+        { record_id: "rec-caller", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", facets: [], body: { path: "src/a.ts", name: "caller" } },
+        { record_id: "rec-target", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-target", owner_artifact_version_id: "artv-target", facets: [], body: { path: "src/target.ts", start: 0, end: 1, name: "target" } },
+        {
+          record_id: "rec-call", workspace_id: workspace.workspace_id, category: "relation", kind: "jsts:relation_call", universal_kind: "core:call",
+          owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", facets: [],
+          body: { source_id: "rec-caller", target_id: "rec-target", classification: "confirmed" },
+          primary_source_span: { artifact_version_id: "artv-1", start_byte: String(callStart), end_byte: String(callEnd), start_line: "2", end_line: "2" },
+        },
+      ],
+      artifact_text: async (_scope, artifactVersionId) => artifactVersionId === "artv-1" ? { text: fileText } : undefined,
+    }));
+    const evaluation = await port.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "symbol", name: "target" } }, scope });
+    const references = (evaluation.streams["references"] ?? []) as readonly { readonly value: unknown }[];
+    const value = references[0]!.value as { optional_source_snippets?: readonly { text: string }[] };
+    expect(value.optional_source_snippets?.[0]?.text).toBe("  target();\n");
+
+    // A span on the truly LAST line (no newline after it anywhere in the
+    // file) must not run off the end of the string either.
+    const lastLineFileText = "function caller() {\n  target();\n}";
+    const lastCallStart = lastLineFileText.length - 1; // the final "}"
+    const portLastLine = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [
+        { record_id: "rec-caller-2", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-2", owner_artifact_version_id: "artv-2", facets: [], body: { path: "src/b.ts", name: "caller2" } },
+        { record_id: "rec-target", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-target", owner_artifact_version_id: "artv-target", facets: [], body: { path: "src/target.ts", start: 0, end: 1, name: "target" } },
+        {
+          record_id: "rec-call-2", workspace_id: workspace.workspace_id, category: "relation", kind: "jsts:relation_call", universal_kind: "core:call",
+          owner_artifact_id: "art-2", owner_artifact_version_id: "artv-2", facets: [],
+          body: { source_id: "rec-caller-2", target_id: "rec-target", classification: "confirmed" },
+          primary_source_span: { artifact_version_id: "artv-2", start_byte: String(lastCallStart), end_byte: String(lastCallStart + 1), start_line: "3", end_line: "3" },
+        },
+      ],
+      artifact_text: async (_scope, artifactVersionId) => artifactVersionId === "artv-2" ? { text: lastLineFileText } : undefined,
+    }));
+    const lastLineEvaluation = await portLastLine.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "symbol", name: "target" } }, scope });
+    const lastLineReferences = (lastLineEvaluation.streams["references"] ?? []) as readonly { readonly value: unknown }[];
+    const lastLineValue = lastLineReferences[0]!.value as { optional_source_snippets?: readonly { text: string }[] };
+    expect(lastLineValue.optional_source_snippets?.[0]?.text).toBe("}");
+  });
+
+  // Adversarial review 2026-09-06: multibyte content BEFORE the span.
+  // `canonical-query-data-port.ts`'s `sourceSnippet` (all modes, not just
+  // "line") treats `primary_source_span.start_byte`/`end_byte` as direct
+  // JS-string (UTF-16 code unit) indices with no byte->char conversion --
+  // verified against the producer side
+  // (`crates/urdira-jsts-syntax-worker/src/lib.rs`'s
+  // `Utf8ToUtf16::new(text).convert_program(...)`, which converts every swc
+  // span from UTF-8 byte offsets to UTF-16 code-unit offsets BEFORE any
+  // `ProposedRecord` is built): despite the "byte" field name, these are
+  // ALREADY UTF-16 code-unit offsets by the time they reach this port, i.e.
+  // exactly what a JS string index expects. This is therefore NOT the
+  // byte-vs-char bug it superficially resembles; this test locks in that
+  // behavior with real multibyte (2- and 3-byte UTF-8, 1-UTF-16-unit)
+  // characters preceding the span, matching production's actual offset
+  // convention (a plain `.indexOf`/`.length` on the JS string, exactly as
+  // production spans are already converted to mean).
+  it("core:find_references \"line\" mode is correct when multibyte (non-ASCII) text precedes the span on the same line", async () => {
+    // "café☕" -- 'é' is 2 UTF-8 bytes/1 UTF-16 unit, '☕' is 3 UTF-8
+    // bytes/1 UTF-16 unit. If start_byte were a true UTF-8 byte offset used
+    // as a direct JS index, this line's span would resolve 2 UTF-16 units
+    // too early (missing the true byte-to-unit conversion entirely).
+    const fileText = "// café☕ comment\nfunction caller() {\n  target();\n}\n";
+    const callStart = fileText.indexOf("target();");
+    const callEnd = callStart + "target();".length;
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [
+        { record_id: "rec-caller", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", facets: [], body: { path: "src/a.ts", name: "caller" } },
+        { record_id: "rec-target", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-target", owner_artifact_version_id: "artv-target", facets: [], body: { path: "src/target.ts", start: 0, end: 1, name: "target" } },
+        {
+          record_id: "rec-call", workspace_id: workspace.workspace_id, category: "relation", kind: "jsts:relation_call", universal_kind: "core:call",
+          owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", facets: [],
+          body: { source_id: "rec-caller", target_id: "rec-target", classification: "confirmed" },
+          primary_source_span: { artifact_version_id: "artv-1", start_byte: String(callStart), end_byte: String(callEnd), start_line: "3", end_line: "3" },
+        },
+      ],
+      artifact_text: async (_scope, artifactVersionId) => artifactVersionId === "artv-1" ? { text: fileText } : undefined,
+    }));
+    const evaluation = await port.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "symbol", name: "target" } }, scope });
+    const references = (evaluation.streams["references"] ?? []) as readonly { readonly value: unknown }[];
+    const value = references[0]!.value as { optional_source_snippets?: readonly { text: string }[] };
+    expect(value.optional_source_snippets?.[0]?.text).toBe("  target();\n");
   });
 });
 

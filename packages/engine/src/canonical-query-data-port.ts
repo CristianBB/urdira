@@ -1926,6 +1926,29 @@ function lineEnd(text: string, index: number): number {
   return newline === -1 ? text.length : newline + 1;
 }
 
+// Adversarial review 2026-09-06 (Frente N): `sourceSnippet`'s two truncation
+// points below (`maxCharactersPerSnippet`, `remainingBudget`) previously cut
+// with a plain `String.prototype.slice(0, limit)`. For any line whose
+// content puts a UTF-16 surrogate pair (an astral character -- most emoji,
+// some CJK extension characters) exactly on that boundary, a plain slice
+// keeps the high surrogate and drops its low surrogate, leaving a lone
+// (unpaired) surrogate in `snippet.text`. That string round-trips through
+// JSON fine (JSON allows unpaired surrogates as `\uXXXX` escapes) but is
+// invalid Unicode text once decoded by a consumer that enforces well-formed
+// UTF-16/UTF-8 (a strict `TextEncoder`/`JSON.parse` reviver, a terminal that
+// rejects WTF-8, `Buffer.from(text, "utf8")` substituting U+FFFD, ...) --
+// exactly the "line >200 chars" truncation case Frente N's adversarial
+// review asked to check "¿corta en medio de un code point UTF-16
+// surrogate?" for. `codePointBefore`/`codePointAt` above already apply the
+// identical one-unit backup for glob-pattern matching; this mirrors that.
+function truncateWithoutSplittingSurrogatePair(text: string, limit: number): string {
+  if (limit >= text.length) return text;
+  if (limit <= 0) return "";
+  const trailing = text.charCodeAt(limit - 1);
+  const boundary = trailing >= 0xd800 && trailing <= 0xdbff ? limit - 1 : limit;
+  return text.slice(0, boundary);
+}
+
 function lineNumberAt(text: string, index: number): number {
   let line = 1;
   for (let cursor = 0; cursor < index; cursor += 1) if (text[cursor] === "\n") line += 1;
@@ -1976,8 +1999,8 @@ async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: Query
     : extendSpanForContext(text, start, coreEnd, contextLines);
   let snippetText = text.slice(sliceStart, sliceEnd);
   let truncated = false;
-  if (snippetText.length > maxCharactersPerSnippet) { snippetText = snippetText.slice(0, maxCharactersPerSnippet); truncated = true; }
-  if (snippetText.length > remainingBudget) { snippetText = snippetText.slice(0, remainingBudget); truncated = true; }
+  if (snippetText.length > maxCharactersPerSnippet) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, maxCharactersPerSnippet); truncated = true; }
+  if (snippetText.length > remainingBudget) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, remainingBudget); truncated = true; }
   const useStoredLines = contextLines === 0 && canonicalSpan !== undefined;
   return {
     text: snippetText,

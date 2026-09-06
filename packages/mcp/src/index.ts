@@ -234,11 +234,23 @@ const renderFieldSchema: JsonSchema = {
 // raw tool call arguments in `invoke()` below and never enters `options`/
 // `response_budget`/the outgoing IPC payload at all, so the engine's schema
 // is completely unaware of it.
+//
+// Adversarial review 2026-09-06 (Frente N, R13/§0 performance criterion):
+// because of the above, `snippet_lines: 0` is RENDER-ONLY -- it never
+// reaches `CanonicalRecordQueryDataPort`'s SNIPPET_POLICY hydration, which
+// always runs (and always pays its `artifact_text` CAS read/decode) for
+// every eligible bundle regardless of what the MCP caller passes here. A
+// caller setting `snippet_lines: 0` gets a smaller rendered response, not a
+// cheaper query. This is an accepted, documented tradeoff (not a bug to
+// silently fix by re-threading a fifth field through
+// `response_budget`'s exact-object validation, per the reasoning above) --
+// see `docs/decisions/01-universal-data-model.md`'s 2026-09-06 amendment
+// for the same caveat at the contract-doc layer.
 const snippetLinesFieldSchema: JsonSchema = {
   type: "integer",
   minimum: 0,
   maximum: 3,
-  description: "Number of source-snippet lines rendered inline per compact-text result for structural/discovery bundles (core:find_references/core:get_outline/core:search_hybrid/core:search_semantic). Optional; default: 1. 0 disables inline snippet lines.",
+  description: "Number of source-snippet lines rendered inline per compact-text result for structural/discovery bundles (core:find_references/core:get_outline/core:search_hybrid/core:search_semantic). Optional; default: 1. 0 disables inline snippet lines (rendering only -- the engine still hydrates the snippet server-side).",
 };
 
 const DEFAULT_SNIPPET_LINES = 1;
