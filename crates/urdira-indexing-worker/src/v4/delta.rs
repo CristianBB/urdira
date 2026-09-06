@@ -1207,6 +1207,7 @@ fn run_one(
         generation,
         manifest_path: manifest_path.to_string_lossy().into_owned(),
         timings: clock.queryable_timings(),
+        reconcile: None,
     })
     .map_err(ScanError)?;
 

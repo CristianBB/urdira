@@ -1238,7 +1238,21 @@ function renderIndexStatusText(page: JsonRecord): string {
         const changedPaths = typeof lastScan["changed_paths"] === "number" ? `, changed_paths=${lastScan["changed_paths"]}` : "";
         const timings = isRecord(lastScan["timings"]) ? lastScan["timings"] as JsonRecord : undefined;
         const wallMs = typeof timings?.["total_ms"] === "number" ? `, wall_ms=${timings["total_ms"]}` : "";
-        lines.push(`  last_scan: kind=${kind}${changedPaths}${wallMs}`);
+        // Frente E: `kind === "reconcile"` carries a `ReconcileSummary` --
+        // render it as `reconcile/<mode> (+added ~changed -deleted of
+        // frontier_size)` instead of the plain `kind=reconcile` an agent
+        // could otherwise mistake for a scan that never actually measured
+        // anything.
+        const reconcile = isRecord(lastScan["reconcile"]) ? lastScan["reconcile"] as JsonRecord : undefined;
+        const label = reconcile !== undefined && typeof reconcile["mode"] === "string"
+          ? `kind=${kind}/${reconcile["mode"]}`
+          : `kind=${kind}`;
+        const reconcileSummary = reconcile !== undefined
+          && typeof reconcile["added"] === "number" && typeof reconcile["changed"] === "number"
+          && typeof reconcile["deleted"] === "number" && typeof reconcile["frontier_size"] === "number"
+          ? ` (+${reconcile["added"]} ~${reconcile["changed"]} -${reconcile["deleted"]} of ${reconcile["frontier_size"]})`
+          : "";
+        lines.push(`  last_scan: ${label}${reconcileSummary}${changedPaths}${wallMs}`);
       }
       if (!lexicalCurrent) lines.push("  hint: search_text will report partial until lexical catches up");
       if (!semanticCurrent) lines.push("  hint: search_semantic is unavailable until semantic indexing catches up");

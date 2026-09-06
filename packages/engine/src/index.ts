@@ -29,6 +29,8 @@ export {
   runRustWorkspaceScan,
   type ChangedPath,
   type ChangedPathKind,
+  type ReconcileMode,
+  type ReconcileSummary,
   type RustWorkspaceScanOutcome,
   type RustWorkspaceScanTransport,
   type ScanPriority,

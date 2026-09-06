@@ -2,7 +2,7 @@ import { chmod, readdir, readFile, stat, unlink, writeFile } from "node:fs/promi
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, resolve } from "node:path";
-import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
+import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, isOutdatedWorkspaceError, readStructuralStore, recreateOutdatedWorkspaceDatabase, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase } from "@urdira/storage";
 import { existsSync } from "node:fs";
@@ -1288,6 +1288,8 @@ function v4StatusFields(
         ...(lastScanSummary.changed_paths === undefined ? {} : { changed_paths: lastScanSummary.changed_paths }),
         timings: lastScanSummary.timings,
         ...(scanTimeline === undefined ? {} : { timeline: relativeTimeline(scanTimeline) }),
+        // Frente E: set only for `kind === "reconcile"`.
+        ...(lastScanSummary.reconcile === undefined ? {} : { reconcile: lastScanSummary.reconcile }),
       },
     } : {}),
     // Folds the lane arithmetic above into one answer per operation family:
@@ -2089,11 +2091,26 @@ const v4LastScanTimelines = new Map<string, V4ScanTimeline>();
  * convention.
  */
 interface V4LastScanSummary {
-  readonly kind: "full" | "changed";
+  readonly kind: "full" | "changed" | "reconcile";
   readonly changed_paths?: number;
   readonly timings: ScanTimings;
+  /** Frente E: set only when `kind === "reconcile"`. */
+  readonly reconcile?: ReconcileSummary;
 }
 const v4LastScanSummaries = new Map<string, V4LastScanSummary>();
+
+/**
+ * Frente E: explicit opt-out from `reconcile`'s new default for a v4 scan
+ * whose `requestedUris === undefined` (see `runV4WorkspaceScan`'s scope
+ * decision) -- populated by `core:reindex` and by the outdated-workspace-
+ * format recovery sweep (`createDurableStorage`'s startup pass, below),
+ * both of which genuinely need a `full` republish regardless of how small
+ * an authoritative delta would measure (an explicit user-requested reindex,
+ * or a workspace whose on-disk format was just recreated from scratch).
+ * Consumed (deleted) by the SAME scope decision on its very next scan --
+ * a one-shot flag, not a standing preference for the workspace.
+ */
+const forceFullScans = new Set<string>();
 
 /** Converts a `V4ScanTimeline`'s absolute epoch-ms fields to `DAEMON_START_EPOCH_MS`-relative ms for the `core:index_status` wire shape (`last_scan_timeline`'s own doc comment above). */
 function relativeTimeline(timeline: V4ScanTimeline): Record<string, number> {
@@ -2167,9 +2184,26 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // "unsafe/lost-coverage" signal (an explicit reindex, or a coalesced
   // buffer that saw one) -- treated the same way v3's full scan already
   // treats it: as requiring a full rescan, not a narrow changed-paths one.
-  let scope: ScanScope = isFirstScan || requestedUris === undefined
+  // Frente E (plan `generic-waddling-hartmanis.md` §2.3): `requestedUris ===
+  // undefined` used to mean "full" unconditionally -- but it is ALSO the
+  // signal `watchers.ts` sends for every git-driven "unknown extent of
+  // change" event (`branch_changed`/`events_lost`/`provider_reset`, always
+  // `changedUris === undefined`) and for the periodic reconciliation sweep,
+  // neither of which actually needs the FULL pipeline: `reconcile` derives
+  // the same authoritative delta from a fresh walk (never trusting the
+  // watcher's own hint either way) and republishes it through whichever
+  // pipeline (`changed`'s or `full`'s) is cheaper for the delta's measured
+  // size -- see `crates/urdira-indexing-worker/src/v4/scan.rs::run_reconcile`'s
+  // own doc comment. `forceFullScans` (below) is the explicit opt-out for
+  // the callers that genuinely need `full` regardless of delta size --
+  // `core:reindex` and the outdated-workspace-format recovery sweep, both
+  // populate it before scheduling this scan.
+  const forceFull = forceFullScans.delete(workspaceId);
+  let scope: ScanScope = isFirstScan || forceFull
     ? { kind: "full" }
-    : { kind: "changed", paths: mapV4ChangedPaths(requestedUris, authoritativeDeletes) };
+    : requestedUris === undefined
+      ? { kind: "reconcile" }
+      : { kind: "changed", paths: mapV4ChangedPaths(requestedUris, authoritativeDeletes) };
   // P3-1: the worker rejects `Changed{paths: []}` outright (`crates/urdira-
   // indexing-worker/src/v4/delta.rs`, "requires at least one path") -- found
   // live via `tests/v4-mutation-harness.test.ts`'s rename mutation, which
@@ -2262,7 +2296,12 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
       // I/O error) is NOT caught here -- it propagates to the outer `catch`
       // below (rollback + timeline bookkeeping), same as any other scan
       // failure, rather than being silently masked by a full-rescan retry.
-      const isUninitializedState = scope.kind === "changed" && error instanceof Error && error.message.includes("requires a prior generation; send scope: Full");
+      // Frente E: `run_reconcile` rejects the identical "no prior
+      // generation" case with the SAME message substring (`scan.rs`'s own
+      // doc comment on that error) -- covered here too, same retry-to-full
+      // recovery, since a workspace `reconcile` targets always needs SOME
+      // prior generation to diff against.
+      const isUninitializedState = (scope.kind === "changed" || scope.kind === "reconcile") && error instanceof Error && error.message.includes("requires a prior generation; send scope: Full");
       if (!isUninitializedState) throw error;
       if (!v4ChangedScopeUnsupportedWarned.has(workspaceId)) {
         v4ChangedScopeUnsupportedWarned.add(workspaceId);
@@ -2286,12 +2325,18 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   timeline.completed_at = Date.now();
   debugTiming(`workspace=${workspaceId} completed_at generation=${outcome.generation}`);
   // P4-d: `scope` here is whichever request actually succeeded -- either
-  // the original request, or the `Full` retry after a `Changed` rejection
-  // (both reassignments above keep `scope` pointing at the attempt that
-  // produced `outcome`).
+  // the original request, or the `Full` retry after a `Changed`/`Reconcile`
+  // rejection (both reassignments above keep `scope` pointing at the
+  // attempt that produced `outcome`).
   v4LastScanSummaries.set(workspaceId, scope.kind === "changed"
     ? { kind: "changed", changed_paths: scope.paths.length, timings: outcome.timings }
-    : { kind: "full", timings: outcome.timings });
+    : scope.kind === "reconcile"
+      // `exactOptionalPropertyTypes`: omit `reconcile` entirely rather than
+      // assigning `undefined` -- `outcome.reconcile` is absent only if the
+      // worker predates Frente E, an older-binary edge case worth keeping
+      // distinguishable from "reconcile ran and reported nothing".
+      ? { kind: "reconcile", timings: outcome.timings, ...(outcome.reconcile === undefined ? {} : { reconcile: outcome.reconcile }) }
+      : { kind: "full", timings: outcome.timings });
   const priorReadiness = v4ReadinessState.get(workspaceId);
   // P1-D-c: the residual pass is gated behind the SAME env var
   // `indexing-core-process-transport.ts` forwards to the worker child
@@ -2424,6 +2469,16 @@ export class DaemonRuntime {
           const workspace = registry.get(outdated.workspace_id);
           if (!workspace || workspace.status === "removed" || workspace.status === "removing") continue;
           registry.recordScanFailure(outdated.workspace_id, outdated.error_code);
+          // Frente E: the eventual scan this reconciliation triggers (via
+          // the crash-recovery loop below, once `recreateOutdatedWorkspace
+          // Database` clears the on-disk footprint) must be `full`, never
+          // `reconcile` -- the recreated database has no prior generation
+          // for `reconcile` to diff against, and would just error+retry via
+          // the SAME "requires a prior generation" fallback above at extra
+          // cost. Set unconditionally alongside `beginReconciliation` (both
+          // gated by the identical status check) rather than relying on
+          // that retry path.
+          forceFullScans.add(outdated.workspace_id);
           if (workspace.status !== "indexing" && workspace.status !== "suspended") registry.beginReconciliation(outdated.workspace_id);
         }
       }
@@ -4256,6 +4311,15 @@ export class DaemonRuntime {
           // relaxing it (see final report).
           const alreadyIndexing = workspace.status === "indexing";
           const operation = options.workspace_registry.beginReconciliation(workspace.workspace_id);
+          // Frente E: `core:reindex` is an explicit, user-requested full
+          // republish -- never let the new `reconcile` default (small-delta
+          // scans go through the cheaper `changed`-shaped pipeline) narrow
+          // it. Added unconditionally (not just when `!alreadyIndexing`
+          // schedules a scan here): if a scan is already in flight, this
+          // still forces the NEXT one (whatever schedules it) full, which
+          // is the correct reading of "the user asked to reindex" either
+          // way.
+          forceFullScans.add(workspace.workspace_id);
           if (!alreadyIndexing) scheduleWorkspaceScan(workspace.workspace_id);
           return { workspace_id: workspace.workspace_id, status: operation.workspace.status, reconciliation_operation_id: operation.operation_id, reindex_started: !alreadyIndexing };
         }

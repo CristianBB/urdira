@@ -17,8 +17,28 @@ export interface ChangedPath {
   readonly path: string;
   readonly kind: ChangedPathKind;
 }
-export type ScanScope = { readonly kind: "full" } | { readonly kind: "changed"; readonly paths: readonly ChangedPath[] };
+export type ScanScope = { readonly kind: "full" } | { readonly kind: "changed"; readonly paths: readonly ChangedPath[] } | { readonly kind: "reconcile" };
 export type ScanPriority = "interactive" | "background";
+/** Frente E (plan `generic-waddling-hartmanis.md` §2.1): which of `reconcile`'s
+ * two republish pipelines actually ran (or neither, for `noop`) -- mirrors
+ * Rust's `ReconcileMode`. */
+export type ReconcileMode = "noop" | "delta" | "cold";
+/** Mirrors Rust's `ReconcileSummary` -- reported on `ScanCompleted`/`Queryable`
+ * only for a `scope: {kind: "reconcile"}` request. `added`/`changed`/`deleted`/
+ * `frontier_size` are the AUTHORITATIVE delta the reconcile measured (never the
+ * watcher's own hint); `threshold` is the effective `T` this call used.
+ * `fell_back_to_cold` is `true` only for the R2 fallback (the `delta` pipeline
+ * was attempted and failed, and this `cold` result is the SAME request's
+ * recovery, not a size-driven decision). */
+export interface ReconcileSummary {
+  readonly mode: ReconcileMode;
+  readonly added: number;
+  readonly changed: number;
+  readonly deleted: number;
+  readonly frontier_size: number;
+  readonly threshold: number;
+  readonly fell_back_to_cold: boolean;
+}
 export interface ScanTimings {
   readonly catalog_ms?: number;
   readonly parse_ms?: number;
@@ -54,12 +74,18 @@ export interface WorkspaceScanQueryable {
   readonly generation: number;
   readonly manifest_path: string;
   readonly timings: ScanTimings;
+  /** Frente E: present only for a `scope: {kind: "reconcile"}` request whose
+   * transport also decorated this milestone -- absent for `full`/`changed`. */
+  readonly reconcile?: ReconcileSummary;
 }
 export interface WorkspaceScanResult {
   readonly generation: number;
   readonly snapshot_id: string;
   readonly roots: ScanRoots;
   readonly timings: ScanTimings;
+  /** Frente E: present only for a `scope: {kind: "reconcile"}` request --
+   * absent for `full`/`changed`. */
+  readonly reconcile?: ReconcileSummary;
 }
 /**
  * P1-D-c (decision 28): the background residual TypeScript-checker pass's

@@ -349,6 +349,11 @@ pub fn run_scoped(
         return Ok(ColdAnalysis { owners: Vec::new() });
     }
 
+    // Captured before `change_set` moves into `syntax.analyze` below -- see
+    // the Frente E fix further down (`if is_full_change_set { ... }`) for
+    // why a `Full` caller cannot trust `analyze()`'s own `affected_files`
+    // narrowing on a warm `syntax` project.
+    let is_full_change_set = matches!(change_set, AuthoritativeChangeSet::Full);
     let root_names: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
     let project_key = format!("v4:{workspace_id}");
     let cancelled = AtomicBool::new(false);
@@ -481,6 +486,41 @@ pub fn run_scoped(
         if !surface_changed {
             affected_paths = changed_files.clone();
         }
+    }
+
+    // Frente E discovery (2026-09-06, plan `generic-waddling-hartmanis.md`
+    // §2.4's `debug_repeated_full_scan_matches_oracle`): this function's own
+    // doc comment states the `Full` contract plainly -- "every current file
+    // is changed" -- but `syntax.analyze`'s own membership/incremental fast
+    // path (the one `run_cold`'s doc comment praises: "a SECOND Full scan of
+    // an unchanged workspace in the same process ... hits analyze()'s own
+    // fast path instead of reparsing from scratch") can narrow `affected_
+    // files` on a WARM `syntax` project regardless of `change_set`, since
+    // its membership diff has no notion of "the caller asked for Full" --
+    // it only ever compares against its own previously cached state. That
+    // narrowing is harmless for `run_incremental` (an unaffected owner's
+    // rows are simply left untouched in the store, correct for a diff
+    // publish) but silently WRONG for `run_cold`: `materialize_cold_
+    // partitioned`/`write_base_partitioned` do not diff against a prior
+    // generation at all -- they publish a COMPLETE replacement base
+    // snapshot from exactly `ColdAnalysis.owners`, so any owner missing
+    // from `affected_paths` here is not "left alone", it is DROPPED from
+    // the new generation outright. Reproduced live: a second `Full` scan
+    // (e.g. `core:reindex` against an already-`ready` v4 workspace, or this
+    // module's own `run_reconcile` cold branches, both reuse the same
+    // long-lived `syntax`) after creating one new file published a
+    // generation whose `records` root reflected ONLY that new file's own
+    // facts -- every pre-existing, wholly-unchanged owner's records
+    // vanished. Fixed here, not inside `syntax.analyze` itself (this
+    // module's own brief keeps that shared v3/v4 crate untouched): a `Full`
+    // caller always gets every present path back, regardless of what the
+    // syntax worker's own fast path decided -- `facts_for_paths` (below)
+    // reads already-cached per-file results for a path `analyze()` chose to
+    // skip re-parsing, so this costs nothing when the parse itself really
+    // was skippable, and only restores correctness when it silently wasn't
+    // supposed to be skipped for THIS caller's purposes.
+    if is_full_change_set {
+        affected_paths = files.iter().map(|file| file.path.clone()).collect();
     }
 
     let files_by_path: HashMap<&str, &SourceInput> = files

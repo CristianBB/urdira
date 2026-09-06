@@ -1,4 +1,5 @@
 import {
+  type ReconcileSummary,
   type ScanRoots,
   type ScanTimings,
   type WorkspaceScanQueryable,
@@ -10,6 +11,8 @@ import {
 export type {
   ChangedPath,
   ChangedPathKind,
+  ReconcileMode,
+  ReconcileSummary,
   ScanPriority,
   ScanRoots,
   ScanScope,
@@ -32,9 +35,9 @@ export type {
 export interface RustWorkspaceScanTransport {
   workspaceScan(
     request: WorkspaceScanRequest,
-    onQueryable?: (event: { readonly generation: number; readonly manifest_path: string; readonly timings: ScanTimings }) => void,
+    onQueryable?: (event: { readonly generation: number; readonly manifest_path: string; readonly timings: ScanTimings; readonly reconcile?: ReconcileSummary }) => void,
   ): Promise<
-    | { readonly kind: "scan_completed"; readonly request_id: string; readonly generation: number; readonly snapshot_id: string; readonly roots: ScanRoots; readonly timings: ScanTimings }
+    | { readonly kind: "scan_completed"; readonly request_id: string; readonly generation: number; readonly snapshot_id: string; readonly roots: ScanRoots; readonly timings: ScanTimings; readonly reconcile?: ReconcileSummary }
     | { readonly kind: "error"; readonly code: string; readonly message: string }
     | { readonly kind: string }
   >;
@@ -89,6 +92,9 @@ export interface RustWorkspaceScanOutcome {
   readonly timings: ScanTimings;
   /** Set only if a `queryable` event was observed before `scan_completed`. */
   readonly queryable: WorkspaceScanQueryable | undefined;
+  /** Frente E: present only for a `scope: {kind: "reconcile"}` request --
+   * absent (never sent) for `full`/`changed`. */
+  readonly reconcile?: ReconcileSummary;
 }
 
 /**
@@ -126,6 +132,9 @@ export async function runRustWorkspaceScan(
       generation: queryableEvent.generation,
       manifest_path: queryableEvent.manifest_path,
       timings: queryableEvent.timings,
+      // `exactOptionalPropertyTypes`: omit the key entirely rather than
+      // assigning `undefined` -- `full`/`changed` never set `reconcile`.
+      ...(queryableEvent.reconcile === undefined ? {} : { reconcile: queryableEvent.reconcile }),
     };
     onQueryable?.({ ...queryable, at_ms: queryableAtMs });
   });
@@ -147,6 +156,9 @@ export async function runRustWorkspaceScan(
     completed_at_ms: completedAtMs,
     timings: completed.timings,
     queryable,
+    // `exactOptionalPropertyTypes`: omit the key entirely rather than
+    // assigning `undefined` -- `full`/`changed` never set `reconcile`.
+    ...(completed.reconcile === undefined ? {} : { reconcile: completed.reconcile }),
   };
 }
 
