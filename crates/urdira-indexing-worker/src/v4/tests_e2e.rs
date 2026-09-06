@@ -4476,6 +4476,135 @@ fn reconcile_touch_all_files_is_noop_with_metadata_refresh_then_settles() {
     let _ = std::fs::remove_dir_all(&scratch_root);
 }
 
+/// Adversarial-review regression test (revisor E-fix, 2026-09-06): a
+/// reconcile whose delta is MOSTLY metadata-only noise but has just enough
+/// real content changes to land in `ReconcileMode::Delta` (not `Noop`)
+/// must STILL persist `metadata_refreshed` for the untouched-content uris
+/// -- `Delta::compute`'s outer authoritative delta carries those entries
+/// regardless of which branch below the threshold check actually runs, and
+/// `run_reconcile`'s doc comment on `metadata_refreshed` explicitly claims
+/// "Delta/Cold refresh it as part of `Catalog::apply`'s own transaction,
+/// same as any other batch" -- but the `Delta` branch's own `Catalog::apply`
+/// call (inside `delta::run_one`) is scoped to exactly `changed_paths`
+/// (added/changed/deleted only), a DIFFERENT, narrower `SourceDelta` than
+/// the outer one this function computed; the outer `delta.metadata_refreshed`
+/// is never threaded into it. Without a fix, this reconciles as `Delta`,
+/// reports `metadata_refreshed > 0` in ITS OWN summary (which is at least
+/// honest about what it found), but the SECOND reconcile of the
+/// now-untouched tree re-discovers and re-reports the EXACT SAME
+/// `metadata_refreshed` count forever (never persisted, so it can never
+/// settle to 0) -- exactly the perpetual-rediscovery outcome
+/// `Catalog::refresh_metadata`'s own doc comment says this whole feature
+/// exists to prevent.
+#[test]
+fn reconcile_delta_mode_also_persists_metadata_refresh_for_untouched_uris() {
+    let scratch_root = scratch_dir("reconcile-delta-metadata-persist");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-delta-metadata",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let frontier_file_count = {
+        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog reopens");
+        let frontier = urdira_source_frontier::Frontier::load(
+            &conn,
+            "workspace:v4-e2e-reconcile-delta-metadata",
+        )
+        .expect("frontier loads");
+        frontier.present.len()
+    };
+    assert!(
+        frontier_file_count >= 4,
+        "fixture must have enough files for a single content edit to stay under the default threshold"
+    );
+
+    // Every file's stat metadata moves (bare rewrite of its own bytes), AND
+    // exactly one file's CONTENT also changes -- 1/frontier_file_count stays
+    // comfortably under `RECONCILE_DELTA_THRESHOLD` (0.25) for this fixture,
+    // so the reconcile below lands in `Delta` mode, not `Cold`.
+    touch_preserving_content(&workspace_root);
+    let edited_file = workspace_root.join("src/domain/task.ts");
+    assert!(
+        edited_file.is_file(),
+        "fixture must contain src/domain/task.ts"
+    );
+    let mut content = std::fs::read_to_string(&edited_file).unwrap();
+    content.push_str("\nexport const urdiraReconcileDeltaMetadataProbe = 1;\n");
+    std::fs::write(&edited_file, content).unwrap();
+
+    let (reconciled, _) = run_reconcile_scan(
+        "request:reconcile-delta-1",
+        "workspace:v4-e2e-reconcile-delta-metadata",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        scan::RECONCILE_DELTA_THRESHOLD,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(
+        summary.mode,
+        urdira_worker_protocol::ReconcileMode::Delta,
+        "one content edit out of {frontier_file_count} files must stay under the default threshold"
+    );
+    assert_eq!(summary.changed, 1);
+    assert!(
+        summary.metadata_refreshed > 0,
+        "the untouched-content files must still be reported as metadata-stale"
+    );
+
+    // Nothing on disk changes between the two reconciles: if the first
+    // reconcile's metadata_refreshed entries were actually persisted to the
+    // catalog, this SECOND reconcile finds nothing left to refresh.
+    let (reconciled_again, _) = run_reconcile_scan(
+        "request:reconcile-delta-2",
+        "workspace:v4-e2e-reconcile-delta-metadata",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        scan::RECONCILE_DELTA_THRESHOLD,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let summary_again = reconcile_summary_of(&reconciled_again);
+    assert_eq!(
+        summary_again.mode,
+        urdira_worker_protocol::ReconcileMode::Noop,
+        "nothing changed on disk since the first reconcile"
+    );
+    assert_eq!(
+        summary_again.metadata_refreshed, 0,
+        "the first Delta-mode reconcile's metadata_refreshed entries must have been \
+         persisted to the catalog -- a second reconcile of the SAME untouched tree must \
+         not re-discover the same stale-metadata set forever"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
 /// (b) Simulates an index-pack import (the P-1 bug report this front
 /// fixes): copy the ENTIRE data directory (workspace tree, catalog,
 /// structural store, CAS) onto a fresh location -- every file gets a new

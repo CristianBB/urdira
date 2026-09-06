@@ -447,4 +447,106 @@ mod tests {
             vec![("a.ts".to_string(), "sha256:meta-new".to_string())]
         );
     }
+
+    /// Adversarial-review integrity guard: two DIFFERENT uris swapping
+    /// content (a.ts gets what b.ts used to hold and vice versa) must both
+    /// be classified as `changed` -- `classify` compares an observation
+    /// only against the frontier entry AT THE SAME `normalized_uri`, never
+    /// across uris, so equal content_hash values landing on different keys
+    /// can never be folded into each other's equivalence check or into
+    /// `metadata_refreshed`.
+    #[test]
+    fn swap_content_between_two_uris_marks_both_changed() {
+        let mut frontier = Frontier::empty();
+        frontier
+            .set_present(
+                "a.ts",
+                FrontierEntry {
+                    artifact_id: "artifact:a".to_string(),
+                    artifact_version_id: "artifact-version:a".to_string(),
+                    content_hash: fake_hash("a-content"),
+                    byte_length: 10,
+                    metadata_digest: "sha256:meta-a".to_string(),
+                    artifact_ordinal: 0,
+                },
+            )
+            .unwrap();
+        frontier
+            .set_present(
+                "b.ts",
+                FrontierEntry {
+                    artifact_id: "artifact:b".to_string(),
+                    artifact_version_id: "artifact-version:b".to_string(),
+                    content_hash: fake_hash("b-content"),
+                    byte_length: 10,
+                    metadata_digest: "sha256:meta-b".to_string(),
+                    artifact_ordinal: 1,
+                },
+            )
+            .unwrap();
+        // a.ts now holds what b.ts used to hold, and vice versa.
+        let observations = vec![
+            observation("a.ts", "b-content", "sha256:meta-a"),
+            observation("b.ts", "a-content", "sha256:meta-b"),
+        ];
+        let delta = Delta::compute(&frontier, &observations);
+        let changed_uris: HashSet<&str> = delta
+            .changed
+            .iter()
+            .map(|observation| observation.normalized_uri.as_str())
+            .collect();
+        assert_eq!(
+            changed_uris,
+            HashSet::from(["a.ts", "b.ts"]),
+            "a content swap between two uris must mark BOTH as changed, never equivalent"
+        );
+        assert_eq!(delta.equivalent_count, 0);
+        assert!(delta.metadata_refreshed.is_empty());
+        assert!(delta.added.is_empty());
+        assert!(delta.deleted.is_empty());
+    }
+
+    /// Adversarial-review integrity guard: a uri that used to be a regular
+    /// file and is now a symlink (or otherwise unobservable -- the walker
+    /// never produces an `Observation` for a symlink at all, see
+    /// `walker.rs`'s module doc) must never be treated as content-
+    /// equivalent just because `compute_partial` received no `Present`
+    /// observation for it. The caller (`Walker::observe_paths`) reports
+    /// this as `PathObservation::Absent`, which `compute_partial` -- unlike
+    /// `classify`, which only ever runs on a `Present` observation -- routes
+    /// straight to `deleted`, the same as a real deletion. This is
+    /// unaffected by the Frente E-fix equivalence rule (that rule only ever
+    /// compares two `Present`-side digests), but is worth pinning explicitly
+    /// since a regular-file-to-symlink transition is exactly the kind of
+    /// "same path, different filesystem object" edge case a content-hash
+    /// equivalence rule could otherwise be tempted to special-case.
+    #[test]
+    fn path_that_becomes_unobservable_is_deleted_not_equivalent() {
+        let mut frontier = Frontier::empty();
+        frontier
+            .set_present(
+                "a.ts",
+                FrontierEntry {
+                    artifact_id: "artifact:a".to_string(),
+                    artifact_version_id: "artifact-version:a".to_string(),
+                    content_hash: fake_hash("a"),
+                    byte_length: 10,
+                    metadata_digest: "sha256:meta-a".to_string(),
+                    artifact_ordinal: 0,
+                },
+            )
+            .unwrap();
+        // `Walker::observe_paths` reports this shape for a path that no
+        // longer resolves to a regular file -- a symlink now sitting where
+        // a.ts used to be a regular file, or plain deletion, look
+        // identical from `compute_partial`'s point of view.
+        let results = vec![PathObservation::Absent {
+            normalized_uri: "a.ts".to_string(),
+        }];
+        let delta = Delta::compute_partial(&frontier, &results);
+        assert_eq!(delta.deleted, vec!["a.ts".to_string()]);
+        assert_eq!(delta.equivalent_count, 0);
+        assert!(delta.changed.is_empty());
+        assert!(delta.metadata_refreshed.is_empty());
+    }
 }

@@ -647,6 +647,41 @@ pub fn run_reconcile(
         catalog::read_highest_applied_generation(conn, &request.workspace_id)? + 1;
 
     if (touched_count as f64) <= threshold * (frontier_size as f64) {
+        // Adversarial-review fix (revisor E-fix, 2026-09-06): `delta::run`
+        // below builds and applies its OWN `SourceDelta`, scoped to exactly
+        // `paths` (added/changed/deleted) via a fresh `compute_partial`
+        // against `workspace_state.frontier` -- it never sees THIS
+        // function's own outer `delta.metadata_refreshed` (uris the
+        // authoritative walk above found content-equivalent elsewhere in
+        // the tree, with just a stale `metadata_digest`; by construction
+        // (`Delta::classify`) these uris are disjoint from `paths`, so
+        // `delta::run`'s own inner delta can never carry them). Persist
+        // them here, explicitly, in their own short transaction, before
+        // handing off -- without this a Delta-mode reconcile would report
+        // `metadata_refreshed > 0` in its own summary (a true count of what
+        // it FOUND) without ever making it durable, so every subsequent
+        // reconcile of the same untouched tree would re-discover and
+        // re-report the identical stale-metadata set forever: exactly the
+        // perpetual-rediscovery outcome `Catalog::refresh_metadata`'s own
+        // doc comment says this whole feature exists to prevent. Harmless
+        // to do even when the delta attempt below fails and falls back to
+        // cold (R2): the fallback re-walks and re-diffs from scratch, so
+        // its own fresh delta simply finds these uris already
+        // metadata-current and carries no redundant refresh for them.
+        urdira_source_frontier::Catalog::refresh_metadata(
+            conn,
+            &request.workspace_id,
+            &mut frontier,
+            &delta.metadata_refreshed,
+        )?;
+        if let Some(state) = worker_state.get_mut(&request.workspace_id) {
+            for (uri, new_metadata_digest) in &delta.metadata_refreshed {
+                if let Some(entry) = state.frontier.present.get_mut(uri) {
+                    entry.metadata_digest = new_metadata_digest.clone();
+                }
+            }
+        }
+
         // Small delta: republish exactly the touched owners through the
         // existing `Changed` pipeline (`delta::run` never inspects
         // `request.scope` -- see that module's own `run`/`run_one`, which

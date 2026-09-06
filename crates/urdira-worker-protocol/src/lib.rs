@@ -299,9 +299,14 @@ pub struct ReconcileSummary {
     /// import onto a fresh filesystem. These are NOT counted in `added`/
     /// `changed`/`deleted` (they never open a new `artifact_version`) and
     /// do NOT count towards the `threshold` decision -- they are always
-    /// refreshed in-place (`Catalog::apply`'s own transaction for `Delta`/
-    /// `Cold`, `Catalog::refresh_metadata`'s dedicated one for `Noop`)
-    /// regardless of which pipeline this reconcile ran.
+    /// refreshed in-place before this reconcile returns, regardless of
+    /// which pipeline it ran: `Catalog::apply`'s own transaction for `Cold`
+    /// (the outer authoritative delta IS the delta `apply_full` commits),
+    /// and `Catalog::refresh_metadata`'s own dedicated transaction for both
+    /// `Noop` and `Delta` (the `Delta` pipeline's own `Catalog::apply` call
+    /// is scoped to a narrower, re-diffed `SourceDelta` covering only the
+    /// touched paths, so `run_reconcile` applies the outer delta's
+    /// `metadata_refreshed` itself, before handing off to it).
     pub metadata_refreshed: u64,
 }
 

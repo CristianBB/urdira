@@ -758,21 +758,29 @@ fn apply_metadata_refresh(
 }
 
 impl Catalog {
-    /// Frente E-fix: the reconcile no-op path's own catalog write.
-    /// `scan::run_reconcile`'s `touched_count == 0` branch never calls
-    /// [`Catalog::apply`] at all (there is nothing added/changed/deleted to
-    /// publish, and a `Noop` must not mint a new generation or touch
-    /// `source_index_state`/`source_observation_batches`) -- but the SAME
-    /// authoritative delta can still carry `metadata_refreshed` entries
-    /// (a byte-identical tree whose stat metadata moved: a `touch`, a
-    /// checkout, an index-pack import). This applies exactly those, in one
-    /// short dedicated transaction, so the catalog's own `metadata_digest`
-    /// column is current before the NEXT reconcile's walk -- without which
-    /// every subsequent reconcile of the same untouched tree would
-    /// re-discover and re-refresh the identical set forever (harmless, but
-    /// wasted work every time, defeating half the point of this fix).
-    /// No-ops immediately (no transaction opened at all) when `refreshed`
-    /// is empty, so a genuine no-op reconcile of an already-refreshed tree
+    /// Frente E-fix: the reconcile paths' own catalog write for a
+    /// metadata-only refresh, used at two call sites in `scan::
+    /// run_reconcile`: (1) the `touched_count == 0` (`Noop`) branch, which
+    /// never calls [`Catalog::apply`] at all (there is nothing added/
+    /// changed/deleted to publish, and a `Noop` must not mint a new
+    /// generation or touch `source_index_state`/`source_observation_
+    /// batches`), and (2) the `Delta` branch (adversarial-review fix,
+    /// 2026-09-06), whose own `Catalog::apply` call runs INSIDE
+    /// `delta::run` against a separate, narrower `SourceDelta` scoped to
+    /// only the touched paths -- it never sees this function's caller's
+    /// outer, full-tree delta, so that delta's own `metadata_refreshed`
+    /// entries (uris elsewhere in the tree the SAME authoritative walk
+    /// found content-equivalent, just with a stale `metadata_digest`) must
+    /// be applied here explicitly instead. In both cases: a byte-identical
+    /// uri whose stat metadata moved (a `touch`, a checkout, an index-pack
+    /// import). This applies exactly those, in one short dedicated
+    /// transaction, so the catalog's own `metadata_digest` column is
+    /// current before the NEXT reconcile's walk -- without which every
+    /// subsequent reconcile of the same untouched tree would re-discover
+    /// and re-refresh the identical set forever (harmless, but wasted work
+    /// every time, defeating half the point of this fix). No-ops
+    /// immediately (no transaction opened at all) when `refreshed` is
+    /// empty, so a genuine no-op reconcile of an already-refreshed tree
     /// never even touches the database.
     pub fn refresh_metadata(
         conn: &mut Connection,
@@ -1375,6 +1383,83 @@ mod tests {
         assert_eq!(
             frontier.present.get("a.ts").unwrap().metadata_digest,
             digest_before
+        );
+    }
+
+    /// Adversarial-review perf guard: `apply_metadata_refresh` issues one
+    /// `UPDATE` per row (via `prepare_cached`, inside a single transaction)
+    /// rather than a batched/multi-row statement -- this pins that this
+    /// stays cheap at the scale the review brief called out explicitly
+    /// (a `touch -r` sweep or a checkout that rewrites mtimes across the
+    /// whole tree: 20k files). `artifact_versions`' `UNIQUE (workspace_id,
+    /// artifact_version_id)` constraint gives the `WHERE workspace_id = ?
+    /// AND artifact_version_id = ? AND valid_to_generation IS NULL` an
+    /// index to use, so this is 20k indexed point-updates inside one
+    /// transaction, not 20k table scans. In-memory SQLite (no fsync)
+    /// isolates the per-statement CPU/B-tree cost this test cares about
+    /// from disk I/O, which a single-transaction commit amortizes to one
+    /// fsync regardless of row count on a real file-backed database.
+    #[test]
+    fn refresh_metadata_of_20k_uris_stays_under_budget() {
+        let mut conn = open_test_db();
+        let workspace_id = "workspace:one";
+        let mut frontier = Frontier::empty();
+
+        const N: usize = 20_000;
+        let uris: Vec<String> = (0..N).map(|i| format!("src/file-{i}.ts")).collect();
+        let cold: Vec<Observation> = uris
+            .iter()
+            .map(|uri| observation(uri, format!("export const v = {uri:?};").as_bytes()))
+            .collect();
+        let delta0 = Delta::compute(&frontier, &cold);
+        assert_eq!(delta0.added.len(), N);
+        Catalog::apply(
+            &mut conn,
+            workspace_id,
+            &mut frontier,
+            &delta0,
+            1,
+            &batch_meta(true),
+        )
+        .unwrap();
+
+        // Every uri's stat metadata moves (a `touch -r`/checkout-mtime
+        // sweep), content untouched -- exactly the batch shape
+        // `Delta::classify` routes entirely into `metadata_refreshed`.
+        let refreshed: Vec<(String, String)> = uris
+            .iter()
+            .enumerate()
+            .map(|(i, uri)| (uri.clone(), format!("sha256:{i:064x}")))
+            .collect();
+
+        let started = std::time::Instant::now();
+        Catalog::refresh_metadata(&mut conn, workspace_id, &mut frontier, &refreshed).unwrap();
+        let elapsed = started.elapsed();
+        eprintln!(
+            "[perf] apply_metadata_refresh({N} rows, in-memory sqlite) took {:.1}ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "refreshing {N} rows took {elapsed:?}, over the 500ms budget"
+        );
+
+        for (uri, expected_digest) in &refreshed {
+            assert_eq!(
+                &frontier.present.get(uri).unwrap().metadata_digest,
+                expected_digest
+            );
+        }
+        let stored_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_versions WHERE workspace_id = ?1 AND analysis_metadata_digest LIKE 'sha256:0%'",
+                params![workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored_count >= 1,
+            "the refreshed digests must be durably stored, not just in-memory"
         );
     }
 }
