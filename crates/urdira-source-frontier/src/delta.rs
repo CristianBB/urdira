@@ -1,9 +1,33 @@
 //! Diffs a batch of [`crate::walker::Observation`]s against a
-//! [`crate::frontier::Frontier`], applying the same equivalence rule as
-//! `isEquivalentObservation` (`packages/engine/src/source-indexer.ts:342`):
-//! content hash AND metadata digest both equal the frontier's current entry
-//! means nothing changed, so no new `artifact_versions` row is opened.
-
+//! [`crate::frontier::Frontier`].
+//!
+//! **Frente E-fix (plan `generic-waddling-hartmanis.md` §0/§2, 2026-09-06):
+//! content-hash equivalence, not `isEquivalentObservation`'s stricter rule.**
+//! The TS oracle this crate was originally ported from
+//! (`isEquivalentObservation`, `packages/engine/src/source-indexer.ts:342`)
+//! requires BOTH `content_hash` AND `metadata_digest` to match the
+//! frontier's current entry for a uri to count as unchanged. That rule
+//! makes every stat-only mutation that never touches a byte of content — a
+//! bare `touch`, a `git stash`/checkout round trip that rewrites mtimes, or
+//! copying/importing an already-indexed tree onto a fresh filesystem (an
+//! index-pack import: same bytes, new inode/ctime) — look exactly like a
+//! full-corpus edit: `Delta::compute` used to put every such uri in
+//! `changed`, and a reconcile of an otherwise byte-identical tree came back
+//! `mode: "cold"` with `changed == frontier_size`, re-analyzing content that
+//! never changed. Deliberately diverging from the TS oracle here (this
+//! crate's `walker.rs` module doc already documents one such deliberate
+//! simplification versus the TS provider): this crate's own equivalence
+//! rule is now content-addressed — `content_hash` (and `byte_length`,
+//! `set_present`'s own invariant) equal to the frontier's current entry
+//! means nothing changed, full stop, regardless of `metadata_digest`. A
+//! `metadata_digest`-only difference is still recorded (in
+//! `Delta::metadata_refreshed`) so [`crate::catalog::Catalog`] can keep the
+//! stored digest current — the next diff against the SAME on-disk state
+//! then costs nothing extra — without opening a new `artifact_versions` row
+//! or otherwise treating the uri as a real content change. This is the
+//! SAME guarantee `isEquivalentObservation`'s stricter rule protected
+//! (content-addressed identity), just without the metadata-driven false
+//! positives.
 use crate::frontier::Frontier;
 use crate::walker::{Observation, PathObservation};
 use std::collections::HashSet;
@@ -18,13 +42,25 @@ pub struct Delta {
     /// Uris with no prior artifact at all (never present, never tombstoned).
     pub added: Vec<Observation>,
     /// Uris with a materially different observation than the frontier's
-    /// current state: a different content/metadata digest than the live
+    /// current state: a different CONTENT hash than the live
     /// `Frontier::present` entry, or a uri that was tombstoned
-    /// (recreated/reincluded — its prior tombstone must be closed).
+    /// (recreated/reincluded — its prior tombstone must be closed). A
+    /// `metadata_digest`-only difference is never enough to land a uri here
+    /// (see the module doc's Frente E-fix note) — that goes to
+    /// `metadata_refreshed` instead.
     pub changed: Vec<Observation>,
     /// Uris previously present (per `Frontier::present`) that this batch no
     /// longer observes.
     pub deleted: Vec<String>,
+    /// Frente E-fix: uris whose `content_hash`/`byte_length` are UNCHANGED
+    /// from the frontier's current entry (so they are counted in
+    /// `equivalent_count`, never in `changed`) but whose `metadata_digest`
+    /// differs — `(normalized_uri, new_metadata_digest)`. `Catalog::apply`
+    /// (the `changed`/`Full` path) and `Catalog::refresh_metadata` (the
+    /// reconcile no-op path, which never calls `apply` at all) both use
+    /// this to keep `artifact_versions.analysis_metadata_digest` current
+    /// without opening a new version or touching `valid_from_generation`.
+    pub metadata_refreshed: Vec<(String, String)>,
     pub equivalent_count: u64,
 }
 
@@ -73,11 +109,23 @@ impl Delta {
 
 fn classify(frontier: &Frontier, observation: &Observation, delta: &mut Delta) {
     match frontier.present.get(&observation.normalized_uri) {
+        // Frente E-fix: content-addressed equivalence — a uri whose
+        // content_hash/byte_length exactly match the frontier's current
+        // entry is unchanged, regardless of metadata_digest (see the
+        // module doc). A metadata_digest difference on an otherwise
+        // equivalent observation is recorded in `metadata_refreshed`
+        // rather than promoting the uri to `changed`.
         Some(entry)
             if entry.content_hash == observation.content_hash
-                && entry.metadata_digest == observation.metadata_digest =>
+                && entry.byte_length == observation.byte_length =>
         {
             delta.equivalent_count += 1;
+            if entry.metadata_digest != observation.metadata_digest {
+                delta.metadata_refreshed.push((
+                    observation.normalized_uri.clone(),
+                    observation.metadata_digest.clone(),
+                ));
+            }
         }
         Some(_) => delta.changed.push(observation.clone()),
         None => {
@@ -259,5 +307,144 @@ mod tests {
         }];
         let delta = Delta::compute_partial(&frontier, &results);
         assert_eq!(delta.deleted, vec!["a.ts".to_string()]);
+    }
+
+    // -----------------------------------------------------------------
+    // Frente E-fix (plan `generic-waddling-hartmanis.md` §0/§2, 2026-09-06):
+    // content-hash equivalence, metadata-only refresh.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn metadata_only_difference_is_equivalent_with_refresh_full_scan() {
+        let mut frontier = Frontier::empty();
+        frontier
+            .set_present(
+                "a.ts",
+                FrontierEntry {
+                    artifact_id: "artifact:a".to_string(),
+                    artifact_version_id: "artifact-version:a".to_string(),
+                    content_hash: fake_hash("a"),
+                    byte_length: 10,
+                    metadata_digest: "sha256:meta-old".to_string(),
+                    artifact_ordinal: 0,
+                },
+            )
+            .unwrap();
+        // Same content, different metadata_digest -- a `touch`, a
+        // `git stash`/checkout mtime rewrite, or an index-pack import onto
+        // a fresh filesystem all look like this: identical bytes, a
+        // different inode/ctime/mtime.
+        let observations = vec![observation("a.ts", "a", "sha256:meta-new")];
+        let delta = Delta::compute(&frontier, &observations);
+        assert_eq!(
+            delta.equivalent_count, 1,
+            "a content-identical uri must count as equivalent regardless of metadata_digest"
+        );
+        assert!(
+            delta.changed.is_empty(),
+            "a metadata-only difference must never land in `changed`"
+        );
+        assert!(delta.added.is_empty());
+        assert_eq!(
+            delta.metadata_refreshed,
+            vec![("a.ts".to_string(), "sha256:meta-new".to_string())]
+        );
+    }
+
+    #[test]
+    fn identical_metadata_and_content_yields_no_refresh() {
+        let mut frontier = Frontier::empty();
+        frontier
+            .set_present(
+                "a.ts",
+                FrontierEntry {
+                    artifact_id: "artifact:a".to_string(),
+                    artifact_version_id: "artifact-version:a".to_string(),
+                    content_hash: fake_hash("a"),
+                    byte_length: 10,
+                    metadata_digest: "sha256:meta-a".to_string(),
+                    artifact_ordinal: 0,
+                },
+            )
+            .unwrap();
+        let observations = vec![observation("a.ts", "a", "sha256:meta-a")];
+        let delta = Delta::compute(&frontier, &observations);
+        assert_eq!(delta.equivalent_count, 1);
+        assert!(
+            delta.metadata_refreshed.is_empty(),
+            "no metadata_refreshed entry when nothing actually differs"
+        );
+    }
+
+    /// Integrity guard: two observations of the SAME byte_length but
+    /// DIFFERENT content must still be classified as `changed` -- the
+    /// content-hash equivalence rule must never fall back to `byte_length`
+    /// alone as a cheaper proxy for content equality.
+    #[test]
+    fn same_byte_length_different_content_stays_changed() {
+        let mut frontier = Frontier::empty();
+        frontier
+            .set_present(
+                "a.ts",
+                FrontierEntry {
+                    artifact_id: "artifact:a".to_string(),
+                    artifact_version_id: "artifact-version:a".to_string(),
+                    content_hash: fake_hash("aaaaaaaaaa"),
+                    byte_length: 10,
+                    metadata_digest: "sha256:meta-a".to_string(),
+                    artifact_ordinal: 0,
+                },
+            )
+            .unwrap();
+        // `observation()` always reports byte_length 10 regardless of the
+        // content label -- same length, different content_hash, same
+        // metadata_digest (so a metadata false-positive cannot explain the
+        // classification either).
+        let observations = vec![observation("a.ts", "bbbbbbbbbb", "sha256:meta-a")];
+        let delta = Delta::compute(&frontier, &observations);
+        assert_eq!(
+            delta.changed.len(),
+            1,
+            "same-length, different-content must still be `changed` -- integrity over byte_length shortcuts"
+        );
+        assert_eq!(delta.equivalent_count, 0);
+        assert!(delta.metadata_refreshed.is_empty());
+    }
+
+    #[test]
+    fn compute_partial_also_refreshes_metadata_for_a_present_observation() {
+        let mut frontier = Frontier::empty();
+        frontier
+            .set_present(
+                "a.ts",
+                FrontierEntry {
+                    artifact_id: "artifact:a".to_string(),
+                    artifact_version_id: "artifact-version:a".to_string(),
+                    content_hash: fake_hash("a"),
+                    byte_length: 10,
+                    metadata_digest: "sha256:meta-old".to_string(),
+                    artifact_ordinal: 0,
+                },
+            )
+            .unwrap();
+        // The editor "changed" pipeline reports a-ts as Modified after a
+        // save that rewrote the exact same bytes (metadata changes on
+        // every `write`, content does not) -- `compute_partial` must apply
+        // the SAME equivalence rule `compute` does, not a stricter one.
+        let results = vec![PathObservation::Present(observation(
+            "a.ts",
+            "a",
+            "sha256:meta-new",
+        ))];
+        let delta = Delta::compute_partial(&frontier, &results);
+        assert_eq!(delta.equivalent_count, 1);
+        assert!(
+            delta.changed.is_empty(),
+            "a no-content-change save must not open a new artifact_version"
+        );
+        assert_eq!(
+            delta.metadata_refreshed,
+            vec![("a.ts".to_string(), "sha256:meta-new".to_string())]
+        );
     }
 }

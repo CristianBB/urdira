@@ -67,6 +67,7 @@ interface IndexStatusWorkspaceView {
       readonly frontier_size: number;
       readonly threshold: number;
       readonly fell_back_to_cold: boolean;
+      readonly metadata_refreshed: number;
     };
   };
 }
@@ -125,7 +126,7 @@ function createFakeV4Transport(state: FakeTransportState): RustWorkspaceScanTran
         roots: { records: `sha256:${hex("a")}`, dependency: `sha256:${hex("b")}`, graph: `sha256:${hex("c")}`, metric: `sha256:${hex("d")}` },
         timings: { total_ms: 2 },
         ...(request.scope.kind === "reconcile"
-          ? { reconcile: { mode: "delta" as const, added: 1, changed: 0, deleted: 0, frontier_size: 3, threshold: 0.25, fell_back_to_cold: false } }
+          ? { reconcile: { mode: "delta" as const, added: 1, changed: 0, deleted: 0, frontier_size: 3, threshold: 0.25, fell_back_to_cold: false, metadata_refreshed: 0 } }
           : {}),
       };
     },
@@ -194,7 +195,7 @@ describe("Daemon v4 ScanScope::Reconcile wiring (Frente E)", () => {
 
       const status = await pollUntilStructuralReady(daemon.client, daemon.workspaceId);
       expect(status.last_scan?.kind).toBe("reconcile");
-      expect(status.last_scan?.reconcile).toEqual({ mode: "delta", added: 1, changed: 0, deleted: 0, frontier_size: 3, threshold: 0.25, fell_back_to_cold: false });
+      expect(status.last_scan?.reconcile).toEqual({ mode: "delta", added: 1, changed: 0, deleted: 0, frontier_size: 3, threshold: 0.25, fell_back_to_cold: false, metadata_refreshed: 0 });
     } finally {
       await stopV4Daemon(daemon);
     }

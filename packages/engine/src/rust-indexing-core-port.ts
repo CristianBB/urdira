@@ -29,7 +29,13 @@ export type ReconcileMode = "noop" | "delta" | "cold";
  * watcher's own hint); `threshold` is the effective `T` this call used.
  * `fell_back_to_cold` is `true` only for the R2 fallback (the `delta` pipeline
  * was attempted and failed, and this `cold` result is the SAME request's
- * recovery, not a size-driven decision). */
+ * recovery, not a size-driven decision). `metadata_refreshed` (Frente E-fix,
+ * plan `generic-waddling-hartmanis.md` §0/§2, 2026-09-06): how many uris this
+ * reconcile found content-equivalent (same content hash) but with a stale stat
+ * metadata digest -- a `touch`, a checkout, or an index-pack import onto a
+ * fresh filesystem. Never counted in `added`/`changed`/`deleted` or the
+ * `threshold` decision; always refreshed in place regardless of which mode
+ * ran. */
 export interface ReconcileSummary {
   readonly mode: ReconcileMode;
   readonly added: number;
@@ -38,6 +44,7 @@ export interface ReconcileSummary {
   readonly frontier_size: number;
   readonly threshold: number;
   readonly fell_back_to_cold: boolean;
+  readonly metadata_refreshed: number;
 }
 export interface ScanTimings {
   readonly catalog_ms?: number;

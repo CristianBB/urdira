@@ -194,6 +194,18 @@ impl Catalog {
                 frontier,
             )?;
         }
+        // Frente E-fix: a content-equivalent uri whose metadata_digest
+        // still differs from the frontier's stored one -- part of the SAME
+        // transaction as everything else this batch touched, so a `Full`/
+        // `Changed` batch that mixes real changes with metadata-only
+        // refreshes commits both atomically. See `delta.rs`'s module doc
+        // and `apply_metadata_refresh`'s own doc comment.
+        apply_metadata_refresh(
+            &transaction,
+            workspace_id,
+            frontier,
+            &delta.metadata_refreshed,
+        )?;
         let insert_elapsed = insert_started.elapsed();
 
         let digest_started = std::time::Instant::now();
@@ -696,6 +708,88 @@ fn apply_deleted(
     )
 }
 
+/// Frente E-fix: applies exactly `delta.metadata_refreshed` -- for each
+/// `(uri, new_metadata_digest)` pair, `UPDATE`s the CURRENT
+/// (`valid_to_generation IS NULL`) `artifact_versions` row's
+/// `analysis_metadata_digest` column (the same column `Frontier::load`
+/// reads back as `FrontierEntry::metadata_digest`) and mirrors the new
+/// value onto `frontier.present`'s in-memory entry. Never touches
+/// `content_hash`/`byte_length`/`valid_from_generation`/`content_blob_id`,
+/// never opens a new `artifact_version_id`, and writes nothing to
+/// `source_observations`/`source_observation_batches` -- this is
+/// deliberately NOT an observation (plan §2's rule: a metadata-only
+/// difference on an otherwise content-equivalent uri is not "a new fact
+/// about this artifact", just an updated freshness fingerprint on the SAME
+/// one). Takes `&Connection` (not `&Transaction`) so both call sites can
+/// share it: [`Catalog::apply`] passes its own open `&Transaction`
+/// (`Transaction: Deref<Target = Connection>` covers the coercion), and
+/// [`Catalog::refresh_metadata`] opens a dedicated one. A uri no longer in
+/// `frontier.present` at call time (should not happen -- this is only ever
+/// fed entries `Delta::compute`/`compute_partial` classified as
+/// content-equivalent against a `Frontier::present` entry) is skipped
+/// rather than treated as an error, matching this crate's existing
+/// tolerance for stale/already-absent entries elsewhere (e.g.
+/// `compute_partial`'s `Absent` arm).
+fn apply_metadata_refresh(
+    conn: &Connection,
+    workspace_id: &str,
+    frontier: &mut Frontier,
+    refreshed: &[(String, String)],
+) -> Result<(), CoreError> {
+    for (uri, new_metadata_digest) in refreshed {
+        let Some(artifact_version_id) = frontier
+            .present
+            .get(uri)
+            .map(|entry| entry.artifact_version_id.clone())
+        else {
+            continue;
+        };
+        conn.prepare_cached(
+            "UPDATE artifact_versions SET analysis_metadata_digest = ?1 WHERE workspace_id = ?2 AND artifact_version_id = ?3 AND valid_to_generation IS NULL",
+        )
+        .map_err(sql_error)?
+        .execute(params![new_metadata_digest, workspace_id, artifact_version_id])
+        .map_err(sql_error)?;
+        if let Some(entry) = frontier.present.get_mut(uri) {
+            entry.metadata_digest = new_metadata_digest.clone();
+        }
+    }
+    Ok(())
+}
+
+impl Catalog {
+    /// Frente E-fix: the reconcile no-op path's own catalog write.
+    /// `scan::run_reconcile`'s `touched_count == 0` branch never calls
+    /// [`Catalog::apply`] at all (there is nothing added/changed/deleted to
+    /// publish, and a `Noop` must not mint a new generation or touch
+    /// `source_index_state`/`source_observation_batches`) -- but the SAME
+    /// authoritative delta can still carry `metadata_refreshed` entries
+    /// (a byte-identical tree whose stat metadata moved: a `touch`, a
+    /// checkout, an index-pack import). This applies exactly those, in one
+    /// short dedicated transaction, so the catalog's own `metadata_digest`
+    /// column is current before the NEXT reconcile's walk -- without which
+    /// every subsequent reconcile of the same untouched tree would
+    /// re-discover and re-refresh the identical set forever (harmless, but
+    /// wasted work every time, defeating half the point of this fix).
+    /// No-ops immediately (no transaction opened at all) when `refreshed`
+    /// is empty, so a genuine no-op reconcile of an already-refreshed tree
+    /// never even touches the database.
+    pub fn refresh_metadata(
+        conn: &mut Connection,
+        workspace_id: &str,
+        frontier: &mut Frontier,
+        refreshed: &[(String, String)],
+    ) -> Result<(), CoreError> {
+        if refreshed.is_empty() {
+            return Ok(());
+        }
+        let transaction = conn.transaction().map_err(sql_error)?;
+        apply_metadata_refresh(&transaction, workspace_id, frontier, refreshed)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(())
+    }
+}
+
 /// Upserts `source_index_state`, respecting its `CHECK (state_revision > 0)`
 /// constraint (so a first-ever apply for a workspace starts at 1, matching
 /// `apply_source_index_commits`' `expected_revision == 0` insert branch).
@@ -1058,6 +1152,229 @@ mod tests {
         assert_eq!(
             frontier.source_state_digest(),
             frontier.from_scratch_digest().unwrap()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Frente E-fix (plan `generic-waddling-hartmanis.md` §0/§2, 2026-09-06):
+    // metadata-only refresh, applied both via `Catalog::apply` (the
+    // `Full`/`Changed` path, which may mix real changes with refreshes in
+    // the same batch) and via the standalone `Catalog::refresh_metadata`
+    // (the reconcile no-op path, which never calls `apply` at all).
+    // -----------------------------------------------------------------
+
+    /// A batch that is ENTIRELY a metadata refresh (no added/changed/
+    /// deleted at all -- e.g. a reconcile's `Delta::compute` classified
+    /// every touched uri as content-equivalent) still commits cleanly
+    /// through `Catalog::apply`: no new `artifact_version_id`, no new
+    /// `source_observations` row, `analysis_metadata_digest` updated in
+    /// place, and `frontier`'s in-memory entry mirrors the new digest.
+    #[test]
+    fn apply_with_only_metadata_refreshed_does_not_open_a_new_version() {
+        let mut conn = open_test_db();
+        let workspace_id = "workspace:one";
+        let mut frontier = Frontier::empty();
+        let cold = vec![observation("a.ts", b"export const a = 1;")];
+        let delta0 = Delta::compute(&frontier, &cold);
+        Catalog::apply(
+            &mut conn,
+            workspace_id,
+            &mut frontier,
+            &delta0,
+            1,
+            &batch_meta(true),
+        )
+        .unwrap();
+        let version_before = frontier
+            .present
+            .get("a.ts")
+            .unwrap()
+            .artifact_version_id
+            .clone();
+        let observation_count_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_observations WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Same content, refreshed stat metadata (a `touch`/checkout/import
+        // -- same bytes, a new inode/ctime/mtime `metadata_digest`).
+        let mut touched = observation("a.ts", b"export const a = 1;");
+        touched.metadata_digest = "sha256:touched-metadata-digest".to_string();
+        let delta1 = Delta::compute(&frontier, std::slice::from_ref(&touched));
+        assert_eq!(delta1.equivalent_count, 1);
+        assert!(delta1.added.is_empty());
+        assert!(delta1.changed.is_empty());
+        assert_eq!(
+            delta1.metadata_refreshed,
+            vec![("a.ts".to_string(), touched.metadata_digest.clone())]
+        );
+
+        let applied = Catalog::apply(
+            &mut conn,
+            workspace_id,
+            &mut frontier,
+            &delta1,
+            2,
+            &batch_meta(true),
+        )
+        .unwrap();
+        assert_eq!(applied.added, 0);
+        assert_eq!(applied.changed, 0);
+        assert_eq!(applied.deleted, 0);
+        assert_eq!(applied.equivalent, 1);
+
+        assert_eq!(
+            frontier.present.get("a.ts").unwrap().artifact_version_id,
+            version_before,
+            "a metadata-only refresh must never open a new artifact_version"
+        );
+        assert_eq!(
+            frontier.present.get("a.ts").unwrap().metadata_digest,
+            touched.metadata_digest
+        );
+
+        let stored_digest: String = conn
+            .query_row(
+                "SELECT analysis_metadata_digest FROM artifact_versions WHERE artifact_version_id = ?1 AND valid_to_generation IS NULL",
+                params![version_before],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_digest, touched.metadata_digest);
+
+        let version_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_versions WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            version_rows, 1,
+            "no new artifact_versions row for a metadata-only refresh"
+        );
+        let observation_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_observations WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            observation_count_after, observation_count_before,
+            "a metadata-only refresh writes no source_observations row (not a new fact about this artifact)"
+        );
+    }
+
+    /// `Catalog::refresh_metadata` -- the reconcile no-op path's own call
+    /// (never `apply`, since there is nothing added/changed/deleted to
+    /// publish): updates `analysis_metadata_digest` and the in-memory
+    /// frontier WITHOUT bumping `source_index_state.state_revision` or
+    /// `current_generation` -- the "no new generation" invariant a Noop
+    /// reconcile depends on, verified directly at this layer.
+    #[test]
+    fn refresh_metadata_updates_digest_without_a_new_generation() {
+        let mut conn = open_test_db();
+        let workspace_id = "workspace:one";
+        let mut frontier = Frontier::empty();
+        let cold = vec![observation("a.ts", b"export const a = 1;")];
+        let delta0 = Delta::compute(&frontier, &cold);
+        Catalog::apply(
+            &mut conn,
+            workspace_id,
+            &mut frontier,
+            &delta0,
+            1,
+            &batch_meta(true),
+        )
+        .unwrap();
+        let version_before = frontier
+            .present
+            .get("a.ts")
+            .unwrap()
+            .artifact_version_id
+            .clone();
+        let (revision_before, generation_before): (i64, i64) = conn
+            .query_row(
+                "SELECT state_revision, current_generation FROM source_index_state WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        Catalog::refresh_metadata(
+            &mut conn,
+            workspace_id,
+            &mut frontier,
+            &[("a.ts".to_string(), "sha256:refreshed".to_string())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            frontier.present.get("a.ts").unwrap().metadata_digest,
+            "sha256:refreshed"
+        );
+        assert_eq!(
+            frontier.present.get("a.ts").unwrap().artifact_version_id,
+            version_before
+        );
+        let stored_digest: String = conn
+            .query_row(
+                "SELECT analysis_metadata_digest FROM artifact_versions WHERE artifact_version_id = ?1 AND valid_to_generation IS NULL",
+                params![version_before],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_digest, "sha256:refreshed");
+
+        let (revision_after, generation_after): (i64, i64) = conn
+            .query_row(
+                "SELECT state_revision, current_generation FROM source_index_state WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            revision_after, revision_before,
+            "refresh_metadata must not bump state_revision -- it never runs for a Noop reconcile's non-existent generation"
+        );
+        assert_eq!(generation_after, generation_before);
+    }
+
+    /// An empty `refreshed` slice never opens a transaction at all --
+    /// confirmed indirectly here by simply checking it is a true no-op on
+    /// both the frontier and `source_index_state`.
+    #[test]
+    fn refresh_metadata_with_empty_slice_is_a_true_no_op() {
+        let mut conn = open_test_db();
+        let workspace_id = "workspace:one";
+        let mut frontier = Frontier::empty();
+        let cold = vec![observation("a.ts", b"export const a = 1;")];
+        let delta0 = Delta::compute(&frontier, &cold);
+        Catalog::apply(
+            &mut conn,
+            workspace_id,
+            &mut frontier,
+            &delta0,
+            1,
+            &batch_meta(true),
+        )
+        .unwrap();
+        let digest_before = frontier
+            .present
+            .get("a.ts")
+            .unwrap()
+            .metadata_digest
+            .clone();
+
+        Catalog::refresh_metadata(&mut conn, workspace_id, &mut frontier, &[]).unwrap();
+
+        assert_eq!(
+            frontier.present.get("a.ts").unwrap().metadata_digest,
+            digest_before
         );
     }
 }

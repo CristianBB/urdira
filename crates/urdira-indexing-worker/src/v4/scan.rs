@@ -545,17 +545,26 @@ pub fn run_reconcile(
 
     let enumeration = catalog::enumerate(workspace_root, cas_root)?;
     let walk_elapsed = enumeration.walk_elapsed;
-    let (frontier, delta) = catalog::diff(conn, &request.workspace_id, &enumeration.observations)?;
+    let (mut frontier, delta) =
+        catalog::diff(conn, &request.workspace_id, &enumeration.observations)?;
 
     let added = delta.added.len() as u64;
     let changed = delta.changed.len() as u64;
     let deleted = delta.deleted.len() as u64;
     let touched_count = added + changed + deleted;
     let frontier_size = frontier.present.len() as u64;
+    // Frente E-fix: uris this reconcile's authoritative delta found
+    // content-equivalent but with a stale `metadata_digest` -- never
+    // counted in `touched_count`/the threshold decision (a metadata-only
+    // difference is not "extent of change"), always refreshed regardless
+    // of which branch below actually runs (`Noop` refreshes it directly,
+    // below; `Delta`/`Cold` refresh it as part of `Catalog::apply`'s own
+    // transaction, same as any other batch).
+    let metadata_refreshed = delta.metadata_refreshed.len() as u64;
 
     if debug_timing {
         eprintln!(
-            "[urdira-indexing-worker] v4 reconcile: added={added} changed={changed} deleted={deleted} frontier={frontier_size} threshold={threshold} walk={:.3}s",
+            "[urdira-indexing-worker] v4 reconcile: added={added} changed={changed} deleted={deleted} frontier={frontier_size} metadata_refreshed={metadata_refreshed} threshold={threshold} walk={:.3}s",
             walk_elapsed.as_secs_f64(),
         );
     }
@@ -571,6 +580,37 @@ pub fn run_reconcile(
                 "v4 reconcile: background CAS write queue failed: {error}"
             ))
         })?;
+        // Frente E-fix: a true `Noop` never calls `Catalog::apply` (there
+        // is nothing added/changed/deleted to publish, and this branch
+        // must not mint a new generation) -- but the delta can still carry
+        // `metadata_refreshed` entries (a byte-identical tree whose stat
+        // metadata moved: a `touch`, a checkout, an index-pack import).
+        // `Catalog::refresh_metadata` applies exactly those in one short,
+        // dedicated transaction that never touches `source_index_state`/
+        // `workspace_current_state`, so the next reconcile of the SAME
+        // untouched tree does not rediscover and re-refresh the identical
+        // set again. No-ops immediately when the vector is empty.
+        urdira_source_frontier::Catalog::refresh_metadata(
+            conn,
+            &request.workspace_id,
+            &mut frontier,
+            &delta.metadata_refreshed,
+        )?;
+        // This process may already have a cached `WorkspaceState` for this
+        // workspace from an earlier `Changed` scan (`state::ensure_
+        // workspace`) -- its own `Frontier` is a SEPARATE in-memory copy
+        // from the one `catalog::diff` just loaded above (this function
+        // never reads or writes `worker_state`'s cache otherwise), so keep
+        // it current too: harmless to skip (content_hash is the only field
+        // `classify` ever compares), but keeps `metadata_digest` from
+        // drifting between the two copies for as long as this process runs.
+        if let Some(state) = worker_state.get_mut(&request.workspace_id) {
+            for (uri, new_metadata_digest) in &delta.metadata_refreshed {
+                if let Some(entry) = state.frontier.present.get_mut(uri) {
+                    entry.metadata_digest = new_metadata_digest.clone();
+                }
+            }
+        }
         let generation_u64 = u64::try_from(current_generation)
             .map_err(|_| ScanError("generation must be non-negative".into()))?;
         let roots = read_generation_roots(conn, current_generation)?;
@@ -582,6 +622,7 @@ pub fn run_reconcile(
             frontier_size,
             threshold,
             fell_back_to_cold: false,
+            metadata_refreshed,
         };
         let event = IndexingEvent::ScanCompleted {
             request_id: request.request_id.clone(),
@@ -681,6 +722,7 @@ pub fn run_reconcile(
                     frontier_size,
                     threshold,
                     fell_back_to_cold: false,
+                    metadata_refreshed,
                 };
                 return Ok((with_reconcile_summary(event, summary), Some(touched)));
             }
@@ -729,6 +771,7 @@ pub fn run_reconcile(
                     frontier_size,
                     threshold,
                     fell_back_to_cold: true,
+                    metadata_refreshed,
                 };
                 return Ok((with_reconcile_summary(event, summary), None));
             }
@@ -759,6 +802,7 @@ pub fn run_reconcile(
         frontier_size,
         threshold,
         fell_back_to_cold: false,
+        metadata_refreshed,
     };
     Ok((with_reconcile_summary(event, summary), None))
 }

@@ -1332,7 +1332,15 @@ function renderIndexStatusText(page: JsonRecord): string {
           && typeof reconcile["deleted"] === "number" && typeof reconcile["frontier_size"] === "number"
           ? ` (+${reconcile["added"]} ~${reconcile["changed"]} -${reconcile["deleted"]} of ${reconcile["frontier_size"]})`
           : "";
-        lines.push(`  last_scan: ${label}${reconcileSummary}${changedPaths}${wallMs}`);
+        // Frente E-fix: `metadata_refreshed` is a newer field an older
+        // worker's `ReconcileSummary` may not carry at all -- conditional
+        // on both presence and being worth mentioning (0 is the common,
+        // uninteresting case for an already-settled tree).
+        const metadataRefreshed = reconcile !== undefined
+          && typeof reconcile["metadata_refreshed"] === "number" && reconcile["metadata_refreshed"] > 0
+          ? `, refreshed=${reconcile["metadata_refreshed"]}`
+          : "";
+        lines.push(`  last_scan: ${label}${reconcileSummary}${metadataRefreshed}${changedPaths}${wallMs}`);
       }
       if (!lexicalCurrent) lines.push("  hint: search_text will report partial until lexical catches up");
       if (!semanticCurrent) lines.push("  hint: search_semantic is unavailable until semantic indexing catches up");

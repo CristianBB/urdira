@@ -57,6 +57,10 @@ export interface ReconcileSummary {
   readonly frontier_size: number;
   readonly threshold: number;
   readonly fell_back_to_cold: boolean;
+  /** Frente E-fix: uris found content-equivalent but with a stale metadata
+   * digest -- see `rust-indexing-core-port.ts`'s own copy for the full
+   * explanation. */
+  readonly metadata_refreshed: number;
 }
 export interface ScanTimings {
   readonly catalog_ms?: number;
