@@ -168,7 +168,15 @@ function decodeDocumentGrains(value: string | null): readonly ("artifact" | "ent
 }
 function normalizedTerm(value: string): string { return value.normalize("NFKC").toLocaleLowerCase("en-US"); }
 
-interface VectorConfig {
+/**
+ * Exported (Frente S-B, 2026-09-06, adversarial review item #7): the exact
+ * shape `canonicalVectorBytes` below re-encodes against -- the reconciler
+ * (`@urdira/engine`'s `semantic-reconciler.ts`) needs this SAME shape to
+ * predict what a `putVectors` call would actually store, see that
+ * function's own doc comment for why duplicating the transform instead of
+ * importing it was the bug.
+ */
+export interface VectorConfig {
   readonly element_type: "float32" | "float64";
   readonly vector_encoding: "float32-le" | "float64-le";
   readonly normalization: "none" | "l2";
@@ -210,7 +218,19 @@ function encodeVectorValues(values: readonly number[], config: VectorConfig): Ui
   return bytes;
 }
 
-function canonicalVectorBytes(vector: Uint8Array, dimensions: number, config: VectorConfig): Uint8Array {
+/**
+ * THE canonical "decode -> re-apply L2 normalization -> re-encode" pass
+ * every vector this store persists goes through -- `putVectors` below is
+ * its only caller within this module, and it is now ALSO the reconciler's
+ * (`@urdira/engine`'s `semantic-reconciler.ts`) only way to predict what
+ * `putVectors` will actually store from a freshly generated vector, without
+ * duplicating this transform (see that reconciler's own doc comment on why
+ * a hand-duplicated copy silently drifted: this module's own finite-value
+ * and zero-norm checks were never mirrored there). Exported for exactly
+ * that one external caller -- everything else in this module keeps calling
+ * it unqualified, same as before.
+ */
+export function canonicalVectorBytes(vector: Uint8Array, dimensions: number, config: VectorConfig): Uint8Array {
   const width = config.element_type === "float32" ? 4 : 8;
   if (vector.byteLength !== dimensions * width) throw new StorageError("storage:invalid_vector", "Vector byte length does not match its declared dimensions.");
   let values = decodeVectorValues(vector, config);

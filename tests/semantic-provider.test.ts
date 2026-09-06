@@ -436,7 +436,7 @@ describe("HTTP embedding provider", () => {
     let server: Server;
     let baseUrl: string;
     let requestCount: number;
-    let behavior: (requestIndex: number, body: { readonly input: readonly string[] }) => { readonly status: number; readonly body: unknown };
+    let behavior: (requestIndex: number, body: { readonly input: readonly string[] }) => { readonly status: number; readonly body: unknown; readonly headers?: Record<string, string> };
 
     beforeEach(async () => {
       requestCount = 0;
@@ -447,8 +447,8 @@ describe("HTTP embedding provider", () => {
           request.on("end", () => {
             requestCount += 1;
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { readonly input: readonly string[] };
-            const { status, body: responseBody } = behavior(requestCount, body);
-            response.writeHead(status, { "content-type": "application/json" });
+            const { status, body: responseBody, headers } = behavior(requestCount, body);
+            response.writeHead(status, { "content-type": "application/json", ...headers });
             response.end(JSON.stringify(responseBody));
           });
         });
@@ -526,6 +526,69 @@ describe("HTTP embedding provider", () => {
         { profile_id: provider.profile.embedding_profile_id, executable_binding_id: provider.binding.executable_binding_digest, dimensions: provider.profile.dimensions, distance_metric: "cosine", normalization: "l2" },
       );
       expect(ranked[0]?.projection_record_id).toBe("html-doc");
+    });
+
+    it("respects a 429 response's own Retry-After header as a MINIMUM wait, even when it is longer than the configured backoff (adversarial review item #8)", async () => {
+      const sleeps: number[] = [];
+      behavior = (requestIndex) => requestIndex === 1
+        ? { status: 429, body: "rate limited", headers: { "retry-after": "2" } }
+        : { status: 200, body: { data: [{ embedding: [1, 0, 0, 0] }] } };
+      // `retry_backoff_ms: [10]` is far SHORTER than the server's own
+      // `Retry-After: 2` (2,000ms) -- the actual wait must be raised to at
+      // least the server's own value, never left at the configured 10ms.
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4, retry_backoff_ms: [10], sleep_impl: async (ms) => { sleeps.push(ms); } });
+      const generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: "retry-me" });
+      expect(requestCount).toBe(2);
+      expect(generated.vector.byteLength).toBe(16);
+      expect(sleeps).toEqual([2000]);
+    });
+
+    it("does not let a stale/malformed Retry-After value shorten or break the configured backoff", async () => {
+      const sleeps: number[] = [];
+      behavior = (requestIndex) => requestIndex === 1
+        ? { status: 429, body: "rate limited", headers: { "retry-after": "not-a-valid-value" } }
+        : { status: 200, body: { data: [{ embedding: [1, 0, 0, 0] }] } };
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4, retry_backoff_ms: [10], sleep_impl: async (ms) => { sleeps.push(ms); } });
+      const generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: "retry-me" });
+      expect(requestCount).toBe(2);
+      expect(generated.vector.byteLength).toBe(16);
+      expect(sleeps).toEqual([10]);
+    });
+
+    it("reorders a response whose data[] items come back out of request order, when each item carries its own index (adversarial review item #8)", async () => {
+      const oneHot = new Map<string, readonly number[]>([["a", [1, 0, 0, 0]], ["bb", [0, 1, 0, 0]], ["ccc", [0, 0, 1, 0]]]);
+      behavior = (_requestIndex, body) => ({
+        status: 200,
+        // Deliberately REVERSED from request order (index 2 first, index 0
+        // last) -- some "OpenAI-compatible" servers do this (e.g. shortest
+        // input finishes first) while still tagging each item with its own
+        // `index`. A naive positional `data[i]` read would pair "a"'s own
+        // embedding with "ccc" and vice versa.
+        body: { data: body.input.map((text, requestIndex) => ({ index: requestIndex, embedding: oneHot.get(text) })).reverse() },
+      });
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4 });
+      const generated = await provider.binding.generateVectors!([
+        { profile: provider.profile, purpose: "document", text: "a" },
+        { profile: provider.profile, purpose: "document", text: "bb" },
+        { profile: provider.profile, purpose: "document", text: "ccc" },
+      ]);
+      const decode = (bytes: Uint8Array) => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+      expect(decode(generated[0]!.vector)).toEqual([1, 0, 0, 0]);
+      expect(decode(generated[1]!.vector)).toEqual([0, 1, 0, 0]);
+      expect(decode(generated[2]!.vector)).toEqual([0, 0, 1, 0]);
+    });
+
+    it("falls back to positional data[] order when items carry no index at all (baseline OpenAI contract, unaffected by the index-reordering fix)", async () => {
+      const perIndexEmbedding = [[1, 0, 0, 0], [0, 1, 0, 0]];
+      behavior = (_requestIndex, body) => ({ status: 200, body: { data: body.input.map((_text, index) => ({ embedding: perIndexEmbedding[index] })) } });
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4 });
+      const generated = await provider.binding.generateVectors!([
+        { profile: provider.profile, purpose: "document", text: "a" },
+        { profile: provider.profile, purpose: "document", text: "bb" },
+      ]);
+      const decode = (bytes: Uint8Array) => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+      expect(decode(generated[0]!.vector)).toEqual([1, 0, 0, 0]);
+      expect(decode(generated[1]!.vector)).toEqual([0, 1, 0, 0]);
     });
   });
 });

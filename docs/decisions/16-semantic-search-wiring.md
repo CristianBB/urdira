@@ -100,7 +100,7 @@ for that batch; the reconciler's existing per-document fallback isolates
 which document(s) in a failed batch actually matter and marks each
 `failed` with a `provider_error:*` reason, exactly as it already did for
 any other provider throw. `api_key` continues to come from
-`URDIRA_EMBEDDING_API_KEY`/the descriptor, never a digest field.
+`URDIRA_EMBEDDINGS_API_KEY`/the descriptor, never a digest field.
 
 Configuration surface: this app has always selected its semantic provider
 kind (`neural`/`hash`/`http`) via environment variables read once at daemon
@@ -120,3 +120,32 @@ exceeds "add a missing flag" and was not attempted speculatively.
 confirmation this is the expected behavior rather than a missed
 provisioning step. Local MiniLM remains the shipped default; the evaluated
 model pack stays rejected (decision 06/18).
+
+### Amendment 2026-09-06 (adversarial review item #9): environment variable reference
+
+Every knob `resolveSemanticDescriptor` (`apps/urdira/src/index.ts`) reads is
+resolved ONCE, from `process.env`, at daemon start -- there was previously no
+single place documenting the full list for an operator or agent to discover
+them short of reading that function's own source. Consolidated here (this is
+now the canonical reference; keep it in sync with `resolveSemanticDescriptor`'s
+own doc comment if the set of variables changes):
+
+| Variable | Applies to | Effect |
+|---|---|---|
+| `URDIRA_EMBEDDINGS_PROVIDER` | selection | `"hash"` selects the pure-JS hermetic hash provider; anything else (unset included) falls through to `neural` unless `URDIRA_EMBEDDINGS_ENDPOINT` is set. |
+| `URDIRA_EMBEDDINGS_ENDPOINT` | selection + http | Non-empty selects the opt-in HTTP provider (`{kind: "http"}`); takes priority over `URDIRA_EMBEDDINGS_PROVIDER`. |
+| `URDIRA_EMBEDDINGS_MODEL` | http | Required alongside `_ENDPOINT`. |
+| `URDIRA_EMBEDDINGS_DIMENSIONS` | http | Required alongside `_ENDPOINT`; positive integer. |
+| `URDIRA_EMBEDDINGS_API_KEY` | http | Optional bearer token; never persisted in any digest (see above). |
+| `URDIRA_EMBEDDINGS_MAX_BATCH_INPUTS` | http | Optional override for R12's per-request item cap (default 64). |
+| `URDIRA_EMBEDDINGS_MAX_INPUT_TOKENS` | http | Optional override for R12's per-request estimated-token budget (default 8192), which also bounds the HTTP provider's own `.segment()` `max_segments`. |
+| `URDIRA_LOCAL_EMBEDDINGS_MODEL` | neural (default) | Overrides the bundled model id (default `Xenova/all-MiniLM-L6-v2`). |
+| `URDIRA_LOCAL_EMBEDDINGS_DTYPE` | neural (default) | Overrides the ONNX quantization (default `q8`). |
+| `URDIRA_SEMANTIC_INDEX` | all | `0`/`false` disables semantic maintenance/search entirely (structural indexing and lexical search stay available). |
+| `URDIRA_SEMANTIC_PROCESS` (legacy alias `URDIRA_SEMANTIC_THREAD`) | all | Controls whether semantic embedding runs in a separate worker process/thread vs. inline. |
+| `URDIRA_SEMANTIC_EMBED_BATCH` | reconciler | Overrides `reconcileSemanticProjection`'s own `embed_batch_size` (default 16 documents/segments per commit batch). |
+
+No CLI flag currently mirrors any of these (see the "Decided in
+implementation" paragraph above) -- this table, plus `apps/urdira/src/index.ts`'s
+`resolveSemanticDescriptor` doc comment, is the documented surface an
+operator or agent needs to configure the HTTP provider end to end.

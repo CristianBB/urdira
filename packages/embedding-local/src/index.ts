@@ -152,6 +152,128 @@ function segmentFromOffsets(text: string, offsets: ReadonlyArray<readonly [numbe
 }
 
 /**
+ * Frente S-B (2026-09-06) fix, adversarial review item #1: `segmentByLines`
+ * treats one LINE as its indivisible unit of work, but a single line can
+ * legitimately hold far more than `windowTokens` tokens on its own -- a
+ * minified bundle, a one-line JSON blob, a 5,000-char generated string
+ * literal. The original code shipped that whole oversized line as ONE
+ * segment ("always keeping at least one line per segment, even if that one
+ * line alone exceeds the window"), reasoning only about *segment* forward
+ * progress -- but every one of those segments is handed to the extractor as
+ * a single string (`segmentsFor`/`extractor(texts)` in this same module),
+ * and the model's OWN tokenizer then silently truncates it to whatever the
+ * pipeline's own `max_length` happens to be. That is exactly the silent
+ * truncation R7 pins the segmenter to prevent: the back half of an oversized
+ * line was never embedded at all, and nothing about the returned
+ * `Segmentation` (`truncated` is a document-level, `max_segments` flag, not
+ * a per-segment one) ever reported it.
+ *
+ * This function now guarantees `token_count(segment.text) <= windowTokens`
+ * for EVERY segment it returns, oversized single lines included: a line
+ * whose own token count exceeds `windowTokens` is first cut, via this
+ * function's binary search over `tokenize`'s own count function (the only
+ * oracle available without real offsets), into consecutive sub-line pieces
+ * that each fit `pieceTokens` -- NOT `windowTokens` itself. `pieceTokens` is
+ * deliberately the SMALLER of the two (see its call site: `min(windowTokens,
+ * max(1, overlapTokens))`), never a maximal windowTokens-sized chunk: a
+ * piece sized to fill the whole window would make every accumulated segment
+ * exactly ONE piece wide, and the accumulation loop below can only express
+ * overlap by rewinding whole pieces -- one piece can never rewind INTO
+ * itself, so a maximal piece size would silently produce ZERO overlap for
+ * an entire oversized line, failing R7's 32-token-overlap guarantee exactly
+ * where it matters most (a single run-on line has no other segmentation
+ * signal at all). Sizing pieces at `overlapTokens` instead guarantees
+ * several pieces accumulate per window (`windowTokens / overlapTokens`,
+ * e.g. 8 for the R7 pin of 256/32) and lets the SAME rewind-by-token-sum
+ * logic that already produces overlap for ordinary multi-line text produce
+ * it here too, at matching (piece) granularity.
+ *
+ * Performance fix (adversarial review item #2, 2026-09-06): the original
+ * shape of this function bisected the FULL remaining `[start, end)` range on
+ * every recursive call -- for one pathological 200KB line with no other
+ * segmentation signal at all, that is `O(remaining_length)` PER
+ * `tokenize()` call, `O(log(remaining_length))` calls per split point, and
+ * `O(line_length / pieceTokens)` split points overall: measured at ~314M
+ * cumulative tokenized characters (~1,570x the 200KB input) and ~670ms wall
+ * time for a single document, comfortably over this function's own 500ms
+ * budget and heading toward true quadratic blowup on a longer line. This
+ * walks `[start, end)` LEFT TO RIGHT instead, using exponential (galloping)
+ * search anchored at the CURRENT cursor to find a small bounding interval
+ * around the next split point -- seeded from `CHARS_PER_TOKEN_ESTIMATE`,
+ * so a realistic tokenizer needs only a handful of doubling steps to
+ * bracket the true boundary -- and only then binary-searches WITHIN that
+ * small interval, never the whole remaining range. Every `tokenize()` call
+ * here costs `O(interval size)`, which stays proportional to one output
+ * piece's own size (a small constant multiple of it, from the doubling
+ * overshoot) rather than to how much of the line is still left to cut, so
+ * total work across every piece of one line is `O(line_length)`, not
+ * `O(line_length^2 / pieceTokens)`.
+ */
+function splitOversizedSpan(text: string, tokenize: TextTokenizer, start: number, end: number, pieceTokens: number, wholeTokenCount: number): Array<{ readonly start: number; readonly end: number; readonly tokenCount: number }> {
+  if (wholeTokenCount <= pieceTokens || end - start <= 1) return [{ start, end, tokenCount: wholeTokenCount }];
+  const pieces: Array<{ readonly start: number; readonly end: number; readonly tokenCount: number }> = [];
+  let cursor = start;
+  while (cursor < end) {
+    const remaining = end - cursor;
+    // Exponential search: grow a probe interval `[cursor, probe)` from a
+    // chars/token-estimated seed until its own token count exceeds
+    // `pieceTokens` (or it reaches `end`) -- `boundOk` tracks the largest
+    // probe distance still known to fit, `boundOver` the smallest known to
+    // overflow, bracketing the true split point within a range proportional
+    // to the eventual piece size rather than to `remaining`. Deliberately
+    // NOT preceded by a separate "does the whole remainder already fit"
+    // `tokenize(cursor, end)` check -- that call's own cost is `O(remaining)`
+    // and re-running it on EVERY piece is exactly what made an earlier
+    // version of this function quadratic in the line's length (see this
+    // function's own doc comment); the exponential loop below already
+    // detects "the rest fits" for free the moment a probe capped at
+    // `remaining` still comes in under `pieceTokens`.
+    let boundOk = 0;
+    let boundOkCount = 0;
+    let boundOver = remaining;
+    let step = Math.max(1, Math.min(remaining, Math.ceil(pieceTokens * CHARS_PER_TOKEN_ESTIMATE)));
+    for (;;) {
+      const probe = Math.min(step, remaining);
+      const count = tokenize(text.slice(cursor, cursor + probe)).token_count;
+      if (count <= pieceTokens) {
+        boundOk = probe;
+        boundOkCount = count;
+        if (probe >= remaining) break; // the rest of the line already fits -- handled below, no extra tokenize call.
+        step = Math.min(probe * 2, remaining);
+      } else {
+        boundOver = probe;
+        break;
+      }
+    }
+    if (boundOk >= remaining) { pieces.push({ start: cursor, end, tokenCount: boundOkCount }); break; }
+    // Binary search within `[boundOk, boundOver)` ONLY -- bounded to the
+    // last doubling interval, never the whole remaining range.
+    let lo = boundOk;
+    let hi = boundOver;
+    while (hi - lo > 1) {
+      const mid = lo + Math.ceil((hi - lo) / 2);
+      const count = tokenize(text.slice(cursor, cursor + mid)).token_count;
+      if (count <= pieceTokens) lo = mid; else hi = mid;
+    }
+    // Guarantees forward progress even if the search's own oracle reports
+    // the FIRST single character as already over `pieceTokens` (a
+    // pathological tokenizer): always cut at least one char per piece.
+    let splitPoint = cursor + Math.max(lo, 1);
+    // Never split inside a UTF-16 surrogate pair -- `text.slice` would
+    // otherwise produce a lone, unpaired surrogate in one or both halves.
+    if (splitPoint > cursor && splitPoint < end) {
+      const code = text.charCodeAt(splitPoint);
+      if (code >= 0xdc00 && code <= 0xdfff) splitPoint -= 1;
+    }
+    if (splitPoint <= cursor) splitPoint = cursor + 1;
+    const count = tokenize(text.slice(cursor, splitPoint)).token_count;
+    pieces.push({ start: cursor, end: splitPoint, tokenCount: count });
+    cursor = splitPoint;
+  }
+  return pieces;
+}
+
+/**
  * Deterministic fallback for a tokenizer with no offset support (R7's own
  * anticipated case -- and, empirically, this package's OWN bundled MiniLM
  * tokenizer today: `AutoTokenizer`'s `__call__` never populates
@@ -159,28 +281,35 @@ function segmentFromOffsets(text: string, offsets: ReadonlyArray<readonly [numbe
  * non-test-fake construction of this provider actually runs, not a rare
  * edge case). Splits `text` into LINES (each line's span running through its
  * own trailing `\n`, so every line's span concatenated back together
- * reconstructs `text` exactly), counts each line's own tokens via
- * `tokenize`, then greedily accumulates whole lines into a segment until
- * adding the next line would exceed `windowTokens` (always keeping at least
- * one line per segment, even if that one line alone exceeds the window --
- * guarantees forward progress for a single enormous line). The next
- * segment's starting line rewinds far enough into the segment just closed
- * that the rewound lines' own token counts sum to at least `overlapTokens`
+ * reconstructs `text` exactly), further cutting any line whose own token
+ * count exceeds `windowTokens` into sub-line pieces via `splitOversizedSpan`
+ * (see that function's own doc comment), counts each resulting piece's own
+ * tokens via `tokenize`, then greedily accumulates whole pieces into a
+ * segment until adding the next piece would exceed `windowTokens` (always
+ * keeping at least one piece per segment -- guaranteed forward progress,
+ * since every piece by construction fits the window on its own). The next
+ * segment's starting piece rewinds far enough into the segment just closed
+ * that the rewound pieces' own token counts sum to at least `overlapTokens`
  * (falling forward to the segment's own end when the whole segment's token
  * count is itself under `overlapTokens`, so a segment made of very few,
- * very large lines still always advances). Never true token-level overlap
- * (there is no sub-line boundary to overlap at) -- a documented,
- * line-granularity approximation of R7's token overlap, not the precise
- * offset-based path's guarantee.
+ * very large pieces still always advances). Never true token-level overlap
+ * for a genuine multi-line segment (there is no sub-line boundary to overlap
+ * at there) -- a documented, line-granularity approximation of R7's token
+ * overlap, not the precise offset-based path's guarantee.
  */
 function segmentByLines(text: string, tokenize: TextTokenizer, windowTokens: number, overlapTokens: number, maxSegments: number): Segmentation {
+  // See `splitOversizedSpan`'s own doc comment for why an oversized line's
+  // pieces are sized at `overlapTokens` (when configured), never at a
+  // maximal `windowTokens` chunk.
+  const oversizedPieceTokens = overlapTokens > 0 ? Math.min(windowTokens, overlapTokens) : windowTokens;
   const lines: Array<{ readonly start: number; readonly end: number; readonly tokenCount: number }> = [];
   let cursor = 0;
   while (cursor < text.length) {
     const newlineIndex = text.indexOf("\n", cursor);
     const end = newlineIndex === -1 ? text.length : newlineIndex + 1;
     const tokenCount = Math.max(1, tokenize(text.slice(cursor, end)).token_count);
-    lines.push({ start: cursor, end, tokenCount });
+    if (tokenCount > windowTokens) lines.push(...splitOversizedSpan(text, tokenize, cursor, end, oversizedPieceTokens, tokenCount));
+    else lines.push({ start: cursor, end, tokenCount });
     cursor = end;
   }
   if (lines.length === 0) return { segments: [], truncated: false };

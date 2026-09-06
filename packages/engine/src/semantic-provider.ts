@@ -368,6 +368,27 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+/**
+ * Frente S-B (2026-09-06) fix, adversarial review item #8: `Retry-After`
+ * (RFC 9110 §10.2.3) on a 429/5xx response is a server-issued MINIMUM wait,
+ * either delta-seconds (`"30"`) or an HTTP-date (`"Wed, 21 Oct ... GMT"`) --
+ * ignoring it (the original shape of this provider) means retrying into a
+ * rate limit the server just told this provider to back off from, which
+ * only makes the limiter angrier. Returns `undefined` (never `0`) for a
+ * missing/unparseable header, so the caller's own `Math.max` against the
+ * configured backoff never accidentally shortens it; a date already in the
+ * past clamps to `0` (retry immediately) rather than a negative delay.
+ */
+function parseRetryAfterMs(value: string | null): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isFinite(dateMs)) return undefined;
+  return Math.max(0, dateMs - Date.now());
+}
+
 const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export interface HttpEmbeddingProviderOptions {
@@ -560,13 +581,22 @@ export function createHttpEmbeddingProvider(options: HttpEmbeddingProviderOption
    * response.
    */
   const parseChunkResponse = async (response: Response, chunk: readonly GenerateVectorInput[], truncatedTexts: readonly string[]): Promise<readonly SemanticGeneratedVector[]> => {
-    const payload = (await response.json()) as { readonly data?: ReadonlyArray<{ readonly embedding?: unknown }> };
-    // `data[i]` is mapped back to `chunk[i]` strictly by INDEX -- the
-    // OpenAI-compatible contract this provider targets guarantees response
-    // ordering matches request ordering (mirroring `EmbeddingExtractor`'s
-    // identical positional contract in `@urdira/embedding-local`).
+    const payload = (await response.json()) as { readonly data?: ReadonlyArray<{ readonly embedding?: unknown; readonly index?: unknown }> };
+    const rawData = payload.data ?? [];
+    // Frente S-B (2026-09-06) fix, adversarial review item #8: the
+    // OpenAI-compatible contract this provider targets guarantees `data[i]`
+    // corresponds to `input[i]`, but some real-world "OpenAI-compatible"
+    // servers reorder `data` (e.g. to finish shorter inputs first) while
+    // still tagging each item with its OWN `index` field. Reordering by
+    // `index` when EVERY item in the response carries one (never a partial
+    // mix -- a response with some indices present and others missing is
+    // already malformed enough that positional fallback is no worse) avoids
+    // silently pairing a vector with the wrong document's digest/identity.
+    const byIndex = rawData.length > 0 && rawData.every((item) => typeof item?.index === "number")
+      ? new Map(rawData.map((item) => [item.index as number, item]))
+      : undefined;
     return chunk.map((input, index) => {
-      const embedding = payload.data?.[index]?.embedding;
+      const embedding = (byIndex !== undefined ? byIndex.get(index) : rawData[index])?.embedding;
       if (!Array.isArray(embedding)) throw new Error(`HTTP embedding provider response from ${options.endpoint} is missing data[${index}].embedding.`);
       if (embedding.length !== input.profile.dimensions) throw new Error(`HTTP embedding provider returned ${embedding.length} dimensions, expected ${input.profile.dimensions}.`);
       if (embedding.some((value) => typeof value !== "number" || !Number.isFinite(value))) throw new Error("HTTP embedding provider returned a non-finite embedding value.");
@@ -586,6 +616,12 @@ export function createHttpEmbeddingProvider(options: HttpEmbeddingProviderOption
    * total attempts) with the configured backoff BETWEEN attempts, only for a
    * 429/5xx status or a network-level failure (including this attempt's own
    * timeout abort) -- see `createHttpEmbeddingProvider`'s own doc comment.
+   * Frente S-B (2026-09-06) fix, item #8: a 429/5xx response's own
+   * `Retry-After` header (`parseRetryAfterMs`) raises the NEXT attempt's
+   * wait to at least that value -- the configured backoff still applies as
+   * a floor of its own (never shortened below `retryBackoffMs[attempt]`),
+   * so `Retry-After` can only lengthen a wait, never shorten one below what
+   * was already configured.
    */
   const sendChunkWithRetry = async (chunk: readonly GenerateVectorInput[]): Promise<readonly SemanticGeneratedVector[]> => {
     // Purpose ("document" vs "query") is not distinguished in the request
@@ -596,8 +632,12 @@ export function createHttpEmbeddingProvider(options: HttpEmbeddingProviderOption
     const truncatedTexts = chunk.map((input) => input.text.length > HTTP_INPUT_TEXT_CAP ? input.text.slice(0, HTTP_INPUT_TEXT_CAP) : input.text);
     const maxAttempts = retryBackoffMs.length + 1;
     let lastError: unknown;
+    let retryAfterFloorMs = 0;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      if (attempt > 0) await sleepImpl(retryBackoffMs[attempt - 1]!);
+      if (attempt > 0) {
+        await sleepImpl(Math.max(retryBackoffMs[attempt - 1]!, retryAfterFloorMs));
+        retryAfterFloorMs = 0;
+      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
@@ -614,7 +654,11 @@ export function createHttpEmbeddingProvider(options: HttpEmbeddingProviderOption
         if (!response.ok) {
           const preview = await previewResponseBody(response);
           const message = `HTTP embedding provider request to ${options.endpoint} failed with status ${response.status}: ${preview}`;
-          if (isRetryableStatus(response.status) && attempt < maxAttempts - 1) { lastError = new Error(message); continue; }
+          if (isRetryableStatus(response.status) && attempt < maxAttempts - 1) {
+            lastError = new Error(message);
+            retryAfterFloorMs = parseRetryAfterMs(response.headers.get("retry-after")) ?? 0;
+            continue;
+          }
           throw new HttpEmbeddingProviderUnavailableError(message);
         }
         return await parseChunkResponse(response, chunk, truncatedTexts);

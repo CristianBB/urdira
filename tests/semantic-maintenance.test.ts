@@ -1167,6 +1167,62 @@ describe("reconcileSemanticProjection entity pass: multi-segment documents (Fren
     });
   });
 
+  it("never writes a partial segment set: no vector row for a multi-segment document is visible until EVERY one of its segments has settled (adversarial review item #5)", async () => {
+    const workspaceId = "ws-semantic-entity-segments-atomic";
+    const base = createLocalHashProvider();
+    const longBody = "x".repeat(1300);
+    const func = `export function atomicMultiSegmentCoverageTesting() {\n  // ${longBody}\n  return 1;\n}`;
+    let embedCallCount = 0;
+    let sawOpenRowBeforeCompletion = false;
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1", text: func, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-atomic", recordKind: "jsts:entity_callable", ownerArtifactId: "art-1", ownerArtifactVersionId: "artv-1", validFromGeneration: 1, body: { name: "atomicMultiSegmentCoverageTesting", kind: "function", language: "typescript", path: "art-1", start: 0, end: func.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      // `generateVectors` deliberately OMITTED so every segment routes
+      // through the per-document `generateVector` fallback one at a time
+      // (same technique as the partial-failure test below), letting this
+      // probe observe DB state BETWEEN consecutive segment embeds.
+      const provider: ResolvedSemanticProvider = {
+        profile: base.profile,
+        binding: {
+          runtime_binding_id: base.binding.runtime_binding_id,
+          executable_binding_digest: base.binding.executable_binding_digest,
+          generateVector: async (input) => {
+            // Only an ENTITY segment call carries `segment_index` at all
+            // (see `GenerateVectorInput.segment_index`'s own doc comment) --
+            // the artifact pass embeds this SAME file's own artifact-grain
+            // document through this SAME provider instance first, and that
+            // call must not be mistaken for one of "rec-atomic"'s segments.
+            if (input.segment_index !== undefined) {
+              embedCallCount += 1;
+              const openRows = await opened.database.all<{ segment_index: number }>(
+                "SELECT segment_index FROM vector_projection_rows WHERE workspace_id = ? AND document_grain = 'entity' AND document_ref = 'rec-atomic' AND valid_to_generation IS NULL",
+                [workspaceId],
+              );
+              if (openRows.length > 0) sawOpenRowBeforeCompletion = true;
+            }
+            return base.binding.generateVector(input);
+          },
+          ...(base.binding.segment === undefined ? {} : { segment: base.binding.segment }),
+        },
+      };
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, embed_batch_size: 1 });
+      expect(result.entity_failed).toBe(0);
+      expect(result.marker_written).toBe(true);
+      // Confirms this record genuinely needed more than one segment --
+      // otherwise the assertion above would be vacuously true.
+      expect(embedCallCount).toBeGreaterThan(1);
+      expect(sawOpenRowBeforeCompletion).toBe(false);
+
+      const segments = await entitySegmentRows(opened, workspaceId, "rec-atomic");
+      expect(segments.length).toBe(embedCallCount);
+      expect(segments.every((row) => row.valid_to_generation === null)).toBe(true);
+    });
+  });
+
   it("self-heals a partial multi-segment failure: closes the surviving successful segment(s) so the WHOLE document is retried from scratch, and marks it failed for this pass", async () => {
     const workspaceId = "ws-semantic-entity-segments-partial-failure";
     const base = createLocalHashProvider();

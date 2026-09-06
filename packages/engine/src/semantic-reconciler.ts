@@ -1,5 +1,5 @@
 import { canonicalBytes, decodeCanonical, digestBytes } from "@urdira/canonical";
-import { hydrateRelationalValue, type RelationalValueRow, type SqliteCommand, type WorkspaceDatabase } from "@urdira/storage";
+import { canonicalVectorBytes as storageCanonicalVectorBytes, hydrateRelationalValue, type RelationalValueRow, type SqliteCommand, type VectorProjectionInput, type WorkspaceDatabase } from "@urdira/storage";
 import { buildSemanticDocument } from "./semantic-documents.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
 import type { SemanticGeneratedVector } from "./semantic-runtime.js";
@@ -253,40 +253,6 @@ function yieldToEventLoop(): Promise<void> {
  * scan path, and exists purely as a defensive guard against a differently-
  * produced or hand-repaired `artifact_versions` row.
  */
-/**
- * Frente S-B (2026-09-06) fix: mirrors `@urdira/storage`'s `putVectors` own
- * internal re-canonicalization pass (`canonicalVectorBytes`,
- * `packages/storage/src/projections.ts`) byte-for-byte -- decode float
- * values, re-apply L2 normalization when configured, re-encode -- so
- * `commitGeneratedVector`'s parked-row digest comparison can predict what
- * `putVectors` will ACTUALLY store from `vector`, rather than comparing
- * against the pre-storage digest the PROVIDER itself computed. Duplicated
- * here (not imported from `@urdira/storage`) because it is a small, pure,
- * three-step transform and this engine package's own architecture manifest
- * does not import `@urdira/storage`'s internal (non-exported)
- * `canonicalVectorBytes` -- only its public `WorkspaceDatabase`/`SqliteCommand`
- * surface. See the call site's own doc comment for the exact non-idempotence
- * this closes.
- */
-function reencodeAsStorageWouldStore(vector: Uint8Array, config: { readonly dimensions: number; readonly element_type: "float32" | "float64"; readonly normalization: "none" | "l2" }): Uint8Array {
-  const width = config.element_type === "float32" ? 4 : 8;
-  const view = new DataView(vector.buffer, vector.byteOffset, vector.byteLength);
-  let values: number[] = [];
-  for (let offset = 0; offset < vector.byteLength; offset += width) values.push(config.element_type === "float32" ? view.getFloat32(offset, true) : view.getFloat64(offset, true));
-  if (config.normalization === "l2") {
-    const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
-    if (norm !== 0) values = values.map((value) => value / norm);
-  }
-  const bytes = new Uint8Array(values.length * width);
-  const outView = new DataView(bytes.buffer);
-  values.forEach((value, index) => {
-    const normalized = Object.is(value, -0) ? 0 : value;
-    if (config.element_type === "float32") outView.setFloat32(index * width, normalized, true);
-    else outView.setFloat64(index * width, normalized, true);
-  });
-  return bytes;
-}
-
 function decodeText(bytes: Uint8Array): string | undefined {
   if (bytes.some((byte) => byte === 0)) return undefined;
   try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
@@ -806,6 +772,32 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   };
 
   /**
+   * Frente S-B (2026-09-06) fix, item #5 (adversarial review, plan §4.5): a
+   * segment that WOULD be written on success is never applied to
+   * `vector_projection_rows` the instant its own embed call resolves --
+   * doing that (the original shape of this code) let a crash between two
+   * `embedAndCommitBatch` flushes of the SAME multi-segment document leave
+   * SOME of its segment rows durably committed and the rest never retried:
+   * the next pass's "missing entity rows" query excludes any `document_ref`
+   * with at least one OPEN row, so the surviving segment(s) alone made the
+   * whole document look already handled, and `syncDocumentStatusBulk`'s
+   * covered-backfill (which only checks "at least one open row exists, no
+   * status row yet") then durably certified that permanently-incomplete
+   * document as `"covered"` -- silent, permanent data loss for exactly the
+   * documents large enough to need more than one segment, in direct
+   * violation of R8's "never silent" rule. Each successful segment's WOULD-BE
+   * write is instead buffered here (`pendingWrites`) and the entire
+   * document's segments are committed in ONE transaction
+   * (`applyEntityDocumentOutcome` below) only once every sibling has
+   * settled -- so a crash at any point before that leaves EXACTLY ZERO rows
+   * for the document (it is retried from scratch next pass), never a
+   * partial set.
+   */
+  type EntitySegmentWrite =
+    | { readonly kind: "insert"; readonly value: VectorProjectionInput }
+    | { readonly kind: "reopen"; readonly projectionRecordId: string; readonly validFromGeneration: number; readonly wasClosed: boolean };
+
+  /**
    * Frente S-B (2026-09-06, decision 17 segmentation): per-ENTITY-RECORD
    * aggregation state for its (possibly many) segments -- `semantic_document_status`
    * holds exactly ONE row per `(document_grain, document_id)` (unchanged by
@@ -817,7 +809,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
    * removed the instant its `settled` count reaches `total_segments` --
    * whichever batch flush's `commitGeneratedVector`/`embedAndCommitBatch`
    * call happens to settle the LAST outstanding segment performs the one
-   * real DB write, via `writeItemStatus`'s own entity branch below.
+   * real DB write, via `applyEntityDocumentOutcome` below.
    */
   type EntityDocumentAggregate = {
     readonly artifactId: string;
@@ -828,57 +820,92 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     settled: number;
     failed: boolean;
     readonly reasonCodes: Set<string>;
+    readonly pendingWrites: EntitySegmentWrite[];
   };
   const entityDocumentAggregates = new Map<string, EntityDocumentAggregate>();
 
   const registerEntityDocument = (recordId: string, input: { readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly totalSegments: number; readonly truncated: boolean }): void => {
-    entityDocumentAggregates.set(recordId, { ...input, settled: 0, failed: false, reasonCodes: new Set() });
+    entityDocumentAggregates.set(recordId, { ...input, settled: 0, failed: false, reasonCodes: new Set(), pendingWrites: [] });
   };
 
   /**
-   * Records one segment's OWN outcome for its owning entity record, writing
-   * the record's single `semantic_document_status` row (`covered` -- with
-   * `reason_codes: ["segments_truncated"]` when `truncated` was set at
-   * registration, per R8 -- or `failed`, union of every failed segment's own
-   * reason codes) only once every one of its segments has settled.
-   * Idempotent per call: a record already finalized (defensively -- should
-   * not happen, since `entityDocumentAggregates` is deleted the instant it
-   * finalizes) is a no-op rather than a crash or a duplicate write.
+   * Records one segment's OWN outcome for its owning entity record, applying
+   * the record's ENTIRE buffered write set -- every sibling segment's
+   * `insert`/`reopen`, plus the record's single `semantic_document_status`
+   * row (`covered`, with `reason_codes: ["segments_truncated"]` when
+   * `truncated` was set at registration per R8, or `failed`, union of every
+   * failed segment's own reason codes) -- in ONE transaction, only once
+   * every one of its segments has settled. Idempotent per call: a record
+   * already finalized (defensively -- should not happen, since
+   * `entityDocumentAggregates` is deleted the instant it finalizes) is a
+   * no-op rather than a crash or a duplicate write.
    *
-   * Partial-failure self-heal: when the FINAL aggregated status is
-   * `"failed"` (at least one segment's embed/write genuinely failed), every
-   * OTHER segment of this SAME document that DID succeed and already has an
-   * OPEN vector row is closed right here, at the CURRENT generation (same
-   * "close at now, not at content's own lifecycle" convention as step 1's
-   * profile-swap close) -- without this, the next pass's "missing entity
-   * rows" query (`NOT EXISTS` an open row for this `document_ref`) would see
-   * the surviving successful segment(s) and conclude the WHOLE document is
-   * already covered, permanently abandoning the one segment that never
-   * embedded. Closing every segment together makes the document appear
-   * fully missing again, so the next pass retries ALL of its segments from
-   * scratch -- a small amount of redundant re-embedding for the segments
-   * that did succeed, in exchange for the correctness guarantee that a
-   * partially-failed multi-segment document is never silently left
-   * incomplete forever.
+   * A `"failed"` outcome for ANY segment discards every OTHER segment's own
+   * buffered write for this same document -- nothing beyond the single
+   * `"failed"` status row is ever written, so a partially-successful
+   * multi-segment embed can never leave a partial row set behind (see this
+   * type's own doc comment for the crash-recovery gap this closes). The next
+   * pass's "missing entity rows" query still finds every one of this
+   * document's segments missing (since none were written) and retries all of
+   * them from scratch -- a small amount of redundant re-embedding for the
+   * segments that did succeed this time, in exchange for the guarantee that
+   * a partially-failed multi-segment document is never silently left
+   * incomplete forever. Legacy self-heal note: an EARLIER build of this
+   * function wrote each segment's row immediately and closed already-written
+   * siblings on a LATER sibling's failure; that close is now unreachable by
+   * construction (nothing is ever written before every sibling succeeds), so
+   * it is retired rather than kept as dead code.
    */
-  const recordEntitySegmentOutcome = async (recordId: string, status: "covered" | "failed", reasonCodes: readonly string[]): Promise<void> => {
+  const recordEntitySegmentOutcome = async (recordId: string, status: "covered" | "failed", reasonCodes: readonly string[], write?: EntitySegmentWrite): Promise<void> => {
     const aggregate = entityDocumentAggregates.get(recordId);
     if (aggregate === undefined) return;
     aggregate.settled += 1;
     if (status === "failed") { aggregate.failed = true; for (const code of reasonCodes) aggregate.reasonCodes.add(code); }
+    else if (write !== undefined) aggregate.pendingWrites.push(write);
     if (aggregate.settled < aggregate.totalSegments) return;
     entityDocumentAggregates.delete(recordId);
     const finalStatus: SemanticDocumentStatus = aggregate.failed ? "failed" : "covered";
     const finalReasonCodes = aggregate.failed ? [...aggregate.reasonCodes] : aggregate.truncated ? ["segments_truncated"] : [];
+    const statusCommand = documentStatusUpsertCommand({
+      workspaceId, profileId, executableBindingId, generation, updatedAt: nowIso(),
+      documentGrain: "entity", documentId: recordId, artifactId: aggregate.artifactId, artifactVersionId: aggregate.artifactVersionId,
+      displayPath: aggregate.displayPath, status: finalStatus, reasonCodes: finalReasonCodes, segmentCount: aggregate.totalSegments,
+    });
+    // `aggregate.failed`: nothing was ever written for this document's
+    // segments (every success buffered, never applied) -- only the status
+    // row lands.
     if (aggregate.failed) {
-      const selfHealClose = await sql.run(
-        "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND document_grain = 'entity' AND document_ref = ? AND profile_id = ? AND executable_binding_id = ? AND valid_to_generation IS NULL",
-        [generation, workspaceId, recordId, profileId, executableBindingId],
-      );
-      counts.closed += selfHealClose.changes;
-      counts.entity_closed += selfHealClose.changes;
+      await sql.transaction([statusCommand]);
+      return;
     }
-    await writeStatusRow({ documentGrain: "entity", documentId: recordId, artifactId: aggregate.artifactId, artifactVersionId: aggregate.artifactVersionId, displayPath: aggregate.displayPath, status: finalStatus, reasonCodes: finalReasonCodes, segmentCount: aggregate.totalSegments });
+    const inserts = aggregate.pendingWrites.filter((entry): entry is Extract<EntitySegmentWrite, { readonly kind: "insert" }> => entry.kind === "insert");
+    const reopens = aggregate.pendingWrites.filter((entry): entry is Extract<EntitySegmentWrite, { readonly kind: "reopen" }> => entry.kind === "reopen");
+    const reopenCommands: SqliteCommand[] = reopens
+      .filter((entry) => entry.wasClosed)
+      .map((entry) => ({ kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = NULL WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [workspaceId, entry.projectionRecordId, entry.validFromGeneration] }));
+    // `putVectors` (`@urdira/storage`) rejects an EMPTY `values` array
+    // outright (`storage:invalid_vector_batch`) -- a document whose every
+    // segment reopened an already-parked row (no fresh insert at all) must
+    // run its reopen UPDATEs + status upsert as a plain transaction instead.
+    try {
+      if (inserts.length > 0) await database.projections.putVectors(inserts.map((entry) => entry.value), [...reopenCommands, statusCommand]);
+      else await sql.transaction([...reopenCommands, statusCommand]);
+    } catch {
+      // The bulk apply itself failed (shard conflict, invalid vector, DB
+      // error, ...) -- since it is all-or-nothing (a single `putVectors`
+      // call or a single `sql.transaction`), nothing was written, so falling
+      // back to a `failed` status row is safe and matches every other
+      // provider-failure path in this reconciler (left missing, retried next
+      // pass, marker withheld).
+      await sql.transaction([documentStatusUpsertCommand({
+        workspaceId, profileId, executableBindingId, generation, updatedAt: nowIso(),
+        documentGrain: "entity", documentId: recordId, artifactId: aggregate.artifactId, artifactVersionId: aggregate.artifactVersionId,
+        displayPath: aggregate.displayPath, status: "failed", reasonCodes: ["provider_error:vector_write_failed"], segmentCount: aggregate.totalSegments,
+      })]);
+      counts.entity_failed += aggregate.pendingWrites.length;
+      return;
+    }
+    counts.entity_inserted += aggregate.pendingWrites.length;
   };
 
   /**
@@ -945,15 +972,33 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       // on an ALREADY-unit-norm float32 vector: re-dividing by a norm that
       // float32 rounding put at, say, 0.9999999 or 1.0000001 instead of
       // exactly 1.0 can flip the last bit of one or more components on
-      // re-encoding. `storageReencodedDigest` mirrors that exact transform
-      // so this comparison is apples-to-apples -- discovered live via the
-      // entity segmentation self-heal path (a segment closed then reopened
-      // one pass later), but the underlying gap predates segmentation
-      // entirely: ANY reopened row (e.g. a provider swapped back to a
-      // previous identity) was equally at risk of a spurious
+      // re-encoding. Reusing `@urdira/storage`'s OWN exported
+      // `canonicalVectorBytes` (Frente S-B, adversarial review item #7 --
+      // see that export's own doc comment) means this comparison can never
+      // silently drift from `putVectors`'s actual behavior the way a
+      // hand-duplicated copy of the same transform did: discovered live via
+      // the entity segmentation self-heal path (a segment closed then
+      // reopened one pass later), but the underlying gap predates
+      // segmentation entirely -- ANY reopened row (e.g. a provider swapped
+      // back to a previous identity) was equally at risk of a spurious
       // `provider_error:vector_digest_mismatch` on an actually-unchanged,
-      // fully-deterministic provider.
-      const rehashedDigest = digestBytes(reencodeAsStorageWouldStore(generated.vector, { dimensions: provider.profile.dimensions, element_type: provider.profile.element_type as "float32" | "float64", normalization: provider.profile.normalization as "none" | "l2" }));
+      // fully-deterministic provider. `canonicalVectorBytes` is also
+      // STRICTER than the old duplicate (throws on a non-finite value or an
+      // exact-zero L2 norm, rather than silently passing one through) --
+      // caught here and folded into the SAME digest-mismatch failure path,
+      // since either way `putVectors` itself could never have stored this
+      // vector successfully.
+      let rehashedDigest: string;
+      try {
+        rehashedDigest = digestBytes(storageCanonicalVectorBytes(generated.vector, provider.profile.dimensions, {
+          element_type: provider.profile.element_type as "float32" | "float64",
+          vector_encoding: provider.profile.vector_encoding as "float32-le" | "float64-le",
+          normalization: provider.profile.normalization as "none" | "l2",
+          distance_metric: provider.profile.distance_metric as "squared_l2" | "cosine",
+        }));
+      } catch {
+        rehashedDigest = "";
+      }
       if (parked.vector_digest !== rehashedDigest) {
         bumpFailed(item);
         // Plan 2026-09-06 (Frente S-A): a non-deterministic provider under an
@@ -962,29 +1007,58 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         await writeItemStatus(item, "failed", ["provider_error:vector_digest_mismatch"]);
         return;
       }
-      // Plan 2026-09-06 (Frente S-A), extended by Frente S-B for an ENTITY
-      // item: the reopen (when needed) and the `covered` status upsert land
-      // in one transaction ONLY for an artifact item -- an entity item's
-      // status is never written here directly (see `writeItemStatus`'s own
-      // doc comment); its "covered" outcome is recorded via
-      // `recordEntitySegmentOutcome` AFTER the reopen transaction commits,
-      // which performs the real (aggregated) status write only once every
-      // sibling segment has also settled.
-      const statusCommand = item.documentGrain === "entity" ? undefined : documentStatusUpsertCommand({
+      if (item.documentGrain === "entity") {
+        // Frente S-B (2026-09-06) fix, item #5: buffered, never applied
+        // immediately -- see `recordEntitySegmentOutcome`'s own doc comment
+        // for the crash-recovery gap this closes. `bumpInserted`/counts land
+        // once the WHOLE document's segments are actually written, inside
+        // `recordEntitySegmentOutcome` itself.
+        await recordEntitySegmentOutcome(item.documentRef!, "covered", [], { kind: "reopen", projectionRecordId: item.projectionRecordId, validFromGeneration: item.validFromGeneration, wasClosed: parked.valid_to_generation !== null });
+        await yieldToEventLoop();
+        return;
+      }
+      // Artifact item: the reopen (when needed) and the `covered` status
+      // upsert land in one transaction, exactly as before -- an artifact
+      // document is always exactly one row, so there is no multi-segment
+      // atomicity concern here.
+      const statusCommand = documentStatusUpsertCommand({
         workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: documentIdOf(item),
         artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath,
         status: "covered", reasonCodes: [], generation, updatedAt: nowIso(),
       });
       const reopenUpdate: SqliteCommand = { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = NULL WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [workspaceId, item.projectionRecordId, item.validFromGeneration] };
-      const reopenCommands: SqliteCommand[] = parked.valid_to_generation !== null
-        ? statusCommand === undefined ? [reopenUpdate] : [reopenUpdate, statusCommand]
-        : statusCommand === undefined ? [] : [statusCommand];
-      if (reopenCommands.length > 0) await sql.transaction(reopenCommands);
-      if (item.documentGrain === "entity") await recordEntitySegmentOutcome(item.documentRef!, "covered", []);
+      const reopenCommands: SqliteCommand[] = parked.valid_to_generation !== null ? [reopenUpdate, statusCommand] : [statusCommand];
+      await sql.transaction(reopenCommands);
       // An OPEN parked row (valid_to already NULL) cannot normally reach here
       // (the missing-rows queries exclude documents with an open current-
       // profile row), treated as already-covered either way.
       bumpInserted(item);
+      await yieldToEventLoop();
+      return;
+    }
+    if (item.documentGrain === "entity") {
+      // Frente S-B (2026-09-06) fix, item #5: buffered, never applied
+      // immediately -- see `recordEntitySegmentOutcome`'s own doc comment.
+      const value: VectorProjectionInput = {
+        projection_record_id: item.projectionRecordId,
+        owner_artifact_id: item.ownerArtifactId,
+        owner_artifact_version_id: item.ownerArtifactVersionId,
+        profile_id: profileId,
+        executable_binding_id: executableBindingId,
+        dimensions: provider.profile.dimensions,
+        element_type: provider.profile.element_type,
+        vector: generated.vector,
+        vector_encoding: provider.profile.vector_encoding as "float32-le" | "float64-le",
+        normalization: provider.profile.normalization as "none" | "l2",
+        distance_metric: provider.profile.distance_metric as "squared_l2" | "cosine",
+        valid_from_generation: item.validFromGeneration,
+        document_grain: item.documentGrain,
+        document_ref: item.documentRef!,
+        ...(item.segmentIndex === undefined ? {} : { segment_index: item.segmentIndex }),
+        ...(item.segmentStart === undefined ? {} : { segment_start: item.segmentStart }),
+        ...(item.segmentEnd === undefined ? {} : { segment_end: item.segmentEnd }),
+      };
+      await recordEntitySegmentOutcome(item.documentRef!, "covered", [], { kind: "insert", value });
       await yieldToEventLoop();
       return;
     }
@@ -1002,24 +1076,11 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         normalization: provider.profile.normalization as "none" | "l2",
         distance_metric: provider.profile.distance_metric as "squared_l2" | "cosine",
         valid_from_generation: item.validFromGeneration,
-        // Omitted (not set to a literal `undefined`) for an artifact item:
-        // `encodeCanonical` (`@urdira/canonical`) rejects an object property
-        // whose value is `undefined` outright (invalid logical value)
-        // -- unlike `JSON.stringify`, which silently drops such keys -- so
-        // this must be a conditional spread, not a bare `document_grain:
-        // item.documentGrain`.
-        ...(item.documentGrain === undefined ? {} : { document_grain: item.documentGrain }),
-        ...(item.documentRef === undefined ? {} : { document_ref: item.documentRef }),
-        ...(item.segmentIndex === undefined ? {} : { segment_index: item.segmentIndex }),
-        ...(item.segmentStart === undefined ? {} : { segment_start: item.segmentStart }),
-        ...(item.segmentEnd === undefined ? {} : { segment_end: item.segmentEnd }),
-      }], item.documentGrain === "entity" ? [] : [
+      }], [
         // Plan 2026-09-06 (Frente S-A): the `covered` status row commits in
         // the SAME transaction as the vector insert (`putVectors`'s own
         // `extraCommands` parameter) -- a crash between the two can never
-        // leave one written without the other. Frente S-B: an ENTITY item's
-        // extraCommands stay empty -- its status is aggregated across
-        // siblings AFTER this transaction (see the doc comment above).
+        // leave one written without the other.
         documentStatusUpsertCommand({
           workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: documentIdOf(item),
           artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath,
@@ -1033,7 +1094,6 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       await writeItemStatus(item, "failed", ["provider_error:vector_write_failed"]);
       return;
     }
-    if (item.documentGrain === "entity") await recordEntitySegmentOutcome(item.documentRef!, "covered", []);
     bumpInserted(item);
     // See `yieldToEventLoop`'s doc comment: this is the loop whose combined
     // per-document embedding cost is the one actually at risk of starving

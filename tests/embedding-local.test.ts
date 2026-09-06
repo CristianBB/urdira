@@ -113,6 +113,45 @@ describe("segmentByTokens (Frente S-B, R7/R8)", () => {
     expect(segmentation.segments[1]!.start_char).toBeLessThan(segmentation.segments[0]!.end_char);
   });
 
+  it("cuts a single line whose own token count exceeds window_tokens into token-sized sub-line pieces -- never sends an oversized chunk to the model for silent truncation (adversarial review item #1)", () => {
+    // One line, no newline at all (minified bundle / long JSON / a giant
+    // generated string literal all look like this): 1,000 chars, 5
+    // chars/token via the injected tokenizer below -> 200 "tokens", far past
+    // window_tokens. window_tokens: 20 (>= 2 sub-line pieces of ~10 tokens
+    // each per segment) so overlap has room to rewind by a whole piece.
+    const hugeLine = "x".repeat(1000);
+    const tokenize: TextTokenizer = (value) => ({ token_count: Math.ceil(value.length / 5) });
+    const segmentation = segmentByTokens(hugeLine, tokenize, { window_tokens: 20, overlap_tokens: 8, max_segments: 64 });
+    expect(segmentation.truncated).toBe(false);
+    expect(segmentation.segments.length).toBeGreaterThan(1);
+    // The core fidelity guarantee: no segment this fallback ever produces
+    // exceeds the pinned window, so nothing is silently truncated by the
+    // model's own tokenizer at embed time.
+    for (const segment of segmentation.segments) {
+      expect(tokenize(segment.text).token_count).toBeLessThanOrEqual(20);
+      expect(segment.text).toBe(hugeLine.slice(segment.start_char, segment.end_char));
+    }
+    expect(segmentation.segments[0]!.start_char).toBe(0);
+    expect(segmentation.segments.at(-1)!.end_char).toBe(hugeLine.length);
+    // Consecutive segments still overlap at this finer sub-line granularity.
+    expect(segmentation.segments[1]!.start_char).toBeLessThan(segmentation.segments[0]!.end_char);
+  });
+
+  it("cuts an oversized line down while leaving its normal-sized sibling lines untouched, in one mixed document", () => {
+    const normalLine = "short line here\n";
+    const hugeLine = "y".repeat(300);
+    const text = `${normalLine}${hugeLine}\n${normalLine}`;
+    const tokenize: TextTokenizer = (value) => ({ token_count: Math.max(1, Math.ceil(value.trim().length / 5)) });
+    const segmentation = segmentByTokens(text, tokenize, { window_tokens: 10, overlap_tokens: 4, max_segments: 64 });
+    expect(segmentation.truncated).toBe(false);
+    for (const segment of segmentation.segments) {
+      expect(tokenize(segment.text).token_count).toBeLessThanOrEqual(10);
+      expect(segment.text).toBe(text.slice(segment.start_char, segment.end_char));
+    }
+    expect(segmentation.segments[0]!.start_char).toBe(0);
+    expect(segmentation.segments.at(-1)!.end_char).toBe(text.length);
+  });
+
   it("uses OFFSET-based segmentation when the tokenizer reports offsets, producing exact token-window slices with the configured overlap", () => {
     const text = "AAAAABBBBBCCCCCDDDDDEEEEE"; // 5 "tokens" of 5 chars each
     const offsets: ReadonlyArray<readonly [number, number]> = [[0, 5], [5, 10], [10, 15], [15, 20], [20, 25]];
