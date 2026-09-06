@@ -47,10 +47,12 @@ use oxc_ast::ast::{
     ImportDeclaration, ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier,
     ImportOrExportKind, ImportSpecifier, MethodDefinition, MethodDefinitionKind, ModuleExportName,
     ObjectPattern, ObjectProperty, PropertyDefinition, PropertyKey, PropertyKind,
-    StaticMemberExpression, TSEnumDeclaration, TSInterfaceDeclaration, TSMethodSignature,
-    TSMethodSignatureKind, TSModuleDeclaration, TSQualifiedName, TSSignature, TSType,
-    TSTypeAliasDeclaration, TSTypeAnnotation, TSTypeName, TSTypePredicate, TSTypePredicateName,
-    TSTypeQueryExprName, ThisExpression, VariableDeclaration, VariableDeclarator,
+    StaticMemberExpression, TSCallSignatureDeclaration, TSConstructSignatureDeclaration,
+    TSConstructorType, TSEnumDeclaration, TSFunctionType, TSInterfaceDeclaration,
+    TSMethodSignature, TSMethodSignatureKind, TSModuleDeclaration, TSQualifiedName, TSSignature,
+    TSType, TSTypeAliasDeclaration, TSTypeAnnotation, TSTypeName, TSTypePredicate,
+    TSTypePredicateName, TSTypeQueryExprName, ThisExpression, VariableDeclaration,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{
     Visit,
@@ -61,7 +63,9 @@ use oxc_ast_visit::{
         walk_formal_parameter_rest, walk_function, walk_import_declaration,
         walk_import_default_specifier, walk_import_expression, walk_import_namespace_specifier,
         walk_import_specifier, walk_object_property, walk_property_definition,
-        walk_static_member_expression, walk_ts_enum_declaration, walk_ts_interface_declaration,
+        walk_static_member_expression, walk_ts_call_signature_declaration,
+        walk_ts_construct_signature_declaration, walk_ts_constructor_type,
+        walk_ts_enum_declaration, walk_ts_function_type, walk_ts_interface_declaration,
         walk_ts_method_signature, walk_ts_module_declaration, walk_ts_qualified_name,
         walk_ts_type_alias_declaration, walk_ts_type_predicate, walk_variable_declarator,
     },
@@ -1388,6 +1392,40 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// deciding whether a directly-init'd arrow/function-expression's own
     /// params get the variable's id or fall back to the module.
     declarator_owns_entity: bool,
+    /// 2026-09-06 fidelity-review fix (flecos v4 plan §3, adversarial review
+    /// of F.2): depth counter, `>0` while this walk is anywhere inside a
+    /// TYPE-ONLY function signature -- `TSFunctionType` (`type F = (a:
+    /// string) => void`), `TSConstructorType` (`type C = new (a: string) =>
+    /// Foo`), `TSCallSignatureDeclaration`/`TSConstructSignatureDeclaration`
+    /// (an interface/type-literal's own unnamed `(x: number): void`/`new
+    /// (x: number): Foo` member) -- none of which is EVER a real callable
+    /// declaration `push_member_entities`/`lib.rs`'s own entity pass
+    /// materializes an entity for (only a NAMED `TSMethodSignature` is,
+    /// handled by `visit_ts_method_signature`'s own `param_owner_stack`
+    /// push, unaffected by this field). Before this fix, `visit_formal_
+    /// parameter` had no way to tell a real callable's parameter from one of
+    /// these type-position parameters -- both reach it through the exact
+    /// same generic `FormalParameter` walk -- so EVERY occurrence of a
+    /// typed function-valued annotation (an extremely common TS shape: `const
+    /// f: (a: number) => void = (a) => {}`, a React/Express callback prop
+    /// type, ...) silently produced a SECOND, PHANTOM `jsts:entity_parameter`
+    /// per parameter name, byte-identical in shape to a real one but
+    /// anchored at the TYPE ANNOTATION's own span and dangling with
+    /// `parent_id = module` (never a real declaration `core:contains` should
+    /// ever point at). Harmless under the pre-2026-09-06 "referenced-only"
+    /// cut (a type-position parameter can never be referenced by a bare
+    /// identifier, so it never actually materialized); F.2's "every
+    /// declaration" fix makes it materialize a wrong entity every single
+    /// time instead. A counter, not a `bool`, because these nest (`type F =
+    /// (cb: (x: number) => void) => void`). Consulted by `visit_formal_
+    /// parameter`/`visit_formal_parameter_rest`/`visit_catch_parameter`
+    /// (catch bindings can never appear in a type position at all, but the
+    /// three share enough structure that checking uniformly costs nothing
+    /// and stays correct if that ever changes) to skip ONLY the entity-fact
+    /// recording -- the `push_site`/`record_local_type`/predicate-stack
+    /// bookkeeping these nodes already do is untouched, since none of that
+    /// depends on whether a real declaration backs the parameter.
+    type_only_signature_depth: u32,
     /// Parameter entities, "every declaration" variant (2026-09-06,
     /// supersedes the 2026-09-04 "referenced-only" cut): every identifier-
     /// pattern parameter declaration this walk has seen, keyed by its own
@@ -1641,6 +1679,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             param_owner_stack: Vec::new(),
             pending_function_owner: None,
             declarator_owns_entity: false,
+            type_only_signature_depth: 0,
             parameter_declarations: BTreeMap::new(),
             catch_declarations: BTreeMap::new(),
             predicate_param_stack: Vec::new(),
@@ -5887,7 +5926,30 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// own `GetAccessorDeclaration`/`SetAccessorDeclaration` node kind even
     /// inside a signature body -- `classify_symbol_declaration` never sees
     /// these (Hallazgo B: never referenced by a bare identifier), so this
-    /// override exists solely to keep `callable_stack` in sync as an owner.
+    /// override exists to keep `callable_stack` in sync as an owner AND
+    /// (2026-09-06 fidelity-review fix, flecos v4 plan §3, adversarial
+    /// review) to bracket `param_owner_stack` exactly like `visit_method_
+    /// definition` does -- before this fix, this override never touched
+    /// `param_owner_stack` at all, so EVERY interface/type-literal method
+    /// signature's own parameters fell through to whatever frame happened to
+    /// be on top of the stack (`None` at module top level), giving every one
+    /// of them `parent_id = module_id` instead of the signature's own
+    /// `jsts:entity_callable` (when `member_qualified_names` has one for a
+    /// module-level, NAMED interface's method -- `push_member_entities`/
+    /// `member_declarations` do materialize that entity, see
+    /// `parameter_entity_record`'s own doc comment, which already documented
+    /// this exact rule; the implementation here just never carried it out).
+    /// The bug was latent but harmless under the pre-2026-09-06 "referenced-
+    /// only" parameter cut (a signature parameter is never referenced by a
+    /// bare identifier, so it never produced an entity at all); F.2's "every
+    /// declaration" fix (this same plan) makes it produce a WRONG entity
+    /// every time instead, dangling the module's own `core:contains`
+    /// children with unrelated interface-method parameters and leaving
+    /// `get_outline` on the interface method itself blind to its own
+    /// parameters. A type-literal method (no entity, `member_qualified_
+    /// names.get(&id)` misses) still correctly falls back to the module,
+    /// exactly like a nested/anonymous class method already does via
+    /// `visit_method_definition`'s own identical lookup.
     fn visit_ts_method_signature(&mut self, signature: &TSMethodSignature<'a>) {
         // A string-literal-keyed signature (`interface I { 'my method'():
         // void }`) is valid TS too, same widening as `visit_method_
@@ -5900,7 +5962,21 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 TSMethodSignatureKind::Set => DeclKind::Setter,
             };
             let id = declaration_id(kind, &self.path, key_start, &key_name);
-            self.callable_stack.push(id);
+            self.callable_stack.push(id.clone());
+            // Same `member_qualified_names` lookup `visit_method_definition`
+            // uses: `None` for a type-literal method (never enumerated by
+            // `member_declarations`) or a nested/anonymous interface's own
+            // member, correctly falling back to the module -- see this
+            // method's own doc comment above.
+            let owner = self
+                .member_qualified_names
+                .get(&id)
+                .cloned()
+                .map(|qualified_name| ParamOwner {
+                    entity_id: id,
+                    qualified_name,
+                });
+            self.param_owner_stack.push(owner);
             self.push_site(
                 SiteKind::TypedDecl,
                 signature.span.start,
@@ -5924,6 +6000,7 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         self.predicate_param_stack.pop();
         if pushed {
             self.callable_stack.pop();
+            self.param_owner_stack.pop();
         }
     }
 
@@ -6179,7 +6256,17 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             // declarations` simply has no fact keyed under it here (by
             // construction, never inserted), so `finish` never materializes
             // it a second time, since `push_member_entities` already will.
-            if !parameter.has_modifier() {
+            //
+            // `type_only_signature_depth == 0`: 2026-09-06 fidelity-review
+            // fix (see that field's own doc comment) -- a parameter inside a
+            // `TSFunctionType`/`TSConstructorType`/`TSCallSignatureDeclaration`/
+            // `TSConstructSignatureDeclaration` is a TYPE annotation, never a
+            // real declaration; skipping the fact recording here (while still
+            // pushing this same `TypedDecl` site and recording its local type
+            // just below, unchanged) is what stops it from materializing a
+            // phantom, wrongly-parented `jsts:entity_parameter` alongside the
+            // real declaration's own.
+            if !parameter.has_modifier() && self.type_only_signature_depth == 0 {
                 let entity_id = declaration_id(
                     DeclKind::Parameter,
                     &self.path,
@@ -6277,7 +6364,13 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// accessibility modifier on a rest parameter at all, so `FormalParameterRest`
     /// has no `has_modifier`-equivalent to check).
     fn visit_formal_parameter_rest(&mut self, parameter: &FormalParameterRest<'a>) {
-        if let BindingPattern::BindingIdentifier(ident) = &parameter.rest.argument {
+        // `type_only_signature_depth == 0`: same 2026-09-06 fidelity-review
+        // guard `visit_formal_parameter` applies -- `type F = (...args:
+        // number[]) => void` is a type-only signature too, and a rest
+        // parameter is just as valid there as an ordinary one.
+        if let BindingPattern::BindingIdentifier(ident) = &parameter.rest.argument
+            && self.type_only_signature_depth == 0
+        {
             let entity_id = declaration_id(
                 DeclKind::Parameter,
                 &self.path,
@@ -6302,6 +6395,52 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             );
         }
         walk_formal_parameter_rest(self, parameter);
+    }
+
+    /// 2026-09-06 fidelity-review fix (see `type_only_signature_depth`'s own
+    /// doc comment): `type F = (a: string) => void` -- a type-only function
+    /// signature. Its own `params`/`return_type` are still walked normally
+    /// (a predicate return type, a nested `TSFunctionType` in a parameter's
+    /// own type annotation, ... all still need visiting), just under the
+    /// depth counter so `visit_formal_parameter`/`visit_formal_parameter_
+    /// rest` know not to materialize an entity for any parameter reached
+    /// through it.
+    fn visit_ts_function_type(&mut self, ty: &TSFunctionType<'a>) {
+        self.type_only_signature_depth += 1;
+        walk_ts_function_type(self, ty);
+        self.type_only_signature_depth -= 1;
+    }
+
+    /// Sibling of `visit_ts_function_type` above, for `type C = new (a:
+    /// string) => Foo` (a constructor type).
+    fn visit_ts_constructor_type(&mut self, ty: &TSConstructorType<'a>) {
+        self.type_only_signature_depth += 1;
+        walk_ts_constructor_type(self, ty);
+        self.type_only_signature_depth -= 1;
+    }
+
+    /// Sibling of `visit_ts_function_type` above, for an interface/type-
+    /// literal's own unnamed call signature (`interface I { (x: number):
+    /// void }`) -- unlike `TSMethodSignature`, this has no name at all, so
+    /// `signature_member_shape`/`member_declarations` never enumerates it
+    /// and no entity is ever materialized for the signature itself either;
+    /// its parameters must not get one.
+    fn visit_ts_call_signature_declaration(&mut self, signature: &TSCallSignatureDeclaration<'a>) {
+        self.type_only_signature_depth += 1;
+        walk_ts_call_signature_declaration(self, signature);
+        self.type_only_signature_depth -= 1;
+    }
+
+    /// Sibling of `visit_ts_call_signature_declaration` above, for an
+    /// interface/type-literal's own unnamed construct signature (`interface
+    /// I { new (x: number): Foo }`).
+    fn visit_ts_construct_signature_declaration(
+        &mut self,
+        signature: &TSConstructSignatureDeclaration<'a>,
+    ) {
+        self.type_only_signature_depth += 1;
+        walk_ts_construct_signature_declaration(self, signature);
+        self.type_only_signature_depth -= 1;
     }
 }
 
@@ -11197,6 +11336,132 @@ mod tests {
         let catch_id = declaration_id(DeclKind::Variable, "a.ts", catch_start, "error");
         assert!(parameter_entity(&semantics, &catch_id).is_some());
         assert!(parameter_contains(&semantics, &catch_id).is_some());
+    }
+
+    /// 2026-09-06 fidelity-review regression (flecos v4 plan §3, adversarial
+    /// review of F.2): a module-level, NAMED interface's own `TSMethodSignature`
+    /// member has a real `jsts:entity_callable` (`push_member_entities`/
+    /// `member_declarations`, lib.rs), so its own parameter's `parent_id`
+    /// must be THAT method's entity id, not the module -- `visit_ts_method_
+    /// signature` used to never touch `param_owner_stack` at all (only
+    /// `visit_method_definition`/`visit_arrow_function_expression`/`visit_
+    /// function` did), so every interface/type-literal method signature
+    /// parameter silently fell back to the module fallback branch. Harmless
+    /// under the pre-2026-09-06 "referenced-only" cut (a signature parameter
+    /// is never referenced by a bare identifier, so no entity ever
+    /// materialized at all); becomes a wrong `parent_id` on every single one
+    /// once F.2 makes every declaration materialize.
+    #[test]
+    fn interface_method_signature_parameter_attributes_to_the_method_not_the_module() {
+        let source = "interface I {\n  foo(x: number): void;\n}\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let method_id = declaration_id(
+            DeclKind::Method,
+            "a.ts",
+            source.find("foo").unwrap() as u32,
+            "foo",
+        );
+        let param_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("x:").unwrap() as u32,
+            "x",
+        );
+        let entity = parameter_entity(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a jsts:entity_parameter for {param_id}"));
+        assert_eq!(
+            entity.body.to_value()["parent_id"],
+            method_id,
+            "expected the interface method signature's own parameter to be parented under the method entity, not the module"
+        );
+        let contains = parameter_contains(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a core:contains row for {param_id}"));
+        assert_eq!(contains.body.to_value()["source_id"], method_id);
+    }
+
+    /// Sibling of the fix above: a type-literal method (`type T = { foo(): void }`)
+    /// has NO member entity at all (`member_declarations` only enumerates
+    /// module-level `ClassDeclaration`/`TSInterfaceDeclaration` members, never
+    /// a `TSTypeLiteral`'s), so its own parameter must still fall back to the
+    /// module -- the fix above must not invent a `parent_id` that was never
+    /// published as an entity (would dangle `core:contains`).
+    #[test]
+    fn type_literal_method_signature_parameter_falls_back_to_the_module() {
+        let source = "type T = {\n  foo(x: number): void;\n};\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let module_id = "jsts:module:a.ts:0:a.ts";
+        let param_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("x:").unwrap() as u32,
+            "x",
+        );
+        let entity = parameter_entity(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a jsts:entity_parameter for {param_id}"));
+        assert_eq!(entity.body.to_value()["parent_id"], module_id);
+    }
+
+    /// 2026-09-06 fidelity-review regression (flecos v4 plan §3, adversarial
+    /// review of F.2): a TYPE-POSITION function signature -- `TSFunctionType`
+    /// here -- is never a real declaration, so its own parameters must never
+    /// materialize a `jsts:entity_parameter` at all. Before this fix, EVERY
+    /// typed function-valued annotation (an extremely common TS shape:
+    /// callback prop types, `EventHandler`-style aliases, ...) produced a
+    /// PHANTOM parameter entity per parameter name in the type annotation,
+    /// in addition to the real implementation's own -- byte-identical in
+    /// shape, dangling with `parent_id = module` (harmless under the
+    /// pre-2026-09-06 "referenced-only" cut, since a type-position parameter
+    /// can never be referenced by a bare identifier; F.2's "every
+    /// declaration" fix made it materialize every single time instead).
+    /// Exactly two parameter entities must exist here -- the real
+    /// implementation's `a`/`b`, parented under the variable `add` -- never
+    /// four.
+    #[test]
+    fn function_type_annotation_parameters_never_materialize_a_phantom_entity() {
+        let source = "const add: (a: number, b: number) => number = (a, b) => a + b;\n";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert_eq!(
+            semantics.parameter_entity_rows.len(),
+            2,
+            "rows: {:?}",
+            semantics.parameter_entity_rows
+        );
+        let variable_id = declaration_id(
+            DeclKind::Variable,
+            "a.ts",
+            source.find("add").unwrap() as u32,
+            "add",
+        );
+        for row in &semantics.parameter_entity_rows {
+            assert_eq!(
+                row.body.to_value()["parent_id"],
+                variable_id,
+                "expected only the real implementation's own parameters, parented under `add`; got {:?}",
+                semantics.parameter_entity_rows
+            );
+        }
+    }
+
+    /// Sibling of the fix above for `TSConstructorType` (`type C = new (a:
+    /// string) => Foo`) and the two anonymous interface signature shapes
+    /// (`TSCallSignatureDeclaration`/`TSConstructSignatureDeclaration`) --
+    /// none of the four is ever a real declaration, so none of their own
+    /// parameters may materialize an entity.
+    #[test]
+    fn constructor_type_and_anonymous_interface_signature_parameters_never_materialize_an_entity() {
+        let source = concat!(
+            "type C = new (ctorArg: string) => object;\n",
+            "interface I {\n",
+            "  (callArg: number): void;\n",
+            "  new (newArg: number): object;\n",
+            "}\n",
+        );
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        assert!(
+            semantics.parameter_entity_rows.is_empty(),
+            "expected no parameter entities at all for these four type-only signature shapes, got: {:?}",
+            semantics.parameter_entity_rows
+        );
     }
 
     #[test]

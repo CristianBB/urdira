@@ -821,6 +821,219 @@ fn cold_scan_materializes_every_declared_parameter_in_declaration_order_whether_
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// Adversarial-review addition (2026-09-06, flecos v4 plan §3.3, incremental
+/// path): F.2 made EVERY declared parameter materialize an entity, cold AND
+/// incremental (both funnel through the SAME `analyze::run_scoped`, see its
+/// call sites in `run_cold`/`run_incremental`) -- but no existing test
+/// exercised the specific "EDIT that adds a brand-new, NEVER-referenced
+/// parameter to an existing owner" shape end-to-end through `ScanScope::
+/// Changed`. The generic `incremental_create_roots_match_a_from_scratch_
+/// scan_of_the_mutated_tree` family only ever adds/deletes/renames whole
+/// FILES, which never exercises record CHAINING (a brand-new identity's
+/// first-ever occurrence always uses the cold `record_id = sha256(digest)`
+/// recipe on both sides, incremental and oracle alike -- see decision 11).
+/// An in-place CONTENT edit of an EXISTING owner is different: any record
+/// whose digest changes across the edit (here, the file's own `jsts:
+/// module:...` container entity, whose digest embeds the file's length/
+/// content per `incremental_edit_produces_a_self_consistent_incremental_
+/// merkle_update`'s own doc comment) legitimately CHAINS (`record_id =
+/// H(digest || predecessor)`), so it can never be compared against an
+/// independent from-scratch oracle scan of the same final tree (that
+/// oracle's own chain history differs -- IT sees this identity for the
+/// first time ever, so it always assigns the cold recipe instead). This
+/// test therefore follows the SAME self-consistency pattern `incremental_
+/// edit_produces_a_self_consistent_incremental_merkle_update` already
+/// established (recompute the roots from the store's own final visible key
+/// set, rather than diffing against an unrelated oracle history), while
+/// directly asserting what an "open record never closed" leak (a stale
+/// generation-1 parameter record surviving alongside its generation-2
+/// replacement) would actually break: the FINAL live parameter-entity count
+/// for this owner is exactly two (`a`, `b`), each with exactly one live
+/// `core:contains` row from the function, never three (which a leaked
+/// stale generation-1 `a`-only-shaped record would produce).
+#[test]
+fn incremental_edit_adding_an_unreferenced_parameter_is_self_consistent() {
+    let scratch_root = scratch_dir("incremental-edit-unused-param");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    // A harness-owned file (never referenced from the rest of the fixture,
+    // same discipline `incremental_create_*` uses for its own created file)
+    // so this test's own mutation cannot perturb any OTHER test's asserted
+    // record counts for the shared fixture tree.
+    let edited_relative = "src/domain/urdira-harness-param-edit.ts";
+    let edited_absolute = workspace_root.join(edited_relative);
+    std::fs::write(
+        &edited_absolute,
+        "export function urdiraHarnessParamEdit_marker1(a) {\n  return a;\n}\n",
+    )
+    .expect("write initial harness file");
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-edit-unused-param",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+    let reader1 = StoreReader::open(&structural_root).expect("reader opens after cold");
+    let mut records_before: std::collections::HashMap<[u8; 32], [u8; 32]> =
+        std::collections::HashMap::new();
+    for view in reader1.iter_visible(1) {
+        records_before.insert(view.identity_key_digest(), view.record_id());
+    }
+    drop(reader1);
+
+    // Edit in place: add a SECOND parameter, `b`, that the body never reads
+    // -- exactly the case F.2 now materializes an entity for.
+    std::fs::write(
+        &edited_absolute,
+        "export function urdiraHarnessParamEdit_marker1(a, b) {\n  return a;\n}\n",
+    )
+    .expect("rewrite harness file with an added unreferenced parameter");
+
+    let incremental = run_scan(
+        "request:incremental-edit-unused-param",
+        "workspace:v4-e2e-edit-unused-param",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: edited_relative.to_string(),
+                kind: ChangeKind::Modified,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&incremental), 2);
+    let incremental_roots = roots_of(&incremental);
+
+    // Property 1 (same as `incremental_edit_produces_a_self_consistent_
+    // incremental_merkle_update`): the incrementally-updated roots equal a
+    // from-scratch rebuild over the STORE'S OWN final visible key set.
+    let reader2 = StoreReader::open(&structural_root).expect("reader opens after incremental");
+    let generation2 = reader2.generation();
+    assert_eq!(generation2, 2);
+    let (records_root_from_scratch, dependency_root_from_scratch) =
+        urdira_structural_store::recompute_roots_from_scratch(&reader2, generation2)
+            .expect("recompute_roots_from_scratch succeeds");
+    assert_eq!(
+        incremental_roots.records,
+        urdira_structural_store::to_prefixed_hex(&records_root_from_scratch),
+        "the incrementally-updated records root must equal a from-scratch rebuild over the SAME final key set"
+    );
+    assert_eq!(
+        incremental_roots.dependency,
+        urdira_structural_store::to_prefixed_hex(&dependency_root_from_scratch),
+        "the incrementally-updated dependency root must equal a from-scratch rebuild over the SAME final key set"
+    );
+    let graph_entries: Vec<_> = reader2
+        .iter_visible(generation2)
+        .filter(|view| view.category() == urdira_structural_store::row::CATEGORY_RELATION)
+        .map(|view| (view.record_id(), view.record_digest()))
+        .collect();
+    let graph_root_from_scratch =
+        urdira_structural_store::BucketedMerkleSet::from_sorted(&graph_entries)
+            .expect("graph merkle build succeeds")
+            .root();
+    assert_eq!(
+        incremental_roots.graph,
+        urdira_structural_store::to_prefixed_hex(&graph_root_from_scratch),
+        "the incrementally-updated graph root must equal a from-scratch rebuild over the SAME final key set"
+    );
+
+    // Property 2: every OTHER record (not this owner's own container/
+    // members, which legitimately chain across this edit) keeps its exact
+    // prior id -- same invariant the sibling self-consistency test checks.
+    let mut unchanged_checked = 0;
+    for view in reader2.iter_visible(generation2) {
+        if let Some(&prior_id) = records_before.get(&view.identity_key_digest())
+            && prior_id == view.record_id()
+        {
+            unchanged_checked += 1;
+        }
+    }
+    assert!(
+        unchanged_checked > 100,
+        "most of generation 1's records must survive this edit with their exact prior id \
+         (got {unchanged_checked}); an edit to one file should not reopen/rechain unrelated records"
+    );
+
+    // Property 3 (the actual leak check this test exists for): exactly TWO
+    // live `jsts:entity_parameter` entities for this owner post-edit -- `a`
+    // (unchanged/chained) and `b` (brand new) -- never three, which a
+    // leaked stale generation-1 `a`-only-shaped record would produce, and
+    // never one, which would mean `b` silently failed to materialize.
+    let param_prefix = format!("jsts:parameter:{edited_relative}:");
+    let live_param_count =
+        visible_entity_count_with_prefix(&structural_root, param_prefix.as_bytes());
+    assert_eq!(
+        live_param_count, 2,
+        "expected exactly the `a`/`b` parameter entities live after the incremental edit, got {live_param_count}"
+    );
+
+    // Property 4: each of the two live parameter entities has EXACTLY one
+    // live `core:contains` row from the function -- not zero (a dangling
+    // entity `get_outline` would never reach) and not two (a duplicate
+    // `contains` row from an unclosed generation-1 copy).
+    let dicts = reader2.dictionaries();
+    let contains_count_for = |target_record_id: &[u8; 32]| -> usize {
+        reader2
+            .iter_visible(generation2)
+            .filter(|view| {
+                if view.category() != urdira_structural_store::row::CATEGORY_RELATION {
+                    return false;
+                }
+                let universal_kind = dicts
+                    .universal_kinds
+                    .get(view.universal_kind_id() as usize)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if universal_kind != "core:contains" {
+                    return false;
+                }
+                let Some(target_subject) = view.target_subject() else {
+                    return false;
+                };
+                dicts.subjects.get(target_subject as usize) == Some(target_record_id)
+            })
+            .count()
+    };
+    let param_record_ids: Vec<[u8; 32]> = reader2
+        .iter_visible(generation2)
+        .filter(|view| {
+            view.category() == urdira_structural_store::row::CATEGORY_ENTITY
+                && view.identity_key().starts_with(param_prefix.as_bytes())
+        })
+        .map(|view| view.record_id())
+        .collect();
+    assert_eq!(param_record_ids.len(), 2);
+    for record_id in &param_record_ids {
+        assert_eq!(
+            contains_count_for(record_id),
+            1,
+            "expected exactly one live core:contains row targeting each parameter entity"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
 #[test]
 fn cold_scan_is_deterministic_across_two_independent_runs() {
     let scratch_a = scratch_dir("determinism-a");
