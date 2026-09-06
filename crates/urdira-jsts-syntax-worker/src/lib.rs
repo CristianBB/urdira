@@ -2057,6 +2057,39 @@ impl SyntaxWorkerState {
         // over every file's already-in-memory, usually-empty `ambient_
         // modules` vector is cheap: no AST walk, no reparse, not the
         // per-edit cost class those P3-6 indexes exist to avoid.
+        //
+        // Frente E-P0b fix (fleco 1, 2026-09-06): this doc comment's OWN
+        // "(1) every file THIS call (re)parsed" clause used to be violated
+        // in practice -- `reresolve_file` (T1's bounded add/remove
+        // re-resolution sweep, above) ALSO rebuilds a stale path's ENTIRE
+        // `direct_imports`/relations list via `build_import_export_facts`
+        // with `ambient_index: None` (its own doc comment says so
+        // explicitly: "the separate `reresolve_ambient_relations` pass
+        // below is what applies ambient resolution"), for EVERY reresolved
+        // file, not just the one specifier whose target actually changed --
+        // but the revisit loop below only ever iterated `changed`/
+        // `ambient_affected`, never `reresolved`. A file pulled into
+        // `reresolved` because ONE of its OWN unrelated imports' candidate
+        // path was touched by this batch's adds/removes therefore
+        // permanently REGRESSED any OTHER import in that same file whose
+        // classification depended on a workspace-wide ambient declaration
+        // (e.g. a workspace-ambiguous wildcard `declare module '*.vue'` in
+        // two different packages correctly demoting a bare `.vue` import to
+        // `Possible`/no-target) back to a naive `classify_external_
+        // specifier` guess -- confirmed live on n8n (`docs/evidence/2026-
+        // 09-06-v4-reconcile-threshold.md` §9.3): an untouched file's
+        // `@/app/components/DependencyPill.vue` import, correctly
+        // `Possible` (ambiguous between `packages/@n8n/mcp-apps/.../shims-
+        // vue.d.ts` and `packages/@n8n/mcp-browser-extension/.../
+        // shimsVue.d.ts`) at generation 1, reverted to a fabricated
+        // `jsts:external_module:@/app/components/DependencyPill.vue`
+        // identity the moment `reresolve_file` rebuilt its relations for an
+        // UNRELATED specifier elsewhere in the same file -- diverging the
+        // `graph` Merkle root from an independent from-scratch oracle of
+        // the identical tree. Fixed by folding `reresolved` into this
+        // loop's own iteration set too (empty whenever `path_membership_
+        // incremental` did not run, so this is a strict superset, never a
+        // behavior change for any call that never populates `reresolved`).
         let ambient_index_started = std::time::Instant::now();
         let ambient_index = resolver::AmbientModuleIndex::rebuild(&next_files);
         if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
@@ -2106,7 +2139,11 @@ impl SyntaxWorkerState {
                 }
             }
         }
-        for path in changed.iter().chain(ambient_affected.iter()) {
+        for path in changed
+            .iter()
+            .chain(ambient_affected.iter())
+            .chain(reresolved.iter())
+        {
             if let Some(updated) = next_files
                 .get(path.as_str())
                 .and_then(|file| reresolve_ambient_relations(file, &ambient_index))

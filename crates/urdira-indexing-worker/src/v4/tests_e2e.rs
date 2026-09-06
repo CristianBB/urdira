@@ -2796,6 +2796,309 @@ fn mixed_burst_two_deletes_two_creates_and_an_edit_does_not_panic_and_matches_an
     let _ = std::fs::remove_dir_all(&oracle_root);
 }
 
+/// Frente E-P0b (2026-09-06), P0-2 root cause: a `Changed`/`Reconcile`
+/// batch that names a CONFIG ASSET path (`tsconfig.json`/`jsconfig.json`/
+/// `package.json`/`pnpm-workspace.yaml`) alongside an ordinary content edit
+/// -- routine in a real git history diff of any size (confirmed live on
+/// two real n8n git-history switches, `docs/evidence/2026-09-06-v4-
+/// reconcile-threshold.md` §4/§9.4: `.github/scripts/jsconfig.json` was
+/// CREATED as part of a much larger mixed batch) -- used to crash with
+/// "changed artifact id is absent from the current and retained
+/// manifests" (`urdira-jsts-syntax-worker::lib.rs::authoritative_changed_
+/// paths`). Root cause: `delta.rs::run_one`'s `changed_artifact_ids` used
+/// to include EVERY `source_delta.changed`/`added`/`deleted` path's
+/// artifact id, config assets included -- but `analyze()`'s own retained/
+/// current manifest is built EXCLUSIVELY from JSTS SOURCE paths (`state::
+/// SourceCache::files_vec()`), never config assets (a separate channel,
+/// `config_assets: Vec<ConfigAssetInput>`, that never populates
+/// `ProjectState::source_metadata`) -- so a config asset's artifact id can
+/// never be found in that manifest, no matter how fresh. Fixed by scoping
+/// `changed_artifact_ids` to `analyze::is_jsts_source_path` paths only.
+/// This fixture creates a NEW nested `jsconfig.json` (forcing `has_
+/// structural`) alongside a genuine content edit (forcing `has_content`),
+/// so the batch also exercises `delta.rs::run`'s mixed-burst split -- the
+/// exact shape the real git-switch failure took.
+#[test]
+fn config_asset_created_alongside_a_content_edit_does_not_crash_and_matches_an_independent_oracle()
+{
+    let scratch_root = scratch_dir("config-asset-mixed");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-config-asset-mixed";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // A brand-new config asset, nested under a directory that never had one
+    // before -- created as part of the SAME batch as an ordinary content
+    // edit elsewhere in the tree (real git diffs routinely add/move config
+    // files alongside unrelated source edits).
+    let created_config_relative = "src/domain/jsconfig.json";
+    std::fs::write(
+        workspace_root.join(created_config_relative),
+        "{\n  \"compilerOptions\": { \"checkJs\": false }\n}\n",
+    )
+    .expect("write new config asset");
+
+    let edited_relative = "src/domain/task.ts";
+    let edited_absolute = workspace_root.join(edited_relative);
+    let before = std::fs::read_to_string(&edited_absolute).expect("read edited file");
+    let after = format!(
+        "{before}{}\nexport function urdiraConfigAssetMixedEdit_marker() {{\n  return \"marker\";\n}}\n",
+        if before.ends_with('\n') { "" } else { "\n" }
+    );
+    std::fs::write(&edited_absolute, &after).expect("write mutated file");
+
+    let mixed = run_scan(
+        "request:config-asset-mixed",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![
+                ChangedPath {
+                    path: created_config_relative.to_string(),
+                    kind: ChangeKind::Created,
+                },
+                ChangedPath {
+                    path: edited_relative.to_string(),
+                    kind: ChangeKind::Modified,
+                },
+            ],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&mixed),
+        3,
+        "a mixed batch (config asset create + content edit) must consume two internal \
+         generations (structural, then content), matching any other mixed burst"
+    );
+    let mixed_roots = roots_of(&mixed);
+
+    let oracle_root = scratch_dir("config-asset-mixed-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-config-asset-mixed-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    // `records` is deliberately NOT asserted here: `task.ts`'s own content
+    // edit chains its module entity's `record_id` from generation 1's
+    // digest (decision 11's documented, already-accepted incremental-vs-
+    // oracle divergence -- an independent from-scratch oracle only ever
+    // sees ONE generation, so it always mints the first-occurrence
+    // `record_id = sha256(record_digest)` formula instead) -- the SAME
+    // legitimate gap every other mixed-burst e2e test in this file leaves
+    // unasserted for exactly this reason. `dependency`/`graph` are the
+    // roots this test exists to protect (P0-2's own failure mode).
+    if mixed_roots.dependency != oracle_roots.dependency || mixed_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&mixed),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(mixed_roots.dependency, oracle_roots.dependency);
+    assert_eq!(mixed_roots.graph, oracle_roots.graph);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Frente E-P0b (2026-09-06), fleco 1 root cause: `urdira-jsts-syntax-
+/// worker::lib.rs::analyze`'s T1 bounded reresolution (`reresolve_file`,
+/// triggered by a PURE structural `Changed` batch through `path_membership_
+/// incremental`) rebuilds an UNTOUCHED file's ENTIRE relation list via
+/// `build_import_export_facts(..., ambient_index: None)` the moment ANY ONE
+/// of that file's OWN specifiers gets a new/different candidate target from
+/// this batch's adds/removes -- discarding a workspace-ambiguous ambient
+/// classification (`Possible`, no target) any OTHER, unrelated bare import
+/// in that same file had correctly earned from a full ambient-aware pass at
+/// an earlier generation, reverting it to a naive `classify_external_
+/// specifier` guess (`Confirmed`, external). The post-processing "ambient
+/// revisit" pass (`reresolve_ambient_relations`, guarded by `changed ∪
+/// ambient_affected`) never re-examined a merely-`reresolved` file, so the
+/// wrong classification stuck -- diverging `graph` from an independent
+/// oracle. Confirmed live on n8n (`docs/evidence/2026-09-06-v4-reconcile-
+/// threshold.md` §9.3): `@/app/components/DependencyPill.vue`, ambiguous
+/// between two real `declare module '*.vue'` shims in unrelated packages.
+///
+/// This fixture reproduces the SAME shape at fixture scale, PURE structural
+/// (no mixed-burst split needed -- `reresolve_file` fires on its own):
+/// `src/shims/*.vue.d.ts` (two files, same wildcard pattern -- workspace-
+/// ambiguous by construction) and `src/widget-consumer.ts` (one BARE `*.vue`
+/// import that must stay `Possible`, one relative `./widget-helper` import
+/// that starts UNRESOLVED). Creating `src/widget-helper.ts` is a PURE
+/// `Created` batch that makes `widget-consumer.ts`'s OWN `./widget-helper`
+/// candidate resolve for the first time -- exactly the trigger `reresolve_
+/// file` exists for -- while `widget-consumer.ts` itself is never touched.
+#[test]
+fn reresolved_file_keeps_an_unrelated_ambiguous_ambient_import_pending_and_matches_an_independent_oracle()
+ {
+    let scratch_root = scratch_dir("reresolve-ambient-pending");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    // Two DIFFERENT files declaring the SAME wildcard pattern: `*.vue`
+    // resolves to a workspace-ambiguous ambient module (neither one is "the"
+    // declaration `unique_namespace_entity` could pick).
+    std::fs::create_dir_all(workspace_root.join("src/shims")).expect("create shims dir");
+    std::fs::write(
+        workspace_root.join("src/shims/shim-a.d.ts"),
+        "declare module '*.vue';\n",
+    )
+    .expect("write shim-a.d.ts");
+    std::fs::write(
+        workspace_root.join("src/shims/shim-b.d.ts"),
+        "declare module '*.vue';\n",
+    )
+    .expect("write shim-b.d.ts");
+
+    // One BARE `*.vue`-pattern import (must stay `Possible`/no-target, the
+    // ambient-ambiguous case) plus one RELATIVE import to a file that does
+    // NOT exist yet (starts `Unresolved`/no-target for an unrelated reason).
+    std::fs::write(
+        workspace_root.join("src/widget-consumer.ts"),
+        "import Widget from 'widget.vue';\nimport { helperMarker } from './widget-helper';\n\nexport function useWidget() {\n  return { Widget, helperMarker };\n}\n",
+    )
+    .expect("write widget-consumer.ts");
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-reresolve-ambient-pending";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // A PURE structural `Created` batch, unrelated to `widget-consumer.ts`'s
+    // OWN content -- but its `./widget-helper` candidate now resolves,
+    // which is exactly what `reresolve_file`'s `CandidateIndex.importers_of`
+    // lookup exists to catch.
+    std::fs::write(
+        workspace_root.join("src/widget-helper.ts"),
+        "export const helperMarker = \"marker\";\n",
+    )
+    .expect("write widget-helper.ts");
+
+    let created = run_scan(
+        "request:create-widget-helper",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: "src/widget-helper.ts".to_string(),
+                kind: ChangeKind::Created,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&created),
+        2,
+        "a pure structural batch never needs the mixed-burst split"
+    );
+    let created_roots = roots_of(&created);
+
+    let oracle_root = scratch_dir("reresolve-ambient-pending-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-reresolve-ambient-pending-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    if created_roots.dependency != oracle_roots.dependency
+        || created_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&created),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        created_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle after a pure structural \
+         create that reresolves an unrelated import in the SAME untouched file"
+    );
+    assert_eq!(
+        created_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle -- the ambiguous-ambient \
+         `*.vue` import must stay Possible/no-target, never fabricated into an external_module \
+         entity, after `reresolve_file` rebuilds this file's relations for an unrelated reason"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
 /// The portion of the task brief's gate that IS achievable byte-for-byte
 /// against an independent from-scratch oracle: a pure file CREATION.
 /// Every record a new file produces has a brand-new `identity_key`
