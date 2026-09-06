@@ -38,6 +38,8 @@ import {
   enumerateForkRoot,
   isKnownPreexistingVerifyGap,
   multisetKey,
+  recomputeV4SnapshotDigestsAfterRewrite,
+  rewriteV4WorkspaceIdentity,
   rollbackForkPublication,
   sortedResolvedPluginsDigest,
   stableId,
@@ -1389,9 +1391,17 @@ async function importAfterEnumeration(options: IndexPackImportOptions, context: 
 // `docs/evidence/2026-09-02-v4-p0-s3-merkle-bucket.md` -- so a v4 pack is
 // at minimum ~140 MB before compression, even for a tiny fixture).
 //
-// Self-contained and directly tested (`tests/index-pack-v4.test.ts`), not
-// wired into `attemptIndexPackImport`'s v3 orchestration above or into any
-// daemon RPC -- see `workspace-fork.ts`'s matching v4 section for why.
+// Directly tested (`tests/index-pack-v4.test.ts`) and, since plan
+// `generic-waddling-hartmanis.md` §7.1 (Frente P-1), wired into the daemon:
+// `core:index_pack_export` (`packages/daemon/src/runtime.ts`) branches to
+// `exportV4IndexPack` for a native-structural-store workspace via
+// `index-pack-export-v4-worker-thread.ts`, and `runV4WorkspaceScan`'s
+// first-scan branch imports a pending `--index-pack` path via
+// `importV4IndexPack` (staged, then renamed atomically over the paths
+// `ensureV4Workspace` just bootstrapped) before handing the workspace to a
+// `reconcile` scan. NOT wired into `attemptIndexPackImport`'s v3
+// orchestration above -- see `workspace-fork.ts`'s matching v4 section for
+// why that one stays a compatibility-only oracle.
 // =============================================================================
 
 export const V4_INDEX_PACK_FORMAT = "urdira-index-pack-v4" as const;
@@ -1443,6 +1453,27 @@ export interface ExportV4IndexPackOptions {
   readonly sidecarRoot?: string;
   readonly workspaceId: string;
   readonly outputPath: string;
+  /** Same `--require-git-clean` contract as `ExportIndexPackOptions` (v3,
+   * above): reject the export outright if `canonicalRoot`'s git worktree has
+   * uncommitted changes, rather than silently packing a source state a
+   * later `git diff` cannot reproduce. */
+  readonly requireGitClean?: boolean;
+  readonly canonicalRoot?: string;
+  readonly gitObjects?: GitObjectPort;
+  readonly now?: () => string;
+}
+
+/** Thrown by `exportV4IndexPack` when the catalog's `current_generation` changed between the start and the end of the export (a concurrent scan published mid-export) -- see that function's doc comment. */
+export class IndexPackExportRaceError extends Error {}
+
+async function readV4CurrentGeneration(databasePath: string, workspaceId: string): Promise<number> {
+  const database = await openSqliteDatabase({ filename: databasePath, read_only: true });
+  try {
+    const current = await database.get<{ current_generation: number }>("SELECT current_generation FROM workspace_current_state WHERE workspace_id = ?", [workspaceId]);
+    return current?.current_generation ?? 0;
+  } finally {
+    await database.close();
+  }
 }
 
 /**
@@ -1459,6 +1490,36 @@ export interface ExportV4IndexPackOptions {
  * import, not just trusted from the manifest.
  */
 export async function exportV4IndexPack(options: ExportV4IndexPackOptions): Promise<{ readonly packPath: string; readonly manifest: V4IndexPackManifest }> {
+  if (options.requireGitClean) {
+    if (options.canonicalRoot === undefined) throw new Error("v4 index pack export: requireGitClean was requested without a canonicalRoot to check");
+    const now = options.now ?? (() => new Date().toISOString());
+    const admin = await administrativeState(options.canonicalRoot, options.gitObjects ?? ISOMORPHIC_GIT_OBJECT_PORT, now);
+    if (admin.vcs_state.dirty) throw new Error("v4 index pack export: workspace root has uncommitted changes (requireGitClean)");
+  }
+  // Adversarial-review fix (plan §7.1 review, item 5): read the generation
+  // BEFORE walking `structural/`/`sidecar/` (below, potentially the
+  // slowest part of an export -- tens to hundreds of MB) as well as after,
+  // and reject the export if a concurrent scan advanced the generation
+  // in between. Several `structural/` files are fixed-name and rewritten
+  // IN PLACE across generations, not append-only (`urdira-structural-store`'s
+  // `merkle::persist` overwrites `records.tree`/`dependency.tree` at the
+  // same path every publish) -- so a walk straddling a concurrent publish
+  // could read a torn mix of old- and new-generation bytes for those files
+  // while `roots`/`generation` below end up reflecting whichever side of
+  // the publish the LATER SQL read happened to land on. The daemon's
+  // `core:index_pack_export` handler already gates on `scanInFlight` before
+  // calling this function, which should make this window vanishingly rare
+  // in practice -- this is the defense for the residual TOCTOU gap between
+  // that check and this function's own, slower, file I/O (a new scan
+  // request racing in after the gate passed). A torn `structural/` file
+  // that slips through despite this check is still independently caught by
+  // `importV4IndexPack`'s own Merkle root re-derivation on the IMPORT side
+  // (`roots_verified: false` -> the daemon falls back to a full scan) --
+  // this check exists to fail loudly and immediately at EXPORT time instead
+  // of silently shipping a pack whose corruption is discovered, if ever,
+  // only much later at import.
+  const generationBefore = await readV4CurrentGeneration(options.databasePath, options.workspaceId);
+
   const files = [
     { path: "workspace.sqlite", absolutePath: options.databasePath },
     ...(await walkV4PackDirectory(options.structuralRoot, "structural")),
@@ -1483,6 +1544,12 @@ export async function exportV4IndexPack(options: ExportV4IndexPackOptions): Prom
     }
   } finally {
     await database.close();
+  }
+
+  if (generation !== generationBefore) {
+    throw new IndexPackExportRaceError(
+      `v4 index pack export for ${options.workspaceId}: generation changed from ${generationBefore} to ${generation} while exporting (a scan published concurrently) -- the pack would be internally inconsistent; retry once the workspace is idle`,
+    );
   }
 
   const manifest: V4IndexPackManifest = {
@@ -1574,6 +1641,20 @@ export interface ImportV4IndexPackOptions {
   readonly targetDatabasePath: string;
   readonly targetStructuralRoot: string;
   readonly targetSidecarRoot?: string;
+  /** Decidido en implementación (plan `generic-waddling-hartmanis.md` §7.1,
+   * R17): the workspace id the imported catalog must be bound to on THIS
+   * installation -- almost never the donor's own `manifest.workspace_id`
+   * (two installations mint independent ids for what may be the same
+   * canonical root). Optional -- defaults to `manifest.workspace_id` (a
+   * no-op rewrite), which keeps every existing direct caller of this
+   * function (donor id === target id, e.g. `tests/index-pack-v4.test.ts`'s
+   * plain round-trip tests) unchanged; a real cross-installation import
+   * (the daemon's `runV4WorkspaceScan` slot) always passes the real target
+   * id explicitly. Re-pinning happens unconditionally whenever it IS given
+   * (a no-op when it happens to already match) so `storage.openWorkspace`'s
+   * `bindWorkspaceIdentity` never sees a foreign id and throws
+   * `storage:workspace_binding_mismatch`. */
+  readonly targetWorkspaceId?: string;
 }
 
 export interface ImportV4IndexPackResult {
@@ -1615,5 +1696,30 @@ export async function importV4IndexPack(options: ImportV4IndexPackOptions): Prom
     if (file.headerRoot !== expectedRoot) mismatches.push(`${setKind}: header root differs from the manifest's`);
     if (file.recomputedRoot !== file.headerRoot) mismatches.push(`${setKind}: imported file's own bucket levels no longer match its header root`);
   }
+
+  // R17 (plan §7.1.2): re-pin the just-copied catalog to THIS installation's
+  // workspace id. `rewriteV4WorkspaceIdentity` is generic over every TEXT
+  // column (`workspace-fork.ts`'s doc comment) but deliberately skips
+  // `workspace_meta.value`, which is a BLOB (canonical-encoded), not TEXT --
+  // so the one row that actually gates `storage.openWorkspace`
+  // (`bindWorkspaceIdentity`) needs its own direct `UPDATE`. Unconditional
+  // (not gated on `manifest.workspace_id !== options.targetWorkspaceId`):
+  // `rewriteV4WorkspaceIdentity` itself is a no-op when the ids already
+  // match, and re-running the `UPDATE`/digest recompute in that case just
+  // writes back the same bytes -- simpler than a second identity comparison
+  // here that could drift from the one inside `rewriteV4WorkspaceIdentity`.
+  const targetWorkspaceId = options.targetWorkspaceId ?? manifest.workspace_id;
+  const database = await openSqliteDatabase({ filename: options.targetDatabasePath });
+  try {
+    await rewriteV4WorkspaceIdentity(database, manifest.workspace_id, targetWorkspaceId);
+    // Not created if absent (R17: `bindWorkspaceIdentity` mints it on the
+    // workspace's first open) -- a `WHERE key = 'workspace_id'` `UPDATE`
+    // against a row that does not exist yet simply affects zero rows.
+    await database.run("UPDATE workspace_meta SET value = ? WHERE key = 'workspace_id'", [encodeCanonical(targetWorkspaceId)]);
+    await recomputeV4SnapshotDigestsAfterRewrite(database);
+  } finally {
+    await database.close();
+  }
+
   return { manifest, roots_verified: mismatches.length === 0, root_mismatches: mismatches };
 }

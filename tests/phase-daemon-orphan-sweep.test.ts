@@ -48,13 +48,24 @@ describe("classifyWorkspaceDataDirEntryName", () => {
   it("recognizes .v3.stale-* as retained_stale and .fork-staging-*/.import-staging-* as staging, both keyed by the original safe id", () => {
     expect(classifyWorkspaceDataDirEntryName("workspace_x.v3.stale-2026-09-02T12-00-00-000Z")).toEqual({ safeId: "workspace_x", kind: "unknown", category: "stale" });
     expect(classifyWorkspaceDataDirEntryName("workspace_x.structural.fork-staging-abc123")).toEqual({ safeId: "workspace_x", kind: "structural", category: "staging" });
-    // v4 (plan §7.1, P-1, a later wave): index-pack import's staging root
-    // (`<db>.import-staging-<uuid>` where `<db>` is `<safeId>.sqlite`) isn't
-    // produced by any shipped code path yet, but classified here ahead of
-    // time so it gets the same one-hour `in_progress` grace as fork-staging
-    // instead of falling through to the generic "unrecognized suffix"
-    // branch (which would flag it as an immediate orphan candidate).
+    // v4 (plan §7.1, P-1): `importPendingV4IndexPack` (`@urdira/daemon`'s
+    // `runtime.ts`) stages THREE independently-renamed roots per import --
+    // the catalog, the native structural root, and the Rust-side scan
+    // sidecar root -- each named by appending `.import-staging-<uuid>`
+    // directly onto its own real final path (the same "suffix appended onto
+    // an already-suffixed footprint path" shape the fork staging case
+    // above uses). All three MUST classify as `"staging"` (the one-hour
+    // `in_progress` grace), keyed by the bare `workspace_x` id -- an
+    // adversarial review found the structural/sidecar variants originally
+    // falling through to the generic `WORKSPACE_FOOTPRINT_SUFFIXES` match
+    // on bare `.structural`/`.sidecar` instead (stripping only that
+    // suffix, leaving `workspace_x.import-staging-<uuid>` as a bogus,
+    // never-registered safe_id, classified as an IMMEDIATE `"footprint"`
+    // orphan with no age grace at all) before `IMPORT_STAGING_SUFFIX_
+    // PATTERN` was widened to also strip `.structural`/`.sidecar`.
     expect(classifyWorkspaceDataDirEntryName("workspace_x.sqlite.import-staging-def456")).toEqual({ safeId: "workspace_x", kind: "database", category: "staging" });
+    expect(classifyWorkspaceDataDirEntryName("workspace_x.structural.import-staging-def456")).toEqual({ safeId: "workspace_x", kind: "structural", category: "staging" });
+    expect(classifyWorkspaceDataDirEntryName("workspace_x.sidecar.import-staging-def456")).toEqual({ safeId: "workspace_x", kind: "sidecar", category: "staging" });
   });
 
   it("falls back to the whole name for anything with no recognized suffix", () => {

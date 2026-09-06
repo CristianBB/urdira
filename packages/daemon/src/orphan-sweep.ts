@@ -24,11 +24,14 @@ import { WORKSPACE_FOOTPRINT_SUFFIXES, type WorkspaceFootprintEntryKind } from "
  *    it is deliberately preserved recovery evidence.
  *  - `in_progress`: a `<id>....fork-staging-<uuid>` directory
  *    (`forkV4StructuralStore`'s copy-then-rename staging root,
- *    `@urdira/engine`'s `workspace-fork.ts`) OR a `<id>.sqlite.import-staging-
- *    <uuid>` directory (plan §7.1's index-pack import staging root, landing
- *    in a later wave -- classified here ahead of time so the sweep never
- *    needs to relearn this shape once that code exists) less than one hour
- *    old. A normal, momentary artifact of a fork or index-pack import in
+ *    `@urdira/engine`'s `workspace-fork.ts`) OR one of `<id>.sqlite.import-
+ *    staging-<uuid>` / `<id>.structural.import-staging-<uuid>` /
+ *    `<id>.sidecar.import-staging-<uuid>` (plan §7.1's index-pack import
+ *    staging roots -- `importPendingV4IndexPack`, `@urdira/daemon`'s
+ *    `runtime.ts`, stages the catalog, the native structural root, AND the
+ *    Rust-side scan sidecar root as three independently-renamed siblings)
+ *    less than one hour old. A normal, momentary artifact of a fork or
+ *    index-pack import in
  *    flight; never a purge candidate while young, REGARDLESS of whether its
  *    derived id is "known" (the target workspace usually IS already
  *    registered while its fork/import is running -- that is exactly why
@@ -84,16 +87,28 @@ const STALE_SUFFIX_PATTERN = /^(.*)\.v3\.stale-[^/]+$/u;
 // `(?:\.structural)?` keeps this pattern correct even if a future staging
 // root is created directly off some other footprint suffix.
 const FORK_STAGING_SUFFIX_PATTERN = /^(.*?)(?:\.structural)?\.fork-staging-[^/]+$/u;
-// R15 / plan §7.1 (P-1, a later wave): index-pack import writes its staging
-// root as `<db>.import-staging-<uuid>`, where `<db>` is already the
-// `<safeId>.sqlite` database path -- so the on-disk name is
-// `<safeId>.sqlite.import-staging-<uuid>`. Not yet produced by any shipped
-// code path (P-1 lands after this frente), but classified now rather than
-// left to fall through to the generic "unrecognized suffix" branch below --
-// which would treat a mid-import staging directory as an immediate orphan
-// candidate (no age grace at all) the moment it appeared, instead of the
-// same one-hour `in_progress` grace every other staging root gets.
-const IMPORT_STAGING_SUFFIX_PATTERN = /^(.*?)(?:\.sqlite)?\.import-staging-[^/]+$/u;
+// P-1 (plan §7.1, R15/R17; adversarial-review fix): `importPendingV4IndexPack`
+// (`@urdira/daemon`'s `runtime.ts`) stages THREE roots per import, each
+// built by appending `.import-staging-<uuid>` directly onto the REAL final
+// path it will `rename` onto -- exactly the same "suffix appended onto an
+// already-suffixed footprint path" shape `FORK_STAGING_SUFFIX_PATTERN`
+// above handles for forks:
+//   - `<safeId>.sqlite.import-staging-<uuid>`     (the catalog database)
+//   - `<safeId>.structural.import-staging-<uuid>` (the native structural root)
+//   - `<safeId>.sidecar.import-staging-<uuid>`    (the Rust-side scan sidecar root)
+// All three groups must resolve to the bare `<safeId>` and land in
+// `"staging"` (the one-hour `in_progress` grace) -- ONLY the database
+// variant was covered before this fix; the structural/sidecar variants fell
+// through to the generic `WORKSPACE_FOOTPRINT_SUFFIXES` match on bare
+// `.structural`/`.sidecar` (which strips only that suffix), yielding a
+// bogus, never-registered safe_id (`<safeId>.import-staging-<uuid>`)
+// classified as an immediate `"footprint"` orphan with NO age grace --
+// found live via `classifyWorkspaceDataDirEntryName` cross-testing against
+// `importPendingV4IndexPack`'s actual staging names
+// (`tests/phase-daemon-orphan-sweep.test.ts`). A concurrent
+// `workspace-orphans-purge --confirm` could then delete an in-flight
+// import's staging structural/sidecar directory underneath it.
+const IMPORT_STAGING_SUFFIX_PATTERN = /^(.*?)(\.sqlite|\.structural|\.sidecar)?\.import-staging-[^/]+$/u;
 
 /** Exported for direct unit coverage (`tests/phase-daemon-orphan-sweep.test.ts`) independent of the filesystem walk below. */
 export function classifyWorkspaceDataDirEntryName(name: string): ClassifiedEntryName {
@@ -104,7 +119,11 @@ export function classifyWorkspaceDataDirEntryName(name: string): ClassifiedEntry
   if (stagingMatch) return { safeId: stagingMatch[1]!, kind: "structural", category: "staging" };
 
   const importStagingMatch = IMPORT_STAGING_SUFFIX_PATTERN.exec(name);
-  if (importStagingMatch) return { safeId: importStagingMatch[1]!, kind: "database", category: "staging" };
+  if (importStagingMatch) {
+    const matchedSuffix = importStagingMatch[2];
+    const kind: WorkspaceFootprintEntryKind = matchedSuffix === ".structural" ? "structural" : matchedSuffix === ".sidecar" ? "sidecar" : "database";
+    return { safeId: importStagingMatch[1]!, kind, category: "staging" };
+  }
 
   for (const { suffix, kind } of WORKSPACE_FOOTPRINT_SUFFIXES) {
     if (name.length > suffix.length && name.endsWith(suffix)) return { safeId: name.slice(0, -suffix.length), kind, category: "footprint" };
