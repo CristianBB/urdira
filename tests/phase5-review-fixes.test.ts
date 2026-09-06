@@ -3,10 +3,32 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { computeDigest, digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { ModelPackInstallation } from "@urdira/contracts";
 import { createDurableStorage, createFaultInjector, MIGRATION_TABLE_ADAPTERS, openSqliteDatabase, StorageMaintenance, WorkspaceLifecycleRepository } from "../packages/storage/src/index.js";
+
+// v4 (plan §6, Frente H, R16, adversarial-review addition): a controllable
+// fault injected into `removeWorkspaceFootprint`'s DATABASE-removal step
+// only, to exercise `purgeWorkspace`'s crash-mid-purge invariant against the
+// real production code path -- see "purge crashing after sidecars, before
+// the database" below. Defaults to pass-through (delegating to the real
+// implementation) so every OTHER test in this file that exercises
+// `purgeWorkspace` is unaffected.
+const footprintFault = vi.hoisted(() => ({ failNextDatabaseRemoval: false }));
+vi.mock("../packages/storage/src/workspace-footprint.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../packages/storage/src/workspace-footprint.js")>();
+  return {
+    ...actual,
+    removeWorkspaceFootprint: async (entries: Parameters<typeof actual.removeWorkspaceFootprint>[0], options: Parameters<typeof actual.removeWorkspaceFootprint>[1]) => {
+      if (!options.keep_database && footprintFault.failNextDatabaseRemoval) {
+        footprintFault.failNextDatabaseRemoval = false;
+        throw new Error("injected: simulated crash mid-purge, after sidecars removed, before the database itself");
+      }
+      return actual.removeWorkspaceFootprint(entries, options);
+    },
+  };
+});
 
 const workspaceA = {
   workspace_id: "ws-review-a", canonical_root: "/review/a", display_root: "/review/a", source_provider_bindings: [], status: "registered", registered_at: "2026-08-09T00:00:00.000000000Z",
@@ -237,6 +259,39 @@ describe("Phase 5 independent-review regressions", { timeout: 30_000 }, () => {
         await expect(access(leftover), leftover).rejects.toMatchObject({ code: "ENOENT" });
       }
       expect(await storage.catalog.database.get("SELECT workspace_id FROM installation_workspaces WHERE workspace_id = ?", [workspaceB.workspace_id])).toBeUndefined();
+    });
+  });
+
+  it("purge crashing after sidecars, before the database (R16): leaves a database-without-a-tombstone state that a retry finishes cleanly", async () => {
+    await withStorage(async (_root, storage) => {
+      const workspaceC = { workspace_id: "ws-review-c", canonical_root: "/review/c", display_root: "/review/c", source_provider_bindings: [], status: "registered", registered_at: "2026-08-09T00:00:00.000000000Z" };
+      const registered = await storage.catalog.registerWorkspace(workspaceC);
+      await storage.catalog.database.run("UPDATE installation_workspaces SET removed_at = ? WHERE workspace_id = ?", ["2026-08-09T00:00:00.000000000Z", workspaceC.workspace_id]);
+      const name = registered.database_path.slice(0, -".sqlite".length);
+      await mkdir(`${name}.structural`, { recursive: true });
+      await writeFile(`${name}.structural/MANIFEST`, "{}");
+      await writeFile(`${name}.lexical.sqlite`, "lex");
+
+      footprintFault.failNextDatabaseRemoval = true;
+      await expect(storage.catalog.purgeWorkspace(workspaceC.workspace_id, "2026-08-10T00:00:01.000000000Z")).rejects.toThrow(/injected/);
+
+      // Sidecars are gone -- that step ran for real (pass-through mock)
+      // before the injected failure fired on the database step.
+      await expect(access(`${name}.structural`)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(`${name}.lexical.sqlite`)).rejects.toMatchObject({ code: "ENOENT" });
+      // The database itself and its catalog tombstone both survive:
+      // "database-without-a-tombstone" is the one crash shape R16 declares
+      // acceptable, and only ever in this order -- never a tombstoned
+      // workspace whose database silently survives untracked.
+      await expect(access(registered.database_path)).resolves.toBeUndefined();
+      expect(await storage.catalog.database.get("SELECT workspace_id FROM installation_workspaces WHERE workspace_id = ?", [workspaceC.workspace_id])).toMatchObject({ workspace_id: workspaceC.workspace_id });
+
+      // A retry (the injected fault only fires once) finishes the purge
+      // cleanly -- the whole point of R16's ordering is that this state is
+      // always retryable.
+      await expect(storage.catalog.purgeWorkspace(workspaceC.workspace_id, "2026-08-10T00:00:02.000000000Z")).resolves.toMatchObject({ purged: true });
+      await expect(access(registered.database_path)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await storage.catalog.database.get("SELECT workspace_id FROM installation_workspaces WHERE workspace_id = ?", [workspaceC.workspace_id])).toBeUndefined();
     });
   });
 

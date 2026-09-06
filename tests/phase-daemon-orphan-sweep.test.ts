@@ -45,9 +45,16 @@ describe("classifyWorkspaceDataDirEntryName", () => {
     expect(classifyWorkspaceDataDirEntryName("workspace_x.sidecar")).toEqual({ safeId: "workspace_x", kind: "sidecar", category: "footprint" });
   });
 
-  it("recognizes .v3.stale-* as retained_stale and .fork-staging-* as staging, both keyed by the original safe id", () => {
+  it("recognizes .v3.stale-* as retained_stale and .fork-staging-*/.import-staging-* as staging, both keyed by the original safe id", () => {
     expect(classifyWorkspaceDataDirEntryName("workspace_x.v3.stale-2026-09-02T12-00-00-000Z")).toEqual({ safeId: "workspace_x", kind: "unknown", category: "stale" });
     expect(classifyWorkspaceDataDirEntryName("workspace_x.structural.fork-staging-abc123")).toEqual({ safeId: "workspace_x", kind: "structural", category: "staging" });
+    // v4 (plan §7.1, P-1, a later wave): index-pack import's staging root
+    // (`<db>.import-staging-<uuid>` where `<db>` is `<safeId>.sqlite`) isn't
+    // produced by any shipped code path yet, but classified here ahead of
+    // time so it gets the same one-hour `in_progress` grace as fork-staging
+    // instead of falling through to the generic "unrecognized suffix"
+    // branch (which would flag it as an immediate orphan candidate).
+    expect(classifyWorkspaceDataDirEntryName("workspace_x.sqlite.import-staging-def456")).toEqual({ safeId: "workspace_x", kind: "database", category: "staging" });
   });
 
   it("falls back to the whole name for anything with no recognized suffix", () => {
@@ -222,6 +229,29 @@ describe("Daemon orphan RPCs (core:workspace_orphans_list / core:workspace_orpha
     expect(relistedPayload.retained_stale).toHaveLength(1);
     expect(relistedPayload.in_progress).toHaveLength(1);
   }, 60_000);
+
+  it("rejects core:workspace_orphans_purge with neither --all nor safe_ids, and with both at once (ambiguous intent)", async () => {
+    dataRoot = await mkdtemp(join(tmpdir(), "urdira-orphan-daemon-args-"));
+    const registry = createPersistentWorkspaceRegistry(dataRoot);
+    runtime = await DaemonRuntime.start({
+      data_root: dataRoot,
+      engine_build_id: "build-orphan-sweep-args-test",
+      workspace_registry: registry,
+      resolve_plugin_provider: async () => undefined,
+      lexical_index: false,
+      semantic_index: false,
+      scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+    });
+    const client = new DaemonClient(runtime.endpoint, { request_timeout_ms: 30_000 });
+
+    const neither = await client.call("core:workspace_orphans_purge", { args: [], values: {} });
+    expect(neither.outcome).toBe("error");
+    expect(neither.error?.code).toBe("core:ipc_request_invalid");
+
+    const both = await client.call("core:workspace_orphans_purge", { args: ["workspace_a"], values: { all: "true" } });
+    expect(both.outcome).toBe("error");
+    expect(both.error?.code).toBe("core:ipc_request_invalid");
+  }, 30_000);
 
   it("survives an already-empty workspaces directory at startup (no workspace ever added yet)", async () => {
     dataRoot = await mkdtemp(join(tmpdir(), "urdira-orphan-daemon-empty-"));

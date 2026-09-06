@@ -24,18 +24,21 @@ import { WORKSPACE_FOOTPRINT_SUFFIXES, type WorkspaceFootprintEntryKind } from "
  *    it is deliberately preserved recovery evidence.
  *  - `in_progress`: a `<id>....fork-staging-<uuid>` directory
  *    (`forkV4StructuralStore`'s copy-then-rename staging root,
- *    `@urdira/engine`'s `workspace-fork.ts`) less than one hour old. A
- *    normal, momentary artifact of a fork in flight; never a purge
- *    candidate while young, REGARDLESS of whether its derived id is
- *    "known" (the target workspace usually IS already registered while its
- *    fork is running -- that is exactly why age, not the known-id check,
- *    gates this category).
+ *    `@urdira/engine`'s `workspace-fork.ts`) OR a `<id>.sqlite.import-staging-
+ *    <uuid>` directory (plan §7.1's index-pack import staging root, landing
+ *    in a later wave -- classified here ahead of time so the sweep never
+ *    needs to relearn this shape once that code exists) less than one hour
+ *    old. A normal, momentary artifact of a fork or index-pack import in
+ *    flight; never a purge candidate while young, REGARDLESS of whether its
+ *    derived id is "known" (the target workspace usually IS already
+ *    registered while its fork/import is running -- that is exactly why
+ *    age, not the known-id check, gates this category).
  *  - everything else groups by its derived footprint id: skipped when that
  *    id is in `knownSafeIds` (a currently registered or removed-but-in-
  *    grace workspace's own, expected files); otherwise an orphan --
- *    including a `.fork-staging-*` directory older than one hour, which
- *    graduates from `in_progress` to `orphans` regardless of `knownSafeIds`
- *    (stale fork staging is never anyone's expected footprint).
+ *    including a `.fork-staging-*`/`.import-staging-*` directory older than
+ *    one hour, which graduates from `in_progress` to `orphans` regardless of
+ *    `knownSafeIds` (stale staging is never anyone's expected footprint).
  */
 
 export type { WorkspaceFootprintEntryKind };
@@ -81,6 +84,16 @@ const STALE_SUFFIX_PATTERN = /^(.*)\.v3\.stale-[^/]+$/u;
 // `(?:\.structural)?` keeps this pattern correct even if a future staging
 // root is created directly off some other footprint suffix.
 const FORK_STAGING_SUFFIX_PATTERN = /^(.*?)(?:\.structural)?\.fork-staging-[^/]+$/u;
+// R15 / plan §7.1 (P-1, a later wave): index-pack import writes its staging
+// root as `<db>.import-staging-<uuid>`, where `<db>` is already the
+// `<safeId>.sqlite` database path -- so the on-disk name is
+// `<safeId>.sqlite.import-staging-<uuid>`. Not yet produced by any shipped
+// code path (P-1 lands after this frente), but classified now rather than
+// left to fall through to the generic "unrecognized suffix" branch below --
+// which would treat a mid-import staging directory as an immediate orphan
+// candidate (no age grace at all) the moment it appeared, instead of the
+// same one-hour `in_progress` grace every other staging root gets.
+const IMPORT_STAGING_SUFFIX_PATTERN = /^(.*?)(?:\.sqlite)?\.import-staging-[^/]+$/u;
 
 /** Exported for direct unit coverage (`tests/phase-daemon-orphan-sweep.test.ts`) independent of the filesystem walk below. */
 export function classifyWorkspaceDataDirEntryName(name: string): ClassifiedEntryName {
@@ -89,6 +102,9 @@ export function classifyWorkspaceDataDirEntryName(name: string): ClassifiedEntry
 
   const stagingMatch = FORK_STAGING_SUFFIX_PATTERN.exec(name);
   if (stagingMatch) return { safeId: stagingMatch[1]!, kind: "structural", category: "staging" };
+
+  const importStagingMatch = IMPORT_STAGING_SUFFIX_PATTERN.exec(name);
+  if (importStagingMatch) return { safeId: importStagingMatch[1]!, kind: "database", category: "staging" };
 
   for (const { suffix, kind } of WORKSPACE_FOOTPRINT_SUFFIXES) {
     if (name.length > suffix.length && name.endsWith(suffix)) return { safeId: name.slice(0, -suffix.length), kind, category: "footprint" };

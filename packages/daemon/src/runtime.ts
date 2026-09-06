@@ -4283,6 +4283,14 @@ export class DaemonRuntime {
           const values = requestRecord(payload["values"]);
           const all = values["all"] === "true";
           if (!all && requestedSafeIds.length === 0) throw new DaemonError("core:ipc_request_invalid", "core:workspace_orphans_purge requires --all or at least one safe_id.");
+          // `--all` and explicit safe ids together is ambiguous intent, not
+          // a "do both, ids win" or "do both, --all wins" convenience: a
+          // caller who typed `--all workspace_a` almost certainly meant one
+          // or the other, and silently purging every orphan when they named
+          // one specific id (or vice versa) is exactly the kind of
+          // "function invocable by the agent = 100% functional" fidelity
+          // gap plan §0(c) exists to close. Reject instead of guessing.
+          if (all && requestedSafeIds.length > 0) throw new DaemonError("core:ipc_request_invalid", "core:workspace_orphans_purge accepts --all or explicit safe_ids, not both.");
           const knownSafeIds = knownWorkspaceSafeIds();
           const report = await sweepWorkspaceDataDir({ workspacesDir: workspacesDataDir, knownSafeIds });
           latestOrphanReport = report;
