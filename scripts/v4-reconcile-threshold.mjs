@@ -602,7 +602,7 @@ async function gitDiffNameOnlyCount(repoDir, a, b) {
  * comment for why the cold scan and the reconcile must share one process).
  * `repoDir`'s working tree is left checked out at `refB` when this returns.
  */
-async function runOneGitSwitchCycle(label, repoDir, refA, refB, workspaceId, threshold, dataDir) {
+async function runOneGitSwitchCycle(label, repoDir, refA, refB, workspaceId, threshold, dataDir, keepData = false) {
   console.log(`[git-switch:${label}] checkout ${refA} (T=${threshold})`);
   await gitCheckout(repoDir, refA);
   await waitForQuietMachine(`git-switch ${label} cold@${refA} T=${threshold}`);
@@ -631,16 +631,86 @@ async function runOneGitSwitchCycle(label, repoDir, refA, refB, workspaceId, thr
     return { coldEvent, coldWallMs, reconcileEvent, reconcileWallMs };
   });
   console.log(`[git-switch:${label}] cold@${refA}: ${result.coldWallMs.toFixed(1)}ms; reconcile(T=${threshold})@${refB}: ${result.reconcileWallMs.toFixed(1)}ms mode=${result.reconcileEvent.reconcile.mode} metadata_refreshed=${result.reconcileEvent.reconcile.metadata_refreshed}`);
-  await rm(dataDir, { recursive: true, force: true });
+  if (keepData) {
+    console.log(`[git-switch:${label}] --keep-data: kept ${dataDir} (generation=${result.reconcileEvent.generation})`);
+  } else {
+    await rm(dataDir, { recursive: true, force: true });
+  }
   return result;
 }
 
-async function measureOneSwitch(label, repoDir, refA, refB, scratchDir) {
+/**
+ * Frente E-P0b (2026-09-06): the two real git-switch P0 findings (§4/§9 of
+ * the evidence doc) were never caught by THIS harness's own reporting --
+ * `measureOneSwitch` only ever compared wall times and the `reconcile`
+ * summary (`mode`/`fell_back_to_cold`), never Merkle roots. After fixing
+ * both P0s, this checks the missing half directly: an INDEPENDENT
+ * from-scratch cold scan of `refB` (a brand-new workspace_id/data dir,
+ * never touched by the delta/cold cycles above), compared against the
+ * `T=1` (forced-`Delta`-attempt) cycle's own `reconcile` roots. `records`
+ * is deliberately excluded (decision 11's documented chained-id-vs-
+ * first-occurrence gap, same as every fixture e2e test in `tests_e2e.rs`);
+ * `dependency`/`graph` are the roots every one of this task's fixes exists
+ * to protect.
+ */
+async function runIndependentOracleColdScan(label, repoDir, ref, dataDir, keepData = false) {
+  await gitCheckout(repoDir, ref);
+  const dataPaths = await initDataDir(dataDir);
+  const { runRustWorkspaceScan } = await import(resolve(root, "packages/engine/dist/rust-workspace-scan.js"));
+  const event = await withTransport({}, (transport) =>
+    runRustWorkspaceScan(transport, {
+      workspace_id: `workspace:v4-reconcile-threshold:git:${label}:oracle`,
+      workspace_root: repoDir,
+      database_path: dataPaths.databasePath,
+      structural_root: dataPaths.structuralRoot,
+      cas_root: dataPaths.casRoot,
+      sidecar_root: dataPaths.sidecarRoot,
+      registry_snapshot_id: "registry:v4-reconcile-threshold",
+      configuration_revision_id: "configuration:v4-reconcile-threshold",
+      resolution_lock_id: "resolution:v4-reconcile-threshold",
+      priority: "interactive",
+      scope: { kind: "full" },
+    }),
+  );
+  if (keepData) {
+    console.log(`[git-switch:${label}] --keep-data: kept oracle ${dataDir} (generation=${event.generation})`);
+  } else {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+  return event.roots;
+}
+
+async function measureOneSwitch(label, repoDir, refA, refB, scratchDir, keepData = false) {
   const workspaceId = `workspace:v4-reconcile-threshold:git:${label}`;
   const changedFiles = await gitDiffNameOnlyCount(repoDir, refA, refB);
 
   const deltaDataDir = join(scratchDir, `${label}-delta-data`);
-  const deltaCycle = await runOneGitSwitchCycle(label, repoDir, refA, refB, workspaceId, 1.0, deltaDataDir);
+  const deltaCycle = await runOneGitSwitchCycle(label, repoDir, refA, refB, workspaceId, 1.0, deltaDataDir, keepData);
+
+  const oracleDataDir = join(scratchDir, `${label}-oracle-data`);
+  const oracleRoots = await runIndependentOracleColdScan(label, repoDir, refB, oracleDataDir, keepData);
+  const rootsOk = {
+    dependency: deltaCycle.reconcileEvent.roots.dependency === oracleRoots.dependency,
+    graph: deltaCycle.reconcileEvent.roots.graph === oracleRoots.graph,
+  };
+  console.log(
+    `[git-switch:${label}] roots_ok vs independent oracle of ${refB}: dependency=${rootsOk.dependency} graph=${rootsOk.graph}`,
+  );
+
+  if (keepData) {
+    return {
+      label,
+      ref_a: refA,
+      ref_b: refB,
+      changed_files: changedFiles,
+      reconcile_delta_summary: deltaCycle.reconcileEvent.reconcile,
+      reconcile_delta_roots_ok_vs_independent_oracle: rootsOk,
+      delta_generation: deltaCycle.reconcileEvent.generation,
+      delta_data_dir: deltaDataDir,
+      oracle_generation: 1,
+      oracle_data_dir: oracleDataDir,
+    };
+  }
 
   const coldDataDir = join(scratchDir, `${label}-cold-data`);
   const coldCycle = await runOneGitSwitchCycle(label, repoDir, refA, refB, workspaceId, 0.0, coldDataDir);
@@ -653,37 +723,42 @@ async function measureOneSwitch(label, repoDir, refA, refB, scratchDir) {
     cold_at_a_wall_ms: deltaCycle.coldWallMs,
     reconcile_delta_wall_ms: deltaCycle.reconcileWallMs,
     reconcile_delta_summary: deltaCycle.reconcileEvent.reconcile,
+    reconcile_delta_roots_ok_vs_independent_oracle: rootsOk,
     reconcile_cold_wall_ms: coldCycle.reconcileWallMs,
     reconcile_cold_summary: coldCycle.reconcileEvent.reconcile,
   };
 }
 
 async function runGitSwitchMode(options) {
-  const { gitRepo, gitTagA, gitTagB, gitHeadBack, data, out } = options;
+  const { gitRepo, gitTagA, gitTagB, gitHeadBack, data, out, keepData, onlySwitch } = options;
   assertNeverTmp(gitRepo, "--git-repo");
   assertNeverTmp(data, "--data");
   await mkdir(data, { recursive: true });
   const results = [];
 
-  const tagsRepo = join(data, "tags-clone");
-  await rm(tagsRepo, { recursive: true, force: true });
-  console.log(`[git-switch] cloning ${gitRepo} -> ${tagsRepo}`);
-  await execFileAsync("git", ["clone", "--no-hardlinks", "--quiet", gitRepo, tagsRepo]);
-  results.push(await measureOneSwitch("tags-3-months", tagsRepo, gitTagA, gitTagB, data));
-  await rm(tagsRepo, { recursive: true, force: true });
+  if (!onlySwitch || onlySwitch === "tags-3-months") {
+    const tagsRepo = join(data, "tags-clone");
+    await rm(tagsRepo, { recursive: true, force: true });
+    console.log(`[git-switch] cloning ${gitRepo} -> ${tagsRepo}`);
+    await execFileAsync("git", ["clone", "--no-hardlinks", "--quiet", gitRepo, tagsRepo]);
+    results.push(await measureOneSwitch("tags-3-months", tagsRepo, gitTagA, gitTagB, data, keepData));
+    if (!keepData) await rm(tagsRepo, { recursive: true, force: true });
+  }
 
-  const headRepo = join(data, "head-clone");
-  await rm(headRepo, { recursive: true, force: true });
-  console.log(`[git-switch] cloning ${gitRepo} -> ${headRepo}`);
-  await execFileAsync("git", ["clone", "--no-hardlinks", "--quiet", gitRepo, headRepo]);
-  // Resolve HEAD to a concrete sha BEFORE any checkout: `measureOneSwitch`
-  // checks out `refA` (`HEAD~N`) first, which detaches HEAD at that older
-  // commit -- a literal "HEAD" passed as `refB` would then resolve to that
-  // SAME older commit instead of the tip, making the diff a no-op.
-  const { stdout: headShaOut } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: headRepo });
-  const headSha = headShaOut.trim();
-  results.push(await measureOneSwitch("head-vs-head200", headRepo, `${headSha}~${gitHeadBack}`, headSha, data));
-  await rm(headRepo, { recursive: true, force: true });
+  if (!onlySwitch || onlySwitch === "head-vs-head200") {
+    const headRepo = join(data, "head-clone");
+    await rm(headRepo, { recursive: true, force: true });
+    console.log(`[git-switch] cloning ${gitRepo} -> ${headRepo}`);
+    await execFileAsync("git", ["clone", "--no-hardlinks", "--quiet", gitRepo, headRepo]);
+    // Resolve HEAD to a concrete sha BEFORE any checkout: `measureOneSwitch`
+    // checks out `refA` (`HEAD~N`) first, which detaches HEAD at that older
+    // commit -- a literal "HEAD" passed as `refB` would then resolve to that
+    // SAME older commit instead of the tip, making the diff a no-op.
+    const { stdout: headShaOut } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: headRepo });
+    const headSha = headShaOut.trim();
+    results.push(await measureOneSwitch("head-vs-head200", headRepo, `${headSha}~${gitHeadBack}`, headSha, data, keepData));
+    if (!keepData) await rm(headRepo, { recursive: true, force: true });
+  }
 
   const result = { switches: results, measured_at: new Date().toISOString() };
   await writeFile(out, `${JSON.stringify(result, null, 2)}\n`);
@@ -754,6 +829,9 @@ function parseArgs(argv) {
         break;
       case "--git-head-back":
         options.gitHeadBack = Number.parseInt(next(), 10);
+        break;
+      case "--only-switch":
+        options.onlySwitch = next();
         break;
       default:
         console.error(`Unknown argument: ${arg}`);

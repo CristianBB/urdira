@@ -458,3 +458,264 @@ cargo build --release --locked -p urdira-indexing-worker                # clean
 `ep0-bisect-100-fixed*` directories (workspace + data copies, `--keep-data` outputs, and their
 `*-results.json` companions) deleted at the end of this session. `CARGO_TARGET_DIR` override
 (`.claude/worktrees/cargo-target-ep0`) removed.
+
+## 10. Frente E-P0b (2026-09-06/07): fleco 1 root cause found and fixed; fleco 2 (P0-2) fixed
+## and confirmed at real git-switch scale; TWO NEW graph-parity gaps found, diagnosed, deferred
+
+Branch `frente-ep0b-graph-parity` on top of `ae61841` (`frente-ep0-delta-parity`, itself on `main`
+`47e96a2`). Per plan §0 ("integridad primero"): both flecos this task was explicitly scoped to are
+fixed and verified; this session's own broader graph-parity verification (a NEW `roots_ok` check
+added to `scripts/v4-reconcile-threshold.mjs`'s git-switch mode, §10.4) surfaced two ADDITIONAL,
+previously-undiagnosed `graph`-only divergences at larger scale, outside this task's literal
+scope (§9.2/§9.3's own hypotheses) but directly relevant to "graph raíz idéntica al oráculo a
+cualquier N" -- reproduced with full evidence and left open rather than silently unnoticed,
+matching this campaign's own established practice (§9.4's own P0-2 disposition in the PRIOR
+session).
+
+### 10.1 Fleco 1 root cause: `reresolve_file`'s narrow rebuild discards a corpus-wide ambient
+### decision for an UNRELATED specifier in the same file
+
+**Reproduced** exactly as §9.3 left it: `--files 1008` on n8n, `graph` diverges from an
+independent oracle. Diagnosed with a targeted graph-relation diff (temporary test, deleted before
+commit) comparing `CATEGORY_RELATION` records by `identity_key` between the incremental delta
+store (generation 3) and a from-scratch cold scan of the identical post-mutation tree: **the
+SAME import statement** (`packages/frontend/editor-ui/src/app/components/DependencyPill.test.ts`
+byte offset 62:126, `import DependencyPill from '@/app/components/DependencyPill.vue'`) carries
+`jsts:external_module:@/app/components/DependencyPill.vue` as its target in the incremental delta
+but `unresolved` (no target, `RelationClassification::Possible`) in the independent oracle.
+
+**Confirmed by direct probe** (`WorkspaceResolver::resolve` against the real tsconfig content,
+temporary test, deleted before commit): `resolve()` returns `None` for this specifier
+UNCONDITIONALLY, regardless of `available` -- the tsconfig `paths` entry `"@/*": ["./src/*"]`
+substitutes to `src/app/components/DependencyPill.vue`, and `probe_extensions` never finds a
+`.vue`-suffixed candidate in `available` (`.vue` is not a `JSTS_EXTENSIONS` member, so it is never
+tracked as a source file). This rules out hypotheses (i) (a config-asset alias change -- the
+fraction-sweep's own `isCandidateSourcePath` never selects non-source-extension files for
+mutation, so no tsconfig/package.json is ever touched) and (iii) (non-deterministic resolver
+construction -- `WorkspaceResolver::build` is a pure, deterministic function of a `BTreeMap`-sorted
+asset list). The divergence is NOT about `.vue`-target resolvability at all.
+
+**Actual mechanism, found by tracing generation-by-generation** (querying the SAME kept
+`--keep-data` store at generation 1 vs generation 3): generation 1 (this workspace's OWN initial
+cold scan, sharing the warm process with the later reconcile, per §1.2's methodology) correctly
+computes `unresolved` for this import -- **workspace-ambiguous ambient wildcard**:
+`packages/@n8n/mcp-apps/src/apps/workflow-preview/shims-vue.d.ts` and
+`packages/@n8n/mcp-browser-extension/src/ui/shimsVue.d.ts` both declare `declare module '*.vue'`
+(confirmed: `grep -rl "declare module.*\.vue"` across the WHOLE corpus, not just `editor-ui`) --
+`AmbientModuleIndex` is built corpus-wide, so `has_any_declaration("...DependencyPill.vue")` finds
+2 declaring files (workspace-ambiguous, `resolver.rs`'s own `build_import_export_facts` branch 3:
+`(None, Possible)`), correctly demoting the import away from a naive external-module guess. By
+generation 3 this SAME relation has flipped to `Confirmed`/`external_module` with a DIFFERENT
+`record_id` -- meaning the relation was genuinely REWRITTEN, not merely carried forward.
+
+`DependencyPill.test.ts` also imports `packages/frontend/editor-ui/src/__tests__/utils.ts`-shaped
+relative specifiers; when ANY of the --files-1008 mutation's 50 deletes/50 renames touches a path
+in this file's own `CandidateIndex` (specifier-candidate reverse index), `path_membership_
+incremental`'s T1 fast path (`urdira-jsts-syntax-worker::lib.rs`, `reresolve_file`) pulls this
+UNTOUCHED file into its own `stale_paths`/`reresolved` set and calls `reresolve_file`, which
+**unconditionally rebuilds the file's ENTIRE `direct_imports`-derived relation list** via
+`build_import_export_facts(..., ambient_index: None)` (its own doc comment: "the separate
+`reresolve_ambient_relations` pass below is what applies ambient resolution") -- discarding the
+CORRECT ambient-ambiguous classification for the UNRELATED `.vue` import and falling through to
+`classify_external_specifier`'s naive guess. The post-processing "ambient revisit" pass
+(`reresolve_ambient_relations`, meant to re-apply the real `ambient_index` afterward) only ever
+iterated `changed ∪ ambient_affected` -- `reresolved` (T1's own bounded-reresolution output) was
+never included, so the wrong classification stuck permanently.
+
+**Fix** (`crates/urdira-jsts-syntax-worker/src/lib.rs`): fold `reresolved` into the ambient-revisit
+loop's iteration set (`changed.iter().chain(ambient_affected.iter()).chain(reresolved.iter())`) --
+strictly additive, empty whenever `path_membership_incremental` did not run, so no behavior change
+for any call that never populates `reresolved`.
+
+**New e2e test** (`crates/urdira-indexing-worker/src/v4/tests_e2e.rs`):
+`reresolved_file_keeps_an_unrelated_ambiguous_ambient_import_pending_and_matches_an_independent_oracle`
+-- fixture-scale repro of the exact mechanism (two `declare module '*.vue'` shims in different
+files, one file with a bare `*.vue` import plus an unrelated relative import that only resolves
+after a PURE structural `Created` batch). Confirmed to FAIL without the fix (reproduces the exact
+"changed artifact id..." -- no, reproduces the `graph` root mismatch directly, panic message
+showing differing `graph` hex digests) and PASS with it. `dependency`/`graph` asserted;
+`records` deliberately not (decision 11, unaffected by this bug).
+
+### 10.2 Fleco 2 (P0-2) root cause: `changed_artifact_ids` names CONFIG ASSET paths, which
+### `analyze()`'s own manifest can never contain
+
+**Reproduced** on both real git switches with `URDIRA_DEBUG_TIMING=1`: `.github/scripts/
+jsconfig.json` (tags-3-months switch) and, independently, `pnpm-workspace.yaml`/`package.json`
+(head-vs-head200 switch) are CREATED/MODIFIED as part of the SAME batch as hundreds of ordinary
+source changes -- routine in any real git history diff of meaningful size. Worker stderr (exact,
+both switches):
+```
+[urdira-indexing-worker] v4 delta: mixed burst split into two generations: structural=[...]
+[urdira-indexing-worker] v4 reconcile: delta failed: v4 syntax analysis failed: changed artifact id
+is absent from the current and retained manifests: sha256:...; falling back to cold
+```
+
+**Mechanism**: `delta.rs::run_one`'s `changed_artifact_ids` (the `AuthoritativeChangeSet::Exact`
+list handed to `syntax.analyze()`) used to be built from EVERY `source_delta.changed`/`added`/
+`deleted` path, config assets included -- `Catalog::apply`/the frontier track config assets
+exactly like any other observed file. But `analyze()`'s own retained/current manifest
+(`ProjectState::source_metadata`, `urdira-jsts-syntax-worker::lib.rs`) is built EXCLUSIVELY from
+its `sources: Vec<SourceInput>` argument, which `state::SourceCache::files_vec()` populates from
+JSTS SOURCE paths only (`is_jsts_source_path`) -- config assets travel through the entirely
+separate `config_assets: Vec<ConfigAssetInput>` channel and NEVER populate `source_metadata`.
+`authoritative_changed_paths` looks up each declared id in the union of that manifest's `prior`/
+`current` snapshots -- a config asset's artifact id can never be found there, by construction, no
+matter how fresh the manifest is, and the validation runs UNCONDITIONALLY (before the branch that
+would even use its result), so it errors out the whole `Changed`/`Reconcile` call even when the
+config asset was folded correctly into `configuration_digest` elsewhere.
+
+**Fix** (`crates/urdira-indexing-worker/src/v4/delta.rs`): scope `changed_artifact_ids` to
+`analyze::is_jsts_source_path` paths only (both the `changed`/`added` loop and the `deleted` loop)
+-- a touched config asset still correctly drives `ResetReason::ConfigurationChanged` via
+`fold_configuration_digest` over `config_assets_vec()`, unaffected by this filter; it was simply
+never meant to appear in this authoritative-EXACT-ids list, whose sole contract is naming
+CONTENT-CHANGED SOURCE files.
+
+**New e2e test**:
+`config_asset_created_alongside_a_content_edit_does_not_crash_and_matches_an_independent_oracle`
+-- a new nested `jsconfig.json` (forcing `has_structural`) alongside a genuine content edit
+(forcing `has_content`, exercising the SAME mixed-burst split the real failures took). Confirmed
+to reproduce the EXACT verbatim error message without the fix, and to pass (`dependency`/`graph`
+match an independent oracle; `records` unasserted, decision 11) with it.
+
+**Re-measured on both real git switches with the fixed release binary**:
+
+| switch | pre-fix `reconcile(T=1)` | post-fix `reconcile(T=1)` | `fell_back_to_cold` |
+| --- | --- | --- | --- |
+| tags-3-months (504 changed) | `mode=cold`, fallback, 11.80s | **`mode=delta`**, 36.6s | **false** (was true) |
+| head-vs-head200 (1,971 changed) | `mode=cold`, fallback, 106.9s* | **`mode=delta`**, 106.9s | **false** (was true) |
+
+(*head-vs-head200's pre-fix wall was not separately isolated in §4's own table; both this
+session's pre-fix confirmation run and the post-fix run hit the SAME `mode=cold` fallback path
+before the fix, `fell_back_to_cold=true` both times, matching §4's own finding.)
+
+### 10.3 P0-1 (dependency, prior session's own fix) re-confirmed at real git-switch scale
+
+`dependency` root parity vs an independent from-scratch oracle of the post-switch tree: **holds**
+on both real git switches with the fixed binary (`roots_ok.dependency = true` both times) -- the
+prior session's `dependency_id`-granularity fix (§9.2) generalizes correctly beyond the synthetic
+fraction-sweep mutations it was originally verified against.
+
+### 10.4 NEW finding, NOT fixed this session: `graph` still diverges on both real git switches
+### (harness itself extended to catch this -- it never checked roots before)
+
+`scripts/v4-reconcile-threshold.mjs`'s git-switch mode never compared Merkle roots at all before
+this session (only wall times and the `reconcile` summary) -- extended with `runIndependentOracleColdScan`
+(a brand-new workspace_id/data dir, `ScanScope::Full` on the post-switch tree) and a `roots_ok`
+comparison (`dependency`/`graph`; `records` deliberately excluded, decision 11) in `measureOneSwitch`,
+plus `--keep-data`/`--only-switch` support threaded through `runOneGitSwitchCycle` for follow-up
+diagnosis. Result, POST-fix (both fixes from §10.1/§10.2 applied):
+
+| switch | `mode` | `dependency` | `graph` |
+| --- | --- | --- | --- |
+| tags-3-months | delta | **true** | **false** |
+| head-vs-head200 | delta | **true** | **false** |
+
+Diagnosed with the same graph-relation diff used in §10.1 (kept `--keep-data`, `--only-switch
+tags-3-months`): 19 relations present ONLY in the independent oracle (never the reverse -- a
+one-directional, only-ever-loses gap, the same shape as every prior P0 in this family). ALL 19 are
+`jsts:call`/`jsts:references` relations whose IDENTITY encodes a `jsts:property:...`/`jsts:method:...`
+target -- e.g. `jsts:references:...isolated-vm-bridge.ts:...:jsts:method:...isolated-vm-bridge.ts:
+...execute:jsts:method:...types/bridge.ts:2185:debug`. `jsts:property`/entities with this shape are
+produced by the RESIDUAL (tsgo type-checker) pipeline (`crates/urdira-indexing-worker/src/v4/
+residual.rs:2044`), NOT the plain syntax-level `WorkspaceResolver` §10.1's fix touches -- confirmed
+by `grep`, no `"property"` entity kind exists anywhere in `urdira-jsts-syntax-worker`. Every one of
+the 7 files involved (both sides of each reference pair) is confirmed, via `git diff --name-only`
+on the exact two tags, to be among the switch's own 504 changed files -- these are NOT untouched
+"affected-closure" files; they are files DIRECTLY edited by the real commit range. This is a
+DIFFERENT root cause from §9.2/§9.3 and from §10.1: the residual/tsgo pipeline's own incremental
+scheduling (`ResidualContext::touched_owners`, scoped per-internal-generation off `delta::run`'s
+own `touched_owner_paths`) does not consistently reproduce a cold scan's cross-file property/type
+reference resolution when multiple mutually-referencing files are edited together in one large
+real diff. **Not diagnosed further or fixed this session** -- `residual.rs` is a 4,000+-line module
+this session did not have the remaining budget to trace to a root cause with the same confidence as
+§10.1/§10.2, and a wrong fix risks destabilizing a heavily budget/schedule-constrained pipeline
+several other fronts depend on. Flagged here with full repro evidence (exact identity keys, exact
+files, exact switch/tags, exact diagnostic queries) per this campaign's own practice, rather than
+left silently unnoticed.
+
+**Second, independent NEW finding** (`--files 1008`, same session, re-measured with BOTH fixes
+applied): `graph` STILL diverges at this scale too (`roots_ok.delta.dependency=true,
+graph=false` -- `records=false` is the expected decision-11 gap) -- but via a THIRD, again
+DIFFERENT mechanism, matching the ORIGINAL task brief's own hypothesis (ii) almost exactly: the
+mutation plan DELETES `packages/@n8n/benchmark/src/test-execution/k6-summary.ts` (defines
+`K6Check`/`K6CounterMetric`/`K6TrendMetric`/`K6EndOfTestSummary` interfaces); `test-report.ts`
+(UNTOUCHED by the mutation, a real importer of the deleted file) keeps 4 STALE `jsts:references`
+relations pointing at those now-nonexistent interfaces in the incremental delta (4
+only-in-incremental -- the OPPOSITE direction from every other gap found this session: a phantom
+EXTRA relation, not a lost one) that an independent oracle correctly does not have. Root cause:
+`reresolve_file` (§10.1's own subject) is scoped, BY ITS OWN DESIGN, to rebuild ONLY
+`RelationKind::Import`/`Export` edges (its own filter: `!(matches!(relation.kind, RelationKind::
+Import | RelationKind::Export) && relation.source_id == module_id)` keeps everything else
+untouched) -- it correctly updates `test-report.ts`'s OWN import-of-`k6-summary` edge to
+"unresolved" but has no mechanism to invalidate the DOWNSTREAM `jsts:references` relations
+(built by `semantic_sites.rs`'s type/value reference tracking, a completely different code path)
+that resolved THROUGH that import while it was still live. Correctly fixing this needs either (a)
+promoting a `resolution_changed` path to a full reparse (defeating T1's own O(delta) design intent
+for the common case, needing careful scoping to avoid a performance regression) or (b) a narrower
+"drop any reference whose target's identity falls inside a path just removed from `direct_imports`'
+resolved set" pass -- both are real design work, not a one-line fix, and were judged out of this
+session's remaining budget. **Not fixed this session**, flagged with full repro (exact deleted
+file, exact importer, exact 4 relation identities, exact `--files 1008` seed).
+
+### 10.5 Threshold decision: `RECONCILE_DELTA_THRESHOLD` left UNCHANGED at 0.01
+
+Per plan §0 criterion (a) ("mejor rendimiento que no comprometa la integridad de los datos"): T is
+NOT raised despite this session fixing both of E.6's own original P0 blockers. Both NEW findings in
+§10.4 are `graph`-only gaps in the `Delta` path specifically (the `Cold` path is unaffected --
+confirmed `roots_ok.cold_all=true` in every fraction-sweep cell measured this session), and BOTH
+manifest at exactly the scale a real branch switch is likely to hit (§10.4's git-switch numbers;
+§10.4's own `--files 1008` finding). Raising T would route MORE real reconcile calls through
+`Delta`, increasing exposure to two confirmed, not-yet-fixed correctness gaps -- the opposite of
+this session's own mandate. `T = 0.01` (unchanged from §5) remains the right, conservative choice
+until §10.4's two findings are resolved by a future task.
+
+### 10.6 Re-measurement summary (`--files 202/1008`, ×1 each, this session's fixed binary)
+
+| N | `mode` | `dependency` | `graph` | `records` |
+| --- | --- | --- | --- | --- |
+| 202 (p≈0.01) | delta | true | **true** | false (decision 11, expected) |
+| 1008 (p≈0.05) | delta | true | **false** (§10.4, new finding #2) | false (decision 11, expected) |
+
+`--files 2015` (p≈0.10) was not re-measured in this session (time budget spent on diagnosing the
+two NEW findings above once `graph=false` persisted at 1008 despite §10.1's fix) -- given `graph`
+already diverges at 1008 via a mechanism §10.1 does not touch, a clean 2015 result would not have
+changed this session's threshold decision (§10.5) or its conclusion that §10.4's two findings need
+a future task.
+
+### 10.7 Verification (this session)
+
+```
+cargo fmt --all -- --check                                                      # clean
+cargo clippy --workspace --all-targets --locked -- -D warnings                  # clean
+cargo test -p urdira-indexing-worker -p urdira-source-frontier -p urdira-structural-store --locked
+  # 123 passed/16 ignored (indexing-worker), 46 passed (source-frontier), 19 passed (structural-store
+  # unit), plus every one of that crate's integration test binaries -- 0 failed across all of them
+cargo build --release --locked -p urdira-indexing-worker                        # clean
+CI=true ./node_modules/.bin/vitest run tests/phase-daemon-v4-reconcile.test.ts tests/v4-mutation-harness.test.ts
+                                                                                  # 6 passed, 3 skipped
+```
+
+### 10.8 Files touched
+
+- `crates/urdira-jsts-syntax-worker/src/lib.rs`: the ambient-revisit loop (inside `analyze()`) now
+  also iterates `reresolved` (§10.1).
+- `crates/urdira-indexing-worker/src/v4/delta.rs`: `changed_artifact_ids` scoped to
+  `is_jsts_source_path` paths (§10.2); new `use super::analyze::is_jsts_source_path;`.
+- `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`: two new e2e tests (§10.1/§10.2).
+- `scripts/v4-reconcile-threshold.mjs`: git-switch mode now verifies `dependency`/`graph` against
+  an independent oracle (`runIndependentOracleColdScan`, new `roots_ok` log line); `--keep-data`
+  and `--only-switch` now also work in git-switch mode (`runOneGitSwitchCycle`/`measureOneSwitch`/
+  `runGitSwitchMode` all threading the flag through).
+- This file: §10.
+
+### 10.9 Scratch cleanup
+
+`~/Proyectos/urdira-benchmark/v4-fold/ep0b-{bisect-1008,git-switch,git-switch-fixed,graph-diag,
+remeasure-202,remeasure-1008,n8n-git}*` (workspace/data copies, git clones, `--keep-data` outputs)
+deleted at the end of this session; the small `*-results.json` companions retained (`ep0b-bisect-
+1008-results.json`, `ep0b-git-switch-results.json`, `ep0b-git-switch-fixed-results.json`, `ep0b-
+graph-diag-results.json`, `ep0b-remeasure-{202,1008}-results.json`), matching §9's own retention
+pattern. `CARGO_TARGET_DIR` override (`.claude/worktrees/cargo-target-ep0b`) removed. All temporary
+diagnostic `#[ignore]` probe tests (resolver-resolution probe, oracle-cold-scan-and-dump, graph-set-diff,
+dependency-pill-records dump) added and removed within this session -- none survive in the final diff.

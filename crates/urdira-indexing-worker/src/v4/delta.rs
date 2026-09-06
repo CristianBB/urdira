@@ -87,6 +87,7 @@
 //!   both the OLD and NEW ordinal explicitly wherever it matters (see
 //!   `resolve_owner_ordinal`/`MaterializedGeneration::owner_ordinals`).
 
+use super::analyze::is_jsts_source_path;
 use super::diff::{self, OwnerDiff};
 use super::materialize;
 use super::publish;
@@ -623,10 +624,44 @@ fn run_one(
     // `analyze()`) still takes the cheap path for pure add/remove -- this
     // set is a correctness precondition for that function to accept the
     // call at all, not a scope-narrowing choice this module makes.
+    //
+    // Frente E-P0b fix (P0-2, 2026-09-06): a `Changed`/`Reconcile` batch
+    // that names a CONFIG ASSET path (`tsconfig.json`/`jsconfig.json`/
+    // `package.json`/`pnpm-workspace.yaml`, per `analyze::
+    // is_config_asset_path`) alongside ordinary source paths -- routine in
+    // a real git history diff of any size, never exercised by this task's
+    // own synthetic fraction-sweep mutator (`scripts/v4-reconcile-
+    // threshold.mjs`'s `isCandidateSourcePath` deliberately excludes
+    // non-source extensions) -- used to crash the WHOLE batch with
+    // "changed artifact id is absent from the current and retained
+    // manifests". Root cause: `source_delta.changed`/`added`/`deleted`
+    // (from `SourceDelta::compute_partial`, above) cover EVERY observed
+    // path Walker touched, config assets included -- `Catalog::apply`/the
+    // frontier track config assets exactly like any other file. But
+    // `analyze()`'s own retained/current manifests
+    // (`ProjectState::source_metadata`, keyed from its `sources: Vec<
+    // SourceInput>` argument) are built EXCLUSIVELY from `state::
+    // SourceCache::files_vec()` -- config assets travel through the
+    // entirely separate `config_assets: Vec<ConfigAssetInput>` channel
+    // (`SourceCache::apply_delta`'s own `is_jsts_source_path`/`is_config_
+    // asset_path` split) and NEVER populate `source_metadata` at all.
+    // `authoritative_changed_paths` looks up each declared id in the union
+    // of that manifest's `prior`/`current` snapshots (`lib.rs`) -- a config
+    // asset's artifact id can never be found there, by construction, no
+    // matter how fresh or stable the manifest is. Fixed by scoping this
+    // list to `is_jsts_source_path` paths only, mirroring exactly what
+    // `SourceCache` already does and what `analyze()`'s own `sources`
+    // argument already contains -- a touched config asset still correctly
+    // drives `configuration_digest` (via `fold_configuration_digest` over
+    // `config_assets_vec()`, unaffected by this filter) and, through it,
+    // `ResetReason::ConfigurationChanged`'s own full-reparse path; it was
+    // never meant to appear in this authoritative-EXACT-ids list, whose
+    // sole contract is naming CONTENT-CHANGED SOURCE files.
     let mut changed_artifact_ids: Vec<String> = source_delta
         .changed
         .iter()
         .chain(source_delta.added.iter())
+        .filter(|observation| is_jsts_source_path(&observation.normalized_uri))
         .filter_map(|observation| {
             workspace_state
                 .frontier
@@ -636,6 +671,9 @@ fn run_one(
         })
         .collect();
     for uri in &source_delta.deleted {
+        if !is_jsts_source_path(uri) {
+            continue;
+        }
         if let Some(Some(old_entry)) = old_entries.get(uri) {
             changed_artifact_ids.push(old_entry.artifact_id.clone());
         }
