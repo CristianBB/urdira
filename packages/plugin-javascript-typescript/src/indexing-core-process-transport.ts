@@ -282,6 +282,16 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
       // process at all, matching the typeflow flags above.
       ...(process.env["URDIRA_V4_RESIDUAL"] !== undefined ? { URDIRA_V4_RESIDUAL: process.env["URDIRA_V4_RESIDUAL"] } : {}),
       ...(process.env["URDIRA_TSGO_BINARY"] !== undefined ? { URDIRA_TSGO_BINARY: process.env["URDIRA_TSGO_BINARY"] } : {}),
+      // Frente E (plan `generic-waddling-hartmanis.md` §2.6): the reconcile
+      // delta/cold threshold-calibration harness
+      // (`scripts/v4-reconcile-threshold.mjs`) forces `run_reconcile`'s `T`
+      // to 1.0 (always take the `Delta` branch) or 0.0 (always take the
+      // `Cold` fallback) by setting this on the SPAWNING process's own env
+      // before calling `runRustWorkspaceScan` -- same forward-only-when-set
+      // convention as every other Rust-side flag above; without this line
+      // the override would never reach the worker subprocess at all
+      // (production never sets it, so this is a no-op there).
+      ...(process.env["URDIRA_V4_RECONCILE_THRESHOLD"] !== undefined ? { URDIRA_V4_RECONCILE_THRESHOLD: process.env["URDIRA_V4_RECONCILE_THRESHOLD"] } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,

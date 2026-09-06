@@ -4522,24 +4522,19 @@ fn reconcile_delta_mode_also_persists_metadata_refresh_for_untouched_uris() {
     );
     assert_eq!(generation_of(&cold), 1);
 
-    let frontier_file_count = {
-        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog reopens");
-        let frontier = urdira_source_frontier::Frontier::load(
-            &conn,
-            "workspace:v4-e2e-reconcile-delta-metadata",
-        )
-        .expect("frontier loads");
-        frontier.present.len()
-    };
-    assert!(
-        frontier_file_count >= 4,
-        "fixture must have enough files for a single content edit to stay under the default threshold"
-    );
-
+    // Both reconciles below force `threshold=1.0` (always `Delta` for any
+    // non-empty delta) rather than `scan::RECONCILE_DELTA_THRESHOLD` --
+    // this test's own purpose is Delta-mode metadata-refresh persistence,
+    // not the DEFAULT constant's specific magnitude (that is what
+    // `reconcile_delta_threshold_is_within_measured_bounds` and the
+    // explicit-threshold tests already cover). `RECONCILE_DELTA_THRESHOLD`
+    // is a MEASURED value (plan §2.6, `scan.rs`'s own doc comment) that can
+    // legitimately be smaller than "1 edit out of this fixture's frontier"
+    // -- forcing `Delta` here keeps this test's outcome independent of
+    // wherever that measured constant lands.
+    //
     // Every file's stat metadata moves (bare rewrite of its own bytes), AND
-    // exactly one file's CONTENT also changes -- 1/frontier_file_count stays
-    // comfortably under `RECONCILE_DELTA_THRESHOLD` (0.25) for this fixture,
-    // so the reconcile below lands in `Delta` mode, not `Cold`.
+    // exactly one file's CONTENT also changes.
     touch_preserving_content(&workspace_root);
     let edited_file = workspace_root.join("src/domain/task.ts");
     assert!(
@@ -4557,7 +4552,7 @@ fn reconcile_delta_mode_also_persists_metadata_refresh_for_untouched_uris() {
         &database_path,
         &structural_root,
         &cas_root,
-        scan::RECONCILE_DELTA_THRESHOLD,
+        1.0,
         false,
         &mut syntax,
         &mut worker_state,
@@ -4566,7 +4561,7 @@ fn reconcile_delta_mode_also_persists_metadata_refresh_for_untouched_uris() {
     assert_eq!(
         summary.mode,
         urdira_worker_protocol::ReconcileMode::Delta,
-        "one content edit out of {frontier_file_count} files must stay under the default threshold"
+        "threshold=1.0 forces Delta for any non-empty delta"
     );
     assert_eq!(summary.changed, 1);
     assert!(
@@ -4584,7 +4579,7 @@ fn reconcile_delta_mode_also_persists_metadata_refresh_for_untouched_uris() {
         &database_path,
         &structural_root,
         &cas_root,
-        scan::RECONCILE_DELTA_THRESHOLD,
+        1.0,
         false,
         &mut syntax,
         &mut worker_state,
@@ -6827,4 +6822,30 @@ fn full_scan_twice_with_a_content_edit_matches_a_from_scratch_oracle() {
 
     let _ = std::fs::remove_dir_all(&scratch_root);
     let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Plan §2.6/§0 R1: `RECONCILE_DELTA_THRESHOLD` is a MEASURED constant
+/// (`scan.rs`'s own doc comment carries the full n8n table, the git-switch
+/// numbers, and the two P0 findings this measurement surfaced -- see
+/// `docs/evidence/2026-09-06-v4-reconcile-threshold.md` for the complete
+/// writeup). This test only pins the SHAPE of that decision so a future
+/// re-measurement landing anywhere in the legal range does not need this
+/// test edited too: `0.01` is the smallest fraction plan §2.6 ever
+/// measures (a T below that has no measured support), and `0.50` is R1's
+/// own explicit cap ("si delta nunca alcanza cold hasta el 50%, T = 0.50").
+/// The measured value that pinned the constant (2026-09-06) was `0.01` --
+/// below the `[0.05, 0.50]` sanity range this task's own instructions
+/// anticipated, accepted instead of forced into that range because R1's
+/// formula has no floor and a lower T is also the SAFER choice (it keeps
+/// reconcile on the always-correct `Cold` path for anything past a
+/// near-trivial delta, which is where this same measurement run found two
+/// real correctness gaps in the `Delta`/R2 pipeline -- see the evidence
+/// doc).
+#[test]
+fn reconcile_delta_threshold_is_within_measured_bounds() {
+    assert!(
+        (0.01..=0.50).contains(&scan::RECONCILE_DELTA_THRESHOLD),
+        "RECONCILE_DELTA_THRESHOLD={} must stay within the measured plan §0 R1 bounds [0.01, 0.50]",
+        scan::RECONCILE_DELTA_THRESHOLD
+    );
 }

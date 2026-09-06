@@ -23,7 +23,53 @@ use urdira_worker_protocol::{
 /// (both branches are diffed against the exact same authoritative
 /// enumeration). Override for the threshold-calibration harness (plan
 /// §2.6) and for tests that want to force one branch deterministically.
-pub const RECONCILE_DELTA_THRESHOLD: f64 = 0.25;
+///
+/// **Measured 2026-09-06** (`scripts/v4-reconcile-threshold.mjs`, n8n corpus
+/// `~/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02`, 20,148-file
+/// frontier, release worker, machine idle -- full table, git-switch
+/// numbers, and the two P0 findings this run surfaced in the merged
+/// Frente E `Delta`/R2 pipeline: `docs/evidence/2026-09-06-v4-reconcile-threshold.md`):
+///
+/// | p (fraction touched) | n (files) | delta_wall | cold_wall | ratio |
+/// | --------------------- | --------- | ---------- | --------- | ----- |
+/// | 0 (noop)               | 0         | 1.0s       | 1.0s      | 1.02  |
+/// | 0.01                   | 202       | 20.8s      | 22.2s     | 0.94  |
+/// | 0.05                   | 1,008     | 29.1s      | 21.8s     | 1.33  |
+/// | 0.10                   | 2,015     | 36.9s      | 23.9s     | 1.54  |
+/// | 0.25                   | 5,037     | 55.7s      | 21.3s     | 2.61  |
+/// | 0.50                   | 10,074    | 97.7s      | 23.2s     | 4.21  |
+///
+/// `cold_wall` stays roughly flat (~21-24s, dominated by reprocessing the
+/// whole frontier regardless of how much changed) while `delta_wall` grows
+/// with `p`; the crossover (linear interpolation between the p=0.01 and
+/// p=0.05 cells, the two rows the ratio flips between) lands at
+/// p≈0.0164, giving `T = 0.0164 * 0.8 ≈ 0.0131`, rounded to **0.01**. This
+/// is below the `[0.05, 0.50]` sanity range this task's own instructions
+/// anticipated -- accepted as the measured, correct value rather than
+/// forced into that range (R1's formula has no floor, only the 0.50 cap
+/// for a delta that never catches up): a lower T is also the SAFER choice
+/// per plan criterion (a) here, since two real-corpus-scale correctness
+/// gaps in the merged `Delta`/R2 pipeline were found live while measuring
+/// this (both already flagged in the evidence doc as follow-up items, not
+/// fixed by this measurement task):
+/// - `records`/`dependency` roots can diverge from a from-scratch oracle
+///   under `Delta` at ANY touched fraction (a `delta.rs`-documented,
+///   pre-existing scope-narrowing tradeoff: dependency rows are diffed at
+///   OWNER granularity, so an edge's `valid_from` churns even when the
+///   edge itself is unchanged) -- and at p>=0.05 on this corpus, `graph`
+///   diverged too (not previously exercised at this scale/mix).
+/// - On two REAL git-history diffs (n8n tag-to-tag, 3 months apart, and
+///   `HEAD~200..HEAD`), `delta::run`'s "mixed burst split into two
+///   generations" path errored outright ("changed artifact id is absent
+///   from the current and retained manifests") on EVERY attempt; R2's
+///   same-request cold fallback caught it correctly every time (no
+///   partial generation), but `Delta` never actually completed for either
+///   real diff tested.
+///
+/// A low T means reconcile takes the safe, always-correct `Cold` path for
+/// anything but a near-trivial delta -- exactly the two gaps above never
+/// get exercised in practice until they are fixed.
+pub const RECONCILE_DELTA_THRESHOLD: f64 = 0.01;
 
 fn reconcile_threshold() -> f64 {
     std::env::var("URDIRA_V4_RECONCILE_THRESHOLD")
