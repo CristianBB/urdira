@@ -334,15 +334,58 @@ impl Segment {
         &d[ordinal * DEPS_META_STRIDE..(ordinal + 1) * DEPS_META_STRIDE]
     }
 
-    pub fn deps_effective_valid_to(&self, ordinal: usize, inline_valid_to: u32) -> u32 {
+    /// Frente E-P0 (P0-1 root cause fix): `dependency_id` is a PURE,
+    /// unsalted function of `(owner_path, dep_path, role)`
+    /// (`urdira-indexing-worker::v4::deps::dependency_id`), NOT chained the
+    /// way `record_id` is (`diff::chained_record_id` mints a FRESH id on
+    /// every replace/reopen) -- so, unlike `record_closures`/[`Self::
+    /// effective_valid_to`] (where a given key can only EVER have been
+    /// opened by exactly one physical row across the store's entire
+    /// history, making a single global "key -> valid_to" map always
+    /// unambiguous), the SAME `dependency_id` can legitimately be reused
+    /// by a LATER physical row after an earlier one under that key was
+    /// closed (an edge closed then reopened, whether within one owner-diff
+    /// churning an unrelated field or a genuine remove-then-re-add later).
+    /// Applying `dep_closures[key]` unconditionally to EVERY row carrying
+    /// that key -- including one opened AT OR AFTER the closure's own
+    /// generation -- permanently hides the reopened row: confirmed live on
+    /// n8n (`docs/evidence/2026-09-06-v4-reconcile-threshold.md`, "tras
+    /// E-P0"), a `--files 100` bisection lost 14,935 of an independent
+    /// oracle's 35,504 live dependency edges this way. A closure can only
+    /// ever legitimately apply to a row that existed BEFORE it was
+    /// recorded -- `ordinal`'s own `valid_from` gates the lookup here so a
+    /// row opened at or after `dep_closures[key]`'s generation (a fresh
+    /// reopen, this SAME key's next physical row) is never affected by a
+    /// closure meant for its now-dead predecessor. Symmetric with
+    /// `diff::diff_owner`'s companion fix (`urdira-indexing-worker::v4::
+    /// delta`'s module doc): that fix stops WRITING a same-generation
+    /// close+reopen pair for an edge that never actually changed (the
+    /// dominant case measured live); this read-side guard is what makes a
+    /// genuine cross-generation remove-then-re-add of the identical edge
+    /// correct too, a case the write-side fix alone cannot cover (two
+    /// independent `diff_one_owner` calls, no shared context). Documented
+    /// residual: a dependency_id closed and reopened THREE OR MORE times
+    /// across the store's history collapses `dep_closures` (one merged
+    /// entry per key) to whichever closure the segment-merge last wrote,
+    /// which can misattribute an EARLIER cycle's closure generation to a
+    /// LATER cycle's row if their generations interleave unusually --
+    /// correct for the single-cycle case this task measured and fixed
+    /// live; a full fix would need per-row (not per-key) closure
+    /// attribution, out of this task's scope.
+    pub fn deps_effective_valid_to(
+        &self,
+        ordinal: usize,
+        valid_from: u32,
+        inline_valid_to: u32,
+    ) -> u32 {
         if self.dep_closures.is_empty() {
             return inline_valid_to;
         }
         let key = self.deps_key_at(ordinal);
-        self.dep_closures
-            .get(&key)
-            .copied()
-            .unwrap_or(inline_valid_to)
+        match self.dep_closures.get(&key) {
+            Some(&closed_at) if closed_at > valid_from => closed_at,
+            _ => inline_valid_to,
+        }
     }
 
     pub fn pending_row(&self, ordinal: usize) -> &[u8] {
@@ -363,15 +406,32 @@ impl Segment {
         )
     }
 
-    pub fn pending_effective_valid_to(&self, ordinal: usize, inline_valid_to: u32) -> u32 {
+    /// Frente E-P0: same fix as [`Self::deps_effective_valid_to`], same
+    /// reason -- `PendingSiteKey` (`owner_artifact`/`start`/`end`/
+    /// `site_kind`) is a plain, reusable, unchained key, and `delta.rs`'s
+    /// own `diff_one_owner` deliberately does an unconditional "wholesale
+    /// replace" for pending sites on EVERY owner reprocessing (never a
+    /// `diff::diff_owner`-style "unchanged, keep" -- see that module's own
+    /// doc comment on `pending_opened`/`pending_closures`), so a pending
+    /// site that is STILL pending after a reprocessing (the common case:
+    /// an unresolved import that stays unresolved) writes a same-
+    /// generation close+reopen pair for the IDENTICAL key on every single
+    /// touch -- even more frequently than the dependency case this was
+    /// found from. Gated by `valid_from` for the same reason.
+    pub fn pending_effective_valid_to(
+        &self,
+        ordinal: usize,
+        valid_from: u32,
+        inline_valid_to: u32,
+    ) -> u32 {
         if self.pending_closures.is_empty() {
             return inline_valid_to;
         }
         let key = self.pending_key_at(ordinal);
-        self.pending_closures
-            .get(&key)
-            .copied()
-            .unwrap_or(inline_valid_to)
+        match self.pending_closures.get(&key) {
+            Some(&closed_at) if closed_at > valid_from => closed_at,
+            _ => inline_valid_to,
+        }
     }
 }
 
@@ -675,7 +735,7 @@ impl DependencyView {
     }
     pub fn valid_to_effective(&self) -> u32 {
         self.segment
-            .deps_effective_valid_to(self.ordinal, self.valid_to_raw())
+            .deps_effective_valid_to(self.ordinal, self.valid_from(), self.valid_to_raw())
     }
     pub fn is_visible(&self, generation: u64) -> bool {
         let vf = self.valid_from() as u64;
@@ -712,8 +772,11 @@ impl PendingSiteView {
         u32le(self.meta(), pending_sites::VALID_TO)
     }
     pub fn valid_to_effective(&self) -> u32 {
-        self.segment
-            .pending_effective_valid_to(self.ordinal, self.valid_to_raw())
+        self.segment.pending_effective_valid_to(
+            self.ordinal,
+            self.valid_from(),
+            self.valid_to_raw(),
+        )
     }
     pub fn is_visible(&self, generation: u64) -> bool {
         let vf = self.valid_from() as u64;

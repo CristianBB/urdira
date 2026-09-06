@@ -361,7 +361,7 @@ async function waitForQuietMachine(label, maxAttempts = 20) {
 // ---------------------------------------------------------------------------
 
 async function runFractionSweep(options) {
-  const { corpus, data, fractions, repeat, out } = options;
+  const { corpus, data, fractions, repeat, out, files, keepData } = options;
   assertNeverTmp(data, "--data");
   await mkdir(data, { recursive: true });
 
@@ -383,10 +383,19 @@ async function runFractionSweep(options) {
   const rows = [];
   let frontierSize;
 
-  for (const p of fractions) {
-    const label = `p${String(Math.round(p * 10000)).padStart(4, "0")}`;
+  // `--files N` bisection mode: ONE cell, `touchedCount` given directly
+  // (still fed through the SAME seeded `buildMutationPlan`, so `--files 202`
+  // reproduces p=0.01's exact plan on the n8n corpus this doc's evidence
+  // measured -- `pickIndices`' seed/order never depend on `fractions`).
+  const cellPlan = files !== undefined ? [{ syntheticFraction: null, files }] : fractions.map((p) => ({ p }));
+
+  for (const cell of cellPlan) {
+    const p = cell.p;
+    const label = files !== undefined ? `files${cell.files}` : `p${String(Math.round(p * 10000)).padStart(4, "0")}`;
     let touchedCount;
-    if (p === 0) {
+    if (files !== undefined) {
+      touchedCount = cell.files;
+    } else if (p === 0) {
       touchedCount = 0;
     } else if (frontierSize !== undefined) {
       touchedCount = Math.max(1, Math.ceil(p * frontierSize));
@@ -418,8 +427,12 @@ async function runFractionSweep(options) {
       deltaWalls.push(deltaEvent.completed_at_ms);
       deltaSummary = deltaEvent.reconcile;
       deltaRoots = deltaEvent.roots;
-      await rm(deltaWorkspace, { recursive: true, force: true });
-      await rm(deltaDataDir, { recursive: true, force: true });
+      if (!keepData) {
+        await rm(deltaWorkspace, { recursive: true, force: true });
+        await rm(deltaDataDir, { recursive: true, force: true });
+      } else {
+        console.log(`[fraction ${p}] --keep-data: kept ${deltaWorkspace} / ${deltaDataDir}`);
+      }
 
       // Forced Cold (T=0.0), independent fresh copy, same mutation plan,
       // same warm-process shape.
@@ -431,8 +444,12 @@ async function runFractionSweep(options) {
       coldWalls.push(coldEvent.completed_at_ms);
       coldSummary = coldEvent.reconcile;
       coldRoots = coldEvent.roots;
-      await rm(coldWorkspace, { recursive: true, force: true });
-      await rm(coldDataDir, { recursive: true, force: true });
+      if (!keepData) {
+        await rm(coldWorkspace, { recursive: true, force: true });
+        await rm(coldDataDir, { recursive: true, force: true });
+      } else {
+        console.log(`[fraction ${p}] --keep-data: kept ${coldWorkspace} / ${coldDataDir}`);
+      }
     }
 
     if (frontierSize === undefined) frontierSize = deltaSummary.frontier_size;
@@ -452,8 +469,12 @@ async function runFractionSweep(options) {
       const oracleEvent = await runFullScan(oracleWorkspace, oracleDataPaths, `${workspaceId}:oracle:${label}`);
       oracleWallMs = performance.now() - oracleStart;
       oracleRoots = oracleEvent.roots;
-      await rm(oracleWorkspace, { recursive: true, force: true });
-      await rm(oracleData, { recursive: true, force: true });
+      if (!keepData) {
+        await rm(oracleWorkspace, { recursive: true, force: true });
+        await rm(oracleData, { recursive: true, force: true });
+      } else {
+        console.log(`[fraction ${p}] --keep-data: kept ${oracleWorkspace} / ${oracleData}`);
+      }
     }
 
     const deltaRootsOk = rootsDiff(deltaRoots, oracleRoots);
@@ -697,6 +718,27 @@ function parseArgs(argv) {
         break;
       case "--out":
         options.out = resolve(next());
+        break;
+      // Frente E-P0 (plan `generic-waddling-hartmanis.md` §2.6 follow-up,
+      // task 1a): bisect P0-1's records/dependency/graph divergence by
+      // touched-file COUNT directly, bypassing the `--fractions` ×
+      // frontier-size arithmetic -- `N` is passed straight to
+      // `buildMutationPlan`'s `touchedCount` (same seeded selection/90-10
+      // edit/delete-or-rename split as the fraction sweep), so `--files 10`
+      // and `--files 202` (p=0.01's own `touchedCount` on the n8n corpus
+      // this doc's evidence measured) replay byte-identical plans. Runs
+      // exactly ONE cell (skips the fraction loop) when set.
+      case "--files":
+        options.files = Number.parseInt(next(), 10);
+        break;
+      // Frente E-P0: keep every scratch workspace/data directory this run
+      // creates instead of deleting them at the end of each cell -- needed
+      // to open the resulting stores afterward with a diagnostic tool
+      // (`dump_dependency_set_diff`/`dump_records_set_diff` in
+      // `tests_e2e.rs`) once a divergence is found. Off by default (the
+      // fraction sweep's normal contract still cleans up after itself).
+      case "--keep-data":
+        options.keepData = true;
         break;
       case "--git-switch":
         options.gitSwitch = true;

@@ -11,27 +11,52 @@
 //!
 //! **Documented scope narrowing versus the plan's exact wording (§6.3),
 //! reported here rather than silently left implicit:**
-//! - Dependency rows are diffed at OWNER granularity, not by `dependency_id`
-//!   (plan §6.3's "deps/edges: regenerar y diff por edge_id/dependency_id
-//!   [abrir nuevas, cerrar ausentes]"): every affected/deleted owner's
-//!   PREVIOUS dependency rows are closed unconditionally and its freshly
-//!   materialized ones opened unconditionally, rather than keeping an
-//!   unchanged dependency edge open across the edit. `DependencyRow.record`
-//!   is left `None` on this path (the already-documented "bare `record:`
-//!   sentinel" fallback `deps.rs` supports): the record ordinal `deps.rs`
-//!   would otherwise attach a dependency to is only stable within ONE
-//!   `materialize_generation` call's own `records` vector, which this
-//!   diff's "unchanged, keep" case can drop entries from AFTER
-//!   materialization already ran -- reusing that ordinal here would
-//!   sometimes point a dependency at the wrong opened row. Both
-//!   simplifications keep dependency volume bounded by the affected
-//!   closure (never O(corpus)), at the cost of a dependency edge's own
-//!   valid_from churning every time its OWNING file (not necessarily the
-//!   edge itself) is edited, and of `DependencyRow.record` being
-//!   unpopulated on this path. Neither affects `record_id`/Merkle root
-//!   correctness for records (the gate this task measures against);
-//!   flagged here as a residual precision gap for whichever task next
-//!   tightens dependency identity.
+//! - Dependency rows ARE now diffed by `dependency_id` (plan §6.3's
+//!   "deps/edges: regenerar y diff por edge_id/dependency_id [abrir
+//!   nuevas, cerrar ausentes]", exactly): `diff_one_owner`'s dependency
+//!   handling (below) keeps an edge present in both the owner's previous
+//!   live rows and its freshly materialized ones ENTIRELY untouched
+//!   (neither closed nor reopened), closes only a genuinely REMOVED edge,
+//!   and opens only a genuinely NEW one. **Frente E-P0 fix, 2026-09-06**:
+//!   this used to close every affected/deleted owner's PREVIOUS dependency
+//!   rows unconditionally and open every freshly materialized one
+//!   unconditionally (owner granularity, not edge granularity) -- harmless
+//!   for the Merkle LOGICAL VALUE in isolation (`dependency_id` has no
+//!   "same identity, different content" case the way a record's
+//!   `identity_key`/`record_digest` pair does), but a REAL visibility bug:
+//!   unlike `record_id` (chained via `diff::chained_record_id`, so a
+//!   replaced/reopened record always mints a FRESH id), `dependency_id` is
+//!   an unsalted, reusable function of `(owner_path, dep_path, role)`
+//!   (`deps.rs::dependency_id`) -- closing an edge and reopening the
+//!   IDENTICAL edge in the SAME owner-diff (the common case: an owner
+//!   reprocessed for closure reasons whose own dependency graph never
+//!   actually changed) wrote a closure AND a fresh open for the SAME key,
+//!   and `Segment::deps_effective_valid_to` (`urdira-structural-store`)
+//!   resolved visibility from one flat, store-wide `dependency_id ->
+//!   valid_to` map applied to EVERY physical row carrying that key --
+//!   permanently swallowing the freshly reopened row under the closure
+//!   meant for its now-dead predecessor. Confirmed live on n8n
+//!   (`--files 100` bisection, `docs/evidence/2026-09-06-v4-reconcile-
+//!   threshold.md` §"tras E-P0"): incremental had only 20,569 of an
+//!   independent oracle's 35,504 live dependency edges (0 edges present
+//!   only in the incremental store -- a one-directional, only-ever-loses
+//!   gap). `DependencyRow.record` is still left `None` on the "opened"
+//!   path (the already-documented "bare `record:` sentinel" fallback
+//!   `deps.rs` supports): the record ordinal `deps.rs` would otherwise
+//!   attach a dependency to is only stable within ONE `materialize_
+//!   generation` call's own `records` vector, which this diff's
+//!   "unchanged, keep" case can drop entries from AFTER materialization
+//!   already ran -- reusing that ordinal here would sometimes point a
+//!   dependency at the wrong opened row; this residual (not a Merkle root
+//!   or visibility correctness gap, since neither `record_id`/`record_id`-
+//!   resolution nor `dependency_id`/`dependency_logical` ever reads
+//!   `DependencyRow.record`) is unchanged by this fix. `Segment::deps_
+//!   effective_valid_to`'s own `valid_from`-gated read-side guard
+//!   (`urdira-structural-store::reader`) is the second, independent half
+//!   of this fix -- for a dependency genuinely removed in one generation
+//!   and genuinely re-added in a LATER one (two separate `diff_one_owner`
+//!   calls sharing no context, so this owner-granularity-to-edge-
+//!   granularity fix alone does not protect that case).
 //! - A `Changed` batch that mixes a genuine content edit with a
 //!   create/delete of a DIFFERENT path in the SAME command USED TO fall
 //!   back, inside `urdira-jsts-syntax-worker::SyntaxWorkerState::analyze`
@@ -1079,15 +1104,90 @@ fn run_one(
         closed_relation_keys.extend(owner_diff.closed_relation_keys);
         kernel_to_final.extend(owner_diff.kernel_to_final);
 
+        // Frente E-P0 (P0-1 root cause fix, `docs/evidence/2026-09-06-v4-
+        // reconcile-threshold.md` §3/§4): THIS used to close EVERY one of
+        // the owner's previous dependency rows unconditionally and open
+        // EVERY one of `next_deps` unconditionally (the module doc's own
+        // "owner granularity, not edge/key granularity" simplification).
+        // That is fine for the MERKLE ROOT in isolation (`dependency_id`
+        // has no "same identity, different content" case the way a
+        // record's `identity_key`/`record_digest` pair does -- `deps.rs`'s
+        // own doc: "role is already baked into dependency_id itself, so
+        // there is nothing else to fold in"), but it is NOT fine for
+        // VISIBILITY: unlike `record_id` (chained -- `diff::chained_
+        // record_id` -- so a replaced/reopened record ALWAYS gets a FRESH
+        // id, never colliding with the id it superseded), `dependency_id`
+        // is a PURE, unsalted function of `(owner_path, dep_path, role)`
+        // (`deps.rs::dependency_id`) -- closing an edge and reopening the
+        // IDENTICAL edge (the common case: an owner reprocessed for
+        // closure reasons, e.g. an unrelated file elsewhere in the batch
+        // renamed/deleted, whose dependency graph never actually changed)
+        // writes BOTH a closure AND a fresh open for the SAME key.
+        // `Segment::deps_effective_valid_to` (`urdira-structural-store`)
+        // resolves visibility from ONE flat, store-wide `dependency_id ->
+        // valid_to` map applied to EVERY physical row carrying that key,
+        // with no notion of "this closure only targets the row that
+        // existed before it" -- so the freshly reopened row (identical
+        // key) was permanently swallowed by the very closure meant for
+        // its now-dead predecessor. Confirmed live on n8n (`--files 100`
+        // bisection): a `dependency` root mismatch traced via `dump_
+        // dependency_set_diff` showed 0 edges present only in the
+        // incremental store and 14,935 present only in the independent
+        // oracle (incremental had 20,569 of the oracle's 35,504 live
+        // edges) -- a one-directional, only-ever-loses-edges gap, exactly
+        // what "close+reopen the identical key, permanently invisible"
+        // predicts (never "gains" a phantom edge, which a chaining bug
+        // would instead risk).
+        //
+        // Fix: diff dependencies BY `dependency_id`, same shape as
+        // `diff::diff_owner`'s own "same identity + same digest -> keep,
+        // never rewritten" branch for records -- an edge present in BOTH
+        // `prev` and `next` is left ENTIRELY untouched (neither closed nor
+        // reopened), so its one, single, already-durable physical row
+        // just keeps being the live one; only a genuinely REMOVED edge
+        // (in `prev`, absent from `next`) is closed, and only a genuinely
+        // NEW edge (in `next`, absent from `prev`) is opened. This also
+        // means `deps_closures`/`opened_deps` can no longer share a key
+        // within one owner's diff (a plain set difference is disjoint by
+        // construction), so `writer.rs`'s `dep_changes` Merkle Change list
+        // (`Set` for every `deps_opened` row, `Delete` for every
+        // `deps_closures` key, Sets built before Deletes) never needs to
+        // arbitrate a same-key Set/Delete collision either -- the
+        // `Delete`-wins-on-collision behavior `apply_changes_in_bucket`
+        // already has (last write in list order wins) would otherwise
+        // ALSO have dropped a reopened key from the `dependency` merkle
+        // tree even after the storage-visibility half of this bug is
+        // fixed. `Segment::deps_effective_valid_to`'s own read-side guard
+        // (`valid_from`-gated, `urdira-structural-store::reader`) is the
+        // second, independent half of this fix -- for the rarer case of a
+        // dependency genuinely removed in one generation and genuinely
+        // re-added in a LATER one (a real close-then-reopen across
+        // generations, which this owner-granularity diff fix does not by
+        // itself protect, since the two events are two separate
+        // `diff_one_owner` calls with no shared context).
         if let Some(ordinal) = prev_ordinal {
-            for dep in store_reader.deps_by_owner(ordinal, prev_generation) {
-                deps_closures.push((dep.dependency_id(), generation_u32));
+            let prev_deps = store_reader.deps_by_owner(ordinal, prev_generation);
+            let next_dep_ids: HashSet<[u8; 32]> =
+                next_deps.iter().map(|d| d.dependency_id).collect();
+            let mut prev_dep_ids: HashSet<[u8; 32]> = HashSet::with_capacity(prev_deps.len());
+            for dep in &prev_deps {
+                let id = dep.dependency_id();
+                prev_dep_ids.insert(id);
+                if !next_dep_ids.contains(&id) {
+                    deps_closures.push((id, generation_u32));
+                }
             }
+            opened_deps.extend(
+                next_deps
+                    .into_iter()
+                    .filter(|dep| !prev_dep_ids.contains(&dep.dependency_id)),
+            );
             for pending in store_reader.pending_sites_by_owner(ordinal, prev_generation) {
                 pending_closures.push((pending.key(), generation_u32));
             }
+        } else {
+            opened_deps.extend(next_deps);
         }
-        opened_deps.extend(next_deps);
         pending_opened.extend(next_pending);
     };
 
