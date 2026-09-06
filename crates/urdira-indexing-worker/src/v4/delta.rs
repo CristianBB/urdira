@@ -341,6 +341,44 @@ pub fn run(
     clock: &mut ScanClock,
     on_queryable: &mut dyn FnMut(IndexingEvent) -> Result<(), String>,
 ) -> Result<(IndexingEvent, Vec<String>), ScanError> {
+    run_with_failure_injection(
+        request,
+        changed_paths,
+        conn,
+        workspace_root,
+        structural_root,
+        cas_root,
+        syntax,
+        worker_state,
+        clock,
+        on_queryable,
+        false,
+    )
+}
+
+/// Frente E adversarial-review regression test hook: identical to
+/// [`run`], plus an explicit `inject_failure_after_apply` this module's own
+/// production call sites always pass `false` for (`run`, above, is the only
+/// one they use). `scan::run_reconcile`'s test-only entry point uses this
+/// directly to exercise the "delta fails AFTER `Catalog::apply` already
+/// committed a generation, before anything published" case -- see
+/// `run_one`'s own doc comment at the injection point and
+/// `reconcile_falls_back_to_cold_when_delta_fails_after_catalog_apply`
+/// (`tests_e2e.rs`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_failure_injection(
+    request: &super::scan::ScanRequest,
+    changed_paths: &[ChangedPath],
+    conn: &mut Connection,
+    workspace_root: &Path,
+    structural_root: &Path,
+    cas_root: &Path,
+    syntax: &mut SyntaxWorkerState,
+    worker_state: &mut WorkerState,
+    clock: &mut ScanClock,
+    on_queryable: &mut dyn FnMut(IndexingEvent) -> Result<(), String>,
+    inject_failure_after_apply: bool,
+) -> Result<(IndexingEvent, Vec<String>), ScanError> {
     if changed_paths.is_empty() {
         return Err(ScanError(
             "v4 WorkspaceScan{scope: Changed} requires at least one path".into(),
@@ -374,6 +412,7 @@ pub fn run(
             worker_state,
             &mut structural_clock,
             on_queryable,
+            inject_failure_after_apply,
         )?;
         let mut content_clock = ScanClock::start();
         let (content_event, content_touched_owner_paths) = run_one(
@@ -387,6 +426,7 @@ pub fn run(
             worker_state,
             &mut content_clock,
             on_queryable,
+            inject_failure_after_apply,
         )?;
         touched_owner_paths.extend(content_touched_owner_paths);
         touched_owner_paths.sort();
@@ -404,6 +444,7 @@ pub fn run(
         worker_state,
         clock,
         on_queryable,
+        inject_failure_after_apply,
     )
 }
 
@@ -419,6 +460,7 @@ fn run_one(
     worker_state: &mut WorkerState,
     clock: &mut ScanClock,
     on_queryable: &mut dyn FnMut(IndexingEvent) -> Result<(), String>,
+    inject_failure_after_apply: bool,
 ) -> Result<(IndexingEvent, Vec<String>), ScanError> {
     // P3-1 deliverable 2: generation counter. `Changed` on a workspace that
     // has never published a generation makes no sense (there is nothing to
@@ -432,7 +474,18 @@ fn run_one(
                 .into(),
         ));
     }
-    let generation_i64 = current_generation + 1;
+    // Adversarial-review hardening (Frente E, 2026-09-06): NOT
+    // `current_generation + 1` -- see `catalog::read_highest_applied_
+    // generation`'s doc comment and `scan::run_full`'s identical fix. A
+    // workspace left `"indexing"` by a crashed prior process (this same
+    // module's own `Catalog::apply`, above, committing before `publish_
+    // delta` ever runs) can leave `source_index_state` ahead of the
+    // published pointer `current_generation` reads; a live `Changed`
+    // request racing that workspace's own not-yet-run crash-recovery retry
+    // would otherwise collide on the SAME `source_observation_batches`
+    // primary key the aborted attempt already used. Byte-identical to the
+    // old computation whenever the two counters agree (the common case).
+    let generation_i64 = catalog::read_highest_applied_generation(conn, &request.workspace_id)? + 1;
     let generation = u64::try_from(generation_i64)
         .map_err(|_| ScanError("generation must be non-negative".into()))?;
     let generation_u32 = u32::try_from(generation)
@@ -515,6 +568,24 @@ fn run_one(
     )?;
     catalog::restore_steady_state_pragmas(conn)?;
     clock.record_catalog(catalog_started.elapsed());
+
+    // Frente E adversarial-review regression test hook (explicit parameter,
+    // not an env var -- this binary is `#![forbid(unsafe_code)]` and
+    // `std::env::set_var` is `unsafe` since edition 2024, the same reason
+    // `scan::run_reconcile`'s own `inject_delta_failure` is a parameter, per
+    // this module's `run_reconcile_scan` test helper doc comment). Unlike
+    // that flag (which never even calls this function), this fails AFTER
+    // `Catalog::apply` has already committed generation `generation_i64`'s
+    // SQLite rows -- the "hard case" the review brief asked for, where the
+    // frontier has moved but nothing has published yet. See
+    // `reconcile_falls_back_to_cold_when_delta_fails_after_catalog_apply`
+    // (`tests_e2e.rs`) and `scan::run_reconcile`'s own cold-fallback fix.
+    if inject_failure_after_apply {
+        return Err(ScanError(
+            "v4 delta: injected failure after Catalog::apply (test-only, inject_failure_after_apply)"
+                .into(),
+        ));
+    }
 
     // `urdira_jsts_syntax_worker::SyntaxWorkerState::analyze`'s own
     // `authoritative_changed_paths` validates `changed_artifact_ids`

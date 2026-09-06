@@ -135,6 +135,10 @@ pub fn run_with_residual(
             // parameter for `URDIRA_V4_ENTITY_INDEX`).
             reconcile_threshold(),
             std::env::var_os("URDIRA_V4_RECONCILE_FAIL_DELTA").is_some(),
+            // No production env var for this one -- it is a test-only hook
+            // (see `run_with_failure_injection`'s doc comment); production
+            // always passes `false`.
+            false,
             &mut conn,
             &workspace_root,
             &structural_root,
@@ -206,7 +210,22 @@ fn run_full(
     // daemon's own "reindex from scratch" path) now correctly continues
     // from that workspace's real current generation instead of colliding
     // on `source_observation_batches`' primary key.
-    let generation = catalog::read_current_generation(conn, &request.workspace_id)? + 1;
+    //
+    // Adversarial-review hardening (Frente E, 2026-09-06):
+    // `read_current_generation` alone reads only the PUBLISHED pointer
+    // (`workspace_current_state`); `read_highest_applied_generation`'s own
+    // doc comment explains why that can be stale after a crash mid-scan
+    // (`Catalog::apply` commits before `publish_delta`/`publish_cold` ever
+    // runs) -- the daemon's own crash-recovery sweep
+    // (`packages/daemon/src/runtime.ts`'s "a workspace left `indexing` by a
+    // prior process life") retries exactly such a workspace with a fresh
+    // `Full` scan, which is this function. Byte-identical to the old
+    // behavior whenever the two counters agree (the overwhelmingly common
+    // case: `publish` always follows `apply` within the same successful
+    // request), and closes the SAME `source_observation_batches`
+    // primary-key collision `run_reconcile`'s cold fallback fix
+    // (`catalog.rs`) closes for the reconcile-specific path.
+    let generation = catalog::read_highest_applied_generation(conn, &request.workspace_id)? + 1;
     let enumeration = catalog::enumerate(workspace_root, cas_root)?;
     let (frontier, delta) = catalog::diff(conn, &request.workspace_id, &enumeration.observations)?;
     run_full_from(
@@ -505,6 +524,7 @@ pub fn run_reconcile(
     request: &ScanRequest,
     threshold: f64,
     inject_delta_failure: bool,
+    inject_delta_failure_after_apply: bool,
     conn: &mut rusqlite::Connection,
     workspace_root: &Path,
     structural_root: &Path,
@@ -575,7 +595,15 @@ pub fn run_reconcile(
         return Ok((event, Some(Vec::new())));
     }
 
-    let next_generation = current_generation + 1;
+    // Adversarial-review hardening: same reasoning as `run_full`'s own
+    // generation computation, above -- `read_highest_applied_generation`
+    // rather than the bare published pointer, so a reconcile reached via the
+    // daemon's crash-recovery sweep (retrying a workspace a prior process
+    // left `indexing`) cannot collide with a generation a crashed scan's own
+    // `Catalog::apply` already committed but never published. Byte-identical
+    // to `current_generation + 1` whenever the two counters agree.
+    let next_generation =
+        catalog::read_highest_applied_generation(conn, &request.workspace_id)? + 1;
 
     if (touched_count as f64) <= threshold * (frontier_size as f64) {
         // Small delta: republish exactly the touched owners through the
@@ -619,7 +647,16 @@ pub fn run_reconcile(
                 "v4 reconcile: injected delta failure (URDIRA_V4_RECONCILE_FAIL_DELTA)".into(),
             ))
         } else {
-            delta::run(
+            // Adversarial-review addition: `inject_delta_failure_after_apply`
+            // (always `false` in production -- `run_with_residual`'s own
+            // `ScanScope::Reconcile` arm never sets it) lets a test make
+            // THIS call fail AFTER its own `Catalog::apply` already
+            // committed `current_generation + 1`'s SQLite rows, unlike
+            // `inject_delta_failure` above which never reaches `delta::run`
+            // at all. See `run_with_failure_injection`'s doc comment and the
+            // cold-fallback's generation computation below, which this hook
+            // exists to regression-test.
+            delta::run_with_failure_injection(
                 request,
                 &paths,
                 conn,
@@ -630,6 +667,7 @@ pub fn run_reconcile(
                 worker_state,
                 clock,
                 on_queryable,
+                inject_delta_failure_after_apply,
             )
         };
 
@@ -656,8 +694,16 @@ pub fn run_reconcile(
                 eprintln!(
                     "[urdira-indexing-worker] v4 reconcile: delta failed: {error}; falling back to cold"
                 );
+                // Adversarial-review fix: NOT `read_current_generation(..) +
+                // 1` -- that reads only the PUBLISHED pointer, which the
+                // failed `delta::run` attempt may already have outrun (its
+                // own `Catalog::apply` commits before `publish_delta` ever
+                // runs). See `read_highest_applied_generation`'s doc comment
+                // for why reusing a generation number `delta::run` already
+                // wrote catalog rows for would fail this very fallback on a
+                // `source_observation_batches` primary-key collision.
                 let cold_generation =
-                    catalog::read_current_generation(conn, &request.workspace_id)? + 1;
+                    catalog::read_highest_applied_generation(conn, &request.workspace_id)? + 1;
                 let enumeration2 = catalog::enumerate(workspace_root, cas_root)?;
                 let (frontier2, delta2) =
                     catalog::diff(conn, &request.workspace_id, &enumeration2.observations)?;

@@ -3829,14 +3829,29 @@ export class DaemonRuntime {
       // ever invoked by an explicit client action (watcher reconciliation,
       // `core:workspace_add`, `core:configuration_set`, `core:reindex`).
       // Retry every such workspace once storage and the scan scheduler are
-      // ready. This is a full-rescan retry, not partial-progress resumption:
-      // `runFullWorkspaceScan`/`CandidateIndexer` (`packages/engine/src/workspace-indexing-session.ts`,
-      // not modified by this change) do not currently expose recovery
-      // semantics for resuming a partially completed scan, so a fresh full
-      // scan is the simplest correct retry. Flagged as a known limitation in
-      // the final report, not a silent shortcut: a very large workspace pays
-      // for a full rescan after every crash instead of resuming near where
-      // it left off.
+      // ready.
+      //
+      // Adversarial-review note (Frente E, 2026-09-06): for a v3 workspace
+      // this is still a full-rescan retry (v3 has no incremental recovery
+      // semantics -- `runFullWorkspaceScan`/`CandidateIndexer`,
+      // `packages/engine/src/workspace-indexing-session.ts`, not modified by
+      // this change -- so a fresh full scan is the simplest correct retry;
+      // a very large v3 workspace pays for a full rescan after every crash
+      // instead of resuming near where it left off, a known limitation).
+      // For a NON-first-scan v4 workspace, this call has no URIs, so
+      // `runV4WorkspaceScan`'s own scope decision (`packages/daemon/src/
+      // runtime.ts`, this task's own diff) now routes it through
+      // `ScanScope::Reconcile` rather than `Full` -- deliberately NOT added
+      // to `forceFullScans`. `run_reconcile` performs the exact same
+      // authoritative walk `Full` would (never trusting anything the
+      // crashed process left behind, including a dangling
+      // `Catalog::apply`-but-never-published generation --
+      // `catalog::read_highest_applied_generation`'s doc comment), so it is
+      // equally correct, and strictly cheaper when the crash happened
+      // between two otherwise-unrelated edits: a real recovery win this
+      // sweep gets "for free" from Frente E's own invariant ("T moves cost,
+      // never the result"), not a regression back to the "no partial-
+      // progress resumption" limitation this comment used to describe.
       for (const workspace of options.workspace_registry?.list() ?? []) {
         if (workspace.status === "indexing") scheduleWorkspaceScan(workspace.workspace_id);
       }
@@ -4394,6 +4409,20 @@ export class DaemonRuntime {
           // consistent with the rest of this change making indexing actually
           // complete.
           const indexing = impact === "query_only" ? undefined : options.workspace_registry.beginReconciliation(workspace.workspace_id);
+          // Adversarial-review fix (Frente E, 2026-09-06): a non-`query_only`
+          // `impact` (`"plugin_resolution"`/`"source_selection"`/
+          // `"semantic_projection"`/`"analysis"`, `classifyWorkspaceConfigurationImpact`)
+          // means the RULES for interpreting the SAME on-disk bytes changed,
+          // not the bytes themselves. `runV4WorkspaceScan`'s reconcile
+          // default derives its delta from an authoritative FILE-CONTENT
+          // walk (`catalog::enumerate`/`diff`) -- it has no way to see a
+          // configuration-only change, so an unmodified reconcile call here
+          // would find `touched_count == 0` and take the `Noop` branch,
+          // silently leaving the workspace serving results built under the
+          // STALE configuration forever. `forceFullScans` (same mechanism
+          // `core:reindex` uses, above) makes this call always `full`
+          // instead, same as it did before Frente E's `reconcile` default.
+          if (indexing) forceFullScans.add(workspace.workspace_id);
           if (indexing) scheduleWorkspaceScan(workspace.workspace_id);
           return { workspace_id: workspace.workspace_id, configuration_applied: true, configuration_impact: impact, reindex_required: indexing !== undefined, observation_preserved: true, ...(indexing === undefined ? {} : { reconciliation_operation_id: indexing.operation_id, workspace_status: indexing.workspace.status }), ...(semanticModel === undefined ? {} : { semantic_model: semanticModel }) };
         }

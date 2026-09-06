@@ -86,6 +86,61 @@ pub fn read_current_generation(conn: &Connection, workspace_id: &str) -> Result<
     })
 }
 
+/// Frente E adversarial-review fix: the HIGHEST generation number any
+/// `Catalog::apply` call has ever committed for `workspace_id`, whether or
+/// not that generation ever went on to publish -- `MAX` of
+/// `source_index_state.current_generation` (updated INSIDE `Catalog::
+/// apply`'s own transaction, `upsert_source_index_state`) and
+/// `workspace_current_state.current_generation` ([`read_current_generation`],
+/// above, updated only later, by `publish::publish_delta`/`publish_cold`).
+/// Those two normally agree (`publish` always follows `apply` within the
+/// same successful request), so every EXISTING caller of
+/// `read_current_generation` keeps using it unchanged -- this is for exactly
+/// one new caller: `scan::run_reconcile`'s cold-fallback branch, reached
+/// only after `delta::run` has already returned an `Err`. If that failure
+/// happened AFTER `delta::run`'s own `run_one` committed `Catalog::apply`
+/// for `current_generation + 1` but BEFORE `publish_delta` ran (a real
+/// window: everything between those two calls -- materialize, diff_owner,
+/// the hybrid lane, the structural segment write -- is fallible), then
+/// `source_index_state.current_generation` already reads `current_generation
+/// + 1` while `workspace_current_state.current_generation` still reads the
+/// OLD value. Naively computing the fallback's next generation as
+/// `read_current_generation(..) + 1` in that window reuses the SAME
+/// generation number `delta::run`'s own (aborted) attempt already committed
+/// rows for -- `apply_full`'s own `Catalog::apply` would then try to
+/// `INSERT` a `source_observation_batches` row whose `observation_batch_id`
+/// (deterministic from `(workspace_id, generation)`, see
+/// `urdira_source_frontier::ids::observation_batch_id`) already exists,
+/// failing the SQLite transaction on a primary-key collision -- turning "R2:
+/// never leave a partial generation" into "R2: the recovery attempt itself
+/// fails, leaving generation `current_generation + 1` UNPUBLISHED forever
+/// (unreachable by any future request, since every future attempt recomputes
+/// the SAME colliding number)". Using the higher of the two counters here
+/// means the fallback always picks a genuinely free generation number,
+/// regardless of how far the aborted attempt got. See
+/// `reconcile_falls_back_to_cold_when_delta_fails_after_catalog_apply`
+/// (`tests_e2e.rs`) for the regression this closes.
+pub fn read_highest_applied_generation(
+    conn: &Connection,
+    workspace_id: &str,
+) -> Result<i64, ScanError> {
+    let published = read_current_generation(conn, workspace_id)?;
+    let applied = conn
+        .query_row(
+            "SELECT current_generation FROM source_index_state WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0))
+        .map_err(|error| {
+            ScanError(format!(
+                "v4 catalog: reading source_index_state.current_generation failed: {error}"
+            ))
+        })?;
+    Ok(published.max(applied))
+}
+
 /// Restores `synchronous=NORMAL` after the cold catalog transaction
 /// (`run_full_scan`, above) has committed -- see `open_and_ensure_schema`'s
 /// doc comment for why `synchronous=OFF` was safe for that transaction
