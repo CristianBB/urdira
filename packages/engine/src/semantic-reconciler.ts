@@ -1,5 +1,5 @@
 import { canonicalBytes, decodeCanonical, digestBytes } from "@urdira/canonical";
-import { hydrateRelationalValue, type RelationalValueRow, type WorkspaceDatabase } from "@urdira/storage";
+import { hydrateRelationalValue, type RelationalValueRow, type SqliteCommand, type WorkspaceDatabase } from "@urdira/storage";
 import { buildSemanticDocument } from "./semantic-documents.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
 import type { SemanticGeneratedVector } from "./semantic-runtime.js";
@@ -272,6 +272,8 @@ type StaleVectorRow = {
   readonly projection_record_id: string;
   readonly valid_from_generation: number;
   readonly closing_generation: number;
+  /** Plan 2026-09-06 (Frente S-A): the `semantic_document_status` document id this row's status entry is keyed by -- `owner_artifact_version_id` for step 2's artifact-grain query, `document_ref` (the owning entity record id) for step 4's entity-grain query -- aliased to this one column name by both queries. */
+  readonly document_id: string;
 };
 
 type MissingVectorRow = {
@@ -375,6 +377,52 @@ function renderEntityDocument(input: { readonly kind: string; readonly label: st
 }
 
 /**
+ * Plan 2026-09-06 (Frente S-A): `semantic_document_status` is the source of
+ * truth for "which documents are affected (not covered)" -- `core:search_semantic`'s
+ * coverage view and `core:semantic_affected_page` both read it, never
+ * `vector_projection_rows` directly for anything but the `covered` count.
+ * Fixed reason-code vocabulary (plan §4.1): `binary`, `oversized`,
+ * `below_min_length`, `unsupported_kind`, `provider_error:*`,
+ * `segments_truncated` (segmentation, Frente S-B, not written by this wave),
+ * `pending_embed`.
+ */
+type SemanticDocumentStatus = "covered" | "pending" | "excluded" | "unsupported" | "failed";
+
+/** One `semantic_document_status` upsert -- see that table's own DDL comment (`packages/storage/sql/workspace-v4-semantic.sql`). Reason codes are sorted for a deterministic stored JSON array. `segmentCount` defaults to `1` for `covered` documents (one artifact-or-entity vector; Frente S-B's per-segment count is out of this wave's scope) and `0` otherwise. */
+function documentStatusUpsertCommand(input: {
+  readonly workspaceId: string; readonly profileId: string; readonly executableBindingId: string;
+  readonly documentGrain: "artifact" | "entity"; readonly documentId: string;
+  readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string;
+  readonly status: SemanticDocumentStatus; readonly reasonCodes: readonly string[];
+  readonly segmentCount?: number; readonly generation: number; readonly updatedAt: string;
+}): SqliteCommand {
+  return {
+    kind: "run",
+    sql: `INSERT INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT (workspace_id, profile_id, executable_binding_id, document_grain, document_id) DO UPDATE SET
+            artifact_id = excluded.artifact_id, artifact_version_id = excluded.artifact_version_id, display_path = excluded.display_path,
+            status = excluded.status, reason_codes = excluded.reason_codes, segment_count = excluded.segment_count,
+            generation = excluded.generation, updated_at = excluded.updated_at`,
+    params: [
+      input.workspaceId, input.profileId, input.executableBindingId, input.documentGrain, input.documentId,
+      input.artifactId, input.artifactVersionId, input.displayPath, input.status,
+      JSON.stringify([...input.reasonCodes].sort()), input.segmentCount ?? (input.status === "covered" ? 1 : 0),
+      input.generation, input.updatedAt,
+    ],
+  };
+}
+
+/** Deletes one `semantic_document_status` row -- used when its underlying artifact version/entity record is no longer visible (plan §4.1's "cierre de versiones"). */
+function documentStatusDeleteCommand(input: { readonly workspaceId: string; readonly profileId: string; readonly executableBindingId: string; readonly documentGrain: "artifact" | "entity"; readonly documentId: string }): SqliteCommand {
+  return {
+    kind: "run",
+    sql: "DELETE FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = ? AND document_id = ?",
+    params: [input.workspaceId, input.profileId, input.executableBindingId, input.documentGrain, input.documentId],
+  };
+}
+
+/**
  * D-slice semantic sibling of `reconcileLexicalProjection`
  * (`lexical-reconciler.ts`): the async, post-ready maintenance pass the
  * daemon submits after every successful scan, bringing `vector_projection_rows`
@@ -449,6 +497,104 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   const generation = await currentGeneration();
   if (generation === undefined) return buildResult(0, false);
 
+  const nowIso = (): string => new Date().toISOString();
+
+  /** Cheap existence probe: does `semantic_document_status` already hold at least one row for this exact vector space? Gates whether the fast path below also needs to run the (idempotent, near-zero-cost-once-populated) bulk classification, for a legacy sidecar that predates this table. */
+  const hasAnyDocumentStatus = async (): Promise<boolean> => {
+    const row = await sql.get<{ present: number }>(
+      "SELECT 1 AS present FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? LIMIT 1",
+      [workspaceId, profileId, executableBindingId],
+    );
+    return row !== undefined;
+  };
+
+  /**
+   * Bulk, idempotent status-table maintenance that complements the
+   * per-document writes steps 3/5 make inline as they process the
+   * missing-vector queries: it classifies documents those queries never see
+   * at all (binary artifact versions; whole-file/module "container" entity
+   * records -- both excluded by the missing-vector queries' own SQL `WHERE`
+   * clauses), backfills `covered` rows for documents a prior pass (or a
+   * pre-`semantic_document_status` version of this reconciler) already
+   * vectorized without ever writing a status row, and sweeps orphaned rows
+   * whose underlying artifact version/entity record is no longer visible.
+   * Every statement is a single bulk `INSERT ... SELECT` / `DELETE ... WHERE
+   * NOT EXISTS` scoped by a `NOT EXISTS` against `semantic_document_status`
+   * itself (or, for the sweep, the reverse direction) -- so after the first
+   * pass over a given corpus, every one of these becomes a near-zero-row
+   * no-op scan, safe to run on every reconcile pass (including ones the fast
+   * path would otherwise skip entirely -- see `hasAnyDocumentStatus` above).
+   */
+  const syncDocumentStatusBulk = async (): Promise<void> => {
+    const updatedAt = nowIso();
+    await sql.run(
+      `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
+       SELECT ?, ?, ?, 'artifact', artifact_versions.artifact_version_id, artifact_versions.artifact_id, artifact_versions.artifact_version_id, COALESCE(source_artifacts.display_path, artifact_versions.artifact_id), 'excluded', '["binary"]', 0, ?, ?
+         FROM artifact_versions
+         JOIN source_artifacts ON source_artifacts.workspace_id = artifact_versions.workspace_id AND source_artifacts.artifact_id = artifact_versions.artifact_id
+        WHERE artifact_versions.workspace_id = ? AND artifact_versions.encoding = 'binary'
+          AND artifact_versions.valid_from_generation <= ? AND (artifact_versions.valid_to_generation IS NULL OR artifact_versions.valid_to_generation > ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM semantic_document_status
+             WHERE semantic_document_status.workspace_id = artifact_versions.workspace_id AND semantic_document_status.profile_id = ? AND semantic_document_status.executable_binding_id = ?
+               AND semantic_document_status.document_grain = 'artifact' AND semantic_document_status.document_id = artifact_versions.artifact_version_id
+          )`,
+      [workspaceId, profileId, executableBindingId, generation, updatedAt, workspaceId, generation, generation, profileId, executableBindingId],
+    );
+    await sql.run(
+      `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
+       SELECT ?, ?, ?, 'entity', record_occurrences.record_id, record_occurrences.owner_artifact_id, record_occurrences.owner_artifact_version_id, COALESCE(source_artifacts.display_path, record_occurrences.owner_artifact_id), 'unsupported', '["unsupported_kind"]', 0, ?, ?
+         FROM record_occurrences
+         JOIN source_artifacts ON source_artifacts.workspace_id = record_occurrences.workspace_id AND source_artifacts.artifact_id = record_occurrences.owner_artifact_id
+        WHERE record_occurrences.workspace_id = ? AND record_occurrences.category = 'entity' AND record_occurrences.kind = ?
+          AND record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM semantic_document_status
+             WHERE semantic_document_status.workspace_id = record_occurrences.workspace_id AND semantic_document_status.profile_id = ? AND semantic_document_status.executable_binding_id = ?
+               AND semantic_document_status.document_grain = 'entity' AND semantic_document_status.document_id = record_occurrences.record_id
+          )`,
+      [workspaceId, profileId, executableBindingId, generation, updatedAt, workspaceId, INELIGIBLE_ENTITY_RECORD_KIND, generation, generation, profileId, executableBindingId],
+    );
+    await sql.run(
+      `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
+       SELECT vector_projection_rows.workspace_id, vector_projection_rows.profile_id, vector_projection_rows.executable_binding_id,
+              CASE WHEN vector_projection_rows.document_grain = 'entity' THEN 'entity' ELSE 'artifact' END,
+              CASE WHEN vector_projection_rows.document_grain = 'entity' THEN vector_projection_rows.document_ref ELSE vector_projection_rows.owner_artifact_version_id END,
+              vector_projection_rows.owner_artifact_id, vector_projection_rows.owner_artifact_version_id,
+              COALESCE(source_artifacts.display_path, vector_projection_rows.owner_artifact_id), 'covered', '[]', 1, ?, ?
+         FROM vector_projection_rows
+         LEFT JOIN source_artifacts ON source_artifacts.workspace_id = vector_projection_rows.workspace_id AND source_artifacts.artifact_id = vector_projection_rows.owner_artifact_id
+        WHERE vector_projection_rows.workspace_id = ? AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ? AND vector_projection_rows.valid_to_generation IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM semantic_document_status
+             WHERE semantic_document_status.workspace_id = vector_projection_rows.workspace_id AND semantic_document_status.profile_id = vector_projection_rows.profile_id AND semantic_document_status.executable_binding_id = vector_projection_rows.executable_binding_id
+               AND semantic_document_status.document_grain = CASE WHEN vector_projection_rows.document_grain = 'entity' THEN 'entity' ELSE 'artifact' END
+               AND semantic_document_status.document_id = CASE WHEN vector_projection_rows.document_grain = 'entity' THEN vector_projection_rows.document_ref ELSE vector_projection_rows.owner_artifact_version_id END
+          )`,
+      [generation, updatedAt, workspaceId, profileId, executableBindingId],
+    );
+    await sql.run(
+      `DELETE FROM semantic_document_status
+        WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'artifact'
+          AND NOT EXISTS (
+            SELECT 1 FROM artifact_versions
+             WHERE artifact_versions.workspace_id = semantic_document_status.workspace_id AND artifact_versions.artifact_version_id = semantic_document_status.document_id
+               AND artifact_versions.valid_from_generation <= ? AND (artifact_versions.valid_to_generation IS NULL OR artifact_versions.valid_to_generation > ?)
+          )`,
+      [workspaceId, profileId, executableBindingId, generation, generation],
+    );
+    await sql.run(
+      `DELETE FROM semantic_document_status
+        WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'entity'
+          AND NOT EXISTS (
+            SELECT 1 FROM record_occurrences
+             WHERE record_occurrences.workspace_id = semantic_document_status.workspace_id AND record_occurrences.record_id = semantic_document_status.document_id
+               AND record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
+          )`,
+      [workspaceId, profileId, executableBindingId, generation, generation],
+    );
+  };
+
   // Already-complete fast path: the completion marker is only ever written
   // (below) after a full close+insert pass against exactly this generation
   // AND this exact provider identity AND both document grains completing
@@ -473,6 +619,17 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // tracking, read back as undefined) is not complete for THIS policy -- see
   // `entityPolicyDigest`'s comment above.
   if (indexState !== undefined && indexState.completed_generation === generation && indexState.profile_id === profileId && indexState.executable_binding_id === executableBindingId && documentGrainsComplete && indexState.entity_policy_digest === entityPolicyDigest) {
+    // Plan 2026-09-06 (Frente S-A) backfill: a marker already satisfying the
+    // fast path proves every vector is in place, but says nothing about
+    // whether `semantic_document_status` has ever been populated for this
+    // exact vector space -- a sidecar that reached "complete" under a
+    // pre-`semantic_document_status` build of this reconciler (or one whose
+    // status rows were later wiped) would otherwise stay invisible to
+    // `core:semantic_affected_page`/the coverage view forever, since the
+    // fast path would keep returning here without ever reaching the slow
+    // path's own per-document writes. `hasAnyDocumentStatus` makes the
+    // common (already-backfilled) case a single indexed point lookup.
+    if (!(await hasAnyDocumentStatus())) await syncDocumentStatusBulk();
     return buildResult(generation, true);
   }
 
@@ -522,7 +679,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // step 1 applies to the per-row `UPDATE` here.
   const staleRows = await sql.all<StaleVectorRow>(
     `SELECT vector_projection_rows.projection_record_id AS projection_record_id, vector_projection_rows.valid_from_generation AS valid_from_generation,
-            artifact_versions.valid_to_generation AS closing_generation
+            artifact_versions.valid_to_generation AS closing_generation, vector_projection_rows.owner_artifact_version_id AS document_id
        FROM vector_projection_rows
        JOIN artifact_versions ON artifact_versions.workspace_id = vector_projection_rows.workspace_id
         AND artifact_versions.artifact_id = vector_projection_rows.owner_artifact_id
@@ -538,10 +695,16 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     // row after it) is simply left OPEN for the next pass to close instead.
     if (shouldAbort?.()) return buildResult(generation, false, true);
     await waitForQueryDrain();
-    await sql.run(
-      "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?",
-      [row.closing_generation, workspaceId, row.projection_record_id, row.valid_from_generation],
-    );
+    // Plan 2026-09-06 (Frente S-A): the vector close and its
+    // `semantic_document_status` row's removal land in one transaction --
+    // the underlying artifact version is already gone, so this document has
+    // no place in the status table at all (never re-inserted as `pending`
+    // by a later pass, since the missing-vector query it would come from
+    // requires the version to be VISIBLE).
+    await sql.transaction([
+      { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [row.closing_generation, workspaceId, row.projection_record_id, row.valid_from_generation] },
+      documentStatusDeleteCommand({ workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: row.document_id }),
+    ]);
     counts.closed += 1;
     await yieldToEventLoop();
   }
@@ -563,10 +726,27 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     readonly validFromGeneration: number;
     readonly documentGrain?: "entity";
     readonly documentRef?: string;
+    /** Plan 2026-09-06 (Frente S-A): carried through so `commitGeneratedVector`/`embedAndCommitBatch` can write this item's `semantic_document_status` row without a second query. */
+    readonly displayPath: string;
   };
 
   const bumpInserted = (item: PendingEmbedItem): void => { if (item.documentGrain === "entity") counts.entity_inserted += 1; else counts.inserted += 1; };
   const bumpFailed = (item: PendingEmbedItem): void => { if (item.documentGrain === "entity") counts.entity_failed += 1; else counts.failed += 1; };
+
+  /** Plan 2026-09-06 (Frente S-A): the `semantic_document_status` document id for one pending item -- the owning entity record id for an entity item, the artifact version id for an artifact item (mirrors `entityDocumentId`'s own natural-id convention for this table, see the DDL's own comment: "artifact_version_id or the entity record id"). */
+  const documentIdOf = (item: PendingEmbedItem): string => item.documentGrain === "entity" ? item.documentRef! : item.ownerArtifactVersionId;
+
+  /** Plan 2026-09-06 (Frente S-A): immediate (non-transactional) status upsert -- used wherever there is no companion vector write to be atomic WITH (a permanent skip classification, or a `failed` classification). Reads `generation`/`workspaceId`/`profileId`/`executableBindingId` from the enclosing closure. */
+  const writeStatusRow = async (input: { readonly documentGrain: "artifact" | "entity"; readonly documentId: string; readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly status: SemanticDocumentStatus; readonly reasonCodes: readonly string[] }): Promise<void> => {
+    const command = documentStatusUpsertCommand({ workspaceId, profileId, executableBindingId, generation, updatedAt: nowIso(), ...input });
+    if (command.kind !== "run") throw new Error("unreachable: documentStatusUpsertCommand always returns a run command");
+    await sql.run(command.sql, command.params ?? []);
+  };
+
+  /** `writeStatusRow` for a `PendingEmbedItem` -- see that function's own doc comment. */
+  const writeItemStatus = async (item: PendingEmbedItem, status: SemanticDocumentStatus, reasonCodes: readonly string[]): Promise<void> => {
+    await writeStatusRow({ documentGrain: item.documentGrain ?? "artifact", documentId: documentIdOf(item), artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath, status, reasonCodes });
+  };
 
   // Commits ONE already-generated vector for ONE pending item: the exact
   // same parked-row-reopen-or-insert decision the pre-batching loop made
@@ -601,13 +781,28 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       [workspaceId, item.projectionRecordId, item.validFromGeneration],
     );
     if (parked !== undefined) {
-      if (parked.vector_digest !== generated.vector_digest) { bumpFailed(item); return; }
-      if (parked.valid_to_generation !== null) {
-        await sql.run(
-          "UPDATE vector_projection_rows SET valid_to_generation = NULL WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?",
-          [workspaceId, item.projectionRecordId, item.validFromGeneration],
-        );
+      if (parked.vector_digest !== generated.vector_digest) {
+        bumpFailed(item);
+        // Plan 2026-09-06 (Frente S-A): a non-deterministic provider under an
+        // unchanged binding digest -- structurally distinguishable from every
+        // other failure mode here, so it gets its own reason code.
+        await writeItemStatus(item, "failed", ["provider_error:vector_digest_mismatch"]);
+        return;
       }
+      // Plan 2026-09-06 (Frente S-A): the reopen (when needed) and the
+      // `covered` status upsert land in one transaction -- when the parked
+      // row is already open (the defensive "cannot normally reach here"
+      // case noted below), there is nothing to reopen and the status upsert
+      // runs alone.
+      const statusCommand = documentStatusUpsertCommand({
+        workspaceId, profileId, executableBindingId, documentGrain: item.documentGrain ?? "artifact", documentId: documentIdOf(item),
+        artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath,
+        status: "covered", reasonCodes: [], generation, updatedAt: nowIso(),
+      });
+      const reopenCommands: SqliteCommand[] = parked.valid_to_generation !== null
+        ? [{ kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = NULL WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [workspaceId, item.projectionRecordId, item.validFromGeneration] }, statusCommand]
+        : [statusCommand];
+      await sql.transaction(reopenCommands);
       // An OPEN parked row (valid_to already NULL) cannot normally reach here
       // (the missing-rows queries exclude documents with an open current-
       // profile row), treated as already-covered either way.
@@ -637,11 +832,22 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         // item.documentGrain`.
         ...(item.documentGrain === undefined ? {} : { document_grain: item.documentGrain }),
         ...(item.documentRef === undefined ? {} : { document_ref: item.documentRef }),
-      }]);
+      }], [
+        // Plan 2026-09-06 (Frente S-A): the `covered` status row commits in
+        // the SAME transaction as the vector insert (`putVectors`'s own
+        // `extraCommands` parameter) -- a crash between the two can never
+        // leave one written without the other.
+        documentStatusUpsertCommand({
+          workspaceId, profileId, executableBindingId, documentGrain: item.documentGrain ?? "artifact", documentId: documentIdOf(item),
+          artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath,
+          status: "covered", reasonCodes: [], generation, updatedAt: nowIso(),
+        }),
+      ]);
     } catch {
       // putVectors rejected the batch (shard conflict, invalid vector, ...):
       // left missing, retried next pass, marker withheld below.
       bumpFailed(item);
+      await writeItemStatus(item, "failed", ["provider_error:vector_write_failed"]);
       return;
     }
     bumpInserted(item);
@@ -703,6 +909,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         // is withheld while either failure counter is nonzero so the fast
         // path can never seal these rows out of retry.
         bumpFailed(item);
+        await writeItemStatus(item, "failed", ["provider_error:generate_vector_failed"]);
         continue;
       }
       await commitGeneratedVector(item, generated);
@@ -760,14 +967,28 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     // the batch itself is the atom the checkpoint now protects, not each
     // individual row's read.
     if (pendingBatch.length === 0 && shouldAbort?.()) return buildResult(generation, false, true);
-    if (row.byte_length > maxDocumentBytes) { counts.skipped_oversized += 1; continue; }
+    const displayPath = row.display_path ?? row.artifact_id;
+    if (row.byte_length > maxDocumentBytes) {
+      counts.skipped_oversized += 1;
+      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["oversized"] });
+      continue;
+    }
     const bytes = await content.read(row.content_hash);
     const text = decodeText(bytes);
-    if (text === undefined) { counts.skipped_undecodable += 1; continue; }
+    if (text === undefined) {
+      counts.skipped_undecodable += 1;
+      // Decided in implementation: the fixed reason-code vocabulary (plan
+      // §4.1) has no separate code for "declared non-binary but does not
+      // decode as clean UTF-8" -- reusing `binary` here is the closest fit
+      // (both mean "not real embeddable text"), never silently dropped from
+      // the affected view.
+      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["binary"] });
+      continue;
+    }
     const document = buildSemanticDocument({
       artifact_id: row.artifact_id,
       artifact_version_id: row.artifact_version_id,
-      display_path: row.display_path ?? row.artifact_id,
+      display_path: displayPath,
       content_class: "source",
       language_ids: [],
       source_text: text,
@@ -776,7 +997,14 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     // See `EMBEDDABLE_TOKEN_PATTERN`'s doc comment: classified BEFORE ever
     // calling the provider, so this never costs a network round trip (HTTP
     // provider) or risks matching the wrong thrown error (local provider).
-    if (!EMBEDDABLE_TOKEN_PATTERN.test(embeddingText)) { counts.skipped_empty += 1; continue; }
+    if (!EMBEDDABLE_TOKEN_PATTERN.test(embeddingText)) {
+      counts.skipped_empty += 1;
+      // Decided in implementation: an empty/degenerate document is
+      // permanently unembeddable content, closest to `below_min_length` in
+      // the fixed vocabulary (there is no dedicated "empty" code).
+      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["below_min_length"] });
+      continue;
+    }
     // Every new row is back-dated to the version's own
     // `valid_from_generation`, same as `reconcileLexicalProjection` does for
     // lexical documents: it makes the vector visible starting from exactly
@@ -788,7 +1016,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     // `semanticVectorProjectionRecordId`), so the old and new rows can never
     // share a primary key.
     const projectionRecordId = semanticVectorProjectionRecordId({ document_id: document.document_id, profile_id: profileId, executable_binding_id: executableBindingId });
-    pendingBatch.push({ embeddingText, projectionRecordId, ownerArtifactId: row.artifact_id, ownerArtifactVersionId: row.artifact_version_id, validFromGeneration: row.valid_from_generation });
+    pendingBatch.push({ embeddingText, projectionRecordId, ownerArtifactId: row.artifact_id, ownerArtifactVersionId: row.artifact_version_id, validFromGeneration: row.valid_from_generation, displayPath });
     if (pendingBatch.length < embedBatchSize) continue;
     await embedAndCommitBatch(pendingBatch);
     pendingBatch = [];
@@ -817,7 +1045,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // falls back to the CURRENT generation via `COALESCE`.
   const staleEntityRows = await sql.all<StaleVectorRow>(
     `SELECT vector_projection_rows.projection_record_id AS projection_record_id, vector_projection_rows.valid_from_generation AS valid_from_generation,
-            COALESCE(record_occurrences.valid_to_generation, ?) AS closing_generation
+            COALESCE(record_occurrences.valid_to_generation, ?) AS closing_generation, vector_projection_rows.document_ref AS document_id
        FROM vector_projection_rows
        LEFT JOIN record_occurrences ON record_occurrences.workspace_id = vector_projection_rows.workspace_id
         AND record_occurrences.record_id = vector_projection_rows.document_ref
@@ -831,10 +1059,12 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   );
   for (const row of staleEntityRows) {
     if (shouldAbort?.()) return buildResult(generation, false, true);
-    await sql.run(
-      "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?",
-      [row.closing_generation, workspaceId, row.projection_record_id, row.valid_from_generation],
-    );
+    // Plan 2026-09-06 (Frente S-A): same one-transaction close+delete as
+    // step 2's identical stale-close loop above.
+    await sql.transaction([
+      { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [row.closing_generation, workspaceId, row.projection_record_id, row.valid_from_generation] },
+      documentStatusDeleteCommand({ workspaceId, profileId, executableBindingId, documentGrain: "entity", documentId: row.document_id }),
+    ]);
     counts.closed += 1;
     counts.entity_closed += 1;
     await yieldToEventLoop();
@@ -911,17 +1141,43 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       }
     }
     const fileState = currentFileState!;
-    if (fileState.status === "oversized") { counts.entity_skipped_oversized += 1; continue; }
-    if (fileState.status === "undecodable") { counts.entity_skipped_undecodable += 1; continue; }
+    const entityDisplayPath = row.display_path ?? row.owner_artifact_id;
+    if (fileState.status === "oversized") {
+      counts.entity_skipped_oversized += 1;
+      await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["oversized"] });
+      continue;
+    }
+    if (fileState.status === "undecodable") {
+      counts.entity_skipped_undecodable += 1;
+      await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["binary"] });
+      continue;
+    }
     const body = row.body_payload == null
       ? decodeEntityRecordBody(hydrateRelationalValue(await sql.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [workspaceId, row.record_id, row.valid_from_generation])))
       : decodeEntityRecordBody(decodeCanonical(row.body_payload instanceof Uint8Array ? row.body_payload : new Uint8Array(row.body_payload)));
     const eligibility = evaluateEntityEligibility(row.record_kind, body, fileState.text, minEntitySpanLength);
-    if (!eligibility.eligible) { counts.entity_skipped_ineligible += 1; continue; }
+    if (!eligibility.eligible) {
+      counts.entity_skipped_ineligible += 1;
+      // Decided in implementation: a body `kind` this reconciler never
+      // embeds regardless of span/position (`INELIGIBLE_ENTITY_BODY_KINDS`,
+      // e.g. `"parameter"`) is `unsupported_kind`; every other ineligibility
+      // reason `evaluateEntityEligibility` checks (span too short, or not a
+      // top-level/column-0 declaration) is `below_min_length` -- the closest
+      // fit in the fixed vocabulary for "this span/position never
+      // qualifies".
+      const bodyKind = typeof body["kind"] === "string" ? body["kind"] as string : undefined;
+      const reasonCode = bodyKind !== undefined && INELIGIBLE_ENTITY_BODY_KINDS.has(bodyKind) ? "unsupported_kind" : "below_min_length";
+      await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: reasonCode === "unsupported_kind" ? "unsupported" : "excluded", reasonCodes: [reasonCode] });
+      continue;
+    }
     const spanText = fileState.text.slice(eligibility.start, eligibility.end);
     const docComment = leadingDocComment(fileState.text, eligibility.start);
     const embeddingText = renderEntityDocument({ kind: eligibility.kind, label: eligibility.label, docComment, spanText });
-    if (!EMBEDDABLE_TOKEN_PATTERN.test(embeddingText)) { counts.entity_skipped_empty += 1; continue; }
+    if (!EMBEDDABLE_TOKEN_PATTERN.test(embeddingText)) {
+      counts.entity_skipped_empty += 1;
+      await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["below_min_length"] });
+      continue;
+    }
     // Identity is a pure function of the RECORD id alone (see
     // `entityDocumentId`'s own doc comment) -- back-dated to the RECORD's own
     // `valid_from_generation` (not the owning file's), so a reused record
@@ -933,12 +1189,21 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       embeddingText, projectionRecordId,
       ownerArtifactId: row.owner_artifact_id, ownerArtifactVersionId: row.owner_artifact_version_id,
       validFromGeneration: row.valid_from_generation, documentGrain: "entity", documentRef: row.record_id,
+      displayPath: entityDisplayPath,
     });
     if (entityPendingBatch.length < embedBatchSize) continue;
     await embedAndCommitBatch(entityPendingBatch);
     entityPendingBatch = [];
   }
   if (entityPendingBatch.length > 0) await embedAndCommitBatch(entityPendingBatch);
+
+  // Plan 2026-09-06 (Frente S-A): bulk status-table maintenance -- binary/
+  // unsupported-kind classification, covered-from-vectors backfill, and the
+  // orphan sweep (see `syncDocumentStatusBulk`'s own doc comment). Runs on
+  // every slow-path pass; each statement is a `NOT EXISTS`-scoped bulk
+  // operation that becomes a near-zero-row no-op once the corpus has been
+  // classified once, so this is cheap in the (common) steady state.
+  await syncDocumentStatusBulk();
 
   // Only publish the completion marker if the workspace's current generation
   // is still exactly what step 1 (generation read) read -- same reasoning as

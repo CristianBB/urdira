@@ -32,6 +32,8 @@ import type {
   LexicalSearchMatch,
   PendingSiteRow,
   RecordColumnSelector,
+  SemanticAffectedDocumentRow,
+  SemanticDocumentStatusCounts,
   SemanticIndexStateSnapshot,
   SemanticVectorRow,
   SqliteCanonicalQuerySnapshotPort,
@@ -438,5 +440,13 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
 
   async semantic_entity_scope_counts(scope: QueryScope): Promise<{ readonly entity_count: number }> {
     return this.sqlite.semantic_entity_scope_counts!(scope);
+  }
+
+  async semantic_document_status_counts(scope: QueryScope, profileId: string, executableBindingId: string): Promise<SemanticDocumentStatusCounts> {
+    return this.sqlite.semantic_document_status_counts!(scope, profileId, executableBindingId);
+  }
+
+  async semantic_affected_documents(scope: QueryScope, profileId: string, executableBindingId: string): Promise<readonly SemanticAffectedDocumentRow[]> {
+    return this.sqlite.semantic_affected_documents!(scope, profileId, executableBindingId);
   }
 }

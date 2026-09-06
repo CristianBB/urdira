@@ -1,5 +1,5 @@
-import { canonicalBytes, digestBytes } from "@urdira/canonical";
-import { facetRegistry, languageRegistry, universalEntityKinds, universalRelationKinds, type QueryScope, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
+import { canonicalBytes, digestBytes, digestCanonicalArray } from "@urdira/canonical";
+import { facetRegistry, languageRegistry, universalEntityKinds, universalRelationKinds, type QueryScope, type SemanticAffectedArtifactPage, type SemanticAffectedArtifactView, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
 import type { RelationalValueRow } from "@urdira/storage";
 import type { SqliteDatabase } from "@urdira/storage";
 import { EngineError, EngineErrorWithDetails } from "./errors.js";
@@ -212,6 +212,36 @@ export interface CanonicalQuerySnapshotPort {
    */
   readonly semantic_entity_scope_counts?: (scope: QueryScope) => Promise<{ readonly entity_count: number }>;
   /**
+   * Plan 2026-09-06 (Frente S-A): real, per-`semantic_document_status`
+   * counts for one exact vector space -- a single `GROUP BY document_grain,
+   * status` over the status table. Replaces `semantic_scope_counts`/
+   * `semantic_entity_scope_counts`'s inferred/over-counted
+   * `unsupported_artifact_count`/`failed_artifact_count`/`entity_count`/
+   * `covered_entity_count` in `buildSemanticCoverageView` whenever the port
+   * implements this method; `undefined` keeps the pre-existing inferred
+   * arithmetic exactly as it was (a v3/legacy-sidecar port with no status
+   * table simply omits this, same optional-capability convention every other
+   * `semantic_*` method here already uses).
+   */
+  readonly semantic_document_status_counts?: (scope: QueryScope, profile_id: string, executable_binding_id: string) => Promise<SemanticDocumentStatusCounts>;
+  /**
+   * Plan 2026-09-06 (Frente S-A): every AFFECTED (`status <> 'covered'`)
+   * document's identity/status/reasons for one exact vector space, ordered
+   * by `(display_path, artifact_id, document_id)` in ONE bulk read -- the
+   * single pass `core:search_semantic`/`core:search_hybrid`'s embedded first
+   * page and `core:semantic_affected_page`'s own keyset pagination both
+   * paginate over in memory (never re-queried per page: this method's own
+   * result IS the complete, stably-ordered affected set for this exact
+   * `(generation, profile_id, executable_binding_id)`). Bounded by corpus
+   * size, not by any page `limit` -- the same order of magnitude
+   * `semantic_vectors` (unfiltered, uncapped) already accepts on every
+   * semantic search call, so this is not a new performance-class cost.
+   * `undefined` disables the "affected page" capability entirely (no
+   * `affected_artifact_set_id`/`affected_artifact_page` on the coverage view,
+   * and `core:semantic_affected_page` answers `core:required_capability_unsupported`).
+   */
+  readonly semantic_affected_documents?: (scope: QueryScope, profile_id: string, executable_binding_id: string) => Promise<readonly SemanticAffectedDocumentRow[]>;
+  /**
    * `core:get_outline`'s additive `pending_sites` stream (evidence doc
    * 2026-09-04 §8): every visible `pending.sites` row
    * (`crates/urdira-structural-store`) owned by one artifact -- the
@@ -245,6 +275,25 @@ export interface SemanticIndexStateSnapshot {
   readonly completed_generation?: number;
   readonly profile_id?: string;
   readonly executable_binding_id?: string;
+}
+
+/** Plan 2026-09-06 (Frente S-A): `semantic_document_status_counts`'s own doc comment. */
+export interface SemanticDocumentStatusCounts {
+  readonly unsupported_artifact_count: number;
+  readonly failed_artifact_count: number;
+  readonly entity_count: number;
+  readonly covered_entity_count: number;
+}
+
+/** Plan 2026-09-06 (Frente S-A): `semantic_affected_documents`'s own doc comment -- one row of `semantic_document_status`, minus the columns the affected view never surfaces (`segment_count`, `generation`, `updated_at`). */
+export interface SemanticAffectedDocumentRow {
+  readonly document_grain: "artifact" | "entity";
+  readonly document_id: string;
+  readonly artifact_id: string;
+  readonly artifact_version_id: string;
+  readonly display_path: string;
+  readonly status: string;
+  readonly reason_codes: readonly string[];
 }
 
 /**
@@ -394,6 +443,10 @@ const SEMANTIC_CANDIDATE_CAP = 100;
 // pool since the two lanes run separate `exactVectorScan` calls (see
 // `trySemanticSearch`).
 const SEMANTIC_ENTITY_CANDIDATE_CAP = SEMANTIC_CANDIDATE_CAP;
+/** Plan 2026-09-06 (Frente S-A, §4.2): the coverage view's embedded first affected page size -- `min(response_budget.max_items, 20)`; see `trySemanticSearch`'s own call site for why the plain `20` is used here (`response_budget` does not reach this layer). */
+const SEMANTIC_AFFECTED_FIRST_PAGE_LIMIT = 20;
+/** `core:semantic_affected_page`'s own default/maximum `limit` -- default mirrors the coverage view's embedded first page, maximum bounds a single continuation call's cost the same way `MAX_MCP_PAGE_ITEMS` bounds `response_budget.max_items` one layer up. */
+const SEMANTIC_AFFECTED_PAGE_MAX_LIMIT = 200;
 // Must track the reconciler's own `max_document_bytes` default
 // (`semantic-reconciler.ts`'s `ReconcileSemanticProjectionInput.max_document_bytes`,
 // default 2_000_000) for `semantic_scope_counts`'s `oversized_count` to mean
@@ -1249,6 +1302,43 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return { entity_count: row?.entity_count ?? 0 };
   }
 
+  /** See `CanonicalQuerySnapshotPort.semantic_document_status_counts`'s own doc comment. */
+  async semantic_document_status_counts(scope: QueryScope, profileId: string, executableBindingId: string): Promise<SemanticDocumentStatusCounts> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    const rows = await this.database.all<{ document_grain: string; status: string; n: number }>(
+      "SELECT document_grain, status, COUNT(*) AS n FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? GROUP BY document_grain, status",
+      [scope.workspace_id, profileId, executableBindingId],
+    );
+    let unsupportedArtifacts = 0, failedArtifacts = 0, entityCount = 0, coveredEntityCount = 0;
+    for (const row of rows) {
+      if (row.document_grain === "entity") {
+        entityCount += row.n;
+        if (row.status === "covered") coveredEntityCount += row.n;
+      } else {
+        if (row.status === "unsupported") unsupportedArtifacts += row.n;
+        else if (row.status === "failed") failedArtifacts += row.n;
+      }
+    }
+    return { unsupported_artifact_count: unsupportedArtifacts, failed_artifact_count: failedArtifacts, entity_count: entityCount, covered_entity_count: coveredEntityCount };
+  }
+
+  /** See `CanonicalQuerySnapshotPort.semantic_affected_documents`'s own doc comment. */
+  async semantic_affected_documents(scope: QueryScope, profileId: string, executableBindingId: string): Promise<readonly SemanticAffectedDocumentRow[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    const rows = await this.database.all<{ document_grain: string; document_id: string; artifact_id: string; artifact_version_id: string; display_path: string; status: string; reason_codes: string }>(
+      `SELECT document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes
+         FROM semantic_document_status
+        WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND status <> 'covered'
+        ORDER BY display_path, artifact_id, document_id`,
+      [scope.workspace_id, profileId, executableBindingId],
+    );
+    return rows.map((row) => ({
+      document_grain: row.document_grain === "entity" ? "entity" as const : "artifact" as const,
+      document_id: row.document_id, artifact_id: row.artifact_id, artifact_version_id: row.artifact_version_id, display_path: row.display_path, status: row.status,
+      reason_codes: parseReasonCodes(row.reason_codes),
+    }));
+  }
+
   /**
    * D1/D6: literal-substring search over `lexical_documents`/`lexical_fts`,
    * trusted only when `lexical_index_state.completed_generation` equals
@@ -1926,6 +2016,14 @@ function digestOf(value: unknown): string {
   return digestBytes(canonicalBytes(value));
 }
 
+/** Plan 2026-09-06 (Frente S-A): defensive decode of `semantic_document_status.reason_codes` -- always written by this codebase's own reconciler as a JSON array of strings, but never trusted blindly against a hand-edited or foreign-tool-written row. */
+function parseReasonCodes(value: string): readonly string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+  } catch { return []; }
+}
+
 /**
  * Collapses `vectors` (as `semantic_vectors` returns them: every visible row
  * for one provider identity, unfiltered, unranked) to at most one row per
@@ -2060,6 +2158,133 @@ function matchesWordMode(value: string, offset: number, length: number, mode: "s
  * genuinely separate question this v1 extension answers informationally, not
  * yet a gate on the overall semantic lane's readiness state.
  */
+/**
+ * Plan 2026-09-06 (Frente S-A, R11): the stateless, self-contained
+ * `core:semantic_affected_page` cursor -- a hex-encoded JSON object `{set,
+ * k, dir}` (hexadecimal, NOT base64/base64url: `scripts/check-architecture.mjs`'s
+ * `checkNativePipelineContracts` guardrail bans `Buffer`/`toString` base64
+ * framing repo-wide, and `packages/engine/src/cursor-cache.ts`'s own opaque
+ * cursor tokens already establish hex as this codebase's one local-handle
+ * encoding -- see that file's `encode`/`decode` for the identical
+ * convention this mirrors). `set` is the `affected_artifact_set_id` the
+ * cursor was minted against (a cursor whose `set` disagrees with the
+ * CURRENT set id is rejected outright, never silently mixed into a page --
+ * see `pageAffectedRows`'s caller); `k` is the `(display_path, artifact_id,
+ * document_id)` keyset tuple of the row the cursor is anchored to; `dir` is
+ * `"next"` (this cursor was minted from a page's LAST row, so the next page
+ * starts strictly after `k`) or `"prev"` (minted from a page's FIRST row, so
+ * the previous page ends strictly before `k`).
+ */
+interface AffectedCursor {
+  readonly set: string;
+  readonly k: readonly [string, string, string];
+  readonly dir: "next" | "prev";
+}
+
+/** Thrown by `decodeAffectedCursor` for a structurally malformed cursor -- `execute`'s caller (`trySemanticAffectedPage`) turns this into a registered `core:invalid_argument`-shaped error, never an unhandled throw. */
+export class AffectedCursorError extends Error {}
+
+function encodeAffectedCursor(cursor: AffectedCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("hex");
+}
+
+function decodeAffectedCursor(token: string): AffectedCursor {
+  let parsed: unknown;
+  try { parsed = JSON.parse(Buffer.from(token, "hex").toString("utf8")); }
+  catch { throw new AffectedCursorError("Malformed core:semantic_affected_page cursor: not valid hex-encoded JSON."); }
+  if (typeof parsed !== "object" || parsed === null) throw new AffectedCursorError("Malformed core:semantic_affected_page cursor: expected a JSON object.");
+  const record = parsed as Record<string, unknown>;
+  const set = record["set"];
+  const k = record["k"];
+  const dir = record["dir"];
+  if (typeof set !== "string" || !Array.isArray(k) || k.length !== 3 || !k.every((value): value is string => typeof value === "string") || (dir !== "next" && dir !== "prev")) {
+    throw new AffectedCursorError("Malformed core:semantic_affected_page cursor: expected {set: string, k: [string, string, string], dir: \"next\" | \"prev\"}.");
+  }
+  return { set, k: [k[0] as string, k[1] as string, k[2] as string], dir };
+}
+
+/** Lexicographic order over an affected row's `(display_path, artifact_id, document_id)` keyset tuple -- the exact tie-break chain `semantic_affected_documents`'s own `ORDER BY` uses, so binary-searching this array with this comparator agrees with the array's own order. */
+function compareAffectedKeys(left: readonly [string, string, string], right: readonly [string, string, string]): number {
+  for (let index = 0; index < 3; index += 1) {
+    const a = left[index]!, b = right[index]!;
+    if (a < b) return -1;
+    if (a > b) return 1;
+  }
+  return 0;
+}
+
+function affectedKeyOf(row: SemanticAffectedDocumentRow): readonly [string, string, string] {
+  return [row.display_path, row.artifact_id, row.document_id];
+}
+
+/**
+ * Plan 2026-09-06 (Frente S-A): slices `rows` (already ordered by
+ * `affectedKeyOf`, `semantic_affected_documents`'s own contract) into one
+ * page, entirely in memory -- a binary search locates the cursor's anchor in
+ * O(log n), then a plain array slice produces the page, so pagination cost
+ * is independent of how many earlier pages were walked. `cursor` absent
+ * means "first page, ascending, from the start."
+ */
+function pageAffectedRows(rows: readonly SemanticAffectedDocumentRow[], limit: number, cursor?: { readonly k: readonly [string, string, string]; readonly dir: "next" | "prev" }): { readonly page: readonly SemanticAffectedDocumentRow[]; readonly startIndex: number } {
+  if (cursor === undefined) return { page: rows.slice(0, limit), startIndex: 0 };
+  if (cursor.dir === "next") {
+    // First index whose key is strictly greater than the cursor's anchor.
+    let lo = 0, hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (compareAffectedKeys(affectedKeyOf(rows[mid]!), cursor.k) <= 0) lo = mid + 1; else hi = mid;
+    }
+    return { page: rows.slice(lo, lo + limit), startIndex: lo };
+  }
+  // "prev": first index whose key is NOT strictly less than the cursor's
+  // anchor (i.e. the exclusive end of "everything before the anchor"), then
+  // take up to `limit` rows immediately preceding it.
+  let lo = 0, hi = rows.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (compareAffectedKeys(affectedKeyOf(rows[mid]!), cursor.k) < 0) lo = mid + 1; else hi = mid;
+  }
+  const start = Math.max(0, lo - limit);
+  return { page: rows.slice(start, lo), startIndex: start };
+}
+
+/**
+ * Plan 2026-09-06 (Frente S-A): builds one `SemanticAffectedArtifactPage`
+ * (§4.2/§4.3) from the complete, already-ordered affected-row set
+ * (`semantic_affected_documents`) plus an optional decoded cursor -- shared
+ * verbatim by `buildSemanticCoverageView`'s embedded first page and
+ * `trySemanticAffectedPage`'s own continuation operation, so the two can
+ * never disagree about set id computation or page-boundary arithmetic.
+ * `setId` is computed ONCE per call over every row in `rows` (R11's
+ * "accumulated digest over the sorted keys"), independent of `limit`/`cursor`,
+ * so it is stable across every page of the SAME underlying set.
+ */
+/** The `affected_artifact_set_id` component of `buildAffectedArtifactPage` -- split out so `trySemanticAffectedPage` can validate a requested set id/cursor against the CURRENT set BEFORE paying for `pageAffectedRows`, and so the coverage view's embedded-first-page call site and the continuation operation's own call site never compute this digest twice for the same `rows`/identity. */
+function computeAffectedSetId(rows: readonly SemanticAffectedDocumentRow[], inputs: { readonly bindingId: string; readonly generation: number; readonly profileId: string; readonly executableBindingId: string }): string {
+  const keysDigest = digestCanonicalArray(rows.map(affectedKeyOf));
+  return digestOf({ binding_id: inputs.bindingId, generation: inputs.generation, profile_id: inputs.profileId, executable_binding_id: inputs.executableBindingId, total: rows.length, keys_digest: keysDigest });
+}
+
+function buildAffectedArtifactPage(rows: readonly SemanticAffectedDocumentRow[], inputs: { readonly setId: string; readonly limit: number; readonly cursor?: { readonly k: readonly [string, string, string]; readonly dir: "next" | "prev" } }): SemanticAffectedArtifactPage {
+  const setId = inputs.setId;
+  const { page, startIndex } = pageAffectedRows(rows, inputs.limit, inputs.cursor);
+  const hasPrevious = startIndex > 0;
+  const hasNext = startIndex + page.length < rows.length;
+  const artifacts: readonly SemanticAffectedArtifactView[] = page.map((row) => ({
+    artifact_id: row.artifact_id, artifact_version_id: row.artifact_version_id, display_path: row.display_path,
+    coverage_status: row.status, reason_codes: row.reason_codes, diagnostic_record_ids: [],
+  }));
+  return {
+    affected_artifact_set_id: setId,
+    artifacts,
+    total: rows.length,
+    ...(hasNext && page.length > 0 ? { next_cursor: encodeAffectedCursor({ set: setId, k: affectedKeyOf(page[page.length - 1]!), dir: "next" }) } : {}),
+    ...(hasPrevious && page.length > 0 ? { previous_cursor: encodeAffectedCursor({ set: setId, k: affectedKeyOf(page[0]!), dir: "prev" }) } : {}),
+    has_next: hasNext,
+    has_previous: hasPrevious,
+  };
+}
+
 type EntitySemanticCoverageView = SemanticCoverageView & {
   /** Decision 17: cheap over-count of candidate entity records (`CanonicalQuerySnapshotPort.semantic_entity_scope_counts`'s own doc comment explains why this over-counts relative to the reconciler's true eligible set). `0` when the port does not implement that method. */
   readonly entity_count: number;
@@ -2076,8 +2301,18 @@ function buildSemanticCoverageView(inputs: {
   readonly indexSupported: boolean;
   readonly entityCount: number;
   readonly coveredEntityCount: number;
+  /**
+   * Plan 2026-09-06 (Frente S-A): real `semantic_document_status` counts
+   * (`unsupported`/`failed` artifacts, exact entity counts), when the port
+   * implements `semantic_document_status_counts` -- overrides the
+   * corresponding inferred/over-counted fields below. `undefined` keeps this
+   * function's pre-existing inferred arithmetic byte-for-byte.
+   */
+  readonly realCounts: SemanticDocumentStatusCounts | undefined;
+  /** Plan 2026-09-06 (Frente S-A): the embedded first affected page (§4.2), built by the caller via `buildAffectedArtifactPage`. `undefined` when the port has no `semantic_affected_documents` capability -- `affected_artifact_set_id`/`affected_artifact_page` are then omitted entirely, same as before this plan. */
+  readonly affectedPage: SemanticAffectedArtifactPage | undefined;
 }): EntitySemanticCoverageView {
-  const { provider, marker, isCurrent, counts, coveredCount, indexSupported, entityCount, coveredEntityCount } = inputs;
+  const { provider, marker, isCurrent, counts, coveredCount, indexSupported, entityCount, coveredEntityCount, realCounts, affectedPage } = inputs;
   const eligible = Math.max(0, counts.artifact_count - counts.oversized_count);
   const materializationState: "complete" | "degraded" | "updating" | "unavailable" = !indexSupported ? "unavailable" : isCurrent ? (coveredCount >= eligible ? "complete" : "degraded") : "updating";
   const settled = materializationState === "complete" || materializationState === "degraded";
@@ -2092,11 +2327,15 @@ function buildSemanticCoverageView(inputs: {
     covered_artifact_count: coveredCount,
     pending_artifact_count: pending,
     excluded_artifact_count: excluded,
-    unsupported_artifact_count: 0,
-    failed_artifact_count: 0,
-    affected_artifact_count: pending,
-    entity_count: entityCount,
-    covered_entity_count: coveredEntityCount,
+    unsupported_artifact_count: realCounts?.unsupported_artifact_count ?? 0,
+    failed_artifact_count: realCounts?.failed_artifact_count ?? 0,
+    // Invariant (plan 2026-09-06): affected = status <> 'covered'. Real total
+    // from the affected page when available; the old "pending" heuristic
+    // otherwise (a port with no status-table capability at all).
+    affected_artifact_count: affectedPage?.total ?? pending,
+    entity_count: realCounts?.entity_count ?? entityCount,
+    covered_entity_count: realCounts?.covered_entity_count ?? coveredEntityCount,
+    ...(affectedPage === undefined ? {} : { affected_artifact_set_id: affectedPage.affected_artifact_set_id, affected_artifact_page: affectedPage }),
   };
 }
 
@@ -3026,6 +3265,37 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const dedupedEntityVectors = dedupeVectorsByDocumentRef(allVectors.filter((vector) => vector.document_grain === "entity"));
     const counts = portReady ? await this.snapshots.semantic_scope_counts!(operation.scope, SEMANTIC_MAX_DOCUMENT_BYTES) : { artifact_count: 0, oversized_count: 0 };
     const entityCounts = this.snapshots.semantic_entity_scope_counts !== undefined ? await this.snapshots.semantic_entity_scope_counts(operation.scope) : { entity_count: 0 };
+    // Plan 2026-09-06 (Frente S-A): real status-table counts and the
+    // embedded first affected page, computed ONCE for whichever coverage
+    // view this call ends up returning (the unavailable/hybrid-degrade
+    // branch below, or the normal ranked-result branch further down) --
+    // both share the exact same real-coverage inputs. `undefined` whenever
+    // there is no resolved provider (nothing to key the status table by) or
+    // the port lacks the new capability, preserving the pre-existing
+    // inferred/`0` fields exactly.
+    const realCounts = provider !== undefined && this.snapshots.semantic_document_status_counts !== undefined
+      ? await this.snapshots.semantic_document_status_counts(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
+      : undefined;
+    const affectedRows = provider !== undefined && this.snapshots.semantic_affected_documents !== undefined
+      ? await this.snapshots.semantic_affected_documents(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
+      : undefined;
+    const affectedPage = provider !== undefined && affectedRows !== undefined
+      ? buildAffectedArtifactPage(affectedRows, {
+          setId: computeAffectedSetId(affectedRows, {
+            bindingId: digestOf({ profile_id: provider.profile.embedding_profile_id, executable_binding_id: provider.binding.executable_binding_digest }),
+            generation: marker?.generation ?? 0, profileId: provider.profile.embedding_profile_id, executableBindingId: provider.binding.executable_binding_digest,
+          }),
+          // Plan §4.2: `limit = min(response_budget.max_items, 20)`. Decided
+          // in implementation: `response_budget` does not reach this port
+          // layer (it is resolved above the canonical query engine, in the
+          // MCP/query-execution shedding path) -- the plan's own stated
+          // upper bound (20) is used directly, which equals the min() result
+          // for every default-or-larger budget (`DEFAULT_RESPONSE_BUDGET.max_items`
+          // is 50), and is never wider than the plan's ceiling for a smaller
+          // one either.
+          limit: SEMANTIC_AFFECTED_FIRST_PAGE_LIMIT,
+        })
+      : undefined;
 
     // `allVectors.length === 0` (not `dedupedVectors.length === 0`, its v1
     // pre-decision-17 form) so a workspace with ONLY entity vectors and no
@@ -3052,7 +3322,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const lexicalRanked = await this.rankedLexicalMatches(operation, queryText, pathPrefixes, !includeArtifactLane);
       const ranked = lexicalRanked ?? [];
       const candidates = await this.hydrateSemanticCandidates(operation.scope, ranked.map((match) => ({ id: match.artifact_version_id, grain: "artifact" as const })));
-      const coverage = buildSemanticCoverageView({ provider, marker, isCurrent: false, counts, coveredCount: 0, indexSupported: false, entityCount: entityCounts.entity_count, coveredEntityCount: 0 });
+      const coverage = buildSemanticCoverageView({ provider, marker, isCurrent: false, counts, coveredCount: 0, indexSupported: false, entityCount: entityCounts.entity_count, coveredEntityCount: 0, realCounts, affectedPage });
       return result({ candidates, semantic_coverage: [coverageItem(coverage)] }, capabilityStates, semanticEvaluationState(coverage.materialization_state));
     }
 
@@ -3147,8 +3417,81 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // `entityRanks`/`candidates` -- so a narrow `paths` filter or either
     // lane's own cap never makes the coverage view understate how much of
     // the workspace is actually materialized.
-    const coverage = buildSemanticCoverageView({ provider, marker, isCurrent, counts, coveredCount: dedupedVectors.length, indexSupported: true, entityCount: entityCounts.entity_count, coveredEntityCount: dedupedEntityVectors.length });
+    const coverage = buildSemanticCoverageView({ provider, marker, isCurrent, counts, coveredCount: dedupedVectors.length, indexSupported: true, entityCount: entityCounts.entity_count, coveredEntityCount: dedupedEntityVectors.length, realCounts, affectedPage });
     return result({ candidates, semantic_coverage: [coverageItem(coverage)] }, capabilityStates, semanticEvaluationState(coverage.materialization_state));
+  }
+
+  /**
+   * Plan 2026-09-06 (Frente S-A, §4.3): `core:semantic_affected_page` --
+   * pages through the AFFECTED (`status <> 'covered'`) documents named by a
+   * prior `semantic_coverage.affected_artifact_set_id`. The requested
+   * `affected_artifact_set_id` (and, when present, the cursor's own embedded
+   * `set`) is validated against the CURRENT set id BEFORE any page is
+   * sliced -- a mismatch means the workspace's affected documents changed
+   * since that id/cursor was minted, and this throws `core:affected_set_stale`
+   * rather than ever returning a page that mixes two different sets or
+   * silently reinterprets a stale cursor against new data (R11).
+   */
+  private async trySemanticAffectedPage(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
+    if (operation.operation_id !== "core:semantic_affected_page") return undefined;
+    const scope = requireSingleWorkspaceScope(operation.scope);
+    const args = object(operation.arguments);
+    const requestedSetId = typeof args["affected_artifact_set_id"] === "string" ? args["affected_artifact_set_id"] as string : "";
+    const cursorToken = typeof args["cursor"] === "string" ? args["cursor"] as string : undefined;
+    const requestedLimit = typeof args["limit"] === "number" && Number.isSafeInteger(args["limit"]) && (args["limit"] as number) > 0
+      ? Math.min(args["limit"] as number, SEMANTIC_AFFECTED_PAGE_MAX_LIMIT)
+      : SEMANTIC_AFFECTED_FIRST_PAGE_LIMIT;
+
+    const provider = this.options.semantic;
+    if (provider === undefined || this.snapshots.semantic_affected_documents === undefined) {
+      throw new SemanticQueryError(
+        "core:required_capability_unsupported",
+        `core:semantic_affected_page requires a configured semantic provider and an affected-documents-capable snapshot port for workspace "${scope.workspace_id}".`,
+        { capability: "core:semantic_affected_documents", workspace_snapshot_binding_ids: [scope.workspace_id], reason_codes: [provider === undefined ? "no_provider_configured" : "snapshot_port_unsupported"] },
+      );
+    }
+
+    let decodedCursor: AffectedCursor | undefined;
+    if (cursorToken !== undefined) {
+      try { decodedCursor = decodeAffectedCursor(cursorToken); }
+      catch (error) { throw new SemanticQueryError("core:cursor_invalid", error instanceof Error ? error.message : "Malformed core:semantic_affected_page cursor.", { reason_code: "malformed_cursor" }); }
+    }
+
+    const marker = this.snapshots.semantic_index_state !== undefined ? await this.snapshots.semantic_index_state(operation.scope) : undefined;
+    const rows = await this.snapshots.semantic_affected_documents(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+    const currentSetId = computeAffectedSetId(rows, {
+      bindingId: digestOf({ profile_id: provider.profile.embedding_profile_id, executable_binding_id: provider.binding.executable_binding_digest }),
+      generation: marker?.generation ?? 0, profileId: provider.profile.embedding_profile_id, executableBindingId: provider.binding.executable_binding_digest,
+    });
+    // Never a mixed/partial page (R11 + this plan's own invariant): a
+    // cursor with a `set` different from `currentSetId`, OR an
+    // `affected_artifact_set_id` argument different from it, is rejected
+    // outright before `pageAffectedRows` ever runs.
+    if (requestedSetId !== currentSetId || (decodedCursor !== undefined && decodedCursor.set !== currentSetId)) {
+      throw new SemanticQueryError(
+        "core:affected_set_stale",
+        `The affected document set for workspace "${scope.workspace_id}" has changed since this affected_artifact_set_id/cursor was minted; re-run core:search_semantic or core:search_hybrid to read the current semantic_coverage.affected_artifact_set_id.`,
+        { current_set_id: currentSetId },
+      );
+    }
+
+    const page = buildAffectedArtifactPage(rows, { setId: currentSetId, limit: requestedLimit, ...(decodedCursor === undefined ? {} : { cursor: { k: decodedCursor.k, dir: decodedCursor.dir } }) });
+    const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+    // ONE synthetic item carrying the complete `SemanticAffectedArtifactPage`
+    // (`next_cursor`/`previous_cursor`/`has_next`/`has_previous`/`total`
+    // included) -- the same "one structured view per item" convention
+    // `coverageItem` already uses for `semantic_coverage`. This is
+    // deliberate, not incidental: R11's cursor is a stateless value that
+    // round-trips through THIS operation's own `cursor` ARGUMENT on a fresh
+    // call, never through the generic per-stream `request_type: continuation`
+    // mechanism (`QueryEngine.continue`) -- emitting N per-artifact items
+    // instead would both hide the page's cursors from every caller (no
+    // per-item field carries them) and let the generic engine's OWN
+    // `response_budget.max_items` keyset-paginate this stream independently
+    // of `limit`, double-paginating in a way this operation's own contract
+    // never promises. A single item is always far under any budget, so the
+    // generic wrapper is a no-op pass-through here.
+    return result({ semantic_affected_artifacts: [{ value: page, stable_sort_key: `unclassified\0${currentSetId}` }] }, capabilityStates);
   }
 
   async execute(operation: OperationInvocation): Promise<OperationEvaluation> {
@@ -3160,6 +3503,8 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     if (pushedContext !== undefined) return pushedContext;
     const pushedSemantic = await this.trySemanticSearch(boundOperation);
     if (pushedSemantic !== undefined) return pushedSemantic;
+    const pushedAffectedPage = await this.trySemanticAffectedPage(boundOperation);
+    if (pushedAffectedPage !== undefined) return pushedAffectedPage;
     const warm = (await this.snapshots.has_warm_records?.(boundOperation.scope)) ?? false;
     if (!warm) {
       const pushed = await this.tryPushdown(boundOperation);

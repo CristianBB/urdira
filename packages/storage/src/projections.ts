@@ -1,7 +1,7 @@
 import { digestBytes, digestLogicalValue } from "@urdira/canonical";
 import type { BlobStore } from "./cas.js";
 import { StorageError } from "./errors.js";
-import type { SqliteDatabase, SqliteValue } from "./sqlite.js";
+import type { SqliteCommand, SqliteDatabase, SqliteValue } from "./sqlite.js";
 
 export interface GraphEdge {
   readonly edge_id: string;
@@ -392,7 +392,18 @@ export class WorkspaceProjectionRepository {
 
   async putVector(value: VectorProjectionInput): Promise<void> { await this.putVectors([value]); }
 
-  async putVectors(values: ReadonlyArray<VectorProjectionInput>): Promise<void> {
+  /**
+   * `extraCommands` (plan 2026-09-06, Frente S-A): additional raw statements
+   * to run in the SAME transaction as this batch's vector writes -- the
+   * reconciler's own `semantic_document_status` upsert for each committed
+   * document, so a crash between the vector write and the status write can
+   * never happen (both land, or neither does). Run even on the "every vector
+   * already present, byte-identical" early-return path below (no vector work
+   * to do this call, but the caller may still need its status row written --
+   * e.g. re-affirming `covered` for a document whose vector already exists).
+   * Empty/omitted for every caller that predates this parameter.
+   */
+  async putVectors(values: ReadonlyArray<VectorProjectionInput>, extraCommands: readonly SqliteCommand[] = []): Promise<void> {
     if (values.length === 0) throw new StorageError("storage:invalid_vector_batch", "A vector shard batch must contain at least one vector.");
     const ordered = [...values].sort((left, right) => left.projection_record_id.localeCompare(right.projection_record_id));
     if (new Set(ordered.map((value) => value.projection_record_id)).size !== ordered.length) throw new StorageError("storage:vector_batch_conflict", "A packed vector batch cannot contain duplicate projection identities.");
@@ -429,13 +440,17 @@ export class WorkspaceProjectionRepository {
       const existing = existingById.get(item.key);
       if (existing && existing.vector_digest !== item.digest) throw new StorageError("storage:projection_immutable", `Vector ${item.input.projection_record_id} conflicts with its immutable typed row.`);
     }
-    if (normalizedValues.every((item) => existingById.has(item.key))) return;
+    if (normalizedValues.every((item) => existingById.has(item.key))) {
+      if (extraCommands.length > 0) await this.database.transaction(extraCommands);
+      return;
+    }
     const shard = await this.blobs.cas.put(packed, { media_type: "application/octet-stream" });
     const shardId = `shard:${shard.content_hash}`;
     const existingShard = await this.database.get<{ shard_id: string }>("SELECT shard_id FROM vector_shards WHERE workspace_id = ? AND content_hash = ?", [this.workspaceId, shard.content_hash]);
-    const commands: Array<{ kind: "run"; sql: string; params: readonly SqliteValue[] }> = [];
+    const commands: SqliteCommand[] = [];
     if (!existingShard) commands.push({ kind: "run", sql: "INSERT INTO vector_shards (shard_id, workspace_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [shardId, this.workspaceId, first.profile_id, first.executable_binding_id, first.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, packed.byteLength, shard.content_hash, shard.storage_reference, new Date().toISOString()] });
     for (const item of normalizedValues) if (!existingById.has(item.key)) commands.push({ kind: "run", sql: "INSERT INTO vector_projection_rows (projection_record_id, workspace_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, document_grain, document_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [item.input.projection_record_id, this.workspaceId, existingShard?.shard_id ?? shardId, item.offset, item.vector.byteLength, item.digest, item.input.owner_artifact_id, item.input.owner_artifact_version_id, item.input.profile_id, item.input.executable_binding_id, item.input.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, item.valid_from_generation, nullable(item.valid_to_generation), item.input.document_grain ?? null, item.input.document_ref ?? null] });
+    commands.push(...extraCommands);
     await this.database.transaction(commands);
   }
 

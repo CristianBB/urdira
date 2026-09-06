@@ -76,3 +76,44 @@ pooled document vector participates in exact scan.
 
 Cross-workspace vector sharing is unsupported. Content-identical documents
 under different workspace/provider bindings are reconciled independently.
+
+## Amendment 2026-09-06 (Frente S-A): per-document status table
+
+"Coverage reports artifact and entity totals separately" (above) is now
+backed by a real per-document ledger, `semantic_document_status`
+(`packages/storage/sql/workspace-v4-semantic.sql`, mirrored additively into
+`workspace-v3.sql` so the one shared reconciler implementation works
+unmodified against either schema). One row per `(workspace_id, profile_id,
+executable_binding_id, document_grain, document_id)` -- `document_id` is the
+artifact version id for an artifact-grain row, the owning entity record id
+for an entity-grain row -- carrying `status` (`covered | pending | excluded |
+unsupported | failed`) and a sorted JSON `reason_codes` array from a fixed
+vocabulary: `binary`, `oversized`, `below_min_length`, `unsupported_kind`,
+`provider_error:*`, `segments_truncated` (segmentation is a later increment;
+no row uses this code yet), `pending_embed`.
+
+The reconciler writes this table in the SAME per-document enumeration it
+already runs for embedding (steps 3/5 of `reconcileSemanticProjection`):
+`covered` commits in the same transaction as the vector write; permanent
+skips (oversized, undecodable/binary content, empty rendering, ineligible
+entity kind/span) are written as `excluded` or `unsupported` at the exact
+point they are classified; a provider throw or a post-generation digest
+mismatch is written `failed` with a `provider_error:*` reason. Two
+bulk-classification passes (binary artifact versions and whole-file/module
+"container" entity records -- both excluded from the reconciler's own
+missing-document queries by their `WHERE` clauses, so they would otherwise
+never reach the ledger at all) and a backfill pass (covering a sidecar that
+predates this table, populated from `vector_projection_rows` directly) run
+once per reconcile pass, each scoped by a `NOT EXISTS` against the status
+table itself so they cost nothing once the corpus has been classified. An
+orphan sweep deletes a document's row when its underlying artifact
+version/entity record stops being visible, closing the gap the ordinary
+stale-close joins (scoped to documents that had an OPEN vector) cannot
+cover: a `pending`/`excluded`/`unsupported`/`failed` document that never had
+a vector at all.
+
+`core:search_semantic`/`core:search_hybrid`'s coverage view and the new
+`core:semantic_affected_page` operation both read this table exclusively for
+`unsupported`/`failed`/entity counts and the affected-document list -- see
+[Semantic search and ranking](06-semantic-search-ranking.md)'s own 2026-09-06
+amendment for the pagination mechanism built on top of it.

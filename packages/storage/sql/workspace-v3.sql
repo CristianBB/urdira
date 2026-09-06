@@ -486,6 +486,34 @@ CREATE TABLE IF NOT EXISTS vector_projection_rows (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS vector_projection_lookup_idx ON vector_projection_rows(workspace_id, profile_id, executable_binding_id, projection_record_id);
 CREATE INDEX IF NOT EXISTS vector_projection_visible_idx ON vector_projection_rows(workspace_id, profile_id, executable_binding_id, valid_from_generation, valid_to_generation, projection_record_id);
+-- Plan 2026-09-06 (Frente S-A): per-document semantic materialization status
+-- -- byte-for-byte identical to the v4 semantic sidecar's own copy
+-- (packages/storage/sql/workspace-v4-semantic.sql), added here too so
+-- packages/engine/src/semantic-reconciler.ts (one shared implementation)
+-- keeps working unmodified against a v3 single-file workspace, exactly like
+-- vector_shards/vector_projection_rows/semantic_index_state above already
+-- do. Deliberately no FOREIGN KEY to artifact_versions even though both
+-- live in this same file (unlike vector_projection_rows' FK above): keeping
+-- v3 and v4 identical here means the reconciler's behavior never depends on
+-- which schema it happens to be running against.
+CREATE TABLE IF NOT EXISTS semantic_document_status (
+  workspace_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  executable_binding_id TEXT NOT NULL,
+  document_grain TEXT NOT NULL,            -- 'artifact' | 'entity'
+  document_id TEXT NOT NULL,               -- artifact_version_id or the entity record id
+  artifact_id TEXT NOT NULL,
+  artifact_version_id TEXT NOT NULL,
+  display_path TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('covered','pending','excluded','unsupported','failed')),
+  reason_codes TEXT NOT NULL DEFAULT '[]', -- JSON array, sorted
+  segment_count INTEGER NOT NULL DEFAULT 0,
+  generation INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, profile_id, executable_binding_id, document_grain, document_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS semantic_document_status_affected
+  ON semantic_document_status (workspace_id, profile_id, executable_binding_id, status, display_path, artifact_id, document_id);
 -- NOTE: vector_projection_document_ref_idx (the entity pass's stale-close
 -- join / entity-lane scan index over (workspace_id, document_grain,
 -- document_ref)) is deliberately NOT created here: initializeSchema runs

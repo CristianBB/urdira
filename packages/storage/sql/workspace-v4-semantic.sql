@@ -87,3 +87,30 @@ CREATE TABLE IF NOT EXISTS semantic_index_state (
   -- NOT entity-complete for the running policy.
   entity_policy_digest TEXT
 ) STRICT;
+-- Plan 2026-09-06 (Frente S-A): per-document semantic materialization
+-- status, the source of truth for "affected" (not yet covered) documents --
+-- both grains, one row per document per exact vector space
+-- (profile_id/executable_binding_id), written by the reconciler's own
+-- enumeration in the SAME pass that would otherwise only touch
+-- vector_projection_rows. Additive per R22 (CREATE TABLE IF NOT EXISTS);
+-- never referenced by a FOREIGN KEY into artifact_versions/record_occurrences
+-- for the identical cross-file reason vector_projection_rows already has no
+-- such FOREIGN KEY in this file.
+CREATE TABLE IF NOT EXISTS semantic_document_status (
+  workspace_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  executable_binding_id TEXT NOT NULL,
+  document_grain TEXT NOT NULL,            -- 'artifact' | 'entity'
+  document_id TEXT NOT NULL,               -- artifact_version_id or the entity record id
+  artifact_id TEXT NOT NULL,
+  artifact_version_id TEXT NOT NULL,
+  display_path TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('covered','pending','excluded','unsupported','failed')),
+  reason_codes TEXT NOT NULL DEFAULT '[]', -- JSON array, sorted
+  segment_count INTEGER NOT NULL DEFAULT 0,
+  generation INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, profile_id, executable_binding_id, document_grain, document_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS semantic_document_status_affected
+  ON semantic_document_status (workspace_id, profile_id, executable_binding_id, status, display_path, artifact_id, document_id);
