@@ -590,6 +590,237 @@ fn cold_scan_materializes_referenced_parameter_entities_and_resolves_their_targe
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// F.2 fidelity fixture (2026-09-06, flecos v4 plan §3.3): EVERY declared
+/// identifier-pattern parameter must materialize a `jsts:entity_parameter`
+/// entity now, regardless of whether the body ever references it -- see
+/// `OwnerSemantics::parameter_entity_rows`'s own doc comment (`urdira-jsts-
+/// syntax-worker::semantic_sites`) for the "every declaration" rule this
+/// test guards as a CI regression net. Before this task, only
+/// `cold_scan_materializes_referenced_parameter_entities_and_resolves_their_
+/// target_subject` (above) existed, and it only ever exercised REFERENCED
+/// parameters -- an unread one (`b` here, `y` here) would previously have
+/// produced NO entity at all, exactly the gap `get_outline` cannot tolerate.
+/// Exercises three owner shapes in one fixture: a plain function declaration
+/// (`f(a, b, c)`, `b` never read), a class method (`Box::m(x, y)`, `y` never
+/// read), and a destructured arrow parameter (`make`) that must still
+/// produce NOTHING -- `classify_symbol_declaration`'s `FormalParameter` arm
+/// only ever resolves a simple `BindingIdentifier` pattern, unaffected by
+/// this task.
+#[test]
+fn cold_scan_materializes_every_declared_parameter_in_declaration_order_whether_or_not_referenced()
+{
+    let scratch = scratch_dir("every-parameter");
+    let workspace_root = scratch.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+    let source = concat!(
+        "function f(a, b, c) {\n",
+        "  return a + c;\n",
+        "}\n",
+        "\n",
+        "class Box {\n",
+        "  m(x, y) {\n",
+        "    return x;\n",
+        "  }\n",
+        "}\n",
+        "\n",
+        "const make = ({ first, second }) => first;\n",
+    );
+    std::fs::write(workspace_root.join("params.ts"), source).expect("write params.ts");
+
+    let database_path = scratch.join("workspace.sqlite");
+    let structural_root = scratch.join("structural");
+    let cas_root = scratch.join("cas");
+    let workspace_id = "workspace:every-parameter";
+
+    let mut conn = catalog::open_and_ensure_schema(&database_path).expect("schema opens");
+    let outcome = catalog::run_full_scan(&mut conn, workspace_id, &workspace_root, &cas_root, 1)
+        .expect("cold catalog scan succeeds");
+    catalog::restore_steady_state_pragmas(&conn).expect("restoring pragmas succeeds");
+
+    let mut clock = ScanClock::start();
+    let mut syntax = SyntaxWorkerState::default();
+    let cas_signal = outcome
+        .cas_write_queue
+        .as_ref()
+        .expect("run_full_scan always populates cas_write_queue")
+        .signal();
+    let (cold_analysis, _cache, _typeflow_cache) = analyze::run_cold(
+        &outcome.frontier,
+        &cas_root,
+        workspace_id,
+        &mut syntax,
+        &mut clock,
+        &cas_signal,
+    )
+    .expect("cold analyze succeeds");
+
+    let materialized =
+        materialize::materialize_cold(cold_analysis.owners).expect("materialize succeeds");
+    let request = scan::ScanRequest {
+        request_id: "request:every-parameter".to_string(),
+        workspace_id: workspace_id.to_string(),
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        database_path: database_path.to_string_lossy().into_owned(),
+        structural_root: structural_root.to_string_lossy().into_owned(),
+        cas_root: cas_root.to_string_lossy().into_owned(),
+        sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+        scope: ScanScope::Full,
+        registry_snapshot_id: "registry:every-parameter".to_string(),
+        configuration_revision_id: "configuration:every-parameter".to_string(),
+        resolution_lock_id: "resolution:every-parameter".to_string(),
+        deadline_ms: None,
+        priority: ScanPriority::Interactive,
+    };
+    let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+    publish::publish_cold(
+        &mut conn,
+        &request,
+        &structural_root,
+        1,
+        &outcome,
+        materialized,
+        &mut clock,
+        &mut on_queryable,
+    )
+    .expect("publish succeeds");
+
+    let reader =
+        StoreReader::open(&structural_root).expect("StoreReader opens the published store");
+    let generation = reader.generation();
+    assert_eq!(generation, 1, "this test asserts a COLD-generation fact");
+    let dicts = reader.dictionaries();
+
+    // Collect every `jsts:entity_parameter` entity, keyed by its own
+    // one-letter name (the identity key's final `:`-delimited segment),
+    // along with its own record id (for `core:contains`/`core:references`
+    // target lookups below) and span start (for the declaration-order
+    // assertion).
+    struct Found {
+        record_id: [u8; 32],
+        start: u32,
+    }
+    let mut by_name: std::collections::BTreeMap<&'static str, Found> = Default::default();
+    for view in reader.iter_visible(generation) {
+        if view.category() != urdira_structural_store::row::CATEGORY_ENTITY {
+            continue;
+        }
+        let identity_key = view.identity_key();
+        if !identity_key.starts_with(b"jsts:parameter:") {
+            continue;
+        }
+        for name in ["a", "b", "c", "x", "y"] {
+            if identity_key.ends_with(format!(":{name}").as_bytes()) {
+                by_name.insert(
+                    name,
+                    Found {
+                        record_id: view.record_id(),
+                        start: view.span_start_byte(),
+                    },
+                );
+            }
+        }
+    }
+    for name in ["a", "b", "c", "x", "y"] {
+        assert!(
+            by_name.contains_key(name),
+            "expected a jsts:entity_parameter for {name:?}, found: {:?}",
+            by_name.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Declaration order within each callable: `a` before `b` before `c`
+    // (function `f`), `x` before `y` (method `Box::m`) -- `b`/`y` are never
+    // referenced, yet still materialize AND still sort correctly.
+    assert!(
+        by_name["a"].start < by_name["b"].start,
+        "expected a's span to start before b's"
+    );
+    assert!(
+        by_name["b"].start < by_name["c"].start,
+        "expected b's span to start before c's"
+    );
+    assert!(
+        by_name["x"].start < by_name["y"].start,
+        "expected x's span to start before y's"
+    );
+
+    // Every one of the five has a `core:contains` row from SOME parent
+    // targeting it (the exact `parent_id` resolution rule is already pinned
+    // by the unit tests in `semantic_sites.rs`; this fixture only guards the
+    // population/order invariant end-to-end through a real cold scan).
+    let contains_target = |target_record_id: &[u8; 32]| -> bool {
+        reader.iter_visible(generation).any(|view| {
+            if view.category() != urdira_structural_store::row::CATEGORY_RELATION {
+                return false;
+            }
+            let universal_kind = dicts
+                .universal_kinds
+                .get(view.universal_kind_id() as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            if universal_kind != "core:contains" {
+                return false;
+            }
+            let Some(target_subject) = view.target_subject() else {
+                return false;
+            };
+            dicts.subjects.get(target_subject as usize) == Some(target_record_id)
+        })
+    };
+    for name in ["a", "b", "c", "x", "y"] {
+        assert!(
+            contains_target(&by_name[name].record_id),
+            "expected a core:contains row targeting parameter {name:?}"
+        );
+    }
+
+    // `a`/`c` are referenced in the body -- a `core:references` relation
+    // must still resolve to each, exactly as it did before this task (the
+    // "referenced-only" filter that used to gate ENTITY materialization
+    // never gated reference resolution itself).
+    let references_target = |target_record_id: &[u8; 32]| -> bool {
+        reader.iter_visible(generation).any(|view| {
+            if view.category() != urdira_structural_store::row::CATEGORY_RELATION {
+                return false;
+            }
+            let universal_kind = dicts
+                .universal_kinds
+                .get(view.universal_kind_id() as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            if universal_kind != "core:references" {
+                return false;
+            }
+            let Some(target_subject) = view.target_subject() else {
+                return false;
+            };
+            dicts.subjects.get(target_subject as usize) == Some(target_record_id)
+        })
+    };
+    for name in ["a", "c"] {
+        assert!(
+            references_target(&by_name[name].record_id),
+            "expected a core:references relation resolved to parameter {name:?}"
+        );
+    }
+
+    // Destructured arrow parameter (`{ first, second }`) never materializes
+    // an entity at all -- unaffected by this task (only a simple identifier-
+    // pattern parameter, `classify_symbol_declaration`'s `FormalParameter`
+    // arm, is ever a candidate).
+    let has_destructured_entity = reader.iter_visible(generation).any(|view| {
+        view.category() == urdira_structural_store::row::CATEGORY_ENTITY
+            && (view.identity_key().ends_with(b":first")
+                || view.identity_key().ends_with(b":second"))
+    });
+    assert!(
+        !has_destructured_entity,
+        "a destructured arrow parameter must never materialize a parameter entity"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn cold_scan_is_deterministic_across_two_independent_runs() {
     let scratch_a = scratch_dir("determinism-a");

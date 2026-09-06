@@ -175,20 +175,25 @@ pub struct OwnerSemantics {
     /// outcome into the same plain-pending path `Unresolved` already takes,
     /// deliberately -- see `visit_call_expression`'s own doc comment).
     pub candidate_call_rows: Vec<ProposedRecord>,
-    /// Parameter entities, "referenced-only" variant (owner-approved,
-    /// 2026-09-04): one `jsts:entity_parameter` `ProposedRecord` per
-    /// identifier-pattern parameter declaration that received AT LEAST ONE
-    /// resolved `reference_rows` entry whose target is that parameter
-    /// (`DeclKind::Parameter`, `resolve_identifier_reference`) -- NOT every
-    /// parameter, unlike every other entity producer. Destructured/rest
-    /// parameters are never candidates (`classify_symbol_declaration`
-    /// already never resolves a reference to one). `id` is byte-identical to
-    /// the `target_id` `reference_rows` already carries for it (`jsts:
-    /// parameter:{path}:{nameStart}:{name}`), so materializing this record
-    /// makes that reference's `target_subject` intern where before it
-    /// dangled. See `ParameterDeclarationFact`/`ParamOwner` (this module) for
-    /// how the declaration facts (span, enclosing entity) are captured
-    /// independently of whether the parameter turns out referenced, and
+    /// Parameter entities, "every declaration" variant (2026-09-06, owner-
+    /// approved fidelity fix superseding the 2026-09-04 "referenced-only"
+    /// cut): one `jsts:entity_parameter` `ProposedRecord` per identifier-
+    /// pattern parameter declaration this walk recorded a fact for
+    /// (`ParameterDeclarationFact`, `parameter_declarations`), REGARDLESS of
+    /// whether any `reference_rows` entry ever targets it -- `get_outline`
+    /// (`packages/engine/src/canonical-query-data-port.ts`) is a BFS over
+    /// `core:contains` and must list every declared parameter an agent might
+    /// ask about, not only the ones some caller happens to read. Destructured/
+    /// rest-pattern parameters are still never candidates (`classify_symbol_
+    /// declaration` never resolves a reference to one, and `visit_formal_
+    /// parameter` never records a fact for a non-identifier pattern either).
+    /// `id` is byte-identical to the `target_id` `reference_rows` carries for
+    /// a REFERENCED parameter (`jsts:parameter:{path}:{nameStart}:{name}`),
+    /// so materializing this record makes that reference's `target_subject`
+    /// intern where before it dangled -- unreferenced parameters get the same
+    /// id shape, just with no inbound reference row. See
+    /// `ParameterDeclarationFact`/`ParamOwner` (this module) for how the
+    /// declaration facts (span, enclosing entity) are captured, and
     /// `parameter_entity_record`'s own doc comment for the `parent_id`
     /// resolution rule (function declaration / class-or-interface member
     /// entity emitted today / variable-bound arrow-or-function-expression /
@@ -1383,59 +1388,41 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// deciding whether a directly-init'd arrow/function-expression's own
     /// params get the variable's id or fall back to the module.
     declarator_owns_entity: bool,
-    /// Parameter entities, "referenced-only" variant: every identifier-
+    /// Parameter entities, "every declaration" variant (2026-09-06,
+    /// supersedes the 2026-09-04 "referenced-only" cut): every identifier-
     /// pattern parameter declaration this walk has seen, keyed by its own
     /// entity id (`jsts:parameter:{path}:{nameStart}:{name}`, byte-identical
     /// to the `target_id` a resolved reference to it carries) -- recorded
-    /// UNCONDITIONALLY in `visit_formal_parameter`, before it is known
-    /// whether the parameter is ever referenced (`finish` filters this map
-    /// down to `referenced_parameter_targets` at the end). A `BTreeMap` so a
-    /// later "same id twice" bug (there should never be one -- each
-    /// `nameStart` is a unique byte offset) would silently keep the LAST
-    /// write rather than panic; never observed live.
+    /// UNCONDITIONALLY in `visit_formal_parameter`, and `finish` now
+    /// materializes an entity for EVERY value in this map regardless of
+    /// whether the parameter is ever referenced (fidelity: `get_outline`
+    /// must list every declared parameter). A `BTreeMap` so a later "same id
+    /// twice" bug (there should never be one -- each `nameStart` is a unique
+    /// byte offset) would silently keep the LAST write rather than panic;
+    /// never observed live. Also gives `finish`'s emission order a
+    /// deterministic, dependency-free sort (by id, which already sorts by
+    /// path/nameStart/name).
     parameter_declarations: BTreeMap<String, ParameterDeclarationFact>,
-    /// Parameter entities, "referenced-only" variant: `entity_id -> qualified
-    /// name` for every class/interface member `push_member_entities`
-    /// (lib.rs) actually emits an entity for -- see `analyze_owner_semantics
-    /// _with_context`'s own construction comment for why this is sourced
-    /// from `urdira_jsts_typeflow::member_declarations` directly rather than
-    /// re-derived. Consulted by `visit_method_definition`/`visit_object_
-    /// property`/`visit_ts_method_signature` to decide each member's own
-    /// `param_owner_stack` frame.
+    /// `entity_id -> qualified name` for every class/interface member
+    /// `push_member_entities` (lib.rs) actually emits an entity for -- see
+    /// `analyze_owner_semantics_with_context`'s own construction comment for
+    /// why this is sourced from `urdira_jsts_typeflow::member_declarations`
+    /// directly rather than re-derived. Consulted by `visit_method_
+    /// definition`/`visit_object_property`/`visit_ts_method_signature` to
+    /// decide each member's own `param_owner_stack` frame.
     member_qualified_names: BTreeMap<String, String>,
-    /// Parameter entities, "referenced-only" variant: the `target_id` of
-    /// every resolved reference (`visit_identifier_reference`'s `Resolved`
-    /// arm) whose target is a parameter (`target_id` starts with
-    /// `"jsts:parameter:"`) -- a `BTreeSet` both to dedupe (a parameter
-    /// referenced twice must still get exactly one entity) and to give
-    /// `finish`'s emission order a deterministic, dependency-free sort (by
-    /// id, which already sorts by path/nameStart/name).
-    referenced_parameter_targets: BTreeSet<String>,
-    /// 2026-09-04 references-parity task, bucket 1: same declaration-fact
-    /// shape and "referenced-only" lifecycle as `parameter_declarations`
-    /// (`ParameterDeclarationFact` is reused verbatim -- nothing about its
-    /// fields is parameter-specific), for a catch clause's own simple
-    /// identifier binding (`catch (error) {}`, `DeclKind::Variable`, v3's
-    /// `isVariableDeclaration` treatment). Recorded unconditionally by
-    /// `visit_catch_parameter`; `finish` filters this down to `referenced_
-    /// catch_targets` and materializes each survivor through the SAME
-    /// `OwnerSemantics::parameter_entity_rows`/`parameter_contains_rows`
-    /// output buckets the parameter producer already uses (a shared,
-    /// kind-agnostic sink -- see `catch_variable_entity_record`'s own doc
-    /// comment).
+    /// 2026-09-04 references-parity task, bucket 1 (now "every declaration"
+    /// too, 2026-09-06): same declaration-fact shape and unconditional
+    /// recording as `parameter_declarations` (`ParameterDeclarationFact` is
+    /// reused verbatim -- nothing about its fields is parameter-specific),
+    /// for a catch clause's own simple identifier binding (`catch (error)
+    /// {}`, `DeclKind::Variable`, v3's `isVariableDeclaration` treatment).
+    /// Recorded unconditionally by `visit_catch_parameter`; `finish`
+    /// materializes every value here through the SAME `OwnerSemantics::
+    /// parameter_entity_rows`/`parameter_contains_rows` output buckets the
+    /// parameter producer already uses (a shared, kind-agnostic sink -- see
+    /// `catch_variable_entity_record`'s own doc comment).
     catch_declarations: BTreeMap<String, ParameterDeclarationFact>,
-    /// 2026-09-04 references-parity task, bucket 1: the `target_id` of
-    /// every resolved reference whose target is a catch binding (`target_id`
-    /// starts with `"jsts:variable:"` -- see `visit_identifier_reference`'s
-    /// `Resolved` arm). Broader than "catch bindings only" by construction
-    /// (any `DeclKind::Variable` target matches the prefix, including an
-    /// ordinary variable that already has its own unconditional entity from
-    /// lib.rs's `SyntaxCollector`) -- harmless: `finish`'s `filter_map`
-    /// against `catch_declarations` silently drops every id that is not
-    /// actually a recorded catch binding, the same safe-miss pattern
-    /// `parameter_declarations`' own filter_map already relies on for a
-    /// parameter PROPERTY's id.
-    referenced_catch_targets: BTreeSet<String>,
     /// 2026-09-04 references-parity task, bucket 3
     /// (`type_predicate_parameter`): the innermost enclosing callable
     /// signature's own identifier-pattern parameter names (`name`, binding
@@ -1655,9 +1642,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             pending_function_owner: None,
             declarator_owns_entity: false,
             parameter_declarations: BTreeMap::new(),
-            referenced_parameter_targets: BTreeSet::new(),
             catch_declarations: BTreeMap::new(),
-            referenced_catch_targets: BTreeSet::new(),
             predicate_param_stack: Vec::new(),
             member_qualified_names,
             local_types: HashMap::new(),
@@ -4023,82 +4008,52 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .iter()
             .map(|row| candidate_call_record(&self.path, row, &self.line_index))
             .collect();
-        // Parameter entities, "referenced-only" variant: `referenced_
-        // parameter_targets` is already sorted (a `BTreeSet`, keyed by the
-        // SAME id `parameter_declarations` is keyed by), so iterating it
-        // directly gives deterministic, dependency-free order for both
-        // buckets below -- no separate sort needed, unlike `reference_rows`/
-        // `call_rows`/etc. above (plain `Vec`s, populated in AST visitation
-        // order). Every target here was inserted from a `target_id` this
-        // SAME walk's `resolve_identifier_reference`/`resolve_static_member_
-        // reference` built with `declaration_id(DeclKind::Parameter, ...)`,
-        // which is exactly the id `visit_formal_parameter` records a fact
-        // under for every ORDINARY (non-property) identifier-pattern
-        // parameter this walk sees. A PARAMETER PROPERTY's target id is
-        // never a key here (`visit_formal_parameter` deliberately skips
-        // recording one, see its own doc comment: `urdira_jsts_typeflow::
-        // member_declarations`/`push_member_entities` already materialize
-        // it unconditionally) -- `filter_map` below silently skips those
-        // rather than double-materializing the same declaration a second
-        // time from this "referenced-only" bucket.
+        // Parameter entities, "every declaration" variant (2026-09-06
+        // fidelity fix, supersedes the 2026-09-04 "referenced-only" cut):
+        // `parameter_declarations` is a `BTreeMap` keyed by the same id
+        // `reference_rows`' `target_id` uses, so iterating `.values()`
+        // directly gives deterministic, dependency-free order (by id, which
+        // already sorts by path/nameStart/name) for both buckets below --
+        // no separate sort needed, unlike `reference_rows`/`call_rows`/etc.
+        // above (plain `Vec`s, populated in AST visitation order). EVERY
+        // identifier-pattern parameter/rest-parameter this walk recorded a
+        // fact for materializes now, whether or not any reference ever
+        // targets it -- `get_outline` must list every declared parameter,
+        // not only the ones a caller happens to read (see `docs/decisions/
+        // 28-v4-rust-semantics-and-residual-checker.md`'s 2026-09-06
+        // amendment). A PARAMETER PROPERTY's id is never a key here
+        // (`visit_formal_parameter` deliberately skips recording one, see
+        // its own doc comment: `urdira_jsts_typeflow::member_declarations`/
+        // `push_member_entities` already materialize it unconditionally) --
+        // so there is no double-materialization risk from including every
+        // key.
         let language = crate::language_for_path(&self.path)
             .map(|(language, _)| language)
             .unwrap_or(crate::Language::Javascript);
-        // 2026-09-04 references-parity task, bucket 1: catch-clause bindings
-        // materialize through the SAME two output buckets as parameters
+        // 2026-09-04 references-parity task, bucket 1 (now "every
+        // declaration" too, 2026-09-06): catch-clause bindings materialize
+        // through the SAME two output buckets as parameters
         // (`OwnerSemantics::parameter_entity_rows`/`parameter_contains_rows`
         // -- see `catch_declarations`'s own doc comment for why sharing the
         // sink is safe), chained after the parameter rows so parameter
         // ordering is unaffected for anything that only cares about that
         // population.
         let parameter_entity_rows = self
-            .referenced_parameter_targets
-            .iter()
-            .filter_map(|target_id| {
-                let fact = self.parameter_declarations.get(target_id)?;
-                Some(parameter_entity_record(
-                    &self.path,
-                    language,
-                    fact,
-                    &self.line_index,
-                ))
-            })
-            .chain(
-                self.referenced_catch_targets
-                    .iter()
-                    .filter_map(|target_id| {
-                        let fact = self.catch_declarations.get(target_id)?;
-                        Some(catch_variable_entity_record(
-                            &self.path,
-                            language,
-                            fact,
-                            &self.line_index,
-                        ))
-                    }),
-            )
+            .parameter_declarations
+            .values()
+            .map(|fact| parameter_entity_record(&self.path, language, fact, &self.line_index))
+            .chain(self.catch_declarations.values().map(|fact| {
+                catch_variable_entity_record(&self.path, language, fact, &self.line_index)
+            }))
             .collect();
         let parameter_contains_rows = self
-            .referenced_parameter_targets
-            .iter()
-            .filter_map(|target_id| {
-                let fact = self.parameter_declarations.get(target_id)?;
-                Some(parameter_contains_record(
-                    &self.path,
-                    fact,
-                    &self.line_index,
-                ))
-            })
+            .parameter_declarations
+            .values()
+            .map(|fact| parameter_contains_record(&self.path, fact, &self.line_index))
             .chain(
-                self.referenced_catch_targets
-                    .iter()
-                    .filter_map(|target_id| {
-                        let fact = self.catch_declarations.get(target_id)?;
-                        Some(catch_variable_contains_record(
-                            &self.path,
-                            fact,
-                            &self.line_index,
-                        ))
-                    }),
+                self.catch_declarations
+                    .values()
+                    .map(|fact| catch_variable_contains_record(&self.path, fact, &self.line_index)),
             )
             .collect();
         // External package/symbol entities task: `external_uses` (visitation
@@ -4676,9 +4631,10 @@ fn candidate_call_record(
     }
 }
 
-/// Parameter entities, "referenced-only" variant: the `jsts:entity_
-/// parameter` `ProposedRecord` for one [`ParameterDeclarationFact`] that
-/// received at least one resolved reference. Reuses `crate::proposal_entity_
+/// Parameter entities, "every declaration" variant (2026-09-06): the `jsts:
+/// entity_parameter` `ProposedRecord` for one [`ParameterDeclarationFact`],
+/// called for EVERY fact `finish` holds regardless of whether it ever
+/// received a resolved reference. Reuses `crate::proposal_entity_
 /// record` (lib.rs's own entity-record builder, private but visible to this
 /// descendant module) rather than duplicating its facets/body-shape logic --
 /// the SAME rules every other entity kind already gets (facets gain `"core:
@@ -4829,28 +4785,6 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 // `relationSource.id !== target.id` guard in `relate` --
                 // so mirror that here even though Rust proved the target.
                 if source_id != target_id {
-                    // Parameter entities, "referenced-only" variant: record
-                    // the target BEFORE moving `target_id` into `ReferenceRow`
-                    // below. `DeclKind::Parameter`'s own `identity_name`
-                    // ("parameter") is the second `:`-delimited segment of
-                    // its target id (`declaration_id`'s own recipe,
-                    // `jsts:parameter:{path}:{nameStart}:{name}`) -- checking
-                    // the prefix directly here (rather than re-parsing it
-                    // through `target_id_kind_name`) keeps this hot path a
-                    // single `starts_with`.
-                    if target_id.starts_with("jsts:parameter:") {
-                        self.referenced_parameter_targets.insert(target_id.clone());
-                    }
-                    // 2026-09-04 references-parity task, bucket 1: same
-                    // "referenced-only" recording for a catch-clause
-                    // binding target (`DeclKind::Variable`'s own
-                    // `"jsts:variable:"` prefix) -- see `referenced_catch_
-                    // targets`'s own doc comment for why matching an
-                    // ordinary (non-catch) variable target here too is
-                    // harmless.
-                    if target_id.starts_with("jsts:variable:") {
-                        self.referenced_catch_targets.insert(target_id.clone());
-                    }
                     self.reference_rows.push(ReferenceRow {
                         start,
                         end,
@@ -5364,8 +5298,8 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// construction: the stack frame is pushed/popped bracketing exactly
     /// that signature's own walk). A match resolves and sites exactly like
     /// `visit_identifier_reference`'s `Resolved` arm (own `core:references`
-    /// row, `referenced_parameter_targets` bookkeeping so the parameter
-    /// entity materializes even when the predicate is its ONLY reference);
+    /// row -- the parameter entity itself always materializes regardless,
+    /// `finish` now walks every `parameter_declarations` value unconditionally);
     /// no match (the name is not among this signature's own simple
     /// parameters -- should not happen for valid TS, but never assumed)
     /// keeps today's `checker_pending` fallback, same reason as before this
@@ -5402,7 +5336,6 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                     );
                     let source_id = self.current_owner();
                     if source_id != target_id {
-                        self.referenced_parameter_targets.insert(target_id.clone());
                         self.reference_rows.push(ReferenceRow {
                             start: name.span.start,
                             end: name.span.end,
@@ -6223,11 +6156,11 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 SiteDisposition::CheckerPending,
                 Some(REASON_TYPE_INFERENCE_REQUIRED),
             );
-            // Parameter entities, "referenced-only" variant: record this
-            // declaration's facts UNCONDITIONALLY (before it is known
-            // whether any reference ever targets it -- `finish` filters this
-            // map down to `referenced_parameter_targets` at the end). A
-            // parameter PROPERTY (`constructor(private x: T) {}`,
+            // Parameter entities, "every declaration" variant (2026-09-06):
+            // record this declaration's facts UNCONDITIONALLY -- `finish`
+            // now materializes an entity for every value in this map,
+            // whether or not any reference ever targets it. A parameter
+            // PROPERTY (`constructor(private x: T) {}`,
             // `parameter.has_modifier()`) is EXCLUDED from this map --
             // 2026-09-04 references-parity task, member-entities-in-cold
             // follow-up: `urdira_jsts_typeflow::member_declarations` (via
@@ -6242,11 +6175,10 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             // arm still never inspects `accessibility`/`readonly`, so a bare
             // reference to `x` elsewhere in the constructor body, and a
             // `this.x` member read (`resolve_static_member_reference`),
-            // still both resolve to this SAME entity id -- `finish`'s
-            // `referenced_parameter_targets` bucket simply finds no fact for
-            // it here (by construction, never inserted) and skips
-            // materializing it a second time, since `push_member_entities`
-            // already will.
+            // still both resolve to this SAME entity id -- `parameter_
+            // declarations` simply has no fact keyed under it here (by
+            // construction, never inserted), so `finish` never materializes
+            // it a second time, since `push_member_entities` already will.
             if !parameter.has_modifier() {
                 let entity_id = declaration_id(
                     DeclKind::Parameter,
@@ -10969,8 +10901,9 @@ mod tests {
         );
     }
 
-    // -- Parameter entities, "referenced-only" variant (owner-approved,
-    // 2026-09-04) --------------------------------------------------------
+    // -- Parameter entities, "every declaration" variant (2026-09-06,
+    // owner-approved fidelity fix superseding the 2026-09-04
+    // "referenced-only" cut) -----------------------------------------------
 
     #[test]
     fn referenced_parameters_get_entities_matching_the_reference_target_across_owner_shapes() {
@@ -11101,29 +11034,51 @@ mod tests {
     }
 
     #[test]
-    fn unreferenced_parameter_produces_no_entity() {
+    fn unreferenced_parameter_still_produces_an_entity() {
+        // 2026-09-06 fidelity fix: EVERY identifier-pattern parameter
+        // declaration materializes an entity now, whether or not any
+        // reference in the body ever targets it -- `get_outline` must list
+        // `value` even though this function's body never reads it.
         let source = "function outer(value) {\n  return 1;\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
-        assert!(
-            semantics.parameter_entity_rows.is_empty(),
+        assert_eq!(
+            semantics.parameter_entity_rows.len(),
+            1,
             "rows: {:?}",
             semantics.parameter_entity_rows
         );
-        assert!(semantics.parameter_contains_rows.is_empty());
+        assert_eq!(semantics.parameter_contains_rows.len(), 1);
+        let param_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("value").unwrap() as u32,
+            "value",
+        );
+        let entity = parameter_entity(&semantics, &param_id)
+            .unwrap_or_else(|| panic!("expected a parameter entity for {param_id}"));
+        assert_eq!(entity.body.to_value()["name"], "value");
+        assert!(parameter_contains(&semantics, &param_id).is_some());
+        // No reference ever targeted it -- the entity exists independent of
+        // `reference_rows`.
+        assert!(
+            !resolved(&semantics).iter().any(|row| row.3 == param_id),
+            "expected no resolved reference targeting an unread parameter"
+        );
     }
 
     #[test]
-    fn destructured_parameters_produce_no_entity_but_a_referenced_rest_parameter_does() {
+    fn destructured_parameters_produce_no_entity_but_an_ordinary_rest_parameter_does() {
         // A destructured parameter (`{ a, b }`) stays conservatively
         // unsupported -- `classify_symbol_declaration`'s `FormalParameter`
-        // arm only ever resolves a simple `BindingIdentifier` pattern, same
-        // as before this task. A REST parameter (`...rest`), however, is
-        // the 2026-09-04 references-parity task's bucket-1 fix
-        // (`classify_symbol_declaration`'s new `AstKind::FormalParameterRest`
-        // arm + `visit_formal_parameter_rest`'s own fact recording): once
-        // referenced (`rest.length`), it now gets exactly the same
-        // "referenced-only" entity/contains-row treatment an ordinary
-        // parameter already did.
+        // arm only ever resolves a simple `BindingIdentifier` pattern, and
+        // `visit_formal_parameter`/`visit_formal_parameter_rest` never
+        // record a fact for a non-identifier pattern either, so it is never
+        // a candidate for materialization regardless of the 2026-09-06
+        // "every declaration" fix. A REST parameter (`...rest`) DOES get a
+        // fact (`visit_formal_parameter_rest`) and, since 2026-09-06,
+        // materializes an entity/contains-row pair whether or not it is
+        // referenced -- this fixture also references it (`rest.length`) so
+        // the same case doubles as reference-resolution coverage.
         let source = "function outer({ a, b }, ...rest) {\n  return a + b + rest.length;\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
         let rest_id = declaration_id(
@@ -11170,16 +11125,23 @@ mod tests {
     }
 
     #[test]
-    fn unreferenced_rest_parameter_produces_no_entity() {
-        // Same "referenced-only" discipline an ordinary parameter already
-        // has (see `unreferenced_parameter_produces_no_entity`): a rest
-        // parameter that is never referenced in the body gets no entity at
-        // all, even though `classify_symbol_declaration` now knows how to
-        // classify it.
+    fn unreferenced_rest_parameter_still_produces_an_entity() {
+        // Same "every declaration" fidelity an ordinary parameter now has
+        // (see `unreferenced_parameter_still_produces_an_entity`): a rest
+        // parameter that is never referenced in the body still gets exactly
+        // one entity + contains row.
         let source = "function outer(...rest) {\n  return 0;\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
-        assert!(semantics.parameter_entity_rows.is_empty());
-        assert!(semantics.parameter_contains_rows.is_empty());
+        assert_eq!(semantics.parameter_entity_rows.len(), 1);
+        assert_eq!(semantics.parameter_contains_rows.len(), 1);
+        let rest_id = declaration_id(
+            DeclKind::Parameter,
+            "a.ts",
+            source.find("rest)").unwrap() as u32,
+            "rest",
+        );
+        assert!(parameter_entity(&semantics, &rest_id).is_some());
+        assert!(parameter_contains(&semantics, &rest_id).is_some());
     }
 
     #[test]
@@ -11191,7 +11153,7 @@ mod tests {
         // declaration`'s new `AstKind::CatchParameter` arm (`DeclKind::
         // Variable`, matching v3's `isVariableDeclaration` treatment) and
         // materializes a `core:value` entity via `visit_catch_parameter`'s
-        // "referenced-only" fact recording.
+        // unconditional fact recording (every declaration, 2026-09-06).
         let source = "function outer() {\n  try {\n    risky();\n  } catch (error) {\n    log(error.message);\n  }\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
         let catch_start = source.find("error) {").unwrap() as u32;
@@ -11222,12 +11184,19 @@ mod tests {
     }
 
     #[test]
-    fn unreferenced_catch_binding_produces_no_entity() {
+    fn unreferenced_catch_binding_still_produces_an_entity() {
+        // 2026-09-06 fidelity fix: same "every declaration" treatment as an
+        // unreferenced parameter -- a catch binding never read in the block
+        // still materializes its `core:value` entity + contains row.
         let source =
             "function outer() {\n  try {\n    risky();\n  } catch (error) {\n    log();\n  }\n}\n";
         let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
-        assert!(semantics.parameter_entity_rows.is_empty());
-        assert!(semantics.parameter_contains_rows.is_empty());
+        assert_eq!(semantics.parameter_entity_rows.len(), 1);
+        assert_eq!(semantics.parameter_contains_rows.len(), 1);
+        let catch_start = source.find("error) {").unwrap() as u32;
+        let catch_id = declaration_id(DeclKind::Variable, "a.ts", catch_start, "error");
+        assert!(parameter_entity(&semantics, &catch_id).is_some());
+        assert!(parameter_contains(&semantics, &catch_id).is_some());
     }
 
     #[test]

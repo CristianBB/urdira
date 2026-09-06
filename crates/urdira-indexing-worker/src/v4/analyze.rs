@@ -764,15 +764,20 @@ pub fn run_scoped(
             // ROW gets published.
             owner.records.extend(semantics.candidate_call_rows);
         }
-        // Parameter entities, "referenced-only" variant (owner-approved,
-        // 2026-09-04): one `jsts:entity_parameter` record + one `core:
-        // contains` record per parameter that received at least one
-        // resolved reference in this owner -- see `OwnerSemantics::
+        // Parameter entities, "every declaration" variant (2026-09-06,
+        // owner-approved fidelity fix superseding the 2026-09-04
+        // "referenced-only" cut): one `jsts:entity_parameter` record + one
+        // `core:contains` record per parameter/catch-binding declaration in
+        // this owner, REGARDLESS of whether any reference in this owner (or
+        // any other) ever targets it -- see `OwnerSemantics::
         // parameter_entity_rows`'s own doc comment in `urdira-jsts-syntax-
-        // worker` for the exact eligibility/`parent_id` rule. Unconditional
+        // worker` for the exact `parent_id` resolution rule and why
+        // fidelity (every declared parameter visible to `get_outline`) beats
+        // the earlier "only if referenced" population trim. Unconditional
         // (unlike `candidate_call_rows` above): there is no measurement
-        // escape hatch for these, they are load-bearing for `core:
-        // references`'s own `target_subject` on a parameter target.
+        // escape hatch for these, they are load-bearing both for `core:
+        // references`'s own `target_subject` on a parameter target AND for
+        // `get_outline`'s completeness.
         owner.records.extend(semantics.parameter_entity_rows);
         owner.records.extend(semantics.parameter_contains_rows);
         // External package/symbol entities task (2026-09-04): one `jsts:

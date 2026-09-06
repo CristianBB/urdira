@@ -2217,6 +2217,32 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         children.push(endpoints.target);
         contains.set(endpoints.source, children);
       }
+      // 2026-09-06 flecos-v4 fidelity fix: `maps.relations`' own order is
+      // NOT guaranteed to be declaration order (it is whatever order the
+      // underlying `records` array holds `core:contains` rows in, which for
+      // some producers -- e.g. `jsts:entity_parameter`'s own `contains` rows,
+      // emitted by iterating a `BTreeMap<entity_id, _>` -- sorts by the
+      // ENTITY ID STRING, not numerically by byte offset: `"10"` sorts
+      // before `"9"` lexicographically). An agent reading `get_outline`
+      // expects a callable's parameters listed left-to-right as declared, so
+      // sort each parent's children by their own `primary_source_span.
+      // start_byte` (numeric) before emitting -- falling back to `start_line`
+      // then to `identity_key`/`record_id` only when a span is missing
+      // entirely (e.g. a synthetic `external_module`/`external_symbol`
+      // entity, whose span is always `0`/`0`, so those simply keep whatever
+      // stable order `Array.prototype.sort` gives ties).
+      for (const children of contains.values()) {
+        children.sort((left, right) => {
+          const leftStart = left.primary_source_span?.start_byte;
+          const rightStart = right.primary_source_span?.start_byte;
+          if (leftStart !== undefined && rightStart !== undefined) {
+            const diff = Number(leftStart) - Number(rightStart);
+            if (diff !== 0) return diff;
+          } else if (leftStart !== undefined) return -1;
+          else if (rightStart !== undefined) return 1;
+          return (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id);
+        });
+      }
       const seen = new Set<string>([container.identity_key ?? container.record_id]);
       let frontier = [container];
       const members: CanonicalQueryRecord[] = [];

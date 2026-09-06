@@ -311,3 +311,45 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
   to the pending site). The residual pass reads `pending.sites`, closes the site and any
   candidate rows at the same span when it confirms a target, and additionally publishes
   inferred types, `type_of` relations and compiler diagnostics in the same upgrade generation.
+
+## Amendment 2026-09-06 (flecos v4 plan, Frente F, see `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`)
+
+- **Union/overload receivers never promote to confirmed, even when every candidate agrees — ACCEPTED as steady state.**
+  This invariant already lived in code (`semantic_sites.rs:170-178` and `:1085-1093`,
+  `OwnerSemantics::candidate_call_rows`'s own doc comment: "**Never** produces a `classification:
+  confirmed` row: a union/overload receiver is a genuine ambiguity in this round, never promoted
+  to a single target even when every candidate agrees") but was documented only at the code site,
+  not in this decision. It is now recorded here explicitly: an overloaded member (`MemberLookup::
+  Many`, reason `overload_ambiguous`) or a union-typed receiver (`MemberLookup::UnionCandidates`,
+  reason `union_ambiguous`) always stays a `possible` `core:call`/heritage row per candidate (with
+  a real `target_id`, facet `core:indirect`) plus its own `pending.sites` entry for a later
+  residual pass to confirm — it is **never** collapsed to one `confirmed` row by this crate's own
+  zero-wrong-target discipline, regardless of how many (or how unanimous) the candidates are. No
+  code change accompanies this amendment; it closes an open documentation gap flagged during the
+  2026-09-06 flecos-v4 review (plan `§3.0`/`§3.1`, decision 28 vs. 29 cross-reference: the
+  invariant's normative home is this decision, not 29).
+- **Parameter entities: every declaration, not only referenced ones.** `OwnerSemantics::
+  parameter_entity_rows`/`parameter_contains_rows` (`semantic_sites.rs`) now materialize a `jsts:
+  entity_parameter`/`core:value` (catch binding) entity and its `core:contains` row for EVERY
+  identifier-pattern parameter/rest-parameter/catch-binding declaration this crate's walk records
+  a fact for (`parameter_declarations`/`catch_declarations`, both `BTreeMap`s, iterated by
+  `.values()` in `finish()`), superseding the 2026-09-04 "referenced-only" cut (a parameter got an
+  entity only if some resolved reference in its own body targeted it). Motive: `core:get_outline`
+  (`packages/engine/src/canonical-query-data-port.ts`) is a BFS over `core:contains` — an agent
+  asking for a callable's signature must see every declared parameter, including one the body
+  never reads (a common, legitimate shape: an unused `error`/`event`/interface-conformance
+  parameter). Destructured/object-pattern parameters and catch bindings remain unsupported exactly
+  as before (`classify_symbol_declaration`'s `FormalParameter`/`CatchParameter` arms only resolve
+  a simple `BindingIdentifier`; this amendment does not change what counts as a candidate, only
+  whether a candidate needs a reference to materialize). A constructor parameter PROPERTY is still
+  excluded from this producer (`urdira_jsts_typeflow::member_declarations`/`push_member_entities`
+  owns it unconditionally instead, unchanged). `get_outline`'s own child ordering was hardened to
+  sort by `primary_source_span.start_byte` (`canonical-query-data-port.ts`'s `core:get_outline`
+  handler) rather than relying on `core:contains` relation-record order, which is NOT guaranteed
+  to be positional (a `BTreeMap<entity_id, _>`'s iteration order sorts the id STRING, and an
+  unpadded byte offset embedded in that id does not sort numerically past a digit-width boundary,
+  e.g. `"10"` before `"9"`). Population effect: n8n's `jsts:entity_parameter` count moves from
+  74,769 (referenced-only) to a new, larger figure re-measured by F.3 (plan §0 rule R5); the
+  regression floor in `scripts/v4-population-floors.json`/`crates/urdira-indexing-worker/src/v4/
+  tests_e2e.rs`'s `n8n_population_floors` starts at `74,021` (`0.99 x` the OLD figure) and is
+  expected to only move up once F.3's measurement lands.

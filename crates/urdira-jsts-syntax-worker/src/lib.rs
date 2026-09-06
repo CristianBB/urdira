@@ -791,15 +791,15 @@ pub enum EntityKind {
     /// signature.
     Property,
     /// An identifier-pattern parameter declaration (function/method/
-    /// constructor/getter/setter/arrow/function-expression) that received
-    /// AT LEAST ONE resolved reference in its own body -- the "referenced-
-    /// only" variant (owner-approved, 2026-09-04): unlike every other
-    /// `EntityKind`, NOT every declaration of this kind gets an entity, only
-    /// the ones `semantic_sites.rs`'s reference resolution actually proved a
-    /// target for. See `semantic_sites::ParamOwner`/`ParameterDeclarationFact`
-    /// for the producer and `docs/evidence/2026-09-04-v4-pending-sites-fold-
-    /// and-member-entities.md`'s sibling page for the class/interface member
-    /// entity precedent this follows.
+    /// constructor/getter/setter/arrow/function-expression). EVERY such
+    /// declaration gets an entity now (2026-09-06 fidelity fix, flecos v4
+    /// plan §3.3, superseding the 2026-09-04 "referenced-only" cut that used
+    /// to require at least one resolved reference in the body): `get_outline`
+    /// must list every declared parameter an agent might ask about, not only
+    /// the ones some caller happens to read. See `semantic_sites::ParamOwner`/
+    /// `ParameterDeclarationFact` for the producer and `docs/evidence/
+    /// 2026-09-04-v4-pending-sites-fold-and-member-entities.md`'s sibling page
+    /// for the class/interface member entity precedent this follows.
     Parameter,
     /// External package/symbol entities task (2026-09-04): the whole
     /// external package/builtin an unresolved bare/scoped import specifier
