@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { encodeCanonical } from "@urdira/canonical";
 import {
+  ensureSemanticSidecarSchemaCompatibilityV4,
   openSqliteDatabase,
   V4_IDENTITY_FORMAT,
   WORKSPACE_V4_INDEX_CONTRACT,
@@ -159,10 +160,28 @@ export async function ensureV4Workspace(input: EnsureV4WorkspaceInput): Promise<
   // (`SqliteCanonicalQuerySnapshotPort.search_literal`'s own contract).
   for (const kind of ["lexical", "semantic"] as const) {
     const sidecarPath = sidecarDatabasePathFor(databasePath, kind);
-    if (existsSync(sidecarPath)) continue;
+    // Frente S-B (R22): the semantic sidecar's own additive column migration
+    // (`ensureSemanticSidecarSchemaCompatibilityV4`) must run even when the
+    // file ALREADY exists -- a workspace bootstrapped before
+    // `segment_index`/`segment_start`/`segment_end` existed would otherwise
+    // never receive them. The lexical sidecar has no such migration yet, so
+    // its own early-`continue` (skip entirely once the file exists) is
+    // unchanged.
+    if (existsSync(sidecarPath)) {
+      if (kind === "semantic") {
+        const sidecarDatabase = await openSqliteDatabase({ filename: sidecarPath });
+        try {
+          await ensureSemanticSidecarSchemaCompatibilityV4(sidecarDatabase);
+        } finally {
+          await sidecarDatabase.close();
+        }
+      }
+      continue;
+    }
     const sidecarDatabase = await openSqliteDatabase({ filename: sidecarPath });
     try {
       await sidecarDatabase.exec(kind === "lexical" ? WORKSPACE_V4_LEXICAL_SCHEMA : WORKSPACE_V4_SEMANTIC_SCHEMA);
+      if (kind === "semantic") await ensureSemanticSidecarSchemaCompatibilityV4(sidecarDatabase);
     } finally {
       await sidecarDatabase.close();
     }

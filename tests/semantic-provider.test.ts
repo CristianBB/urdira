@@ -1,13 +1,16 @@
-import { describe, expect, it, vi } from "vitest";
+import { createServer, type Server } from "node:http";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { exactVectorScan, type ExactVectorCandidate } from "../packages/engine/src/index.js";
 import {
   createHttpEmbeddingProvider,
   createLocalHashProvider,
+  HttpEmbeddingProviderUnavailableError,
 } from "../packages/engine/src/index.js";
 import {
   computeLocalHashVector,
   extractLocalHashTokens,
 } from "../packages/engine/src/semantic-provider.js";
+import { DEFAULT_MAX_SEGMENTS } from "../packages/engine/src/semantic-runtime.js";
 
 describe("local hash embedding provider", () => {
   it("ships the PINNED profile literal, stable across calls", () => {
@@ -138,6 +141,36 @@ describe("local hash embedding provider", () => {
 
     expect(ranked[0]?.projection_record_id).toBe("related");
   });
+
+  it("Frente S-B: executable_binding_digest incorporates the R10 segmenter identity, and .segment() splits long text using the chars/4 approximation", async () => {
+    const provider = createLocalHashProvider();
+    expect(provider.binding.segment).toBeDefined();
+    // Short text (well under the 1024-char window) is exactly one segment
+    // covering the whole text.
+    const short = await provider.binding.segment!("function shortFunction() { return 1; }");
+    expect(short.segments).toHaveLength(1);
+    expect(short.truncated).toBe(false);
+    expect(short.segments[0]).toMatchObject({ index: 0, start_char: 0, end_char: 38, text: "function shortFunction() { return 1; }" });
+
+    // Long text (well over one window) splits into overlapping segments.
+    const long = "x".repeat(3000);
+    const segmented = await provider.binding.segment!(long);
+    expect(segmented.segments.length).toBeGreaterThan(1);
+    expect(segmented.truncated).toBe(false);
+    // Consecutive segments overlap by the configured overlap_chars (128).
+    const first = segmented.segments[0]!;
+    const second = segmented.segments[1]!;
+    expect(second.start_char).toBe(first.end_char - 128);
+    // Every segment's own text matches its own recorded offsets.
+    for (const segment of segmented.segments) expect(segment.text).toBe(long.slice(segment.start_char, segment.end_char));
+
+    // A text needing more than DEFAULT_MAX_SEGMENTS segments is truncated,
+    // never silently dropped without a signal (R8).
+    const huge = "y".repeat(1024 * (DEFAULT_MAX_SEGMENTS + 5));
+    const cappedSegmentation = await provider.binding.segment!(huge);
+    expect(cappedSegmentation.segments).toHaveLength(DEFAULT_MAX_SEGMENTS);
+    expect(cappedSegmentation.truncated).toBe(true);
+  });
 });
 
 function fakeJsonResponse(status: number, body: unknown): Response {
@@ -174,11 +207,71 @@ describe("HTTP embedding provider", () => {
     expect(secondInit.headers["authorization"]).toBeUndefined();
   });
 
-  it("throws when the response reports a non-2xx status, including a truncated body preview", async () => {
+  it("throws HttpEmbeddingProviderUnavailableError when the response reports a persistent non-2xx status, including a truncated body preview, after exhausting retries", async () => {
     const fetchImpl = vi.fn(async () => fakeJsonResponse(500, "internal server error detail")) as unknown as typeof fetch;
-    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, fetch_impl: fetchImpl });
+    // R12: a 500 is retryable -- `retry_backoff_ms: []` (zero retries) keeps
+    // this test fast while still exercising the FINAL non-retryable-status
+    // throw path; the retry loop itself is exercised separately below.
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, fetch_impl: fetchImpl, retry_backoff_ms: [] });
     await expect(provider.binding.generateVector({ profile: provider.profile, purpose: "query", text: "x" })).rejects.toThrow(/500/);
     await expect(provider.binding.generateVector({ profile: provider.profile, purpose: "query", text: "x" })).rejects.toThrow(/internal server error detail/);
+    const error = await provider.binding.generateVector({ profile: provider.profile, purpose: "query", text: "x" }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(HttpEmbeddingProviderUnavailableError);
+    expect((error as HttpEmbeddingProviderUnavailableError).code).toBe("core:embedding_provider_unavailable");
+  });
+
+  it("retries a 429 with the configured backoff and succeeds once the endpoint recovers (R12)", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) return fakeJsonResponse(429, "rate limited");
+      return fakeJsonResponse(200, { data: [{ embedding: [1, 0, 0, 0] }] });
+    }) as unknown as typeof fetch;
+    const provider = createHttpEmbeddingProvider({
+      endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, fetch_impl: fetchImpl,
+      sleep_impl: async (ms) => { sleeps.push(ms); },
+    });
+    const generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: "retry me" });
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([500]);
+    expect(generated.vector.byteLength).toBe(16);
+  });
+
+  it("retries only on 429/5xx/network errors -- a non-retryable 4xx status fails immediately, with no retry and no injected sleep", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return fakeJsonResponse(400, "bad request");
+    }) as unknown as typeof fetch;
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, fetch_impl: fetchImpl, sleep_impl: async (ms) => { sleeps.push(ms); } });
+    await expect(provider.binding.generateVector({ profile: provider.profile, purpose: "query", text: "x" })).rejects.toThrow(/400/);
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("retries a network-level fetch rejection (not just a non-2xx status) and eventually throws HttpEmbeddingProviderUnavailableError once every retry is exhausted", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      throw new TypeError("fetch failed: network unreachable");
+    }) as unknown as typeof fetch;
+    const provider = createHttpEmbeddingProvider({
+      endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, fetch_impl: fetchImpl,
+      retry_backoff_ms: [0, 0], sleep_impl: async () => undefined,
+    });
+    await expect(provider.binding.generateVector({ profile: provider.profile, purpose: "query", text: "x" })).rejects.toBeInstanceOf(HttpEmbeddingProviderUnavailableError);
+    expect(calls).toBe(3); // 1 initial attempt + 2 retries
+  });
+
+  it("never retries a malformed-but-successful response (wrong dimensions/non-finite) -- that is a provider contract bug, not unavailability", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => { calls += 1; return fakeJsonResponse(200, { data: [{ embedding: [1, 0, 0] }] }); }) as unknown as typeof fetch;
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, fetch_impl: fetchImpl, sleep_impl: async () => undefined });
+    const error = await provider.binding.generateVector({ profile: provider.profile, purpose: "query", text: "x" }).catch((caught: unknown) => caught);
+    expect(error).not.toBeInstanceOf(HttpEmbeddingProviderUnavailableError);
+    expect(calls).toBe(1);
   });
 
   it("throws when the returned embedding has the wrong dimensionality", async () => {
@@ -264,5 +357,238 @@ describe("HTTP embedding provider", () => {
     expect(provider.profile.embedding_profile_id).toBe("core:http-text-embed-3-large-1536");
     expect(provider.binding.runtime_binding_id).toBe("core:http-embeddings");
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("R12: splits generateVectors into sequential (concurrency-1) requests of at most max_batch_inputs items each, never in parallel", async () => {
+    const requestBodies: string[] = [];
+    let concurrentInFlight = 0;
+    let maxConcurrentObserved = 0;
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      concurrentInFlight += 1;
+      maxConcurrentObserved = Math.max(maxConcurrentObserved, concurrentInFlight);
+      requestBodies.push(init!.body as string);
+      await new Promise((resolve) => setImmediate(resolve));
+      concurrentInFlight -= 1;
+      const input = (JSON.parse(init!.body as string) as { readonly input: readonly string[] }).input;
+      // One-hot per GLOBAL input identity (never magnitude-encoded -- an L2
+      // normalization step downstream would collapse any two same-direction
+      // vectors of different magnitude to the identical unit vector).
+      const oneHot = new Map<string, readonly number[]>([["a", [1, 0, 0, 0]], ["b", [0, 1, 0, 0]], ["c", [0, 0, 1, 0]], ["d", [0, 0, 0, 1]], ["e", [1, 1, 0, 0]]]);
+      return fakeJsonResponse(200, { data: input.map((text) => ({ embedding: oneHot.get(text) })) });
+    }) as unknown as typeof fetch;
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, fetch_impl: fetchImpl, max_batch_inputs: 2 });
+
+    const inputs = ["a", "b", "c", "d", "e"].map((text) => ({ profile: provider.profile, purpose: "document" as const, text }));
+    const generated = await provider.binding.generateVectors!(inputs);
+
+    expect(maxConcurrentObserved).toBe(1); // never more than one request in flight
+    expect(requestBodies.map((body) => (JSON.parse(body) as { readonly input: readonly string[] }).input)).toEqual([["a", "b"], ["c", "d"], ["e"]]);
+    expect(generated).toHaveLength(5);
+    // Each vector round-trips its OWN identity, mapped back to the correct
+    // GLOBAL position -- input "c" (chunk 2, index 0) must not be confused
+    // with input "a" (chunk 1, index 0).
+    const decodeFloat32 = (bytes: Uint8Array) => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+    expect(decodeFloat32(generated[2]!.vector)).toEqual([0, 0, 1, 0]); // "c"
+    expect(decodeFloat32(generated[0]!.vector)).toEqual([1, 0, 0, 0]); // "a"
+  });
+
+  it("R12: splits generateVectors by ESTIMATED token budget (chars/4) even under max_batch_inputs, always keeping at least one item per chunk", async () => {
+    const requestBodies: string[] = [];
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(init!.body as string);
+      const input = (JSON.parse(init!.body as string) as { readonly input: readonly string[] }).input;
+      return fakeJsonResponse(200, { data: input.map(() => ({ embedding: [1, 0, 0, 0] })) });
+    }) as unknown as typeof fetch;
+    // max_input_tokens: 10 -> ~40 chars per request budget.
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, fetch_impl: fetchImpl, max_input_tokens: 10, max_batch_inputs: 64 });
+    const inputs = [
+      { profile: provider.profile, purpose: "document" as const, text: "a".repeat(20) }, // ~5 tokens
+      { profile: provider.profile, purpose: "document" as const, text: "b".repeat(20) }, // ~5 tokens -> chunk full at 10
+      { profile: provider.profile, purpose: "document" as const, text: "c".repeat(100) }, // ~25 tokens alone -- exceeds budget but still gets its OWN chunk
+    ];
+    await provider.binding.generateVectors!(inputs);
+    const chunks = requestBodies.map((body) => (JSON.parse(body) as { readonly input: readonly string[] }).input.length);
+    expect(chunks).toEqual([2, 1]);
+  });
+
+  it("R12: .segment() splits by chars/4, bounded by max_input_tokens (never exceeding DEFAULT_MAX_SEGMENTS)", async () => {
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, max_input_tokens: 512 });
+    expect(provider.binding.segment).toBeDefined();
+    // 512 tokens / 256-token window = 2 segments max for this provider,
+    // regardless of DEFAULT_MAX_SEGMENTS's own higher ceiling.
+    const huge = "z".repeat(1024 * 10);
+    const segmentation = await provider.binding.segment!(huge);
+    expect(segmentation.segments.length).toBeLessThanOrEqual(2);
+    expect(segmentation.truncated).toBe(true);
+  });
+
+  it("R10/R12: executable_binding_digest changes with max_batch_inputs, max_input_tokens, and the segmenter identity -- never with api_key", () => {
+    const base = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4 });
+    const differentBatch = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, max_batch_inputs: 8 });
+    const differentTokens = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test", model: "m", dimensions: 4, max_input_tokens: 4096 });
+    expect(differentBatch.binding.executable_binding_digest).not.toBe(base.binding.executable_binding_digest);
+    expect(differentTokens.binding.executable_binding_digest).not.toBe(base.binding.executable_binding_digest);
+    expect(base.profile.maximum_document_tokens).toBe("8192");
+    expect(differentTokens.profile.maximum_document_tokens).toBe("4096");
+  });
+
+  describe("node:http e2e (R12 full pipeline)", () => {
+    let server: Server;
+    let baseUrl: string;
+    let requestCount: number;
+    let behavior: (requestIndex: number, body: { readonly input: readonly string[] }) => { readonly status: number; readonly body: unknown; readonly headers?: Record<string, string> };
+
+    beforeEach(async () => {
+      requestCount = 0;
+      await new Promise<void>((resolve) => {
+        server = createServer((request, response) => {
+          const chunks: Buffer[] = [];
+          request.on("data", (chunk: Buffer) => chunks.push(chunk));
+          request.on("end", () => {
+            requestCount += 1;
+            const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { readonly input: readonly string[] };
+            const { status, body: responseBody, headers } = behavior(requestCount, body);
+            response.writeHead(status, { "content-type": "application/json", ...headers });
+            response.end(JSON.stringify(responseBody));
+          });
+        });
+        server.listen(0, "127.0.0.1", () => {
+          const address = server.address();
+          baseUrl = typeof address === "object" && address !== null ? `http://127.0.0.1:${address.port}/v1/embeddings` : "";
+          resolve();
+        });
+      });
+    });
+
+    afterEach(async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    it("batches correctly by index over a real HTTP round trip", async () => {
+      // One-hot per input identity -- see the equivalent unit test above for
+      // why a magnitude-encoded embedding cannot survive this provider's
+      // own L2 normalization.
+      const oneHot = new Map<string, readonly number[]>([["a", [1, 0, 0, 0]], ["bb", [0, 1, 0, 0]], ["ccc", [0, 0, 1, 0]]]);
+      behavior = (_requestIndex, body) => ({ status: 200, body: { data: body.input.map((text) => ({ embedding: oneHot.get(text) })) } });
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4, max_batch_inputs: 2 });
+      const generated = await provider.binding.generateVectors!([
+        { profile: provider.profile, purpose: "document", text: "a" },
+        { profile: provider.profile, purpose: "document", text: "bb" },
+        { profile: provider.profile, purpose: "document", text: "ccc" },
+      ]);
+      expect(requestCount).toBe(2); // [a, bb] then [ccc]
+      const decode = (bytes: Uint8Array) => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+      expect(decode(generated[0]!.vector)).toEqual([1, 0, 0, 0]);
+      expect(decode(generated[1]!.vector)).toEqual([0, 1, 0, 0]);
+      expect(decode(generated[2]!.vector)).toEqual([0, 0, 1, 0]);
+    });
+
+    it("429 then success: retries and eventually returns a real embedding over a live HTTP round trip", async () => {
+      behavior = (requestIndex, body) => requestIndex === 1
+        ? { status: 429, body: "rate limited" }
+        : { status: 200, body: { data: body.input.map(() => ({ embedding: [1, 0, 0, 0] })) } };
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4, sleep_impl: async () => undefined });
+      const generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: "retry-me" });
+      expect(requestCount).toBe(2);
+      expect(generated.vector.byteLength).toBe(16);
+    });
+
+    it("persistent 500: marks failed (HttpEmbeddingProviderUnavailableError) after exhausting retries over a live HTTP round trip", async () => {
+      behavior = () => ({ status: 500, body: "always down" });
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4, retry_backoff_ms: [0, 0], sleep_impl: async () => undefined });
+      const error = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: "never works" }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(HttpEmbeddingProviderUnavailableError);
+      expect((error as HttpEmbeddingProviderUnavailableError).code).toBe("core:embedding_provider_unavailable");
+      expect(requestCount).toBe(3); // 1 initial attempt + 2 retries
+    });
+
+    it("search_semantic-shaped retrieval: embeds a small corpus + a query over the HTTP provider and ranks the semantically closest document first", async () => {
+      // Deterministic per-text "embedding": encodes which of two topic
+      // keywords the text contains into orthogonal dimensions -- exercises
+      // the full request/response round trip driving a real
+      // `exactVectorScan` ranking, not just shape assertions.
+      behavior = (_requestIndex, body) => ({
+        status: 200,
+        body: { data: body.input.map((text) => ({ embedding: [text.includes("html") ? 1 : 0, text.includes("socket") ? 1 : 0, 0, 0] })) },
+      });
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4 });
+      const embed = (text: string) => provider.binding.generateVector({ profile: provider.profile, purpose: "document", text });
+      const htmlDoc = await embed("parses an html document");
+      const socketDoc = await embed("opens a network socket");
+      const query = await provider.binding.generateVector({ profile: provider.profile, purpose: "query", text: "html parser" });
+
+      const ranked = exactVectorScan(
+        [
+          { projection_record_id: "html-doc", profile_id: provider.profile.embedding_profile_id, executable_binding_id: provider.binding.executable_binding_digest, vector: htmlDoc.vector },
+          { projection_record_id: "socket-doc", profile_id: provider.profile.embedding_profile_id, executable_binding_id: provider.binding.executable_binding_digest, vector: socketDoc.vector },
+        ],
+        query.vector,
+        { profile_id: provider.profile.embedding_profile_id, executable_binding_id: provider.binding.executable_binding_digest, dimensions: provider.profile.dimensions, distance_metric: "cosine", normalization: "l2" },
+      );
+      expect(ranked[0]?.projection_record_id).toBe("html-doc");
+    });
+
+    it("respects a 429 response's own Retry-After header as a MINIMUM wait, even when it is longer than the configured backoff (adversarial review item #8)", async () => {
+      const sleeps: number[] = [];
+      behavior = (requestIndex) => requestIndex === 1
+        ? { status: 429, body: "rate limited", headers: { "retry-after": "2" } }
+        : { status: 200, body: { data: [{ embedding: [1, 0, 0, 0] }] } };
+      // `retry_backoff_ms: [10]` is far SHORTER than the server's own
+      // `Retry-After: 2` (2,000ms) -- the actual wait must be raised to at
+      // least the server's own value, never left at the configured 10ms.
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4, retry_backoff_ms: [10], sleep_impl: async (ms) => { sleeps.push(ms); } });
+      const generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: "retry-me" });
+      expect(requestCount).toBe(2);
+      expect(generated.vector.byteLength).toBe(16);
+      expect(sleeps).toEqual([2000]);
+    });
+
+    it("does not let a stale/malformed Retry-After value shorten or break the configured backoff", async () => {
+      const sleeps: number[] = [];
+      behavior = (requestIndex) => requestIndex === 1
+        ? { status: 429, body: "rate limited", headers: { "retry-after": "not-a-valid-value" } }
+        : { status: 200, body: { data: [{ embedding: [1, 0, 0, 0] }] } };
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4, retry_backoff_ms: [10], sleep_impl: async (ms) => { sleeps.push(ms); } });
+      const generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: "retry-me" });
+      expect(requestCount).toBe(2);
+      expect(generated.vector.byteLength).toBe(16);
+      expect(sleeps).toEqual([10]);
+    });
+
+    it("reorders a response whose data[] items come back out of request order, when each item carries its own index (adversarial review item #8)", async () => {
+      const oneHot = new Map<string, readonly number[]>([["a", [1, 0, 0, 0]], ["bb", [0, 1, 0, 0]], ["ccc", [0, 0, 1, 0]]]);
+      behavior = (_requestIndex, body) => ({
+        status: 200,
+        // Deliberately REVERSED from request order (index 2 first, index 0
+        // last) -- some "OpenAI-compatible" servers do this (e.g. shortest
+        // input finishes first) while still tagging each item with its own
+        // `index`. A naive positional `data[i]` read would pair "a"'s own
+        // embedding with "ccc" and vice versa.
+        body: { data: body.input.map((text, requestIndex) => ({ index: requestIndex, embedding: oneHot.get(text) })).reverse() },
+      });
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4 });
+      const generated = await provider.binding.generateVectors!([
+        { profile: provider.profile, purpose: "document", text: "a" },
+        { profile: provider.profile, purpose: "document", text: "bb" },
+        { profile: provider.profile, purpose: "document", text: "ccc" },
+      ]);
+      const decode = (bytes: Uint8Array) => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+      expect(decode(generated[0]!.vector)).toEqual([1, 0, 0, 0]);
+      expect(decode(generated[1]!.vector)).toEqual([0, 1, 0, 0]);
+      expect(decode(generated[2]!.vector)).toEqual([0, 0, 1, 0]);
+    });
+
+    it("falls back to positional data[] order when items carry no index at all (baseline OpenAI contract, unaffected by the index-reordering fix)", async () => {
+      const perIndexEmbedding = [[1, 0, 0, 0], [0, 1, 0, 0]];
+      behavior = (_requestIndex, body) => ({ status: 200, body: { data: body.input.map((_text, index) => ({ embedding: perIndexEmbedding[index] })) } });
+      const provider = createHttpEmbeddingProvider({ endpoint: baseUrl, model: "m", dimensions: 4 });
+      const generated = await provider.binding.generateVectors!([
+        { profile: provider.profile, purpose: "document", text: "a" },
+        { profile: provider.profile, purpose: "document", text: "bb" },
+      ]);
+      const decode = (bytes: Uint8Array) => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+      expect(decode(generated[0]!.vector)).toEqual([1, 0, 0, 0]);
+      expect(decode(generated[1]!.vector)).toEqual([0, 1, 0, 0]);
+    });
   });
 });

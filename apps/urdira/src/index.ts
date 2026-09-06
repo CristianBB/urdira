@@ -2127,7 +2127,31 @@ function resolveSemanticDescriptor(dataRoot: string): SemanticProviderDescriptor
     const dimensions = Number(dimensionsRaw);
     if (!Number.isSafeInteger(dimensions) || dimensions <= 0) throw new Error(`URDIRA_EMBEDDINGS_DIMENSIONS must be a positive integer; received "${dimensionsRaw}".`);
     const apiKey = process.env["URDIRA_EMBEDDINGS_API_KEY"];
-    return { kind: "http", endpoint, model, dimensions, ...(apiKey === undefined || apiKey === "" ? {} : { api_key: apiKey }) };
+    // Frente S-B.3 (2026-09-06, R12): optional per-provider overrides for the
+    // HTTP embedding provider's own batching/token-budget knobs
+    // (`createHttpEmbeddingProvider`'s `max_batch_inputs`/`max_input_tokens`,
+    // defaults 64/8192) -- this env-var surface is the SAME configuration
+    // path `URDIRA_EMBEDDINGS_ENDPOINT`/`_MODEL`/`_DIMENSIONS`/`_API_KEY`
+    // already use for selecting `{kind: "http", ...}` at all (decided in
+    // implementation: this app's semantic provider selection has always
+    // been env-var-driven, resolved once at daemon start, never a per-call
+    // `workspace configure`/`config set` RPC argument -- widening that
+    // existing surface with two more optional variables is the minimal,
+    // architecture-consistent way to expose these two new knobs, rather
+    // than inventing a new RPC-argument-based configuration path this app
+    // has never had for ANY semantic provider kind).
+    const maxBatchInputsRaw = process.env["URDIRA_EMBEDDINGS_MAX_BATCH_INPUTS"];
+    const maxBatchInputs = maxBatchInputsRaw !== undefined && maxBatchInputsRaw !== "" ? Number(maxBatchInputsRaw) : undefined;
+    if (maxBatchInputs !== undefined && (!Number.isSafeInteger(maxBatchInputs) || maxBatchInputs <= 0)) throw new Error(`URDIRA_EMBEDDINGS_MAX_BATCH_INPUTS must be a positive integer; received "${maxBatchInputsRaw}".`);
+    const maxInputTokensRaw = process.env["URDIRA_EMBEDDINGS_MAX_INPUT_TOKENS"];
+    const maxInputTokens = maxInputTokensRaw !== undefined && maxInputTokensRaw !== "" ? Number(maxInputTokensRaw) : undefined;
+    if (maxInputTokens !== undefined && (!Number.isSafeInteger(maxInputTokens) || maxInputTokens <= 0)) throw new Error(`URDIRA_EMBEDDINGS_MAX_INPUT_TOKENS must be a positive integer; received "${maxInputTokensRaw}".`);
+    return {
+      kind: "http", endpoint, model, dimensions,
+      ...(apiKey === undefined || apiKey === "" ? {} : { api_key: apiKey }),
+      ...(maxBatchInputs === undefined ? {} : { max_batch_inputs: maxBatchInputs }),
+      ...(maxInputTokens === undefined ? {} : { max_input_tokens: maxInputTokens }),
+    };
   }
   if ((process.env["URDIRA_EMBEDDINGS_PROVIDER"] ?? "").toLowerCase() === "hash") {
     return { kind: "hash" };

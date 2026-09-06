@@ -8,7 +8,7 @@ import { BlobStore, CAS_LAYOUT_MARKER_FILENAME, CAS_LAYOUT_VERSION, ContentAddre
 import { record, resetTimings, snapshotTimings, timed, timedSync, timingEnabled } from "./debug-timing.js";
 import { StorageError } from "./errors.js";
 import { isOutdatedWorkspaceError } from "./recreate-outdated.js";
-import { CATALOG_SCHEMA, ensureCatalogSchemaCompatibility, ensureWorkspaceSchemaCompatibility, ensureWorkspaceSchemaCompatibilityV4, initializeSchema, WORKSPACE_V4_INDEX_CONTRACT } from "./schema.js";
+import { CATALOG_SCHEMA, ensureCatalogSchemaCompatibility, ensureSemanticSidecarSchemaCompatibilityV4, ensureWorkspaceSchemaCompatibility, ensureWorkspaceSchemaCompatibilityV4, initializeSchema, WORKSPACE_V4_INDEX_CONTRACT } from "./schema.js";
 import { WORKSPACE_V4_LEXICAL_SCHEMA, WORKSPACE_V4_SCHEMA, WORKSPACE_V4_SEMANTIC_SCHEMA } from "./workspace-v4-sql.js";
 import { WORKSPACE_V3_SCHEMA } from "./workspace-v3-sql.js";
 import { createWorkspaceRepositories, type WorkspaceRepositories } from "./repositories.js";
@@ -1552,6 +1552,12 @@ export class WorkspaceDatabase {
     const sidecarPath = join(dirname(this.rawDatabase.filename), `${name}.${kind}.sqlite`);
     const database = await openSqliteDatabase({ filename: sidecarPath });
     await initializeSchema(database, kind === "lexical" ? WORKSPACE_V4_LEXICAL_SCHEMA : WORKSPACE_V4_SEMANTIC_SCHEMA);
+    // Frente S-B (R22): additive column migration for a semantic sidecar
+    // that predates `segment_index`/`segment_start`/`segment_end` -- see
+    // `ensureSemanticSidecarSchemaCompatibilityV4`'s own doc comment for why
+    // this must run unconditionally (new AND pre-existing files alike), not
+    // just gated behind "the file didn't exist yet".
+    if (kind === "semantic") await ensureSemanticSidecarSchemaCompatibilityV4(database);
     this.sidecarDatabases.set(kind, database);
     return database;
   }

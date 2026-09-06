@@ -2287,6 +2287,122 @@ describe("CanonicalRecordQueryDataPort core:search_semantic entity lane (decisio
   });
 });
 
+// Frente S-B (2026-09-06, decision 17 segmentation): an entity document can
+// now legitimately have SEVERAL open `vector_projection_rows` sharing one
+// `document_ref` (one per segment) -- these tests exercise
+// `trySemanticSearch`'s max-similarity aggregation over those rows
+// (`entitySegmentRanks` + the per-document reduction) and the
+// `semantic_evidence.matched_segment` evidence it attaches to the winning
+// candidate.
+async function putSemanticEntitySegmentVector(opened: OpenedWorkspace, provider: ResolvedSemanticProvider, options: { readonly recordId: string; readonly ownerArtifactId: string; readonly ownerVersionId: string; readonly text: string; readonly segmentIndex: number; readonly segmentStart: number; readonly segmentEnd: number; readonly validFromGeneration?: number }): Promise<void> {
+  const generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: options.text, segment_index: options.segmentIndex });
+  await opened.projections.putVectors([{
+    projection_record_id: `semantic-entity-document:${options.recordId}:${options.segmentIndex}`,
+    owner_artifact_id: options.ownerArtifactId,
+    owner_artifact_version_id: options.ownerVersionId,
+    profile_id: provider.profile.embedding_profile_id,
+    executable_binding_id: provider.binding.executable_binding_digest,
+    dimensions: provider.profile.dimensions,
+    element_type: provider.profile.element_type,
+    vector: generated.vector,
+    vector_encoding: provider.profile.vector_encoding as "float32-le" | "float64-le",
+    normalization: provider.profile.normalization as "none" | "l2",
+    distance_metric: provider.profile.distance_metric as "squared_l2" | "cosine",
+    valid_from_generation: options.validFromGeneration ?? 1,
+    document_grain: "entity",
+    document_ref: options.recordId,
+    segment_index: options.segmentIndex,
+    segment_start: options.segmentStart,
+    segment_end: options.segmentEnd,
+  }]);
+}
+
+interface SemanticEvidenceCandidateValue extends CandidateStreamValue {
+  readonly semantic_evidence?: { readonly matched_segment?: { readonly index: number; readonly start_char: number; readonly end_char: number } };
+}
+function candidateEvidenceValues(evaluation: { readonly streams: Readonly<Record<string, readonly unknown[]>> }): readonly SemanticEvidenceCandidateValue[] {
+  return (evaluation.streams["candidates"] as readonly { readonly value: SemanticEvidenceCandidateValue }[]).map((item) => item.value);
+}
+
+describe("CanonicalRecordQueryDataPort core:search_semantic entity lane: multi-segment max-similarity aggregation (Frente S-B)", () => {
+  it("aggregates a multi-segment entity to ONE candidate, keyed by the HIGHEST-similarity segment, and attaches its matched_segment evidence", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedThreeDocumentWorkspace(opened, provider);
+      await insertRecordOccurrence(opened, "rec-multi-segment", "artv-alpha", 1, { name: "multiSegmentEntity", kind: "function", language: "typescript", path: "src/alpha.ts", start: 0, end: 80 });
+      // Segment 0: vocabulary UNRELATED to the query. Segment 1: an EXACT
+      // match to the query text -- the closest possible vector under the
+      // local hash embedder. Only ONE candidate must surface for this
+      // record, and it must be attributed to segment 1's own span.
+      await putSemanticEntitySegmentVector(opened, provider, { recordId: "rec-multi-segment", ownerArtifactId: "art-alpha", ownerVersionId: "artv-alpha", text: GAMMA_TEXT, segmentIndex: 0, segmentStart: 0, segmentEnd: 40 });
+      await putSemanticEntitySegmentVector(opened, provider, { recordId: "rec-multi-segment", ownerArtifactId: "art-alpha", ownerVersionId: "artv-alpha", text: ALPHA_TEXT, segmentIndex: 1, segmentStart: 40, segmentEnd: 80 });
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+
+      const evaluation = await dataPort.execute(semanticOperation("core:search_semantic"));
+      const values = candidateEvidenceValues(evaluation);
+      const matches = values.filter((value) => value.record_id === "rec-multi-segment");
+      // Exactly ONE candidate for this record, never one per segment row.
+      expect(matches).toHaveLength(1);
+      expect(matches[0]?.semantic_evidence?.matched_segment).toEqual({ index: 1, start_char: 40, end_char: 80 });
+    });
+  });
+
+  it("ranks the multi-segment entity ahead of a decoy using its BEST segment's similarity, even though its OTHER segment is a poor match", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      await insertSemanticArtifactVersion(opened, { artifactId: "art-host", versionId: "artv-host", path: "src/host.ts", byteLength: 100, validFromGeneration: 1 });
+      await insertRecordOccurrence(opened, "rec-multi-segment", "artv-host", 1, { name: "multiSegmentEntity", kind: "function", language: "typescript", path: "src/host.ts", start: 0, end: 80 });
+      await putSemanticEntitySegmentVector(opened, provider, { recordId: "rec-multi-segment", ownerArtifactId: "art-host", ownerVersionId: "artv-host", text: GAMMA_TEXT, segmentIndex: 0, segmentStart: 0, segmentEnd: 40 });
+      await putSemanticEntitySegmentVector(opened, provider, { recordId: "rec-multi-segment", ownerArtifactId: "art-host", ownerVersionId: "artv-host", text: ALPHA_TEXT, segmentIndex: 1, segmentStart: 40, segmentEnd: 80 });
+      // A single-segment decoy entity whose only vector is a middling match.
+      await insertRecordOccurrence(opened, "rec-decoy", "artv-host", 1, { name: "decoyEntity", kind: "function", language: "typescript", path: "src/host.ts", start: 0, end: 40 });
+      await putSemanticEntityVector(opened, provider, { recordId: "rec-decoy", ownerArtifactId: "art-host", ownerVersionId: "artv-host", text: BETA_TEXT });
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+
+      const evaluation = await dataPort.execute(semanticOperation("core:search_semantic", { filter: { subject_types: ["entity"] } }));
+      const values = candidateStreamValues(evaluation);
+      const rankOf = (recordId: string) => values.findIndex((value) => value.record_id === recordId);
+      expect(rankOf("rec-multi-segment")).toBeGreaterThanOrEqual(0);
+      expect(rankOf("rec-decoy")).toBeGreaterThanOrEqual(0);
+      expect(rankOf("rec-multi-segment")).toBeLessThan(rankOf("rec-decoy"));
+    });
+  });
+
+  it("omits semantic_evidence entirely for a pre-segmentation entity vector with no recorded segment span", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedEntityLaneWorkspace(opened, provider);
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+
+      const evaluation = await dataPort.execute(semanticOperation("core:search_semantic"));
+      const values = candidateEvidenceValues(evaluation);
+      const entityCandidate = values.find((value) => value.record_id === "rec-entity-alpha");
+      expect(entityCandidate).toBeDefined();
+      expect(entityCandidate?.semantic_evidence).toBeUndefined();
+    });
+  });
+
+  it("dedupes correctly across MULTIPLE multi-segment entities: N segment rows across 2 records still yield exactly 2 entity candidates", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedThreeDocumentWorkspace(opened, provider);
+      await insertRecordOccurrence(opened, "rec-one", "artv-alpha", 1, { name: "one", kind: "function", language: "typescript", path: "src/alpha.ts", start: 0, end: 80 });
+      await putSemanticEntitySegmentVector(opened, provider, { recordId: "rec-one", ownerArtifactId: "art-alpha", ownerVersionId: "artv-alpha", text: ALPHA_TEXT, segmentIndex: 0, segmentStart: 0, segmentEnd: 40 });
+      await putSemanticEntitySegmentVector(opened, provider, { recordId: "rec-one", ownerArtifactId: "art-alpha", ownerVersionId: "artv-alpha", text: GAMMA_TEXT, segmentIndex: 1, segmentStart: 40, segmentEnd: 80 });
+      await insertRecordOccurrence(opened, "rec-two", "artv-beta", 1, { name: "two", kind: "function", language: "typescript", path: "src/beta.ts", start: 0, end: 80 });
+      await putSemanticEntitySegmentVector(opened, provider, { recordId: "rec-two", ownerArtifactId: "art-beta", ownerVersionId: "artv-beta", text: BETA_TEXT, segmentIndex: 0, segmentStart: 0, segmentEnd: 40 });
+      await putSemanticEntitySegmentVector(opened, provider, { recordId: "rec-two", ownerArtifactId: "art-beta", ownerVersionId: "artv-beta", text: GAMMA_TEXT, segmentIndex: 1, segmentStart: 40, segmentEnd: 80 });
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+
+      const evaluation = await dataPort.execute(semanticOperation("core:search_semantic", { filter: { subject_types: ["entity"] } }));
+      const values = candidateStreamValues(evaluation);
+      expect(values).toHaveLength(2);
+      expect(new Set(values.map((value) => value.record_id))).toEqual(new Set(["rec-one", "rec-two"]));
+    });
+  });
+});
+
 describe("CanonicalRecordQueryDataPort core:search_semantic unavailable-index error", () => {
   it("throws core:semantic_index_unavailable with the registered detail fields when there are zero vectors and no marker", async () => {
     await withSemanticWorkspace(async (opened, cas) => {
