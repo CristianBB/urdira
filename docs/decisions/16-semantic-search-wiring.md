@@ -78,3 +78,45 @@ not converted or reused across provider identities or machines.
 - Structural readiness never depends on model availability.
 - Exact retrieval and completeness reporting remain deterministic and
   auditable.
+
+## Amendment 2026-09-06 (Frente S-B): HTTP provider batching, retries, configuration
+
+R12 (plan `generic-waddling-hartmanis.md` §0): the opt-in HTTP embedding
+provider (`createHttpEmbeddingProvider`) is now a complete, production-grade
+transport, not a single unbatched fire-and-forget request. `generateVectors`
+splits its inputs into sequential (concurrency 1 -- never `Promise.all`)
+requests, each capped at `max_batch_inputs` (default 64) items AND an
+estimated `max_input_tokens` (default 8192, chars/4) total, always keeping
+at least one item per request so a single oversized document still makes
+progress. Each request retries up to `retry_backoff_ms.length` times
+(default `[500, 1000, 2000]`ms, 3 retries / 4 total attempts) on a 429/5xx
+status or a network-level failure (including this provider's own 60s
+per-attempt timeout) -- never on a malformed-but-successfully-received
+response body (wrong dimensionality, non-finite values, missing fields),
+which is a provider contract bug retrying cannot fix. Exhausting every
+retry (or an immediate non-retryable 4xx) raises the typed
+`HttpEmbeddingProviderUnavailableError` (`code: "core:embedding_provider_unavailable"`)
+for that batch; the reconciler's existing per-document fallback isolates
+which document(s) in a failed batch actually matter and marks each
+`failed` with a `provider_error:*` reason, exactly as it already did for
+any other provider throw. `api_key` continues to come from
+`URDIRA_EMBEDDING_API_KEY`/the descriptor, never a digest field.
+
+Configuration surface: this app has always selected its semantic provider
+kind (`neural`/`hash`/`http`) via environment variables read once at daemon
+start (`apps/urdira/src/index.ts`'s `resolveSemanticDescriptor`), never a
+per-call `workspace configure`/`config set` RPC argument for any provider
+kind -- widening that existing surface with two more optional variables,
+`URDIRA_EMBEDDINGS_MAX_BATCH_INPUTS`/`URDIRA_EMBEDDINGS_MAX_INPUT_TOKENS`,
+is the minimal, architecture-consistent way to expose the two new knobs.
+Decided in implementation: no new CLI flags were added to `packages/cli` for
+this -- doing so would mean designing a new RPC-argument-based provider
+configuration channel this system has never had for ANY provider kind
+(the descriptor is fixed at daemon start, not mutable via RPC today), which
+exceeds "add a missing flag" and was not attempted speculatively.
+`ensureSemanticAssets` for an `http` descriptor now logs an explicit
+"external HTTP endpoint; no local model download" notice at configure time
+(previously a silent no-op), so an operator who configures `http` sees
+confirmation this is the expected behavior rather than a missed
+provisioning step. Local MiniLM remains the shipped default; the evaluated
+model pack stays rejected (decision 06/18).

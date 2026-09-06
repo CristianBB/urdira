@@ -27,7 +27,7 @@ import { access } from "node:fs/promises";
 
 export type SemanticProviderDescriptor =
   | { readonly kind: "neural"; readonly model_id?: string; readonly dtype?: string; readonly cache_dir: string; readonly window_chars?: number; readonly max_windows?: number }
-  | { readonly kind: "http"; readonly endpoint: string; readonly model: string; readonly dimensions: number; readonly api_key?: string }
+  | { readonly kind: "http"; readonly endpoint: string; readonly model: string; readonly dimensions: number; readonly api_key?: string; readonly max_batch_inputs?: number; readonly max_input_tokens?: number }
   | { readonly kind: "hash" };
 
 /**
@@ -53,6 +53,13 @@ export async function buildSemanticProvider(descriptor: SemanticProviderDescript
       model: descriptor.model,
       dimensions: descriptor.dimensions,
       ...(descriptor.api_key === undefined ? {} : { api_key: descriptor.api_key }),
+      // Frente S-B (2026-09-06, R12): threaded through so an operator's
+      // `URDIRA_EMBEDDINGS_MAX_BATCH_INPUTS`/`URDIRA_EMBEDDINGS_MAX_INPUT_TOKENS`
+      // (`apps/urdira/src/index.ts`'s `resolveSemanticDescriptor`) actually
+      // reach the provider -- both are optional, `createHttpEmbeddingProvider`
+      // itself defaults them (64 / 8192) when omitted.
+      ...(descriptor.max_batch_inputs === undefined ? {} : { max_batch_inputs: descriptor.max_batch_inputs }),
+      ...(descriptor.max_input_tokens === undefined ? {} : { max_input_tokens: descriptor.max_input_tokens }),
     });
   }
   // "neural": the only branch that ever touches `@urdira/embedding-local` --
@@ -119,6 +126,16 @@ export interface SemanticModelProvisioningNotice {
  * to log it itself after catching this function's old thrown error.
  */
 export async function ensureSemanticAssets(descriptor: SemanticProviderDescriptor): Promise<SemanticModelProvisioningNotice | undefined> {
+  // Frente S-B.3 (2026-09-06, plan §4.6 (vi)): an `"http"` descriptor's
+  // "model" lives on an operator-owned remote endpoint -- there is nothing
+  // for this daemon to download, ever, but a configure call must say so
+  // explicitly (never silently do nothing with no explanation at all) so an
+  // operator who just typed `--endpoint ...` sees confirmation this is the
+  // expected "no local model" behavior, not a missed provisioning step.
+  if (descriptor.kind === "http") {
+    console.warn(`[urdira] semantic provider configured as external HTTP endpoint "${descriptor.endpoint}"; no local model download.`);
+    return undefined;
+  }
   if (descriptor.kind !== "neural") return undefined;
   const { ensureLocalEmbeddingModel, DEFAULT_MODEL_ID } = await import("@urdira/embedding-local");
   const modelId = descriptor.model_id ?? DEFAULT_MODEL_ID;
