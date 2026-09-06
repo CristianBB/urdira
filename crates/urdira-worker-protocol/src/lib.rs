@@ -291,6 +291,23 @@ pub struct ReconcileSummary {
     /// attempted and failed, and this `Cold` result is the SAME request's
     /// recovery, not a size-driven decision.
     pub fell_back_to_cold: bool,
+    /// Frente E-fix (plan `generic-waddling-hartmanis.md` §0/§2,
+    /// 2026-09-06): how many uris this reconcile's authoritative delta
+    /// classified as content-equivalent (same `content_hash`/
+    /// `byte_length` as the frontier) but with a stale `metadata_digest` --
+    /// a `touch`, a `git stash`/checkout mtime rewrite, or an index-pack
+    /// import onto a fresh filesystem. These are NOT counted in `added`/
+    /// `changed`/`deleted` (they never open a new `artifact_version`) and
+    /// do NOT count towards the `threshold` decision -- they are always
+    /// refreshed in-place before this reconcile returns, regardless of
+    /// which pipeline it ran: `Catalog::apply`'s own transaction for `Cold`
+    /// (the outer authoritative delta IS the delta `apply_full` commits),
+    /// and `Catalog::refresh_metadata`'s own dedicated transaction for both
+    /// `Noop` and `Delta` (the `Delta` pipeline's own `Catalog::apply` call
+    /// is scoped to a narrower, re-diffed `SourceDelta` covering only the
+    /// touched paths, so `run_reconcile` applies the outer delta's
+    /// `metadata_refreshed` itself, before handing off to it).
+    pub metadata_refreshed: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

@@ -125,6 +125,15 @@ pub struct Observation {
     pub content_hash: String,
     pub byte_length: u64,
     pub metadata: StatMetadata,
+    /// Frente E-fix (`delta.rs`'s module doc): `hash_and_include` (below)
+    /// ALWAYS reads the file and computes `content_hash` unconditionally —
+    /// there is no metadata-based shortcut in this crate that skips hashing
+    /// when the stat metadata is unchanged (unlike some content-addressed
+    /// systems' "trust mtime" fast path). `metadata_digest` is therefore
+    /// never a proxy for "has this file's content changed" on its own; it
+    /// is stored purely as observability/freshness data (and as the input
+    /// `content_version_token` mixes in), while `crate::delta::classify`'s
+    /// equivalence decision is keyed on `content_hash`/`byte_length` alone.
     pub metadata_digest: String,
     pub version_token: String,
     /// `"utf-8"` or `"binary"`, matching `ArtifactVersionInput.encoding`

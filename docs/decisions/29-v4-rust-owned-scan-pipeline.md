@@ -525,3 +525,100 @@ oracle` (and its content-edit sibling, confirming the `Cold` pipeline never
 chains). This closes part of Open item 8 above ("existing-workspace
 migration is unaddressed") for the specific "repeated `Full` on a live
 worker" sub-case; the broader migration story is unchanged.
+
+## Amendment (2026-09-06): content-hash equivalence in the frontier delta
+
+**Bug (found live by the Frente P-1 index-pack import work):** `reconcile`
+(and every other scope, since all three funnel through the same
+`urdira-source-frontier::Delta::compute`/`compute_partial`) required BOTH
+`content_hash` AND `metadata_digest` (`walker.rs`'s per-file stat digest —
+`byte_length`/`ctime_ms`/`device`/`inode`/`mode`/`mtime_ms`) to match the
+frontier's stored entry for a uri to count as unchanged — a straight port
+of the TS oracle's `isEquivalentObservation`
+(`packages/engine/src/source-indexer.ts:342`). Confirmed live: the walker
+(`walker.rs::hash_and_include`) has no metadata-based shortcut at all — it
+`std::fs::read`s and SHA-256-hashes every observed file's content
+unconditionally on every walk (`content_hash = sha256_hex_prefixed(&bytes)`,
+computed before `metadata_digest` and never gated on it), so a stale
+`metadata_digest` was never a proxy for "this file needs rehashing"; it was
+purely stored/compared data. That made every mutation that changes a
+file's inode/ctime/mtime without touching a single byte of its content — a
+bare `touch`, a `git stash`/checkout round trip, or exactly what triggered
+this: copying an already-indexed tree plus its `workspace.sqlite`/
+`.structural/` onto a fresh filesystem (an index-pack import) — look
+identical to a full-corpus content edit. `scan::run_reconcile`'s
+authoritative walk came back `mode: "cold"` with `changed == frontier_size`
+on a byte-identical import, re-parsing/re-materializing/re-publishing the
+entire corpus for nothing. The owner's standing criterion (maximum
+throughput without compromising integrity) singles this out: content-hash
+equivalence is itself a content-addressed guarantee, strictly no weaker
+than the old rule, so removing the metadata half of the check costs
+nothing in correctness.
+
+**Fix — `urdira-source-frontier`:**
+- `Delta::compute`/`compute_partial`'s shared `classify` (`delta.rs`) now
+  keys equivalence on `content_hash`/`byte_length` alone. A uri whose
+  content matches the frontier but whose `metadata_digest` differs is
+  still `equivalent` (never `changed`, never re-analyzed) and is recorded
+  in a new `Delta::metadata_refreshed: Vec<(normalized_uri,
+  new_metadata_digest)>` instead.
+- `Catalog::apply` applies `delta.metadata_refreshed` inside its existing
+  transaction: an `UPDATE artifact_versions SET analysis_metadata_digest =
+  ?` for the uri's current (`valid_to_generation IS NULL`) row, mirrored
+  onto the in-memory `Frontier` entry. No new `artifact_version_id`, no
+  `source_observations` row (a metadata-only refresh is not a new
+  observed fact about the artifact), no change to `valid_from_generation`.
+- A new `Catalog::refresh_metadata(conn, workspace_id, frontier,
+  refreshed)` applies the SAME update outside of `apply` entirely, in one
+  short dedicated transaction that never touches
+  `source_index_state`/`source_observation_batches` — for
+  `scan::run_reconcile`'s `Noop` branch, which never calls `apply` at all
+  (nothing added/changed/deleted to publish) but must still persist the
+  refresh so the NEXT reconcile of the same settled tree does not
+  rediscover it. No-ops without opening a transaction when the list is
+  empty.
+- `walker.rs`'s `Observation::metadata_digest` field doc now states the
+  hashing invariant explicitly (see the bug description above) so a future
+  reader does not assume a metadata-gated hashing shortcut that was never
+  implemented.
+
+**Effect on `reconcile` (`scan.rs::run_reconcile`):** `metadata_refreshed`
+entries are never counted in `added`/`changed`/`deleted`/`touched_count`
+and never affect the `Delta`-vs-`Cold` threshold decision. A byte-identical
+tree (touch, checkout, or import) now reports `mode: "noop"` with
+`metadata_refreshed == N`; the `Noop` branch calls `Catalog::
+refresh_metadata` directly (plus mirrors the refresh onto this process's
+cached `WorkerState` frontier, if one exists for the workspace) so a
+second reconcile of the same tree reports `metadata_refreshed == 0`. The
+`Delta`/`Cold` branches get the refresh for free through their own
+`Catalog::apply` call. `ReconcileSummary` gains `metadata_refreshed: u64`
+(mirrored in `rust-indexing-core-port.ts`,
+`indexing-core-process-transport.ts`, and rendered by the MCP
+`urdira_index_status` text renderer as a conditional `, refreshed=N`
+suffix — omitted when absent or zero, so an older worker's summary and a
+fully-settled tree both render exactly as before).
+
+**Integrity preserved:** two observations of the same `byte_length` but
+different `content_hash` are still `changed` unconditionally — the
+equivalence rule never falls back to `byte_length` alone as a cheaper
+proxy for content equality (`delta.rs`'s
+`same_byte_length_different_content_stays_changed` test, and
+`tests_e2e.rs`'s `reconcile_same_byte_length_different_content_is_never_
+equivalent`).
+
+**Tests added:** `urdira-source-frontier::delta` unit tests
+(`metadata_only_difference_is_equivalent_with_refresh_full_scan`,
+`identical_metadata_and_content_yields_no_refresh`,
+`same_byte_length_different_content_stays_changed`,
+`compute_partial_also_refreshes_metadata_for_a_present_observation`);
+`urdira-source-frontier::catalog` unit tests
+(`apply_with_only_metadata_refreshed_does_not_open_a_new_version`,
+`refresh_metadata_updates_digest_without_a_new_generation`,
+`refresh_metadata_with_empty_slice_is_a_true_no_op`);
+`urdira-indexing-worker::v4::tests_e2e` end-to-end tests
+(`reconcile_touch_all_files_is_noop_with_metadata_refresh_then_settles`,
+`reconcile_after_a_full_data_dir_copy_is_noop` — the literal index-pack
+import reproduction, copying the whole data dir onto a fresh location and
+reconciling from a brand-new `WorkerState` — and
+`reconcile_same_byte_length_different_content_is_never_equivalent`). Every
+pre-existing `incremental_*`/`reconcile_*` test stays green unmodified.

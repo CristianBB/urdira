@@ -4334,6 +4334,442 @@ fn reconcile_falls_back_to_cold_when_delta_fails_after_catalog_apply() {
     let _ = std::fs::remove_dir_all(&oracle_root);
 }
 
+// ---------------------------------------------------------------------
+// Frente E-fix (plan `generic-waddling-hartmanis.md` §0/§2, 2026-09-06):
+// content-hash equivalence in the reconcile pipeline. A byte-identical
+// tree whose stat metadata moved (a `touch`, a `git stash`/checkout mtime
+// rewrite, or an index-pack import onto a fresh filesystem) must stay a
+// true `Noop` -- same generation, same roots -- never `changed ==
+// frontier_size`. A real content edit, even one that happens to keep the
+// exact same byte length, must still be `changed`.
+// ---------------------------------------------------------------------
+
+/// Recursively rewrites every regular file under `dir` with its OWN
+/// existing bytes: any `write` syscall bumps `mtime`/`ctime` regardless of
+/// whether the bytes written differ from what was already there, so this
+/// changes every file's `metadata_digest` without touching a single byte
+/// of content.
+fn touch_dir_recursive(dir: &Path) {
+    for entry in std::fs::read_dir(dir).expect("read_dir succeeds") {
+        let entry = entry.expect("dir entry readable");
+        let file_type = entry.file_type().expect("file_type readable");
+        let path = entry.path();
+        if file_type.is_dir() {
+            touch_dir_recursive(&path);
+        } else if file_type.is_file() {
+            let bytes = std::fs::read(&path).expect("read succeeds");
+            std::fs::write(&path, bytes).expect("rewrite succeeds");
+        }
+    }
+}
+
+/// [`touch_dir_recursive`] plus a small sleep first -- gives the
+/// filesystem's timestamp clock room to tick over so `StatMetadata`'s
+/// `ctime_ms`/`mtime_ms` (millisecond-precision `f64`s) reliably differ
+/// from whatever a preceding cold scan already observed, on every
+/// platform this test suite runs on.
+fn touch_preserving_content(root: &Path) {
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    touch_dir_recursive(root);
+}
+
+/// (a) A `touch` of every file in the tree (content byte-for-byte
+/// unchanged): the first reconcile is `Noop` with `metadata_refreshed ==`
+/// every observed file, same generation and roots as the cold scan; a
+/// SECOND reconcile of the now-refreshed tree finds nothing left to
+/// refresh (`metadata_refreshed == 0`) -- proving the refresh is durable,
+/// not recomputed from scratch every time.
+#[test]
+fn reconcile_touch_all_files_is_noop_with_metadata_refresh_then_settles() {
+    let scratch_root = scratch_dir("reconcile-touch-metadata");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-touch",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+    let cold_roots = roots_of(&cold);
+
+    let frontier_file_count = {
+        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog reopens");
+        let frontier =
+            urdira_source_frontier::Frontier::load(&conn, "workspace:v4-e2e-reconcile-touch")
+                .expect("frontier loads");
+        frontier.present.len()
+    };
+    assert!(frontier_file_count > 0);
+
+    // Same bytes, fresh mtime/ctime for every file -- no content changed.
+    touch_preserving_content(&workspace_root);
+
+    let (reconciled, touched) = run_reconcile_scan(
+        "request:reconcile-touch-1",
+        "workspace:v4-e2e-reconcile-touch",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        scan::RECONCILE_DELTA_THRESHOLD,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&reconciled),
+        1,
+        "a touch-only reconcile must not publish a new generation"
+    );
+    assert_eq!(roots_of(&reconciled), cold_roots);
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Noop);
+    assert_eq!(summary.added, 0);
+    assert_eq!(summary.changed, 0);
+    assert_eq!(summary.deleted, 0);
+    assert!(!summary.fell_back_to_cold);
+    assert_eq!(
+        summary.metadata_refreshed as usize, frontier_file_count,
+        "every observed file's stale metadata_digest must be refreshed"
+    );
+    assert_eq!(touched, Some(Vec::new()));
+
+    // The refresh must be durable: a second reconcile of the SAME
+    // (already-refreshed) tree finds nothing left to refresh.
+    let (reconciled_again, _) = run_reconcile_scan(
+        "request:reconcile-touch-2",
+        "workspace:v4-e2e-reconcile-touch",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        scan::RECONCILE_DELTA_THRESHOLD,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&reconciled_again), 1);
+    let summary_again = reconcile_summary_of(&reconciled_again);
+    assert_eq!(
+        summary_again.mode,
+        urdira_worker_protocol::ReconcileMode::Noop
+    );
+    assert_eq!(
+        summary_again.metadata_refreshed, 0,
+        "the first reconcile's refresh must have persisted -- nothing left to refresh"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
+/// Adversarial-review regression test (revisor E-fix, 2026-09-06): a
+/// reconcile whose delta is MOSTLY metadata-only noise but has just enough
+/// real content changes to land in `ReconcileMode::Delta` (not `Noop`)
+/// must STILL persist `metadata_refreshed` for the untouched-content uris
+/// -- `Delta::compute`'s outer authoritative delta carries those entries
+/// regardless of which branch below the threshold check actually runs, and
+/// `run_reconcile`'s doc comment on `metadata_refreshed` explicitly claims
+/// "Delta/Cold refresh it as part of `Catalog::apply`'s own transaction,
+/// same as any other batch" -- but the `Delta` branch's own `Catalog::apply`
+/// call (inside `delta::run_one`) is scoped to exactly `changed_paths`
+/// (added/changed/deleted only), a DIFFERENT, narrower `SourceDelta` than
+/// the outer one this function computed; the outer `delta.metadata_refreshed`
+/// is never threaded into it. Without a fix, this reconciles as `Delta`,
+/// reports `metadata_refreshed > 0` in ITS OWN summary (which is at least
+/// honest about what it found), but the SECOND reconcile of the
+/// now-untouched tree re-discovers and re-reports the EXACT SAME
+/// `metadata_refreshed` count forever (never persisted, so it can never
+/// settle to 0) -- exactly the perpetual-rediscovery outcome
+/// `Catalog::refresh_metadata`'s own doc comment says this whole feature
+/// exists to prevent.
+#[test]
+fn reconcile_delta_mode_also_persists_metadata_refresh_for_untouched_uris() {
+    let scratch_root = scratch_dir("reconcile-delta-metadata-persist");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-delta-metadata",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let frontier_file_count = {
+        let conn = catalog::open_and_ensure_schema(&database_path).expect("catalog reopens");
+        let frontier = urdira_source_frontier::Frontier::load(
+            &conn,
+            "workspace:v4-e2e-reconcile-delta-metadata",
+        )
+        .expect("frontier loads");
+        frontier.present.len()
+    };
+    assert!(
+        frontier_file_count >= 4,
+        "fixture must have enough files for a single content edit to stay under the default threshold"
+    );
+
+    // Every file's stat metadata moves (bare rewrite of its own bytes), AND
+    // exactly one file's CONTENT also changes -- 1/frontier_file_count stays
+    // comfortably under `RECONCILE_DELTA_THRESHOLD` (0.25) for this fixture,
+    // so the reconcile below lands in `Delta` mode, not `Cold`.
+    touch_preserving_content(&workspace_root);
+    let edited_file = workspace_root.join("src/domain/task.ts");
+    assert!(
+        edited_file.is_file(),
+        "fixture must contain src/domain/task.ts"
+    );
+    let mut content = std::fs::read_to_string(&edited_file).unwrap();
+    content.push_str("\nexport const urdiraReconcileDeltaMetadataProbe = 1;\n");
+    std::fs::write(&edited_file, content).unwrap();
+
+    let (reconciled, _) = run_reconcile_scan(
+        "request:reconcile-delta-1",
+        "workspace:v4-e2e-reconcile-delta-metadata",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        scan::RECONCILE_DELTA_THRESHOLD,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(
+        summary.mode,
+        urdira_worker_protocol::ReconcileMode::Delta,
+        "one content edit out of {frontier_file_count} files must stay under the default threshold"
+    );
+    assert_eq!(summary.changed, 1);
+    assert!(
+        summary.metadata_refreshed > 0,
+        "the untouched-content files must still be reported as metadata-stale"
+    );
+
+    // Nothing on disk changes between the two reconciles: if the first
+    // reconcile's metadata_refreshed entries were actually persisted to the
+    // catalog, this SECOND reconcile finds nothing left to refresh.
+    let (reconciled_again, _) = run_reconcile_scan(
+        "request:reconcile-delta-2",
+        "workspace:v4-e2e-reconcile-delta-metadata",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        scan::RECONCILE_DELTA_THRESHOLD,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let summary_again = reconcile_summary_of(&reconciled_again);
+    assert_eq!(
+        summary_again.mode,
+        urdira_worker_protocol::ReconcileMode::Noop,
+        "nothing changed on disk since the first reconcile"
+    );
+    assert_eq!(
+        summary_again.metadata_refreshed, 0,
+        "the first Delta-mode reconcile's metadata_refreshed entries must have been \
+         persisted to the catalog -- a second reconcile of the SAME untouched tree must \
+         not re-discover the same stale-metadata set forever"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
+/// (b) Simulates an index-pack import (the P-1 bug report this front
+/// fixes): copy the ENTIRE data directory (workspace tree, catalog,
+/// structural store, CAS) onto a fresh location -- every file gets a new
+/// inode/ctime (a real filesystem copy), but every byte is identical.
+/// Reconciling the COPY, from a brand-new (empty) `WorkerState` exactly
+/// like a fresh daemon process opening an imported pack, must still be
+/// `Noop`.
+#[test]
+fn reconcile_after_a_full_data_dir_copy_is_noop() {
+    let scratch_root = scratch_dir("reconcile-import-source");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-import",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+    let cold_roots = roots_of(&cold);
+
+    // Simulate an index-pack import: copy the WHOLE data dir (workspace
+    // tree + `workspace.sqlite` [+ any `-wal`/`-shm` sidecar left by the
+    // cold scan's connection] + structural store + CAS) onto a fresh
+    // location.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let imported_root = scratch_dir("reconcile-import-target");
+    copy_dir_recursive(&scratch_root, &imported_root);
+    let imported_workspace_root = imported_root.join("workspace");
+    let imported_database_path = imported_root.join("workspace.sqlite");
+    let imported_structural_root = imported_root.join("structural");
+    let imported_cas_root = imported_root.join("cas");
+
+    // A brand-new process's WorkerState for this data dir: nothing cached,
+    // exactly like a real daemon restart against a freshly imported pack.
+    let mut fresh_worker_state: super::state::WorkerState = std::collections::HashMap::new();
+    let (reconciled, touched) = run_reconcile_scan(
+        "request:reconcile-import",
+        "workspace:v4-e2e-reconcile-import",
+        &imported_workspace_root,
+        &imported_database_path,
+        &imported_structural_root,
+        &imported_cas_root,
+        scan::RECONCILE_DELTA_THRESHOLD,
+        false,
+        &mut syntax,
+        &mut fresh_worker_state,
+    );
+    assert_eq!(
+        generation_of(&reconciled),
+        1,
+        "reconciling a byte-identical imported copy must not publish a new generation"
+    );
+    assert_eq!(roots_of(&reconciled), cold_roots);
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(summary.mode, urdira_worker_protocol::ReconcileMode::Noop);
+    assert_eq!(summary.added, 0);
+    assert_eq!(summary.changed, 0);
+    assert_eq!(summary.deleted, 0);
+    assert!(
+        summary.metadata_refreshed > 0,
+        "the import's fresh inode/ctime must surface as a metadata refresh, not a content change -- this is the bug this front fixes"
+    );
+    assert_eq!(touched, Some(Vec::new()));
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&imported_root);
+}
+
+/// (c) Integrity guard at the reconcile level: a real content edit that
+/// happens to keep the EXACT SAME byte length must still be `changed`,
+/// never folded into `metadata_refreshed`/`equivalent` -- the
+/// content-hash equivalence rule (`delta.rs`) must never fall back to
+/// `byte_length` alone as a cheaper proxy for content equality.
+#[test]
+fn reconcile_same_byte_length_different_content_is_never_equivalent() {
+    let scratch_root = scratch_dir("reconcile-same-length-edit");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-reconcile-same-length-edit",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // A real, already-indexed fixture file, overwritten with SAME-LENGTH,
+    // DIFFERENT content (swap one letter for another that never appears
+    // elsewhere in a way that would change the count -- length preserved).
+    let edited_relative = "src/domain/task.ts";
+    let edited_path = workspace_root.join(edited_relative);
+    let original = std::fs::read_to_string(&edited_path)
+        .unwrap_or_else(|error| panic!("fixture file {edited_relative} must exist: {error}"));
+    let replaced = if original.contains('a') {
+        original.replacen('a', "z", 1)
+    } else if original.contains('e') {
+        original.replacen('e', "z", 1)
+    } else {
+        panic!("fixture file {edited_relative} has no 'a' or 'e' to swap for a same-length edit");
+    };
+    assert_eq!(
+        replaced.len(),
+        original.len(),
+        "the edit must preserve byte length"
+    );
+    assert_ne!(replaced, original);
+    std::fs::write(&edited_path, &replaced).expect("same-length rewrite succeeds");
+
+    let (reconciled, _touched) = run_reconcile_scan(
+        "request:reconcile-same-length-edit",
+        "workspace:v4-e2e-reconcile-same-length-edit",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        1.0, // force the Delta pipeline regardless of this fixture's size
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let summary = reconcile_summary_of(&reconciled);
+    assert_eq!(
+        summary.changed, 1,
+        "a same-length content edit must still be classified as changed"
+    );
+    assert_eq!(summary.added, 0);
+    assert_eq!(summary.deleted, 0);
+    assert_eq!(
+        summary.metadata_refreshed, 0,
+        "a real content change is never also reported as a metadata refresh"
+    );
+    assert_ne!(
+        generation_of(&reconciled),
+        1,
+        "a real content change must publish a new generation"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
 /// Counts the currently-visible entity records under `identity_key`
 /// `prefix` -- used below to check the external module/symbol identity's
 /// live-record count directly against the store, generation over
