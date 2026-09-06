@@ -55,13 +55,24 @@ function recordPayload(body: Readonly<Record<string, unknown>>): Uint8Array {
   return encodeCanonical(body);
 }
 
-async function insertRecordOccurrence(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, recordId: string, ownerArtifactVersionId: string, validFromGeneration: number, body: Readonly<Record<string, unknown>>): Promise<void> {
+// Both statements below (the `record_occurrences` row and its flattened
+// `relationalValueCommands`) for one record, as plain `SqliteCommand`s
+// rather than executed directly -- lets `insertRecordOccurrencesBulk` pack
+// many records' commands into a single `transaction()` round trip to the
+// SQLite worker thread instead of one round trip per statement per record
+// (see that function's own doc comment for why this matters).
+function recordOccurrenceCommands(recordId: string, ownerArtifactVersionId: string, validFromGeneration: number, body: Readonly<Record<string, unknown>>): readonly SqliteCommand[] {
   const payload = encodeCanonical(body);
-  await opened.database.run(
-    "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES (?, ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, 'analysis', 'configuration', 'dependencies')",
-    [recordId, workspace.workspace_id, ownerArtifactVersionId, validFromGeneration, `digest-${recordId}`, digestBytes(payload), payload.byteLength],
-  );
-  await opened.database.transaction(relationalValueCommands(flattenRelationalValue(workspace.workspace_id, recordId, validFromGeneration, body)));
+  const insertOccurrence: SqliteCommand = {
+    kind: "run",
+    sql: "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES (?, ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, ?, 'analysis', 'configuration', 'dependencies')",
+    params: [recordId, workspace.workspace_id, ownerArtifactVersionId, validFromGeneration, `digest-${recordId}`, digestBytes(payload), payload.byteLength],
+  };
+  return [insertOccurrence, ...relationalValueCommands(flattenRelationalValue(workspace.workspace_id, recordId, validFromGeneration, body))];
+}
+
+async function insertRecordOccurrence(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, recordId: string, ownerArtifactVersionId: string, validFromGeneration: number, body: Readonly<Record<string, unknown>>): Promise<void> {
+  await opened.database.transaction(recordOccurrenceCommands(recordId, ownerArtifactVersionId, validFromGeneration, body));
 }
 
 async function insertArtifactVersion(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, artifactVersionId: string, contentHash: string, encoding: string, artifactId = "art-1", normalizedPath = "src/index.ts", artifactKind = "source_file", languageHint: string | null = null): Promise<void> {
@@ -70,14 +81,32 @@ async function insertArtifactVersion(opened: Awaited<ReturnType<Awaited<ReturnTy
   await opened.database.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'metadata-digest', 'observation-1', 0, NULL)", [artifactVersionId, workspace.workspace_id, artifactId, `blob-${artifactVersionId}`, contentHash, encoding, languageHint]);
 }
 
-// Bulk variant of `insertRecordOccurrence`, batched (100 rows/statement,
-// comfortably under SQLite's bound-parameter cap at 8 params/row) so a
+// Bulk variant of `insertRecordOccurrence`, batched 100 rows per
+// `transaction()` call (comfortably under SQLite's bound-parameter cap --
+// each row contributes ~8 params across its own statements) so a
 // corpus-scale seed (thousands of rows) stays fast to set up.
+//
+// This used to call `insertRecordOccurrence` once per row despite the
+// comment above already claiming "100 rows/statement": each row was really
+// two separate `database.run`/`database.transaction` round trips to the
+// SQLite worker thread (packages/storage/src/sqlite.ts), so a 10,001-row
+// seed cost >20,000 worker round trips and dominated this file's slowest
+// test's runtime (measured ~8.5s of it isolated, the vast majority of the
+// test) -- exactly the kind of load that tips a borderline-but-passing test
+// into a `Test timed out in 60000ms` once the full `pnpm test:coverage` run
+// puts a few dozen other test files' work on the same CPUs at once (see
+// docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md
+// §10.6 and §10.7 for this exact test's own prior flake history). Packing
+// every row in a `BATCH`-sized chunk into ONE `transaction()` call cuts that
+// to one round trip per chunk (~1% of the round trips at BATCH=100),
+// without changing a single row written -- same statements, same params,
+// same end state, just fewer messages to get there.
 async function insertRecordOccurrencesBulk(opened: Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>, count: number, ownerArtifactVersionId: string, validFromGeneration: number): Promise<void> {
   const BATCH = 100;
   for (let start = 0; start < count; start += BATCH) {
     const rows = Array.from({ length: Math.min(BATCH, count - start) }, (_unused, offset) => start + offset);
-    for (const index of rows) await insertRecordOccurrence(opened, `bulk-rec-${String(index).padStart(6, "0")}`, ownerArtifactVersionId, validFromGeneration, { name: `bulk-${index}` });
+    const commands = rows.flatMap((index) => recordOccurrenceCommands(`bulk-rec-${String(index).padStart(6, "0")}`, ownerArtifactVersionId, validFromGeneration, { name: `bulk-${index}` }));
+    await opened.database.transaction(commands);
   }
 }
 
