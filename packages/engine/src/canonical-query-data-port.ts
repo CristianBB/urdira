@@ -2160,11 +2160,16 @@ function matchesWordMode(value: string, offset: number, length: number, mode: "s
  */
 /**
  * Plan 2026-09-06 (Frente S-A, R11): the stateless, self-contained
- * `core:semantic_affected_page` cursor -- a base64url-encoded JSON object
- * `{set, k, dir}`. `set` is the `affected_artifact_set_id` the cursor was
- * minted against (a cursor whose `set` disagrees with the CURRENT set id is
- * rejected outright, never silently mixed into a page -- see
- * `pageAffectedRows`'s caller); `k` is the `(display_path, artifact_id,
+ * `core:semantic_affected_page` cursor -- a hex-encoded JSON object `{set,
+ * k, dir}` (hexadecimal, NOT base64/base64url: `scripts/check-architecture.mjs`'s
+ * `checkNativePipelineContracts` guardrail bans `Buffer`/`toString` base64
+ * framing repo-wide, and `packages/engine/src/cursor-cache.ts`'s own opaque
+ * cursor tokens already establish hex as this codebase's one local-handle
+ * encoding -- see that file's `encode`/`decode` for the identical
+ * convention this mirrors). `set` is the `affected_artifact_set_id` the
+ * cursor was minted against (a cursor whose `set` disagrees with the
+ * CURRENT set id is rejected outright, never silently mixed into a page --
+ * see `pageAffectedRows`'s caller); `k` is the `(display_path, artifact_id,
  * document_id)` keyset tuple of the row the cursor is anchored to; `dir` is
  * `"next"` (this cursor was minted from a page's LAST row, so the next page
  * starts strictly after `k`) or `"prev"` (minted from a page's FIRST row, so
@@ -2180,13 +2185,13 @@ interface AffectedCursor {
 export class AffectedCursorError extends Error {}
 
 function encodeAffectedCursor(cursor: AffectedCursor): string {
-  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("hex");
 }
 
 function decodeAffectedCursor(token: string): AffectedCursor {
   let parsed: unknown;
-  try { parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")); }
-  catch { throw new AffectedCursorError("Malformed core:semantic_affected_page cursor: not valid base64url-encoded JSON."); }
+  try { parsed = JSON.parse(Buffer.from(token, "hex").toString("utf8")); }
+  catch { throw new AffectedCursorError("Malformed core:semantic_affected_page cursor: not valid hex-encoded JSON."); }
   if (typeof parsed !== "object" || parsed === null) throw new AffectedCursorError("Malformed core:semantic_affected_page cursor: expected a JSON object.");
   const record = parsed as Record<string, unknown>;
   const set = record["set"];

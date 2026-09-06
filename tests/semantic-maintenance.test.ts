@@ -698,6 +698,65 @@ describe("reconcileSemanticProjection: semantic_document_status (plan 2026-09-06
     });
   });
 
+  it("never leaves a covered status without its vector, or a vector without its covered status, when the shared insert transaction aborts mid-write", async () => {
+    const workspaceId = "ws-semantic-status-atomic-abort";
+    const provider = createLocalHashProvider();
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-atomic", artifactVersionId: "artv-atomic", text: "function atomicAbortContent() {}", validFromGeneration: 1, displayPath: "src/atomic.ts" });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      // Simulates a crash INSIDE `putVectors`'s own transaction -- the ONE
+      // call that carries both the `vector_projection_rows` insert and the
+      // `semantic_document_status` "covered" upsert (`putVectors`'s
+      // `extraCommands` parameter) -- by making the underlying
+      // `database.transaction` throw for exactly that call. A real SQLite
+      // transaction (`BEGIN IMMEDIATE` ... `ROLLBACK` on throw, see
+      // `packages/storage/src/sqlite.ts`) guarantees this either commits
+      // every statement in the array or none of them; this test proves the
+      // reconciler actually relies on that guarantee (one shared
+      // transaction) rather than two separate ones that could commit the
+      // vector row and then fail before the status row, or vice versa.
+      const realTransaction = opened.database.transaction.bind(opened.database);
+      const spy = vi.spyOn(opened.database, "transaction").mockImplementation(async (commands: readonly { readonly kind: string; readonly sql?: string }[]) => {
+        if (commands.some((command) => command.kind === "run" && command.sql?.includes("INSERT INTO vector_projection_rows"))) {
+          throw new Error("simulated crash mid-transaction");
+        }
+        return realTransaction(commands as Parameters<typeof realTransaction>[0]);
+      });
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      spy.mockRestore();
+
+      // The reconciler must have caught the throw and recorded the document
+      // as failed (retried next pass) -- never silently treated the aborted
+      // write as a success, and never advanced the completion marker while a
+      // failure is outstanding.
+      expect(result.failed).toBe(1);
+      expect(result.marker_written).toBe(false);
+
+      const vectorRow = await openVectorRow(opened, "artv-atomic");
+      const rows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const statusRow = rows.find((row) => row.document_id === "artv-atomic");
+
+      // The invariant this whole plan section exists to protect: the vector
+      // write rolled back (no row persisted at all), so the status must
+      // never say "covered" without a vector backing it -- it is "failed"
+      // instead, exactly like any other provider/write failure.
+      expect(vectorRow).toBeUndefined();
+      expect(statusRow).toMatchObject({ status: "failed" });
+
+      // Recovery: once the transaction is no longer sabotaged, the next pass
+      // embeds and covers the document normally -- proving the aborted pass
+      // left the row genuinely retryable, not stuck.
+      const recovered = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(recovered.inserted).toBe(1);
+      expect(recovered.marker_written).toBe(true);
+      expect(await openVectorRow(opened, "artv-atomic")).toBeDefined();
+      const finalRows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(finalRows.find((row) => row.document_id === "artv-atomic")).toMatchObject({ status: "covered" });
+    });
+  });
+
   it("deletes a pending document's status row once its underlying artifact version closes without ever being embedded", async () => {
     const workspaceId = "ws-semantic-status-orphan";
     const provider = createLocalHashProvider();

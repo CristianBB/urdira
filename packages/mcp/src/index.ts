@@ -1020,11 +1020,6 @@ function formatCount(value: number): string {
   return value.toLocaleString("en-US");
 }
 
-/** Truncates an opaque id/cursor to the same `16 chars + "..."` convention `renderQueryPageText`'s own `MORE:` line already uses, so every truncated token in this renderer looks the same. */
-function truncateToken(value: string): string {
-  return value.length > 16 ? `${value.slice(0, 16)}...` : value;
-}
-
 /**
  * Plan 2026-09-06 (Frente S-A, §4.3): `core:search_semantic`/`core:search_hybrid`'s
  * `semantic_coverage` stream carries one raw `SemanticCoverageView` per item
@@ -1045,10 +1040,20 @@ function describeSemanticCoverage(view: JsonRecord): BundleDescriptor {
   const pending = typeof view["pending_artifact_count"] === "number" ? view["pending_artifact_count"] : 0;
   const failed = typeof view["failed_artifact_count"] === "number" ? view["failed_artifact_count"] : 0;
   const excluded = (typeof view["excluded_artifact_count"] === "number" ? view["excluded_artifact_count"] : 0) + (typeof view["unsupported_artifact_count"] === "number" ? view["unsupported_artifact_count"] : 0);
+  // Unlike every other id this renderer touches, `affected_artifact_set_id`
+  // and `next_cursor` are never merely displayed -- they are the exact
+  // arguments a following `core:semantic_affected_page` call must supply
+  // verbatim (the cursor is a hex-encoded JSON blob; a truncated
+  // prefix cannot be decoded back into a valid `{set, k, dir}` object, and a
+  // truncated set id can never equal the server's freshly recomputed
+  // current set id). So, deliberately, NEITHER is put through the generic
+  // 16-char truncation the rest of this file's ids get: printing a
+  // shortened, unusable copy here would silently strand every agent that
+  // tries to page past the first `semantic_coverage` line.
   const setId = firstNonEmptyString(view["affected_artifact_set_id"]);
   const page = isRecord(view["affected_artifact_page"]) ? view["affected_artifact_page"] as JsonRecord : undefined;
   const nextCursor = page !== undefined ? firstNonEmptyString(page["next_cursor"]) : undefined;
-  const setSuffix = setId !== undefined ? ` (set ${truncateToken(setId)}${nextCursor !== undefined ? `; next: ${truncateToken(nextCursor)}` : ""})` : "";
+  const setSuffix = setId !== undefined ? ` (set ${setId}${nextCursor !== undefined ? `; next: ${nextCursor}` : ""})` : "";
   return { label: `coverage: covered ${formatCount(covered)}/${formatCount(total)} · pending ${formatCount(pending)} · failed ${formatCount(failed)} · excluded ${formatCount(excluded)}${setSuffix}`, isMatchStyle: false };
 }
 
@@ -1080,7 +1085,10 @@ function describeSemanticAffectedPage(view: JsonRecord): BundleDescriptor {
   const total = typeof view["total"] === "number" ? view["total"] : artifacts.length;
   const lines = [`# ${formatCount(total)} affected document${total === 1 ? "" : "s"}`, ...artifacts.map(formatAffectedArtifactLine)];
   if (view["has_next"] === true && typeof view["next_cursor"] === "string") {
-    lines.push(`MORE: call core:semantic_affected_page again with the same affected_artifact_set_id and cursor=${truncateToken(view["next_cursor"])}`);
+    // Full cursor, never truncated -- see `describeSemanticCoverage`'s
+    // identical reasoning: this value must round-trip byte-for-byte into
+    // the next `core:semantic_affected_page` call's own `cursor` argument.
+    lines.push(`MORE: call core:semantic_affected_page again with the same affected_artifact_set_id and cursor=${view["next_cursor"]}`);
   }
   return { label: lines.join("\n"), isMatchStyle: false };
 }

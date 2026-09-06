@@ -888,8 +888,12 @@ describe("Phase 13 Urdira MCP adapter", () => {
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("coverage: covered 13,980/14,120 · pending 90 · failed 2 · excluded 50");
-    expect(text).toContain("set sha256:abcdef012...");
-    expect(text).toContain("next: eyJzZXQiOiJzaGEy...");
+    // Full, untruncated set id and cursor -- both are load-bearing arguments
+    // for a following `core:semantic_affected_page` call, not display-only
+    // ids, so (unlike every other id this renderer prints) they must never
+    // be shortened with a "..." ellipsis.
+    expect(text).toContain("set sha256:abcdef0123456789affectedsetid");
+    expect(text).toContain("next: eyJzZXQiOiJzaGEyNTY6YWJjZGVmMDEyMzQ1Njc4OSJ9");
     expect(text.match(/coverage:/g)).toHaveLength(1);
   });
 
@@ -928,7 +932,10 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(text).toContain("src/a.ts (pending: pending_embed)");
     expect(text).toContain("src/b.ts (excluded: oversized)");
     expect(text).toContain("MORE: call core:semantic_affected_page again");
-    expect(text).toContain("cursor=eyJzZXQiOiJzaGEy...");
+    // Full, untruncated cursor -- a truncated base64url JSON blob can never
+    // be decoded back into a valid {set, k, dir} object, so an agent copying
+    // a shortened cursor could never actually continue paging.
+    expect(text).toContain("cursor=eyJzZXQiOiJzaGEyNTY6YWJjZGVmMDEyMzQ1Njc4OSJ9");
   });
 
   it("renders an index_status page as a few compact lines per workspace", async () => {
