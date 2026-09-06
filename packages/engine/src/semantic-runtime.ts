@@ -8,6 +8,109 @@ export interface SemanticVectorConfiguration {
   readonly normalization: "none" | "l2";
 }
 
+/**
+ * Frente S-B (2026-09-06), R7/R8/R10: one addressable slice of a document's
+ * text a provider embeds independently, in the shared shape every provider's
+ * `SemanticRuntimeBinding.segment?` and `@urdira/embedding-local`'s
+ * `segmentByTokens` both produce. `start_char`/`end_char` are UTF-16 code
+ * unit offsets into the ORIGINAL text passed to the segmenter (never into a
+ * normalized/lowercased copy), so a caller can always recover `text` via
+ * `originalText.slice(start_char, end_char)` -- and `text` itself is provided
+ * directly so callers never need to re-slice at all.
+ */
+export interface SegmentSpan {
+  readonly index: number;
+  readonly text: string;
+  readonly start_char: number;
+  readonly end_char: number;
+}
+
+/**
+ * The result of segmenting one document's text: its ordered segments (never
+ * empty for non-empty input -- see each segmenter's own doc comment for the
+ * empty-text convention) plus whether more content existed beyond
+ * `max_segments` (R8: `reason_code = "segments_truncated"`, never silent).
+ */
+export interface Segmentation {
+  readonly segments: readonly SegmentSpan[];
+  readonly truncated: boolean;
+}
+
+/**
+ * R8 (plan §0): the shared, single-source-of-truth default cap on segments
+ * per document across every provider (`embedding-local`'s token segmenter,
+ * and this module's own char segmenter for the hash/HTTP providers) -- ola 3
+ * measures n8n's actual p99 segment count and may raise this (never above
+ * 256, per R8's own ceiling), but the constant lives in exactly ONE place so
+ * every provider's default moves together. Lives in `@urdira/engine` (not
+ * `@urdira/embedding-local`) because `@urdira/engine`'s own hash/HTTP
+ * providers need it too, and `@urdira/embedding-local` already depends on
+ * `@urdira/engine` (never the reverse -- see this package's other imports).
+ */
+export const DEFAULT_MAX_SEGMENTS = 64;
+
+/**
+ * R7 (plan §0): the pinned segmenter window/overlap, in TOKENS -- MiniLM's
+ * own trained `max_seq_length`, with a 32-token overlap so a match spanning
+ * a window boundary is never split into two half-strength vectors. The
+ * token-based segmenter (`@urdira/embedding-local`'s `segmentByTokens`) uses
+ * these directly; the char-based segmenter below approximates a token as 4
+ * UTF-16 code units (the same rough heuristic `semantic-provider.ts`'s
+ * pre-existing `HTTP_INPUT_TEXT_CAP` sizing already assumed) for providers
+ * with no real tokenizer to consult.
+ */
+export const DEFAULT_SEGMENT_WINDOW_TOKENS = 256;
+export const DEFAULT_SEGMENT_OVERLAP_TOKENS = 32;
+/** chars-per-token approximation shared by every char-based segmenter (hash/HTTP providers, and `embedding-local`'s own line-based token-count fallback when no real tokenizer is available at all). */
+export const CHARS_PER_TOKEN_ESTIMATE = 4;
+
+export interface SegmentByCharsOptions {
+  readonly window_chars: number;
+  readonly overlap_chars: number;
+  readonly max_segments?: number;
+}
+
+/**
+ * Frente S-B: deterministic, tokenizer-free segmenter for providers with no
+ * real subword tokenizer to consult (the bundled hash provider, and the HTTP
+ * provider -- see each one's own `.binding.segment` in `semantic-provider.ts`).
+ * Approximates "tokens" as fixed-size runs of UTF-16 code units
+ * (`window_chars`/`overlap_chars`, chosen by the caller as
+ * `token_count * CHARS_PER_TOKEN_ESTIMATE`): consecutive windows of
+ * `window_chars` characters, stepping forward by `window_chars -
+ * overlap_chars` each time (never less than 1 -- validated below), capped at
+ * `max_segments` (default `DEFAULT_MAX_SEGMENTS`). Mirrors
+ * `embedding-local`'s `segmentByTokens` offset-based path exactly, one layer
+ * down (chars instead of tokens) -- same overlap/cap/truncation semantics,
+ * so the reconciler's entity pass treats every provider's segmentation
+ * uniformly regardless of which one produced it.
+ *
+ * Empty text produces zero segments (`{segments: [], truncated: false}`) --
+ * callers that require at least one segment (the reconciler's own
+ * empty-document pre-check already filters these out before segmenting at
+ * all) must check for this themselves, exactly like
+ * `embedding-local`'s `segmentByTokens`.
+ */
+export function segmentByChars(text: string, options: SegmentByCharsOptions): Segmentation {
+  const windowChars = options.window_chars;
+  const overlapChars = options.overlap_chars;
+  const maxSegments = options.max_segments ?? DEFAULT_MAX_SEGMENTS;
+  if (!Number.isSafeInteger(windowChars) || windowChars <= 0) throw new Error("segmentByChars window_chars must be a positive integer.");
+  if (!Number.isSafeInteger(overlapChars) || overlapChars < 0 || overlapChars >= windowChars) throw new Error("segmentByChars overlap_chars must be a non-negative integer smaller than window_chars.");
+  if (!Number.isSafeInteger(maxSegments) || maxSegments <= 0) throw new Error("segmentByChars max_segments must be a positive integer.");
+  if (text.length === 0) return { segments: [], truncated: false };
+  const step = windowChars - overlapChars;
+  const segments: SegmentSpan[] = [];
+  let truncated = false;
+  for (let start = 0; start < text.length; start += step) {
+    if (segments.length >= maxSegments) { truncated = true; break; }
+    const end = Math.min(start + windowChars, text.length);
+    segments.push({ index: segments.length, text: text.slice(start, end), start_char: start, end_char: end });
+    if (end >= text.length) break;
+  }
+  return { segments, truncated };
+}
+
 function vectorValues(value: readonly number[] | Uint8Array, configuration: SemanticVectorConfiguration): number[] {
   const width = configuration.element_type === "float32" ? 4 : 8;
   if (value instanceof Uint8Array) {
@@ -96,6 +199,17 @@ export interface SemanticGenerateInput {
   readonly profile: EmbeddingProfile;
   readonly purpose: "document" | "query";
   readonly text: string;
+  /**
+   * Frente S-B (decision 17 segmentation): which segment of its owning
+   * document `text` is, when the caller already segmented it (the
+   * reconciler's entity pass, one call per segment) -- folded into
+   * `input_digest` so two DIFFERENT segments that happen to render identical
+   * text (a short, repeated line) still get distinguishable digests. Omitted
+   * (not `undefined`) for every non-segmented call (every artifact-grain
+   * call, and every query), matching this codebase's `exactOptionalPropertyTypes`
+   * convention for every other optional field here.
+   */
+  readonly segment_index?: number;
 }
 
 /** The per-call shape every binding's `generateVector`/`generateVectors` accepts: `SemanticGenerateInput` minus the two identity fields a binding already carries on itself (`runtime_binding_id`, `executable_binding_digest`) -- callers pass those once, at binding-resolution time, never per call. */
@@ -138,6 +252,24 @@ export interface SemanticRuntimeBinding {
    * exists.
    */
   generateVectors?(inputs: readonly GenerateVectorInput[]): Promise<readonly SemanticGeneratedVector[]>;
+  /**
+   * Frente S-B (decision 17 segmentation, R7-R10): splits `text` into the
+   * segments THIS binding's provider would embed one-per-segment for an
+   * entity-grain document -- the reconciler's entity pass (`semantic-reconciler.ts`)
+   * calls this once per candidate entity's rendered text, then calls
+   * `generateVector`/`generateVectors` once per returned segment (with
+   * `segment_index` set), producing one `vector_projection_rows` row per
+   * segment rather than one per document. Absent on a binding that has no
+   * segmentation of its own (should not happen for any of the three shipped
+   * providers -- local neural, hash, HTTP -- but kept optional for the same
+   * reason `generateVectors` is: a caller MUST treat an absent method as "one
+   * segment covering the whole text" (`{segments: [{index: 0, text, start_char:
+   * 0, end_char: text.length}], truncated: false}`), never as an error.
+   * Deterministic and side-effect-free: calling this twice with the same
+   * `text` on the same binding instance always returns the identical
+   * segmentation.
+   */
+  segment?(text: string): Promise<Segmentation>;
 }
 
 export interface DeterministicSemanticRuntimeOptions {
@@ -163,7 +295,7 @@ export class DeterministicSemanticRuntime {
     const generateVector = async (input: GenerateVectorInput): Promise<SemanticGeneratedVector> => {
       if (this.#failFor.has(runtimeBindingId)) throw new Error(`Semantic runtime ${runtimeBindingId} failed.`);
       const tokenIdsValue = tokenIds(input.text);
-      const inputDigest = digestBytes(canonicalBytes({ purpose: input.purpose, profile_digest: input.profile.profile_digest, text: input.text, token_ids: tokenIdsValue }));
+      const inputDigest = digestBytes(canonicalBytes({ purpose: input.purpose, profile_digest: input.profile.profile_digest, text: input.text, token_ids: tokenIdsValue, ...(input.segment_index === undefined ? {} : { segment_index: input.segment_index }) }));
       const generated = await this.#inference.infer({ purpose: input.purpose, profile: input.profile, text: input.text, token_ids: tokenIdsValue, input_digest: inputDigest });
       const vector = canonicalVectorBytes(generated, { dimensions: input.profile.dimensions, element_type: input.profile.element_type as "float32" | "float64", normalization: input.profile.normalization as "none" | "l2" });
       return { vector, vector_digest: digestBytes(vector), input_digest: inputDigest, profile_digest: input.profile.profile_digest };

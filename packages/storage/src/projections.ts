@@ -119,6 +119,19 @@ export interface VectorProjectionInput {
   readonly document_grain?: "artifact" | "entity";
   /** The owning entity record_id for an entity-grain row. Must be set iff `document_grain === "entity"` -- see `putVectors`'s own validation. */
   readonly document_ref?: string;
+  /**
+   * Frente S-B (2026-09-06, decision 17 segmentation): which segment of its
+   * owning document this row's vector was embedded from. Omitted (not `0`)
+   * for every caller that predates segmentation -- `putVectors` defaults it
+   * to `0` at the SQL layer (`segment_index INTEGER NOT NULL DEFAULT 0`),
+   * matching "segment 0 of 1" for an un-segmented artifact-grain row exactly.
+   * An entity-grain row (one vector per segment) always sets this to the
+   * segment's own 0-based index within its document.
+   */
+  readonly segment_index?: number;
+  /** Frente S-B: the winning segment's own `[segment_start, segment_end)` UTF-16 code unit offsets into the document's rendered text -- omitted (both, together) for an un-segmented row, matching `segment_index`'s own "segment 0 of 1" convention. */
+  readonly segment_start?: number;
+  readonly segment_end?: number;
 }
 
 export type VectorBatchInput = VectorProjectionInput;
@@ -449,7 +462,7 @@ export class WorkspaceProjectionRepository {
     const existingShard = await this.database.get<{ shard_id: string }>("SELECT shard_id FROM vector_shards WHERE workspace_id = ? AND content_hash = ?", [this.workspaceId, shard.content_hash]);
     const commands: SqliteCommand[] = [];
     if (!existingShard) commands.push({ kind: "run", sql: "INSERT INTO vector_shards (shard_id, workspace_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, byte_length, content_hash, storage_reference, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [shardId, this.workspaceId, first.profile_id, first.executable_binding_id, first.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, packed.byteLength, shard.content_hash, shard.storage_reference, new Date().toISOString()] });
-    for (const item of normalizedValues) if (!existingById.has(item.key)) commands.push({ kind: "run", sql: "INSERT INTO vector_projection_rows (projection_record_id, workspace_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, document_grain, document_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [item.input.projection_record_id, this.workspaceId, existingShard?.shard_id ?? shardId, item.offset, item.vector.byteLength, item.digest, item.input.owner_artifact_id, item.input.owner_artifact_version_id, item.input.profile_id, item.input.executable_binding_id, item.input.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, item.valid_from_generation, nullable(item.valid_to_generation), item.input.document_grain ?? null, item.input.document_ref ?? null] });
+    for (const item of normalizedValues) if (!existingById.has(item.key)) commands.push({ kind: "run", sql: "INSERT INTO vector_projection_rows (projection_record_id, workspace_id, shard_id, shard_offset, byte_length, vector_digest, owner_artifact_id, owner_artifact_version_id, profile_id, executable_binding_id, dimensions, element_type, vector_encoding, normalization, distance_metric, valid_from_generation, valid_to_generation, document_grain, document_ref, segment_index, segment_start, segment_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params: [item.input.projection_record_id, this.workspaceId, existingShard?.shard_id ?? shardId, item.offset, item.vector.byteLength, item.digest, item.input.owner_artifact_id, item.input.owner_artifact_version_id, item.input.profile_id, item.input.executable_binding_id, item.input.dimensions, config.element_type, config.vector_encoding, config.normalization, config.distance_metric, item.valid_from_generation, nullable(item.valid_to_generation), item.input.document_grain ?? null, item.input.document_ref ?? null, item.input.segment_index ?? 0, item.input.segment_start ?? null, item.input.segment_end ?? null] });
     commands.push(...extraCommands);
     await this.database.transaction(commands);
   }

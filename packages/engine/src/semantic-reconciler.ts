@@ -37,8 +37,15 @@ export function semanticMaterializationIdentity(input: { readonly workspace_id: 
  * cross-profile collision structurally impossible and keeps closed rows from
  * every previous provider intact as history.
  */
-export function semanticVectorProjectionRecordId(input: { readonly document_id: string; readonly profile_id: string; readonly executable_binding_id: string }): string {
-  return `semantic-vector:${digestBytes(canonicalBytes({ document_id: input.document_id, profile_id: input.profile_id, executable_binding_id: input.executable_binding_id }))}`;
+export function semanticVectorProjectionRecordId(input: { readonly document_id: string; readonly profile_id: string; readonly executable_binding_id: string; readonly segment_index?: number }): string {
+  // Frente S-B (2026-09-06, decision 17 segmentation): `segment_index`
+  // folds into this id for an entity-grain document (one vector PER
+  // segment, plan §4.5) -- omitted (not `0`) for every artifact-grain call
+  // and every pre-segmentation entity call, so a caller that never
+  // segments (single-segment documents, the common case) keeps computing
+  // the IDENTICAL id it always has; only a document with 2+ segments ever
+  // needs more than one distinct id for the same `document_id`.
+  return `semantic-vector:${digestBytes(canonicalBytes({ document_id: input.document_id, profile_id: input.profile_id, executable_binding_id: input.executable_binding_id, ...(input.segment_index === undefined ? {} : { segment_index: input.segment_index }) }))}`;
 }
 
 /**
@@ -169,9 +176,9 @@ export interface ReconcileSemanticProjectionResult {
   readonly skipped_empty: number;
   /** Versions whose embedding provider call threw for a reason OTHER than "no embeddable token" -- left missing, retried on the next pass (see the doc comment on the insert loop for the retry-forever tradeoff this implies). */
   readonly failed: number;
-  /** Decision 17: entity-grain vectors newly embedded and written this pass (step 5). */
+  /** Decision 17: entity-grain vectors newly embedded and written this pass (step 5). Frente S-B (2026-09-06): counts SEGMENTS, not documents -- a multi-segment entity contributes one unit here per segment successfully committed, not one per document (a single-segment entity, the common case, still contributes exactly one, unchanged from before segmentation existed). */
   readonly entity_inserted: number;
-  /** Decision 17: entity-grain vector rows closed this pass (step 4) because their owning entity record is no longer visible. A SUBSET of `closed` above, not an addition to it -- see `closed`'s own doc comment. */
+  /** Decision 17: entity-grain vector rows closed this pass (step 4) because their owning entity record is no longer visible. A SUBSET of `closed` above, not an addition to it -- see `closed`'s own doc comment. Frente S-B: counts individual SEGMENT rows closed, not documents. */
   readonly entity_closed: number;
   /** Decision 17: candidate entity records skipped because their OWNING FILE's declared byte length exceeded `max_document_bytes` -- every other entity in that same file is skipped for the identical reason, without ever reading its text. */
   readonly entity_skipped_oversized: number;
@@ -181,7 +188,7 @@ export interface ReconcileSemanticProjectionResult {
   readonly entity_skipped_ineligible: number;
   /** Decision 17: eligible, decodable entity documents skipped because their rendered text contained no embeddable token. */
   readonly entity_skipped_empty: number;
-  /** Decision 17: entity documents whose embedding provider call threw for a reason other than "no embeddable token" -- left missing, retried on the next pass, and (like `failed`) withholds the completion marker until it clears. */
+  /** Decision 17: entity documents whose embedding provider call threw for a reason other than "no embeddable token" -- left missing, retried on the next pass, and (like `failed`) withholds the completion marker until it clears. Frente S-B: counts SEGMENTS, not documents (see `entity_inserted`'s own doc comment) -- one failed segment marks its WHOLE owning document `failed` in `semantic_document_status` (`recordEntitySegmentOutcome`), even though only that one segment's own row failed to write. */
   readonly entity_failed: number;
   /** Whether `semantic_index_state.completed_generation` (plus the provider identity fields, plus `document_grains: ["artifact", "entity"]`) was advanced to `generation` -- `false` when a concurrent scan bumped the workspace's current generation while this pass ran, or when either the artifact or the entity step left any `failed`/`entity_failed` row behind (see the function doc comment). */
   readonly marker_written: boolean;
@@ -200,12 +207,20 @@ export interface ReconcileSemanticProjectionResult {
 const DEFAULT_MAX_DOCUMENT_BYTES = 2_000_000;
 /** Default for `ReconcileSemanticProjectionInput.embed_batch_size` -- see its own doc comment. */
 const DEFAULT_EMBED_BATCH_SIZE = 16;
+// Frente S-B (2026-09-06, plan §4.4/S-B.1): `DEFAULT_MIN_ENTITY_SPAN_LENGTH`,
+// `evaluateEntityEligibility`, `renderEntityDocument`, `leadingDocComment`,
+// `decodeEntityRecordBody`, `EntityEligibility`, and the two ineligibility
+// constants below are exported (were module-private) so
+// `scripts/semantic-window-histogram.mjs` -- and this package's own
+// `tests/`, and any future caller -- enumerate/render CANDIDATE documents
+// using the EXACT SAME algorithm this reconciler's own entity pass (step 5)
+// runs, never a duplicated, driftable reimplementation.
 /** Default for `ReconcileSemanticProjectionInput.entity_policy.min_span_length` -- decision 17's measured policy (excalidraw-scale gate: 2,544 eligible docs at this threshold). */
-const DEFAULT_MIN_ENTITY_SPAN_LENGTH = 120;
+export const DEFAULT_MIN_ENTITY_SPAN_LENGTH = 120;
 /** The record `kind` column value for whole-file/module entity records -- decision 17's measurement-driven policy amendment: these duplicate the artifact-grain document of the same file (654 of them on the bench corpus, some 400KB+), so they are never entity-eligible regardless of span length. See `packages/plugin-javascript-typescript/src/fact-delta.ts`'s `proposalRecord` for where this kind string is produced. */
-const INELIGIBLE_ENTITY_RECORD_KIND = "jsts:entity_container";
+export const INELIGIBLE_ENTITY_RECORD_KIND = "jsts:entity_container";
 /** Body `kind` values (the analyzer's own per-entity `kind`, e.g. `"function"`/`"class"`/`"variable"`/`"parameter"`) that are never entity-eligible regardless of span or position. */
-const INELIGIBLE_ENTITY_BODY_KINDS = new Set(["parameter"]);
+export const INELIGIBLE_ENTITY_BODY_KINDS = new Set(["parameter"]);
 
 /**
  * Hands control back to the event loop's I/O phase between documents -- the
@@ -238,6 +253,40 @@ function yieldToEventLoop(): Promise<void> {
  * scan path, and exists purely as a defensive guard against a differently-
  * produced or hand-repaired `artifact_versions` row.
  */
+/**
+ * Frente S-B (2026-09-06) fix: mirrors `@urdira/storage`'s `putVectors` own
+ * internal re-canonicalization pass (`canonicalVectorBytes`,
+ * `packages/storage/src/projections.ts`) byte-for-byte -- decode float
+ * values, re-apply L2 normalization when configured, re-encode -- so
+ * `commitGeneratedVector`'s parked-row digest comparison can predict what
+ * `putVectors` will ACTUALLY store from `vector`, rather than comparing
+ * against the pre-storage digest the PROVIDER itself computed. Duplicated
+ * here (not imported from `@urdira/storage`) because it is a small, pure,
+ * three-step transform and this engine package's own architecture manifest
+ * does not import `@urdira/storage`'s internal (non-exported)
+ * `canonicalVectorBytes` -- only its public `WorkspaceDatabase`/`SqliteCommand`
+ * surface. See the call site's own doc comment for the exact non-idempotence
+ * this closes.
+ */
+function reencodeAsStorageWouldStore(vector: Uint8Array, config: { readonly dimensions: number; readonly element_type: "float32" | "float64"; readonly normalization: "none" | "l2" }): Uint8Array {
+  const width = config.element_type === "float32" ? 4 : 8;
+  const view = new DataView(vector.buffer, vector.byteOffset, vector.byteLength);
+  let values: number[] = [];
+  for (let offset = 0; offset < vector.byteLength; offset += width) values.push(config.element_type === "float32" ? view.getFloat32(offset, true) : view.getFloat64(offset, true));
+  if (config.normalization === "l2") {
+    const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
+    if (norm !== 0) values = values.map((value) => value / norm);
+  }
+  const bytes = new Uint8Array(values.length * width);
+  const outView = new DataView(bytes.buffer);
+  values.forEach((value, index) => {
+    const normalized = Object.is(value, -0) ? 0 : value;
+    if (config.element_type === "float32") outView.setFloat32(index * width, normalized, true);
+    else outView.setFloat64(index * width, normalized, true);
+  });
+  return bytes;
+}
+
 function decodeText(bytes: Uint8Array): string | undefined {
   if (bytes.some((byte) => byte === 0)) return undefined;
   try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
@@ -298,7 +347,7 @@ type MissingEntityRow = {
   readonly body_payload: Uint8Array | ArrayBuffer | null;
 };
 
-function decodeEntityRecordBody(value: unknown): Record<string, unknown> {
+export function decodeEntityRecordBody(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
@@ -324,11 +373,11 @@ function decodeEntityRecordBody(value: unknown): Record<string, unknown> {
  * (`packages/plugin-javascript-typescript/src/analyzer.ts`'s `JsTsEntity.start`/`.end`),
  * so they index `fileText` directly with no translation.
  */
-type EntityEligibility =
+export type EntityEligibility =
   | { readonly eligible: false }
   | { readonly eligible: true; readonly kind: string; readonly label: string; readonly start: number; readonly end: number };
 
-function evaluateEntityEligibility(recordKind: string, body: Record<string, unknown>, fileText: string, minSpanLength: number): EntityEligibility {
+export function evaluateEntityEligibility(recordKind: string, body: Record<string, unknown>, fileText: string, minSpanLength: number): EntityEligibility {
   if (recordKind === INELIGIBLE_ENTITY_RECORD_KIND) return { eligible: false };
   const kind = typeof body["kind"] === "string" ? body["kind"] as string : undefined;
   if (kind === undefined || INELIGIBLE_ENTITY_BODY_KINDS.has(kind)) return { eligible: false };
@@ -359,7 +408,7 @@ function evaluateEntityEligibility(recordKind: string, body: Record<string, unkn
  * slightly odd-looking rendered document, never a correctness problem for
  * embedding eligibility itself.
  */
-function leadingDocComment(text: string, start: number): string | undefined {
+export function leadingDocComment(text: string, start: number): string | undefined {
   let index = start;
   while (index > 0 && WHITESPACE_PATTERN.test(text[index - 1]!)) index -= 1;
   if (index < 2 || text[index - 2] !== "*" || text[index - 1] !== "/") return undefined;
@@ -369,7 +418,7 @@ function leadingDocComment(text: string, start: number): string | undefined {
 }
 
 /** Decision 17 rendering (PINNED): `<kind> <label>\n<leading doc comment if present>\n<source span text>`. Truncation to the provider's own document budget happens inside the provider itself (see `semantic-provider.ts`'s `HTTP_INPUT_TEXT_CAP` for the HTTP path; the bundled local providers embed the full text) -- exactly how the artifact pass's own rendered text already reaches the provider today, so this function does no truncation of its own. */
-function renderEntityDocument(input: { readonly kind: string; readonly label: string; readonly docComment: string | undefined; readonly spanText: string }): string {
+export function renderEntityDocument(input: { readonly kind: string; readonly label: string; readonly docComment: string | undefined; readonly spanText: string }): string {
   const lines = [`${input.kind} ${input.label}`];
   if (input.docComment !== undefined) lines.push(input.docComment);
   lines.push(input.spanText);
@@ -728,6 +777,19 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     readonly documentRef?: string;
     /** Plan 2026-09-06 (Frente S-A): carried through so `commitGeneratedVector`/`embedAndCommitBatch` can write this item's `semantic_document_status` row without a second query. */
     readonly displayPath: string;
+    /**
+     * Frente S-B (2026-09-06, decision 17 segmentation): which segment of
+     * its owning ENTITY document this item is -- always present for an
+     * entity item (`documentGrain === "entity"`), always absent for an
+     * artifact item (R9: the artifact lane stays one vector, no segment
+     * identity of its own). `segmentStart`/`segmentEnd` are the segment's
+     * own `[start, end)` UTF-16 offsets into the entity's rendered
+     * `embeddingText` (the WHOLE document's text, before this item's own
+     * `embeddingText` was narrowed to just this one segment's slice).
+     */
+    readonly segmentIndex?: number;
+    readonly segmentStart?: number;
+    readonly segmentEnd?: number;
   };
 
   const bumpInserted = (item: PendingEmbedItem): void => { if (item.documentGrain === "entity") counts.entity_inserted += 1; else counts.inserted += 1; };
@@ -737,15 +799,108 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   const documentIdOf = (item: PendingEmbedItem): string => item.documentGrain === "entity" ? item.documentRef! : item.ownerArtifactVersionId;
 
   /** Plan 2026-09-06 (Frente S-A): immediate (non-transactional) status upsert -- used wherever there is no companion vector write to be atomic WITH (a permanent skip classification, or a `failed` classification). Reads `generation`/`workspaceId`/`profileId`/`executableBindingId` from the enclosing closure. */
-  const writeStatusRow = async (input: { readonly documentGrain: "artifact" | "entity"; readonly documentId: string; readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly status: SemanticDocumentStatus; readonly reasonCodes: readonly string[] }): Promise<void> => {
+  const writeStatusRow = async (input: { readonly documentGrain: "artifact" | "entity"; readonly documentId: string; readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly status: SemanticDocumentStatus; readonly reasonCodes: readonly string[]; readonly segmentCount?: number }): Promise<void> => {
     const command = documentStatusUpsertCommand({ workspaceId, profileId, executableBindingId, generation, updatedAt: nowIso(), ...input });
     if (command.kind !== "run") throw new Error("unreachable: documentStatusUpsertCommand always returns a run command");
     await sql.run(command.sql, command.params ?? []);
   };
 
-  /** `writeStatusRow` for a `PendingEmbedItem` -- see that function's own doc comment. */
+  /**
+   * Frente S-B (2026-09-06, decision 17 segmentation): per-ENTITY-RECORD
+   * aggregation state for its (possibly many) segments -- `semantic_document_status`
+   * holds exactly ONE row per `(document_grain, document_id)` (unchanged by
+   * this frente), so N segment-level outcomes for the SAME entity record
+   * must be reduced to ONE final status write, never N competing writes
+   * racing to overwrite each other's `status`/`reason_codes`. An entry is
+   * created (via `registerEntityDocument` below) BEFORE any of its
+   * segments' `PendingEmbedItem`s are pushed into `entityPendingBatch`, and
+   * removed the instant its `settled` count reaches `total_segments` --
+   * whichever batch flush's `commitGeneratedVector`/`embedAndCommitBatch`
+   * call happens to settle the LAST outstanding segment performs the one
+   * real DB write, via `writeItemStatus`'s own entity branch below.
+   */
+  type EntityDocumentAggregate = {
+    readonly artifactId: string;
+    readonly artifactVersionId: string;
+    readonly displayPath: string;
+    readonly totalSegments: number;
+    readonly truncated: boolean;
+    settled: number;
+    failed: boolean;
+    readonly reasonCodes: Set<string>;
+  };
+  const entityDocumentAggregates = new Map<string, EntityDocumentAggregate>();
+
+  const registerEntityDocument = (recordId: string, input: { readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly totalSegments: number; readonly truncated: boolean }): void => {
+    entityDocumentAggregates.set(recordId, { ...input, settled: 0, failed: false, reasonCodes: new Set() });
+  };
+
+  /**
+   * Records one segment's OWN outcome for its owning entity record, writing
+   * the record's single `semantic_document_status` row (`covered` -- with
+   * `reason_codes: ["segments_truncated"]` when `truncated` was set at
+   * registration, per R8 -- or `failed`, union of every failed segment's own
+   * reason codes) only once every one of its segments has settled.
+   * Idempotent per call: a record already finalized (defensively -- should
+   * not happen, since `entityDocumentAggregates` is deleted the instant it
+   * finalizes) is a no-op rather than a crash or a duplicate write.
+   *
+   * Partial-failure self-heal: when the FINAL aggregated status is
+   * `"failed"` (at least one segment's embed/write genuinely failed), every
+   * OTHER segment of this SAME document that DID succeed and already has an
+   * OPEN vector row is closed right here, at the CURRENT generation (same
+   * "close at now, not at content's own lifecycle" convention as step 1's
+   * profile-swap close) -- without this, the next pass's "missing entity
+   * rows" query (`NOT EXISTS` an open row for this `document_ref`) would see
+   * the surviving successful segment(s) and conclude the WHOLE document is
+   * already covered, permanently abandoning the one segment that never
+   * embedded. Closing every segment together makes the document appear
+   * fully missing again, so the next pass retries ALL of its segments from
+   * scratch -- a small amount of redundant re-embedding for the segments
+   * that did succeed, in exchange for the correctness guarantee that a
+   * partially-failed multi-segment document is never silently left
+   * incomplete forever.
+   */
+  const recordEntitySegmentOutcome = async (recordId: string, status: "covered" | "failed", reasonCodes: readonly string[]): Promise<void> => {
+    const aggregate = entityDocumentAggregates.get(recordId);
+    if (aggregate === undefined) return;
+    aggregate.settled += 1;
+    if (status === "failed") { aggregate.failed = true; for (const code of reasonCodes) aggregate.reasonCodes.add(code); }
+    if (aggregate.settled < aggregate.totalSegments) return;
+    entityDocumentAggregates.delete(recordId);
+    const finalStatus: SemanticDocumentStatus = aggregate.failed ? "failed" : "covered";
+    const finalReasonCodes = aggregate.failed ? [...aggregate.reasonCodes] : aggregate.truncated ? ["segments_truncated"] : [];
+    if (aggregate.failed) {
+      const selfHealClose = await sql.run(
+        "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND document_grain = 'entity' AND document_ref = ? AND profile_id = ? AND executable_binding_id = ? AND valid_to_generation IS NULL",
+        [generation, workspaceId, recordId, profileId, executableBindingId],
+      );
+      counts.closed += selfHealClose.changes;
+      counts.entity_closed += selfHealClose.changes;
+    }
+    await writeStatusRow({ documentGrain: "entity", documentId: recordId, artifactId: aggregate.artifactId, artifactVersionId: aggregate.artifactVersionId, displayPath: aggregate.displayPath, status: finalStatus, reasonCodes: finalReasonCodes, segmentCount: aggregate.totalSegments });
+  };
+
+  /**
+   * `writeStatusRow` for a `PendingEmbedItem` -- see that function's own doc
+   * comment. Frente S-B (2026-09-06): an ENTITY item (`documentGrain ===
+   * "entity"`) NEVER writes its own row directly -- every entity item is
+   * one SEGMENT of a multi-segment document sharing one status row with its
+   * siblings, so this routes through `recordEntitySegmentOutcome`'s
+   * per-record aggregation instead (only `"covered"`/`"failed"` are ever
+   * passed for an entity item; `"pending"`/`"excluded"`/`"unsupported"` are
+   * only ever used for the whole-document skip classifications in step 5's
+   * OWN pre-segmentation checks, which call `writeStatusRow` directly, never
+   * this function -- see the doc comment on `evaluateEntityEligibility`'s
+   * call site below).
+   */
   const writeItemStatus = async (item: PendingEmbedItem, status: SemanticDocumentStatus, reasonCodes: readonly string[]): Promise<void> => {
-    await writeStatusRow({ documentGrain: item.documentGrain ?? "artifact", documentId: documentIdOf(item), artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath, status, reasonCodes });
+    if (item.documentGrain === "entity") {
+      if (status !== "covered" && status !== "failed") throw new Error(`unreachable: an entity PendingEmbedItem only ever settles as covered or failed, got ${status}.`);
+      await recordEntitySegmentOutcome(item.documentRef!, status, reasonCodes);
+      return;
+    }
+    await writeStatusRow({ documentGrain: "artifact", documentId: documentIdOf(item), artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath, status, reasonCodes });
   };
 
   // Commits ONE already-generated vector for ONE pending item: the exact
@@ -781,7 +936,25 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       [workspaceId, item.projectionRecordId, item.validFromGeneration],
     );
     if (parked !== undefined) {
-      if (parked.vector_digest !== generated.vector_digest) {
+      // Frente S-B (2026-09-06) fix: compare against the digest
+      // `putVectors` (`@urdira/storage`) will ACTUALLY store -- never
+      // `generated.vector_digest` as-is. `putVectors` re-applies its own
+      // decode/L2-renormalize/re-encode pass to whatever bytes it receives
+      // (a defensive step for a caller that hands it non-normalized raw
+      // values), and that re-normalization is NOT perfectly bit-idempotent
+      // on an ALREADY-unit-norm float32 vector: re-dividing by a norm that
+      // float32 rounding put at, say, 0.9999999 or 1.0000001 instead of
+      // exactly 1.0 can flip the last bit of one or more components on
+      // re-encoding. `storageReencodedDigest` mirrors that exact transform
+      // so this comparison is apples-to-apples -- discovered live via the
+      // entity segmentation self-heal path (a segment closed then reopened
+      // one pass later), but the underlying gap predates segmentation
+      // entirely: ANY reopened row (e.g. a provider swapped back to a
+      // previous identity) was equally at risk of a spurious
+      // `provider_error:vector_digest_mismatch` on an actually-unchanged,
+      // fully-deterministic provider.
+      const rehashedDigest = digestBytes(reencodeAsStorageWouldStore(generated.vector, { dimensions: provider.profile.dimensions, element_type: provider.profile.element_type as "float32" | "float64", normalization: provider.profile.normalization as "none" | "l2" }));
+      if (parked.vector_digest !== rehashedDigest) {
         bumpFailed(item);
         // Plan 2026-09-06 (Frente S-A): a non-deterministic provider under an
         // unchanged binding digest -- structurally distinguishable from every
@@ -789,20 +962,25 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         await writeItemStatus(item, "failed", ["provider_error:vector_digest_mismatch"]);
         return;
       }
-      // Plan 2026-09-06 (Frente S-A): the reopen (when needed) and the
-      // `covered` status upsert land in one transaction -- when the parked
-      // row is already open (the defensive "cannot normally reach here"
-      // case noted below), there is nothing to reopen and the status upsert
-      // runs alone.
-      const statusCommand = documentStatusUpsertCommand({
-        workspaceId, profileId, executableBindingId, documentGrain: item.documentGrain ?? "artifact", documentId: documentIdOf(item),
+      // Plan 2026-09-06 (Frente S-A), extended by Frente S-B for an ENTITY
+      // item: the reopen (when needed) and the `covered` status upsert land
+      // in one transaction ONLY for an artifact item -- an entity item's
+      // status is never written here directly (see `writeItemStatus`'s own
+      // doc comment); its "covered" outcome is recorded via
+      // `recordEntitySegmentOutcome` AFTER the reopen transaction commits,
+      // which performs the real (aggregated) status write only once every
+      // sibling segment has also settled.
+      const statusCommand = item.documentGrain === "entity" ? undefined : documentStatusUpsertCommand({
+        workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: documentIdOf(item),
         artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath,
         status: "covered", reasonCodes: [], generation, updatedAt: nowIso(),
       });
+      const reopenUpdate: SqliteCommand = { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = NULL WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [workspaceId, item.projectionRecordId, item.validFromGeneration] };
       const reopenCommands: SqliteCommand[] = parked.valid_to_generation !== null
-        ? [{ kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = NULL WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [workspaceId, item.projectionRecordId, item.validFromGeneration] }, statusCommand]
-        : [statusCommand];
-      await sql.transaction(reopenCommands);
+        ? statusCommand === undefined ? [reopenUpdate] : [reopenUpdate, statusCommand]
+        : statusCommand === undefined ? [] : [statusCommand];
+      if (reopenCommands.length > 0) await sql.transaction(reopenCommands);
+      if (item.documentGrain === "entity") await recordEntitySegmentOutcome(item.documentRef!, "covered", []);
       // An OPEN parked row (valid_to already NULL) cannot normally reach here
       // (the missing-rows queries exclude documents with an open current-
       // profile row), treated as already-covered either way.
@@ -832,13 +1010,18 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         // item.documentGrain`.
         ...(item.documentGrain === undefined ? {} : { document_grain: item.documentGrain }),
         ...(item.documentRef === undefined ? {} : { document_ref: item.documentRef }),
-      }], [
+        ...(item.segmentIndex === undefined ? {} : { segment_index: item.segmentIndex }),
+        ...(item.segmentStart === undefined ? {} : { segment_start: item.segmentStart }),
+        ...(item.segmentEnd === undefined ? {} : { segment_end: item.segmentEnd }),
+      }], item.documentGrain === "entity" ? [] : [
         // Plan 2026-09-06 (Frente S-A): the `covered` status row commits in
         // the SAME transaction as the vector insert (`putVectors`'s own
         // `extraCommands` parameter) -- a crash between the two can never
-        // leave one written without the other.
+        // leave one written without the other. Frente S-B: an ENTITY item's
+        // extraCommands stay empty -- its status is aggregated across
+        // siblings AFTER this transaction (see the doc comment above).
         documentStatusUpsertCommand({
-          workspaceId, profileId, executableBindingId, documentGrain: item.documentGrain ?? "artifact", documentId: documentIdOf(item),
+          workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: documentIdOf(item),
           artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath,
           status: "covered", reasonCodes: [], generation, updatedAt: nowIso(),
         }),
@@ -850,6 +1033,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       await writeItemStatus(item, "failed", ["provider_error:vector_write_failed"]);
       return;
     }
+    if (item.documentGrain === "entity") await recordEntitySegmentOutcome(item.documentRef!, "covered", []);
     bumpInserted(item);
     // See `yieldToEventLoop`'s doc comment: this is the loop whose combined
     // per-document embedding cost is the one actually at risk of starving
@@ -877,7 +1061,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     const generateVectors = provider.binding.generateVectors;
     if (generateVectors !== undefined) {
       try {
-        const generated = await generateVectors(pending.map((item) => ({ profile: provider.profile, purpose: "document" as const, text: item.embeddingText })));
+        const generated = await generateVectors(pending.map((item) => ({ profile: provider.profile, purpose: "document" as const, text: item.embeddingText, ...(item.segmentIndex === undefined ? {} : { segment_index: item.segmentIndex }) })));
         if (generated.length !== pending.length) throw new Error(`Semantic runtime binding generateVectors returned ${generated.length} vectors for ${pending.length} inputs.`);
         for (let index = 0; index < pending.length; index += 1) await commitGeneratedVector(pending[index]!, generated[index]!);
         return;
@@ -890,7 +1074,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     for (const item of pending) {
       let generated: SemanticGeneratedVector;
       try {
-        generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: item.embeddingText });
+        generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: item.embeddingText, ...(item.segmentIndex === undefined ? {} : { segment_index: item.segmentIndex }) });
       } catch {
         // The embedding provider itself threw (network failure, malformed
         // response, timeout, ...) -- the bundled local providers never throw
@@ -1184,16 +1368,49 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     // that keeps an OLD owner version still gets a vector visible from
     // exactly when the RECORD itself became visible.
     const documentId = entityDocumentId(row.record_id);
-    const projectionRecordId = semanticVectorProjectionRecordId({ document_id: documentId, profile_id: profileId, executable_binding_id: executableBindingId });
-    entityPendingBatch.push({
-      embeddingText, projectionRecordId,
-      ownerArtifactId: row.owner_artifact_id, ownerArtifactVersionId: row.owner_artifact_version_id,
-      validFromGeneration: row.valid_from_generation, documentGrain: "entity", documentRef: row.record_id,
-      displayPath: entityDisplayPath,
+    // Frente S-B (2026-09-06, decision 17 segmentation): the CURRENT
+    // provider's OWN segmenter (`.binding.segment`) splits this entity's
+    // rendered text into its per-segment spans -- a binding that has not
+    // implemented `segment` (should not happen for any of the three shipped
+    // providers, kept for architectural symmetry with `generateVectors`'
+    // identical optionality) is treated as "one segment covering the whole
+    // text", per `SemanticRuntimeBinding.segment`'s own doc comment.
+    const segmentation = provider.binding.segment !== undefined
+      ? await provider.binding.segment(embeddingText)
+      : { segments: [{ index: 0, text: embeddingText, start_char: 0, end_char: embeddingText.length }], truncated: false };
+    if (segmentation.segments.length === 0) {
+      // Defensive: `embeddingText` already passed `EMBEDDABLE_TOKEN_PATTERN`
+      // above, so a real segmenter should never produce zero segments here --
+      // treated the same as the empty-text skip immediately above it.
+      counts.entity_skipped_empty += 1;
+      await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["below_min_length"] });
+      continue;
+    }
+    // Registered BEFORE any of this record's segment items are pushed into
+    // `entityPendingBatch` -- see `EntityDocumentAggregate`'s own doc
+    // comment for why this ordering is load-bearing (a segment can settle,
+    // and therefore look up this aggregate, the instant its OWN batch flush
+    // resolves, which can happen before every sibling segment has even been
+    // pushed if `embedBatchSize` is smaller than this record's own segment
+    // count -- but never before ALL of THIS record's segments have been
+    // pushed in THIS same loop iteration, since nothing yields control back
+    // to another `for` iteration between here and the loop below).
+    registerEntityDocument(row.record_id, {
+      artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath,
+      totalSegments: segmentation.segments.length, truncated: segmentation.truncated,
     });
-    if (entityPendingBatch.length < embedBatchSize) continue;
-    await embedAndCommitBatch(entityPendingBatch);
-    entityPendingBatch = [];
+    for (const segment of segmentation.segments) {
+      const projectionRecordId = semanticVectorProjectionRecordId({ document_id: documentId, profile_id: profileId, executable_binding_id: executableBindingId, segment_index: segment.index });
+      entityPendingBatch.push({
+        embeddingText: segment.text, projectionRecordId,
+        ownerArtifactId: row.owner_artifact_id, ownerArtifactVersionId: row.owner_artifact_version_id,
+        validFromGeneration: row.valid_from_generation, documentGrain: "entity", documentRef: row.record_id,
+        displayPath: entityDisplayPath, segmentIndex: segment.index, segmentStart: segment.start_char, segmentEnd: segment.end_char,
+      });
+      if (entityPendingBatch.length < embedBatchSize) continue;
+      await embedAndCommitBatch(entityPendingBatch);
+      entityPendingBatch = [];
+    }
   }
   if (entityPendingBatch.length > 0) await embedAndCommitBatch(entityPendingBatch);
 

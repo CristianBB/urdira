@@ -109,6 +109,16 @@ export async function ensureWorkspaceSchemaCompatibility(database: SqliteDatabas
   if (!vectorNames.has("document_grain")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN document_grain TEXT");
   if (!vectorNames.has("document_ref")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN document_ref TEXT");
   await database.exec("CREATE INDEX IF NOT EXISTS vector_projection_document_ref_idx ON vector_projection_rows(workspace_id, document_grain, document_ref)");
+  // Frente S-B (2026-09-06, R22): per-segment identity columns -- an
+  // artifact-grain row (still one vector, R9) keeps `segment_index = 0` and
+  // NULL `segment_start`/`segment_end` (nothing to distinguish); an
+  // entity-grain row (now one vector PER segment) gets the winning segment's
+  // own token-window bounds. Additive, idempotent, no backfill needed:
+  // every pre-existing row is correctly "segment 0 of 1" under these
+  // defaults.
+  if (!vectorNames.has("segment_index")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN segment_index INTEGER NOT NULL DEFAULT 0");
+  if (!vectorNames.has("segment_start")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN segment_start INTEGER");
+  if (!vectorNames.has("segment_end")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN segment_end INTEGER");
   const semanticIndexStateColumns = await database.all<{ name: string }>("PRAGMA table_info(semantic_index_state)");
   if (!semanticIndexStateColumns.some((column) => column.name === "document_grains")) await database.exec("ALTER TABLE semantic_index_state ADD COLUMN document_grains TEXT");
   if (!semanticIndexStateColumns.some((column) => column.name === "entity_policy_digest")) await database.exec("ALTER TABLE semantic_index_state ADD COLUMN entity_policy_digest TEXT");
@@ -272,6 +282,30 @@ export async function readStructuralStore(database: SqliteDatabase): Promise<"na
   let decoded: unknown;
   try { decoded = decodeCanonical(bytes); } catch { return undefined; }
   return typeof decoded === "string" && STRUCTURAL_STORE_VALUES.has(decoded) ? (decoded as "native" | "sqlite") : undefined;
+}
+
+/**
+ * Frente S-B (2026-09-06, R22): additive, idempotent migration for the v4
+ * semantic sidecar (`<workspace>.semantic.sqlite`) -- `ensureV4Workspace`
+ * (`packages/engine/src/workspace-v4-bootstrap.ts`) only runs `CREATE TABLE
+ * IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS` for a sidecar file that did NOT
+ * already exist on disk, so a workspace whose semantic sidecar predates this
+ * column addition would otherwise never get it; `WorkspaceDatabase.openSidecar`
+ * has the identical gap. Both call sites now run this function
+ * UNCONDITIONALLY (new or pre-existing file alike) right after applying
+ * `WORKSPACE_V4_SEMANTIC_SCHEMA` -- `PRAGMA table_info` makes every `ALTER
+ * TABLE` a no-op once the columns already exist, so repeating this on every
+ * open costs one cheap introspection query, never a real schema change.
+ * Mirrors `ensureWorkspaceSchemaCompatibility`'s identical v3 columns
+ * (`vector_projection_rows.segment_index`/`segment_start`/`segment_end`)
+ * exactly -- see that function's own comment for the column semantics.
+ */
+export async function ensureSemanticSidecarSchemaCompatibilityV4(database: SqliteDatabase): Promise<void> {
+  const vectorColumns = await database.all<{ name: string }>("PRAGMA table_info(vector_projection_rows)");
+  const vectorNames = new Set(vectorColumns.map((column) => column.name));
+  if (!vectorNames.has("segment_index")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN segment_index INTEGER NOT NULL DEFAULT 0");
+  if (!vectorNames.has("segment_start")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN segment_start INTEGER");
+  if (!vectorNames.has("segment_end")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN segment_end INTEGER");
 }
 
 export async function writeStructuralStore(database: SqliteDatabase, value: "native" | "sqlite"): Promise<void> {

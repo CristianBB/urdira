@@ -9,7 +9,7 @@ import { expandRelations, findShortestPaths, type OperationEvaluation, type Oper
 import { decodeRow, object, type RecordRow } from "./query-record-decode.js";
 import type { RecordBodyInterner } from "./record-body-interner.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
-import { exactVectorScan, fuseSemanticLanes, rerankSemanticMatches } from "./semantic-retrieval.js";
+import { exactVectorScan, fuseSemanticLanes, rerankSemanticMatches, type RankedSemanticCandidate } from "./semantic-retrieval.js";
 import type { StageSetHandle } from "./stage-set-handle.js";
 
 export interface CanonicalQueryRecord {
@@ -322,6 +322,18 @@ export interface SemanticVectorRow {
   readonly distance_metric: string;
   readonly document_grain?: "artifact" | "entity";
   readonly document_ref?: string;
+  /**
+   * Frente S-B (2026-09-06, decision 17 segmentation): which segment of its
+   * owning ENTITY document this row's vector was embedded from -- `0` for
+   * every artifact-grain row and every pre-segmentation entity row (both
+   * "segment 0 of 1" by construction, matching `vector_projection_rows.segment_index`'s
+   * own `NOT NULL DEFAULT 0` column). `segment_start`/`segment_end` are the
+   * segment's own `[start, end)` UTF-16 offsets into the entity's rendered
+   * document text -- `undefined` (both together) for an un-segmented row.
+   */
+  readonly segment_index: number;
+  readonly segment_start?: number;
+  readonly segment_end?: number;
 }
 
 export interface LexicalSearchMatch {
@@ -1223,8 +1235,8 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     if (this.content === undefined) return [];
     const generation = await this.currentGeneration(scope);
     if (generation === undefined) return [];
-    const rows = await this.database.all<{ projection_record_id: string; owner_artifact_id: string; owner_artifact_version_id: string; shard_id: string; shard_offset: number; byte_length: number; dimensions: number; element_type: string; normalization: string; distance_metric: string; document_grain: string | null; document_ref: string | null }>(
-      `SELECT projection_record_id, owner_artifact_id, owner_artifact_version_id, shard_id, shard_offset, byte_length, dimensions, element_type, normalization, distance_metric, document_grain, document_ref
+    const rows = await this.database.all<{ projection_record_id: string; owner_artifact_id: string; owner_artifact_version_id: string; shard_id: string; shard_offset: number; byte_length: number; dimensions: number; element_type: string; normalization: string; distance_metric: string; document_grain: string | null; document_ref: string | null; segment_index: number | null; segment_start: number | null; segment_end: number | null }>(
+      `SELECT projection_record_id, owner_artifact_id, owner_artifact_version_id, shard_id, shard_offset, byte_length, dimensions, element_type, normalization, distance_metric, document_grain, document_ref, segment_index, segment_start, segment_end
          FROM vector_projection_rows
         WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ?
           AND valid_from_generation <= ? AND (valid_to_generation IS NULL OR valid_to_generation > ?)
@@ -1262,11 +1274,17 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       // property outright, so this must be a conditional spread, not a bare
       // ternary-valued property.
       const isEntity = row.document_grain === "entity" && row.document_ref !== null;
+      // Frente S-B: `segment_start`/`segment_end` are omitted together
+      // (never one without the other) -- both are non-NULL for a REAL
+      // segment span, and both are NULL for every un-segmented row
+      // (`segment_index` alone is never NULL, defaulting to `0`).
+      const hasSegmentSpan = row.segment_start !== null && row.segment_end !== null;
       result.push({
         projection_record_id: row.projection_record_id, owner_artifact_id: row.owner_artifact_id, owner_artifact_version_id: row.owner_artifact_version_id,
         vector_payload: packed.slice(row.shard_offset, row.shard_offset + row.byte_length), dimensions: row.dimensions, element_type: row.element_type,
-        normalization: row.normalization, distance_metric: row.distance_metric,
+        normalization: row.normalization, distance_metric: row.distance_metric, segment_index: row.segment_index ?? 0,
         ...(isEntity ? { document_grain: "entity" as const, document_ref: row.document_ref as string } : {}),
+        ...(hasSegmentSpan ? { segment_start: row.segment_start as number, segment_end: row.segment_end as number } : {}),
       });
     }
     return result;
@@ -2046,12 +2064,21 @@ function dedupeVectorsByOwner(vectors: readonly SemanticVectorRow[]): readonly S
  * `owner_artifact_version_id`: unlike artifact-grain vectors, many entity
  * rows legitimately share one owner artifact version (every eligible entity
  * in the same file), so deduping by owner here would wrongly collapse an
- * entire file's worth of entity candidates down to one. The reconciler's own
- * entity stale-close/missing-insert queries (`semantic-reconciler.ts` steps
- * 4-5) already guarantee at most one OPEN row per `(document_ref,
- * profile_id, executable_binding_id)`, so this is -- like
- * `dedupeVectorsByOwner` for the artifact case -- a defensive no-op in
- * practice, not a case this file has any way to construct.
+ * entire file's worth of entity candidates down to one.
+ *
+ * Frente S-B (2026-09-06, decision 17 segmentation): this is now ONLY "best
+ * by document" in the trivial, similarity-blind sense of "one arbitrary
+ * representative row per document" -- used SOLELY for the coverage view's
+ * `covered_entity_count` (a plain distinct-document count, where WHICH
+ * segment represents a document does not matter). It is NO LONGER how the
+ * entity lane's SEARCH RANKING picks a document's winning segment -- that is
+ * `trySemanticSearch`'s own max-similarity reduction over `entitySegmentRanks`
+ * (see its doc comment), which walks the ALREADY-SCORED, best-first exact-scan
+ * result instead of this function's first-occurrence-in-storage-order pick.
+ * A multi-segment entity now legitimately has SEVERAL open rows sharing one
+ * `document_ref` (one per segment), so "at most one open row per document_ref"
+ * is no longer the invariant this dedup happens to be defensive against --
+ * it is now doing real, necessary collapsing work for that count.
  */
 function dedupeVectorsByDocumentRef(vectors: readonly SemanticVectorRow[]): readonly SemanticVectorRow[] {
   const byRef = new Map<string, SemanticVectorRow>();
@@ -2354,10 +2381,28 @@ function coverageItem(view: EntitySemanticCoverageView): QueryStreamItem {
   return { value: view, stable_sort_key: `unclassified\0${view.semantic_index_binding_id}` };
 }
 
-/** Candidate stream item for both `core:search_semantic` and `core:search_hybrid` -- the registry pins both operations' `candidates` stream to `possible`-only (`registries.ts`), so unlike `item()` above there is no `confirmed` case to branch on. `rank` is always the FINAL, post-hydration output position (1-based, contiguous, no gaps even if some ranked ids failed to hydrate) -- never a fusion-internal or exact-scan-internal rank, which could contain gaps once un-hydratable ids are dropped. */
-function semanticCandidateItem(record: CanonicalQueryRecord, rank: number): QueryStreamItem {
+/**
+ * Candidate stream item for both `core:search_semantic` and
+ * `core:search_hybrid` -- the registry pins both operations' `candidates`
+ * stream to `possible`-only (`registries.ts`), so unlike `item()` above
+ * there is no `confirmed` case to branch on. `rank` is always the FINAL,
+ * post-hydration output position (1-based, contiguous, no gaps even if some
+ * ranked ids failed to hydrate) -- never a fusion-internal or
+ * exact-scan-internal rank, which could contain gaps once un-hydratable ids
+ * are dropped.
+ *
+ * `matchedSegment` (Frente S-B, decision 17 segmentation): present only for
+ * an entity candidate whose winning row carries a real segment span --
+ * folded into the emitted value's `semantic_evidence.matched_segment` field
+ * so a caller (the future snippet renderer, Frente N) can point directly at
+ * the segment that actually matched, rather than the whole entity's span.
+ * Absent for every artifact candidate and every entity candidate with no
+ * segment span recorded (a pre-segmentation row).
+ */
+function semanticCandidateItem(record: CanonicalQueryRecord, rank: number, matchedSegment?: { readonly index: number; readonly start_char: number; readonly end_char: number }): QueryStreamItem {
   const identity = record.identity_key ?? record.record_id;
-  return { value: recordValue(record, "possible"), stable_sort_key: `possible\0${String(rank).padStart(6, "0")}\0${identity}` };
+  const value = { ...recordValue(record, "possible"), ...(matchedSegment === undefined ? {} : { semantic_evidence: { matched_segment: matchedSegment } }) };
+  return { value, stable_sort_key: `possible\0${String(rank).padStart(6, "0")}\0${identity}` };
 }
 
 /**
@@ -3161,7 +3206,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * recomputing `rank` from the OUTPUT position, not reusing the input
    * index).
    */
-  private async hydrateSemanticCandidates(scope: QueryScope, rankedEntries: readonly { readonly id: string; readonly grain: "artifact" | "entity" }[]): Promise<readonly QueryStreamItem[]> {
+  private async hydrateSemanticCandidates(scope: QueryScope, rankedEntries: readonly { readonly id: string; readonly grain: "artifact" | "entity" }[], matchedSegmentsByDocumentRef?: ReadonlyMap<string, { readonly index: number; readonly start_char: number; readonly end_char: number }>): Promise<readonly QueryStreamItem[]> {
     const artifactIds = rankedEntries.filter((entry) => entry.grain === "artifact").map((entry) => entry.id);
     const entityIds = rankedEntries.filter((entry) => entry.grain === "entity").map((entry) => entry.id);
     const hydratedArtifacts = await this.snapshots.records_by_artifact_versions?.(scope, artifactIds) ?? [];
@@ -3176,7 +3221,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const items: QueryStreamItem[] = [];
     for (const entry of rankedEntries) {
       const record = entry.grain === "entity" ? byRecordId.get(entry.id) : byVersionId.get(entry.id);
-      if (record !== undefined) items.push(semanticCandidateItem(record, items.length + 1));
+      if (record !== undefined) items.push(semanticCandidateItem(record, items.length + 1, entry.grain === "entity" ? matchedSegmentsByDocumentRef?.get(entry.id) : undefined));
     }
     return items;
   }
@@ -3342,7 +3387,14 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // currently belongs to (whether or not that's the SAME version that
     // originally produced it -- see the reconciler's own step 4/5 doc
     // comments on why a reused record can outlive its original owner).
-    let entityVectorsForScan = includeEntityLane ? dedupedEntityVectors : [];
+    // Frente S-B (decision 17 segmentation): the RAW, un-deduplicated set of
+    // every visible entity-grain SEGMENT row -- NOT `dedupedEntityVectors`
+    // (which keeps only the FIRST-occurrence segment per `document_ref`,
+    // fine for a coverage COUNT but wrong for ranking: the winning segment
+    // for a query is whichever one scores highest, not whichever happened
+    // to sort first). `aggregateEntityRanksByMaxSimilarity` below does the
+    // real per-document reduction, AFTER scoring every segment.
+    let entityVectorsForScan = includeEntityLane ? allVectors.filter((vector) => vector.document_grain === "entity") : [];
     if (includeEntityLane && pathPrefixes.length > 0) {
       const paths = await this.hydratePaths(operation.scope, entityVectorsForScan.map((vector) => vector.owner_artifact_version_id));
       entityVectorsForScan = entityVectorsForScan.filter((vector) => matchesPathPrefix(paths.get(vector.owner_artifact_version_id), pathPrefixes));
@@ -3360,15 +3412,42 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       queryVector.vector,
       { profile_id: provider!.profile.embedding_profile_id, executable_binding_id: provider!.binding.executable_binding_digest, dimensions: provider!.profile.dimensions, element_type: provider!.profile.element_type as "float32" | "float64", distance_metric: "cosine", normalization: provider!.profile.normalization as "none" | "l2", limit: SEMANTIC_CANDIDATE_CAP },
     );
-    // Decision 17: the entity lane's OWN exact-scan, keyed by `document_ref`
-    // (the owning record's own `record_id` -- NEVER `owner_artifact_version_id`,
-    // which many entity rows from one file legitimately share) and capped
-    // separately (`SEMANTIC_ENTITY_CANDIDATE_CAP`).
-    const entityRanks = exactVectorScan(
-      entityVectorsForScan.map((vector) => ({ projection_record_id: vector.document_ref!, profile_id: provider!.profile.embedding_profile_id, executable_binding_id: provider!.binding.executable_binding_digest, vector: vector.vector_payload })),
+    // Frente S-B (decision 17 segmentation): the entity lane's OWN exact-scan
+    // runs over EVERY visible SEGMENT row, keyed by its own unique
+    // `projection_record_id` (never `document_ref` -- a multi-segment entity
+    // now has SEVERAL rows sharing one `document_ref`, so keying the scan by
+    // `document_ref` would violate `exactVectorScan`'s own "candidate
+    // identifiers must be unique" invariant the instant a document has 2+
+    // segments). Deliberately UNCAPPED here (no `limit`) -- the cap
+    // (`SEMANTIC_ENTITY_CANDIDATE_CAP`) applies to the AGGREGATED,
+    // one-per-document result below, not to the raw per-segment scan.
+    const entitySegmentRanks = exactVectorScan(
+      entityVectorsForScan.map((vector) => ({ projection_record_id: vector.projection_record_id, profile_id: provider!.profile.embedding_profile_id, executable_binding_id: provider!.binding.executable_binding_digest, vector: vector.vector_payload })),
       queryVector.vector,
-      { profile_id: provider!.profile.embedding_profile_id, executable_binding_id: provider!.binding.executable_binding_digest, dimensions: provider!.profile.dimensions, element_type: provider!.profile.element_type as "float32" | "float64", distance_metric: "cosine", normalization: provider!.profile.normalization as "none" | "l2", limit: SEMANTIC_ENTITY_CANDIDATE_CAP },
+      { profile_id: provider!.profile.embedding_profile_id, executable_binding_id: provider!.binding.executable_binding_digest, dimensions: provider!.profile.dimensions, element_type: provider!.profile.element_type as "float32" | "float64", distance_metric: "cosine", normalization: provider!.profile.normalization as "none" | "l2" },
     );
+    // Reduces the per-segment ranking above to ONE row per `document_ref`,
+    // keeping the HIGHEST-similarity (best-ranked) segment for each --
+    // `exactVectorScan`'s own result is already sorted best-first, so a
+    // plain "first occurrence per document_ref, in rank order" walk IS the
+    // max-similarity reduction; no separate similarity comparison needed
+    // here. Capped at `SEMANTIC_ENTITY_CANDIDATE_CAP` DISTINCT documents
+    // (plan §4.5: "cap 100 tras agregar"), and remembers each winning
+    // document's own matched segment (`matched_segment`) for
+    // `hydrateSemanticCandidates` to attach as evidence.
+    const entityVectorByProjectionId = new Map(entityVectorsForScan.map((vector) => [vector.projection_record_id, vector]));
+    const seenEntityDocuments = new Set<string>();
+    const entityRanks: RankedSemanticCandidate[] = [];
+    const matchedSegmentByDocumentRef = new Map<string, { readonly index: number; readonly start_char: number; readonly end_char: number }>();
+    for (const match of entitySegmentRanks) {
+      if (entityRanks.length >= SEMANTIC_ENTITY_CANDIDATE_CAP) break;
+      const vector = entityVectorByProjectionId.get(match.projection_record_id);
+      const documentRef = vector?.document_ref;
+      if (vector === undefined || documentRef === undefined || seenEntityDocuments.has(documentRef)) continue;
+      seenEntityDocuments.add(documentRef);
+      entityRanks.push({ projection_record_id: documentRef, rank: entityRanks.length + 1 });
+      if (vector.segment_start !== undefined && vector.segment_end !== undefined) matchedSegmentByDocumentRef.set(documentRef, { index: vector.segment_index, start_char: vector.segment_start, end_char: vector.segment_end });
+    }
 
     // Grain lookup for the FUSED ranked ids below -- artifact ids
     // (`owner_artifact_version_id`) and entity ids (`record_id`) are
@@ -3409,7 +3488,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const fused = fuseSemanticLanes(lanes);
     const finalRanked = rerankSemanticMatches(fused);
 
-    const candidates = await this.hydrateSemanticCandidates(operation.scope, finalRanked.map((entry) => ({ id: entry.projection_record_id, grain: grainById.get(entry.projection_record_id) ?? "artifact" })));
+    const candidates = await this.hydrateSemanticCandidates(operation.scope, finalRanked.map((entry) => ({ id: entry.projection_record_id, grain: grainById.get(entry.projection_record_id) ?? "artifact" })), matchedSegmentByDocumentRef);
     // Coverage counts come from `semantic_scope_counts`/`semantic_entity_scope_counts`
     // + `dedupedVectors`/`dedupedEntityVectors` (the FULL, unfiltered,
     // uncapped visible-vector sets) -- never from

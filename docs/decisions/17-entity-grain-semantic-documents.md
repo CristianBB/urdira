@@ -117,3 +117,56 @@ a vector at all.
 `unsupported`/`failed`/entity counts and the affected-document list -- see
 [Semantic search and ranking](06-semantic-search-ranking.md)'s own 2026-09-06
 amendment for the pagination mechanism built on top of it.
+
+## Amendment 2026-09-06 (Frente S-B): per-segment entity vectors
+
+R7 (plan `generic-waddling-hartmanis.md` §0): the "model window" is 256
+tokens (MiniLM's own trained `max_seq_length`), never characters or 512,
+segmented with a 32-token overlap so a match spanning a window boundary is
+never split into two half-strength vectors. All three shipped providers
+(local neural, hash, HTTP) now expose `SemanticRuntimeBinding.segment?(text):
+Promise<{segments: SegmentSpan[]; truncated: boolean}>`: the local provider
+segments by real tokenizer offsets when available, falling back to a
+deterministic line-based accumulation using real per-line token counts
+(empirically, the bundled `Xenova/all-MiniLM-L6-v2` tokenizer never reports
+offsets, so this fallback is the actual path in production today); the hash
+and HTTP providers approximate a token as 4 UTF-16 code units (chars/4) over
+the identical window/overlap shape. `max_segments` defaults to 64 (R8) --
+exceeding it sets `truncated: true`, surfaced as the `segments_truncated`
+reason code (never silent) alongside a `covered` status. Every provider's
+`executable_binding_digest` now folds in a `segmenter:v2:w<N>:o<N>:max<N>`
+identity string (R10): a segmenter-parameter change (including ola 3 raising
+`max_segments` from its own n8n measurement) mints a new binding identity
+and forces one full re-embed, the accepted cost.
+
+The entity pass (step 5) calls `.segment()` once per eligible candidate's
+rendered text and writes ONE `vector_projection_rows` row per segment
+(`segment_index`/`segment_start`/`segment_end` columns, additive
+`ALTER TABLE` migration by `PRAGMA table_info`, applied to both the v4
+semantic sidecar and the v3 mirror -- R22) -- `projection_record_id` folds
+`segment_index` into its hash so segments of one document never collide.
+`semantic_document_status` still holds exactly ONE row per document (its
+schema is unchanged): every segment's own embed/write outcome is aggregated
+in memory before the single status write lands, `covered` only once every
+segment of that document has settled clean, `failed` (union of every failed
+segment's own reason codes) the instant any one segment does not. A
+`failed` aggregate self-heals by closing every OTHER segment of that SAME
+document that DID succeed, so the next pass finds the whole document
+missing again and retries every segment from scratch, rather than leaving a
+partially-embedded document permanently stuck with one un-embedded segment
+a future pass's "does an open row already exist for this document" check
+would otherwise never revisit. The artifact-grain lane is unchanged by this
+amendment: it stays ONE vector per document (mean of segments, R9), the
+same lane-level shape it already had before segmentation existed.
+
+Retrieval's entity lane now runs its exact scan over every visible SEGMENT
+row (keyed by each row's own unique `projection_record_id`, uncapped),
+then reduces the already best-first-sorted result to one candidate per
+`document_ref` by keeping the FIRST (= highest-similarity) occurrence --
+the max-similarity aggregation the plan calls for, expressed as a plain
+sorted-order walk rather than a second comparison pass -- capping the
+final, aggregated list at the existing 100-candidate cap. The winning
+segment's own `(index, start_char, end_char)` is attached to that
+candidate's emitted value as `semantic_evidence.matched_segment`, letting a
+future snippet renderer point at the segment that actually matched instead
+of the whole entity's span.

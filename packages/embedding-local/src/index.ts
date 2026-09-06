@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { canonicalBytes, digestBytes } from "@urdira/canonical";
 import type { EmbeddingProfile } from "@urdira/contracts";
-import { canonicalVectorBytes, type GenerateVectorInput, type ResolvedSemanticProvider, type SemanticGeneratedVector } from "@urdira/engine";
+import { canonicalVectorBytes, CHARS_PER_TOKEN_ESTIMATE, DEFAULT_MAX_SEGMENTS, DEFAULT_SEGMENT_OVERLAP_TOKENS, DEFAULT_SEGMENT_WINDOW_TOKENS, segmenterIdentity, type GenerateVectorInput, type ResolvedSemanticProvider, type SegmentSpan, type Segmentation, type SemanticGeneratedVector } from "@urdira/engine";
 // Type-only import: erased entirely at compile time, so this never triggers
 // the real `@huggingface/transformers` module to load (and never loads the
 // ONNX runtime behind it) just by being present in this file -- only
@@ -23,7 +23,22 @@ import type { DataType } from "@huggingface/transformers";
  * `readonly number[]` (what a hand-written test fake naturally produces);
  * `meanPoolWindowVectors` below accepts either without caring which.
  */
-export type EmbeddingExtractor = (texts: readonly string[]) => Promise<ReadonlyArray<Float32Array | readonly number[]>>;
+export type EmbeddingExtractor = ((texts: readonly string[]) => Promise<ReadonlyArray<Float32Array | readonly number[]>>) & {
+  /**
+   * Frente S-B (2026-09-06): optional per-text token counter/offset provider,
+   * attached to the SAME function object `extractor_factory` returns (a
+   * function is an object in JS; this keeps `EmbeddingExtractor` a single
+   * value rather than widening every caller's type to a `{embed, tokenize}`
+   * pair). `defaultExtractorFactory` below attaches one backed by the real
+   * pipeline's own `tokenizer`; a test's hand-written fake naturally omits
+   * it, which is exactly what exercises `segmentByTokens`'s
+   * no-tokenizer-at-all fallback (see that function's own doc comment) --
+   * the SAME fallback a real tokenizer without offset support (see
+   * `tokenizeWithOffsets`'s own doc comment on `defaultExtractorFactory`)
+   * also exercises.
+   */
+  readonly tokenizeWithOffsets?: TextTokenizer;
+};
 
 export interface LocalNeuralProviderOptions {
   /** Hugging Face model id. Default `"Xenova/all-MiniLM-L6-v2"` -- a small, widely-cached sentence-embedding model with no gated/licensed download step. */
@@ -32,10 +47,23 @@ export interface LocalNeuralProviderOptions {
   readonly cache_dir?: string;
   /** ONNX weight quantization to load. Default `"q8"` (8-bit quantized weights) -- a deliberate quality/size/speed tradeoff for a *bundled* default that downloads on first use; an operator who wants full float32 precision can override it. */
   readonly dtype?: string;
-  /** Document text is split into consecutive, non-overlapping windows of this many UTF-16 code units before embedding. Default 2000. */
+  /**
+   * DEPRECATED (Frente S-B, 2026-09-06): superseded by the token-based
+   * segmenter (`window_tokens`/`overlap_tokens`/`max_segments` below, R7/R8)
+   * -- accepted for backward source compatibility but IGNORED, with a
+   * one-time `console.warn` when set to a value other than `undefined`. Never
+   * participates in `executable_binding_digest` (there is nothing left for
+   * it to identify).
+   */
   readonly window_chars?: number;
-  /** At most this many windows of a single document are embedded (and mean-pooled together); the rest of an oversized document is silently dropped rather than embedded. Default 64. */
+  /** DEPRECATED (Frente S-B, 2026-09-06): superseded by `max_segments` below. See `window_chars`'s own doc comment -- same ignored-with-warning treatment. */
   readonly max_windows?: number;
+  /** Token-based segmenter window size, in tokens (R7: MiniLM's own trained `max_seq_length`). Default 256 (`DEFAULT_SEGMENT_WINDOW_TOKENS`, `@urdira/engine`). */
+  readonly window_tokens?: number;
+  /** Token-based segmenter overlap between consecutive segments, in tokens (R7). Default 32 (`DEFAULT_SEGMENT_OVERLAP_TOKENS`). */
+  readonly overlap_tokens?: number;
+  /** At most this many segments of a single document are produced; the artifact-grain lane mean-pools all of them into one vector (R9), the entity-grain lane (via `.binding.segment`) embeds one vector PER segment. Exceeding this cap sets `Segmentation.truncated` (R8: `reason_code = "segments_truncated"`, never silent). Default 64 (`DEFAULT_MAX_SEGMENTS`). */
+  readonly max_segments?: number;
   /** `true` (default) lets transformers.js download the model from the Hugging Face Hub on first use; `false` restricts it to whatever is already present in `cache_dir` (or the library's default cache), for fully offline operation. */
   readonly allow_download?: boolean;
   /**
@@ -65,10 +93,157 @@ export interface LocalNeuralProviderOptions {
 // module hardcodes the string.
 export const DEFAULT_MODEL_ID = "Xenova/all-MiniLM-L6-v2";
 const DEFAULT_DTYPE = "q8";
-const DEFAULT_WINDOW_CHARS = 2000;
-const DEFAULT_MAX_WINDOWS = 64;
 /** Fixed probe text used once at construction to discover the model's output dimensionality -- see `createLocalNeuralProvider`'s doc comment. Never embedded as a real document or query. */
 const DIMENSION_PROBE_TEXT = "urdira dimension probe";
+
+/**
+ * Frente S-B (2026-09-06): one text's token count and, when the underlying
+ * tokenizer can report them, per-token character offsets -- the shared input
+ * shape `segmentByTokens` accepts. `offsets`, when present, is an ORDERED
+ * list of `[start_char, end_char)` pairs covering only non-degenerate
+ * (`end > start`) CONTENT tokens -- a real fast tokenizer's special/padding
+ * tokens (`[CLS]`/`[SEP]`, historically reported at offset `(0, 0)`) must
+ * already be filtered out by whatever produces this value, never left in for
+ * `segmentByTokens` to trip over. Omitted (not an empty array) when the
+ * tokenizer has no offset support at all -- see `segmentByTokens`'s own
+ * fallback doc comment.
+ */
+export interface TokenizedSpan {
+  readonly token_count: number;
+  readonly offsets?: ReadonlyArray<readonly [number, number]>;
+}
+
+/** A text -> `TokenizedSpan` function -- `defaultExtractorFactory` below attaches a real one (backed by the loaded pipeline's own tokenizer) to every `EmbeddingExtractor` it builds; `segmentByTokens` accepts `undefined` for a caller (typically a test fake) with no tokenizer at all. */
+export type TextTokenizer = (text: string) => TokenizedSpan;
+
+export interface SegmentByTokensOptions {
+  readonly window_tokens?: number;
+  readonly overlap_tokens?: number;
+  readonly max_segments?: number;
+}
+
+/** `TextTokenizer` fallback when no real tokenizer is available at all: approximates one token as `CHARS_PER_TOKEN_ESTIMATE` UTF-16 code units, the same heuristic the hash/HTTP providers' own char-based segmenter uses (`@urdira/engine`'s `segmentByChars`). Never reports offsets -- always routes `segmentByTokens` into the line-based fallback below. */
+function charEstimateTokenizer(text: string): TokenizedSpan {
+  return { token_count: Math.max(1, Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE)) };
+}
+
+/**
+ * Precise path: slides a `window_tokens`-wide, `overlap_tokens`-overlapping
+ * window directly over `offsets` (already known to be non-empty), stepping
+ * by `window_tokens - overlap_tokens` tokens each time. Each segment's
+ * `start_char`/`end_char` are read straight off the first/last covered
+ * token's own offsets, so `text.slice(start_char, end_char)` is always
+ * exactly the tokens the model itself would see for that segment -- no
+ * approximation.
+ */
+function segmentFromOffsets(text: string, offsets: ReadonlyArray<readonly [number, number]>, windowTokens: number, overlapTokens: number, maxSegments: number): Segmentation {
+  const step = windowTokens - overlapTokens;
+  const segments: SegmentSpan[] = [];
+  let truncated = false;
+  for (let tokenStart = 0; tokenStart < offsets.length; tokenStart += step) {
+    if (segments.length >= maxSegments) { truncated = true; break; }
+    const tokenEnd = Math.min(tokenStart + windowTokens, offsets.length);
+    const startChar = offsets[tokenStart]![0];
+    const endChar = offsets[tokenEnd - 1]![1];
+    segments.push({ index: segments.length, text: text.slice(startChar, endChar), start_char: startChar, end_char: endChar });
+    if (tokenEnd >= offsets.length) break;
+  }
+  return { segments, truncated };
+}
+
+/**
+ * Deterministic fallback for a tokenizer with no offset support (R7's own
+ * anticipated case -- and, empirically, this package's OWN bundled MiniLM
+ * tokenizer today: `AutoTokenizer`'s `__call__` never populates
+ * `offset_mapping` for this model, so this is the path every real,
+ * non-test-fake construction of this provider actually runs, not a rare
+ * edge case). Splits `text` into LINES (each line's span running through its
+ * own trailing `\n`, so every line's span concatenated back together
+ * reconstructs `text` exactly), counts each line's own tokens via
+ * `tokenize`, then greedily accumulates whole lines into a segment until
+ * adding the next line would exceed `windowTokens` (always keeping at least
+ * one line per segment, even if that one line alone exceeds the window --
+ * guarantees forward progress for a single enormous line). The next
+ * segment's starting line rewinds far enough into the segment just closed
+ * that the rewound lines' own token counts sum to at least `overlapTokens`
+ * (falling forward to the segment's own end when the whole segment's token
+ * count is itself under `overlapTokens`, so a segment made of very few,
+ * very large lines still always advances). Never true token-level overlap
+ * (there is no sub-line boundary to overlap at) -- a documented,
+ * line-granularity approximation of R7's token overlap, not the precise
+ * offset-based path's guarantee.
+ */
+function segmentByLines(text: string, tokenize: TextTokenizer, windowTokens: number, overlapTokens: number, maxSegments: number): Segmentation {
+  const lines: Array<{ readonly start: number; readonly end: number; readonly tokenCount: number }> = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const newlineIndex = text.indexOf("\n", cursor);
+    const end = newlineIndex === -1 ? text.length : newlineIndex + 1;
+    const tokenCount = Math.max(1, tokenize(text.slice(cursor, end)).token_count);
+    lines.push({ start: cursor, end, tokenCount });
+    cursor = end;
+  }
+  if (lines.length === 0) return { segments: [], truncated: false };
+
+  const segments: SegmentSpan[] = [];
+  let truncated = false;
+  let lineIndex = 0;
+  while (lineIndex < lines.length) {
+    if (segments.length >= maxSegments) { truncated = true; break; }
+    let tokenSum = 0;
+    let endLineIndex = lineIndex;
+    while (endLineIndex < lines.length) {
+      const line = lines[endLineIndex]!;
+      if (tokenSum > 0 && tokenSum + line.tokenCount > windowTokens) break;
+      tokenSum += line.tokenCount;
+      endLineIndex += 1;
+      if (tokenSum >= windowTokens) break;
+    }
+    const segmentStart = lines[lineIndex]!.start;
+    const segmentEnd = lines[endLineIndex - 1]!.end;
+    segments.push({ index: segments.length, text: text.slice(segmentStart, segmentEnd), start_char: segmentStart, end_char: segmentEnd });
+    if (endLineIndex >= lines.length) break;
+    let overlapTokenSum = 0;
+    let overlapStartLineIndex = endLineIndex;
+    while (overlapStartLineIndex > lineIndex && overlapTokenSum < overlapTokens) {
+      overlapStartLineIndex -= 1;
+      overlapTokenSum += lines[overlapStartLineIndex]!.tokenCount;
+    }
+    // Guarantees forward progress: if rewinding for overlap would not
+    // actually move past this segment's own start line, resume from where
+    // this segment ended instead (no overlap for that one transition).
+    lineIndex = overlapStartLineIndex > lineIndex ? overlapStartLineIndex : endLineIndex;
+  }
+  return { segments, truncated };
+}
+
+/**
+ * Frente S-B.2 (plan §4.5, R7/R8): the token-based segmenter that replaces
+ * `computeWindows` for BOTH document grains (R9) -- `tokenizer`, when given,
+ * is tried first via its offsets (`segmentFromOffsets`, precise); when
+ * `tokenizer` is entirely absent OR reports no offsets for this particular
+ * text, falls back to `segmentByLines` (deterministic, line-granularity).
+ * Both paths honor the identical `window_tokens`/`overlap_tokens`/`max_segments`
+ * contract and produce the identical `Segmentation` shape, so every caller
+ * (the artifact-grain mean-pool path, the entity-grain per-segment path, and
+ * `scripts/semantic-window-histogram.mjs`) treats them uniformly. Empty text
+ * produces zero segments (`{segments: [], truncated: false}`) -- callers
+ * that require at least one segment (e.g. `windowsFor` below, for the
+ * "no extractable content" empty-text throw) must check for this themselves.
+ */
+export function segmentByTokens(text: string, tokenizer: TextTokenizer | undefined, options: SegmentByTokensOptions = {}): Segmentation {
+  const windowTokens = options.window_tokens ?? DEFAULT_SEGMENT_WINDOW_TOKENS;
+  const overlapTokens = options.overlap_tokens ?? DEFAULT_SEGMENT_OVERLAP_TOKENS;
+  const maxSegments = options.max_segments ?? DEFAULT_MAX_SEGMENTS;
+  if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) throw new Error("segmentByTokens window_tokens must be a positive integer.");
+  if (!Number.isSafeInteger(overlapTokens) || overlapTokens < 0 || overlapTokens >= windowTokens) throw new Error("segmentByTokens overlap_tokens must be a non-negative integer smaller than window_tokens.");
+  if (!Number.isSafeInteger(maxSegments) || maxSegments <= 0) throw new Error("segmentByTokens max_segments must be a positive integer.");
+  if (text.length === 0) return { segments: [], truncated: false };
+  const tokenize = tokenizer ?? charEstimateTokenizer;
+  const whole = tokenize(text);
+  if (whole.offsets !== undefined && whole.offsets.length > 0) return segmentFromOffsets(text, whole.offsets, windowTokens, overlapTokens, maxSegments);
+  return segmentByLines(text, tokenize, windowTokens, overlapTokens, maxSegments);
+}
 
 function digestOf(value: unknown): string {
   return digestBytes(canonicalBytes(value));
@@ -158,7 +333,7 @@ async function defaultExtractorFactory(options: { readonly model_id: string; rea
   if (options.cache_dir !== undefined) env.cacheDir = options.cache_dir;
   env.allowRemoteModels = options.allow_download;
   const extractor = await pipeline("feature-extraction", options.model_id, { dtype: options.dtype as DataType });
-  return async (texts: readonly string[]) => {
+  const embed = async (texts: readonly string[]) => {
     const output = await extractor([...texts], { pooling: "mean", normalize: true });
     // `Tensor.tolist()` on a `[batch, dimensions]`-shaped tensor (which is
     // exactly what `{pooling: "mean"}` over a batch of texts produces) is a
@@ -166,35 +341,47 @@ async function defaultExtractorFactory(options: { readonly model_id: string; rea
     // library's own `feature-extraction` pipeline doc comment/example.
     return output.tolist() as number[][];
   };
+  /**
+   * Frente S-B (2026-09-06): backed by the loaded pipeline's OWN tokenizer
+   * (`extractor.tokenizer`), never a separately-loaded one -- guarantees the
+   * token count/segmentation this reports is for the EXACT tokenizer that
+   * will actually process each segment's text at embed time. Empirically
+   * (verified against the bundled `Xenova/all-MiniLM-L6-v2` tokenizer),
+   * `tokenizer(text, {return_offsets_mapping: true})` never populates
+   * `offset_mapping` for this model at all -- transformers.js's fast-tokenizer
+   * offset support is model/tokenizer-dependent, and this one does not
+   * provide it -- so `token_count` comes from `tokenizer.tokenize(text)`
+   * (the tokenizer's own content-token-only, no-CLS/SEP string list) and
+   * `offsets` is always omitted here, routing `segmentByTokens` into its
+   * deterministic line-based fallback for every REAL construction of this
+   * provider today. Wrapped in try/catch purely as a defensive backstop
+   * against a future tokenizer whose `tokenize` method throws on
+   * pathological input -- falls back to the same chars/4 estimate
+   * `segmentByTokens`'s own no-tokenizer path uses, never lets a
+   * segmentation call fail an embed.
+   */
+  const tokenizeWithOffsets: TextTokenizer = (text: string): TokenizedSpan => {
+    try {
+      const tokens = (extractor.tokenizer as { readonly tokenize: (value: string) => readonly string[] }).tokenize(text);
+      return { token_count: Array.isArray(tokens) ? tokens.length : Math.max(1, Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE)) };
+    } catch {
+      return { token_count: Math.max(1, Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE)) };
+    }
+  };
+  return Object.assign(embed, { tokenizeWithOffsets });
 }
 
 /**
- * Splits `text` into consecutive, non-overlapping windows of `windowChars`
- * UTF-16 code units each (the final window kept even if shorter), then
- * returns at most `capWindows` of them, in order, from the START of the
- * text. The loop below stops as soon as `capWindows` windows have been
- * collected -- deliberately, so an oversized document (megabytes of text
- * against a `window_chars`/`max_windows` pair that only ever needs the first
- * few hundred KB) never pays the cost of slicing windows past the cap it is
- * about to discard anyway.
- */
-function computeWindows(text: string, windowChars: number, capWindows: number): readonly string[] {
-  const windows: string[] = [];
-  for (let index = 0; index < text.length && windows.length < capWindows; index += windowChars) {
-    windows.push(text.slice(index, index + windowChars));
-  }
-  return windows;
-}
-
-/**
- * Element-wise mean over `vectors` (one per embedded window), all assumed to
- * already be `dimensions` long -- the model's own `{pooling: "mean",
- * normalize: true}` has already reduced each window's token sequence down to
- * one unit vector, so this is the SECOND, document-level pooling stage: it
- * turns "one vector per window" into "one vector for the whole document"
- * before `canonicalVectorBytes` L2-normalizes the result. A single-window
- * document (the common case, and always true for a query -- see
- * `createLocalNeuralProvider`) degenerates to this being a no-op copy.
+ * Element-wise mean over `vectors` (one per embedded SEGMENT -- Frente S-B
+ * renamed this module's own vocabulary from "window" to "segment", see
+ * `segmentByTokens`), all assumed to already be `dimensions` long -- the
+ * model's own `{pooling: "mean", normalize: true}` has already reduced each
+ * segment's token sequence down to one unit vector, so this is the SECOND,
+ * document-level pooling stage: it turns "one vector per segment" into "one
+ * vector for the whole document" before `canonicalVectorBytes` L2-normalizes
+ * the result (R9: the artifact-grain lane's own single vector). A
+ * single-segment document (the common case, and always true for a query --
+ * see `createLocalNeuralProvider`) degenerates to this being a no-op copy.
  */
 function meanPoolWindowVectors(vectors: ReadonlyArray<Float32Array | readonly number[]>, dimensions: number): readonly number[] {
   const sums = new Array<number>(dimensions).fill(0);
@@ -376,14 +563,74 @@ export async function ensureLocalEmbeddingModel(options: EnsureLocalEmbeddingMod
   }
 }
 
+/**
+ * Frente S-B.1 (2026-09-06, `scripts/semantic-window-histogram.mjs`): loads
+ * just the tokenizer side of the bundled model (via the SAME
+ * `extractor_factory` seam `createLocalNeuralProvider` uses) and returns a
+ * single `countTotalTokens` function, for a caller that needs an accurate
+ * TOTAL token count for a whole document -- not a segment boundary --
+ * without assuming any particular `window_tokens`/`overlap_tokens` pair.
+ * This is NOT simply `segmentByTokens(text, tokenizer, {window_tokens: 1,
+ * ...}).segments.length`: for a tokenizer with no offset support (this
+ * package's own bundled MiniLM tokenizer, empirically, today --
+ * see `defaultExtractorFactory`'s doc comment), `segmentByTokens` falls back
+ * to LINE-granularity accumulation, and a `window_tokens: 1` cap there
+ * degenerates to "one segment per LINE" (each line's own token count
+ * almost always exceeds 1), not "one segment per TOKEN" -- silently
+ * undercounting a multi-token line down to 1. `countTotalTokens` instead
+ * sums each line's own token count directly, mirroring `segmentByLines`'s
+ * internal per-line accumulation exactly (so it agrees with what a REAL
+ * segmentation over this text would internally add up), without needing to
+ * cap anything.
+ */
+export async function createLocalTokenCounter(options: LocalNeuralProviderOptions = {}): Promise<{ readonly countTotalTokens: (text: string) => number }> {
+  const modelId = options.model_id ?? DEFAULT_MODEL_ID;
+  const dtype = options.dtype ?? DEFAULT_DTYPE;
+  const allowDownload = options.allow_download ?? true;
+  const extractorFactory = options.extractor_factory ?? defaultExtractorFactory;
+  const extractor = await extractorFactory({
+    model_id: modelId,
+    dtype,
+    ...(options.cache_dir === undefined ? {} : { cache_dir: options.cache_dir }),
+    allow_download: allowDownload,
+  });
+  const tokenize = extractor.tokenizeWithOffsets;
+  return {
+    countTotalTokens: (text: string): number => {
+      if (text.length === 0) return 0;
+      if (tokenize === undefined) return Math.max(1, Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE));
+      const whole = tokenize(text);
+      if (whole.offsets !== undefined) return whole.offsets.length;
+      let total = 0;
+      let cursor = 0;
+      while (cursor < text.length) {
+        const newlineIndex = text.indexOf("\n", cursor);
+        const end = newlineIndex === -1 ? text.length : newlineIndex + 1;
+        total += Math.max(1, tokenize(text.slice(cursor, end)).token_count);
+        cursor = end;
+      }
+      return total;
+    },
+  };
+}
+
 export async function createLocalNeuralProvider(options: LocalNeuralProviderOptions = {}): Promise<ResolvedSemanticProvider> {
   const modelId = options.model_id ?? DEFAULT_MODEL_ID;
   const dtype = options.dtype ?? DEFAULT_DTYPE;
-  const windowChars = options.window_chars ?? DEFAULT_WINDOW_CHARS;
-  const maxWindows = options.max_windows ?? DEFAULT_MAX_WINDOWS;
+  const windowTokens = options.window_tokens ?? DEFAULT_SEGMENT_WINDOW_TOKENS;
+  const overlapTokens = options.overlap_tokens ?? DEFAULT_SEGMENT_OVERLAP_TOKENS;
+  const maxSegments = options.max_segments ?? DEFAULT_MAX_SEGMENTS;
   const allowDownload = options.allow_download ?? true;
-  if (!Number.isSafeInteger(windowChars) || windowChars <= 0) throw new Error("Local neural embedding provider window_chars must be a positive integer.");
-  if (!Number.isSafeInteger(maxWindows) || maxWindows <= 0) throw new Error("Local neural embedding provider max_windows must be a positive integer.");
+  if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) throw new Error("Local neural embedding provider window_tokens must be a positive integer.");
+  if (!Number.isSafeInteger(overlapTokens) || overlapTokens < 0 || overlapTokens >= windowTokens) throw new Error("Local neural embedding provider overlap_tokens must be a non-negative integer smaller than window_tokens.");
+  if (!Number.isSafeInteger(maxSegments) || maxSegments <= 0) throw new Error("Local neural embedding provider max_segments must be a positive integer.");
+  // DEPRECATED aliases (Frente S-B, 2026-09-06): accepted, never consulted
+  // for behavior -- see `LocalNeuralProviderOptions.window_chars`'s own doc
+  // comment. Warn exactly once per construction call, not once per
+  // generate call, so a long-lived provider built with a deprecated option
+  // does not spam the log on every embed.
+  if (options.window_chars !== undefined) console.warn(`[urdira] LocalNeuralProviderOptions.window_chars is deprecated and ignored -- the segmenter now uses window_tokens (default ${DEFAULT_SEGMENT_WINDOW_TOKENS}).`);
+  if (options.max_windows !== undefined) console.warn(`[urdira] LocalNeuralProviderOptions.max_windows is deprecated and ignored -- the segmenter now uses max_segments (default ${DEFAULT_MAX_SEGMENTS}).`);
 
   const extractorFactory = options.extractor_factory ?? defaultExtractorFactory;
   const extractor = await extractorFactory({
@@ -417,8 +664,8 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
     document_input_contract: "core:onnx-document-v1",
     query_input_contract: "core:onnx-query-v1",
     segmentation_contract: "core:onnx-window-v1",
-    maximum_document_tokens: String(windowChars * maxWindows),
-    maximum_query_tokens: String(windowChars),
+    maximum_document_tokens: String(windowTokens * maxSegments),
+    maximum_query_tokens: String(windowTokens),
     dimensions,
     element_type: "float32",
     vector_encoding: "float32-le",
@@ -433,27 +680,38 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
 
   const runtimeBindingId = "core:onnx-local";
   // Deliberately excludes `cache_dir`/`allow_download` -- see the module doc
-  // comment above.
-  const executableBindingDigest = digestOf({ runtime: "transformers.js", package_version: packageVersion, model_id: modelId, dtype, window_chars: windowChars, max_windows: maxWindows, pooling: "mean-l2" });
+  // comment above. `segmenter` (R10) replaces the old `window_chars`/
+  // `max_windows` fields -- those are gone entirely (they no longer affect
+  // anything real, see the deprecation warnings above), and a segmenter
+  // parameter change now bumps this identity the same way it does for the
+  // hash/HTTP providers (`semantic-provider.ts`'s `segmenterIdentity`).
+  const executableBindingDigest = digestOf({ runtime: "transformers.js", package_version: packageVersion, model_id: modelId, dtype, segmenter: segmenterIdentity(maxSegments, windowTokens, overlapTokens), pooling: "mean-l2" });
 
   /**
-   * Builds ONE input's windows the same way `generateVector` below does:
-   * document purpose windows the full text up to `maxWindows`; query
-   * purpose is always exactly the FIRST window, regardless of `maxWindows`.
+   * Builds ONE input's segments via `segmentByTokens`, using this provider's
+   * OWN extractor's `tokenizeWithOffsets` when present (see
+   * `EmbeddingExtractor`'s own doc comment) -- document purpose segments the
+   * full text up to `maxSegments`; query purpose is always exactly the FIRST
+   * segment (`max_segments: 1`), regardless of `maxSegments`, mirroring the
+   * pre-segmenter "query is always the first window" behavior exactly.
    * Throws the identical "no extractable content" error `generateVector`
    * throws for empty/whitespace text -- shared here so `generateVectors`'
-   * batch windowing can never silently diverge from the single-input path.
+   * batch segmentation can never silently diverge from the single-input path.
    */
-  function windowsFor(input: GenerateVectorInput): readonly string[] {
+  function segmentsFor(input: GenerateVectorInput): readonly SegmentSpan[] {
     if (input.text.trim().length === 0) throw new Error("Local neural embedding provider found no extractable content in the given text.");
-    const windows = input.purpose === "query" ? computeWindows(input.text, windowChars, 1) : computeWindows(input.text, windowChars, maxWindows);
-    if (windows.length === 0) throw new Error("Local neural embedding provider found no extractable content in the given text.");
-    return windows;
+    const segmentation = segmentByTokens(input.text, extractor.tokenizeWithOffsets, {
+      window_tokens: windowTokens,
+      overlap_tokens: overlapTokens,
+      max_segments: input.purpose === "query" ? 1 : maxSegments,
+    });
+    if (segmentation.segments.length === 0) throw new Error("Local neural embedding provider found no extractable content in the given text.");
+    return segmentation.segments;
   }
 
-  /** Same bounded input_digest discipline as `createLocalHashProvider` -- see the module doc comment above for the regression this avoids. Shared by `generateVector` and `generateVectors` so both compute it identically. */
+  /** Same bounded input_digest discipline as `createLocalHashProvider` -- see the module doc comment above for the regression this avoids. Shared by `generateVector` and `generateVectors` so both compute it identically. `segment_index` (Frente S-B) folds in when the caller is embedding one pre-cut segment of a larger entity document (see `SemanticGenerateInput.segment_index`'s own doc comment). */
   function inputDigestFor(input: GenerateVectorInput): string {
-    return digestOf({ purpose: input.purpose, profile_digest: input.profile.profile_digest, text_digest: digestBytes(new TextEncoder().encode(input.text)) });
+    return digestOf({ purpose: input.purpose, profile_digest: input.profile.profile_digest, text_digest: digestBytes(new TextEncoder().encode(input.text)), ...(input.segment_index === undefined ? {} : { segment_index: input.segment_index }) });
   }
 
   function pooledVectorFor(input: GenerateVectorInput, windowVectors: ReadonlyArray<Float32Array | readonly number[]>): SemanticGeneratedVector {
@@ -478,28 +736,29 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
       runtime_binding_id: runtimeBindingId,
       executable_binding_digest: executableBindingDigest,
       generateVector: async (input) => {
-        const windows = windowsFor(input);
-        const embedded = await extractor(windows);
-        if (embedded.length !== windows.length) throw new Error(`Local neural embedding extractor returned ${embedded.length} vectors for ${windows.length} input windows.`);
+        const segments = segmentsFor(input);
+        const texts = segments.map((segment) => segment.text);
+        const embedded = await extractor(texts);
+        if (embedded.length !== texts.length) throw new Error(`Local neural embedding extractor returned ${embedded.length} vectors for ${texts.length} input segments.`);
         return pooledVectorFor(input, embedded);
       },
       /**
-       * Flattens every input's own windows (each computed exactly as
-       * `generateVector`'s `windowsFor` would) into ONE ordered list, then
+       * Flattens every input's own segments (each computed exactly as
+       * `generateVector`'s `segmentsFor` would) into ONE ordered list, then
        * issues extractor calls over CONSECUTIVE CHUNKS of that flattened
-       * list capped at `maxWindows` windows each (reusing the same
-       * `max_windows` option a single document's own cap is already
-       * derived from -- see `LocalNeuralProviderOptions.max_windows`'s doc
+       * list capped at `maxSegments` segments each (reusing the same
+       * `max_segments` option a single document's own cap is already
+       * derived from -- see `LocalNeuralProviderOptions.max_segments`'s doc
        * comment) -- splitting into several extractor calls only when the
-       * batch's TOTAL window count exceeds that cap. Chunk boundaries never
-       * need to respect document boundaries: each window is embedded
+       * batch's TOTAL segment count exceeds that cap. Chunk boundaries never
+       * need to respect document boundaries: each segment is embedded
        * independently by the extractor regardless of which chunk carries
-       * it, so a document whose windows happen to straddle two chunks still
+       * it, so a document whose segments happen to straddle two chunks still
        * mean-pools correctly once every chunk's output is collected back
        * into the single flattened `embeddedFlat` array below, in order.
        *
        * ALL-OR-NOTHING, per `SemanticRuntimeBinding.generateVectors`'s own
-       * doc comment: `windowsFor` throwing for ANY single input (the
+       * doc comment: `segmentsFor` throwing for ANY single input (the
        * empty/whitespace backstop) or an extractor call returning the wrong
        * vector count for its chunk rejects the WHOLE batch -- isolating
        * which specific input actually poisoned it is `reconcileSemanticProjection`'s
@@ -507,20 +766,20 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
        * method's.
        */
       generateVectors: async (inputs) => {
-        const perInputWindows = inputs.map((input) => windowsFor(input));
+        const perInputSegments = inputs.map((input) => segmentsFor(input));
 
-        const flatWindows: string[] = [];
+        const flatTexts: string[] = [];
         const ranges: Array<{ readonly start: number; readonly count: number }> = [];
-        for (const windows of perInputWindows) {
-          ranges.push({ start: flatWindows.length, count: windows.length });
-          flatWindows.push(...windows);
+        for (const segments of perInputSegments) {
+          ranges.push({ start: flatTexts.length, count: segments.length });
+          flatTexts.push(...segments.map((segment) => segment.text));
         }
 
         const embeddedFlat: Array<Float32Array | readonly number[]> = [];
-        for (let offset = 0; offset < flatWindows.length; offset += maxWindows) {
-          const chunk = flatWindows.slice(offset, offset + maxWindows);
+        for (let offset = 0; offset < flatTexts.length; offset += maxSegments) {
+          const chunk = flatTexts.slice(offset, offset + maxSegments);
           const embeddedChunk = await extractor(chunk);
-          if (embeddedChunk.length !== chunk.length) throw new Error(`Local neural embedding extractor returned ${embeddedChunk.length} vectors for ${chunk.length} input windows.`);
+          if (embeddedChunk.length !== chunk.length) throw new Error(`Local neural embedding extractor returned ${embeddedChunk.length} vectors for ${chunk.length} input segments.`);
           embeddedFlat.push(...embeddedChunk);
         }
 
@@ -529,6 +788,11 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
           return pooledVectorFor(input, embeddedFlat.slice(range.start, range.start + range.count));
         });
       },
+      // Frente S-B.2 (R7/R8): exposes this provider's OWN token-based
+      // segmenter to the reconciler's entity pass, using the exact same
+      // `segmentByTokens`/`tokenizeWithOffsets` path `segmentsFor` uses for
+      // a "document"-purpose call (never the query-purpose 1-segment cap).
+      segment: async (text: string): Promise<Segmentation> => segmentByTokens(text, extractor.tokenizeWithOffsets, { window_tokens: windowTokens, overlap_tokens: overlapTokens, max_segments: maxSegments }),
     },
   };
 }

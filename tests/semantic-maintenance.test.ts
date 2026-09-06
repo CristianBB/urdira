@@ -336,7 +336,13 @@ describe("reconcileSemanticProjection", () => {
       if (calls <= 2) return new Response("boom", { status: 500 });
       return new Response(JSON.stringify({ data: [{ embedding: [0, 1, 0, 0] }] }), { status: 200, headers: { "content-type": "application/json" } });
     }) as unknown as typeof fetch;
-    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test/v1/embed", model: "retry-model", dimensions: 4, fetch_impl: fetchImpl });
+    // Frente S-B (2026-09-06, R12): the HTTP provider now retries a
+    // 429/5xx status internally (`retry_backoff_ms` defaults to 3 retries
+    // with real backoff) -- `retry_backoff_ms: []` (zero retries, one
+    // attempt) isolates THIS test's own cross-PASS retry semantics from the
+    // provider's own within-CALL retry semantics (covered separately, with
+    // fast injected backoff, in `tests/semantic-provider.test.ts`).
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test/v1/embed", model: "retry-model", dimensions: 4, fetch_impl: fetchImpl, retry_backoff_ms: [] });
 
     await withWorkspace(workspaceId, async (opened, cas) => {
       await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-flaky", artifactVersionId: "artv-flaky", text: "function flakyProviderContent() {}", validFromGeneration: 1 });
@@ -677,7 +683,9 @@ describe("reconcileSemanticProjection: semantic_document_status (plan 2026-09-06
       if (calls <= 2) return new Response("boom", { status: 500 });
       return new Response(JSON.stringify({ data: [{ embedding: [0, 1, 0, 0] }] }), { status: 200, headers: { "content-type": "application/json" } });
     }) as unknown as typeof fetch;
-    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test/v1/embed", model: "status-failed-model", dimensions: 4, fetch_impl: fetchImpl });
+    // Frente S-B (R12): see the identical `retry_backoff_ms: []` comment on
+    // "retries a row whose provider call failed on a prior pass" above.
+    const provider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test/v1/embed", model: "status-failed-model", dimensions: 4, fetch_impl: fetchImpl, retry_backoff_ms: [] });
 
     await withWorkspace(workspaceId, async (opened, cas) => {
       await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-flaky", artifactVersionId: "artv-flaky", text: "function flakyStatusContent() {}", validFromGeneration: 1 });
@@ -1032,6 +1040,191 @@ describe("reconcileSemanticProjection entity pass (decision 17)", () => {
       expect(resumed.marker_written).toBe(true);
       const allEntityVectors = await opened.database.all<{ document_ref: string | null }>("SELECT document_ref FROM vector_projection_rows WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL", [workspaceId]);
       expect(allEntityVectors.map((row) => row.document_ref).sort()).toEqual(["rec-abort-1", "rec-abort-2"]);
+    });
+  });
+});
+
+// Frente S-B (2026-09-06, decision 17 segmentation): the entity pass now
+// embeds ONE vector per SEGMENT of an entity's rendered text (R7/R8/R9),
+// aggregating every segment's own outcome into the SAME single
+// `semantic_document_status` row the document already had before
+// segmentation existed (`recordEntitySegmentOutcome`, `semantic-reconciler.ts`).
+// The hash provider's own chars/4 segmenter windows at 1024 chars with a
+// 128-char overlap (`DEFAULT_SEGMENT_WINDOW_TOKENS * CHARS_PER_TOKEN_ESTIMATE`),
+// so a rendered entity document longer than ~1024 chars reliably produces
+// 2+ segments.
+describe("reconcileSemanticProjection entity pass: multi-segment documents (Frente S-B)", () => {
+  type SegmentStatusRow = { readonly document_id: string; readonly status: string; readonly reason_codes: string; readonly segment_count: number };
+  async function entityStatusRows(opened: WorkspaceDatabase, workspaceId: string, provider: ResolvedSemanticProvider): Promise<readonly SegmentStatusRow[]> {
+    return opened.database.all<SegmentStatusRow>(
+      "SELECT document_id, status, reason_codes, segment_count FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'entity'",
+      [workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest],
+    );
+  }
+  async function entitySegmentRows(opened: WorkspaceDatabase, workspaceId: string, recordId: string): Promise<readonly { readonly segment_index: number; readonly segment_start: number | null; readonly segment_end: number | null; readonly valid_to_generation: number | null }[]> {
+    return opened.database.all(
+      "SELECT segment_index, segment_start, segment_end, valid_to_generation FROM vector_projection_rows WHERE workspace_id = ? AND document_grain = 'entity' AND document_ref = ? ORDER BY segment_index",
+      [workspaceId, recordId],
+    );
+  }
+
+  it("embeds a long entity record as MULTIPLE segment rows sharing one status row (segment_count > 1, status covered)", async () => {
+    const workspaceId = "ws-semantic-entity-segments";
+    const provider = createLocalHashProvider();
+    const longBody = "x".repeat(1300);
+    const func = `export function bigFunctionForSegmentCoverageTesting() {\n  // ${longBody}\n  return 1;\n}`;
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1", text: func, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-big", recordKind: "jsts:entity_callable", ownerArtifactId: "art-1", ownerArtifactVersionId: "artv-1", validFromGeneration: 1, body: { name: "bigFunctionForSegmentCoverageTesting", kind: "function", language: "typescript", path: "art-1", start: 0, end: func.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      // entity_inserted counts SEGMENTS (Frente S-B) -- 2+ for this long body.
+      expect(result.entity_inserted).toBeGreaterThan(1);
+      expect(result.entity_failed).toBe(0);
+      expect(result.marker_written).toBe(true);
+
+      const segments = await entitySegmentRows(opened, workspaceId, "rec-big");
+      expect(segments.length).toBeGreaterThan(1);
+      expect(segments.map((row) => row.segment_index)).toEqual(segments.map((_, index) => index));
+      for (const row of segments) {
+        expect(row.valid_to_generation).toBeNull();
+        expect(row.segment_start).not.toBeNull();
+        expect(row.segment_end).not.toBeNull();
+      }
+      // Consecutive segments overlap.
+      expect(segments[1]!.segment_start!).toBeLessThan(segments[0]!.segment_end!);
+
+      // Exactly ONE status row for the whole record, regardless of segment count.
+      const statusRows = await entityStatusRows(opened, workspaceId, provider);
+      const row = statusRows.find((entry) => entry.document_id === "rec-big");
+      expect(row).toMatchObject({ status: "covered", reason_codes: "[]" });
+      expect(row!.segment_count).toBe(segments.length);
+    });
+  });
+
+  it("closes ALL of a record's segment rows together and re-embeds fresh ones when the record's own content changes", async () => {
+    const workspaceId = "ws-semantic-entity-segments-reembed";
+    const provider = createLocalHashProvider();
+    const longBodyV1 = "a".repeat(1300);
+    const funcV1 = `export function reembedSegmentCoverageTesting() {\n  // ${longBodyV1}\n  return 1;\n}`;
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1", text: funcV1, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-v1", recordKind: "jsts:entity_callable", ownerArtifactId: "art-1", ownerArtifactVersionId: "artv-1", validFromGeneration: 1, body: { name: "reembedSegmentCoverageTesting", kind: "function", language: "typescript", path: "art-1", start: 0, end: funcV1.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const engineDatabase = asEngineWorkspaceDatabase(opened);
+      const first = await reconcileSemanticProjection({ database: engineDatabase, workspace_id: workspaceId, content: cas, provider });
+      const originalSegmentCount = first.entity_inserted;
+      expect(originalSegmentCount).toBeGreaterThan(1);
+
+      // Record content changes (a new record id, per decision 17's record
+      // lifecycle convention: a changed body mints a new record_id).
+      const longBodyV2 = "b".repeat(1300);
+      const funcV2 = `export function reembedSegmentCoverageTesting() {\n  // ${longBodyV2}\n  return 2;\n}`;
+      await closeVersion(opened, "artv-1", 2);
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1-v2", text: funcV2, validFromGeneration: 2 });
+      await closeEntityRecord(opened, "rec-v1", 2);
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-v2", recordKind: "jsts:entity_callable", ownerArtifactId: "art-1", ownerArtifactVersionId: "artv-1-v2", validFromGeneration: 2, body: { name: "reembedSegmentCoverageTesting", kind: "function", language: "typescript", path: "art-1", start: 0, end: funcV2.length } });
+      await setCurrentGeneration(opened, workspaceId, 2);
+
+      const second = await reconcileSemanticProjection({ database: engineDatabase, workspace_id: workspaceId, content: cas, provider });
+      expect(second.entity_closed).toBe(originalSegmentCount); // every old segment row closed together
+      expect(second.entity_inserted).toBeGreaterThan(1);
+
+      const oldSegments = await entitySegmentRows(opened, workspaceId, "rec-v1");
+      expect(oldSegments.every((row) => row.valid_to_generation === 2)).toBe(true);
+      const newSegments = await entitySegmentRows(opened, workspaceId, "rec-v2");
+      expect(newSegments.every((row) => row.valid_to_generation === null)).toBe(true);
+    });
+  });
+
+  it("marks segments_truncated in reason_codes (while still covered) when a document's segment count exceeds max_segments", async () => {
+    const workspaceId = "ws-semantic-entity-segments-truncated";
+    // A provider whose binding wraps the real hash provider but caps its
+    // OWN segmenter at 1 segment -- forces `truncated: true` on any document
+    // long enough to need a second segment, without needing an enormous
+    // (64+ segment) fixture.
+    const base = createLocalHashProvider();
+    const provider: ResolvedSemanticProvider = { profile: base.profile, binding: { ...base.binding, segment: async (text: string) => { const full = await base.binding.segment!(text); return { segments: full.segments.slice(0, 1), truncated: full.segments.length > 1 }; } } };
+    const longBody = "x".repeat(1300);
+    const func = `export function truncatedSegmentCoverageTesting() {\n  // ${longBody}\n  return 1;\n}`;
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1", text: func, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-truncated", recordKind: "jsts:entity_callable", ownerArtifactId: "art-1", ownerArtifactVersionId: "artv-1", validFromGeneration: 1, body: { name: "truncatedSegmentCoverageTesting", kind: "function", language: "typescript", path: "art-1", start: 0, end: func.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(result.entity_inserted).toBe(1); // only the ONE (capped) segment was embedded
+
+      const statusRows = await entityStatusRows(opened, workspaceId, provider);
+      const row = statusRows.find((entry) => entry.document_id === "rec-truncated");
+      expect(row?.status).toBe("covered");
+      expect(JSON.parse(row?.reason_codes ?? "[]")).toEqual(["segments_truncated"]);
+      expect(row?.segment_count).toBe(1);
+    });
+  });
+
+  it("self-heals a partial multi-segment failure: closes the surviving successful segment(s) so the WHOLE document is retried from scratch, and marks it failed for this pass", async () => {
+    const workspaceId = "ws-semantic-entity-segments-partial-failure";
+    const base = createLocalHashProvider();
+    let segmentOneFailuresInjected = 0;
+    // Fails segment index 1's OWN generateVector call EXACTLY ONCE, ever --
+    // both `generateVectors` (batch) and its per-document `generateVector`
+    // fallback route through this same closure, so whichever path the
+    // reconciler takes, segment index 1 fails deterministically on the
+    // FIRST pass (whenever it is first attempted) and succeeds every time
+    // after, including its retry on the SECOND `reconcileSemanticProjection`
+    // call. `generateVectors` is deliberately OMITTED (not set to
+    // `undefined` -- this project's `exactOptionalPropertyTypes` rejects
+    // that) so the reconciler's own batch-then-per-document-fallback logic
+    // always takes the per-document `generateVector` path, which is the one
+    // that threads `segment_index` per call in this test.
+    const provider: ResolvedSemanticProvider = {
+      profile: base.profile,
+      binding: {
+        runtime_binding_id: base.binding.runtime_binding_id,
+        executable_binding_digest: base.binding.executable_binding_digest,
+        generateVector: async (input) => {
+          if (input.segment_index === 1 && segmentOneFailuresInjected === 0) {
+            segmentOneFailuresInjected += 1;
+            throw new Error("injected segment failure");
+          }
+          return base.binding.generateVector(input);
+        },
+        ...(base.binding.segment === undefined ? {} : { segment: base.binding.segment }),
+      },
+    };
+    const longBody = "x".repeat(1300);
+    const func = `export function partialFailureSegmentCoverageTesting() {\n  // ${longBody}\n  return 1;\n}`;
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1", text: func, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-partial", recordKind: "jsts:entity_callable", ownerArtifactId: "art-1", ownerArtifactVersionId: "artv-1", validFromGeneration: 1, body: { name: "partialFailureSegmentCoverageTesting", kind: "function", language: "typescript", path: "art-1", start: 0, end: func.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const engineDatabase = asEngineWorkspaceDatabase(opened);
+
+      const first = await reconcileSemanticProjection({ database: engineDatabase, workspace_id: workspaceId, content: cas, provider });
+      expect(first.entity_failed).toBeGreaterThan(0);
+      expect(first.marker_written).toBe(false);
+
+      const statusAfterFirst = await entityStatusRows(opened, workspaceId, provider);
+      const rowAfterFirst = statusAfterFirst.find((entry) => entry.document_id === "rec-partial");
+      expect(rowAfterFirst?.status).toBe("failed");
+
+      // NOTHING for this record stays open after the self-heal close -- the
+      // whole document is fully missing again, ready to be retried in full.
+      const openSegmentsAfterFirst = await entitySegmentRows(opened, workspaceId, "rec-partial");
+      expect(openSegmentsAfterFirst.filter((row) => row.valid_to_generation === null)).toHaveLength(0);
+
+      const second = await reconcileSemanticProjection({ database: engineDatabase, workspace_id: workspaceId, content: cas, provider });
+      expect(second.entity_failed).toBe(0);
+      expect(second.marker_written).toBe(true);
+      const statusAfterSecond = await entityStatusRows(opened, workspaceId, provider);
+      const rowAfterSecond = statusAfterSecond.find((entry) => entry.document_id === "rec-partial");
+      expect(rowAfterSecond?.status).toBe("covered");
     });
   });
 });

@@ -2,7 +2,7 @@ export { StorageError } from "./errors.js";
 export { ByteBoundaryTelemetry, type ByteBoundary, type ByteTelemetrySnapshot } from "./byte-telemetry.js";
 export { BlobStore, ContentAddressedStore, type BlobReference, type CasPutOptions, type CasPutStreamOptions } from "./cas.js";
 export { SqliteWorkerAdapter, openSqliteDatabase, type OpenSqliteOptions, type SqliteCommand, type SqliteDatabase, type SqliteRunResult, type SqliteValue } from "./sqlite.js";
-export { CATALOG_SCHEMA, WORKSPACE_SCHEMA, ensureCatalogSchemaCompatibility, ensureWorkspaceSchemaCompatibilityV4, readStructuralStore, STRUCTURAL_STORE_META_KEY, WORKSPACE_V4_INDEX_CONTRACT, writeStructuralStore } from "./schema.js";
+export { CATALOG_SCHEMA, WORKSPACE_SCHEMA, ensureCatalogSchemaCompatibility, ensureSemanticSidecarSchemaCompatibilityV4, ensureWorkspaceSchemaCompatibilityV4, readStructuralStore, STRUCTURAL_STORE_META_KEY, WORKSPACE_V4_INDEX_CONTRACT, writeStructuralStore } from "./schema.js";
 export { WORKSPACE_V3_SCHEMA, WORKSPACE_V3_SCHEMA_DIGEST, assertWorkspaceV3SchemaDigest } from "./workspace-v3-sql.js";
 export { WORKSPACE_V4_LEXICAL_SCHEMA, WORKSPACE_V4_SCHEMA, WORKSPACE_V4_SEMANTIC_SCHEMA } from "./workspace-v4-sql.js";
 export { PUBLICATION_SQL, PUBLICATION_V3_SQL_DIGEST } from "./publication-v3-sql.js";
