@@ -261,15 +261,77 @@ explained.
 
 A reader resolves a key by binary search in the newest delta, then the next,
 then the base; the first hit wins. Effective `valid_to` is the row's own
-inline value, or the value found in a per-store, in-memory `HashMap<key,
-valid_to>` merged from every delta's `closures.*` file at open time (bounded
-by the number of closures since the last compaction). Visible-range queries
-(`by_owner`, `adj.*`, `by_name`, `by_kind`) are consulted across every
-segment and merged, filtering closed rows through the same map.
-`visible_count`/`deps_visible_count` are derived in `O(log n)` per segment
-(two sorted `valid_from`/`valid_to` arrays built at open time, plus one
-global sorted closure `valid_to` array), not by an `O(n)` scan — this is the
-fix for the P0-S1 `visible_count` gap.
+inline value, or a value derived from a per-store, in-memory map merged from
+every delta's `closures.*` file at open time (bounded by the number of
+closures since the last compaction). Visible-range queries (`by_owner`,
+`adj.*`, `by_name`, `by_kind`) are consulted across every segment and merged,
+filtering closed rows through the same maps. `visible_count`/
+`deps_visible_count` are derived in `O(log n)` per segment (two sorted
+`valid_from`/`valid_to` arrays built at open time, plus one global sorted
+closure `valid_to` array), not by an `O(n)` scan — this is the fix for the
+P0-S1 `visible_count` gap.
+
+**`records.keys` vs. `deps.keys`/`pending.sites`: one closure map shape does
+not fit both key spaces (frente E-P0, `docs/evidence/2026-09-06-v4-reconcile-threshold.md`,
+plus this frente's own adversarial review, same day).** `record_id` is
+*chained*: `diff::chained_record_id` mints a brand-new 32-byte id on every
+replace/reopen/migration (`urdira-indexing-worker::v4::diff`), so a given
+`record_id` can be opened by at most ONE physical row across the store's
+entire history and closes at most once, ever. `record_closures` is
+therefore a plain `HashMap<[u8; 32], u32>` (last-write-wins on merge is
+unambiguous, since there is only ever one write per key). `dependency_id`
+(`sha256("urdira:v4-dependency-id:v4\0" || owner_path || dep_path || role)`,
+`urdira-indexing-worker::v4::deps`) and `PendingSiteKey`
+(`owner_artifact`/`start`/`end`/`site_kind`) are the OPPOSITE: pure,
+unsalted, content-addressed keys with no chaining at all — the identical
+key is legitimately reused by a later physical row after an earlier one
+under it was closed (an edge removed and later re-added; an unresolved
+import that stays pending across many edits, or gets resolved and later
+regresses). `dep_closures`/`pending_closures` are therefore `HashMap<key,
+Vec<u32>>` — every closure EVER recorded against a key, not just the most
+recent one — and the closure that applies to a specific physical row is the
+smallest recorded value strictly greater than that row's own `valid_from`
+(the closure immediately following this row's own open; two rows under one
+key never overlap in time and a key can only be reopened after being
+closed). Effective `valid_to` for a `deps.meta`/`pending.sites` row is thus:
+`min({closed_at in dep_closures[key] | closed_at > row.valid_from})`, or the
+row's own inline `valid_to` (0 = still open) if that set is empty.
+
+A first cut of this fix (`ae61841`) kept `dep_closures`/`pending_closures` as
+flat `HashMap<key, u32>` (one entry per key, last-write-wins), gated by
+`valid_from` (`closed_at > valid_from` ⇒ apply it) — correct for a key
+closed at most ONCE across the store's history, silently wrong for a key
+closed TWICE or more: `open@1, close@3, reopen@5, close@7` collapses to one
+merged entry `{key: 7}`, so a point-in-time read strictly between two of
+the key's closures (e.g. generation 4) resolves the WRONG, too-late
+`valid_to` — and, independently, `deps_visible_count`'s `O(log n)`
+derivation subtracts one unit per **map entry**, not one unit per
+**physically closed row**, so it overcounts live dependency edges at ANY
+generation, including the CURRENT one (no historical query needed) whenever
+a `dependency_id` was closed more than once. This is fixed by the
+`Vec<u32>`-per-key scheme above (same-day adversarial review of `ae61841`,
+`crates/urdira-structural-store/tests/deps_pending_closure_matrix_test.rs`);
+no on-disk format change — `closures.deps`/`closures.pending`'s bytes are
+unchanged (still `(key, valid_to)` pairs per delta), only the in-memory
+merge and the effective-`valid_to` lookup changed. Cost: bounded by
+"closures against that ONE key since the last `compact()`" — in the
+documented worst case (a key touched on every delta since the last
+compaction, e.g. `pending.sites`'s wholesale-replace-on-every-owner-touch
+pattern), that is the plan's own compaction trigger bound (`deltas > 32`),
+never corpus-sized.
+
+A SAME-generation close+reopen of the identical key (the pre-frente-E-P0
+`delta.rs` owner-granularity diff's own behavior for every "unchanged"
+dependency edge, and `pending.sites`'s still-current wholesale-replace
+behavior for every reprocessed owner) is a degenerate case of the same
+formula, not a separate one: the strict `>` in `closed_at > valid_from`
+means a row whose OWN `valid_from` equals the recorded closure is treated
+as NOT closed by it (that closure belongs to its predecessor, whose
+`valid_from` is strictly less), so the reopened row is visible starting
+exactly at that generation. A store written by the pre-fix code (or by any
+future producer that still emits this pattern) needs no reindex and no
+`HEADER_FORMAT` bump (prohibited by the plan's R22) to be read correctly
+under this scheme.
 
 Recovery (`recover(dir)`) deletes `base-*`/`delta-*` directories not named
 by `MANIFEST`, and if `MANIFEST.next` names a different generation than the

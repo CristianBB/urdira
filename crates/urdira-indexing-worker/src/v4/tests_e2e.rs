@@ -2484,6 +2484,318 @@ fn mixed_burst_edit_plus_create_delete_splits_into_two_generations_and_stays_sel
     let _ = std::fs::remove_dir_all(&scratch_root);
 }
 
+/// Frente E-P0 (plan `generic-waddling-hartmanis.md` §2.6 follow-up,
+/// `docs/evidence/2026-09-06-v4-reconcile-threshold.md` §3/§4): a mixed
+/// batch with a REVERSE DEPENDENT -- `src/index.ts` re-exports from
+/// `src/domain/errors.ts` (`export { ... } from "./domain/errors.js"`),
+/// so deleting `errors.ts` leaves `index.ts` (and its own re-exporter,
+/// `main.ts`, one hop further) an UNTOUCHED owner whose dependency edges
+/// pointed at an entity this batch just closed. Combined with an unrelated
+/// content edit (`task.ts`) and a create, in the SAME `Changed` command --
+/// exactly the shape §2's evidence blamed for `dependency`/`graph`
+/// diverging from an independent from-scratch oracle starting at n8n's
+/// p=0.05 cell (never reproduced at the 3-file scale the pre-existing
+/// `mixed_burst_*` test above uses, since none of its three paths are
+/// imported by any other fixture file).
+#[test]
+fn mixed_burst_with_reverse_dependents_matches_an_independent_oracle_scan() {
+    let scratch_root = scratch_dir("mixed-burst-reverse-deps");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-mixed-reverse-deps";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // Delete `errors.ts` -- imported (re-exported) by `index.ts`, which is
+    // in turn imported by `main.ts`. NEITHER importer is edited here: a
+    // real-world rename/delete that nobody bothered to fix up elsewhere,
+    // exactly what the synthetic mutation harness's own delete/rename step
+    // does (it never rewrites any importer).
+    let deleted_relative = "src/domain/errors.ts";
+    let deleted_absolute = workspace_root.join(deleted_relative);
+    assert!(
+        deleted_absolute.is_file(),
+        "fixture must contain {deleted_relative}"
+    );
+    std::fs::remove_file(&deleted_absolute).expect("remove deleted file");
+
+    // An unrelated content edit, in the SAME batch, on a file with no
+    // relation to `errors.ts` at all -- this is what forces `delta::run`'s
+    // "mixed burst" two-generation split (has_structural && has_content).
+    let edited_relative = "src/domain/task.ts";
+    let edited_absolute = workspace_root.join(edited_relative);
+    let before = std::fs::read_to_string(&edited_absolute).expect("read edited file");
+    let after = format!(
+        "{before}{}\nexport function urdiraHarnessReverseDepEdit_marker() {{\n  return \"marker\";\n}}\n",
+        if before.ends_with('\n') { "" } else { "\n" }
+    );
+    std::fs::write(&edited_absolute, &after).expect("write mutated file");
+
+    // An unrelated create, in the SAME batch too, to match the task
+    // brief's "mezcla edit/create/delete" shape exactly.
+    let created_relative = "src/domain/urdira-mixed-reverse-created.ts";
+    std::fs::write(
+        workspace_root.join(created_relative),
+        "export function urdiraMixedReverseCreated_marker() {\n  return \"marker\";\n}\n",
+    )
+    .expect("write created file");
+
+    let mixed = run_scan(
+        "request:mixed-reverse-deps",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![
+                ChangedPath {
+                    path: deleted_relative.to_string(),
+                    kind: ChangeKind::Deleted,
+                },
+                ChangedPath {
+                    path: edited_relative.to_string(),
+                    kind: ChangeKind::Modified,
+                },
+                ChangedPath {
+                    path: created_relative.to_string(),
+                    kind: ChangeKind::Created,
+                },
+            ],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&mixed),
+        3,
+        "a mixed burst must consume two internal generations (structural, then content)"
+    );
+    let mixed_roots = roots_of(&mixed);
+
+    // Independent oracle: a from-scratch cold scan of the SAME final tree.
+    let oracle_root = scratch_dir("mixed-burst-reverse-deps-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-mixed-reverse-deps-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    if mixed_roots.dependency != oracle_roots.dependency || mixed_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&mixed),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        mixed_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle after a mixed \
+         delete+edit+create batch with a reverse dependent of the deleted file"
+    );
+    assert_eq!(
+        mixed_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle after a mixed \
+         delete+edit+create batch with a reverse dependent of the deleted file"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Frente E-P0 (task 2a): a bigger mixed batch than `mixed_burst_*` above
+/// exercises -- TWO deletes, TWO creates (one of the creates is the other
+/// half of a rename: `repository/task-repository.ts` -> `repository/
+/// task-repository-renamed.ts`, a same-generation Deleted+Created pair
+/// with no Modified entry of its own), and ONE unrelated content edit, all
+/// in the SAME `Changed` command. `in-memory-task-repository.ts` imports
+/// the renamed file (`import type { TaskRepository } from "./task-
+/// repository.js"`) and is itself untouched by this batch, matching the
+/// task brief's "renombra D->E" case with a real reverse dependent in
+/// play. Reproduces (or rules out at fixture scale) the git-switch
+/// finding in `docs/evidence/2026-09-06-v4-reconcile-threshold.md` §4:
+/// `delta::run`'s mixed-burst split failing with "changed artifact id is
+/// absent from the current and retained manifests" on a real two-delete/
+/// two-create/one-edit batch.
+#[test]
+fn mixed_burst_two_deletes_two_creates_and_an_edit_does_not_panic_and_matches_an_independent_oracle()
+ {
+    let scratch_root = scratch_dir("mixed-burst-two-structural");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-mixed-two-structural";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // Delete #1: an unrelated leaf with no reverse dependents.
+    let deleted_relative = "src/domain/errors.ts";
+    std::fs::remove_file(workspace_root.join(deleted_relative)).expect("remove errors.ts");
+
+    // Delete+Create pair #2: a rename WITH a real reverse dependent
+    // (`in-memory-task-repository.ts`, untouched by this batch).
+    let renamed_from = "src/repository/task-repository.ts";
+    let renamed_to = "src/repository/task-repository-renamed.ts";
+    let renamed_content =
+        std::fs::read(workspace_root.join(renamed_from)).expect("read task-repository.ts");
+    std::fs::remove_file(workspace_root.join(renamed_from)).expect("remove old rename path");
+    std::fs::write(workspace_root.join(renamed_to), &renamed_content)
+        .expect("write new rename path");
+
+    // Create #3: unrelated, no relation to anything above.
+    let created_relative = "src/domain/urdira-mixed-two-structural-created.ts";
+    std::fs::write(
+        workspace_root.join(created_relative),
+        "export function urdiraMixedTwoStructuralCreated_marker() {\n  return \"marker\";\n}\n",
+    )
+    .expect("write created file");
+
+    // The one content edit, in the SAME batch, forcing the mixed-burst
+    // split (has_structural && has_content).
+    let edited_relative = "src/domain/task.ts";
+    let edited_absolute = workspace_root.join(edited_relative);
+    let before = std::fs::read_to_string(&edited_absolute).expect("read edited file");
+    let after = format!(
+        "{before}{}\nexport function urdiraHarnessTwoStructuralEdit_marker() {{\n  return \"marker\";\n}}\n",
+        if before.ends_with('\n') { "" } else { "\n" }
+    );
+    std::fs::write(&edited_absolute, &after).expect("write mutated file");
+
+    let mixed = run_scan(
+        "request:mixed-two-structural",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![
+                ChangedPath {
+                    path: deleted_relative.to_string(),
+                    kind: ChangeKind::Deleted,
+                },
+                ChangedPath {
+                    path: renamed_from.to_string(),
+                    kind: ChangeKind::Deleted,
+                },
+                ChangedPath {
+                    path: renamed_to.to_string(),
+                    kind: ChangeKind::Created,
+                },
+                ChangedPath {
+                    path: created_relative.to_string(),
+                    kind: ChangeKind::Created,
+                },
+                ChangedPath {
+                    path: edited_relative.to_string(),
+                    kind: ChangeKind::Modified,
+                },
+            ],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&mixed),
+        3,
+        "a mixed burst must consume two internal generations (structural, then content)"
+    );
+    let mixed_roots = roots_of(&mixed);
+
+    let oracle_root = scratch_dir("mixed-burst-two-structural-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-mixed-two-structural-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    if mixed_roots.dependency != oracle_roots.dependency || mixed_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&mixed),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        mixed_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle after a two-delete/ \
+         two-create/one-edit mixed batch"
+    );
+    assert_eq!(
+        mixed_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle after a two-delete/ \
+         two-create/one-edit mixed batch"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
 /// The portion of the task brief's gate that IS achievable byte-for-byte
 /// against an independent from-scratch oracle: a pure file CREATION.
 /// Every record a new file produces has a brand-new `identity_key`

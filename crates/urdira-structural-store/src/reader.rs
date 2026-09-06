@@ -136,24 +136,53 @@ pub(crate) struct Segment {
     pub deps_valid_from_sorted: Vec<u32>,
     pub deps_valid_to_sorted: Vec<u32>,
     pub record_closures: Arc<HashMap<[u8; 32], u32>>,
-    pub dep_closures: Arc<HashMap<[u8; 32], u32>>,
+    /// Adversarial review fix (frente E-P0 review): unlike
+    /// `record_closures` (a `record_id` closes at most once EVER --
+    /// `record_id` is always freshly chained on replace/reopen, so the
+    /// key itself never repeats), `dependency_id` IS reusable, so a key
+    /// can legitimately be closed more than once across the store's
+    /// history. `Vec<u32>` holds EVERY closure ever recorded against the
+    /// key (append-only fold, see `StoreInner::load`/`extend`), not just
+    /// the last one -- see [`Segment::deps_effective_valid_to`]'s doc
+    /// comment for why collapsing to one entry per key is wrong and what
+    /// replaced it.
+    pub dep_closures: Arc<HashMap<[u8; 32], Vec<u32>>>,
     /// Merged across every delta's `closures.pending` (see
     /// `StoreInner::load`) -- every segment holds the SAME `Arc` to this
     /// one store-wide map, exactly the pattern `record_closures`/`dep_
-    /// closures` already establish.
-    pub pending_closures: Arc<HashMap<PendingSiteKey, u32>>,
+    /// closures` already establish. Same `Vec<u32>`-per-key shape as
+    /// `dep_closures`, same reason (`PendingSiteKey` is reusable too).
+    pub pending_closures: Arc<HashMap<PendingSiteKey, Vec<u32>>>,
 }
 
 fn open_data(dir: &Path, name: &str) -> Result<Arc<Mmap>> {
     Ok(Arc::new(mmap_file(&dir.join(name))?))
 }
 
+/// Adversarial review fix (frente E-P0 review): the closure that applies
+/// to a specific physical row is the SMALLEST recorded closure strictly
+/// greater than that row's own `valid_from` -- the closure immediately
+/// following this row's own open, since two rows sharing a key can never
+/// overlap in time and a key can only be reopened after being closed.
+/// Shared by `Segment::deps_effective_valid_to`/`pending_effective_valid_to`.
+fn closure_for_row(closures: Option<&Vec<u32>>, valid_from: u32, inline_valid_to: u32) -> u32 {
+    match closures {
+        Some(values) => values
+            .iter()
+            .copied()
+            .filter(|&closed_at| closed_at > valid_from)
+            .min()
+            .unwrap_or(inline_valid_to),
+        None => inline_valid_to,
+    }
+}
+
 impl Segment {
     fn open(
         loc: &OpenedLocation,
         record_closures: Arc<HashMap<[u8; 32], u32>>,
-        dep_closures: Arc<HashMap<[u8; 32], u32>>,
-        pending_closures: Arc<HashMap<PendingSiteKey, u32>>,
+        dep_closures: Arc<HashMap<[u8; 32], Vec<u32>>>,
+        pending_closures: Arc<HashMap<PendingSiteKey, Vec<u32>>>,
     ) -> Result<Self> {
         // Uniform accessor over both `OpenedLocation` variants: a base
         // directory opens one mmap per logical file (unchanged); a delta
@@ -334,15 +363,99 @@ impl Segment {
         &d[ordinal * DEPS_META_STRIDE..(ordinal + 1) * DEPS_META_STRIDE]
     }
 
-    pub fn deps_effective_valid_to(&self, ordinal: usize, inline_valid_to: u32) -> u32 {
+    /// Frente E-P0 (P0-1 root cause fix): `dependency_id` is a PURE,
+    /// unsalted function of `(owner_path, dep_path, role)`
+    /// (`urdira-indexing-worker::v4::deps::dependency_id`), NOT chained the
+    /// way `record_id` is (`diff::chained_record_id` mints a FRESH id on
+    /// every replace/reopen) -- so, unlike `record_closures`/[`Self::
+    /// effective_valid_to`] (where a given key can only EVER have been
+    /// opened by exactly one physical row across the store's entire
+    /// history, making a single global "key -> valid_to" map always
+    /// unambiguous), the SAME `dependency_id` can legitimately be reused
+    /// by a LATER physical row after an earlier one under that key was
+    /// closed (an edge closed then reopened, whether within one owner-diff
+    /// churning an unrelated field or a genuine remove-then-re-add later).
+    /// Applying `dep_closures[key]` unconditionally to EVERY row carrying
+    /// that key -- including one opened AT OR AFTER the closure's own
+    /// generation -- permanently hides the reopened row: confirmed live on
+    /// n8n (`docs/evidence/2026-09-06-v4-reconcile-threshold.md`, "tras
+    /// E-P0"), a `--files 100` bisection lost 14,935 of an independent
+    /// oracle's 35,504 live dependency edges this way. A closure can only
+    /// ever legitimately apply to a row that existed BEFORE it was
+    /// recorded -- `ordinal`'s own `valid_from` gates the lookup here so a
+    /// row opened at or after `dep_closures[key]`'s generation (a fresh
+    /// reopen, this SAME key's next physical row) is never affected by a
+    /// closure meant for its now-dead predecessor. Symmetric with
+    /// `diff::diff_owner`'s companion fix (`urdira-indexing-worker::v4::
+    /// delta`'s module doc): that fix stops WRITING a same-generation
+    /// close+reopen pair for an edge that never actually changed (the
+    /// dominant case measured live); this read-side guard is what makes a
+    /// genuine cross-generation remove-then-re-add of the identical edge
+    /// correct too, a case the write-side fix alone cannot cover (two
+    /// independent `diff_one_owner` calls, no shared context).
+    ///
+    /// **Adversarial review fix (frente E-P0 review, same day):** the
+    /// FIRST cut of this fix kept `dep_closures` a flat `HashMap<key,
+    /// u32>` (last-write-wins on merge -- see `StoreInner::load`/
+    /// `extend`), which is correct ONLY for a key closed at most ONCE in
+    /// the store's entire history. A key closed **twice** (not three
+    /// times -- the original version of this doc comment undercounted the
+    /// threshold) already breaks it: `open@1, close@3, reopen@5, close@7`
+    /// collapses to a single merged entry `{key: 7}`, so `ordinal`'s own
+    /// row (say the `valid_from=1` occurrence) resolves `closed_at=7 > 1`
+    /// and reports itself open through generation 7 -- when it was really
+    /// dead from generation 3. This does not corrupt a "what is visible
+    /// RIGHT NOW" read (only ever one physical row is live at the current
+    /// generation, and its own `valid_from` is always `>=` every closure
+    /// recorded before it, so the gate still resolves it correctly), but
+    /// it silently corrupts (a) any point-in-time read at a generation
+    /// strictly between two of the key's closures (`is_visible` takes an
+    /// arbitrary `generation: u64`, not just "current" -- nothing in the
+    /// public API restricts it, and this reader has no other invariant
+    /// ruling such reads out), and (b) [`crate::StoreReader::deps_visible_count`]
+    /// unconditionally, at ANY generation including the current one: that
+    /// function's `O(log n)` derivation subtracts one unit per **map
+    /// entry**, not one unit per **physically closed row** -- confirmed
+    /// live in this review's own regression test
+    /// (`deps_pending_closure_matrix_test.rs`,
+    /// `deps_visible_count_does_not_overcount_a_twice_closed_key`): a
+    /// dependency edge removed, re-added, and removed again (two closures,
+    /// two dead physical rows under the one key) made `deps_visible_count`
+    /// report one MORE live edge than actually exists, at the store's own
+    /// current generation, no historical query needed.
+    ///
+    /// Fixed properly here (not just documented as a residual): `dep_
+    /// closures` now maps a key to EVERY closure ever recorded against it
+    /// (`Vec<u32>`, one entry appended per delta that closes the key --
+    /// see `StoreInner::load`/`extend`), and the closure that applies to
+    /// THIS row is the smallest recorded closure strictly greater than
+    /// `valid_from` (the closure immediately following this row's own
+    /// open -- by construction the very next close event chronologically
+    /// after this row started, since two rows under the same key can never
+    /// overlap and a key can only be reopened after being closed). No
+    /// on-disk format change: `closures.deps`'s bytes are unchanged, this
+    /// only changes how the in-memory merge folds them. Cost: one `Vec`
+    /// per key, bounded by "closures against that ONE key since the last
+    /// `compact()`" -- in the documented worst case (a key touched on
+    /// EVERY delta since the last compaction, e.g. `pending.sites`'
+    /// wholesale-replace-on-every-owner-touch pattern), that is the
+    /// plan's own compaction trigger bound (`deltas > 32`), never
+    /// corpus-sized; `deps_visible_count`'s `dep_closure_valid_to_sorted`
+    /// is rebuilt by flattening every key's `Vec` (one unit per REAL
+    /// closure event again, fixing the overcount too), not by picking one
+    /// value per key. See `docs/decisions/26-v4-structural-store.md`
+    /// ("Effective valid_to") for the semantics written up in full.
+    pub fn deps_effective_valid_to(
+        &self,
+        ordinal: usize,
+        valid_from: u32,
+        inline_valid_to: u32,
+    ) -> u32 {
         if self.dep_closures.is_empty() {
             return inline_valid_to;
         }
         let key = self.deps_key_at(ordinal);
-        self.dep_closures
-            .get(&key)
-            .copied()
-            .unwrap_or(inline_valid_to)
+        closure_for_row(self.dep_closures.get(&key), valid_from, inline_valid_to)
     }
 
     pub fn pending_row(&self, ordinal: usize) -> &[u8] {
@@ -363,15 +476,36 @@ impl Segment {
         )
     }
 
-    pub fn pending_effective_valid_to(&self, ordinal: usize, inline_valid_to: u32) -> u32 {
+    /// Frente E-P0: same fix as [`Self::deps_effective_valid_to`], same
+    /// reason -- `PendingSiteKey` (`owner_artifact`/`start`/`end`/
+    /// `site_kind`) is a plain, reusable, unchained key, and `delta.rs`'s
+    /// own `diff_one_owner` deliberately does an unconditional "wholesale
+    /// replace" for pending sites on EVERY owner reprocessing (never a
+    /// `diff::diff_owner`-style "unchanged, keep" -- see that module's own
+    /// doc comment on `pending_opened`/`pending_closures`), so a pending
+    /// site that is STILL pending after a reprocessing (the common case:
+    /// an unresolved import that stays unresolved) writes a same-
+    /// generation close+reopen pair for the IDENTICAL key on every single
+    /// touch -- even more frequently than the dependency case this was
+    /// found from. Gated by `valid_from` for the same reason.
+    /// Adversarial review fix, same day: see [`Self::deps_effective_valid_to`]'s
+    /// doc comment for the full derivation -- `pending_closures` now maps a
+    /// key to every closure ever recorded against it, not just the last
+    /// one, for the exact same reason (a reusable, unsalted key; this
+    /// class of bug is reachable HERE more often than for dependencies,
+    /// since `delta.rs`'s wholesale-replace touches every one of an
+    /// owner's pending sites on every single reprocessing).
+    pub fn pending_effective_valid_to(
+        &self,
+        ordinal: usize,
+        valid_from: u32,
+        inline_valid_to: u32,
+    ) -> u32 {
         if self.pending_closures.is_empty() {
             return inline_valid_to;
         }
         let key = self.pending_key_at(ordinal);
-        self.pending_closures
-            .get(&key)
-            .copied()
-            .unwrap_or(inline_valid_to)
+        closure_for_row(self.pending_closures.get(&key), valid_from, inline_valid_to)
     }
 }
 
@@ -675,7 +809,7 @@ impl DependencyView {
     }
     pub fn valid_to_effective(&self) -> u32 {
         self.segment
-            .deps_effective_valid_to(self.ordinal, self.valid_to_raw())
+            .deps_effective_valid_to(self.ordinal, self.valid_from(), self.valid_to_raw())
     }
     pub fn is_visible(&self, generation: u64) -> bool {
         let vf = self.valid_from() as u64;
@@ -712,8 +846,11 @@ impl PendingSiteView {
         u32le(self.meta(), pending_sites::VALID_TO)
     }
     pub fn valid_to_effective(&self) -> u32 {
-        self.segment
-            .pending_effective_valid_to(self.ordinal, self.valid_to_raw())
+        self.segment.pending_effective_valid_to(
+            self.ordinal,
+            self.valid_from(),
+            self.valid_to_raw(),
+        )
     }
     pub fn is_visible(&self, generation: u64) -> bool {
         let vf = self.valid_from() as u64;
@@ -807,10 +944,10 @@ pub(crate) struct StoreInner {
     /// clone` fan-out). Kept at this level (not just per-`Segment`) so
     /// `StoreInner::extend` can fuse it without fishing an arbitrary
     /// segment's copy back out.
-    pub dep_closures: Arc<HashMap<[u8; 32], u32>>,
+    pub dep_closures: Arc<HashMap<[u8; 32], Vec<u32>>>,
     /// F1 1.2: mirrors `record_closures`/`dep_closures` for `closures.
     /// pending`.
-    pub pending_closures: Arc<HashMap<PendingSiteKey, u32>>,
+    pub pending_closures: Arc<HashMap<PendingSiteKey, Vec<u32>>>,
     pub closure_valid_to_sorted: Vec<u32>,
     pub dep_closure_valid_to_sorted: Vec<u32>,
     pub manifest_mtime: std::time::SystemTime,
@@ -919,13 +1056,22 @@ impl StoreInner {
         }
 
         // locations is now [base, delta-oldest, ..., delta-newest]; gather
-        // closures across all deltas first (order doesn't matter, each key
-        // closes at most once). The base carries no closures by
-        // construction (write_base never emits them), so skipping index 0
-        // is just an optimization, not a correctness requirement.
+        // closures across all deltas first. `record_id` closes at most
+        // once ever (chained, never reused -- `record_closures` stays a
+        // plain last-write-wins `HashMap`, order doesn't matter). Adversarial
+        // review fix: `dependency_id`/`PendingSiteKey` are NOT chained and
+        // CAN close more than once across a store's history (see `Segment::
+        // deps_effective_valid_to`'s doc comment) -- `dep_closures`/
+        // `pending_closures` therefore fold into a `Vec<u32>` per key (every
+        // closure ever recorded against it, order still irrelevant --
+        // `closure_for_row` picks the minimum greater than a row's own
+        // `valid_from`), not a `HashMap` overwrite. The base carries no
+        // closures by construction (write_base never emits them), so
+        // skipping index 0 is just an optimization, not a correctness
+        // requirement.
         let mut record_closures = HashMap::new();
-        let mut dep_closures = HashMap::new();
-        let mut pending_closures = HashMap::new();
+        let mut dep_closures: HashMap<[u8; 32], Vec<u32>> = HashMap::new();
+        let mut pending_closures: HashMap<PendingSiteKey, Vec<u32>> = HashMap::new();
         for loc in locations.iter().skip(1) {
             let records_bytes =
                 optional_section_bytes(loc, "closures.records", SectionId::ClosuresRecords)?;
@@ -934,12 +1080,12 @@ impl StoreInner {
             }
             let deps_bytes = optional_section_bytes(loc, "closures.deps", SectionId::ClosuresDeps)?;
             for (k, v) in load_closures(deps_bytes)? {
-                dep_closures.insert(k, v);
+                dep_closures.entry(k).or_default().push(v);
             }
             let pending_bytes =
                 optional_section_bytes(loc, "closures.pending", SectionId::ClosuresPending)?;
             for (k, v) in load_pending_closures(pending_bytes)? {
-                pending_closures.insert(k, v);
+                pending_closures.entry(k).or_default().push(v);
             }
         }
         let record_closures = Arc::new(record_closures);
@@ -1035,7 +1181,16 @@ impl StoreInner {
 
         let mut closure_valid_to_sorted: Vec<u32> = record_closures.values().copied().collect();
         closure_valid_to_sorted.sort_unstable();
-        let mut dep_closure_valid_to_sorted: Vec<u32> = dep_closures.values().copied().collect();
+        // Adversarial review fix: `dep_closures.values()` is now `Vec<u32>`
+        // per key (one entry per REAL closure event, not one per key) --
+        // `flatten()` so `deps_visible_count`'s `extra_closures` subtraction
+        // counts every physically closed row once, not once per distinct
+        // key (the bug: a twice-closed key used to contribute only one
+        // unit to this list, undercounting closures by however many times
+        // that key was reused, which made `deps_visible_count` overcount
+        // live edges).
+        let mut dep_closure_valid_to_sorted: Vec<u32> =
+            dep_closures.values().flatten().copied().collect();
         dep_closure_valid_to_sorted.sort_unstable();
 
         // `manifest.base`/`manifest.deltas` are already bare segment names
@@ -1120,8 +1275,14 @@ impl StoreInner {
         // 2. Fuse closures: start from `prev`'s already-merged maps (an
         //    `Arc` bump-then-clone-the-map -- O(existing closures count),
         //    not O(corpus)) and fold each new delta's OWN closures.* on
-        //    top, in the SAME oldest-to-newest order `load` uses (a later
-        //    delta's entry for the same key wins, via `HashMap::insert`).
+        //    top. `record_closures` keeps last-write-wins `HashMap::insert`
+        //    (a `record_id` closes at most once ever). Adversarial review
+        //    fix: `dep_closures`/`pending_closures` APPEND to each key's
+        //    `Vec<u32>` instead of overwriting -- see `Segment::deps_
+        //    effective_valid_to`'s doc comment for why a key can
+        //    legitimately close more than once across the store's history
+        //    and why collapsing to one entry per key silently corrupts
+        //    both point-in-time reads and `deps_visible_count`.
         let mut record_closures = (*prev.record_closures).clone();
         let mut dep_closures = (*prev.dep_closures).clone();
         let mut pending_closures = (*prev.pending_closures).clone();
@@ -1133,12 +1294,12 @@ impl StoreInner {
             }
             let deps_bytes = optional_section_bytes(loc, "closures.deps", SectionId::ClosuresDeps)?;
             for (k, v) in load_closures(deps_bytes)? {
-                dep_closures.insert(k, v);
+                dep_closures.entry(k).or_default().push(v);
             }
             let pending_bytes =
                 optional_section_bytes(loc, "closures.pending", SectionId::ClosuresPending)?;
             for (k, v) in load_pending_closures(pending_bytes)? {
-                pending_closures.insert(k, v);
+                pending_closures.entry(k).or_default().push(v);
             }
         }
         let record_closures = Arc::new(record_closures);
@@ -1254,10 +1415,14 @@ impl StoreInner {
 
         // 7. `closure_valid_to_sorted`/`dep_closure_valid_to_sorted`:
         //    re-derived from the (small, closures-only) fused maps -- cheap
-        //    relative to everything else here, plan §1.2 step 2.
+        //    relative to everything else here, plan §1.2 step 2. Adversarial
+        //    review fix: `flatten()` `dep_closures.values()` (now `Vec<u32>`
+        //    per key) -- see `load`'s matching comment on why one entry
+        //    per REAL closure event is required, not one per distinct key.
         let mut closure_valid_to_sorted: Vec<u32> = record_closures.values().copied().collect();
         closure_valid_to_sorted.sort_unstable();
-        let mut dep_closure_valid_to_sorted: Vec<u32> = dep_closures.values().copied().collect();
+        let mut dep_closure_valid_to_sorted: Vec<u32> =
+            dep_closures.values().flatten().copied().collect();
         dep_closure_valid_to_sorted.sort_unstable();
 
         // 8. Refcount: register a marker naming the FULL new segment list.
