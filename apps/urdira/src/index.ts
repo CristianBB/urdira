@@ -2569,6 +2569,8 @@ function requiredRpcCapabilities(command: CliCommand): readonly string[] {
     "workspace-remove": "core:workspace_remove",
     "workspace-purge": "core:workspace_purge",
     "workspace-configure": "core:workspace_configure",
+    "workspace-orphans": "core:workspace_orphans_list",
+    "workspace-orphans-purge": "core:workspace_orphans_purge",
     "codebase-list": "core:codebase_list",
     "codebase-create": "core:codebase_create",
     "codebase-rename": "core:codebase_rename",

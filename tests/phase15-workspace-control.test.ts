@@ -202,6 +202,56 @@ describe("workspace administration CLI", () => {
     expect(parseCliArgs(["workspace", "purge", "workspace-1", "--confirm"]).name).toBe("workspace-purge");
   });
 
+  // v4 (plan `generic-waddling-hartmanis.md` §6, Frente H): `workspace
+  // orphans` is a two-level subcommand (unlike every other `workspace
+  // <action>` verb above), and `workspace orphans purge` needs a THIRD
+  // token consumed before positional safe ids/`--all` show up in `args`.
+  test("parses the two-level workspace orphans subcommand and its purge variant", () => {
+    const listed = parseCliArgs(["workspace", "orphans"]);
+    expect(listed.name).toBe("workspace-orphans");
+    expect(listed.args).toEqual([]);
+    // Read-only re-sweep: no --dry-run/--confirm required.
+    expect(listed.options.dry_run).toBe(false);
+    expect(listed.options.confirm).toBe(false);
+
+    const purgeAll = parseCliArgs(["workspace", "orphans", "purge", "--all", "--confirm"]);
+    expect(purgeAll.name).toBe("workspace-orphans-purge");
+    expect(purgeAll.args).toEqual([]);
+    expect(purgeAll.options.values["all"]).toBe("true");
+    expect(purgeAll.options.confirm).toBe(true);
+
+    const purgeSpecific = parseCliArgs(["workspace", "orphans", "purge", "workspace_a", "workspace_b", "--dry-run"]);
+    expect(purgeSpecific.name).toBe("workspace-orphans-purge");
+    expect(purgeSpecific.args).toEqual(["workspace_a", "workspace_b"]);
+    expect(purgeSpecific.options.dry_run).toBe(true);
+    expect(purgeSpecific.options.values["all"]).toBeUndefined();
+  });
+
+  test("runs workspace orphans without requiring --dry-run or --confirm, and dispatches to core:workspace_orphans_list", async () => {
+    const calls: Array<{ call: string; payload: unknown }> = [];
+    const result = await runCli(["workspace", "orphans", "--json"], {
+      client: { call: async (call, payload) => { calls.push({ call, payload }); return { outcome: "success", payload: { orphans: [], retained_stale: [], in_progress: [] } }; } },
+    });
+    expect(result.exit_code).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.call).toBe("core:workspace_orphans_list");
+  });
+
+  test("requires --dry-run or --confirm for workspace orphans purge, and forwards safe ids as positional args", async () => {
+    await expect(runCli(["workspace", "orphans", "purge", "workspace_a"], {
+      client: { call: async () => ({ outcome: "success", payload: { purged: [], bytes_freed: 0, remaining: [] } }) },
+    })).rejects.toThrow(/dry-run|confirm/i);
+
+    const calls: Array<{ call: string; payload: unknown }> = [];
+    const result = await runCli(["workspace", "orphans", "purge", "workspace_a", "--confirm", "--json"], {
+      client: { call: async (call, payload) => { calls.push({ call, payload }); return { outcome: "success", payload: { purged: ["workspace_a"], bytes_freed: 1024, remaining: [] } }; } },
+    });
+    expect(result.exit_code).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.call).toBe("core:workspace_orphans_purge");
+    expect((calls[0]!.payload as { readonly args: readonly string[] }).args).toEqual(["workspace_a"]);
+  });
+
   test("passes the exact proposal id to the confirmed configure call", async () => {
     const calls: Array<{ call: string; payload: unknown }> = [];
     const result = await runCli(["workspace", "configure", "workspace-1", "--confirm", "--proposal-id", "proposal-1", "--json"], {

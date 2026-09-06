@@ -1,5 +1,6 @@
 import { access, mkdir, rename } from "node:fs/promises";
 import { basename, dirname, join, relative } from "node:path";
+import { workspaceFootprintEntries } from "./workspace-footprint.js";
 
 /**
  * v4 destructive-cutover helper (plan §9): "v4 destructivo sin migración".
@@ -52,30 +53,21 @@ export async function recreateOutdatedWorkspaceDatabase(input: RecreateOutdatedW
   await mkdir(staleDirectory, { recursive: true });
 
   // Every file/directory that can belong to this one workspace's on-disk
-  // footprint (plan §1): the catalog database and its WAL/SHM/writer-lock
-  // siblings, the native structural store directory, and the two sidecar
-  // databases (with their own WAL/SHM siblings) if lexical/semantic
-  // maintenance ever ran against this workspace.
-  const candidates = [
-    fileName,
-    `${fileName}-wal`,
-    `${fileName}-shm`,
-    `${fileName}.urdira-writer.lock`,
-    `${name}.structural`,
-    `${name}.lexical.sqlite`,
-    `${name}.lexical.sqlite-wal`,
-    `${name}.lexical.sqlite-shm`,
-    `${name}.semantic.sqlite`,
-    `${name}.semantic.sqlite-wal`,
-    `${name}.semantic.sqlite-shm`,
-  ];
-
+  // footprint (plan §1, generic-waddling-hartmanis.md §6 Frente H): the
+  // catalog database and its WAL/SHM/rollback-journal/writer-lock siblings,
+  // the native structural store directory, the two sidecar databases (with
+  // their own WAL/SHM siblings) if lexical/semantic maintenance ever ran
+  // against this workspace, and the Rust-side scan sidecar directory
+  // (`sidecarScanDirFor`). Sourced from `workspace-footprint.ts`'s single
+  // canonical list -- this used to hand-roll its own subset (missing the
+  // rollback-journal file and the `.sidecar/` directory entirely, both
+  // fixed by switching to the shared list) -- rather than a second,
+  // independently-maintained copy.
   const movedPaths: string[] = [];
-  for (const candidate of candidates) {
-    const source = join(directory, candidate);
-    try { await access(source); } catch { continue; }
-    const destination = join(staleDirectory, candidate);
-    await rename(source, destination);
+  for (const entry of workspaceFootprintEntries(directory, name)) {
+    try { await access(entry.path); } catch { continue; }
+    const destination = join(staleDirectory, basename(entry.path));
+    await rename(entry.path, destination);
     movedPaths.push(destination);
   }
 
