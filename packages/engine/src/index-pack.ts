@@ -38,6 +38,8 @@ import {
   enumerateForkRoot,
   isKnownPreexistingVerifyGap,
   multisetKey,
+  recomputeV4SnapshotDigestsAfterRewrite,
+  rewriteV4WorkspaceIdentity,
   rollbackForkPublication,
   sortedResolvedPluginsDigest,
   stableId,
@@ -1389,9 +1391,17 @@ async function importAfterEnumeration(options: IndexPackImportOptions, context: 
 // `docs/evidence/2026-09-02-v4-p0-s3-merkle-bucket.md` -- so a v4 pack is
 // at minimum ~140 MB before compression, even for a tiny fixture).
 //
-// Self-contained and directly tested (`tests/index-pack-v4.test.ts`), not
-// wired into `attemptIndexPackImport`'s v3 orchestration above or into any
-// daemon RPC -- see `workspace-fork.ts`'s matching v4 section for why.
+// Directly tested (`tests/index-pack-v4.test.ts`) and, since plan
+// `generic-waddling-hartmanis.md` §7.1 (Frente P-1), wired into the daemon:
+// `core:index_pack_export` (`packages/daemon/src/runtime.ts`) branches to
+// `exportV4IndexPack` for a native-structural-store workspace via
+// `index-pack-export-v4-worker-thread.ts`, and `runV4WorkspaceScan`'s
+// first-scan branch imports a pending `--index-pack` path via
+// `importV4IndexPack` (staged, then renamed atomically over the paths
+// `ensureV4Workspace` just bootstrapped) before handing the workspace to a
+// `reconcile` scan. NOT wired into `attemptIndexPackImport`'s v3
+// orchestration above -- see `workspace-fork.ts`'s matching v4 section for
+// why that one stays a compatibility-only oracle.
 // =============================================================================
 
 export const V4_INDEX_PACK_FORMAT = "urdira-index-pack-v4" as const;
@@ -1443,6 +1453,14 @@ export interface ExportV4IndexPackOptions {
   readonly sidecarRoot?: string;
   readonly workspaceId: string;
   readonly outputPath: string;
+  /** Same `--require-git-clean` contract as `ExportIndexPackOptions` (v3,
+   * above): reject the export outright if `canonicalRoot`'s git worktree has
+   * uncommitted changes, rather than silently packing a source state a
+   * later `git diff` cannot reproduce. */
+  readonly requireGitClean?: boolean;
+  readonly canonicalRoot?: string;
+  readonly gitObjects?: GitObjectPort;
+  readonly now?: () => string;
 }
 
 /**
@@ -1459,6 +1477,12 @@ export interface ExportV4IndexPackOptions {
  * import, not just trusted from the manifest.
  */
 export async function exportV4IndexPack(options: ExportV4IndexPackOptions): Promise<{ readonly packPath: string; readonly manifest: V4IndexPackManifest }> {
+  if (options.requireGitClean) {
+    if (options.canonicalRoot === undefined) throw new Error("v4 index pack export: requireGitClean was requested without a canonicalRoot to check");
+    const now = options.now ?? (() => new Date().toISOString());
+    const admin = await administrativeState(options.canonicalRoot, options.gitObjects ?? ISOMORPHIC_GIT_OBJECT_PORT, now);
+    if (admin.vcs_state.dirty) throw new Error("v4 index pack export: workspace root has uncommitted changes (requireGitClean)");
+  }
   const files = [
     { path: "workspace.sqlite", absolutePath: options.databasePath },
     ...(await walkV4PackDirectory(options.structuralRoot, "structural")),
@@ -1574,6 +1598,20 @@ export interface ImportV4IndexPackOptions {
   readonly targetDatabasePath: string;
   readonly targetStructuralRoot: string;
   readonly targetSidecarRoot?: string;
+  /** Decidido en implementación (plan `generic-waddling-hartmanis.md` §7.1,
+   * R17): the workspace id the imported catalog must be bound to on THIS
+   * installation -- almost never the donor's own `manifest.workspace_id`
+   * (two installations mint independent ids for what may be the same
+   * canonical root). Optional -- defaults to `manifest.workspace_id` (a
+   * no-op rewrite), which keeps every existing direct caller of this
+   * function (donor id === target id, e.g. `tests/index-pack-v4.test.ts`'s
+   * plain round-trip tests) unchanged; a real cross-installation import
+   * (the daemon's `runV4WorkspaceScan` slot) always passes the real target
+   * id explicitly. Re-pinning happens unconditionally whenever it IS given
+   * (a no-op when it happens to already match) so `storage.openWorkspace`'s
+   * `bindWorkspaceIdentity` never sees a foreign id and throws
+   * `storage:workspace_binding_mismatch`. */
+  readonly targetWorkspaceId?: string;
 }
 
 export interface ImportV4IndexPackResult {
@@ -1615,5 +1653,30 @@ export async function importV4IndexPack(options: ImportV4IndexPackOptions): Prom
     if (file.headerRoot !== expectedRoot) mismatches.push(`${setKind}: header root differs from the manifest's`);
     if (file.recomputedRoot !== file.headerRoot) mismatches.push(`${setKind}: imported file's own bucket levels no longer match its header root`);
   }
+
+  // R17 (plan §7.1.2): re-pin the just-copied catalog to THIS installation's
+  // workspace id. `rewriteV4WorkspaceIdentity` is generic over every TEXT
+  // column (`workspace-fork.ts`'s doc comment) but deliberately skips
+  // `workspace_meta.value`, which is a BLOB (canonical-encoded), not TEXT --
+  // so the one row that actually gates `storage.openWorkspace`
+  // (`bindWorkspaceIdentity`) needs its own direct `UPDATE`. Unconditional
+  // (not gated on `manifest.workspace_id !== options.targetWorkspaceId`):
+  // `rewriteV4WorkspaceIdentity` itself is a no-op when the ids already
+  // match, and re-running the `UPDATE`/digest recompute in that case just
+  // writes back the same bytes -- simpler than a second identity comparison
+  // here that could drift from the one inside `rewriteV4WorkspaceIdentity`.
+  const targetWorkspaceId = options.targetWorkspaceId ?? manifest.workspace_id;
+  const database = await openSqliteDatabase({ filename: options.targetDatabasePath });
+  try {
+    await rewriteV4WorkspaceIdentity(database, manifest.workspace_id, targetWorkspaceId);
+    // Not created if absent (R17: `bindWorkspaceIdentity` mints it on the
+    // workspace's first open) -- a `WHERE key = 'workspace_id'` `UPDATE`
+    // against a row that does not exist yet simply affects zero rows.
+    await database.run("UPDATE workspace_meta SET value = ? WHERE key = 'workspace_id'", [encodeCanonical(targetWorkspaceId)]);
+    await recomputeV4SnapshotDigestsAfterRewrite(database);
+  } finally {
+    await database.close();
+  }
+
   return { manifest, roots_verified: mismatches.length === 0, root_mismatches: mismatches };
 }

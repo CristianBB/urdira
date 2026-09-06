@@ -1,13 +1,14 @@
-import { chmod, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, join, resolve } from "node:path";
-import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
+import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, importV4IndexPack, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, sidecarScanDirFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type V4WorkspacePaths, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, isOutdatedWorkspaceError, isWorkspaceDatabaseFileOpen, readStructuralStore, recreateOutdatedWorkspaceDatabase, removeWorkspaceFootprint, workspaceFootprintEntries, workspaceSafeId, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase, type WorkspaceFootprintEntry } from "@urdira/storage";
 import { sweepWorkspaceDataDir, type OrphanReport } from "./orphan-sweep.js";
 import { existsSync } from "node:fs";
 import { runIndexPackExportInThread } from "./index-pack-export-thread.js";
+import { runIndexPackExportV4InThread } from "./index-pack-export-v4-thread.js";
 import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-thread.js";
 import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths } from "./ownership.js";
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
@@ -2153,6 +2154,83 @@ interface RunV4WorkspaceScanInput {
   readonly registry: WorkspaceRegistry;
   readonly resolveTransport?: ((workspace: RegisteredWorkspace) => Promise<RustWorkspaceScanTransport | undefined>) | undefined;
   readonly submitLexicalMaintenance: (workspaceId: string) => void;
+  /** Frente P-1 (`generic-waddling-hartmanis.md` §7.1): the SAME
+   * workspace_id -> pack path side channel `core:workspace_add`'s v3 branch
+   * already consumes (`pendingIndexPackPaths`, `scheduleWorkspaceScan`'s
+   * enclosing closure) -- passed through so this function's first-scan
+   * branch can consume it too. Optional only so v4-scan unit tests that do
+   * not exercise index-pack import at all can omit it. */
+  readonly pendingIndexPackPaths?: Map<string, string>;
+}
+
+/**
+ * Index pack import (Frente P-1, plan §7.1.3): consumes a pending
+ * `--index-pack` path registered by `core:workspace_add` on a v4 workspace's
+ * genuine first-ever scan. Imports into a fully disjoint staging area first
+ * -- `<db>.import-staging-<uuid>` (the exact suffix the orphan sweep already
+ * classifies as "in progress" for up to an hour, `packages/daemon/src/orphan-sweep.ts`'s
+ * R15 classification) -- so a failure at ANY point (corrupt pack, a Merkle
+ * mismatch, an I/O error mid copy) never touches the paths `ensureV4Workspace`
+ * just bootstrapped: the caller falls through to an ordinary `full` scan of
+ * the freshly-bootstrapped (still pristine) database exactly as if no pack
+ * had been requested.
+ *
+ * Never throws (mirrors `attemptWorkspaceFork`/`attemptIndexPackImport`'s
+ * own "never throws" contract, `index-pack.ts`) -- every failure is caught,
+ * logged, and the staging directory removed before returning `false`.
+ *
+ * On success, swaps the staged files atomically into place with `rename`:
+ * structural, then sidecar (if the pack carried one), then the catalog file
+ * last. If a structural/sidecar rename fails, the catalog has NOT been
+ * swapped yet -- the workspace is left exactly as before this attempt
+ * (still the empty bootstrap database). The one situation this ordering
+ * does not fully protect against -- the database rename itself failing
+ * AFTER structural/sidecar already landed -- would leave the (still
+ * generation-0) bootstrap database paired with a donor's structural files;
+ * the very next `full` scope this function's caller naturally falls back to
+ * unconditionally re-derives and republishes `structural/`/`merkle/*.tree`
+ * for its own new generation regardless of whatever was already on disk
+ * (`catalog::run_full_scan`), so this is self-healing rather than a stuck,
+ * wedged state -- decided in implementation rather than hand-rolling a
+ * multi-path rollback for a failure mode local same-filesystem `rename(2)`
+ * calls essentially never hit in practice.
+ */
+async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: string, workspaceId: string): Promise<boolean> {
+  const stagingDatabasePath = `${paths.database_path}.import-staging-${randomUUID()}`;
+  const stagingStructuralRoot = structuralStoreDirFor(stagingDatabasePath);
+  const stagingSidecarRoot = sidecarScanDirFor(stagingDatabasePath);
+  const cleanupStaging = async (): Promise<void> => {
+    await rm(stagingDatabasePath, { force: true }).catch(() => undefined);
+    await rm(stagingStructuralRoot, { recursive: true, force: true }).catch(() => undefined);
+    await rm(stagingSidecarRoot, { recursive: true, force: true }).catch(() => undefined);
+  };
+  try {
+    const imported = await importV4IndexPack({
+      packPath,
+      targetDatabasePath: stagingDatabasePath,
+      targetStructuralRoot: stagingStructuralRoot,
+      targetSidecarRoot: stagingSidecarRoot,
+      targetWorkspaceId: workspaceId,
+    });
+    if (!imported.roots_verified) {
+      console.error(`[urdira] v4 index pack import for ${workspaceId} failed root verification (${imported.root_mismatches.join("; ")}); falling back to a full scan`);
+      await cleanupStaging();
+      return false;
+    }
+    await rename(stagingStructuralRoot, paths.structural_root);
+    if (existsSync(stagingSidecarRoot)) await rename(stagingSidecarRoot, paths.sidecar_root);
+    // Stale `-wal`/`-shm`/`-journal` siblings of the bootstrap database this
+    // import is about to replace belong to the OLD (about-to-be-discarded)
+    // file -- clearing them first means the freshly-renamed-in catalog is
+    // never paired with a WAL that describes a different schema/page count.
+    for (const suffix of ["-wal", "-shm", "-journal"]) await rm(`${paths.database_path}${suffix}`, { force: true }).catch(() => undefined);
+    await rename(stagingDatabasePath, paths.database_path);
+    return true;
+  } catch (error) {
+    console.error(`[urdira] v4 index pack import for ${workspaceId} threw, falling back to a full scan:`, error);
+    await cleanupStaging();
+    return false;
+  }
 }
 
 /**
@@ -2169,7 +2247,7 @@ interface RunV4WorkspaceScanInput {
  * copy of the same policy.
  */
 async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void> {
-  const { workspace, workspaceId, durableStorage, requestedUris, authoritativeDeletes, activity, registry, resolveTransport, submitLexicalMaintenance } = input;
+  const { workspace, workspaceId, durableStorage, requestedUris, authoritativeDeletes, activity, registry, resolveTransport, submitLexicalMaintenance, pendingIndexPackPaths } = input;
   // Visible to a readiness poll racing this scan's own first await, before
   // any generation has actually landed: still v4, still "not ready yet",
   // exactly like a v3 workspace mid its own first scan.
@@ -2193,6 +2271,26 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // (`priorSnapshotId === undefined`, i.e. `workspace.current_snapshot_id`):
   // no v4 snapshot has ever published for this workspace yet.
   const isFirstScan = workspace.current_snapshot_id === undefined;
+  // Index pack import (Frente P-1, plan §7.1.3): the cross-machine sibling
+  // of v3's `attemptWorkspaceFork`/`attemptIndexPackImport` compatibility
+  // copiers -- tried only on a genuine first-ever scan, and only when
+  // `core:workspace_add` registered a pack path for THIS workspace id
+  // (`pendingIndexPackPaths`, `scheduleWorkspaceScan`'s closure); consumed
+  // (deleted) on this first read regardless of outcome, exactly like the v3
+  // side channel, so a later `core:reindex` never re-attempts an import
+  // against an already-populated workspace. On success the scan below is
+  // forced to `reconcile` (skipping `full` even though `isFirstScan` is
+  // true): the imported catalog already has a generation > 0 to diff
+  // against, and `reconcile` is exactly the mechanism (Frente E) that
+  // derives and republishes the authoritative difference between the
+  // donor's tree and this workspace's own -- a `full` scan here would
+  // needlessly redo the donor's own work from scratch.
+  let importedFromIndexPack = false;
+  const pendingPackPath = isFirstScan ? pendingIndexPackPaths?.get(workspaceId) : undefined;
+  if (pendingPackPath !== undefined) {
+    pendingIndexPackPaths?.delete(workspaceId);
+    importedFromIndexPack = await importPendingV4IndexPack(paths, pendingPackPath, workspaceId);
+  }
   // `requestedUris === undefined` is `mergeScanRequestIntoBuffer`'s own
   // "unsafe/lost-coverage" signal (an explicit reindex, or a coalesced
   // buffer that saw one) -- treated the same way v3's full scan already
@@ -2212,11 +2310,13 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // `core:reindex` and the outdated-workspace-format recovery sweep, both
   // populate it before scheduling this scan.
   const forceFull = forceFullScans.delete(workspaceId);
-  let scope: ScanScope = isFirstScan || forceFull
-    ? { kind: "full" }
-    : requestedUris === undefined
-      ? { kind: "reconcile" }
-      : { kind: "changed", paths: mapV4ChangedPaths(requestedUris, authoritativeDeletes) };
+  let scope: ScanScope = importedFromIndexPack
+    ? { kind: "reconcile" }
+    : isFirstScan || forceFull
+      ? { kind: "full" }
+      : requestedUris === undefined
+        ? { kind: "reconcile" }
+        : { kind: "changed", paths: mapV4ChangedPaths(requestedUris, authoritativeDeletes) };
   // P3-1: the worker rejects `Changed{paths: []}` outright (`crates/urdira-
   // indexing-worker/src/v4/delta.rs`, "requires at least one path") -- found
   // live via `tests/v4-mutation-harness.test.ts`'s rename mutation, which
@@ -3097,6 +3197,7 @@ export class DaemonRuntime {
                       registry,
                       resolveTransport: options.resolve_workspace_scan_transport,
                       submitLexicalMaintenance,
+                      pendingIndexPackPaths,
                     });
                     workspaceWriterBusyRetries.delete(workspaceId);
                     notifyReadinessChanged(workspaceId);
@@ -4268,7 +4369,36 @@ export class DaemonRuntime {
           const workspace = options.workspace_registry.get(workspaceRef) ?? options.workspace_registry.findByCanonicalRoot(workspaceRef);
           if (!workspace) throw new DaemonError("core:workspace_not_found", "Workspace is not registered.");
           if (workspace.status !== "ready") throw new DaemonError("core:workspace_lifecycle", "Workspace must be ready before it can be exported as an index pack.");
+          // Frente P-1 (`generic-waddling-hartmanis.md` §7.1): a v4 workspace
+          // ("ready") can still have a `reconcile`/`changed` scan running in
+          // the background -- `status` alone does not imply "no scan in
+          // flight" for v4 the way it always has for v3 (a v3 scan always
+          // pins `status` to `"indexing"` first). Exporting mid-scan would
+          // read a `merkle_roots`/`snapshots` row for a generation whose
+          // `structural/` files a concurrent scan is still rewriting.
+          if (scanInFlight.has(workspace.workspace_id)) throw new DaemonError("core:workspace_lifecycle", "Workspace has a scan in progress; index pack export requires no scan in flight.");
           const requireGitClean = values["require-git-clean"] === "true";
+          // v4 (native structural store) branches to a completely different
+          // export container (`exportV4IndexPack`, a single gzip file of
+          // `workspace.sqlite` + `structural/` + `sidecar/`) than v3's
+          // tagged-NDJSON row replay -- see `index-pack.ts`'s v4 section
+          // doc comment. A short-lived read-only open is enough to tell
+          // which one this workspace is; it is closed again before either
+          // worker thread opens its own connection to the same file.
+          const structuralStoreDatabase = await indexingStorage.openWorkspace(workspace.workspace_id);
+          const structuralStoreKind = await readStructuralStore(structuralStoreDatabase.database).finally(() => structuralStoreDatabase.close().catch(() => undefined));
+          if (structuralStoreKind === "native") {
+            const databasePath = indexingStorage.defaultWorkspaceDatabasePath(workspace.workspace_id);
+            const resultV4 = await runIndexPackExportV4InThread({
+              database_path: databasePath,
+              structural_root: structuralStoreDirFor(databasePath),
+              sidecar_root: sidecarScanDirFor(databasePath),
+              workspace_id: workspace.workspace_id,
+              out_path: outPath,
+              ...(requireGitClean ? { require_git_clean: true, canonical_root: workspace.canonical_root } : {}),
+            });
+            return { workspace_id: workspace.workspace_id, out_path: resultV4.pack_path, generation: resultV4.manifest.generation, bytes: (await stat(resultV4.pack_path)).size, roots: resultV4.manifest.roots };
+          }
           // The export runs in its own worker thread with its own storage
           // handle: its bulk row reads are synchronous by design (see
           // `exportIndexPack`'s `rawDatabase` comment), so running it here
