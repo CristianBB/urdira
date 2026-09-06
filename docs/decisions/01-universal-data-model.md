@@ -6827,3 +6827,76 @@ outside the replacement scope. The old occurrence closes as replaced; the
 replacement record is `digest({record, previous_record_id})` and receives a
 new identity salted by `owner_migration_barrier` derived from the old identity.
 Facts and evidence do not participate in this migration rule.
+
+## Amendment 2026-09-06 (Frente N, plan `generic-waddling-hartmanis.md` §5): compact MCP renderer -- inline one-line snippets
+
+§"`ResponseBudget.max_items` and `max_characters`" above defines the
+canonical `ResponseBudget`/`QueryOptions.snippets` fields this amendment
+does NOT change -- `core:get_source`/`core:build_context`/`core:search_text`
+keep exactly their pre-existing, caller-configured snippet behavior. This
+amendment documents a purely presentational addition at the MCP adapter
+boundary (`packages/mcp/src/index.ts`), one layer above this canonical
+model, plus the engine-side hydration it renders.
+
+- **Problem**: before this plan, `optional_source_snippets` was populated
+  only for `core:get_source` and `core:search_text` (the MCP renderer's
+  `describeBundle`/`formatDescriptorLine` -- see "Public API and MCP
+  surface"/[Daemon, MCP integration, and packaging](10-daemon-mcp-packaging.md)
+  for the general text-rendering contract those already document -- only
+  ever printed a snippet line for those two). Every other discovery-shaped
+  bundle (`core:find_references`, `core:get_outline`, `core:search_hybrid`,
+  `core:search_semantic`) carried a locator (path/line, from
+  `primary_source_span`) but no source preview, pushing an agent toward a
+  separate `core:get_source` round trip just to see one line of context.
+- **Engine-side SNIPPET_POLICY** (`packages/engine/src/canonical-query-data-port.ts`):
+  a per-operation table, independent of `QueryOptions.snippets` (these
+  operations have no `source`-shaped argument of their own to carry a
+  caller override through): `core:find_references` -> `"line"` on the
+  `references` stream only (the exact source line the reference span starts
+  on -- a NEW `sourceSnippet` mode, line-aligned regardless of
+  `context_lines`, added alongside the pre-existing `"signature"`/
+  `"relevant"`/`"body"` modes); `core:get_outline` -> `"signature"` on
+  LEVEL-0 (root) members only, never deeper-nested ones at `depth > 1`;
+  `core:search_hybrid`/`core:search_semantic` -> `"line"` over
+  `semantic_evidence.matched_segment.start_char` once populated, else
+  `"signature"`. Every snippet is capped at 200 characters and shares a
+  20,000-character total budget per operation call (mirrors
+  `DEFAULT_QUERY_OPTIONS.snippets.max_total_characters`, the MCP adapter's
+  own existing default); a missing artifact text (no CAS blob, evicted, or
+  the port has no content reader) omits the snippet silently -- it never
+  fails the query. `core:locate_implementation` (a recipe) needs no
+  separate wiring: its `implementations` stream is exactly
+  `core:search_hybrid`'s own kind-filtered candidate objects passed through
+  unchanged, so it inherits that operation's policy automatically; its
+  `sources` stream is `core:get_source` with its own pre-existing, larger
+  `mode: "relevant"` configuration and is unaffected.
+- **MCP rendering** (`packages/mcp/src/index.ts`): a bundle whose snippet
+  came from SNIPPET_POLICY (any stream except `core:get_source`'s
+  `"sources"`, `core:build_context`'s `"context"`, and `core:search_text`'s
+  grep-style `"matches"`) renders as one or more `    | <line>` lines
+  (trimmed, non-empty, capped at 200 characters each) immediately after the
+  descriptor line -- visually distinct from `core:get_source`/
+  `core:build_context`'s pre-existing full, uncapped multi-line body
+  (plain 4-space indent, no `|`) and from `core:search_text`'s inline
+  grep-style `path: matched text` line. How many of those lines print is
+  `response_budget.snippet_lines` (default 1, 0 disables them, max 3) -- a
+  hidden option, never advertised in any tool's schema/description/
+  instructions, admitted at validation time the exact same way `render` is
+  (`withHiddenRenderProperty`). Decided in implementation: this option is
+  read directly off the raw MCP tool-call arguments and never enters
+  `options`/`response_budget`/the outgoing engine payload at all, because
+  this canonical model's own `response_budget` (`QueryOptions.response_budget`,
+  validated as an exact `{max_items, max_characters}` object,
+  `packages/engine/src/query-plan.ts`'s `validateBudget`) would reject any
+  extra field -- keeping it entirely inside the MCP adapter avoids treating
+  it as if it were part of this canonical contract, which it deliberately
+  is not. The pre-existing response-budget shedding pass
+  (`shedToBudget`) is unchanged and already drops every bundle's
+  `optional_source_snippets` (compact or full) before it ever drops a whole
+  bundle.
+- **Acceptance (R14, pending)**: whether `snippet_lines` defaults to 1 or to
+  0 (opt-in) is decided by a benchmark comparison (2 corridas of the
+  text+policy arm with snippets ON vs. the existing 3 corridas of that arm
+  without them) reserved for the plan's ola 3; this amendment ships the
+  mechanism with the default ON (`snippet_lines: 1`) pending that
+  measurement.

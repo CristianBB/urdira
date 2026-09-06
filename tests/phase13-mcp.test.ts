@@ -1046,4 +1046,197 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(page.result_sets[0]?.confirmed["previous_cursor"]).toBeUndefined();
     expect(page.result_sets[0]?.confirmed["next_cursor"]).toBe("next.sig");
   });
+
+  // Plan 2026-09-06 (Frente N, §5.1): inline one-line snippets attached by
+  // the engine's SNIPPET_POLICY (`core:find_references`/`core:get_outline`/
+  // `core:search_hybrid`/`core:search_semantic`) to bundles that never had a
+  // preview at all before this plan. These fixtures mirror
+  // `canonical-query-data-port.ts`'s `item()`/`semanticCandidateItem()`
+  // output shape exactly: a flat `recordValue()` object plus a sibling
+  // `optional_source_snippets` field, going through the same
+  // `buildStreamResultSets` fallback-wrap path "preserves source snippets
+  // when formatting the raw streams returned by a pipeline" (above)
+  // exercises for `core:get_source`'s already-full bundle shape.
+  it("renders a find_references reference's inline snippet as a compact one-line locator (\"| \" prefix, single line)", async () => {
+    const call = vi.fn(async () => success({
+      query_execution_id: "execution-snippet-line",
+      streams: {
+        references: {
+          items: [{
+            stable_sort_key: "confirmed rel-1",
+            value: {
+              subject_type: "relation",
+              record_id: "rel-1",
+              universal_kind: "core:call",
+              kind: "jsts:relation_call",
+              classification: "confirmed",
+              body: { path: "src/service.ts" },
+              source_span: { artifact_version_id: "artv-1", start_byte: "800", end_byte: "812", start_line: "42", end_line: "42" },
+              optional_source_snippets: [{ text: "  doStuff(x);", span: { artifact_version_id: "artv-1", start_byte: "798", end_byte: "812", start_line: "42", end_line: "42" }, truncated: false, redacted: false, redactions: [] }],
+            },
+          }],
+          has_next: false, has_previous: false,
+        },
+      },
+      completeness: { overall_status: "complete", dimensions: [] },
+    }));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    const result = await definition.invoke({
+      request_type: "query",
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } } },
+    });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toContain("src/service.ts:42");
+    expect(text).toContain("    | doStuff(x);");
+    // Compact style, unlike the search_text match style above: the locator
+    // and the snippet are on separate lines, never joined with ": ".
+    expect(text).not.toContain("src/service.ts:42: doStuff(x);");
+    expect(text).not.toContain("optional_source_snippets");
+  });
+
+  it("renders a get_outline root member's inline snippet as its opening (signature) line", async () => {
+    const call = vi.fn(async () => success({
+      query_execution_id: "execution-snippet-signature",
+      streams: {
+        members: {
+          items: [{
+            stable_sort_key: "confirmed entity-1",
+            value: {
+              subject_type: "entity",
+              record_id: "entity-1",
+              universal_kind: "core:function",
+              kind: "jsts:entity_callable",
+              classification: "confirmed",
+              body: { name: "createTask", path: "src/task-service.ts" },
+              source_span: { artifact_version_id: "artv-2", start_byte: "100", end_byte: "220", start_line: "10", end_line: "14" },
+              optional_source_snippets: [{ text: "createTask(input: TaskInput): Task {", span: { artifact_version_id: "artv-2", start_byte: "100", end_byte: "137", start_line: "10", end_line: "10" }, truncated: false, redacted: false, redactions: [] }],
+            },
+          }],
+          has_next: false, has_previous: false,
+        },
+      },
+      completeness: { overall_status: "complete", dimensions: [] },
+    }));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    const result = await definition.invoke({
+      request_type: "query",
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:get_outline", arguments: { container: { subject_type: "artifact", path: "src/task-service.ts" } } } },
+    });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toContain("createTask");
+    expect(text).toContain("    | createTask(input: TaskInput): Task {");
+  });
+
+  it("snippet_lines: 0 (hidden response_budget-adjacent option) disables the inline compact snippet line", async () => {
+    const call = vi.fn(async () => success({
+      query_execution_id: "execution-snippet-disabled",
+      streams: {
+        references: {
+          items: [{
+            stable_sort_key: "confirmed rel-2",
+            value: {
+              subject_type: "relation",
+              record_id: "rel-2",
+              universal_kind: "core:call",
+              kind: "jsts:relation_call",
+              classification: "confirmed",
+              body: { path: "src/service.ts" },
+              source_span: { artifact_version_id: "artv-1", start_byte: "800", end_byte: "812", start_line: "42", end_line: "42" },
+              optional_source_snippets: [{ text: "doStuff(x);", span: { artifact_version_id: "artv-1", start_byte: "798", end_byte: "812", start_line: "42", end_line: "42" }, truncated: false, redacted: false, redactions: [] }],
+            },
+          }],
+          has_next: false, has_previous: false,
+        },
+      },
+      completeness: { overall_status: "complete", dimensions: [] },
+    }));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    const result = await definition.invoke({
+      request_type: "query",
+      snippet_lines: 0,
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } } },
+    });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toContain("src/service.ts:42");
+    expect(text).not.toContain("    | ");
+    expect(text).not.toContain("doStuff(x);");
+  });
+
+  it("sheds inline compact snippets before dropping whole find_references bundles under a tight response budget", async () => {
+    const streams = {
+      references: {
+        items: Array.from({ length: 20 }, (_unused, index) => ({
+          stable_sort_key: String(index),
+          value: {
+            subject_type: "relation",
+            record_id: `rel-${index}`,
+            universal_kind: "core:call",
+            kind: "jsts:relation_call",
+            classification: "confirmed",
+            body: { path: `src/file-${index}.ts` },
+            source_span: { artifact_version_id: `artv-${index}`, start_byte: "0", end_byte: "10", start_line: "1", end_line: "1" },
+            optional_source_snippets: [{ text: `callSiteNumber${index}();`, span: { artifact_version_id: `artv-${index}`, start_byte: "0", end_byte: "10", start_line: "1", end_line: "1" }, truncated: false, redacted: false, redactions: [] }],
+          },
+        })),
+        has_next: false, has_previous: false,
+      },
+    };
+    const call = vi.fn(async () => success({ query_execution_id: "execution-shed-snippets", streams, completeness: { overall_status: "complete", dimensions: [] } }));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    const result = await definition.invoke({
+      request_type: "query",
+      query: {
+        api_version: 3,
+        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+        expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } },
+        options: { response_budget: { max_characters: 300 } },
+      },
+    });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toMatch(/^TRUNCATED: dropped \d+ items? \(response_budget\)$/m);
+    // `shedToBudget` trims every bundle's `optional_source_snippets` in one
+    // unconditional pass BEFORE it ever drops a whole bundle from the tail
+    // -- so reaching whole-bundle dropping (asserted below) proves every
+    // surviving bundle's compact snippet line is already gone.
+    expect(text).not.toContain("    | ");
+    expect(text).not.toContain("callSiteNumber");
+    expect(text).not.toContain("src/file-19.ts");
+  });
+
+  it("renders identical compact-snippet text for two identical invocations (deterministic)", async () => {
+    const buildPayload = () => success({
+      query_execution_id: "execution-determinism",
+      streams: {
+        references: {
+          items: [{
+            stable_sort_key: "confirmed rel-1",
+            value: {
+              subject_type: "relation",
+              record_id: "rel-1",
+              universal_kind: "core:call",
+              kind: "jsts:relation_call",
+              classification: "confirmed",
+              body: { path: "src/service.ts" },
+              source_span: { artifact_version_id: "artv-1", start_byte: "800", end_byte: "812", start_line: "42", end_line: "42" },
+              optional_source_snippets: [{ text: "doStuff(x);", span: { artifact_version_id: "artv-1", start_byte: "798", end_byte: "812", start_line: "42", end_line: "42" }, truncated: false, redacted: false, redactions: [] }],
+            },
+          }],
+          has_next: false, has_previous: false,
+        },
+      },
+      completeness: { overall_status: "complete", dimensions: [] },
+    });
+    const call = vi.fn(async () => buildPayload());
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    const args = {
+      request_type: "query",
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } } },
+    };
+    const first = await definition.invoke(args);
+    const second = await definition.invoke(args);
+    const firstText = (first.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    const secondText = (second.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(firstText).toBe(secondText);
+    expect(firstText).toContain("    | doStuff(x);");
+  });
 });

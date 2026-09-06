@@ -214,6 +214,35 @@ const renderFieldSchema: JsonSchema = {
   description: "Output projection for this call. Optional; default: text -- a compact, grep-like plain-text rendering instead of the full JSON envelope. Source bundles retain all snippet text admitted by the query response budget. Pass \"json\" to get the complete structured page (result ids, digests, completeness/diagnostic scaffolding, cursors) for debugging or programmatic consumption.",
 };
 
+// Plan 2026-09-06 (Frente N, §5.1.3): a hidden top-level debug knob, added
+// and hidden the exact same way as `render` right above -- never advertised
+// in any tool's input_schema, description, or MCP_SERVER_INSTRUCTIONS, for
+// the identical reason the comment above `renderFieldSchema` gives (a
+// visible knob gets used reflexively, re-inflating the response an agent
+// pays for). Decided in implementation: the plan's own text describes this
+// as living "in response_budget", but `response_budget` (nested under
+// `options`, or top-level for a continuation/index-status request) is part
+// of the payload forwarded verbatim to the engine, whose own
+// `options.response_budget` validation (`query-plan.ts`'s `validateBudget`,
+// an `exactObject` over exactly `max_items`/`max_characters`) would reject
+// any extra field -- accepting it there would need this MCP adapter to
+// thread it through and strip it back out at every one of the four
+// `response_budget`-embedding payload-construction sites
+// (`queryPayload`'s two branches, `queryRequestFromIntent`,
+// `indexStatusPayload`'s two branches) before the engine ever sees it.
+// Living beside `render` avoids all of that: it is read directly off the
+// raw tool call arguments in `invoke()` below and never enters `options`/
+// `response_budget`/the outgoing IPC payload at all, so the engine's schema
+// is completely unaware of it.
+const snippetLinesFieldSchema: JsonSchema = {
+  type: "integer",
+  minimum: 0,
+  maximum: 3,
+  description: "Number of source-snippet lines rendered inline per compact-text result for structural/discovery bundles (core:find_references/core:get_outline/core:search_hybrid/core:search_semantic). Optional; default: 1. 0 disables inline snippet lines.",
+};
+
+const DEFAULT_SNIPPET_LINES = 1;
+
 const responseBudgetSchema: JsonSchema = objectSchema({
   max_items: { type: "integer", minimum: 1, description: "Maximum result bundles to hydrate across all streams. Optional; default: 50." },
   max_characters: { type: "integer", minimum: 1, description: "Hard ceiling on the serialized envelope size in characters; an over-budget response is shed deterministically to fit. Optional; default: 20000." },
@@ -677,7 +706,7 @@ async function invokeBenchmarkDiscover(
   const queryResponse = await dependencies.client.call(query.call, query.payload, requestOptions);
   result["internal_calls"] = ["core:index_status", query.call];
   result["artifact_lookup"] = queryResponse.outcome === "success"
-    ? { path, result: renderQueryPageText(publicQueryPage(queryResponse.payload, "single_workspace", extractResponseBudget(query.call, query.payload), { render: "text", page_kind: "query" }) as JsonRecord) }
+    ? { path, result: renderQueryPageText(publicQueryPage(queryResponse.payload, "single_workspace", extractResponseBudget(query.call, query.payload), { render: "text", page_kind: "query", snippet_lines: DEFAULT_SNIPPET_LINES }) as JsonRecord) }
     : { path, error: responseError(queryResponse) };
   return { content: [{ type: "text", text: stableJson(result) }] };
 }
@@ -851,11 +880,16 @@ function shedToBudget(envelope: JsonRecord, maxCharacters: number, measure: (val
 // in the default "text" mode, or the serialized JSON envelope in "json"
 // mode -- not always the latter, which is how this used to work before text
 // rendering existed.
-export interface RenderContext { readonly render: "text" | "json"; readonly page_kind: "query" | "index_status"; }
+// `snippet_lines` (plan 2026-09-06, Frente N): how many lines of a compact
+// structural/discovery bundle's inline snippet `renderQueryPageText` prints
+// -- part of the render context (not just a call-site parameter) because
+// `measureForRender` must measure the SAME text `renderQueryPageText` will
+// actually emit, or `shedToBudget` sheds against the wrong length.
+export interface RenderContext { readonly render: "text" | "json"; readonly page_kind: "query" | "index_status"; readonly snippet_lines: number; }
 
 function measureForRender(renderContext: RenderContext): (value: JsonRecord) => number {
   if (renderContext.render === "json") return (value) => stableJson(value).length;
-  return renderContext.page_kind === "index_status" ? (value) => renderIndexStatusText(value).length : (value) => renderQueryPageText(value).length;
+  return renderContext.page_kind === "index_status" ? (value) => renderIndexStatusText(value).length : (value) => renderQueryPageText(value, renderContext.snippet_lines).length;
 }
 
 function finalizeEnvelope(envelope: JsonRecord, responseBudget: { readonly max_characters?: unknown } | undefined, renderContext: RenderContext): JsonRecord {
@@ -894,13 +928,30 @@ function buildStreamResultSets(streams: JsonRecord): JsonRecord[] {
       const value = "value" in streamItem ? streamItem["value"] : item;
       if (isRecord(value) && "result_set" in value && "primary_result" in value && "assessment" in value) return value;
       const classification = streamItem["result_classification"] === "possible" ? "possible" : "confirmed";
+      // Plan 2026-09-06 (Frente N, SNIPPET_POLICY): a raw record value that
+      // reaches this fallback (get_source/build_context already build the
+      // full bundle shape themselves, above) may still carry an
+      // engine-attached `optional_source_snippets` field directly on itself
+      // (`item()`/`semanticCandidateItem()` in
+      // packages/engine/src/canonical-query-data-port.ts). Lift it to this
+      // bundle's own top-level field -- where every other bundle shape, and
+      // `describeBundle` below, expects to find it -- and strip it back out
+      // of `primary_result` so that payload matches exactly what it looked
+      // like before this plan.
+      const valueRecord = isRecord(value) ? value : undefined;
+      const snippetsField = valueRecord?.["optional_source_snippets"];
+      let primaryResult: unknown = value;
+      if (valueRecord !== undefined && "optional_source_snippets" in valueRecord) {
+        const { optional_source_snippets: _droppedSnippets, ...rest } = valueRecord;
+        primaryResult = rest;
+      }
       return {
         result_set: resultSet,
-        primary_result: value,
+        primary_result: primaryResult,
         assessment: { classification, completeness: "complete" },
         provenance_path: Array.isArray(streamItem["provenance_path"]) ? streamItem["provenance_path"] : [],
         essential_related_entities: [],
-        optional_source_snippets: [],
+        optional_source_snippets: Array.isArray(snippetsField) ? snippetsField : [],
       };
     });
     const stream = { classification: "confirmed", page_mode: "summary", result_bundles: bundles, total: bundles.length, ...(typeof page["next_cursor"] === "string" ? { next_cursor: page["next_cursor"] } : {}), has_next: page["has_next"] === true, has_previous: page["has_previous"] === true };
@@ -1004,6 +1055,19 @@ interface BundleDescriptor {
   readonly label: string;
   readonly snippetText?: string | undefined;
   readonly isMatchStyle: boolean;
+  /**
+   * Plan 2026-09-06 (Frente N, §5.1.3): true for a bundle whose snippet was
+   * attached by the SNIPPET_POLICY inline hydration
+   * (`core:find_references`/`core:get_outline`/`core:search_hybrid`/
+   * `core:search_semantic` -- see `canonical-query-data-port.ts`'s
+   * SNIPPET_POLICY doc comment), never for `core:get_source`/
+   * `core:build_context`'s own much larger, caller-configured snippets
+   * (`resultSetLabel` "sources"/"context") or `core:search_text`'s
+   * grep-style match (`isMatchStyle`). Rendered as one or more `    | `
+   * lines, capped at `snippet_lines` (default 1) -- unlike the full-body
+   * style below, which never re-truncates a caller-configured read.
+   */
+  readonly isCompactSnippetStyle: boolean;
 }
 
 /** Best-effort line number: only ever present when a producer already attached one (see the module doc comment above) -- never derived from a byte/character offset here. */
@@ -1054,7 +1118,7 @@ function describeSemanticCoverage(view: JsonRecord): BundleDescriptor {
   const page = isRecord(view["affected_artifact_page"]) ? view["affected_artifact_page"] as JsonRecord : undefined;
   const nextCursor = page !== undefined ? firstNonEmptyString(page["next_cursor"]) : undefined;
   const setSuffix = setId !== undefined ? ` (set ${setId}${nextCursor !== undefined ? `; next: ${nextCursor}` : ""})` : "";
-  return { label: `coverage: covered ${formatCount(covered)}/${formatCount(total)} · pending ${formatCount(pending)} · failed ${formatCount(failed)} · excluded ${formatCount(excluded)}${setSuffix}`, isMatchStyle: false };
+  return { label: `coverage: covered ${formatCount(covered)}/${formatCount(total)} · pending ${formatCount(pending)} · failed ${formatCount(failed)} · excluded ${formatCount(excluded)}${setSuffix}`, isMatchStyle: false, isCompactSnippetStyle: false };
 }
 
 /** One `path (status: reason)` line for a `SemanticAffectedArtifactView`, shared by `describeSemanticAffectedPage` below. */
@@ -1090,7 +1154,7 @@ function describeSemanticAffectedPage(view: JsonRecord): BundleDescriptor {
     // the next `core:semantic_affected_page` call's own `cursor` argument.
     lines.push(`MORE: call core:semantic_affected_page again with the same affected_artifact_set_id and cursor=${view["next_cursor"]}`);
   }
-  return { label: lines.join("\n"), isMatchStyle: false };
+  return { label: lines.join("\n"), isMatchStyle: false, isCompactSnippetStyle: false };
 }
 
 function describeBundle(bundle: JsonRecord, resultSetLabel: string): BundleDescriptor {
@@ -1119,6 +1183,17 @@ function describeBundle(bundle: JsonRecord, resultSetLabel: string): BundleDescr
   // match_count) as grep-style results; otherwise source retrieval would
   // collapse the snippet to its first line and hide the pipeline's evidence.
   const isMatchStyle = resultSetLabel === "matches" || typeof primary["match_count"] === "number";
+  // Plan 2026-09-06 (Frente N, §5.1.3): "sources" (`core:get_source`) and
+  // "context" (`core:build_context`) are the two labels whose snippet the
+  // CALLER explicitly sized (`options.snippets`, up to thousands of
+  // characters) -- those keep the pre-existing full, uncapped multi-line
+  // render below. Every other labeled stream that carries a snippet at all
+  // got it from the new SNIPPET_POLICY inline hydration (`references`,
+  // `members`, `candidates`, and any future policy entry), which is always
+  // <= `INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET` (200 chars) and effectively
+  // one line already (`"line"`/`"signature"` mode, `context_lines: 0`) --
+  // render those compactly, capped at `snippet_lines`.
+  const isCompactSnippetStyle = !isMatchStyle && resultSetLabel !== "sources" && resultSetLabel !== "context";
 
   let label: string;
   if (subjectType === "diagnostic") {
@@ -1135,10 +1210,12 @@ function describeBundle(bundle: JsonRecord, resultSetLabel: string): BundleDescr
     label = compactPreview(primary);
   }
 
-  return { path, line, label, snippetText, isMatchStyle };
+  return { path, line, label, snippetText, isMatchStyle, isCompactSnippetStyle };
 }
 
-function formatDescriptorLine(descriptor: BundleDescriptor, possible: boolean, grouped: boolean): string {
+const COMPACT_SNIPPET_LINE_MAX_CHARS = 200;
+
+function formatDescriptorLine(descriptor: BundleDescriptor, possible: boolean, grouped: boolean, snippetLines: number): string {
   const suffix = possible ? " [possible]" : "";
   const locator = descriptor.line !== undefined ? `:${descriptor.line}` : "";
   const head = grouped ? locator : descriptor.path !== undefined ? `${descriptor.path}${locator}` : locator;
@@ -1150,17 +1227,32 @@ function formatDescriptorLine(descriptor: BundleDescriptor, possible: boolean, g
 
   const primaryLine = `${head.length > 0 ? `${head} ` : ""}${descriptor.label}${suffix}`;
   if (descriptor.snippetText === undefined || descriptor.snippetText.length === 0) return primaryLine;
+
+  // Plan 2026-09-06 (Frente N, §5.1.3): SNIPPET_POLICY-hydrated bundles
+  // render as one or more `    | <line>` lines, trimmed and capped at
+  // `COMPACT_SNIPPET_LINE_MAX_CHARS`, up to `snippet_lines` non-empty
+  // lines -- `snippet_lines: 0` (hidden `response_budget`-adjacent option,
+  // see `snippetLinesFieldSchema`) omits the snippet entirely.
+  if (descriptor.isCompactSnippetStyle) {
+    if (snippetLines <= 0) return primaryLine;
+    const nonEmptyLines = descriptor.snippetText.split("\n").map((segment) => segment.trim()).filter((segment) => segment.length > 0);
+    if (nonEmptyLines.length === 0) return primaryLine;
+    const shown = nonEmptyLines.slice(0, snippetLines).map((segment) => segment.length > COMPACT_SNIPPET_LINE_MAX_CHARS ? `${segment.slice(0, COMPACT_SNIPPET_LINE_MAX_CHARS)}…` : segment);
+    const compactLines = shown.map((segment) => `    | ${segment}`).join("\n");
+    return `${primaryLine}\n${compactLines}`;
+  }
+
   // The query engine has already applied the caller's per-snippet, total
   // snippet, and serialized-response budgets. Do not impose a second hidden
   // line cap here: doing so makes a successful `core:get_source` body read
   // indistinguishable from an arbitrarily truncated result and pushes agents
   // toward repeated searches or native source-reading fallbacks.
-  const snippetLines = descriptor.snippetText.split("\n").map((segment) => `    ${segment}`).join("\n");
-  return `${primaryLine}\n${snippetLines}`;
+  const snippetLinesText = descriptor.snippetText.split("\n").map((segment) => `    ${segment}`).join("\n");
+  return `${primaryLine}\n${snippetLinesText}`;
 }
 
 /** Groups consecutive same-path descriptors under one `== path ==` header (ripgrep-style), matching grep -n output for a lone match and avoiding repeating the path for a run of several. */
-function appendGroupedDescriptors(descriptors: readonly BundleDescriptor[], possible: boolean, lines: string[]): void {
+function appendGroupedDescriptors(descriptors: readonly BundleDescriptor[], possible: boolean, lines: string[], snippetLines: number): void {
   let index = 0;
   while (index < descriptors.length) {
     let end = index + 1;
@@ -1169,18 +1261,18 @@ function appendGroupedDescriptors(descriptors: readonly BundleDescriptor[], poss
     const path = descriptors[index]!.path;
     if (runLength > 1 && path !== undefined) {
       lines.push(`== ${path} ==`);
-      for (let cursor = index; cursor < end; cursor += 1) lines.push(formatDescriptorLine(descriptors[cursor]!, possible, true));
+      for (let cursor = index; cursor < end; cursor += 1) lines.push(formatDescriptorLine(descriptors[cursor]!, possible, true, snippetLines));
     } else {
-      lines.push(formatDescriptorLine(descriptors[index]!, possible, false));
+      lines.push(formatDescriptorLine(descriptors[index]!, possible, false, snippetLines));
     }
     index = end;
   }
 }
 
-function appendStreamLines(resultSetLabel: string, streamPage: unknown, possible: boolean, lines: string[], cursors: { readonly label: string; readonly cursor: string }[]): void {
+function appendStreamLines(resultSetLabel: string, streamPage: unknown, possible: boolean, lines: string[], cursors: { readonly label: string; readonly cursor: string }[], snippetLines: number): void {
   if (!isRecord(streamPage)) return;
   const bundles = Array.isArray(streamPage["result_bundles"]) ? streamPage["result_bundles"] as JsonRecord[] : [];
-  if (bundles.length > 0) appendGroupedDescriptors(bundles.map((bundle) => describeBundle(bundle, resultSetLabel)), possible, lines);
+  if (bundles.length > 0) appendGroupedDescriptors(bundles.map((bundle) => describeBundle(bundle, resultSetLabel)), possible, lines, snippetLines);
   if (streamPage["has_next"] === true && typeof streamPage["next_cursor"] === "string" && streamPage["next_cursor"].length > 0) {
     cursors.push({ label: `${resultSetLabel}.${possible ? "possible" : "confirmed"}`, cursor: streamPage["next_cursor"] });
   }
@@ -1223,8 +1315,8 @@ function bundleCountOf(resultSet: JsonRecord): number {
   return bundlesOf(resultSet["confirmed"]).length + bundlesOf(resultSet["possible"]).length;
 }
 
-/** Renders a `QueryResultPage`-shaped envelope (see `publicQueryPage`) as compact, grep/ctags-density plain text. This is the default `content[0].text` for `urdira_query`/`urdira_analyze_change`/`urdira_build_context`; the full JSON page is still reachable via `render: "json"`. */
-function renderQueryPageText(page: JsonRecord): string {
+/** Renders a `QueryResultPage`-shaped envelope (see `publicQueryPage`) as compact, grep/ctags-density plain text. This is the default `content[0].text` for `urdira_query`/`urdira_analyze_change`/`urdira_build_context`; the full JSON page is still reachable via `render: "json"`. `snippetLines` (plan 2026-09-06, Frente N) caps how many lines of a SNIPPET_POLICY-hydrated bundle's inline snippet get printed; optional, default 1 (see `DEFAULT_SNIPPET_LINES`). */
+function renderQueryPageText(page: JsonRecord, snippetLines: number = DEFAULT_SNIPPET_LINES): string {
   const resultSets = Array.isArray(page["result_sets"]) ? page["result_sets"] as JsonRecord[] : [];
   const totalItems = typeof page["returned_items"] === "number" ? page["returned_items"] : resultSets.reduce((sum, resultSet) => sum + bundleCountOf(resultSet), 0);
 
@@ -1252,8 +1344,8 @@ function renderQueryPageText(page: JsonRecord): string {
   for (const resultSet of nonEmptySets) {
     const label = firstNonEmptyString(resultSet["result_set"]) ?? "results";
     if (showStreamHeaders) lines.push(`## ${label}`);
-    appendStreamLines(label, resultSet["confirmed"], false, lines, cursors);
-    appendStreamLines(label, resultSet["possible"], true, lines, cursors);
+    appendStreamLines(label, resultSet["confirmed"], false, lines, cursors, snippetLines);
+    appendStreamLines(label, resultSet["possible"], true, lines, cursors, snippetLines);
     if (showStreamHeaders) lines.push("");
   }
 
@@ -1390,6 +1482,8 @@ export interface FormatUrdiraResultOptions {
   readonly page_kind?: "query" | "index_status";
   /** Optional; default: "agent". The web profile adds schema-validated structuredContent. */
   readonly presentation_profile?: McpPresentationProfile;
+  /** Optional; default: 1. See `snippetLinesFieldSchema`. */
+  readonly snippet_lines?: number;
 }
 
 // A live benchmark (2026-08-14) found that Claude Code's MCP client reads
@@ -1431,7 +1525,7 @@ export function formatUrdiraResult(value: unknown, options: FormatUrdiraResultOp
   }
   const page = isRecord(stable) ? stable : {};
   const pageKind = options.page_kind ?? "query";
-  const text = pageKind === "index_status" ? renderIndexStatusText(page) : renderQueryPageText(page);
+  const text = pageKind === "index_status" ? renderIndexStatusText(page) : renderQueryPageText(page, options.snippet_lines ?? DEFAULT_SNIPPET_LINES);
   const result: CallToolResult = {
     content: [{ type: "text", text }],
   };
@@ -1534,6 +1628,11 @@ async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { c
   const raw = requireRecord(input, "tool arguments");
   const canonical = canonicalKeys(raw);
   const render: "text" | "json" = isRecord(canonical) && canonical["render"] === "json" ? "json" : "text";
+  // Plan 2026-09-06 (Frente N, §5.1.3): read off the raw args exactly like
+  // `render` above -- see `snippetLinesFieldSchema`'s doc comment for why
+  // this stays outside `options`/`response_budget` entirely.
+  const rawSnippetLines = isRecord(canonical) ? canonical["snippet_lines"] : undefined;
+  const snippetLines = typeof rawSnippetLines === "number" && Number.isSafeInteger(rawSnippetLines) ? Math.max(0, Math.min(3, rawSnippetLines)) : DEFAULT_SNIPPET_LINES;
   const indexStatus = name === "urdira_index_status";
   const query = name === "urdira_query" ? queryPayload(input) : undefined;
   const payload = query?.payload ?? (indexStatus ? indexStatusPayload(input) : queryRequestFromIntent(name === "urdira_analyze_change" ? "core:analyze_impact" : "core:build_context", requireRecord(canonical, "tool arguments")));
@@ -1553,7 +1652,7 @@ async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { c
   const scopeKind = isRecord(payload["scope"]) && payload["scope"]["scope_type"] === "comparison" ? "comparison" : "single_workspace";
   const responseBudget = extractResponseBudget(call, payload);
   const pageKind: "query" | "index_status" = call === "core:index_status" ? "index_status" : "query";
-  const renderContext: RenderContext & { readonly presentation_profile: McpPresentationProfile } = { render, page_kind: pageKind, presentation_profile: presentationProfile };
+  const renderContext: RenderContext & { readonly presentation_profile: McpPresentationProfile } = { render, page_kind: pageKind, presentation_profile: presentationProfile, snippet_lines: snippetLines };
   const page = response.outcome === "success"
     ? (call === "core:index_status" ? publicIndexStatusPage(response.payload) : publicQueryPage(response.payload, scopeKind, responseBudget, renderContext))
     : { error: responseError(response) };
@@ -1817,9 +1916,13 @@ function mcpContext(context: ServerContext, lifecycle: { active: boolean }): Urd
 // A client that never learns `render` exists from the schema, description,
 // or instructions has no way to discover it; a client (or debugger) that
 // already knows to pass render:"json" still gets it honored.
+//
+// Plan 2026-09-06 (Frente N): `snippet_lines` (see `snippetLinesFieldSchema`
+// above) rides the exact same mechanism -- re-admitted here, read directly
+// off the raw args in `invoke()`, never advertised.
 function withHiddenRenderProperty(schema: JsonSchema): JsonSchema {
   if (!isRecord(schema) || !isRecord(schema["properties"])) return schema;
-  return { ...schema, properties: { ...(schema["properties"] as Record<string, JsonSchema>), render: renderFieldSchema } } as JsonSchema;
+  return { ...schema, properties: { ...(schema["properties"] as Record<string, JsonSchema>), render: renderFieldSchema, snippet_lines: snippetLinesFieldSchema } } as JsonSchema;
 }
 
 function hiddenRenderInputSchema(publicSchema: JsonSchema): ReturnType<typeof fromJsonSchema> {

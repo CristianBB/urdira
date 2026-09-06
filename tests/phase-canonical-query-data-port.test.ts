@@ -865,6 +865,211 @@ describe("CanonicalRecordQueryDataPort core:get_source", () => {
   });
 });
 
+// Plan 2026-09-06 (Frente N, §5.1): SNIPPET_POLICY inline one-line snippets
+// for `core:find_references` ("line") and `core:get_outline` ("signature",
+// level-0/root members only). Reuses this file's `FILE_TEXT`/`stubPort`
+// fixtures (`GREET_START`/`GREET_END`/`FAREWELL_START`/`FAREWELL_END` --
+// `FILE_TEXT`'s own doc comment above gives the exact line layout) so the
+// hydrated snippet text/line numbers can be asserted exactly, the same way
+// the `core:get_source` tests above do.
+describe("CanonicalRecordQueryDataPort SNIPPET_POLICY inline snippets (plan 2026-09-06, Frente N)", () => {
+  // `  return "bye";\n` is FILE_TEXT's line 6 (1: `function greet() {`, 2:
+  // `  return "hello";`, 3: `}`, 4: ``, 5: `function farewell() {`, 6: `  return
+  // "bye";`). The relation's own span sits INSIDE that line (just the
+  // `"bye"` token) so "line" mode's line-alignment (not merely `[start,
+  // end)`) is what makes the returned snippet the whole line.
+  const BYE_TOKEN_START = FILE_TEXT.indexOf("\"bye\"");
+  const BYE_TOKEN_END = BYE_TOKEN_START + "\"bye\"".length;
+  const BYE_LINE_START = FILE_TEXT.lastIndexOf("\n", BYE_TOKEN_START - 1) + 1;
+  const BYE_LINE_END = FILE_TEXT.indexOf("\n", BYE_TOKEN_END) + 1;
+
+  function callRelation(recordId: string, sourceId: string, targetId: string): CanonicalQueryRecord {
+    return {
+      record_id: recordId,
+      workspace_id: workspace.workspace_id,
+      category: "relation",
+      kind: "jsts:relation_call",
+      universal_kind: "core:call",
+      owner_artifact_id: "art-1",
+      owner_artifact_version_id: "artv-1",
+      facets: [],
+      body: { source_id: sourceId, target_id: targetId, classification: "confirmed" },
+      primary_source_span: { artifact_version_id: "artv-1", start_byte: String(BYE_TOKEN_START), end_byte: String(BYE_TOKEN_END), start_line: "6", end_line: "6" },
+    };
+  }
+
+  function findReferencesPort(): CanonicalRecordQueryDataPort {
+    return new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [
+        stubRecord("rec-greet", "artv-1", { path: "src/a.ts", start: GREET_START, end: GREET_END, name: "greet" }),
+        stubRecord("rec-farewell", "artv-1", { path: "src/a.ts", start: FAREWELL_START, end: FAREWELL_END, name: "farewell" }),
+        callRelation("rec-call-1", "rec-farewell", "rec-greet"),
+      ],
+    }));
+  }
+
+  it("core:find_references attaches a one-line \"line\"-mode snippet (the full source line, not merely the reference token) with a correct start_line", async () => {
+    const port = findReferencesPort();
+    const evaluation = await port.execute({
+      operation_id: "core:find_references",
+      result_streams: ["references", "owners"],
+      arguments: { target: { subject_type: "symbol", name: "greet" } },
+      scope,
+    });
+    const references = (evaluation.streams["references"] ?? []) as readonly { readonly value: unknown }[];
+    expect(references).toHaveLength(1);
+    const value = references[0]!.value as { source_span?: { start_line?: string; end_line?: string }; optional_source_snippets?: readonly { text: string; span: { start_byte: string; end_byte: string; start_line?: string; end_line?: string } }[] };
+    const snippets = value.optional_source_snippets ?? [];
+    expect(snippets).toHaveLength(1);
+    const snippet = snippets[0]!;
+    // The whole line, not `FILE_TEXT.slice(BYE_TOKEN_START, BYE_TOKEN_END)`
+    // (which would be just `"bye"`) -- proves "line" mode extends to the
+    // enclosing line rather than reusing the raw `[start, end)` span like
+    // "signature"/"relevant"/"body" do.
+    expect(snippet.text).toBe(FILE_TEXT.slice(BYE_LINE_START, BYE_LINE_END));
+    expect(snippet.text).toContain("bye");
+    expect(snippet.span.start_byte).toBe(String(BYE_LINE_START));
+    expect(snippet.span.end_byte).toBe(String(BYE_LINE_END));
+    // `context_lines: 0` -- the stored canonical span's own line numbers are
+    // reused verbatim (`sourceSnippet`'s `useStoredLines` branch), so this
+    // matches the bundle's own `source_span.start_line`/`end_line` exactly.
+    expect(snippet.span.start_line).toBe("6");
+    expect(snippet.span.end_line).toBe("6");
+    expect(snippet.span.start_line).toBe(value.source_span?.start_line);
+    expect(snippet.span.end_line).toBe(value.source_span?.end_line);
+  });
+
+  it("core:find_references omits the snippet (never fails the query) when the artifact text is unavailable", async () => {
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [
+        stubRecord("rec-greet", "artv-1", { path: "src/a.ts", start: GREET_START, end: GREET_END, name: "greet" }),
+        stubRecord("rec-farewell", "artv-missing", { path: "src/b.ts", start: 0, end: 3, name: "farewell" }),
+        { ...callRelation("rec-call-2", "rec-farewell", "rec-greet"), owner_artifact_version_id: "artv-missing", primary_source_span: { artifact_version_id: "artv-missing", start_byte: "0", end_byte: "1", start_line: "1", end_line: "1" } },
+      ],
+    }));
+    const evaluation = await port.execute({
+      operation_id: "core:find_references",
+      result_streams: ["references", "owners"],
+      arguments: { target: { subject_type: "symbol", name: "greet" } },
+      scope,
+    });
+    const references = (evaluation.streams["references"] ?? []) as readonly { readonly value: unknown }[];
+    expect(references).toHaveLength(1);
+    const value = references[0]!.value as { optional_source_snippets?: readonly unknown[] };
+    expect(value.optional_source_snippets ?? []).toEqual([]);
+  });
+
+  function containsRelation(recordId: string, sourceId: string, targetId: string): CanonicalQueryRecord {
+    return {
+      record_id: recordId,
+      workspace_id: workspace.workspace_id,
+      category: "relation",
+      kind: "jsts:relation_contains",
+      universal_kind: "core:contains",
+      owner_artifact_id: "art-1",
+      owner_artifact_version_id: "artv-1",
+      facets: [],
+      body: { source_id: sourceId, target_id: targetId, classification: "confirmed" },
+    };
+  }
+
+  it("core:get_outline attaches a one-line \"signature\"-mode snippet only to level-0 (root) members, never deeper-nested ones", async () => {
+    const moduleRecord = stubRecord("rec-module", "artv-1", { path: "src/a.ts", name: "a.ts" });
+    const rootMember = stubRecord("rec-farewell", "artv-1", { path: "src/a.ts", start: FAREWELL_START, end: FAREWELL_END, name: "farewell" });
+    const nestedMember = stubRecord("rec-greet", "artv-1", { path: "src/a.ts", start: GREET_START, end: GREET_END, name: "greet" });
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [
+        moduleRecord,
+        rootMember,
+        nestedMember,
+        containsRelation("rec-contains-1", "rec-module", "rec-farewell"),
+        containsRelation("rec-contains-2", "rec-farewell", "rec-greet"),
+      ],
+    }));
+    const evaluation = await port.execute({
+      operation_id: "core:get_outline",
+      result_streams: ["members", "pending_sites"],
+      arguments: { container: { subject_type: "entity", entity_id: "rec-module" }, depth: 2 },
+      scope,
+    });
+    const members = (evaluation.streams["members"] ?? []) as readonly { readonly value: unknown }[];
+    expect(members.map((entry) => (entry.value as { record_id: string }).record_id)).toEqual(expect.arrayContaining(["rec-farewell", "rec-greet"]));
+
+    const rootEntry = members.find((entry) => (entry.value as { record_id: string }).record_id === "rec-farewell")!;
+    const rootSnippets = (rootEntry.value as { optional_source_snippets?: readonly { text: string }[] }).optional_source_snippets ?? [];
+    expect(rootSnippets).toHaveLength(1);
+    // "signature" mode: the first line of the body, not the whole
+    // (3-line) `farewell` function.
+    expect(rootSnippets[0]!.text).toBe(FILE_TEXT.slice(FAREWELL_START, FILE_TEXT.indexOf("\n", FAREWELL_START)));
+
+    const nestedEntry = members.find((entry) => (entry.value as { record_id: string }).record_id === "rec-greet")!;
+    const nestedSnippets = (nestedEntry.value as { optional_source_snippets?: readonly unknown[] }).optional_source_snippets ?? [];
+    expect(nestedSnippets).toEqual([]);
+  });
+
+  /**
+   * Plan 2026-09-06 (Frente N, §5.1.2): "una lectura CAS por artefacto
+   * distinto (LRU 64); mide p95 de find_references con 50 resultados ...
+   * (test de tiempo orientativo, no gate); si sube > 30 ms, TEXT_CACHE_LIMIT
+   * a 256." Orientative only -- no hard threshold assertion (a shared CI
+   * runner is not a clean-room timing environment, and the plan itself
+   * calls this "no gate"). Measures the ADDED cost of this front's own
+   * hydration: 50 `references` bundles across 50 distinct artifact_version_
+   * ids (within `TEXT_CACHE_LIMIT`'s 64-entry cap, so no eviction pressure)
+   * with a real per-call CAS read, against the identical 50-bundle query
+   * with no content reader at all (this operation's exact pre-plan
+   * behavior: zero CAS reads, no snippets). The p95 delta is logged via
+   * `console.info` for the evidence record; see the final report for the
+   * observed number and the TEXT_CACHE_LIMIT decision it produced.
+   */
+  it("p95 of core:find_references with 50 bundles: measures the added cost of inline snippet hydration (orientative)", async () => {
+    const fileTextFor = (index: number): string => `// file ${index}\nfunction caller${index}() {\n  target(${index});\n}\n`;
+    const targetSpanStart = 0;
+    const targetSpanEnd = 6;
+    const records: CanonicalQueryRecord[] = [
+      { record_id: "rec-target", workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: "art-target", owner_artifact_version_id: "artv-target", facets: [], body: { path: "src/target.ts", start: targetSpanStart, end: targetSpanEnd, name: "target" } },
+    ];
+    for (let index = 0; index < 50; index += 1) {
+      const text = fileTextFor(index);
+      const callStart = text.indexOf(`target(${index})`);
+      const callEnd = callStart + `target(${index})`.length;
+      records.push({ record_id: `rec-caller-${index}`, workspace_id: workspace.workspace_id, category: "entity", kind: "function_declaration", universal_kind: "core:function", owner_artifact_id: `art-${index}`, owner_artifact_version_id: `artv-${index}`, facets: [], body: { path: `src/caller-${index}.ts`, name: `caller${index}` } });
+      records.push({
+        record_id: `rec-call-${index}`, workspace_id: workspace.workspace_id, category: "relation", kind: "jsts:relation_call", universal_kind: "core:call",
+        owner_artifact_id: `art-${index}`, owner_artifact_version_id: `artv-${index}`, facets: [],
+        body: { source_id: `rec-caller-${index}`, target_id: "rec-target", classification: "confirmed" },
+        primary_source_span: { artifact_version_id: `artv-${index}`, start_byte: String(callStart), end_byte: String(callEnd), start_line: "3", end_line: "3" },
+      });
+    }
+    const operation = { operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "symbol", name: "target" } }, scope };
+
+    const withoutContent = new CanonicalRecordQueryDataPort(stubPort({ records: async () => records, artifact_text: async () => undefined }));
+    const withContent = new CanonicalRecordQueryDataPort(stubPort({ records: async () => records, artifact_text: async (_scope, artifactVersionId) => {
+      const match = /^artv-(\d+)$/.exec(artifactVersionId);
+      return match === undefined || match === null ? undefined : { text: fileTextFor(Number(match[1])) };
+    } }));
+
+    const timeRuns = async (port: CanonicalRecordQueryDataPort, runs: number): Promise<number[]> => {
+      const samples: number[] = [];
+      for (let run = 0; run < runs; run += 1) {
+        const start = performance.now();
+        await port.execute(operation);
+        samples.push(performance.now() - start);
+      }
+      return samples;
+    };
+    const p95 = (samples: number[]): number => [...samples].sort((left, right) => left - right)[Math.floor(samples.length * 0.95)]!;
+
+    await timeRuns(withoutContent, 3); // warm up JIT/module-level caches
+    await timeRuns(withContent, 3);
+    const baseline = p95(await timeRuns(withoutContent, 20));
+    const withSnippets = p95(await timeRuns(withContent, 20));
+    const withSnippetsEvaluation = await withContent.execute(operation);
+    expect((withSnippetsEvaluation.streams["references"] ?? []).length).toBe(50);
+    console.info(`[Frente N p95] find_references x50: baseline=${baseline.toFixed(2)}ms with_snippets=${withSnippets.toFixed(2)}ms delta=${(withSnippets - baseline).toFixed(2)}ms`);
+  });
+});
+
 // --- Cold-path SQL pushdown --------------------------------------------
 //
 // `SqliteCanonicalQuerySnapshotPort.records_by_ids` / `records_by_name` /
