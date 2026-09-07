@@ -11293,6 +11293,307 @@ mod tests {
         assert!(parameter_contains(&semantics, &rest_id).is_some());
     }
 
+    /// F-fix (v3 `record_occurrences.record_id` collision investigation,
+    /// 2026-09-07): direct, storage-free repro over the REAL n8n corpus --
+    /// parses every `.ts`/`.tsx`/`.js`/`.jsx` file independently (both the
+    /// lane-1 `crate::parse_source` entity/relation pass AND this module's
+    /// own `analyze_owner_semantics` parameter-entity pass), pools every
+    /// entity/relation `identity_key` this crate would ever propose for the
+    /// corpus, and reports any `identity_key` shared by more than one
+    /// (path, kind) pair. Skips the daemon/SQLite publish machinery
+    /// entirely -- runs in ~12s, not the ~500s+ a full cold `workspace add`
+    /// costs.
+    ///
+    /// RESULT (2026-09-07, disproves the overload/parameter-identity
+    /// hypothesis this frente started from): over the real n8n corpus
+    /// (14,083 source files, 720,953 distinct identity_keys), there are
+    /// exactly 1,278 colliding identity_keys and EVERY ONE is
+    /// `jsts:external_module:*` -- zero `jsts:entity_parameter`, zero
+    /// `jsts:variable` (catch bindings), zero anything else. This matches
+    /// `external_module_entity`'s own doc comment
+    /// (`crates/urdira-jsts-syntax-worker/src/lib.rs`): an external
+    /// module/symbol entity is, BY DESIGN, proposed identically (same
+    /// identity_key, same body, same record_id) by every file that imports
+    /// the same external specifier -- e.g. `jsts:external_module:@vue/
+    /// test-utils` is proposed by 90+ different files in this corpus alone.
+    /// The Rust unit test `overload_and_accessor_parameters_of_the_same_
+    /// name_never_collide` above independently confirms parameter identity
+    /// itself never collides even for the exact adversarial shapes (two
+    /// overload signatures, two interface method overloads, a getter/setter
+    /// pair, two `declare module` overloads) this frente's brief hypothesized
+    /// as the cause.
+    ///
+    /// This test therefore asserts the NARROWER, still-useful invariant: NO
+    /// non-external-module/-symbol identity_key ever collides (a real
+    /// regression, e.g. a parameter-identity bug, still fails this test),
+    /// while tolerating the KNOWN, intentional external-module/-symbol
+    /// duplication this crate documents and the SQL publish layer must (and,
+    /// after this frente's actual fix, does) de-dupe downstream --
+    /// `crates/urdira-indexing-worker/src/main.rs`'s `record_insert_sql`/
+    /// `direct_sql`/`identity_insert_sql`/`direct_identity_sql` cold
+    /// (`!records_exist`/`!identities_exist`) branches, which is what
+    /// actually raised `UNIQUE constraint failed: record_occurrences.
+    /// record_id` at row 3,525,385 of the real v3 n8n cold scan.
+    ///
+    /// `#[ignore]`d (needs the corpus on disk at a fixed path outside the
+    /// repo); run explicitly with `cargo test --release -p
+    /// urdira-jsts-syntax-worker n8n_corpus_identity_key_collisions_are_only_external_modules
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn n8n_corpus_identity_key_collisions_are_only_external_modules() {
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        let corpus_root = std::env::var("URDIRA_FFIX_N8N_CORPUS").unwrap_or_else(|_| {
+            "/Users/Cristian/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02".to_owned()
+        });
+        let root = Path::new(&corpus_root);
+        assert!(
+            root.is_dir(),
+            "corpus root {corpus_root} does not exist or is not a directory"
+        );
+
+        const SKIPPED_SEGMENTS: &[&str] = &[
+            ".git",
+            ".urdira",
+            "coverage",
+            "dist",
+            "node_modules",
+            "build",
+            ".turbo",
+        ];
+
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            let mut entries: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if SKIPPED_SEGMENTS.contains(&name.as_ref()) {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                if file_type.is_dir() {
+                    walk(root, &path, out);
+                } else if file_type.is_file() {
+                    out.push(path);
+                }
+            }
+            let _ = root;
+        }
+
+        let mut all_files = Vec::new();
+        walk(root, root, &mut all_files);
+        let source_files: Vec<std::path::PathBuf> = all_files
+            .into_iter()
+            .filter(|path| {
+                crate::language_for_path(&path.to_string_lossy()).is_some()
+                    || path.extension().is_some_and(|ext| {
+                        ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx"
+                    })
+            })
+            .collect();
+        eprintln!(
+            "[n8n_corpus_identity_key_collisions_are_only_external_modules] {} source files discovered",
+            source_files.len()
+        );
+        assert!(
+            source_files.len() > 1000,
+            "expected a real n8n-sized corpus, found only {} source files under {corpus_root}",
+            source_files.len()
+        );
+
+        // (identity_key) -> Vec<(relative_path, producer_label)>, so a
+        // collision report names every site that proposed it.
+        let mut by_identity: HashMap<String, Vec<(String, &'static str)>> = HashMap::new();
+        let mut files_parsed = 0usize;
+        let mut files_failed = 0usize;
+        for absolute in &source_files {
+            let relative = absolute
+                .strip_prefix(root)
+                .unwrap_or(absolute)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Ok(bytes) = std::fs::read(absolute) else {
+                files_failed += 1;
+                continue;
+            };
+            let Some((language, script_kind)) = crate::language_for_path(&relative) else {
+                continue;
+            };
+            let Ok(text) = String::from_utf8(bytes.clone()) else {
+                files_failed += 1;
+                continue;
+            };
+            let decoded = crate::DecodedSource {
+                path: relative.clone(),
+                content_digest: crate::sha256_digest(&bytes),
+                bytes,
+                language,
+                script_kind,
+            };
+            let available = BTreeSet::new();
+            let resolver = crate::WorkspaceResolver::default();
+            match crate::parse_source(&decoded, &available, &resolver) {
+                Ok(file_result) => {
+                    files_parsed += 1;
+                    for entity in &file_result.entities {
+                        by_identity
+                            .entry(entity.id.clone())
+                            .or_default()
+                            .push((relative.clone(), "lane1_entity"));
+                    }
+                    for relation in &file_result.relations {
+                        by_identity
+                            .entry(relation.id.clone())
+                            .or_default()
+                            .push((relative.clone(), "lane1_relation"));
+                    }
+                }
+                Err(_) => {
+                    files_failed += 1;
+                    continue;
+                }
+            }
+            match analyze_owner_semantics(&relative, &text) {
+                Ok(semantics) => {
+                    for record in &semantics.parameter_entity_rows {
+                        by_identity
+                            .entry(record.identity_key.clone())
+                            .or_default()
+                            .push((relative.clone(), "parameter_entity"));
+                    }
+                }
+                Err(_) => {
+                    // Already counted as failed above if lane1 also failed;
+                    // a lane1 success with a semantic_sites failure is rare
+                    // but not this test's concern.
+                }
+            }
+        }
+        eprintln!(
+            "[n8n_corpus_identity_key_collisions_are_only_external_modules] files_parsed={files_parsed} files_failed={files_failed} distinct_identity_keys={}",
+            by_identity.len()
+        );
+        let collisions: Vec<(&String, &Vec<(String, &'static str)>)> = by_identity
+            .iter()
+            .filter(|(_, sites)| sites.len() > 1)
+            .collect();
+        if !collisions.is_empty() {
+            let mut by_kind_prefix: HashMap<String, usize> = HashMap::new();
+            for (identity_key, _) in &collisions {
+                let prefix = identity_key
+                    .splitn(3, ':')
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(":");
+                *by_kind_prefix.entry(prefix).or_default() += 1;
+            }
+            let mut by_kind_prefix: Vec<(String, usize)> = by_kind_prefix.into_iter().collect();
+            by_kind_prefix.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+            eprintln!(
+                "[n8n_corpus_identity_key_collisions_are_only_external_modules] {} colliding identity_key(s) by kind prefix: {by_kind_prefix:?}",
+                collisions.len()
+            );
+        }
+        // External module/symbol dedup across owners is a KNOWN, documented
+        // shape (`external_module_entity`'s own doc comment) -- this test's
+        // OWN job is to keep failing on anything ELSE that ever collides
+        // (e.g. a future parameter-identity regression), not on this
+        // already-understood, already-fixed-downstream case. See this
+        // test's own doc comment for the concrete counts this assertion
+        // currently sees (1,278 external-only collisions, 0 elsewhere).
+        let non_external: Vec<_> = collisions
+            .iter()
+            .filter(|(identity_key, _)| {
+                !identity_key.starts_with("jsts:external_module:")
+                    && !identity_key.starts_with("jsts:external_symbol:")
+            })
+            .collect();
+        if !non_external.is_empty() {
+            eprintln!(
+                "[n8n_corpus_identity_key_collisions_are_only_external_modules] {} NON-external collision(s), up to 10:",
+                non_external.len()
+            );
+            for (identity_key, sites) in non_external.iter().take(10) {
+                eprintln!("  {identity_key} -> {sites:?}");
+            }
+        }
+        assert!(
+            non_external.is_empty(),
+            "{} NON-external identity_key collision(s) found (see stderr for details) -- external module/symbol duplication ({} collisions) is expected and tolerated, everything else is a real bug",
+            non_external.len(),
+            collisions.len() - non_external.len(),
+        );
+    }
+
+    /// F-fix (v3 `record_occurrences.record_id` collision investigation,
+    /// 2026-09-07): two overload signatures of the same function, two
+    /// overloaded interface method signatures, a getter/setter pair, and
+    /// two `declare module` function overloads all reuse the SAME parameter
+    /// NAME under the SAME (or an equivalent-looking) parent -- if
+    /// `declaration_id`'s `start` component (the parameter's own binding
+    /// identifier span) ever collided across two of these declarations,
+    /// `finish` would materialize two DIFFERENT `ParameterDeclarationFact`s
+    /// under the SAME `BTreeMap` key, silently keeping only the LAST one
+    /// (see `parameter_declarations`'s own doc comment) -- a correctness
+    /// bug distinct from, but adjacent to, the record_id collision this
+    /// fixture was written to characterize. Every one of these seven
+    /// parameter declarations must get its OWN distinct `entity_id`.
+    #[test]
+    fn overload_and_accessor_parameters_of_the_same_name_never_collide() {
+        let source = "\
+function f(a: string): void;
+function f(a: number): void;
+function f(a: any) {}
+
+interface I {
+  m(x: string): void;
+  m(x: number): void;
+}
+
+class C {
+  get v(): string { return \"\"; }
+  set v(value: string) {}
+}
+
+declare module \"mymod\" {
+  function g(p: string): void;
+  function g(p: number): void;
+}
+";
+        let semantics = analyze_owner_semantics("a.ts", source).expect("analysis succeeds");
+        let ids: Vec<String> = semantics
+            .parameter_entity_rows
+            .iter()
+            .map(|record| record.identity_key.clone())
+            .collect();
+        let distinct: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "expected every parameter entity id to be distinct, got {ids:?}"
+        );
+        // Seven identifier-pattern parameters in this fixture: two `f`
+        // overload signatures + the implementation (a is never referenced
+        // by an implementation without a body, so ONLY the two overload
+        // signatures' `a` and the implementation's own `a` count -- three),
+        // two `I.m` overload signatures (two), the setter's `value` (one),
+        // and two `declare module` `g` overload signatures (two) = 3 + 2 +
+        // 1 + 2 = 8. The getter has no parameter.
+        assert_eq!(ids.len(), 8, "rows: {:?}", semantics.parameter_entity_rows);
+    }
+
     #[test]
     fn referenced_catch_binding_resolves_and_materializes_a_variable_entity() {
         // 2026-09-04 references-parity task, bucket 1
