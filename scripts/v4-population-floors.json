@@ -1,47 +1,47 @@
 {
-  "_generated": "2026-09-06, flecos-v4 F.1 (plan §3.1/§3.2). `floor` = 0.99 x the accepted n8n figure (plan §0 rule R5). `ratio` = 0.99 x the v4/v3 ratio observed between the accepted n8n figures (plan §3.2, ronda-3 evidence) and v3's own oracle kind histogram in docs/evidence/2026-09-02-v4-p0-s4-promotion-gap.md ('Top record_occurrences.kind by count') -- that v3 dump is a DIFFERENT corpus/run than the v4 ronda-3 figures, so the ratio is explicitly provisional, per the plan's own wording ('ratios provisionales'), not a same-scan cross-check. `ratio: 0` means 'no ratio gate for this row, only the absolute floor is enforced' -- see each entry's own `_note` for why.",
+  "_generated": "2026-09-06, flecos-v4 F.1 (plan §3.1/§3.2). `floor` = 0.99 x the accepted n8n figure (plan §0 rule R5). RATIOS RECALIBRATED 2026-09-07 (F.3 §4c / wave-3 parity measurement task): the ratios below this date were originally 0.99 x a CROSS-corpus/cross-run v4-vs-v3 estimate (v4's ronda-3 accepted figures against a DIFFERENT v3 oracle dump, docs/evidence/2026-09-02-v4-p0-s4-promotion-gap.md), explicitly flagged provisional by the plan's own wording. 2026-09-07 is this gate's FIRST same-corpus, same-scan calibration: v4 HEAD 46d36a3 cold-scanned `~/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02` (`n8n_population_floors`, populations.tsv) was diffed against the retained v3 oracle `~/Proyectos/urdira-benchmark/v3-n8n-2026-09-07-b/workspaces/workspace_n8n-corpus-2026-09-02_d99f1eb3-a76a-4699-a6af-cd2df00a8516.sqlite` (same corpus checkout, v3's cold-scan publish bug fixed in 62e1ece/frente F-fix). `ratio` for every `v3_kind`-bearing row below is now 0.99 x that SAME-corpus observed v4/v3 ratio (see docs/evidence/2026-09-07-v4-n8n-parity-and-semantic-segments.md §A for the full table and raw counts); floors (absolute, R5) are untouched by this task -- only ratios were recalibrated, per this task's own file-scope authorization. `ratio: 0` still means 'no ratio gate for this row, only the absolute floor is enforced' -- see each entry's own `_note` for why.",
   "kinds": {
     "jsts:entity_callable": {
       "floor": 29921,
-      "ratio": 1.8846,
+      "ratio": 0.99,
       "v3_kind": "jsts:entity_callable",
-      "_note": "v4 accepted 30,224 / v3 15,879 = 1.9036; ratio stored at 0.99x = 1.8846."
+      "_note": "2026-09-07 same-corpus recalibration: v4 30,224 / v3 30,224 = 1.0000 (EXACT match -- both sides count every syntactic function/method/constructor declaration identically on this corpus, unlike the cross-corpus estimate below); ratio stored at 0.99x = 0.99. SUPERSEDES the old provisional cross-corpus estimate (v4 accepted 30,224 / a DIFFERENT v3 run's 15,879 = 1.9036, stored 1.8846) -- that old v3 figure was from a mismatched corpus/run, not a same-scan cross-check."
     },
     "jsts:entity_container": {
       "floor": 14847,
-      "ratio": 1.0543,
+      "ratio": 0.99,
       "v3_kind": "jsts:entity_container",
-      "_note": "v4 accepted 14,997 / v3 14,082 = 1.0650; ratio stored at 0.99x = 1.0543."
+      "_note": "2026-09-07 same-corpus recalibration: v4 14,993 / v3 14,993 = 1.0000 (EXACT match, same reasoning as jsts:entity_callable -- classes/interfaces/enums are unambiguous syntactic declarations on both sides); ratio stored at 0.99x = 0.99. SUPERSEDES the old provisional cross-corpus estimate (v4 accepted 14,997 / a DIFFERENT v3 run's 14,082 = 1.0650, stored 1.0543)."
     },
     "jsts:entity_parameter": {
       "floor": 78966,
       "ratio": 0,
       "v3_kind": null,
-      "_note": "v3 never materialized a standalone parameter-entity population (absent from the 2026-09-02 v3 oracle's own top-kind-by-count table) -- this is a v4-only population added 2026-09-04, no ratio derivable, hence 0. F.3 (2026-09-07) re-pinned this floor to 0.99x the freshly measured 'every declaration' population (F.2 shipped in e384dfe/f44b8c4, prior to this measurement): n8n_population_floors measured jsts:entity_parameter=79,764 cold on HEAD d71669a; 0.99x79,764=78,966.36, floor stored as 78,966. Supersedes the OLD provisional floor (74,021, 0.99x the 'referenced-only' figure)."
+      "_note": "v3 never materialized a standalone parameter-entity population (absent from the 2026-09-02 v3 oracle's own top-kind-by-count table) -- this is a v4-only population added 2026-09-04, no ratio derivable, hence 0. F.3 (2026-09-07) re-pinned this floor to 0.99x the freshly measured 'every declaration' population (F.2 shipped in e384dfe/f44b8c4, prior to this measurement): n8n_population_floors measured jsts:entity_parameter=79,764 cold on HEAD d71669a; 0.99x79,764=78,966.36, floor stored as 78,966. Supersedes the OLD provisional floor (74,021, 0.99x the 'referenced-only' figure). Confirmed again 2026-09-07 (wave-3 parity task): HEAD 46d36a3 cold measured 79,764, floor still clears (79,764 >= 78,966)."
     },
     "jsts:entity_type": {
       "floor": 14047,
-      "ratio": 1.1086,
+      "ratio": 1.1030,
       "v3_kind": "jsts:entity_type",
-      "_note": "v4 accepted 14,189 / v3 12,671 = 1.1198; ratio stored at 0.99x = 1.1086."
+      "_note": "2026-09-07 same-corpus recalibration: v4 14,275 / v3 12,813 = 1.1141; ratio stored at 0.99x = 1.1030. SUPERSEDES the old provisional cross-corpus estimate (v4 accepted 14,189 / a DIFFERENT v3 run's 12,671 = 1.1198, stored 1.1086) -- close by coincidence, but replaced anyway for consistency now that a real same-scan figure exists."
     },
     "jsts:entity_variable": {
       "floor": 238491,
-      "ratio": 1.1255,
+      "ratio": 1.0136,
       "v3_kind": "jsts:entity_variable",
-      "_note": "v4 accepted 240,900 / v3 211,909 = 1.1368; ratio stored at 0.99x = 1.1255."
+      "_note": "2026-09-07 same-corpus recalibration: v4 241,536 / v3 235,906 = 1.0239; ratio stored at 0.99x = 1.0136. SUPERSEDES the old provisional cross-corpus estimate (v4 accepted 240,900 / a DIFFERENT v3 run's 211,909 = 1.1368, stored 1.1255) -- the old estimate overstated v4's real lead over v3 on this corpus; the same-scan gap is much narrower (2.4%, not 13.7%)."
     },
     "jsts:relation_contains": {
       "floor": 396483,
-      "ratio": 1.6489,
+      "ratio": 1.4282,
       "v3_kind": "jsts:relation_contains",
-      "_note": "v4 accepted 400,488 / v3 240,459 = 1.6655; ratio stored at 0.99x = 1.6489."
+      "_note": "2026-09-07 same-corpus recalibration: v4 406,223 / v3 281,576 = 1.4427; ratio stored at 0.99x = 1.4282. SUPERSEDES the old provisional cross-corpus estimate (v4 accepted 400,488 / a DIFFERENT v3 run's 240,459 = 1.6655, stored 1.6489)."
     },
     "jsts:relation_references": {
       "floor": 1205324,
-      "ratio": 1.0853,
+      "ratio": 0.9168,
       "v3_kind": "jsts:relation_references",
-      "_note": "v4 accepted 1,217,499 / v3 1,110,576 = 1.0963; ratio stored at 0.99x = 1.0853."
+      "_note": "2026-09-07 same-corpus recalibration: v4 1,241,431 / v3 1,340,591 = 0.9260 -- ratio BELOW 1.0, i.e. on THIS same-corpus run v4 has fewer references than v3 (see docs/evidence/2026-09-07-v4-n8n-parity-and-semantic-segments.md §A.1: the per-site diff finds 153,448 v3-confirmed reference sites with no v4 counterpart at all, plus 673 v4_different_target sites -- reported there as a P0, not fixed by this task). Ratio stored at 0.99x = 0.9168 so this gate reflects the REAL calibration rather than the old inflated cross-corpus estimate (v4 accepted 1,217,499 / a DIFFERENT v3 run's 1,110,576 = 1.0963, stored 1.0853) -- that old estimate would have (wrongly) passed today's run. This is the gate's first real same-corpus number for this kind; a future regression is anything measurably below 0.9260, not below the old 1.0963."
     },
     "external_module": {
       "floor": 905,
