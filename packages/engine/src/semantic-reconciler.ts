@@ -2,7 +2,7 @@ import { canonicalBytes, decodeCanonical, digestBytes } from "@urdira/canonical"
 import { canonicalVectorBytes as storageCanonicalVectorBytes, hydrateRelationalValue, type RelationalValueRow, type SqliteCommand, type VectorProjectionInput, type WorkspaceDatabase } from "@urdira/storage";
 import { buildSemanticDocument } from "./semantic-documents.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
-import type { SemanticGeneratedVector } from "./semantic-runtime.js";
+import { canonicalVectorBytes as engineCanonicalVectorBytes, vectorValues, type Segmentation, type SemanticGeneratedVector } from "./semantic-runtime.js";
 
 /**
  * Stable identity for one workspace-generation-profile materialization,
@@ -177,6 +177,23 @@ export interface ReconcileSemanticProjectionInput {
   readonly entity_policy?: {
     /** Minimum `end - start` character span (decision 17's measured policy). Defaults to 120. */
     readonly min_span_length?: number;
+    /**
+     * Frente S-D (2026-09-07, Lever 1/4): caps how many gap segments (the
+     * file text NOT covered by any eligible entity span) the artifact-vector
+     * composition embeds for one document, independent of the provider's own
+     * `max_segments` (R8, `DEFAULT_MAX_SEGMENTS` = 64). Gaps are typically
+     * small (imports/exports/module comments -- plan §4's own framing), so
+     * this is left undefined (no extra cap beyond the provider's own) unless
+     * n8n-scale measurement shows the provider's full cap is still too
+     * costly for gaps specifically, in which case a smaller value (plan's
+     * own suggested floor: 16) truncates further, folding
+     * `reason_code: "segments_truncated"` into the artifact's status row
+     * exactly like any other truncation (R8's own "never silent" rule) --
+     * never applied to entity-grain segmentation, which stays governed by
+     * the provider's own `max_segments` alone (entity vector fidelity is
+     * explicitly out of scope for this lever).
+     */
+    readonly max_gap_segments?: number;
   };
   /**
    * Optional cooperative-cancellation check, polled once per stale-vector
@@ -219,6 +236,57 @@ export interface ReconcileSemanticProjectionInput {
    * behavior is completely unmodified.
    */
   readonly entity_record_source?: SemanticEntityRecordSource;
+  /**
+   * Frente S-D (2026-09-07, Lever 2): when provided, this call handles only
+   * documents whose OWNING artifact id hashes to `index` (of `count` total
+   * shards, deterministic via `shardIndexFor` below) -- the artifact and
+   * entity missing-insert loops (steps 3 and 5) are filtered to that subset,
+   * so a caller runs `count` CONCURRENT calls (typically one per child
+   * process, see `@urdira/daemon`'s `runSemanticReconcileSharded`) each with
+   * a distinct `index`, splitting the embed work across processes to use
+   * more than one CPU core (measured ~1.44x at 2 concurrent processes on a
+   * 10-core machine, `docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
+   * §2.3). Sharding is BY OWNING ARTIFACT (never by entity record or
+   * segment) so an artifact document and every one of its own eligible
+   * entities always land in the SAME shard/process -- required for Lever 1's
+   * `entityCoverageByOwner` to ever fire inside a sharded call (an entity
+   * embedded by a DIFFERENT process could never be composed into this
+   * process's artifact vector).
+   *
+   * A sharded call NEVER runs steps 1/2/4 (workspace-wide, grain-agnostic or
+   * artifact-stale-close/entity-stale-close -- unscoped by shard, so running
+   * them from every shard would race redundant writes against the same
+   * SQLite catalog) except when `index === 0` (one designated shard still
+   * runs them, since SOMEONE must -- harmless if another shard's identical,
+   * idempotent statements also ran, since `UPDATE ... WHERE valid_to_generation
+   * IS NULL AND ...` naturally finds zero matching rows the second time).
+   * A sharded call NEVER runs `syncDocumentStatusBulk` and NEVER writes the
+   * completion marker, regardless of `index` or how clean its own pass was
+   * -- see `runSemanticReconcileSharded`'s own doc comment for why: only the
+   * ORCHESTRATOR, after every shard resolves, can safely conclude "the whole
+   * workspace is caught up," by making one final UNSHARDED call (which finds
+   * nothing left to do in the common case and reaches this function's
+   * ordinary marker-write logic naturally, self-healing any single shard's
+   * `failed`/`entity_failed` rows as a side effect of retrying them
+   * unsharded). `marker_written` is therefore always `false` in a sharded
+   * call's own result.
+   */
+  readonly shard?: { readonly index: number; readonly count: number };
+}
+
+/**
+ * Frente S-D (2026-09-07, Lever 2): deterministic shard assignment for one
+ * owning artifact id -- the low 32 bits of `digestBytes(artifactId)` (SHA-256,
+ * `@urdira/canonical`) reduced mod `shardCount`. Pure and stable across
+ * processes/hosts/runs (SHA-256 of the same UTF-8 bytes is always the same
+ * bytes), which is the whole point: every shard process computes the IDENTICAL
+ * assignment for the same `artifactId` independently, with no coordination.
+ */
+export function shardIndexFor(artifactId: string, shardCount: number): number {
+  if (!Number.isSafeInteger(shardCount) || shardCount <= 0) throw new Error("shardIndexFor shardCount must be a positive integer.");
+  const digest = digestBytes(new TextEncoder().encode(artifactId));
+  const hex = digest.slice(digest.length - 8);
+  return Number(BigInt(`0x${hex}`) % BigInt(shardCount));
 }
 
 export interface ReconcileSemanticProjectionResult {
@@ -274,6 +342,72 @@ function chunk<T>(values: readonly T[], size: number): readonly T[][] {
   const out: T[][] = [];
   for (let index = 0; index < values.length; index += size) out.push(values.slice(index, index + size));
   return out;
+}
+
+/**
+ * Frente S-D (2026-09-07, Lever 1): merges a set of `[start, end)` character
+ * spans (`end > start`, both UTF-16 code unit offsets into the same owning
+ * text) into their minimal sorted, disjoint form -- adjacent (`span.start <=
+ * last.end`) or overlapping spans collapse into one. Pure; does not mutate
+ * `spans`. Used by `reconcileSemanticProjection`'s artifact-vector
+ * composition to turn a file's ELIGIBLE entity spans into the covered-region
+ * set before `complementSpans` computes the "gap" (not-covered) text.
+ */
+function mergeSpans(spans: readonly { readonly start: number; readonly end: number }[]): readonly { readonly start: number; readonly end: number }[] {
+  if (spans.length === 0) return [];
+  const sorted = [...spans].sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged: Array<{ start: number; end: number }> = [{ ...sorted[0]! }];
+  for (const span of sorted.slice(1)) {
+    const last = merged[merged.length - 1]!;
+    if (span.start <= last.end) last.end = Math.max(last.end, span.end);
+    else merged.push({ ...span });
+  }
+  return merged;
+}
+
+/**
+ * Frente S-D (2026-09-07, Lever 1): the complement of `coveredSpans` (already
+ * merged, sorted, disjoint -- callers pass `mergeSpans`'s own output) within
+ * `[0, length)` -- the file-text regions NOT covered by any eligible entity,
+ * i.e. the "gap" text the artifact-vector composition still embeds fresh
+ * (plan §4's own framing: "huecos... típicamente imports/exports/comentarios:
+ * pequeño"). An empty `coveredSpans` returns `[{start: 0, end: length}]` (the
+ * whole text is one gap) -- the "zero eligible entities" fallback case.
+ */
+function complementSpans(coveredSpans: readonly { readonly start: number; readonly end: number }[], length: number): readonly { readonly start: number; readonly end: number }[] {
+  const gaps: Array<{ start: number; end: number }> = [];
+  let cursor = 0;
+  for (const span of coveredSpans) {
+    if (span.start > cursor) gaps.push({ start: cursor, end: span.start });
+    cursor = Math.max(cursor, span.end);
+  }
+  if (cursor < length) gaps.push({ start: cursor, end: length });
+  return gaps;
+}
+
+/**
+ * Frente S-D (2026-09-07, Lever 1): the artifact-vector composition itself --
+ * decodes every already-embedded packed `vectors` component back to raw
+ * values (`vectorValues`, `./semantic-runtime.js`), takes their plain
+ * elementwise mean (every component -- an entity segment or a gap segment --
+ * counts equally, mirroring `@urdira/embedding-local`'s own
+ * `meanPoolWindowVectors` "every window counts equally" convention for
+ * intra-document window pooling), then re-encodes through the SAME canonical
+ * decode/normalize/encode pass (`canonicalVectorBytes`, same module) every
+ * other vector this codebase produces goes through -- never a hand-duplicated
+ * approximation of it (see `commitGeneratedVector`'s own doc comment for the
+ * regression a duplicated normalize pass caused previously). Throws when
+ * `vectors` is empty; callers must never invoke this for a document with zero
+ * available components (see the `skipped_empty` handling at this function's
+ * own call site in `reconcileSemanticProjection`).
+ */
+function combineVectorsMeanNormalized(vectors: readonly Uint8Array[], profile: { readonly dimensions: number; readonly element_type: string; readonly normalization: string }): Uint8Array {
+  if (vectors.length === 0) throw new Error("combineVectorsMeanNormalized requires at least one component vector.");
+  const elementType = profile.element_type === "float64" ? "float64" as const : "float32" as const;
+  const decoded = vectors.map((vector) => vectorValues(vector, { dimensions: profile.dimensions, element_type: elementType, normalization: "none" }));
+  const mean = new Array<number>(profile.dimensions).fill(0);
+  for (const values of decoded) for (let index = 0; index < profile.dimensions; index += 1) mean[index]! += values[index]! / decoded.length;
+  return engineCanonicalVectorBytes(mean, { dimensions: profile.dimensions, element_type: elementType, normalization: profile.normalization === "l2" ? "l2" : "none" });
 }
 // Frente S-B (2026-09-06, plan §4.4/S-B.1): `DEFAULT_MIN_ENTITY_SPAN_LENGTH`,
 // `evaluateEntityEligibility`, `renderEntityDocument`, `leadingDocComment`,
@@ -756,84 +890,94 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     // fast path would keep returning here without ever reaching the slow
     // path's own per-document writes. `hasAnyDocumentStatus` makes the
     // common (already-backfilled) case a single indexed point lookup.
-    if (!(await hasAnyDocumentStatus())) await syncDocumentStatusBulk();
+    // Frente S-D (2026-09-07, Lever 2): a sharded call never runs
+    // workspace-wide bulk maintenance -- see `shard`'s own doc comment. The
+    // orchestrator's final unsharded call performs this backfill instead.
+    if (input.shard === undefined && !(await hasAnyDocumentStatus())) await syncDocumentStatusBulk();
     return buildResult(generation, true);
   }
 
-  // Step 1 (profile-swap close): every OPEN vector row written under a
-  // DIFFERENT (profile_id, executable_binding_id) than the CURRENTLY
-  // configured provider can never again be a valid answer for
-  // `core:search_semantic`/`core:search_hybrid` (both only ever compare
-  // vectors sharing one exact profile+binding pair -- see
-  // `exactVectorScan`'s filter) -- so it is closed outright, "at CURRENT
-  // generation" (not at whatever generation its owning version happens to
-  // have closed at, if ever): this row's vector space is retired as of NOW,
-  // independent of its content's own lifecycle. Deliberately grain-agnostic
-  // (no `document_grain` filter): a provider swap invalidates an entity
-  // vector exactly as completely as it invalidates an artifact vector, for
-  // the identical reason, so both close together in this one statement. A
-  // single raw `UPDATE` (the vector shard bytes are opaque and immutable,
-  // unlike the relational lexical metadata,
-  // it carries no `valid_to_generation` field for a close to keep in sync,
-  // so this needs no value rewrite alongside the column; consistency of
-  // `StorageMaintenance.verify`'s "vector" integrity check with this is
-  // Agent S's storage-slice concern, not this reconciler's) closes every such
-  // row in one statement rather than a per-row loop -- there is no per-row
-  // work to interleave a `yieldToEventLoop` between, unlike the stale-close
-  // and insert loops below.
-  const swapClose = await sql.run(
-    "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND valid_to_generation IS NULL AND (profile_id <> ? OR executable_binding_id <> ?)",
-    [generation, workspaceId, profileId, executableBindingId],
-  );
-  counts.closed += swapClose.changes;
+  // Frente S-D (2026-09-07, Lever 2): steps 1, 2, and (further down) 4 are
+  // workspace-wide and grain-agnostic-or-artifact/entity-stale-close --
+  // unscoped by shard. A sharded call other than index 0 skips them entirely
+  // (see `shard`'s own doc comment); shard 0 (or an unsharded call) still
+  // runs them exactly as before.
+  if (input.shard === undefined || input.shard.index === 0) {
+    // Step 1 (profile-swap close): every OPEN vector row written under a
+    // DIFFERENT (profile_id, executable_binding_id) than the CURRENTLY
+    // configured provider can never again be a valid answer for
+    // `core:search_semantic`/`core:search_hybrid` (both only ever compare
+    // vectors sharing one exact profile+binding pair -- see
+    // `exactVectorScan`'s filter) -- so it is closed outright, "at CURRENT
+    // generation" (not at whatever generation its owning version happens to
+    // have closed at, if ever): this row's vector space is retired as of NOW,
+    // independent of its content's own lifecycle. Deliberately grain-agnostic
+    // (no `document_grain` filter): a provider swap invalidates an entity
+    // vector exactly as completely as it invalidates an artifact vector, for
+    // the identical reason, so both close together in this one statement. A
+    // single raw `UPDATE` (the vector shard bytes are opaque and immutable,
+    // unlike the relational lexical metadata,
+    // it carries no `valid_to_generation` field for a close to keep in sync,
+    // so this needs no value rewrite alongside the column; consistency of
+    // `StorageMaintenance.verify`'s "vector" integrity check with this is
+    // Agent S's storage-slice concern, not this reconciler's) closes every such
+    // row in one statement rather than a per-row loop -- there is no per-row
+    // work to interleave a `yieldToEventLoop` between, unlike the stale-close
+    // and insert loops below.
+    const swapClose = await sql.run(
+      "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND valid_to_generation IS NULL AND (profile_id <> ? OR executable_binding_id <> ?)",
+      [generation, workspaceId, profileId, executableBindingId],
+    );
+    counts.closed += swapClose.changes;
 
-  // Step 2 (close stale, ARTIFACT grain only): every remaining OPEN
-  // ARTIFACT-grain vector row -- which, after step 1, can only belong to the
-  // CURRENT provider -- whose owning `artifact_versions` row has ITSELF
-  // already closed can never be visible at any currently-or-future
-  // generation, so it is closed to the same generation its version closed
-  // at (the historically accurate value, unlike step 1's "at CURRENT
-  // generation"). Restricted to `document_grain IS NULL` (artifact rows)
-  // DELIBERATELY: an entity row's `owner_artifact_id`/`owner_artifact_version_id`
-  // point at whichever artifact version most recently OWNED its record, and
-  // -- per decision 17 -- a reused entity record legitimately outlives that
-  // owner version closing (see step 4's own doc comment for the entity
-  // stale-close join this reconciler uses instead). Without this filter, an
-  // entity vector whose owner version had simply closed on an unrelated
-  // later edit would be closed here even though its underlying record is
-  // still visible and unchanged -- silently losing a perfectly good vector
-  // and forcing a needless re-embed. Same no-payload-rewrite reasoning as
-  // step 1 applies to the per-row `UPDATE` here.
-  const staleRows = await sql.all<StaleVectorRow>(
-    `SELECT vector_projection_rows.projection_record_id AS projection_record_id, vector_projection_rows.valid_from_generation AS valid_from_generation,
-            artifact_versions.valid_to_generation AS closing_generation, vector_projection_rows.owner_artifact_version_id AS document_id
-       FROM vector_projection_rows
-       JOIN artifact_versions ON artifact_versions.workspace_id = vector_projection_rows.workspace_id
-        AND artifact_versions.artifact_id = vector_projection_rows.owner_artifact_id
-        AND artifact_versions.artifact_version_id = vector_projection_rows.owner_artifact_version_id
-      WHERE vector_projection_rows.workspace_id = ? AND vector_projection_rows.valid_to_generation IS NULL
-        AND vector_projection_rows.document_grain IS NULL
-        AND artifact_versions.valid_to_generation IS NOT NULL`,
-    [workspaceId],
-  );
-  for (const row of staleRows) {
-    // Checked before each row's own work, mirroring `reconcileLexicalProjection`'s
-    // identical checkpoint: an abort observed here means this row (and every
-    // row after it) is simply left OPEN for the next pass to close instead.
-    if (shouldAbort?.()) return buildResult(generation, false, true);
-    await waitForQueryDrain();
-    // Plan 2026-09-06 (Frente S-A): the vector close and its
-    // `semantic_document_status` row's removal land in one transaction --
-    // the underlying artifact version is already gone, so this document has
-    // no place in the status table at all (never re-inserted as `pending`
-    // by a later pass, since the missing-vector query it would come from
-    // requires the version to be VISIBLE).
-    await sql.transaction([
-      { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [row.closing_generation, workspaceId, row.projection_record_id, row.valid_from_generation] },
-      documentStatusDeleteCommand({ workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: row.document_id }),
-    ]);
-    counts.closed += 1;
-    await yieldToEventLoop();
+    // Step 2 (close stale, ARTIFACT grain only): every remaining OPEN
+    // ARTIFACT-grain vector row -- which, after step 1, can only belong to the
+    // CURRENT provider -- whose owning `artifact_versions` row has ITSELF
+    // already closed can never be visible at any currently-or-future
+    // generation, so it is closed to the same generation its version closed
+    // at (the historically accurate value, unlike step 1's "at CURRENT
+    // generation"). Restricted to `document_grain IS NULL` (artifact rows)
+    // DELIBERATELY: an entity row's `owner_artifact_id`/`owner_artifact_version_id`
+    // point at whichever artifact version most recently OWNED its record, and
+    // -- per decision 17 -- a reused entity record legitimately outlives that
+    // owner version closing (see step 4's own doc comment for the entity
+    // stale-close join this reconciler uses instead). Without this filter, an
+    // entity vector whose owner version had simply closed on an unrelated
+    // later edit would be closed here even though its underlying record is
+    // still visible and unchanged -- silently losing a perfectly good vector
+    // and forcing a needless re-embed. Same no-payload-rewrite reasoning as
+    // step 1 applies to the per-row `UPDATE` here.
+    const staleRows = await sql.all<StaleVectorRow>(
+      `SELECT vector_projection_rows.projection_record_id AS projection_record_id, vector_projection_rows.valid_from_generation AS valid_from_generation,
+              artifact_versions.valid_to_generation AS closing_generation, vector_projection_rows.owner_artifact_version_id AS document_id
+         FROM vector_projection_rows
+         JOIN artifact_versions ON artifact_versions.workspace_id = vector_projection_rows.workspace_id
+          AND artifact_versions.artifact_id = vector_projection_rows.owner_artifact_id
+          AND artifact_versions.artifact_version_id = vector_projection_rows.owner_artifact_version_id
+        WHERE vector_projection_rows.workspace_id = ? AND vector_projection_rows.valid_to_generation IS NULL
+          AND vector_projection_rows.document_grain IS NULL
+          AND artifact_versions.valid_to_generation IS NOT NULL`,
+      [workspaceId],
+    );
+    for (const row of staleRows) {
+      // Checked before each row's own work, mirroring `reconcileLexicalProjection`'s
+      // identical checkpoint: an abort observed here means this row (and every
+      // row after it) is simply left OPEN for the next pass to close instead.
+      if (shouldAbort?.()) return buildResult(generation, false, true);
+      await waitForQueryDrain();
+      // Plan 2026-09-06 (Frente S-A): the vector close and its
+      // `semantic_document_status` row's removal land in one transaction --
+      // the underlying artifact version is already gone, so this document has
+      // no place in the status table at all (never re-inserted as `pending`
+      // by a later pass, since the missing-vector query it would come from
+      // requires the version to be VISIBLE).
+      await sql.transaction([
+        { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [row.closing_generation, workspaceId, row.projection_record_id, row.valid_from_generation] },
+        documentStatusDeleteCommand({ workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: row.document_id }),
+      ]);
+      counts.closed += 1;
+      await yieldToEventLoop();
+    }
   }
 
   // One document collected in either insert loop below, past every skip
@@ -868,6 +1012,18 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     readonly segmentIndex?: number;
     readonly segmentStart?: number;
     readonly segmentEnd?: number;
+    /**
+     * Frente S-D (2026-09-07, Lever 1): explicit `semantic_document_status.segment_count`
+     * for a COMPOSED artifact item (entity-segment reuse) -- the real count
+     * of entity + gap segment vectors mean-pooled into this artifact vector.
+     * Omitted for every whole-file artifact item (falls back to
+     * `documentStatusUpsertCommand`'s own default of `1`) and every entity
+     * item (irrelevant there -- entity segment counting is
+     * `EntityDocumentAggregate.totalSegments`, unrelated to this field).
+     */
+    readonly artifactSegmentCount?: number;
+    /** Frente S-D (2026-09-07, Lever 1): extra reason codes (currently only ever `["segments_truncated"]`, R8) folded into a COMPOSED artifact item's `covered` status row. Omitted for every other item, matching `artifactSegmentCount`'s own convention. */
+    readonly artifactReasonCodes?: readonly string[];
   };
 
   const bumpInserted = (item: PendingEmbedItem): void => { if (item.documentGrain === "entity") counts.entity_inserted += 1; else counts.inserted += 1; };
@@ -929,6 +1085,9 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     readonly displayPath: string;
     readonly totalSegments: number;
     readonly truncated: boolean;
+    /** Frente S-D (2026-09-07, Lever 1): this entity's own file-absolute `[start, end)` span (`evaluateEntityEligibility`'s own `start`/`end`) -- captured so a clean finalize can register this span (and its freshly-inserted vectors) into `entityCoverageByOwner` for `artifactVersionId`. */
+    readonly spanStart: number;
+    readonly spanEnd: number;
     settled: number;
     failed: boolean;
     readonly reasonCodes: Set<string>;
@@ -936,7 +1095,26 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   };
   const entityDocumentAggregates = new Map<string, EntityDocumentAggregate>();
 
-  const registerEntityDocument = (recordId: string, input: { readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly totalSegments: number; readonly truncated: boolean }): void => {
+  /**
+   * Frente S-D (2026-09-07, Lever 1): per-OWNER-FILE entity coverage,
+   * captured live as `recordEntitySegmentOutcome` (below) finalizes each
+   * entity document THIS pass -- consumed by the (moved) artifact insert
+   * step once the entity insert step has fully run, see this function's own
+   * "step 3 now runs after step 5" doc comment further down. Only an entity
+   * whose EVERY segment was a fresh INSERT this pass (never a "reopen" of an
+   * already-parked row) ever contributes an entry: a reopened row's packed
+   * bytes are not sitting in memory at commit time, and this map is never
+   * populated by a speculative extra CAS read just to backfill it -- see
+   * `recordEntitySegmentOutcome`'s own call site for the exact condition.
+   * A file whose entities contribute no entries here (zero eligible
+   * entities, or every one of them reopened rather than inserted) simply
+   * has no key here at all -- its artifact vector then falls back to a
+   * fresh whole-file embed, identical to this reconciler's pre-Lever-1
+   * behavior.
+   */
+  const entityCoverageByOwner = new Map<string, Array<{ readonly start: number; readonly end: number; readonly vectors: readonly Uint8Array[] }>>();
+
+  const registerEntityDocument = (recordId: string, input: { readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly totalSegments: number; readonly truncated: boolean; readonly spanStart: number; readonly spanEnd: number }): void => {
     entityDocumentAggregates.set(recordId, { ...input, settled: 0, failed: false, reasonCodes: new Set(), pendingWrites: [] });
   };
 
@@ -1018,6 +1196,19 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       return;
     }
     counts.entity_inserted += aggregate.pendingWrites.length;
+    // Frente S-D (2026-09-07, Lever 1): register this entity's coverage for
+    // its owning file ONLY when every one of its segments was a fresh
+    // INSERT this pass (`reopens.length === 0`) -- a mix of insert+reopen
+    // for the SAME entity (rare: possible when a multi-segment entity's
+    // segments independently digest-match some parked rows but not others)
+    // is deliberately excluded rather than contributing a partial vector
+    // set, since `entityCoverageByOwner`'s consumer needs EVERY segment of
+    // an entity it counts as "covered" to build a faithful mean.
+    if (reopens.length === 0 && inserts.length > 0) {
+      const owner = entityCoverageByOwner.get(aggregate.artifactVersionId) ?? [];
+      owner.push({ start: aggregate.spanStart, end: aggregate.spanEnd, vectors: inserts.map((entry) => entry.value.vector) });
+      entityCoverageByOwner.set(aggregate.artifactVersionId, owner);
+    }
   };
 
   /**
@@ -1136,7 +1327,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       const statusCommand = documentStatusUpsertCommand({
         workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: documentIdOf(item),
         artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath,
-        status: "covered", reasonCodes: [], generation, updatedAt: nowIso(),
+        status: "covered", reasonCodes: item.artifactReasonCodes ?? [], ...(item.artifactSegmentCount === undefined ? {} : { segmentCount: item.artifactSegmentCount }), generation, updatedAt: nowIso(),
       });
       const reopenUpdate: SqliteCommand = { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = NULL WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [workspaceId, item.projectionRecordId, item.validFromGeneration] };
       const reopenCommands: SqliteCommand[] = parked.valid_to_generation !== null ? [reopenUpdate, statusCommand] : [statusCommand];
@@ -1196,7 +1387,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         documentStatusUpsertCommand({
           workspaceId, profileId, executableBindingId, documentGrain: "artifact", documentId: documentIdOf(item),
           artifactId: item.ownerArtifactId, artifactVersionId: item.ownerArtifactVersionId, displayPath: item.displayPath,
-          status: "covered", reasonCodes: [], generation, updatedAt: nowIso(),
+          status: "covered", reasonCodes: item.artifactReasonCodes ?? [], ...(item.artifactSegmentCount === undefined ? {} : { segmentCount: item.artifactSegmentCount }), generation, updatedAt: nowIso(),
         }),
       ]);
     } catch {
@@ -1212,6 +1403,121 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     // the event loop across a large pass -- unchanged by batching, since a
     // yield still happens after every individual document's own write.
     await yieldToEventLoop();
+  };
+
+  /**
+   * Frente S-D (2026-09-07, Lever 3): digest identity for the segment cache
+   * -- a pure function of the exact (NFC-normalized) text a provider call
+   * would embed, deliberately INDEPENDENT of `segment_index`/`purpose`/which
+   * document the text came from: the underlying model's output for a given
+   * input text is deterministic regardless of those (they are bookkeeping
+   * metadata the PROVIDER folds into its own `input_digest`, never an input
+   * to the actual embedding computation), so two different entities -- or
+   * the same entity re-embedded after an edit shifted its `segment_index`,
+   * or a gap segment that happens to render identically to an entity segment
+   * elsewhere -- sharing byte-identical rendered text safely share one cache
+   * row.
+   */
+  function segmentCacheDigest(text: string): string {
+    return digestBytes(new TextEncoder().encode(text.normalize("NFC")));
+  }
+
+  /**
+   * Frente S-D (2026-09-07, Lever 3): reads a previously-cached vector for
+   * this exact `(executable_binding_id, segment_digest)` pair, scoped to
+   * this workspace -- `undefined` on a cache miss. A hit means this exact
+   * text was already embedded (in ANY prior generation, by ANY document, in
+   * this OR another shard process -- the cache is workspace+binding scoped,
+   * not document- or generation-scoped) under the CURRENT vector space, so
+   * the provider call for it can be skipped entirely.
+   */
+  const readCachedSegmentVector = async (digest: string): Promise<Uint8Array | undefined> => {
+    const row = await sql.get<{ vector: Uint8Array }>(
+      "SELECT vector FROM semantic_segment_cache WHERE workspace_id = ? AND executable_binding_id = ? AND segment_digest = ?",
+      [workspaceId, executableBindingId, digest],
+    );
+    return row?.vector;
+  };
+
+  /**
+   * Frente S-D (2026-09-07, Lever 3): best-effort cache write -- `INSERT OR
+   * IGNORE` so a row already written (by an earlier pass, or by ANOTHER
+   * concurrent shard process embedding the identical text independently,
+   * Lever 2) is a silent no-op rather than a primary-key conflict, and a
+   * write failure of any other kind is swallowed rather than failing the
+   * embed it is piggybacking on: this cache is purely an optimization -- a
+   * row that fails to write just means the identical text gets embedded
+   * again next time, never a correctness problem (the cached vector, when
+   * present, is always exactly what the provider would compute fresh for
+   * that text, since embedding is deterministic per vector space).
+   */
+  const writeCachedSegmentVector = async (digest: string, vector: Uint8Array): Promise<void> => {
+    try {
+      await sql.run(
+        "INSERT OR IGNORE INTO semantic_segment_cache (workspace_id, executable_binding_id, segment_digest, vector, dimensions, element_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [workspaceId, executableBindingId, digest, vector, provider.profile.dimensions, provider.profile.element_type, nowIso()],
+      );
+    } catch { /* best-effort, see this function's own doc comment */ }
+  };
+
+  /**
+   * Frente S-D (2026-09-07, Lever 1): embeds a plain list of texts (the
+   * artifact-vector composition's own GAP segments -- never a
+   * document-identified `PendingEmbedItem`) and returns their packed vector
+   * bytes in order, trying `provider.binding.generateVectors` first and
+   * falling back to sequential `generateVector` calls on rejection -- the
+   * SAME batch-then-fallback shape `embedAndCommitBatch` below already uses,
+   * minus the per-item commit step (nothing here writes to the database; the
+   * caller mean-pools these bytes with the file's entity vectors into ONE
+   * composed artifact vector before ever writing anything). Throws
+   * (propagating to the caller) if even the sequential fallback cannot embed
+   * every text -- the composed artifact document this call is part of is
+   * then left uncommitted for this pass and marked `failed` by the caller,
+   * retried next pass, exactly like any other provider failure this
+   * reconciler already tolerates.
+   */
+  const embedPlainTexts = async (texts: readonly string[]): Promise<readonly Uint8Array[]> => {
+    if (texts.length === 0) return [];
+    // Frente S-D (2026-09-07, Lever 3): cache lookup first -- only texts that
+    // MISS ever reach the provider. `result` is filled in cache-index order
+    // and returned in the ORIGINAL `texts` order regardless of which indices
+    // hit vs. missed.
+    const digests = texts.map((text) => segmentCacheDigest(text));
+    const cached = await Promise.all(digests.map((digest) => readCachedSegmentVector(digest)));
+    const result = new Array<Uint8Array | undefined>(texts.length);
+    const missIndices: number[] = [];
+    for (let index = 0; index < texts.length; index += 1) {
+      if (cached[index] !== undefined) result[index] = cached[index];
+      else missIndices.push(index);
+    }
+    if (missIndices.length > 0) {
+      const missTexts = missIndices.map((index) => texts[index]!);
+      let missVectors: readonly Uint8Array[];
+      const generateVectors = provider.binding.generateVectors;
+      if (generateVectors !== undefined) {
+        try {
+          const generated = await generateVectors(missTexts.map((text) => ({ profile: provider.profile, purpose: "document" as const, text })));
+          if (generated.length !== missTexts.length) throw new Error(`Semantic runtime binding generateVectors returned ${generated.length} vectors for ${missTexts.length} input segments.`);
+          missVectors = generated.map((item) => item.vector);
+        } catch {
+          // Fall through to the sequential fallback below -- same rationale
+          // as `embedAndCommitBatch`'s own identical catch.
+          const out: Uint8Array[] = [];
+          for (const text of missTexts) out.push((await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text })).vector);
+          missVectors = out;
+        }
+      } else {
+        const out: Uint8Array[] = [];
+        for (const text of missTexts) out.push((await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text })).vector);
+        missVectors = out;
+      }
+      for (let index = 0; index < missIndices.length; index += 1) {
+        const originalIndex = missIndices[index]!;
+        result[originalIndex] = missVectors[index]!;
+        await writeCachedSegmentVector(digests[originalIndex]!, missVectors[index]!);
+      }
+    }
+    return result as readonly Uint8Array[];
   };
 
   // Embeds and commits ONE batch of pending documents: tries
@@ -1230,12 +1536,33 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   const embedAndCommitBatch = async (pending: readonly PendingEmbedItem[]): Promise<void> => {
     if (pending.length === 0) return;
     await waitForQueryDrain();
+    // Frente S-D (2026-09-07, Lever 3): cache lookup FIRST, for the whole
+    // batch, before any provider call -- an item whose `embeddingText`
+    // matches an already-cached `(executable_binding_id, digest)` pair skips
+    // the provider entirely and commits immediately from the cached bytes.
+    // Only cache MISSES are ever collected into `misses` below and reach the
+    // generateVectors/generateVector logic that follows, unchanged in shape
+    // from before this lever (same batch-then-fallback, same per-item
+    // failure isolation) except it now runs over a possibly-smaller list.
+    const digests = pending.map((item) => segmentCacheDigest(item.embeddingText));
+    const cachedVectors = await Promise.all(digests.map((digest) => readCachedSegmentVector(digest)));
+    const misses: PendingEmbedItem[] = [];
+    const missDigests: string[] = [];
+    for (let index = 0; index < pending.length; index += 1) {
+      const cached = cachedVectors[index];
+      if (cached === undefined) { misses.push(pending[index]!); missDigests.push(digests[index]!); continue; }
+      await commitGeneratedVector(pending[index]!, { vector: cached, vector_digest: digestBytes(cached), input_digest: "segment-cache-hit", profile_digest: provider.profile.profile_digest });
+    }
+    if (misses.length === 0) return;
     const generateVectors = provider.binding.generateVectors;
     if (generateVectors !== undefined) {
       try {
-        const generated = await generateVectors(pending.map((item) => ({ profile: provider.profile, purpose: "document" as const, text: item.embeddingText, ...(item.segmentIndex === undefined ? {} : { segment_index: item.segmentIndex }) })));
-        if (generated.length !== pending.length) throw new Error(`Semantic runtime binding generateVectors returned ${generated.length} vectors for ${pending.length} inputs.`);
-        for (let index = 0; index < pending.length; index += 1) await commitGeneratedVector(pending[index]!, generated[index]!);
+        const generated = await generateVectors(misses.map((item) => ({ profile: provider.profile, purpose: "document" as const, text: item.embeddingText, ...(item.segmentIndex === undefined ? {} : { segment_index: item.segmentIndex }) })));
+        if (generated.length !== misses.length) throw new Error(`Semantic runtime binding generateVectors returned ${generated.length} vectors for ${misses.length} inputs.`);
+        for (let index = 0; index < misses.length; index += 1) {
+          await commitGeneratedVector(misses[index]!, generated[index]!);
+          await writeCachedSegmentVector(missDigests[index]!, generated[index]!.vector);
+        }
         return;
       } catch {
         // Batch rejected (or shaped wrong): fall through to the per-document
@@ -1243,7 +1570,8 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         // see this function's own doc comment.
       }
     }
-    for (const item of pending) {
+    for (let index = 0; index < misses.length; index += 1) {
+      const item = misses[index]!;
       let generated: SemanticGeneratedVector;
       try {
         generated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: item.embeddingText, ...(item.segmentIndex === undefined ? {} : { segment_index: item.segmentIndex }) });
@@ -1269,118 +1597,18 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
         continue;
       }
       await commitGeneratedVector(item, generated);
+      await writeCachedSegmentVector(missDigests[index]!, generated.vector);
     }
   };
 
-  // Step 3 (insert missing, ARTIFACT grain): every version visible at
-  // `generation`, whose scan-time encoding decision was "not binary", that
-  // has no OPEN ARTIFACT-grain vector row for the CURRENT (profile_id,
-  // executable_binding_id) -- this covers both a version that has NEVER been
-  // embedded under any provider, and a version whose only prior row(s) were
-  // just closed above (profile swap or stale close). Restricted to
-  // `vector_projection_rows.document_grain IS NULL` in the `NOT EXISTS`
-  // subquery for the identical reason step 2 restricts its own join: an
-  // entity vector can share this exact `(owner_artifact_id,
-  // owner_artifact_version_id)` pair with the file's OWN artifact document
-  // (every entity produced by this same scan of this same file does, by
-  // construction) -- without this filter, that entity row alone would make
-  // this query believe the file's artifact-grain document was "already
-  // covered" and skip embedding it entirely, the first time this reconciler
-  // ever ran on a fresh workspace.
-  const missingRows = await sql.all<MissingVectorRow>(
-    `SELECT artifact_versions.artifact_id AS artifact_id, artifact_versions.artifact_version_id AS artifact_version_id,
-            artifact_versions.content_hash AS content_hash, artifact_versions.byte_length AS byte_length,
-            artifact_versions.valid_from_generation AS valid_from_generation, source_artifacts.display_path AS display_path
-       FROM artifact_versions
-       JOIN source_artifacts ON source_artifacts.workspace_id = artifact_versions.workspace_id AND source_artifacts.artifact_id = artifact_versions.artifact_id
-      WHERE artifact_versions.workspace_id = ? AND artifact_versions.encoding <> 'binary'
-        AND artifact_versions.valid_from_generation <= ?
-        AND (artifact_versions.valid_to_generation IS NULL OR artifact_versions.valid_to_generation > ?)
-        AND NOT EXISTS (
-          SELECT 1 FROM vector_projection_rows
-           WHERE vector_projection_rows.workspace_id = artifact_versions.workspace_id
-             AND vector_projection_rows.owner_artifact_id = artifact_versions.artifact_id
-             AND vector_projection_rows.owner_artifact_version_id = artifact_versions.artifact_version_id
-             AND vector_projection_rows.valid_to_generation IS NULL
-             AND vector_projection_rows.document_grain IS NULL
-             AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
-        )
-      ORDER BY artifact_versions.artifact_id, artifact_versions.artifact_version_id`,
-    [workspaceId, generation, generation, profileId, executableBindingId],
-  );
-
-  let pendingBatch: PendingEmbedItem[] = [];
-  for (const row of missingRows) {
-    // Checked exactly once per BATCH -- right before the FIRST row of a
-    // fresh batch does any of its own read/decode/filter work, i.e.
-    // whenever `pendingBatch` is currently empty. This is what makes
-    // `embed_batch_size: 1` reproduce the pre-batching per-document
-    // checkpoint exactly (see that field's own doc comment): with batches
-    // of size one, `pendingBatch` returns to empty after every single
-    // document's own embed+commit, so this fires before every row's read,
-    // same as before. For a larger batch, every row AFTER the first one
-    // already collecting into a non-empty `pendingBatch` skips this check --
-    // the batch itself is the atom the checkpoint now protects, not each
-    // individual row's read.
-    if (pendingBatch.length === 0 && shouldAbort?.()) return buildResult(generation, false, true);
-    const displayPath = row.display_path ?? row.artifact_id;
-    if (row.byte_length > maxDocumentBytes) {
-      counts.skipped_oversized += 1;
-      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["oversized"] });
-      continue;
-    }
-    const bytes = await content.read(row.content_hash);
-    const text = decodeText(bytes);
-    if (text === undefined) {
-      counts.skipped_undecodable += 1;
-      // Decided in implementation: the fixed reason-code vocabulary (plan
-      // §4.1) has no separate code for "declared non-binary but does not
-      // decode as clean UTF-8" -- reusing `binary` here is the closest fit
-      // (both mean "not real embeddable text"), never silently dropped from
-      // the affected view.
-      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["binary"] });
-      continue;
-    }
-    const document = buildSemanticDocument({
-      artifact_id: row.artifact_id,
-      artifact_version_id: row.artifact_version_id,
-      display_path: displayPath,
-      content_class: "source",
-      language_ids: [],
-      source_text: text,
-    });
-    const embeddingText = document.sections.map((section) => section.text).join("\n");
-    // See `EMBEDDABLE_TOKEN_PATTERN`'s doc comment: classified BEFORE ever
-    // calling the provider, so this never costs a network round trip (HTTP
-    // provider) or risks matching the wrong thrown error (local provider).
-    if (!EMBEDDABLE_TOKEN_PATTERN.test(embeddingText)) {
-      counts.skipped_empty += 1;
-      // Decided in implementation: an empty/degenerate document is
-      // permanently unembeddable content, closest to `below_min_length` in
-      // the fixed vocabulary (there is no dedicated "empty" code).
-      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["below_min_length"] });
-      continue;
-    }
-    // Every new row is back-dated to the version's own
-    // `valid_from_generation`, same as `reconcileLexicalProjection` does for
-    // lexical documents: it makes the vector visible starting from exactly
-    // when its content became visible, not merely from whenever this
-    // reconcile pass happened to run. This is safe unconditionally --
-    // including for the profile-swap-rebuild case where the same version's
-    // OLD vector row was just closed by step 1 at this exact generation --
-    // because `projection_record_id` is scoped by vector space (see
-    // `semanticVectorProjectionRecordId`), so the old and new rows can never
-    // share a primary key.
-    const projectionRecordId = semanticVectorProjectionRecordId({ document_id: document.document_id, profile_id: profileId, executable_binding_id: executableBindingId });
-    pendingBatch.push({ embeddingText, projectionRecordId, ownerArtifactId: row.artifact_id, ownerArtifactVersionId: row.artifact_version_id, validFromGeneration: row.valid_from_generation, displayPath });
-    if (pendingBatch.length < embedBatchSize) continue;
-    await embedAndCommitBatch(pendingBatch);
-    pendingBatch = [];
-  }
-  // A trailing partial batch (fewer than `embedBatchSize` documents left)
-  // already had its one abort check above, at the point its first row
-  // started it from empty -- nothing further to check before this dispatch.
-  if (pendingBatch.length > 0) await embedAndCommitBatch(pendingBatch);
+  // Step 3 (insert missing, ARTIFACT grain) MOVED (Frente S-D, 2026-09-07,
+  // Lever 1): its query and loop now run AFTER step 5 (the entity insert
+  // loop), further down this function -- see the doc comment right before
+  // `missingRows` there for why this ordering is load-bearing: the artifact
+  // pass consumes `entityCoverageByOwner`, which step 5 populates as it
+  // commits fresh entity-segment vectors THIS pass. Steps 1-2 above (both
+  // grain-agnostic or artifact-only) are untouched by this move; step 4
+  // (entity stale-close) runs next, unchanged.
 
   // Step 4 (entity stale-close, decision 17): every OPEN entity-grain vector
   // row for the CURRENT (profile_id, executable_binding_id) -- which, after
@@ -1406,47 +1634,52 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // `SemanticEntityRecordSource.visibleRecordIds`'s own doc comment for why
   // this cannot recover an exact historical `valid_to_generation` the way
   // the v3 join does).
-  const staleEntityRows: readonly StaleVectorRow[] = entitySource === undefined
-    ? await sql.all<StaleVectorRow>(
-        `SELECT vector_projection_rows.projection_record_id AS projection_record_id, vector_projection_rows.valid_from_generation AS valid_from_generation,
-                COALESCE(record_occurrences.valid_to_generation, ?) AS closing_generation, vector_projection_rows.document_ref AS document_id
-           FROM vector_projection_rows
-           LEFT JOIN record_occurrences ON record_occurrences.workspace_id = vector_projection_rows.workspace_id
-            AND record_occurrences.record_id = vector_projection_rows.document_ref
-          WHERE vector_projection_rows.workspace_id = ? AND vector_projection_rows.valid_to_generation IS NULL
-            AND vector_projection_rows.document_grain = 'entity'
-            AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
-            AND (record_occurrences.record_id IS NULL OR NOT (
-              record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
-            ))`,
-        [generation, workspaceId, profileId, executableBindingId, generation, generation],
-      )
-    : await (async (): Promise<readonly StaleVectorRow[]> => {
-        const openRows = await sql.all<{ projection_record_id: string; valid_from_generation: number; document_ref: string }>(
-          `SELECT projection_record_id, valid_from_generation, document_ref
+  // Frente S-D (2026-09-07, Lever 2): workspace-wide, unscoped by shard --
+  // see the identical guard around steps 1/2 above for why only shard 0 (or
+  // an unsharded call) runs it.
+  if (input.shard === undefined || input.shard.index === 0) {
+    const staleEntityRows: readonly StaleVectorRow[] = entitySource === undefined
+      ? await sql.all<StaleVectorRow>(
+          `SELECT vector_projection_rows.projection_record_id AS projection_record_id, vector_projection_rows.valid_from_generation AS valid_from_generation,
+                  COALESCE(record_occurrences.valid_to_generation, ?) AS closing_generation, vector_projection_rows.document_ref AS document_id
              FROM vector_projection_rows
-            WHERE workspace_id = ? AND valid_to_generation IS NULL AND document_grain = 'entity'
-              AND profile_id = ? AND executable_binding_id = ?`,
-          [workspaceId, profileId, executableBindingId],
-        );
-        if (openRows.length === 0) return [];
-        const visible = await entitySource.visibleRecordIds([...new Set(openRows.map((row) => row.document_ref))]);
-        return openRows.filter((row) => !visible.has(row.document_ref)).map((row) => ({
-          projection_record_id: row.projection_record_id, valid_from_generation: row.valid_from_generation,
-          closing_generation: generation, document_id: row.document_ref,
-        }));
-      })();
-  for (const row of staleEntityRows) {
-    if (shouldAbort?.()) return buildResult(generation, false, true);
-    // Plan 2026-09-06 (Frente S-A): same one-transaction close+delete as
-    // step 2's identical stale-close loop above.
-    await sql.transaction([
-      { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [row.closing_generation, workspaceId, row.projection_record_id, row.valid_from_generation] },
-      documentStatusDeleteCommand({ workspaceId, profileId, executableBindingId, documentGrain: "entity", documentId: row.document_id }),
-    ]);
-    counts.closed += 1;
-    counts.entity_closed += 1;
-    await yieldToEventLoop();
+             LEFT JOIN record_occurrences ON record_occurrences.workspace_id = vector_projection_rows.workspace_id
+              AND record_occurrences.record_id = vector_projection_rows.document_ref
+            WHERE vector_projection_rows.workspace_id = ? AND vector_projection_rows.valid_to_generation IS NULL
+              AND vector_projection_rows.document_grain = 'entity'
+              AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
+              AND (record_occurrences.record_id IS NULL OR NOT (
+                record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
+              ))`,
+          [generation, workspaceId, profileId, executableBindingId, generation, generation],
+        )
+      : await (async (): Promise<readonly StaleVectorRow[]> => {
+          const openRows = await sql.all<{ projection_record_id: string; valid_from_generation: number; document_ref: string }>(
+            `SELECT projection_record_id, valid_from_generation, document_ref
+               FROM vector_projection_rows
+              WHERE workspace_id = ? AND valid_to_generation IS NULL AND document_grain = 'entity'
+                AND profile_id = ? AND executable_binding_id = ?`,
+            [workspaceId, profileId, executableBindingId],
+          );
+          if (openRows.length === 0) return [];
+          const visible = await entitySource.visibleRecordIds([...new Set(openRows.map((row) => row.document_ref))]);
+          return openRows.filter((row) => !visible.has(row.document_ref)).map((row) => ({
+            projection_record_id: row.projection_record_id, valid_from_generation: row.valid_from_generation,
+            closing_generation: generation, document_id: row.document_ref,
+          }));
+        })();
+    for (const row of staleEntityRows) {
+      if (shouldAbort?.()) return buildResult(generation, false, true);
+      // Plan 2026-09-06 (Frente S-A): same one-transaction close+delete as
+      // step 2's identical stale-close loop above.
+      await sql.transaction([
+        { kind: "run", sql: "UPDATE vector_projection_rows SET valid_to_generation = ? WHERE workspace_id = ? AND projection_record_id = ? AND valid_from_generation = ?", params: [row.closing_generation, workspaceId, row.projection_record_id, row.valid_from_generation] },
+        documentStatusDeleteCommand({ workspaceId, profileId, executableBindingId, documentGrain: "entity", documentId: row.document_id }),
+      ]);
+      counts.closed += 1;
+      counts.entity_closed += 1;
+      await yieldToEventLoop();
+    }
   }
 
   // Step 5 (insert missing, ENTITY grain, decision 17): every visible entity
@@ -1527,6 +1760,13 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
           }))
           .sort((left, right) => left.owner_artifact_version_id.localeCompare(right.owner_artifact_version_id) || left.record_id.localeCompare(right.record_id));
       })();
+  // Frente S-D (2026-09-07, Lever 2): shard filter -- BY OWNING ARTIFACT, so
+  // an entity and its owning file's artifact document always land in the
+  // SAME shard (see `shard`'s own doc comment). A plain array filter (not a
+  // SQL `WHERE`) keeps the query itself unchanged for every non-sharded
+  // caller and costs only a cheap in-memory pass over lightweight metadata
+  // rows (no CAS reads have happened yet for any of them).
+  const shardedMissingEntityRows = input.shard === undefined ? missingEntityRows : missingEntityRows.filter((row) => shardIndexFor(row.owner_artifact_id, input.shard!.count) === input.shard!.index);
 
   // Owning-file text state for the CURRENT `owner_artifact_version_id` group
   // -- read (and its oversized/undecodable outcome cached) exactly ONCE per
@@ -1541,7 +1781,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   let currentFileState: OwningFileState | undefined;
 
   let entityPendingBatch: PendingEmbedItem[] = [];
-  for (const row of missingEntityRows) {
+  for (const row of shardedMissingEntityRows) {
     // Same batch-scoped abort checkpoint as step 3's loop -- see its own
     // comment. The owning-file read below (when the owner id changes) is
     // part of "this row's own work" the checkpoint protects, exactly like
@@ -1636,6 +1876,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     registerEntityDocument(row.record_id, {
       artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath,
       totalSegments: segmentation.segments.length, truncated: segmentation.truncated,
+      spanStart: eligibility.start, spanEnd: eligibility.end,
     });
     for (const segment of segmentation.segments) {
       const projectionRecordId = semanticVectorProjectionRecordId({ document_id: documentId, profile_id: profileId, executable_binding_id: executableBindingId, segment_index: segment.index });
@@ -1651,6 +1892,203 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     }
   }
   if (entityPendingBatch.length > 0) await embedAndCommitBatch(entityPendingBatch);
+
+  // Step 3 (insert missing, ARTIFACT grain): every version visible at
+  // `generation`, whose scan-time encoding decision was "not binary", that
+  // has no OPEN ARTIFACT-grain vector row for the CURRENT (profile_id,
+  // executable_binding_id) -- this covers both a version that has NEVER been
+  // embedded under any provider, and a version whose only prior row(s) were
+  // just closed above (profile swap or stale close). Restricted to
+  // `vector_projection_rows.document_grain IS NULL` in the `NOT EXISTS`
+  // subquery for the identical reason step 2 restricts its own join: an
+  // entity vector can share this exact `(owner_artifact_id,
+  // owner_artifact_version_id)` pair with the file's OWN artifact document
+  // (every entity produced by this same scan of this same file does, by
+  // construction) -- without this filter, that entity row alone would make
+  // this query believe the file's artifact-grain document was "already
+  // covered" and skip embedding it entirely, the first time this reconciler
+  // ever ran on a fresh workspace.
+  //
+  // Frente S-D (2026-09-07, Lever 1 -- MOVED here, after step 5): this step
+  // used to run right after step 2, before any entity work. It now runs
+  // AFTER step 5 (the entity insert loop above) so that `entityCoverageByOwner`
+  // is fully populated by the time this loop starts -- every entity this
+  // pass freshly embedded for a given owning file is already committed and
+  // captured there (see that map's own doc comment). For a document with a
+  // non-empty coverage entry, the artifact vector is composed from those
+  // entity segment vectors plus fresh vectors of only the file text NOT
+  // covered by any eligible entity span ("gap" text) -- see the branch
+  // inside the loop below. For every other document (no coverage this pass:
+  // zero eligible entities, or every one of them reopened rather than
+  // inserted -- see `entityCoverageByOwner`'s doc comment), this step is
+  // BYTE-FOR-BYTE the same fresh whole-file embed it always was.
+  const missingRows = await sql.all<MissingVectorRow>(
+    `SELECT artifact_versions.artifact_id AS artifact_id, artifact_versions.artifact_version_id AS artifact_version_id,
+            artifact_versions.content_hash AS content_hash, artifact_versions.byte_length AS byte_length,
+            artifact_versions.valid_from_generation AS valid_from_generation, source_artifacts.display_path AS display_path
+       FROM artifact_versions
+       JOIN source_artifacts ON source_artifacts.workspace_id = artifact_versions.workspace_id AND source_artifacts.artifact_id = artifact_versions.artifact_id
+      WHERE artifact_versions.workspace_id = ? AND artifact_versions.encoding <> 'binary'
+        AND artifact_versions.valid_from_generation <= ?
+        AND (artifact_versions.valid_to_generation IS NULL OR artifact_versions.valid_to_generation > ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM vector_projection_rows
+           WHERE vector_projection_rows.workspace_id = artifact_versions.workspace_id
+             AND vector_projection_rows.owner_artifact_id = artifact_versions.artifact_id
+             AND vector_projection_rows.owner_artifact_version_id = artifact_versions.artifact_version_id
+             AND vector_projection_rows.valid_to_generation IS NULL
+             AND vector_projection_rows.document_grain IS NULL
+             AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
+        )
+      ORDER BY artifact_versions.artifact_id, artifact_versions.artifact_version_id`,
+    [workspaceId, generation, generation, profileId, executableBindingId],
+  );
+  // Frente S-D (2026-09-07, Lever 2): shard filter -- same rationale as
+  // `shardedMissingEntityRows` above (BY OWNING ARTIFACT, keeping a file's
+  // artifact document in the SAME shard as its own entities).
+  const shardedMissingRows = input.shard === undefined ? missingRows : missingRows.filter((row) => shardIndexFor(row.artifact_id, input.shard!.count) === input.shard!.index);
+
+  let pendingBatch: PendingEmbedItem[] = [];
+  for (const row of shardedMissingRows) {
+    // Checked exactly once per BATCH (whole-file path) or once per DOCUMENT
+    // (composed path, see below) -- right before the FIRST row of a fresh
+    // batch (or the composed document itself) does any of its own
+    // read/decode/filter work. This is what makes `embed_batch_size: 1`
+    // reproduce the pre-batching per-document checkpoint exactly (see that
+    // field's own doc comment): with batches of size one, `pendingBatch`
+    // returns to empty after every single document's own embed+commit, so
+    // this fires before every row's read, same as before. For a larger
+    // batch, every row AFTER the first one already collecting into a
+    // non-empty `pendingBatch` skips this check -- the batch itself is the
+    // atom the checkpoint now protects, not each individual row's read.
+    if (pendingBatch.length === 0 && shouldAbort?.()) return buildResult(generation, false, true);
+    const displayPath = row.display_path ?? row.artifact_id;
+    if (row.byte_length > maxDocumentBytes) {
+      counts.skipped_oversized += 1;
+      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["oversized"] });
+      continue;
+    }
+    const bytes = await content.read(row.content_hash);
+    const text = decodeText(bytes);
+    if (text === undefined) {
+      counts.skipped_undecodable += 1;
+      // Decided in implementation: the fixed reason-code vocabulary (plan
+      // §4.1) has no separate code for "declared non-binary but does not
+      // decode as clean UTF-8" -- reusing `binary` here is the closest fit
+      // (both mean "not real embeddable text"), never silently dropped from
+      // the affected view.
+      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["binary"] });
+      continue;
+    }
+
+    // Frente S-D (2026-09-07, Lever 1): does THIS pass's entity step already
+    // have fresh, current-generation entity-segment vectors for THIS EXACT
+    // `artifact_version_id`? If so, compose the artifact vector from them
+    // instead of a fresh whole-file embed.
+    const coverage = entityCoverageByOwner.get(row.artifact_version_id);
+    if (coverage !== undefined && coverage.length > 0) {
+      await waitForQueryDrain();
+      const mergedCovered = mergeSpans(coverage.map((entry) => ({ start: entry.start, end: entry.end })));
+      const gapRanges = complementSpans(mergedCovered, text.length);
+      const gapText = gapRanges.map((range) => text.slice(range.start, range.end)).join("\n");
+      const entityVectors = coverage.flatMap((entry) => entry.vectors);
+      let gapVectors: readonly Uint8Array[] = [];
+      let gapTruncated = false;
+      if (EMBEDDABLE_TOKEN_PATTERN.test(gapText)) {
+        const gapSegmentation: Segmentation = provider.binding.segment !== undefined
+          ? await provider.binding.segment(gapText)
+          : { segments: [{ index: 0, text: gapText, start_char: 0, end_char: gapText.length }], truncated: false };
+        const gapCap = Number.isSafeInteger(input.entity_policy?.max_gap_segments) && input.entity_policy!.max_gap_segments! > 0 ? input.entity_policy!.max_gap_segments! : undefined;
+        const cappedSegments = gapCap !== undefined && gapSegmentation.segments.length > gapCap ? gapSegmentation.segments.slice(0, gapCap) : gapSegmentation.segments;
+        gapTruncated = gapSegmentation.truncated || cappedSegments.length < gapSegmentation.segments.length;
+        try {
+          gapVectors = await embedPlainTexts(cappedSegments.map((segment) => segment.text));
+        } catch {
+          // Same "left missing, retried next pass" tradeoff every other
+          // provider failure in this reconciler accepts -- see
+          // `embedAndCommitBatch`'s own identical doc comment.
+          counts.failed += 1;
+          await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "failed", reasonCodes: ["provider_error:generate_vector_failed"] });
+          continue;
+        }
+      }
+      const allVectors = [...entityVectors, ...gapVectors];
+      if (allVectors.length === 0) {
+        // Defensive: an eligible entity's own span is, by construction,
+        // non-empty, so `entityVectors` alone should never be empty here --
+        // handled the same way the ordinary whole-file empty-text check is,
+        // never silently skipped.
+        counts.skipped_empty += 1;
+        await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["below_min_length"] });
+        continue;
+      }
+      const combinedVector = combineVectorsMeanNormalized(allVectors, provider.profile);
+      const generated: SemanticGeneratedVector = {
+        vector: combinedVector,
+        vector_digest: digestBytes(combinedVector),
+        input_digest: digestBytes(canonicalBytes({ kind: "artifact-composition", entity_segments: entityVectors.length, gap_segments: gapVectors.length })),
+        profile_digest: provider.profile.profile_digest,
+      };
+      const composedDocument = buildSemanticDocument({ artifact_id: row.artifact_id, artifact_version_id: row.artifact_version_id, display_path: displayPath, content_class: "source", language_ids: [], source_text: text });
+      const projectionRecordId = semanticVectorProjectionRecordId({ document_id: composedDocument.document_id, profile_id: profileId, executable_binding_id: executableBindingId });
+      const composedItem: PendingEmbedItem = {
+        embeddingText: "", // Unused: `commitGeneratedVector` never reads `.embeddingText`, only `generated.vector` (already computed above).
+        projectionRecordId, ownerArtifactId: row.artifact_id, ownerArtifactVersionId: row.artifact_version_id,
+        validFromGeneration: row.valid_from_generation, displayPath,
+        artifactSegmentCount: allVectors.length, ...(gapTruncated ? { artifactReasonCodes: ["segments_truncated"] } : {}),
+      };
+      await commitGeneratedVector(composedItem, generated);
+      continue;
+    }
+
+    const document = buildSemanticDocument({
+      artifact_id: row.artifact_id,
+      artifact_version_id: row.artifact_version_id,
+      display_path: displayPath,
+      content_class: "source",
+      language_ids: [],
+      source_text: text,
+    });
+    const embeddingText = document.sections.map((section) => section.text).join("\n");
+    // See `EMBEDDABLE_TOKEN_PATTERN`'s doc comment: classified BEFORE ever
+    // calling the provider, so this never costs a network round trip (HTTP
+    // provider) or risks matching the wrong thrown error (local provider).
+    if (!EMBEDDABLE_TOKEN_PATTERN.test(embeddingText)) {
+      counts.skipped_empty += 1;
+      // Decided in implementation: an empty/degenerate document is
+      // permanently unembeddable content, closest to `below_min_length` in
+      // the fixed vocabulary (there is no dedicated "empty" code).
+      await writeStatusRow({ documentGrain: "artifact", documentId: row.artifact_version_id, artifactId: row.artifact_id, artifactVersionId: row.artifact_version_id, displayPath, status: "excluded", reasonCodes: ["below_min_length"] });
+      continue;
+    }
+    // Every new row is back-dated to the version's own
+    // `valid_from_generation`, same as `reconcileLexicalProjection` does for
+    // lexical documents: it makes the vector visible starting from exactly
+    // when its content became visible, not merely from whenever this
+    // reconcile pass happened to run. This is safe unconditionally --
+    // including for the profile-swap-rebuild case where the same version's
+    // OLD vector row was just closed by step 1 at this exact generation --
+    // because `projection_record_id` is scoped by vector space (see
+    // `semanticVectorProjectionRecordId`), so the old and new rows can never
+    // share a primary key.
+    const projectionRecordId = semanticVectorProjectionRecordId({ document_id: document.document_id, profile_id: profileId, executable_binding_id: executableBindingId });
+    pendingBatch.push({ embeddingText, projectionRecordId, ownerArtifactId: row.artifact_id, ownerArtifactVersionId: row.artifact_version_id, validFromGeneration: row.valid_from_generation, displayPath });
+    if (pendingBatch.length < embedBatchSize) continue;
+    await embedAndCommitBatch(pendingBatch);
+    pendingBatch = [];
+  }
+  // A trailing partial batch (fewer than `embedBatchSize` documents left)
+  // already had its one abort check above, at the point its first row
+  // started it from empty -- nothing further to check before this dispatch.
+  if (pendingBatch.length > 0) await embedAndCommitBatch(pendingBatch);
+
+  // Frente S-D (2026-09-07, Lever 2): a sharded call stops here -- it never
+  // runs the workspace-wide bulk status maintenance below, and never writes
+  // the completion marker, regardless of how clean its OWN portion was (see
+  // `shard`'s own doc comment for why only the orchestrator's final,
+  // unsharded call may conclude the whole workspace is caught up).
+  // `marker_written` is therefore always `false` here for a sharded call.
+  if (input.shard !== undefined) return buildResult(generation, false);
 
   // Plan 2026-09-06 (Frente S-A): bulk status-table maintenance -- binary/
   // unsupported-kind classification, covered-from-vectors backfill, and the

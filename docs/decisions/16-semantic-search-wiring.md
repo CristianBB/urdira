@@ -229,3 +229,54 @@ for the full before/after breakdown and the two REMAINING, larger, NOT-fixed-
 this-session cost centers (`exactVectorScan`'s per-candidate `canonicalVectorBytes`
 cost over an uncapped entity-candidate set; `hydrateSemanticCandidates`'s
 sequential, snippet-budget-order-dependent per-candidate CAS read).
+
+## Amendment (2026-09-07, Frente S-D): both remaining cost centers fixed
+
+- **`exactVectorScan`'s per-candidate `canonicalVectorBytes` cost**
+  (`packages/engine/src/semantic-retrieval.ts`): a new `fastCandidateBytes`
+  helper skips the redundant decode -> optionally-renormalize -> re-encode
+  round trip for a `Uint8Array` candidate whose byte length already matches
+  the query's own `dimensions`/`element_type` -- every such candidate has
+  ALREADY been filtered (same call) to share the query's exact
+  `profile_id`/`executable_binding_id`, the SAME vector-space identity that
+  controlled its own canonicalization the one time it was ever written
+  (`putVectors`, `@urdira/storage`, the only writer of
+  `vector_projection_rows`/its packed CAS shards) -- so the write-side
+  guarantee is relied on instead of redundantly re-verified on every read. A
+  raw `readonly number[]` candidate or a byte-length mismatch still takes
+  the full, unchanged `canonicalVectorBytes` path.
+- **`hydrateSemanticCandidates`'s sequential, order-dependent snippet
+  budget** (`packages/engine/src/canonical-query-data-port.ts`): the shared,
+  order-dependent `remainingCandidateSnippetBudget` (earlier-ranked
+  candidates could consume a larger share, and every `sourceSnippet` call
+  had to run one at a time to decrement it safely) is replaced with a FIXED,
+  EQUAL per-candidate share of the same total budget, computed once up
+  front -- independent of candidate order, so every candidate's own
+  `sourceSnippet` call is safe to run with BOUNDED concurrency
+  (`SEMANTIC_HYDRATION_CONCURRENCY`, `mapWithConcurrency`, same magnitude as
+  `semantic_vectors`'s own shard-read concurrency). `context_lines: 0` is
+  unchanged.
+
+- **NEW finding, not in either remaining-cost-center list above: `exactVectorScan`
+  rejected any query once the native candidate set exceeded a generic
+  4MiB/4,096-record native batch bound** (`crates/urdira-native-core/src/lib.rs`'s
+  `MAX_BATCH_FRAMED_BYTES`/`MAX_BATCH_RECORDS`, shared by several unrelated
+  native operations) -- discovered live on the FIRST real query against a
+  2,492-file workspace (13,454 open vectors): every `core:search_semantic`/
+  `core:search_hybrid` call failed outright
+  (`exactVectorTopKBatch rejected the batch: ... byte bound`). For 384-dim
+  vectors this caps out around ~1,300 candidates per native call --
+  n8n-scale entity-grain candidate counts (deliberately uncapped per
+  decision 17) would ALWAYS exceed it, meaning semantic search was
+  completely unusable on any real corpus past a few thousand vectors,
+  independent of every other fix in this document. Fixed by `nativeTopKChunked`
+  (`packages/engine/src/semantic-retrieval.ts`): chunks eligible candidates
+  into native-sized batches, computes each chunk's own top-`limit` natively,
+  then recursively merges and re-ranks chunk winners -- EXACT (decision 06:
+  no ANN, no sampling), proven by a dedicated test running 9,000 synthetic
+  candidates through a fake native port that itself enforces the real
+  bounds.
+
+Measured before/after on n8n (hot, full row set) and a small workspace: see
+`docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md` Part
+3.

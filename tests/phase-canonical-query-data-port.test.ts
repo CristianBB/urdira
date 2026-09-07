@@ -2086,6 +2086,52 @@ describe("CanonicalRecordQueryDataPort core:search_semantic ranking", () => {
     });
   });
 
+  it("Frente S-D (2026-09-07): hydrates candidate snippets with bounded CONCURRENCY, preserving rank order regardless of which snippet's underlying artifact_text call settles first", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedThreeDocumentWorkspace(opened, provider);
+      const inner = new SqliteCanonicalQuerySnapshotPort(opened.database, cas);
+      const callOrder: string[] = [];
+      // Deliberately inverts timing: the FIRST-ranked candidate's own
+      // `artifact_text` call is the SLOWEST to settle, and the LAST-ranked
+      // candidate's is instant -- if `hydrateSemanticCandidates` still
+      // hydrated sequentially (or somehow reordered by completion time),
+      // this would either serialize behind the slow call or surface out of
+      // rank order. A `Proxy` forwards every OTHER method to `inner`
+      // unmodified (bound, since class methods are prototype properties a
+      // plain `{...inner}` spread would silently drop).
+      const delayed = new Proxy(inner, {
+        get(target, prop, receiver) {
+          if (prop === "artifact_text") {
+            return async (queryScope: QueryScope, versionId: string) => {
+              callOrder.push(versionId);
+              const delayMs = versionId === "artv-alpha" ? 30 : versionId === "artv-beta" ? 15 : 0;
+              await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+              return target.artifact_text!(queryScope, versionId);
+            };
+          }
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as CanonicalQuerySnapshotPort;
+      const dataPort = new CanonicalRecordQueryDataPort(delayed, { semantic: provider });
+
+      const evaluation = await dataPort.execute(semanticOperation("core:search_semantic"));
+      const candidates = candidateValues(evaluation);
+      expect(candidates).toHaveLength(3);
+      // Rank order is UNCHANGED from the plain (non-delayed) ranking test
+      // above, even though `artv-alpha`'s own snippet was the LAST to
+      // actually finish resolving.
+      expect(candidates[0]!.value.body.artifact_id).toBe("art-alpha");
+      expect(candidates[0]!.stable_sort_key.startsWith(sortKeyPrefix(1))).toBe(true);
+      expect(candidates[1]!.stable_sort_key.startsWith(sortKeyPrefix(2))).toBe(true);
+      expect(candidates[2]!.stable_sort_key.startsWith(sortKeyPrefix(3))).toBe(true);
+      // Every candidate's snippet was still fetched at all (real concurrency,
+      // not accidentally skipped).
+      expect(callOrder.sort()).toEqual(["artv-alpha", "artv-beta", "artv-gamma"]);
+    });
+  });
+
   it("proves no corpus load happens: execute() succeeds through a port whose records()/has_warm_records() throw", async () => {
     await withSemanticWorkspace(async (opened, cas) => {
       const provider = createLocalHashProvider();

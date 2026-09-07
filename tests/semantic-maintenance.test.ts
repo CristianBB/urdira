@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
-import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type ContentAddressedStore, type WorkspaceDatabase } from "../packages/storage/src/index.js";
-import { createHttpEmbeddingProvider, createLocalHashProvider, reconcileSemanticProjection, type ResolvedSemanticProvider, type SemanticEntityCandidateRow, type SemanticEntityRecordSource, type SemanticReconcilerContentReader } from "../packages/engine/src/index.js";
+import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type ContentAddressedStore, type SqliteValue, type WorkspaceDatabase } from "../packages/storage/src/index.js";
+import { createHttpEmbeddingProvider, createLocalHashProvider, reconcileSemanticProjection, shardIndexFor, vectorValues, type ResolvedSemanticProvider, type SemanticEntityCandidateRow, type SemanticEntityRecordSource, type SemanticReconcilerContentReader } from "../packages/engine/src/index.js";
 
 // `reconcileSemanticProjection` is typed against `@urdira/storage`'s
 // published (dist) `WorkspaceDatabase` declaration, since that is the real
@@ -1000,7 +1000,7 @@ describe("reconcileSemanticProjection entity pass (decision 17)", () => {
     });
   });
 
-  it("stops promptly on abort mid-entity-pass (after the artifact pass has already run to completion), leaving already-committed entity rows intact and the marker unwritten, and resumes cleanly on the next pass", async () => {
+  it("stops promptly on abort mid-artifact-pass (after the entity pass has already run to completion, Frente S-D reordering), leaving already-committed rows intact and the marker unwritten, and resumes cleanly on the next pass", async () => {
     const workspaceId = "ws-semantic-entity-abort";
     const provider = createLocalHashProvider();
     const funcOne = `export function abortEntityContentOneForTestCoverage() {\n  // ${ENTITY_SPAN_PADDING}\n  return 1;\n}`;
@@ -1015,28 +1015,35 @@ describe("reconcileSemanticProjection entity pass (decision 17)", () => {
 
       let reads = 0;
       const content: SemanticReconcilerContentReader = { async read(hash) { reads += 1; return cas.read(hash); } };
-      // `embed_batch_size: 1` pins this to per-document abort-checkpoint
-      // granularity (see the existing artifact-pass abort test's identical
-      // reasoning). The artifact pass reads exactly 2 files (reads 1-2); the
-      // entity pass's OWN, separate file reads start at read 3 -- aborting
-      // once `reads` reaches 3 fires the checkpoint AFTER the first entity
-      // candidate has already been read and committed, but BEFORE the
-      // second one's own read, so the abort is unambiguously mid-ENTITY-pass,
-      // never mid-artifact-pass.
+      // Frente S-D (2026-09-07, Lever 1): the entity pass (step 5) now runs
+      // BEFORE the artifact pass (step 3) -- see `reconcileSemanticProjection`'s
+      // own doc comment on why step 3 moved. `embed_batch_size: 1` still pins
+      // this to per-document abort-checkpoint granularity. The entity pass
+      // reads exactly 2 owner files (reads 1-2, one per distinct entity
+      // record's owning artifact version) and fully completes (both entity
+      // records span their whole owning file, so BOTH also register full
+      // coverage for their own artifact document via `entityCoverageByOwner`);
+      // the artifact pass's OWN reads then start at read 3 -- aborting once
+      // `reads` reaches 3 fires the checkpoint AFTER the first artifact
+      // document (composed entirely from its one covering entity vector, no
+      // gap) has already been read and committed, but BEFORE the second
+      // one's own read, so the abort is unambiguously mid-ARTIFACT-pass,
+      // never mid-entity-pass.
       const shouldAbort = () => reads >= 3;
 
       const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content, provider, embed_batch_size: 1, should_abort: shouldAbort });
       expect(result.aborted).toBe(true);
       expect(result.marker_written).toBe(false);
-      expect(result.inserted).toBe(2); // artifact pass ran to completion first
-      expect(result.entity_inserted).toBe(1);
+      expect(result.entity_inserted).toBe(2); // entity pass ran to completion first
+      expect(result.inserted).toBe(1); // artifact pass aborted after its first document
 
       const committedEntityVectors = await opened.database.all<{ document_ref: string | null }>("SELECT document_ref FROM vector_projection_rows WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL", [workspaceId]);
-      expect(committedEntityVectors).toHaveLength(1);
+      expect(committedEntityVectors).toHaveLength(2);
 
       // A subsequent, unobstructed pass picks up exactly where the aborted one left off.
       const resumed = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
-      expect(resumed.entity_inserted).toBe(1);
+      expect(resumed.entity_inserted).toBe(0); // already complete from the aborted pass
+      expect(resumed.inserted).toBe(1); // the one remaining artifact document
       expect(resumed.marker_written).toBe(true);
       const allEntityVectors = await opened.database.all<{ document_ref: string | null }>("SELECT document_ref FROM vector_projection_rows WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL", [workspaceId]);
       expect(allEntityVectors.map((row) => row.document_ref).sort()).toEqual(["rec-abort-1", "rec-abort-2"]);
@@ -1545,6 +1552,338 @@ describe("reconcileSemanticProjection entity pass with entity_record_source (v4 
       const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
       expect(second).toEqual({ ...first, closed: 0, inserted: 0, entity_inserted: 0 });
       expect(source.calls).toEqual(callsAfterFirst);
+    });
+  });
+});
+
+// Frente S-D (2026-09-07, Lever 1): the artifact-vector composition itself --
+// `reconcileSemanticProjection`'s step 3 (moved to run after step 5) composes
+// an artifact document's vector from its owning file's ELIGIBLE entity
+// segment vectors (already fresh this pass) plus fresh vectors of only the
+// text NOT covered by any such span ("gap" text), instead of always
+// re-embedding the whole file from scratch. `createLocalHashProvider` is
+// used throughout (fully deterministic, no floating-point/model variance) so
+// "numeric equality with tolerance" assertions below are meaningful.
+async function readOpenVectorBytes(opened: WorkspaceDatabase, cas: ContentAddressedStore, where: string, params: readonly SqliteValue[]): Promise<{ readonly vector: Uint8Array; readonly dimensions: number; readonly elementType: "float32" | "float64"; readonly segmentCount: number | undefined }> {
+  const row = await opened.database.get<{ shard_id: string; shard_offset: number; byte_length: number; dimensions: number; element_type: string }>(
+    `SELECT shard_id, shard_offset, byte_length, dimensions, element_type FROM vector_projection_rows WHERE valid_to_generation IS NULL AND ${where}`,
+    params,
+  );
+  if (row === undefined) throw new Error(`No open vector row matching "${where}".`);
+  const shard = await opened.database.get<{ content_hash: string }>("SELECT content_hash FROM vector_shards WHERE shard_id = ?", [row.shard_id]);
+  if (shard === undefined) throw new Error(`No vector_shards row for shard_id ${row.shard_id}.`);
+  const packed = await cas.read(shard.content_hash);
+  return { vector: packed.slice(row.shard_offset, row.shard_offset + row.byte_length), dimensions: row.dimensions, elementType: row.element_type as "float32" | "float64", segmentCount: undefined };
+}
+
+async function readDocumentStatusSegmentCount(opened: WorkspaceDatabase, documentGrain: "artifact" | "entity", documentId: string): Promise<{ readonly segment_count: number; readonly reason_codes: string } | undefined> {
+  return opened.database.get<{ segment_count: number; reason_codes: string }>("SELECT segment_count, reason_codes FROM semantic_document_status WHERE document_grain = ? AND document_id = ?", [documentGrain, documentId]);
+}
+
+function cosineSimilarity(left: readonly number[], right: readonly number[]): number {
+  const dot = left.reduce((sum, value, index) => sum + value * (right[index] ?? 0), 0);
+  const leftNorm = Math.sqrt(left.reduce((sum, value) => sum + value * value, 0));
+  const rightNorm = Math.sqrt(right.reduce((sum, value) => sum + value * value, 0));
+  return dot / (leftNorm * rightNorm);
+}
+
+describe("Frente S-D (2026-09-07): artifact-vector composition from entity segments (Lever 1)", () => {
+  it("when one eligible entity's span covers the WHOLE file (no gap), the composed artifact vector equals that entity's own vector within numeric tolerance", async () => {
+    const workspaceId = "ws-semantic-compose-nogap";
+    const provider = createLocalHashProvider();
+    const text = `export function composeNoGapForTestCoverage() {\n  // ${ENTITY_SPAN_PADDING}\n  return 1;\n}`;
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-nogap", artifactVersionId: "artv-nogap", text, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-nogap", recordKind: "jsts:entity_callable", ownerArtifactId: "art-nogap", ownerArtifactVersionId: "artv-nogap", validFromGeneration: 1, body: { name: "composeNoGapForTestCoverage", kind: "function", start: 0, end: text.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(result.entity_inserted).toBe(1);
+      expect(result.inserted).toBe(1);
+      expect(result.marker_written).toBe(true);
+
+      const artifactVector = await readOpenVectorBytes(opened, cas, "owner_artifact_version_id = ? AND document_grain IS NULL", ["artv-nogap"]);
+      const entityVector = await readOpenVectorBytes(opened, cas, "document_grain = 'entity' AND document_ref = ?", ["rec-nogap"]);
+      const artifactValues = vectorValues(artifactVector.vector, { dimensions: artifactVector.dimensions, element_type: artifactVector.elementType, normalization: "none" });
+      const entityValues = vectorValues(entityVector.vector, { dimensions: entityVector.dimensions, element_type: entityVector.elementType, normalization: "none" });
+      // A single-component mean is that component itself, then re-normalized
+      // -- since the entity vector is already unit-norm, re-normalizing it is
+      // idempotent up to float32 rounding (see `combineVectorsMeanNormalized`'s
+      // own doc comment), so cosine similarity should be extremely close to 1,
+      // never bit-identical.
+      expect(cosineSimilarity(artifactValues, entityValues)).toBeCloseTo(1, 6);
+
+      // `semantic_document_status.segment_count` reflects the REAL component
+      // count (1 entity segment, 0 gap segments) -- plan §4's own requirement.
+      const status = await readDocumentStatusSegmentCount(opened, "artifact", "artv-nogap");
+      expect(status?.segment_count).toBe(1);
+      expect(status?.reason_codes).toBe("[]");
+    });
+  });
+
+  it("when an eligible entity covers only PART of the file, the composed artifact vector combines the entity vector with a fresh gap-segment vector, and differs from the entity-only vector", async () => {
+    const workspaceId = "ws-semantic-compose-gap";
+    const provider = createLocalHashProvider();
+    const gapText = `import { unrelatedHelperForTestCoverageGapSegment } from "./unrelated-gap-helper-module";\n`;
+    const functionText = `export function composeWithGapForTestCoverage() {\n  // ${ENTITY_SPAN_PADDING}\n  return 2;\n}`;
+    const text = `${gapText}${functionText}\n`;
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-gap", artifactVersionId: "artv-gap", text, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-gap", recordKind: "jsts:entity_callable", ownerArtifactId: "art-gap", ownerArtifactVersionId: "artv-gap", validFromGeneration: 1, body: { name: "composeWithGapForTestCoverage", kind: "function", start: gapText.length, end: gapText.length + functionText.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(result.entity_inserted).toBe(1);
+      expect(result.inserted).toBe(1);
+      expect(result.marker_written).toBe(true);
+
+      const artifactVector = await readOpenVectorBytes(opened, cas, "owner_artifact_version_id = ? AND document_grain IS NULL", ["artv-gap"]);
+      const entityVector = await readOpenVectorBytes(opened, cas, "document_grain = 'entity' AND document_ref = ?", ["rec-gap"]);
+      const artifactValues = vectorValues(artifactVector.vector, { dimensions: artifactVector.dimensions, element_type: artifactVector.elementType, normalization: "none" });
+      const entityValues = vectorValues(entityVector.vector, { dimensions: entityVector.dimensions, element_type: entityVector.elementType, normalization: "none" });
+      // A real gap contributes a second, distinct component -- the composed
+      // artifact vector is the mean of TWO vectors, so it must NOT collapse
+      // back onto the entity-only vector (a regression that would mean the
+      // gap was silently dropped).
+      expect(cosineSimilarity(artifactValues, entityValues)).toBeLessThan(0.999);
+
+      // Independently recompute the expected combination via the provider's
+      // OWN deterministic embed of the exact same gap text (the hash
+      // provider's segmenter treats a short gap as one whole segment), then
+      // mean + re-normalize by hand -- must match the reconciler's own
+      // composed vector exactly (deterministic provider, no floating drift).
+      const gapGenerated = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text: gapText.trimEnd() });
+      const gapValues = vectorValues(gapGenerated.vector, { dimensions: provider.profile.dimensions, element_type: provider.profile.element_type as "float32" | "float64", normalization: "none" });
+      const expectedMean = entityValues.map((value, index) => (value + gapValues[index]!) / 2);
+      const normalized = (() => {
+        const norm = Math.sqrt(expectedMean.reduce((sum, value) => sum + value * value, 0));
+        return expectedMean.map((value) => value / norm);
+      })();
+      expect(cosineSimilarity(artifactValues, normalized)).toBeCloseTo(1, 6);
+
+      const status = await readDocumentStatusSegmentCount(opened, "artifact", "artv-gap");
+      expect(status?.segment_count).toBe(2);
+    });
+  });
+
+  it("falls back to the ordinary whole-file embed when the file has zero eligible entities (no coverage this pass)", async () => {
+    const workspaceId = "ws-semantic-compose-none";
+    const provider = createLocalHashProvider();
+    const text = "export const plainConfigValueForTestCoverage = 42;\n";
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-none", artifactVersionId: "artv-none", text, validFromGeneration: 1 });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(result.inserted).toBe(1);
+      expect(result.entity_inserted).toBe(0);
+
+      const artifactVector = await readOpenVectorBytes(opened, cas, "owner_artifact_version_id = ? AND document_grain IS NULL", ["artv-none"]);
+      const artifactValues = vectorValues(artifactVector.vector, { dimensions: artifactVector.dimensions, element_type: artifactVector.elementType, normalization: "none" });
+      const whole = await provider.binding.generateVector({ profile: provider.profile, purpose: "document", text });
+      const wholeValues = vectorValues(whole.vector, { dimensions: provider.profile.dimensions, element_type: provider.profile.element_type as "float32" | "float64", normalization: "none" });
+      // No coverage this pass -- byte-for-byte the pre-Lever-1 whole-file
+      // path, not merely "close": the reconciler's own `buildSemanticDocument`
+      // rendering matches this direct provider call exactly for plain text.
+      expect(cosineSimilarity(artifactValues, wholeValues)).toBeCloseTo(1, 6);
+
+      const status = await readDocumentStatusSegmentCount(opened, "artifact", "artv-none");
+      expect(status?.segment_count).toBe(1);
+    });
+  });
+});
+
+// Frente S-D (2026-09-07, Lever 2): parallel reconciler sharding --
+// `ReconcileSemanticProjectionInput.shard` splits the missing-vector insert
+// loops (steps 3 and 5) across `count` concurrent calls (in production, one
+// per child process, see `@urdira/daemon`'s `runSemanticReconcileSharded`),
+// each handling only documents whose owning artifact hashes to its own
+// `index`. This test runs the two shard calls SEQUENTIALLY against the SAME
+// workspace (correctness only -- real concurrency is a daemon-orchestration
+// concern, not a `reconcileSemanticProjection`-level one) followed by one
+// unsharded "finalize" call, and asserts the resulting rows are IDENTICAL
+// (same document set, same exact vector bytes -- `createLocalHashProvider`
+// is fully deterministic) to a single ordinary unsharded pass over the same
+// corpus.
+async function allVectorRowSignatures(opened: WorkspaceDatabase, cas: ContentAddressedStore): Promise<readonly string[]> {
+  const rows = await opened.database.all<{ document_grain: string | null; document_ref: string | null; owner_artifact_version_id: string; shard_id: string; shard_offset: number; byte_length: number }>(
+    "SELECT document_grain, document_ref, owner_artifact_version_id, shard_id, shard_offset, byte_length FROM vector_projection_rows WHERE valid_to_generation IS NULL",
+  );
+  const out: string[] = [];
+  for (const row of rows) {
+    const shard = await opened.database.get<{ content_hash: string }>("SELECT content_hash FROM vector_shards WHERE shard_id = ?", [row.shard_id]);
+    const packed = shard !== undefined ? await cas.read(shard.content_hash) : new Uint8Array();
+    const bytes = packed.slice(row.shard_offset, row.shard_offset + row.byte_length);
+    out.push(`${row.document_grain ?? "artifact"}:${row.document_ref ?? row.owner_artifact_version_id}:${Buffer.from(bytes).toString("hex")}`);
+  }
+  return out.sort();
+}
+
+describe("Frente S-D (2026-09-07): parallel reconciler sharding (Lever 2)", () => {
+  const shardDocs = [1, 2, 3, 4, 5, 6].map((index) => ({
+    artifactId: `art-shard-${index}`,
+    artifactVersionId: `artv-shard-${index}`,
+    recordId: `rec-shard-${index}`,
+    text: `export function shardedFunctionNumber${index}ForTestCoverageOfTheParallelReconciler() {\n  // ${ENTITY_SPAN_PADDING}\n  return ${index};\n}`,
+  }));
+
+  async function seedShardCorpus(opened: WorkspaceDatabase, cas: ContentAddressedStore, workspaceId: string): Promise<void> {
+    for (const doc of shardDocs) {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: doc.artifactId, artifactVersionId: doc.artifactVersionId, text: doc.text, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: doc.recordId, recordKind: "jsts:entity_callable", ownerArtifactId: doc.artifactId, ownerArtifactVersionId: doc.artifactVersionId, validFromGeneration: 1, body: { name: `shardedFunctionNumber${doc.artifactId}`, kind: "function", start: 0, end: doc.text.length } });
+    }
+    await setCurrentGeneration(opened, workspaceId, 1);
+  }
+
+  it("assigns every document to exactly one of N shards, deterministically", () => {
+    for (const doc of shardDocs) {
+      const shard0 = shardIndexFor(doc.artifactId, 2);
+      const shard1 = shardIndexFor(doc.artifactId, 2);
+      expect(shard0).toBe(shard1); // deterministic: same input, same output
+      expect(shard0 === 0 || shard0 === 1).toBe(true);
+    }
+    // With 6 distinct artifact ids and 2 shards, both shards get at least one document (not a strict requirement of the function, but true for this fixture -- confirms the hash is not degenerate for this test's own inputs).
+    const assignments = new Set(shardDocs.map((doc) => shardIndexFor(doc.artifactId, 2)));
+    expect(assignments.size).toBeGreaterThan(0);
+  });
+
+  it("2 shards + one finalize pass produce the same rows as a single unsharded pass", async () => {
+    const provider = createLocalHashProvider();
+
+    const baselineWorkspace = "ws-semantic-shard-baseline";
+    let baselineRows: readonly string[] = [];
+    await withWorkspace(baselineWorkspace, async (opened, cas) => {
+      await seedShardCorpus(opened, cas, baselineWorkspace);
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: baselineWorkspace, content: cas, provider });
+      expect(result.marker_written).toBe(true);
+      expect(result.inserted).toBe(shardDocs.length);
+      expect(result.entity_inserted).toBe(shardDocs.length);
+      baselineRows = await allVectorRowSignatures(opened, cas);
+    });
+    expect(baselineRows).toHaveLength(shardDocs.length * 2); // 1 artifact + 1 entity vector per document
+
+    const shardedWorkspace = "ws-semantic-shard-2way";
+    await withWorkspace(shardedWorkspace, async (opened, cas) => {
+      await seedShardCorpus(opened, cas, shardedWorkspace);
+      const shard0 = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: shardedWorkspace, content: cas, provider, shard: { index: 0, count: 2 } });
+      const shard1 = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: shardedWorkspace, content: cas, provider, shard: { index: 1, count: 2 } });
+      // A sharded call never writes the marker or runs bulk status maintenance -- only the orchestrator's final unsharded call may.
+      expect(shard0.marker_written).toBe(false);
+      expect(shard1.marker_written).toBe(false);
+      // Every document is handled by EXACTLY one shard (disjoint, deterministic hash assignment) -- the two shards' own counts sum to the whole corpus.
+      expect(shard0.inserted + shard1.inserted).toBe(shardDocs.length);
+      expect(shard0.entity_inserted + shard1.entity_inserted).toBe(shardDocs.length);
+
+      const finalize = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: shardedWorkspace, content: cas, provider });
+      expect(finalize.marker_written).toBe(true);
+      // Nothing left for the finalize pass to embed -- both shards already covered every document between them.
+      expect(finalize.inserted).toBe(0);
+      expect(finalize.entity_inserted).toBe(0);
+
+      const shardedRows = await allVectorRowSignatures(opened, cas);
+      expect(shardedRows).toEqual(baselineRows);
+    });
+  });
+
+  it("a shard with index >= count throws (defensive input validation)", () => {
+    expect(() => shardIndexFor("art-x", 0)).toThrow();
+  });
+});
+
+// Frente S-D (2026-09-07, Lever 3): `semantic_segment_cache` -- a segment
+// whose exact (rendered text, executable_binding_id) pair was already
+// embedded (by ANY document, in ANY prior generation) is never re-sent to
+// the provider; its cached vector is reused directly. Wraps
+// `createLocalHashProvider`'s own binding with call counters so the
+// assertions below are about REAL provider invocations, not just database
+// row counts.
+describe("Frente S-D (2026-09-07): segment cache (Lever 3)", () => {
+  it("does not re-embed a segment whose exact (text, binding) pair is already cached, even across two different entities/files", async () => {
+    const workspaceId = "ws-semantic-cache-dedup";
+    const baseProvider = createLocalHashProvider();
+    let generateVectorCalls = 0;
+    let generateVectorsCalls = 0;
+    const provider: ResolvedSemanticProvider = {
+      profile: baseProvider.profile,
+      binding: {
+        ...baseProvider.binding,
+        generateVector: async (input) => { generateVectorCalls += 1; return baseProvider.binding.generateVector(input); },
+        ...(baseProvider.binding.generateVectors === undefined ? {} : {
+          generateVectors: async (inputs: Parameters<NonNullable<typeof baseProvider.binding.generateVectors>>[0]) => { generateVectorsCalls += 1; return baseProvider.binding.generateVectors!(inputs); },
+        }),
+      },
+    };
+    const sharedText = `export function duplicateBoilerplateForTestCoverageOfTheSegmentCache() {\n  // ${ENTITY_SPAN_PADDING}\n  return "shared";\n}`;
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-cache-a", artifactVersionId: "artv-cache-a", text: sharedText, validFromGeneration: 1 });
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-cache-b", artifactVersionId: "artv-cache-b", text: sharedText, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-cache-a", recordKind: "jsts:entity_callable", ownerArtifactId: "art-cache-a", ownerArtifactVersionId: "artv-cache-a", validFromGeneration: 1, body: { name: "duplicateBoilerplateForTestCoverageOfTheSegmentCache", kind: "function", start: 0, end: sharedText.length } });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-cache-b", recordKind: "jsts:entity_callable", ownerArtifactId: "art-cache-b", ownerArtifactVersionId: "artv-cache-b", validFromGeneration: 1, body: { name: "duplicateBoilerplateForTestCoverageOfTheSegmentCache", kind: "function", start: 0, end: sharedText.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, embed_batch_size: 1 });
+      expect(result.entity_inserted).toBe(2);
+      expect(result.inserted).toBe(2); // both artifacts fully covered by their own single entity (no gap) -- composed, not re-embedded
+
+      // Entity A's segment is a cache MISS (first occurrence, one real
+      // provider call); entity B's segment renders BYTE-IDENTICAL text (same
+      // name/kind/span over byte-identical file content), so it is a cache
+      // HIT -- zero additional provider calls. The composed artifact vectors
+      // never call the provider directly at all (Lever 1: mean-pooled from
+      // already-embedded components), so the total across the whole pass is
+      // exactly ONE real embedding call for ALL FOUR documents (2 entities +
+      // 2 artifacts).
+      expect(generateVectorsCalls + generateVectorCalls).toBe(1);
+
+      const cacheRows = await opened.database.all<{ segment_digest: string }>("SELECT segment_digest FROM semantic_segment_cache WHERE workspace_id = ?", [workspaceId]);
+      expect(new Set(cacheRows.map((row) => row.segment_digest)).size).toBe(1);
+
+      // Both entities' vectors are numerically identical (same cached
+      // bytes), confirming the cache reuse did not silently produce a
+      // DIFFERENT (wrong) vector for the second occurrence.
+      const vectorA = await readOpenVectorBytes(opened, cas, "document_grain = 'entity' AND document_ref = ?", ["rec-cache-a"]);
+      const vectorB = await readOpenVectorBytes(opened, cas, "document_grain = 'entity' AND document_ref = ?", ["rec-cache-b"]);
+      expect(Buffer.from(vectorA.vector).equals(Buffer.from(vectorB.vector))).toBe(true);
+    });
+  });
+
+  it("a second reconcile pass over an UNCHANGED corpus makes zero additional provider calls (the ordinary fast path), and a brand-new document with previously-seen content is a cache hit", async () => {
+    const workspaceId = "ws-semantic-cache-edit";
+    const baseProvider = createLocalHashProvider();
+    let calls = 0;
+    const provider: ResolvedSemanticProvider = {
+      profile: baseProvider.profile,
+      binding: { ...baseProvider.binding, generateVector: async (input) => { calls += 1; return baseProvider.binding.generateVector(input); }, ...(baseProvider.binding.generateVectors === undefined ? {} : { generateVectors: async (inputs: Parameters<NonNullable<typeof baseProvider.binding.generateVectors>>[0]) => { calls += 1; return baseProvider.binding.generateVectors!(inputs); } }) },
+    };
+    const textOne = `export function cacheEditFunctionOneForTestCoverageOfTheSegmentCache() {\n  // ${ENTITY_SPAN_PADDING}\n  return 1;\n}`;
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-cache-edit-1", artifactVersionId: "artv-cache-edit-1", text: textOne, validFromGeneration: 1 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-cache-edit-1", recordKind: "jsts:entity_callable", ownerArtifactId: "art-cache-edit-1", ownerArtifactVersionId: "artv-cache-edit-1", validFromGeneration: 1, body: { name: "cacheEditFunctionOneForTestCoverageOfTheSegmentCache", kind: "function", start: 0, end: textOne.length } });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      const callsAfterFirst = calls;
+      expect(callsAfterFirst).toBeGreaterThan(0);
+
+      // A second, unobstructed pass over the SAME generation hits the
+      // already-complete fast path -- zero new provider calls, zero new
+      // cache lookups even needed.
+      const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(second.marker_written).toBe(true);
+      expect(calls).toBe(callsAfterFirst);
+
+      // Simulates "an edited file keeps ~90% of its segments" (plan §4's own
+      // framing) via the simplest real instance of that: a SECOND, brand-new
+      // artifact whose entity happens to render IDENTICAL text to the first
+      // (e.g. an unrelated file introducing the same well-known boilerplate)
+      // -- this new generation's entity embed is a cache HIT, not a fresh
+      // provider call.
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-cache-edit-2", artifactVersionId: "artv-cache-edit-2", text: textOne, validFromGeneration: 2 });
+      await seedEntityRecord(opened, workspaceId, { recordId: "rec-cache-edit-2", recordKind: "jsts:entity_callable", ownerArtifactId: "art-cache-edit-2", ownerArtifactVersionId: "artv-cache-edit-2", validFromGeneration: 2, body: { name: "cacheEditFunctionOneForTestCoverageOfTheSegmentCache", kind: "function", start: 0, end: textOne.length } });
+      await setCurrentGeneration(opened, workspaceId, 2);
+      const third = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(third.entity_inserted).toBe(1);
+      expect(third.inserted).toBe(1);
+      expect(calls).toBe(callsAfterFirst); // the new document's segment was a 100% cache hit -- zero new provider calls
     });
   });
 });

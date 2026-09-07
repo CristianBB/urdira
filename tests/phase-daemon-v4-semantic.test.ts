@@ -244,4 +244,77 @@ describeIfBuilt("v4 daemon semantic maintenance end-to-end (real urdira-indexing
       await rm(workspaceRoot, { recursive: true, force: true });
     }
   }, 180_000);
+
+  // Frente S-D (2026-09-07, Lever 2): the SAME v4 e2e flow above, but with
+  // `semantic_shard_count: 2` -- `submitSemanticMaintenance` now runs
+  // `runSemanticReconcileSharded` with 2 concurrent child processes instead
+  // of `runSemanticReconcileInProcess`'s single one. Proves the daemon-level
+  // orchestration end-to-end (real child process spawns, a real finalize
+  // call, real `core:index_status` polling) reaches the exact same
+  // observable outcome as the unsharded path: `semantic.current` true with a
+  // real `completed_generation`, a real entity candidate with
+  // `matched_segment`, and a `core:reindex` no-op that settles fast (proving
+  // the finalize call's own fast path holds, not a re-embed).
+  it("reaches semantic.current with semantic_shard_count: 2 (parallel reconciler), and a reconcile no-op stays fast", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-semantic-e2e-sharded-data-"));
+    const workspaceRoot = await seedFixtureWorkspace();
+    let runtime: DaemonRuntime | undefined;
+    const sessions = new Map<string, IndexingCoreProcessTransport>();
+    try {
+      process.env["URDIRA_V4"] = "1";
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-v4-daemon-semantic-e2e-sharded",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        resolve_plugin_provider: async (): Promise<WorkspaceScanPluginProvider> => { throw new Error("resolve_plugin_provider must not be called for a v4 workspace."); },
+        resolve_workspace_scan_transport: async (workspace) => {
+          let transport = sessions.get(workspace.workspace_id);
+          if (transport === undefined) {
+            transport = createIndexingCoreProcessTransport({ command: workerPath!, request_timeout_ms: 120_000 });
+            sessions.set(workspace.workspace_id, transport);
+          }
+          return transport;
+        },
+        semantic_descriptor: { kind: "hash" },
+        semantic_shard_count: 2,
+        reconciliation_sweep_interval_ms: 0,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+      const added = await client.call("core:workspace_add", { args: [workspaceRoot], confirmed: true });
+      expect(added.outcome, JSON.stringify(added)).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+      await pollUntilStructuralReady(client, workspaceId);
+
+      const readyStatus = await pollUntilSemanticCurrent(client, workspaceId, 60_000);
+      expect(readyStatus.semantic?.completed_generation).toBeGreaterThan(0);
+      expect(readyStatus.semantic?.profile_id).toBeDefined();
+      const firstCompletedGeneration = readyStatus.semantic?.completed_generation;
+
+      const semanticStreams = await queryStreams(client, workspaceId, "core:search_semantic", { query_text: ELIGIBLE_ENTITY_NAME, query_class: "identifier" });
+      const candidates = semanticStreams["candidates"]?.items ?? [];
+      expect(candidates.length).toBeGreaterThan(0);
+      const entityCandidate = candidates.find((entry) => {
+        const value = entry.value as Record<string, unknown>;
+        const evidence = value["semantic_evidence"] as Record<string, unknown> | undefined;
+        return evidence?.["matched_segment"] !== undefined;
+      });
+      expect(entityCandidate, JSON.stringify(candidates)).toBeDefined();
+
+      const reindexed = await client.call("core:reindex", { args: [workspaceId] });
+      expect(reindexed.outcome, JSON.stringify(reindexed)).toBe("success");
+      await pollUntilStructuralReady(client, workspaceId);
+      const noopStatus = await pollUntilSemanticCurrent(client, workspaceId, 10_000);
+      expect(noopStatus.semantic?.completed_generation).toBe(firstCompletedGeneration);
+    } finally {
+      if (runtime) await runtime.stop();
+      for (const transport of sessions.values()) {
+        await transport.shutdown().catch(() => undefined);
+        await transport.terminate().catch(() => undefined);
+      }
+      delete process.env["URDIRA_V4"];
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 180_000);
 });

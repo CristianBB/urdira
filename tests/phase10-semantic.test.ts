@@ -169,6 +169,65 @@ describe("Phase 10 semantic engine", () => {
     expect((requests[0] as { candidates: Uint8Array }).candidates.byteLength).toBe(8);
   });
 
+  it("Frente S-D (2026-09-07): chunks native exact-vector batches under the native 4,096-candidate / 4MiB bounds and merges an EXACT top-k across chunks", () => {
+    // Mirrors crates/urdira-native-core/src/lib.rs's MAX_BATCH_RECORDS (4,096)
+    // and MAX_BATCH_FRAMED_BYTES (4MiB, computed as `(query_scalars +
+    // sum(candidate_scalars)) * 8 + sum(identifier_byte_lengths)`) -- the
+    // fake port below ENFORCES both bounds itself (throwing if violated), so
+    // an un-chunked (or incorrectly chunked) `exactVectorScan` call fails
+    // HERE with a clear assertion, not with n8n-scale silence.
+    const NATIVE_BATCH_RECORD_BOUND = 4096;
+    const NATIVE_BATCH_BYTE_BOUND = 4 * 1024 * 1024;
+    const dimensions = 8;
+    const candidateCount = 9000; // > 2x MAX_BATCH_RECORDS, forcing at least 3 native calls
+    const textEncoder = new TextEncoder();
+    // candidate i's vector is [i, 0, 0, ...]; query is the zero vector, so
+    // squared-L2 distance from query to candidate i is exactly i^2 --
+    // monotonic in i, making the TRUE global top-k trivially "smallest
+    // index wins" and independent of any chunk boundary.
+    const candidates = Array.from({ length: candidateCount }, (_, index) => ({
+      projection_record_id: `cand-${String(index).padStart(5, "0")}`,
+      profile_id: "p",
+      executable_binding_id: "b",
+      vector: Array.from({ length: dimensions }, (_, dim) => (dim === 0 ? index : 0)),
+    }));
+    let batchCallCount = 0;
+    let maxCandidatesSeenInOneCall = 0;
+    configureNativeExactVectorTopKPort({
+      exactVectorTopKBatch(batch) {
+        batchCallCount += 1;
+        return batch.map((request) => {
+          const candidateScalarWidth = request.elementType === "float32_le" ? 4 : 8;
+          const candidateCountInThisCall = request.candidates.byteLength / (request.dimensions * candidateScalarWidth);
+          maxCandidatesSeenInOneCall = Math.max(maxCandidatesSeenInOneCall, candidateCountInThisCall);
+          const idBytes = request.projectionRecordIds.reduce((sum, id) => sum + textEncoder.encode(id).length, 0);
+          const totalBytes = (request.dimensions + candidateCountInThisCall * request.dimensions) * 8 + idBytes;
+          if (candidateCountInThisCall > NATIVE_BATCH_RECORD_BOUND) throw new Error(`test fake: candidate count ${candidateCountInThisCall} exceeds the native ${NATIVE_BATCH_RECORD_BOUND}-record bound -- exactVectorScan failed to chunk.`);
+          if (totalBytes > NATIVE_BATCH_BYTE_BOUND) throw new Error(`test fake: batch bytes ${totalBytes} exceeds the native ${NATIVE_BATCH_BYTE_BOUND}-byte bound -- exactVectorScan failed to chunk.`);
+          // Brute-force top-k over JUST this call's own candidates (decode
+          // float32 LE, squared L2 against the zero query) -- a real native
+          // kernel would do the identical computation.
+          const view = new DataView(request.candidates.buffer, request.candidates.byteOffset, request.candidates.byteLength);
+          const ranked = request.projectionRecordIds
+            .map((id, index) => ({ id, first: view.getFloat32(index * request.dimensions * candidateScalarWidth, true) }))
+            .sort((left, right) => (left.first * left.first) - (right.first * right.first) || left.id.localeCompare(right.id));
+          return ranked.slice(0, request.k).map((entry, index) => ({ projection_record_id: entry.id, rank: index + 1 }));
+        });
+      },
+    });
+    const result = exactVectorScan(candidates, Array.from({ length: dimensions }, () => 0), {
+      profile_id: "p", executable_binding_id: "b", dimensions, distance_metric: "squared_l2", limit: 10,
+    });
+    expect(batchCallCount).toBeGreaterThan(1); // proves chunking actually happened, not one lucky call
+    expect(maxCandidatesSeenInOneCall).toBeLessThanOrEqual(NATIVE_BATCH_RECORD_BOUND);
+    // The TRUE global top-10 is candidates 0..9 (smallest index = smallest
+    // distance), regardless of which chunk each one landed in.
+    expect(result.map((entry) => entry.projection_record_id)).toEqual(
+      Array.from({ length: 10 }, (_, index) => `cand-${String(index).padStart(5, "0")}`),
+    );
+    expect(result.map((entry) => entry.rank)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+
   it("fails closed on native vector errors or malformed ordered results", () => {
     configureNativeExactVectorTopKPort({ exactVectorTopKBatch() { throw new Error("native vector failure"); } });
     expect(() => exactVectorScan([

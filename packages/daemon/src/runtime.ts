@@ -12,7 +12,7 @@ import { runIndexPackExportV4InThread } from "./index-pack-export-v4-thread.js";
 import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-thread.js";
 import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths } from "./ownership.js";
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
-import { ensureSemanticAssetsInProcess, runSemanticReconcileInProcess, startNeuralSemanticProviderHost, type NeuralSemanticProviderHost, type SemanticProcessRun } from "./semantic-process.js";
+import { ensureSemanticAssetsInProcess, runSemanticReconcileSharded, startNeuralSemanticProviderHost, type NeuralSemanticProviderHost, type SemanticProcessRun } from "./semantic-process.js";
 import { resolveV4SemanticEntitySource } from "./semantic-v4-wiring.js";
 import { LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcProgress, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
 import { DaemonScheduler, PersistentCursorRecovery, type PersistedCursorState, type SchedulerOptions } from "./scheduler.js";
@@ -388,6 +388,27 @@ export interface DaemonRuntimeOptions {
    * Omitted, `reconcileSemanticProjection` defaults to 16.
    */
   readonly semantic_embed_batch_size?: number;
+  /**
+   * Frente S-D (2026-09-07, Lever 2): how many concurrent semantic
+   * reconciler child processes `submitSemanticMaintenance` runs via
+   * `runSemanticReconcileSharded` (`./semantic-process.js`) -- injected by
+   * the composing application (`apps/urdira`) from the
+   * `URDIRA_SEMANTIC_WORKERS` environment variable. Omitted (or `<= 1`)
+   * degrades to exactly the pre-Lever-2 single-process path
+   * (`runSemanticReconcileInProcess`) with ZERO behavior change -- see
+   * `resolveSemanticShardCount`'s own doc comment for the default (2,
+   * capped at `cpuCount / 4`) applied when this is omitted but the caller
+   * still wants sharding (`apps/urdira` always resolves and passes a
+   * concrete value; a test harness that omits this field entirely gets the
+   * single-process path, matching every pre-Lever-2 test's own expectation).
+   * Only takes effect on the THREADED/process-isolated branch
+   * (`semanticThreadEligible`) -- the in-process fallback branch (a
+   * `semantic_provider`/`semantic_runtime_hooks` override, or
+   * `semantic_process: false`) always runs unsharded, single-process,
+   * regardless of this field, since sharding is fundamentally a
+   * multi-CHILD-PROCESS mechanism.
+   */
+  readonly semantic_shard_count?: number;
   /**
    * Optional hook: evicts (closes) any pooled per-workspace analysis worker
    * for a workspace that was just removed via `core:workspace_remove`. Plain
@@ -4024,7 +4045,11 @@ export class DaemonRuntime {
                 // identical `lexical_thread` branch.
                 let reconciled: ReconcileSemanticProjectionResult;
                 if (semanticThreadEligible) {
-                  const threadRun = runSemanticReconcileInProcess({ data_root: options.data_root, workspace_id: workspaceId, descriptor: semanticDescriptor!, ...(options.semantic_embed_batch_size === undefined ? {} : { embed_batch_size: options.semantic_embed_batch_size }) });
+                  // Frente S-D (2026-09-07, Lever 2): `semantic_shard_count`
+                  // omitted or `<= 1` degrades `runSemanticReconcileSharded`
+                  // to exactly the pre-Lever-2 single-process call -- see
+                  // that option's own doc comment.
+                  const threadRun = runSemanticReconcileSharded({ data_root: options.data_root, workspace_id: workspaceId, descriptor: semanticDescriptor!, ...(options.semantic_embed_batch_size === undefined ? {} : { embed_batch_size: options.semantic_embed_batch_size }) }, options.semantic_shard_count ?? 1);
                   semanticThreadRuns.set(workspaceId, threadRun);
                   try {
                     reconciled = await threadRun.result;
