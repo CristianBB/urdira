@@ -281,24 +281,85 @@ impl TypeflowCache {
             for path in &removed {
                 index.remove_file(path);
             }
-            for path in &upserted {
-                let Some(summary) = self.summaries.get(path) else {
-                    // Upserted then removed again before this `build_index`
-                    // call ever ran (both edits landed in the SAME
-                    // generation's dirty set) -- `pending_removed` already
-                    // handled it above; nothing left to insert.
-                    continue;
-                };
-                let mut refresh_paths: Vec<String> = index.importers_of(path);
-                refresh_paths.push(path.clone());
-                let updates = resolve_import_targets_for(
-                    &self.summaries,
-                    refresh_paths.iter().map(String::as_str),
-                    resolver,
-                    available,
-                    files,
-                );
-                index.replace_file(path, summary.clone(), &updates);
+            // Frente E-P0c fix (Brecha B "second finding", 2026-09-07): a
+            // BOUNDED FIXED-POINT settling loop over `upserted`, not a
+            // single pass. This function's own doc comment already names
+            // the exact gap a single pass leaves open: each `path`'s own
+            // `refresh_paths` is `index.importers_of(path)` queried the
+            // moment `path` itself is (re)inserted -- for a MULTI-FILE edit
+            // batch where an owner `path` and one of its OWN importers are
+            // BOTH in `upserted`, the two paths' relative order in this
+            // `BTreeSet` iteration can decide whether the importer's own
+            // `resolve_import_targets_for` call (scoped to ITS OWN
+            // `refresh_paths`, computed during the IMPORTER's own turn)
+            // ever gets a chance to resolve against the EXPORTER's fresh
+            // (post-edit) shape -- confirmed live on two SEPARATE n8n
+            // `tags-3-months` git-switch pairs (`types/bridge.ts`'s `debug`
+            // method + its caller `bridge/isolated-vm-bridge.ts`; `@n8n/
+            // config`'s `expression-engine.config.ts` properties +
+            // `cli/expression-observability/expression-observability.
+            // provider.ts`'s constructor/method reading them), both edited
+            // together in the same real commit range. A single extra pass
+            // closed the FIRST pair but not the second (a chain one hop
+            // longer, or simply the wrong relative order for THAT pair) --
+            // rather than guess a fixed pass count, this loop repeats the
+            // exact per-path work (`importers_of(path)` + `resolve_import_
+            // targets_for` + `replace_file`) until two consecutive rounds
+            // produce BYTE-IDENTICAL `import_targets` resolutions for every
+            // `upserted` path (a real fixed point, matching the "four-pass
+            // closure... to converge" fixed-point language `urdira_jsts_
+            // typeflow`'s own crate doc already uses for `ProgramIndex`'s
+            // internal reflow), capped at `MAX_SETTLING_ROUNDS` as a
+            // defensive backstop (logged, never silently truncated) against
+            // a pathological non-converging edit graph. Bounded by
+            // `upserted`'s own size per round (never the whole corpus), so
+            // this preserves the per-edit cost class this module's own doc
+            // comment establishes for the common single-file-edit case
+            // (`upserted.len() <= 1` can never have a cross-file ordering
+            // conflict with itself, so it always converges after exactly
+            // one round, unchanged from this function's pre-existing,
+            // already-tested behavor); idempotent once the fixed point is
+            // reached, since `replace_file`'s own internal `reflow_files`
+            // is itself idempotent over unchanged inputs.
+            const MAX_SETTLING_ROUNDS: usize = 8;
+            let mut previous_round: Option<HashMap<(String, String, String), String>> = None;
+            for round in 0..MAX_SETTLING_ROUNDS {
+                let mut round_updates: HashMap<(String, String, String), String> = HashMap::new();
+                for path in &upserted {
+                    let Some(summary) = self.summaries.get(path) else {
+                        // Upserted then removed again before this
+                        // `build_index` call ever ran (both edits landed
+                        // in the SAME generation's dirty set) --
+                        // `pending_removed` already handled it above;
+                        // nothing left to insert.
+                        continue;
+                    };
+                    let mut refresh_paths: Vec<String> = index.importers_of(path);
+                    refresh_paths.push(path.clone());
+                    let updates = resolve_import_targets_for(
+                        &self.summaries,
+                        refresh_paths.iter().map(String::as_str),
+                        resolver,
+                        available,
+                        files,
+                    );
+                    round_updates.extend(updates.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    index.replace_file(path, summary.clone(), &updates);
+                }
+                let converged = previous_round.as_ref() == Some(&round_updates);
+                previous_round = Some(round_updates);
+                if converged {
+                    break;
+                }
+                if round + 1 == MAX_SETTLING_ROUNDS {
+                    eprintln!(
+                        "[urdira-indexing-worker] v4 typeflow: settling loop did not converge \
+                         within {MAX_SETTLING_ROUNDS} rounds for {} upserted path(s) -- \
+                         proceeding with the last round's state (a from-scratch cold scan of \
+                         this generation would still be correct if this ever fires in practice)",
+                        upserted.len(),
+                    );
+                }
             }
         }
         self.index
@@ -749,6 +810,212 @@ mod tests {
             index.member_type_ref(&opts_id, "memory", false),
             Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(base_id)),
             "Opts.memory (aliased to an IMPORTED Base) must resolve through the needed-imports scan"
+        );
+    }
+
+    /// Frente E-P0c adversarial review (2026-09-07), item 6: `docs/evidence/
+    /// 2026-09-06-v4-reconcile-threshold.md` §11.4's own permanent
+    /// diagnostic (`v4::tests_e2e::graph_identity_set_matches_between_two_
+    /// kept_stores`) needs two externally prepared `--keep-data` structural
+    /// roots from a real n8n git-switch -- not a self-contained, CI-runnable
+    /// repro. This is a SYNTHETIC, fixture-scale attempt to build one
+    /// directly at the `TypeflowCache`/`ProgramIndex` level, matching the
+    /// shape §11.4 names for its remaining, NOT-fixed-here root cause: a
+    /// CONSTRUCTOR PARAMETER PROPERTY (`constructor(private readonly
+    /// config: Config)`) reading a member declared on a class imported from
+    /// a DIFFERENT, MUTUALLY-referencing file, where BOTH the declaring
+    /// file (`config.ts`) and the using file (`provider.ts`) are edited in
+    /// the SAME `upserted` batch, inserted in REVERSED-alphabetical order
+    /// (`provider.ts` before `config.ts`) -- the exact "both declaring and
+    /// using file edited together" precondition §11.4 documents for the 3
+    /// relations it could not close, plus this file's own bidirectional
+    /// import (§11.4's "mutually-referencing pair" phrasing for its own
+    /// `link_importer` suspicion).
+    ///
+    /// **NOT `#[ignore]`, does NOT fail**: this is a documented NEGATIVE
+    /// research result, not the requested failing repro. Two independent
+    /// attempts at this reduced fixture scale (a plain one-directional
+    /// import first, then this mutual-import variant) both resolve
+    /// `Provider.config`'s type CORRECTLY and IDENTICALLY regardless of
+    /// `upserted` insertion order -- §11.4's own gap does NOT reproduce at
+    /// this scale/shape. This RULES OUT "a single mutually-referencing pair
+    /// with a one-hop parameter-property read" as §11.4's minimal repro; it
+    /// does not rule out the bug (already confirmed live at real n8n scale,
+    /// §11.4's own `--keep-data` evidence) -- the gap needs either real
+    /// corpus scale/depth (more than 2 files, a longer reflow chain) or a
+    /// mechanism this reduced case does not exercise (candidates §11.4
+    /// itself already lists: `WorkspaceResolver` tsconfig-paths-alias
+    /// proximity, or a `ProgramIndex::reflow_files` bookkeeping edge case
+    /// that only surfaces with more simultaneously-touched files). Kept
+    /// here as (a) a genuine regression test for the SETTLING LOOP's own
+    /// order-independence (item 5 of this review) and (b) a documented
+    /// negative result so whoever picks up E-P0d does not re-spend time on
+    /// this exact reduced hypothesis -- start from §11.4's own real
+    /// `--keep-data` repro instead.
+    #[test]
+    fn typeflow_settling_loop_resolves_mutual_parameter_property_reference_regardless_of_upsert_order()
+     {
+        let dir = scratch_dir("typeflow-param-property-cross-file-gap");
+        let config_blob_v1 = dir.join("config-v1.blob");
+        let provider_blob_v1 = dir.join("provider-v1.blob");
+        let config_blob_v2 = dir.join("config-v2.blob");
+        let provider_blob_v2 = dir.join("provider-v2.blob");
+
+        // `config.ts` and `provider.ts` MUTUALLY reference each other
+        // (config.ts imports a marker interface FROM provider.ts too) --
+        // a genuine two-way edge, not just a one-directional import --
+        // matching §11.4's own "mutually-referencing pair" phrasing for
+        // its suspected `ProgramIndex::replace_file`/`reflow_files`/
+        // `link_importer` root cause, one step past this file's own
+        // simpler (ruled-out-here) one-directional attempt.
+        let text_config_v1 = "import type { ProviderHint } from './provider';\nexport class Config {\n  observabilityEnabled: boolean = false;\n  hint?: ProviderHint;\n}\n";
+        let text_provider_v1 = "import { Config } from './config';\nexport interface ProviderHint {\n  label: string;\n}\nexport class Provider {\n  constructor(private readonly config: Config) {}\n}\n";
+        // Both files are edited TOGETHER in the same batch: `config.ts`
+        // (the DECLARING file) gains a new member; `provider.ts` (the
+        // USING file, accessing the parameter property's type) gains a
+        // method that reads it -- same shape as §11.4's own
+        // `expression-engine.config.ts`/`expression-observability.
+        // provider.ts` pair (there: `observabilityEnabled`/`tracesEnabled`
+        // properties read through a constructor parameter property, both
+        // files genuinely edited in the same real git-switch batch).
+        let text_config_v2 = "import type { ProviderHint } from './provider';\nexport class Config {\n  observabilityEnabled: boolean = false;\n  tracesEnabled: boolean = false;\n  hint?: ProviderHint;\n}\n";
+        let text_provider_v2 = "import { Config } from './config';\nexport interface ProviderHint {\n  label: string;\n}\nexport class Provider {\n  constructor(private readonly config: Config) {}\n  startSpan(): boolean {\n    return this.config.tracesEnabled;\n  }\n}\n";
+
+        // Cold generation: build the real syntax-worker `files` map (needed
+        // by `resolve_named_export`) plus a `TypeflowCache` over the v1
+        // texts, exactly like `imported_type_alias_target_is_reachable_
+        // through_the_needed_imports_scan` above.
+        let mut syntax_state = urdira_jsts_syntax_worker::SyntaxWorkerState::default();
+        let project_key = "typeflow-param-property-cross-file-gap".to_owned();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let sources_v1 = vec![
+            owner("config.ts", &config_blob_v1, text_config_v1),
+            owner("provider.ts", &provider_blob_v1, text_provider_v1),
+        ];
+        syntax_state
+            .analyze(
+                "test:analyze:cold".to_owned(),
+                "test:analyze:cold".to_owned(),
+                project_key.clone(),
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
+                vec!["config.ts".to_owned(), "provider.ts".to_owned()],
+                sources_v1.clone(),
+                Vec::new(),
+                urdira_worker_protocol::AuthoritativeChangeSet::Full,
+                urdira_jsts_syntax_worker::AnalysisBudgets {
+                    max_output_bytes: 64 * 1024 * 1024,
+                    max_files: 16,
+                    max_source_bytes: u32::MAX,
+                    enforce_output_bytes: false,
+                },
+                &cancelled,
+            )
+            .expect("cold syntax analyze succeeds");
+
+        let mut cache = TypeflowCache::build_full(&sources_v1, None).expect("build_full succeeds");
+        assert_eq!(cache.summary_count(), 2);
+
+        // Second generation: BOTH files re-analyzed together (mirrors a
+        // real `Changed` batch touching both paths), giving the fresh
+        // `files` map `resolve_named_export` needs for generation 2.
+        let sources_v2 = vec![
+            owner("config.ts", &config_blob_v2, text_config_v2),
+            owner("provider.ts", &provider_blob_v2, text_provider_v2),
+        ];
+        syntax_state
+            .analyze(
+                "test:analyze:gen2".to_owned(),
+                "test:analyze:gen2".to_owned(),
+                project_key.clone(),
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_owned(),
+                vec!["config.ts".to_owned(), "provider.ts".to_owned()],
+                sources_v2.clone(),
+                Vec::new(),
+                urdira_worker_protocol::AuthoritativeChangeSet::Full,
+                urdira_jsts_syntax_worker::AnalysisBudgets {
+                    max_output_bytes: 64 * 1024 * 1024,
+                    max_files: 16,
+                    max_source_bytes: u32::MAX,
+                    enforce_output_bytes: false,
+                },
+                &cancelled,
+            )
+            .expect("gen2 syntax analyze succeeds");
+        let files_v2 = syntax_state
+            .project_files(&project_key)
+            .expect("project files present")
+            .clone();
+
+        // WARM path: both `config.ts` and `provider.ts` land in the SAME
+        // `upserted` batch (insertion order deliberately reversed from
+        // alphabetical -- `provider.ts` first, `config.ts` second -- to
+        // probe order-sensitivity; `pending_upserted` is itself a
+        // `BTreeSet`, so this should have no effect on the outcome BY
+        // CONSTRUCTION if the settling loop is doing its job).
+        cache.replace_file("provider.ts", text_provider_v2);
+        cache.replace_file("config.ts", text_config_v2);
+
+        let resolver = WorkspaceResolver::build(&[]);
+        let available: BTreeSet<String> = files_v2.keys().cloned().collect();
+        let provider_id = cache.summaries["provider.ts"].classes[0].entity_id.clone();
+        let config_id = cache.summaries["config.ts"].classes[0].entity_id.clone();
+        let incremental_index = cache.build_index(&resolver, &available, &files_v2);
+        let incremental_config_type =
+            incremental_index.member_type_ref(&provider_id, "config", false);
+
+        // Independent oracle: a FRESH `TypeflowCache` built directly from
+        // the FINAL (v2) texts -- never touched by the settling loop at
+        // all (`build_full` runs `ProgramIndex::build`'s own from-scratch
+        // four-pass closure, not the incremental `replace_file` path this
+        // test is probing).
+        let mut oracle_syntax_state = urdira_jsts_syntax_worker::SyntaxWorkerState::default();
+        let oracle_project_key = "typeflow-param-property-cross-file-gap-oracle".to_owned();
+        oracle_syntax_state
+            .analyze(
+                "test:analyze:oracle".to_owned(),
+                "test:analyze:oracle".to_owned(),
+                oracle_project_key.clone(),
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_owned(),
+                vec!["config.ts".to_owned(), "provider.ts".to_owned()],
+                sources_v2.clone(),
+                Vec::new(),
+                urdira_worker_protocol::AuthoritativeChangeSet::Full,
+                urdira_jsts_syntax_worker::AnalysisBudgets {
+                    max_output_bytes: 64 * 1024 * 1024,
+                    max_files: 16,
+                    max_source_bytes: u32::MAX,
+                    enforce_output_bytes: false,
+                },
+                &cancelled,
+            )
+            .expect("oracle syntax analyze succeeds");
+        let oracle_files = oracle_syntax_state
+            .project_files(&oracle_project_key)
+            .expect("oracle project files present")
+            .clone();
+        let mut oracle_cache =
+            TypeflowCache::build_full(&sources_v2, None).expect("oracle build_full succeeds");
+        let oracle_available: BTreeSet<String> = oracle_files.keys().cloned().collect();
+        let oracle_index = oracle_cache.build_index(&resolver, &oracle_available, &oracle_files);
+        let oracle_config_type = oracle_index.member_type_ref(&provider_id, "config", false);
+
+        assert_eq!(
+            oracle_config_type,
+            Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(config_id)),
+            "sanity: the independent from-scratch oracle must resolve Provider's own \
+             constructor-parameter-property `config` to the freshly-edited Config class"
+        );
+        assert_eq!(
+            incremental_config_type, oracle_config_type,
+            "the incrementally settled index (two mutually-referencing files edited in the SAME \
+             batch, `provider.ts` inserted into `upserted` BEFORE `config.ts`) must resolve \
+             Provider.config to the SAME entity an independent from-scratch oracle does over the \
+             identical final texts -- if this ever fails, it is EITHER a settling-loop \
+             regression (item 5) or a minimal repro for §11.4's still-open gap (item 6); it \
+             passes today at this reduced fixture scale (see this test's own doc comment)"
         );
     }
 }

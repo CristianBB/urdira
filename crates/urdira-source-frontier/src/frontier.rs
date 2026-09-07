@@ -109,12 +109,18 @@ fn apply_bucket_change(
     };
     let bucket = bucket_index(&key);
     let entries = index_map.entry(bucket).or_default();
+    let pre_change_count = entries.len() as u32;
     entries.retain(|(existing_key, _)| existing_key != &key);
     if let Change::Set { logical, .. } = change {
         entries.push((key, logical));
     }
     let snapshot = entries.clone();
-    tree.update(&[change], |_| snapshot.clone())
+    // Frente E-P0c: `index_map` is rebuilt from the SAME `Frontier::load`
+    // call that built `tree` (never round-tripped through `BucketedMerkleSet
+    // ::write_to`/`read_from`), so `pre_change_count` here is always exact
+    // -- but `BucketedMerkleSet::update` no longer trusts its own internal
+    // bookkeeping for this regardless (see its own doc comment).
+    tree.update(&[change], |_| (pre_change_count, snapshot.clone()))
 }
 
 fn build_bucket_index(entries: &[(Digest32, Digest32)]) -> BucketIndexMap {

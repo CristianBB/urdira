@@ -87,7 +87,7 @@
 //! see `crate::v4::materialize`'s module doc and `lib.rs`'s
 //! `SyntaxCollector::push_entity`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -384,6 +384,78 @@ fn resolve_visible_owners_for_pass(
     Some(set)
 }
 
+/// Frente E-P0c fix (Brecha B, 2026-09-07): widens `seeds` (a first pass's
+/// own flat `touched_owners ∪ pending_owners` set, [`resolve_visible_owners_
+/// for_pass`]'s return value) with the FORWARD transitive closure of the
+/// store's own `dependency` rows (`StoreReader::deps_by_owner`, already
+/// O(1)-indexed by owner -- `crates/urdira-structural-store/src/reader.rs`)
+/// -- i.e. every file a seed owner depends on, recursively, however many
+/// hops away.
+///
+/// **Root cause this closes** (`docs/evidence/2026-09-06-v4-reconcile-
+/// threshold.md` §10.4's first finding, confirmed live on both real n8n git
+/// switches, 19 `jsts:call`/`jsts:references` relations targeting `jsts:
+/// property`/`jsts:method` present ONLY in an independent cold+residual
+/// oracle): tsgo's own `VirtualFs`/`file_map` (built right after this
+/// function's call site, filtered to exactly `resolved_visible_owners`) is
+/// the ONLY source of cross-file type information the checker ever sees --
+/// a flat `touched ∪ pending` set omits any file a touched/pending owner's
+/// OWN types transitively depend on (a base class, a re-exported interface,
+/// a shared type alias) unless THAT file also happens to be independently
+/// touched or pending. When resolving one owner's call/reference site needs
+/// seeing such a file, tsgo simply cannot -- the type is unresolvable, the
+/// site never confirms, and the relation a cold scan (which always sees the
+/// WHOLE frontier, `resolved_visible_owners: None` there) would have
+/// produced is silently missing. A real corpus's own import graph is what
+/// makes this a real gap: a small, self-contained fixture rarely needs a
+/// third file outside the edited/pending set, but a real multi-file edit
+/// batch (the git-switch repro's own 7 genuinely-edited, mutually-
+/// referencing files) very much can.
+///
+/// **Why forward-only, not also reverse** (`StoreReader::deps_reverse`):
+/// this widens VISIBILITY, not the WINDOW PLAN (`candidate_owners`, kept
+/// narrow and UNCHANGED by this fix, for the same reschedule-convergence
+/// reason `candidate_owners_for_pass`'s own doc comment gives) -- no new
+/// site gets a chance to resolve just because a FILE became visible; only
+/// an already-scheduled site (one of `candidate_owners`) can. A type flows
+/// INTO a scheduled owner's own resolution via what THAT owner (transitively)
+/// imports, never via what imports IT -- an owner that imports a scheduled
+/// one is either itself already scheduled (if touched/pending, needing no
+/// help from this closure) or has no window open this pass regardless of
+/// what it can see. Bounded by the seed set's own real import graph, never
+/// the whole corpus -- preserves this pass's original, deliberate cost
+/// rationale (`ResidualContext::touched_owners`'s own doc comment) while
+/// closing the correctness gap.
+///
+/// Applied ONLY on a chain's first pass (`context.visible_owners.is_none()`
+/// at the call site) -- a continuation propagates its OWN prior
+/// `visible_owners_out` (already closure-widened here, the first time
+/// around) verbatim, per `ResidualContext::visible_owners`'s own contract.
+fn expand_with_dependency_closure(
+    store: &StoreReader,
+    ordinal_of_path: &impl Fn(&str) -> Option<u32>,
+    owner_path: &impl Fn(u32) -> Option<String>,
+    generation: u64,
+    seeds: BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut visited: BTreeSet<String> = seeds.clone();
+    let mut queue: VecDeque<String> = seeds.into_iter().collect();
+    while let Some(path) = queue.pop_front() {
+        let Some(ordinal) = ordinal_of_path(&path) else {
+            continue;
+        };
+        for dep in store.deps_by_owner(ordinal, generation) {
+            let Some(dep_path) = owner_path(dep.dep_artifact()) else {
+                continue;
+            };
+            if visited.insert(dep_path.clone()) {
+                queue.push_back(dep_path);
+            }
+        }
+    }
+    visited
+}
+
 /// Schedules (or re-schedules, superseding any still-running prior attempt
 /// for this workspace) a residual pass after `ScanCompleted` for
 /// `context.workspace_id`. Never blocks the caller -- returns immediately
@@ -626,6 +698,24 @@ fn run_once_with_quiet_period(
             .and_then(|pair| path_by_pair.get(pair))
             .cloned()
     };
+    // Frente E-P0c (Brecha B): reverse of `owner_path` above, needed by
+    // `expand_with_dependency_closure`'s own BFS walk over `StoreReader::
+    // deps_by_owner` (which is keyed by ordinal, not path).
+    let ordinal_of_pair: HashMap<(String, String), u32> = dicts
+        .artifacts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, pair)| (pair.clone(), ordinal as u32))
+        .collect();
+    let ordinal_of_path = |path: &str| -> Option<u32> {
+        frontier
+            .present
+            .get(path)
+            .and_then(|entry| {
+                ordinal_of_pair.get(&(entry.artifact_id.clone(), entry.artifact_version_id.clone()))
+            })
+            .copied()
+    };
 
     // F4 4.3: `URDIRA_V4_ENTITY_INDEX=scan` opts back into the pre-4.3 full
     // `iter_visible` scan, purely to compare against the default `entities.
@@ -742,6 +832,28 @@ fn run_once_with_quiet_period(
         context.visible_owners.as_deref(),
         collected.pending_by_owner.keys().cloned(),
     );
+    // Frente E-P0c fix (Brecha B): a chain's FIRST pass (no explicit
+    // `context.visible_owners` yet) widens the flat `touched ∪ pending` set
+    // just computed with its own forward transitive dependency closure --
+    // see `expand_with_dependency_closure`'s own doc comment for the full
+    // mechanism/evidence. A continuation (`context.visible_owners: Some`)
+    // already received a closure-widened set from the chain's first pass
+    // (propagated verbatim below via `visible_owners_out`) and must not
+    // recompute it. A cold/full run (`resolved_visible_owners: None`) stays
+    // unrestricted either way.
+    let resolved_visible_owners = if context.visible_owners.is_none() {
+        resolved_visible_owners.map(|seeds| {
+            expand_with_dependency_closure(
+                &store,
+                &ordinal_of_path,
+                &owner_path,
+                base_generation,
+                seeds,
+            )
+        })
+    } else {
+        resolved_visible_owners
+    };
     // Reported back on `ResidualOutcome` so `schedule` can propagate it,
     // UNCHANGED, into every continuation's own `next_context.
     // visible_owners` -- computed once here (sorted `Vec`, store-relative
@@ -4798,6 +4910,410 @@ mod tests {
             1,
             "exactly one live type_of for `add` after the edit + run 3 -- never accumulate: {live_type_of_after_run3:?}"
         );
+    }
+
+    /// Every currently-visible `CATEGORY_RELATION` row's `identity_key`
+    /// (never its `record_id`/`record_digest`) -- a proper SET comparator,
+    /// not the raw `graph` merkle root. `docs/evidence/2026-09-03-v4-p3-1-
+    /// incremental.md` §5.1 already documents, as a KNOWN and unrelated
+    /// (decision-11 identity-chaining) limitation predating this task, that
+    /// an EDITED owner's own relations legitimately get a CHAINED
+    /// `record_id` (`H(digest || predecessor)`) on the incremental side
+    /// while an independent from-scratch oracle always mints the unconditional
+    /// cold "first occurrence" id (`sha256(digest)`) for the SAME logical
+    /// relation -- so raw `graph` ROOT equality is unreachable by
+    /// construction whenever ANY edited file's own relations are involved
+    /// (this fixture's own `a.ts`/`b.ts` edit), independent of whether
+    /// Brecha B's own bug is fixed. `identity_key` never chains (decision
+    /// 11's own definition: same identity, different digest MUST chain,
+    /// meaning identity itself is untouched by chaining) -- comparing by it
+    /// is the correct "comparador de conjuntos" for a real missing/phantom
+    /// relation (Brecha B's actual shape) while tolerating this documented,
+    /// pre-existing, unrelated representational difference.
+    fn graph_identity_set_at(structural_root: &Path) -> BTreeSet<Vec<u8>> {
+        let reader = StoreReader::open(structural_root).expect("store opens for graph set");
+        let generation = reader.generation();
+        reader
+            .iter_visible(generation)
+            .filter(|view| view.category() == urdira_structural_store::row::CATEGORY_RELATION)
+            .map(|view| view.identity_key().to_vec())
+            .collect()
+    }
+
+    /// Every currently-visible pending site, keyed by (owner PATH, start,
+    /// end, site_kind, reason) -- same recipe `tests_e2e.rs`'s own
+    /// `pending_site_set` uses, reimplemented locally here (residual.rs's
+    /// own test module cannot see that other file's `#[cfg(test)]`-only
+    /// item) so incremental/oracle stores with different internal artifact
+    /// ordinals still compare by stable path instead of ordinal.
+    fn pending_site_set_at(
+        structural_root: &Path,
+        database_path: &Path,
+        workspace_id: &str,
+    ) -> Vec<(String, u32, u32, u8, u8)> {
+        let reader = StoreReader::open(structural_root).expect("store opens for pending set");
+        let generation = reader.generation();
+        let dicts = reader.dictionaries();
+        let conn =
+            catalog::open_and_ensure_schema(database_path).expect("catalog opens for pending set");
+        let frontier = Frontier::load(&conn, workspace_id).expect("frontier loads for pending set");
+        drop(conn);
+        let mut path_by_pair: HashMap<(String, String), String> = HashMap::new();
+        for (path, entry) in &frontier.present {
+            path_by_pair.insert(
+                (entry.artifact_id.clone(), entry.artifact_version_id.clone()),
+                path.clone(),
+            );
+        }
+        let mut out: Vec<(String, u32, u32, u8, u8)> = Vec::new();
+        for site in reader.iter_visible_pending_sites(generation) {
+            let Some(pair) = dicts.artifacts.get(site.owner_artifact() as usize) else {
+                continue;
+            };
+            let Some(path) = path_by_pair.get(pair) else {
+                continue;
+            };
+            out.push((
+                path.clone(),
+                site.start(),
+                site.end(),
+                site.site_kind(),
+                site.reason(),
+            ));
+        }
+        out.sort();
+        out
+    }
+
+    /// Frente E-P0c (2026-09-07), Brecha B: `docs/evidence/2026-09-06-v4-
+    /// reconcile-threshold.md` §10.4's FIRST finding (residual reference
+    /// loss across a multi-file delta), reproduced at fixture scale. `c.ts`
+    /// declares `abstract class Base { m(): number { ... } }`; `a.ts`
+    /// declares `class A extends Base {}` -- `A` never redeclares `m`
+    /// itself, so `m` is only reachable on `A` by INHERITANCE through
+    /// `Base`; `b.ts` calls `items.map((item) => item.m())` on an `A[]` --
+    /// the SAME "guaranteed pending" `lib.d.ts` `Array.prototype.map`
+    /// dispatch `inferred_types_and_diagnostics_across_two_runs_and_an_edit`'s
+    /// own `[1, 2].map((n) => n)` fixture uses (typeflow's local heuristics
+    /// cannot chase into `lib.d.ts` to infer the callback parameter's type,
+    /// so this call resolves ONLY via a real checker). Resolving the
+    /// inherited `item.m()` call additionally needs tsgo to actually SEE
+    /// `Base`'s own declaration -- which lives ENTIRELY in `c.ts`, a file
+    /// `b.ts` never directly imports (only `a.ts` does, via `extends`).
+    ///
+    /// After a cold scan + baseline residual pass (`touched_owners: None`,
+    /// matching a `Full` scan's own unrestricted visibility), `a.ts` AND
+    /// `b.ts` are edited TOGETHER (`a.ts` gains an unrelated export; `b.ts`'s
+    /// call site changes shape) -- a real `Changed` scan, then ONE residual
+    /// pass with `touched_owners: Some(["a.ts", "b.ts"])`, exactly what
+    /// `scan::run_with_residual` itself would schedule for this delta (C.5's
+    /// own `resolve_visible_owners_for_pass`, BEFORE this task's fix, then
+    /// narrowed tsgo's `VirtualFs`/`file_map` to exactly `{a.ts, b.ts}` --
+    /// `c.ts` has no pending site of its own to pull it into `pending_
+    /// owners` either, so it was invisible to tsgo entirely, and `b.ts`'s
+    /// fresh `item.m()` call site -- an inherited-method dispatch -- could
+    /// never resolve).
+    ///
+    /// Compared against an INDEPENDENT oracle: a from-scratch cold scan of
+    /// the identical final (post-edit) tree, then its own unrestricted
+    /// residual pass (`touched_owners: None`) -- the `graph` relation SET
+    /// (by `identity_key`, NOT the raw merkle root -- see `graph_identity_
+    /// set_at`'s own doc comment for why an edited owner's relations
+    /// legitimately chain to a DIFFERENT `record_id` than an independent
+    /// oracle's unconditional cold recipe, an already-documented, unrelated
+    /// limitation predating this task) and the pending-site set must match
+    /// exactly (Brecha A's own decision 11 keeps raw `records` unasserted
+    /// entirely; unaffected here regardless since this fixture never
+    /// deletes/renames anything).
+    #[test]
+    #[ignore = "requires tsgo binary (set URDIRA_TSGO_BINARY)"]
+    fn residual_first_pass_sees_a_multi_file_edits_transitive_type_dependency_outside_the_edited_set()
+     {
+        binary::discover_for_tests(&fixture_root_repo());
+
+        let scratch = scratch_dir("residual-dep-closure");
+        let workspace_root = scratch.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+
+        let write = |name: &str, text: &str| {
+            std::fs::write(workspace_root.join(name), text).expect("write fixture file");
+        };
+        write("package.json", r#"{"type":"module"}"#);
+        write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"module":"ESNext","moduleResolution":"Bundler","target":"ES2022","strict":false,"skipLibCheck":true,"allowJs":true,"checkJs":true}}"#,
+        );
+        // `m` is declared ONLY on `Base` (c.ts) -- `A` (a.ts) merely
+        // `extends Base`, never redeclaring `m` itself -- so resolving
+        // `item.m()` (an INHERITED method) requires tsgo to actually see
+        // `Base`'s own declaration, not just `A`'s. `.map((item) =>
+        // item.m())` is the SAME "guaranteed pending" shape `inferred_
+        // types_and_diagnostics_across_two_runs_and_an_edit`'s own `[1,
+        // 2].map((n) => n)` uses: a `lib.d.ts` `Array.prototype.map`
+        // dispatch whose callback parameter's type must be inferred from
+        // the array's element type -- typeflow's local heuristics cannot
+        // chase into `lib.d.ts` for this, so the call resolves ONLY via a
+        // real checker.
+        write(
+            "c.ts",
+            "export abstract class Base {\n  m(): number {\n    return 1;\n  }\n}\n",
+        );
+        write(
+            "a.ts",
+            "import { Base } from './c';\n\nexport class A extends Base {}\n",
+        );
+        write(
+            "b.ts",
+            "import { A } from './a';\n\nexport function run(): number {\n  const items: A[] = [new A()];\n  return items.map((item) => item.m())[0];\n}\n",
+        );
+
+        let database_path = scratch.join("workspace.sqlite");
+        let structural_root = scratch.join("structural");
+        let cas_root = scratch.join("cas");
+        let workspace_id = "workspace:v4-residual-dep-closure-test".to_string();
+
+        let mut syntax = SyntaxWorkerState::default();
+        let mut worker_state: WorkerState = WorkerState::default();
+        let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+
+        let cold_request = scan::ScanRequest {
+            request_id: "request:v4-residual-dep-closure-cold".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: ScanScope::Full,
+            registry_snapshot_id: "registry:v4-residual-dep-closure-test".to_string(),
+            configuration_revision_id: "configuration:v4-residual-dep-closure-test".to_string(),
+            resolution_lock_id: "resolution:v4-residual-dep-closure-test".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let cold_event = scan::run_with_residual(
+            cold_request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("cold scan succeeds");
+        let base_generation = match cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+
+        let base_context = ResidualContext {
+            request_id: "request:v4-residual-dep-closure-base".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            registry_snapshot_id: "registry:v4-residual-dep-closure-test".to_string(),
+            configuration_revision_id: "configuration:v4-residual-dep-closure-test".to_string(),
+            resolution_lock_id: "resolution:v4-residual-dep-closure-test".to_string(),
+            touched_owners: None,
+            visible_owners: None,
+            reschedule_count: 0,
+        };
+        let base_outcome = run_once_with_quiet_period(&base_context, 0, std::time::Duration::ZERO)
+            .expect("baseline residual pass does not error")
+            .expect("fixture has pending work to resolve");
+        eprintln!(
+            "[test] base upgraded={} unresolved={} generation={}",
+            base_outcome.upgraded_sites, base_outcome.unresolved_sites, base_outcome.generation,
+        );
+        assert!(base_outcome.generation > base_generation);
+        assert!(
+            base_outcome.upgraded_sites > 0,
+            "the baseline (unrestricted) residual pass must resolve `items.map((item) => item.m())`'s \
+             inherited-method call site at least once, proving the fixture's own site is resolvable \
+             when `c.ts` is visible"
+        );
+
+        // --- Edit a.ts AND b.ts together (a.ts gains an unrelated export;
+        // b.ts's call site changes shape) -- BOTH edited, matching the task
+        // brief's own repro shape, `c.ts` (Base.m's real declaration) still
+        // untouched throughout.
+        write(
+            "a.ts",
+            "import { Base } from './c';\n\nexport class A extends Base {}\n\nexport const marker = 1;\n",
+        );
+        write(
+            "b.ts",
+            "import { A } from './a';\n\nexport function run(): number {\n  const items: A[] = [new A(), new A()];\n  return items.map((item) => item.m())[1];\n}\n",
+        );
+
+        let edit_request = scan::ScanRequest {
+            request_id: "request:v4-residual-dep-closure-edit".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+            scope: ScanScope::Changed {
+                paths: vec![
+                    urdira_worker_protocol::ChangedPath {
+                        path: "a.ts".to_string(),
+                        kind: urdira_worker_protocol::ChangeKind::Modified,
+                    },
+                    urdira_worker_protocol::ChangedPath {
+                        path: "b.ts".to_string(),
+                        kind: urdira_worker_protocol::ChangeKind::Modified,
+                    },
+                ],
+            },
+            registry_snapshot_id: "registry:v4-residual-dep-closure-test".to_string(),
+            configuration_revision_id: "configuration:v4-residual-dep-closure-test".to_string(),
+            resolution_lock_id: "resolution:v4-residual-dep-closure-test".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let edit_event = scan::run_with_residual(
+            edit_request,
+            &mut syntax,
+            &mut worker_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("incremental edit scan succeeds");
+        let edit_generation = match edit_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+        assert!(edit_generation > base_outcome.generation);
+
+        // Exactly what `scan::run_with_residual` schedules for this delta:
+        // `touched_owners: Some(["a.ts", "b.ts"])`.
+        let edit_context = ResidualContext {
+            request_id: "request:v4-residual-dep-closure-edit-residual".to_string(),
+            workspace_id: workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: database_path.to_string_lossy().into_owned(),
+            structural_root: structural_root.to_string_lossy().into_owned(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
+            registry_snapshot_id: "registry:v4-residual-dep-closure-test".to_string(),
+            configuration_revision_id: "configuration:v4-residual-dep-closure-test".to_string(),
+            resolution_lock_id: "resolution:v4-residual-dep-closure-test".to_string(),
+            touched_owners: Some(vec!["a.ts".to_string(), "b.ts".to_string()]),
+            visible_owners: None,
+            reschedule_count: 0,
+        };
+        let edit_outcome = run_once_with_quiet_period(&edit_context, 0, std::time::Duration::ZERO)
+            .expect("edit residual pass does not error")
+            .expect("edited fixture still has pending work");
+        eprintln!(
+            "[test] edit upgraded={} unresolved={} generation={}",
+            edit_outcome.upgraded_sites, edit_outcome.unresolved_sites, edit_outcome.generation,
+        );
+        assert!(edit_outcome.generation > edit_generation);
+        assert!(
+            edit_outcome.upgraded_sites > 0,
+            "the post-edit residual pass (touched_owners scoped to {{a.ts, b.ts}}) must still \
+             resolve `items.map((item) => item.m())`'s inherited-method call site -- c.ts (Base's \
+             own declaration) must be visible via the dependency closure even though it is neither \
+             touched nor independently pending"
+        );
+
+        // --- Independent oracle: fresh cold scan of the FINAL tree, then
+        // one unrestricted residual pass. ---
+        let oracle_root = scratch_dir("residual-dep-closure-oracle");
+        let oracle_database = oracle_root.join("workspace.sqlite");
+        let oracle_structural = oracle_root.join("structural");
+        let oracle_cas = oracle_root.join("cas");
+        let oracle_workspace_id = "workspace:v4-residual-dep-closure-oracle".to_string();
+        let mut oracle_syntax = SyntaxWorkerState::default();
+        let mut oracle_state: WorkerState = WorkerState::default();
+        let oracle_cold_request = scan::ScanRequest {
+            request_id: "request:v4-residual-dep-closure-oracle-cold".to_string(),
+            workspace_id: oracle_workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: oracle_database.to_string_lossy().into_owned(),
+            structural_root: oracle_structural.to_string_lossy().into_owned(),
+            cas_root: oracle_cas.to_string_lossy().into_owned(),
+            sidecar_root: oracle_root.join("sidecar").to_string_lossy().into_owned(),
+            scope: ScanScope::Full,
+            registry_snapshot_id: "registry:v4-residual-dep-closure-oracle".to_string(),
+            configuration_revision_id: "configuration:v4-residual-dep-closure-oracle".to_string(),
+            resolution_lock_id: "resolution:v4-residual-dep-closure-oracle".to_string(),
+            deadline_ms: None,
+            priority: ScanPriority::Interactive,
+        };
+        let oracle_cold_event = scan::run_with_residual(
+            oracle_cold_request,
+            &mut oracle_syntax,
+            &mut oracle_state,
+            &mut on_queryable,
+            None,
+        )
+        .expect("oracle cold scan succeeds");
+        let oracle_base_generation = match oracle_cold_event {
+            IndexingEvent::ScanCompleted { generation, .. } => generation,
+            other => panic!("expected ScanCompleted, got {other:?}"),
+        };
+        let oracle_context = ResidualContext {
+            request_id: "request:v4-residual-dep-closure-oracle-residual".to_string(),
+            workspace_id: oracle_workspace_id.clone(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            database_path: oracle_database.to_string_lossy().into_owned(),
+            structural_root: oracle_structural.to_string_lossy().into_owned(),
+            cas_root: oracle_cas.to_string_lossy().into_owned(),
+            registry_snapshot_id: "registry:v4-residual-dep-closure-oracle".to_string(),
+            configuration_revision_id: "configuration:v4-residual-dep-closure-oracle".to_string(),
+            resolution_lock_id: "resolution:v4-residual-dep-closure-oracle".to_string(),
+            touched_owners: None,
+            visible_owners: None,
+            reschedule_count: 0,
+        };
+        let oracle_outcome =
+            run_once_with_quiet_period(&oracle_context, 0, std::time::Duration::ZERO)
+                .expect("oracle residual pass does not error")
+                .expect("oracle fixture has pending work");
+        assert!(oracle_outcome.generation > oracle_base_generation);
+
+        // Set comparator, not the raw `graph` merkle root -- see
+        // `graph_identity_set_at`'s own doc comment for why raw root
+        // equality is unreachable here regardless of Brecha B, purely from
+        // this fixture's own edit of a.ts/b.ts (decision 11 chaining).
+        let incremental_graph = graph_identity_set_at(&structural_root);
+        let oracle_graph = graph_identity_set_at(&oracle_structural);
+        let only_incremental: Vec<&Vec<u8>> = incremental_graph.difference(&oracle_graph).collect();
+        let only_oracle: Vec<&Vec<u8>> = oracle_graph.difference(&incremental_graph).collect();
+        if !only_incremental.is_empty() || !only_oracle.is_empty() {
+            eprintln!(
+                "[test] graph identity set diff: {} only-in-incremental (phantom), {} only-in-oracle (lost)",
+                only_incremental.len(),
+                only_oracle.len(),
+            );
+            for id in &only_incremental {
+                eprintln!("  ONLY-INCREMENTAL {}", String::from_utf8_lossy(id));
+            }
+            for id in &only_oracle {
+                eprintln!("  ONLY-ORACLE {}", String::from_utf8_lossy(id));
+            }
+        }
+        assert_eq!(
+            incremental_graph, oracle_graph,
+            "graph relation SET (by identity_key) must match an independent from-scratch \
+             cold+residual oracle of the identical final tree -- b.ts's items.map((item) => \
+             item.m()) inherited-method call must resolve through c.ts's Base declaration even \
+             though c.ts is neither touched nor independently pending"
+        );
+
+        let incremental_pending =
+            pending_site_set_at(&structural_root, &database_path, &workspace_id);
+        let oracle_pending =
+            pending_site_set_at(&oracle_structural, &oracle_database, &oracle_workspace_id);
+        assert_eq!(
+            incremental_pending, oracle_pending,
+            "pending.sites must match an independent from-scratch cold+residual oracle too"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(&oracle_root);
     }
 
     /// F4 4.1: a fixture with an exported, typed function and a deliberate

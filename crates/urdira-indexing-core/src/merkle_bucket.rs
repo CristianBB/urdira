@@ -295,13 +295,54 @@ impl BucketedMerkleSet {
 
     /// Recomputes only the buckets touched by `changes` (deduplicated) plus
     /// their 5 ancestor node digests. `bucket_entries(bucket_idx)` must
-    /// return the *current*, post-change contents of that bucket (this
-    /// tree does not retain leaves itself); a duplicate key with
-    /// conflicting logical values inside one bucket's returned entries, or
-    /// inside `changes` itself, is an error.
+    /// return `(pre_change_count, post_change_entries)` for that bucket
+    /// (this tree does not retain leaves itself): `post_change_entries` is
+    /// the *current*, post-change content, exactly as before; `pre_change_
+    /// count` is this bucket's TRUE member count immediately before this
+    /// call's own changes were applied to it -- NEVER derived from this
+    /// struct's own `bucket_count` field, which [`Self::read_from`] cannot
+    /// restore (only digests are persisted, not per-bucket leaf counts) and
+    /// therefore starts at zero for every bucket on a struct loaded that
+    /// way, regardless of what it actually held.
+    ///
+    /// Frente E-P0c fix (2026-09-07, `docs/evidence/2026-09-02-v4-p0-s3-
+    /// merkle-bucket.md`'s own "known caveat", left as an explicit follow-up
+    /// then and finally closed here): this function used to read `self.
+    /// bucket_count[bucket_idx]` as `pre_change_count` itself. For a set
+    /// freshly built via [`Self::from_sorted`] that field is exact, but
+    /// EVERY real caller in this codebase (`urdira-structural-store::writer`
+    /// /`urdira-indexing-worker::v4::diff`) instead calls this on a set
+    /// loaded via [`Self::read_from`] (one `update` per incremental scan
+    /// generation, on a tree persisted -- and reloaded -- by the PRIOR
+    /// generation) -- so `bucket_count` silently undercounts (reads zero)
+    /// for any touched bucket that already had members, permanently
+    /// inflating `self.count` by that bucket's true prior size on every
+    /// single incremental generation from the second one onward. Harmless
+    /// for every other read (`bucket_level`/the node digests are always
+    /// recomputed correctly from `post_change_entries`, independent of
+    /// `self.count`) EXCEPT [`Self::root`]'s own deliberate `count == 0`
+    /// special case (the ONE place `self.count`'s exact value is load-
+    /// bearing): once corpus-wide `self.count` never again reaches its true
+    /// value of zero after the corpus's last live member of a given
+    /// category (e.g. `dependency`, whenever every file's imports resolve
+    /// externally or are all deleted) is removed, `root()` permanently
+    /// returns a real (non-empty-sentinel) node digest instead of the
+    /// canonical all-zero empty root a from-scratch oracle of the identical
+    /// (now-empty) final state computes -- a `dependency`/`graph` root
+    /// mismatch invisible in any corpus that never goes back to truly zero
+    /// members (real corpora essentially never do for `records`/`graph`,
+    /// but easily do for `dependency` -- confirmed live via `urdira-
+    /// indexing-worker`'s own `deleting_an_imported_files_export_drops_the_
+    /// untouched_importers_stale_references_and_matches_an_independent_
+    /// oracle` fixture). Fixed by requiring every caller to supply the true
+    /// pre-change count itself (every one of them already computes or reads
+    /// the pre-change bucket contents anyway, to apply `changes` against),
+    /// rather than trusting this struct's own possibly-stale bookkeeping. A
+    /// duplicate key with conflicting logical values inside one bucket's
+    /// returned entries, or inside `changes` itself, is still an error.
     pub fn update<F>(&mut self, changes: &[Change], bucket_entries: F) -> Result<(), CoreError>
     where
-        F: Fn(u32) -> Vec<(Digest32, Digest32)>,
+        F: Fn(u32) -> (u32, Vec<(Digest32, Digest32)>),
     {
         // P3-1 perf fix: this loop only ever exists to reject a `changes`
         // slice that sets the SAME key to two different logical values --
@@ -334,7 +375,7 @@ impl BucketedMerkleSet {
         touched.dedup();
 
         for bucket_idx in touched {
-            let mut bucket = bucket_entries(bucket_idx);
+            let (old_count, mut bucket) = bucket_entries(bucket_idx);
             bucket.sort_unstable_by_key(|entry| entry.0);
             for window in bucket.windows(2) {
                 if window[0].0 == window[1].0 && window[0].1 != window[1].1 {
@@ -343,7 +384,6 @@ impl BucketedMerkleSet {
             }
             bucket.dedup_by(|a, b| a.0 == b.0);
 
-            let old_count = self.bucket_count[bucket_idx as usize];
             let new_count = bucket.len() as u32;
             self.count = self.count - u64::from(old_count) + u64::from(new_count);
             self.bucket_count[bucket_idx as usize] = new_count;
@@ -776,6 +816,7 @@ mod tests {
         let mut set = BucketedMerkleSet::from_sorted(&entries).unwrap();
 
         let bucket = bucket_index(&reinsert_key);
+        let before_delete_len = store.get(&bucket).map_or(0, Vec::len) as u32;
         store
             .get_mut(&bucket)
             .unwrap()
@@ -783,14 +824,16 @@ mod tests {
         let after_delete = store.get(&bucket).cloned().unwrap_or_default();
         set.update(&[Change::Delete { key: reinsert_key }], |idx| {
             if idx == bucket {
-                after_delete.clone()
+                (before_delete_len, after_delete.clone())
             } else {
-                store.get(&idx).cloned().unwrap_or_default()
+                let entries = store.get(&idx).cloned().unwrap_or_default();
+                (entries.len() as u32, entries)
             }
         })
         .unwrap();
         assert_eq!(set.len(), case.count - 1);
 
+        let before_reinsert_len = store.get(&bucket).map_or(0, Vec::len) as u32;
         store
             .entry(bucket)
             .or_default()
@@ -803,9 +846,10 @@ mod tests {
             }],
             |idx| {
                 if idx == bucket {
-                    after_reinsert.clone()
+                    (before_reinsert_len, after_reinsert.clone())
                 } else {
-                    store.get(&idx).cloned().unwrap_or_default()
+                    let entries = store.get(&idx).cloned().unwrap_or_default();
+                    (entries.len() as u32, entries)
                 }
             },
         )
@@ -813,6 +857,74 @@ mod tests {
 
         assert_eq!(set.len(), case.count);
         assert_eq!(to_prefixed_hex(&set.root()), case.root);
+    }
+
+    /// Frente E-P0c (2026-09-07) regression: deleting a set's LAST member
+    /// through `update`, on an instance loaded via `read_from` (never
+    /// `from_sorted`), must converge back to the canonical empty-set root
+    /// (`ZERO`) -- not a real, non-empty node digest. `read_from` never
+    /// restores `bucket_count` (only digests + the aggregate `count` are
+    /// persisted), so before this task's fix, `update`'s own `old_count =
+    /// self.bucket_count[bucket_idx]` read a false `0` for this bucket
+    /// (which really held 1 member before the delete), leaving `self.count`
+    /// unchanged (1) instead of dropping to its true value (0) --
+    /// `root()`'s `count == 0` special case then never fired, returning a
+    /// real node digest instead of `ZERO`, diverging from a from-scratch
+    /// oracle of the identical (now genuinely empty) member set. See
+    /// `docs/evidence/2026-09-06-v4-reconcile-threshold.md` §10.4/Brecha A
+    /// for the real-world `dependency`-root repro this was found from.
+    #[test]
+    fn deleting_the_last_member_after_a_disk_round_trip_converges_to_the_empty_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "urdira-merkle-bucket-test-empty-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dependency.tree");
+
+        let key = [3u8; 32];
+        let logical = [4u8; 32];
+        let bucket = bucket_index(&key);
+
+        let built = BucketedMerkleSet::from_sorted(&[(key, logical)]).unwrap();
+        assert_eq!(built.len(), 1);
+        assert_ne!(built.root(), ZERO);
+        built.write_to(&path, SetKind::Dependency, 1).unwrap();
+
+        // Simulate exactly what `urdira-structural-store::writer::write_
+        // delta`/`urdira-indexing-worker::v4::diff::graph_bucket_entries`
+        // do: load the PERSISTED tree (never `from_sorted` again), then
+        // `update` it with the caller's own true pre-change bucket count
+        // (here: 1, the bucket's only member, about to be deleted).
+        let (mut loaded, _kind, _generation) = BucketedMerkleSet::read_from(&path).unwrap();
+        loaded
+            .update(&[Change::Delete { key }], |idx| {
+                if idx == bucket {
+                    (1, Vec::new())
+                } else {
+                    (0, Vec::new())
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            loaded.len(),
+            0,
+            "the set's true member count must reach zero"
+        );
+        assert_eq!(
+            loaded.root(),
+            ZERO,
+            "an actually-empty set must report the canonical empty root, matching a from-scratch \
+             oracle that never had any member at all -- not a real (non-empty) node digest"
+        );
+        assert_eq!(
+            loaded.root(),
+            BucketedMerkleSet::empty().root(),
+            "must be byte-identical to a set that was NEVER populated in the first place"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -853,7 +965,7 @@ mod tests {
                     logical: [2u8; 32],
                 },
             ],
-            |_| Vec::new(),
+            |_| (0, Vec::new()),
         ));
         assert!(error.0.contains("conflicting"));
     }
@@ -903,18 +1015,21 @@ mod tests {
             if let Some(&current) = present.get(&key) {
                 if action < 50 {
                     present.remove(&key);
+                    let before_len = store.get(&bucket).map_or(0, Vec::len) as u32;
                     store.get_mut(&bucket).unwrap().retain(|(k, _)| k != &key);
                     let after = store.get(&bucket).cloned().unwrap_or_default();
                     set.update(&[Change::Delete { key }], |idx| {
                         if idx == bucket {
-                            after.clone()
+                            (before_len, after.clone())
                         } else {
-                            store.get(&idx).cloned().unwrap_or_default()
+                            let entries = store.get(&idx).cloned().unwrap_or_default();
+                            (entries.len() as u32, entries)
                         }
                     })
                     .unwrap();
                 } else if action < 80 {
-                    // no-op re-set
+                    // no-op re-set: bucket membership count never changes.
+                    let before_len = store.get(&bucket).map_or(0, Vec::len) as u32;
                     let after = store.get(&bucket).cloned().unwrap_or_default();
                     set.update(
                         &[Change::Set {
@@ -923,9 +1038,10 @@ mod tests {
                         }],
                         |idx| {
                             if idx == bucket {
-                                after.clone()
+                                (before_len, after.clone())
                             } else {
-                                store.get(&idx).cloned().unwrap_or_default()
+                                let entries = store.get(&idx).cloned().unwrap_or_default();
+                                (entries.len() as u32, entries)
                             }
                         },
                     )
@@ -936,6 +1052,7 @@ mod tests {
                     } else {
                         logical_a
                     };
+                    let before_len = store.get(&bucket).map_or(0, Vec::len) as u32;
                     let entry = store
                         .get_mut(&bucket)
                         .unwrap()
@@ -947,14 +1064,16 @@ mod tests {
                     let after = store.get(&bucket).cloned().unwrap_or_default();
                     set.update(&[Change::Set { key, logical: next }], |idx| {
                         if idx == bucket {
-                            after.clone()
+                            (before_len, after.clone())
                         } else {
-                            store.get(&idx).cloned().unwrap_or_default()
+                            let entries = store.get(&idx).cloned().unwrap_or_default();
+                            (entries.len() as u32, entries)
                         }
                     })
                     .unwrap();
                 }
             } else {
+                let before_len = store.get(&bucket).map_or(0, Vec::len) as u32;
                 present.insert(key, logical_a);
                 store.entry(bucket).or_default().push((key, logical_a));
                 let after = store.get(&bucket).cloned().unwrap_or_default();
@@ -965,9 +1084,10 @@ mod tests {
                     }],
                     |idx| {
                         if idx == bucket {
-                            after.clone()
+                            (before_len, after.clone())
                         } else {
-                            store.get(&idx).cloned().unwrap_or_default()
+                            let entries = store.get(&idx).cloned().unwrap_or_default();
+                            (entries.len() as u32, entries)
                         }
                     },
                 )
@@ -1029,6 +1149,13 @@ mod tests {
             slot.1 = new_logical;
         }
         let mut mutable = loaded;
+        // Changing an EXISTING member's logical value never changes this
+        // bucket's membership count -- `before_len == after.len()` -- but
+        // `mutable` was just loaded via `read_from`, so its own `bucket_
+        // count` bookkeeping is unusable here regardless (Frente E-P0c:
+        // `update`'s own doc comment on why this is now a required, not
+        // optional, caller-supplied value).
+        let before_len = store.get(&bucket).map_or(0, Vec::len) as u32;
         let after = store.get(&bucket).cloned().unwrap();
         mutable
             .update(
@@ -1038,9 +1165,10 @@ mod tests {
                 }],
                 |idx| {
                     if idx == bucket {
-                        after.clone()
+                        (before_len, after.clone())
                     } else {
-                        store.get(&idx).cloned().unwrap_or_default()
+                        let entries = store.get(&idx).cloned().unwrap_or_default();
+                        (entries.len() as u32, entries)
                     }
                 },
             )
@@ -1172,7 +1300,13 @@ mod tests {
         }
         let started_update = Instant::now();
         mutable
-            .update(&changes, |idx| store.get(&idx).cloned().unwrap_or_default())
+            .update(&changes, |idx| {
+                // Every change here re-sets an EXISTING key's logical value
+                // -- bucket membership count never changes, so before/after
+                // length are the same.
+                let entries = store.get(&idx).cloned().unwrap_or_default();
+                (entries.len() as u32, entries)
+            })
             .unwrap();
         let update_elapsed = started_update.elapsed();
         println!(

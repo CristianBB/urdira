@@ -1981,6 +1981,17 @@ impl SyntaxWorkerState {
         // yet (defensive; every code path above that returns from this
         // function also updates the index, so this should never fire in
         // practice).
+        //
+        // Frente E-P0c fix (Brecha A, 2026-09-07): `validated_by_path` lets
+        // the stale-paths loop below reparse a reresolved file from its own
+        // (byte-identical, never-touched) source content instead of only
+        // patching its `direct_imports`/import-export relations in place --
+        // see that loop's own doc comment for why a full reparse, not a
+        // narrower patch, is the fix.
+        let validated_by_path: HashMap<&str, &ValidatedSource> = validated
+            .iter()
+            .map(|source| (source.path.as_str(), source))
+            .collect();
         let mut reresolved: BTreeSet<String> = BTreeSet::new();
         if path_membership_incremental {
             let touched: BTreeSet<String> = added.iter().chain(removed.iter()).cloned().collect();
@@ -2006,20 +2017,68 @@ impl SyntaxWorkerState {
                         cancellation_id,
                     });
                 }
-                let updated = next_files
-                    .get(&path)
-                    .and_then(|existing| reresolve_file(existing, available, resolver));
-                if let Some(updated) = updated {
-                    next_files.insert(path.clone(), updated);
-                    reresolved.insert(path);
+                let would_change = next_files.get(&path).is_some_and(|existing| {
+                    import_resolution_would_change(existing, available, resolver)
+                });
+                if !would_change {
+                    continue;
+                }
+                // Frente E-P0c fix (Brecha A, docs/evidence/2026-09-06-v4-
+                // reconcile-threshold.md §10.4 finding #2): this file's own
+                // import/export resolution changed because a DIFFERENT
+                // path in this same batch was added/removed/renamed -- its
+                // own content is byte-identical (a `path_membership_
+                // incremental` precondition), but `reresolve_file` (the
+                // narrow patch this used to call) only ever rebuilds THIS
+                // file's OWN `Import`/`Export`-kind relations, never the
+                // downstream `jsts:references`/`jsts:call` relations a
+                // SEPARATE pass (`semantic_sites.rs`'s hybrid lane) already
+                // baked into this file's `relations` list while the now-
+                // gone import target was still live -- e.g. deleting a file
+                // that exported an interface left every OTHER file's
+                // already-`Confirmed` references to that interface's
+                // members dangling forever, a phantom (only-in-incremental,
+                // never in an independent cold oracle) `find_references`
+                // answer. A full reparse from this file's own (unchanged)
+                // source bytes, using the SAME `available`/`resolver` a
+                // cold scan of the identical post-mutation tree would use,
+                // is byte-for-byte what a cold scan computes for this file
+                // (parsing is a pure function of content + those two
+                // inputs) -- so this file's carried-forward relations are
+                // never stale again, at the SAME bounded cost class as
+                // `reresolve_file`'s own scope (`stale_paths`, never every
+                // corpus file). The subsequent ambient-revisit pass below
+                // (already iterating `reresolved`, fleco 1's own fix) still
+                // runs for this path afterward, exactly as it does for any
+                // OTHER freshly reparsed file (`changed_sources`) -- this
+                // loop's reparse deliberately passes `ambient_index: None`
+                // to `parse_source`, same as that loop, for that reason.
+                let Some(source) = validated_by_path.get(path.as_str()).copied() else {
+                    // Not in this call's own manifest (defensive: every
+                    // `stale_paths` member is drawn from `next_files`,
+                    // which is itself seeded from `validated`/`prior`, so
+                    // this should never fire in practice).
+                    continue;
+                };
+                let reparsed = decode_source(source)
+                    .and_then(|decoded| parse_source(&decoded, available, resolver));
+                match reparsed {
+                    Ok(parsed) => {
+                        next_files.insert(path.clone(), parsed);
+                        reresolved.insert(path);
+                    }
+                    Err(error) => {
+                        self.restore_prior_on_bail(&project_key, prior_rest, next_files);
+                        return Err(error);
+                    }
                 }
             }
         }
-        // P3-6 item 3: `reresolve_file` above may have changed a stable
-        // path's `target_path` (that's the whole point of it) without
-        // changing its specifier text -- refresh THIS path's own
-        // contribution to the reverse-import index now that its outgoing
-        // edges are known to be current. `CandidateIndex` needs no
+        // P3-6 item 3: the reparse above may have changed a stable path's
+        // `target_path` (that's the whole point of it) without changing
+        // its specifier text -- refresh THIS path's own contribution to
+        // the reverse-import index now that its outgoing edges are known
+        // to be current. `CandidateIndex` needs no
         // equivalent step here (specifier text, its own key, never
         // changes from reresolution alone).
         if !reresolved.is_empty() {
@@ -4874,108 +4933,33 @@ fn stable_entity_id(kind: EntityKind, path: &str, start: u32, name: &str) -> Str
     format!("jsts:{}:{path}:{start}:{name}", kind.identity_name())
 }
 
-/// Re-derive only the import/export target-path resolution (and the
-/// corresponding `core:import`/`core:export` relations) of an already-parsed
-/// file against a NEW `available` path set, without re-parsing its source.
-/// `file`'s own byte content never changes here -- only which other path (if
-/// any) each of its relative/bare specifiers now resolves to, which is
-/// exactly what changes when a sibling path is added to or removed from the
-/// corpus (T1, `docs/evidence/2026-09-02-file-creation-diagnosis.md`).
-/// Returns `None` when nothing about this file's resolution actually
-/// changed, so the caller can skip touching it -- keeping the incremental
-/// add/remove-root path's rewrite proportional to what genuinely changed,
-/// not to the corpus size.
-fn reresolve_file(
+/// Cheap, read-only check: would re-resolving `file`'s own
+/// imports/re-exports against a NEW `available` path set change any of
+/// their `target_path`s? `file`'s own byte content never changes here --
+/// this only asks whether a sibling path being added to or removed from
+/// the corpus changed what one of its relative/bare specifiers resolves to
+/// (T1, `docs/evidence/2026-09-02-file-creation-diagnosis.md`). Used to
+/// decide, WITHOUT paying for a reparse, which `stale_paths` candidates
+/// actually need one -- see that loop's own doc comment
+/// (`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §10.4 finding #2,
+/// Frente E-P0c) for why a full reparse -- not an in-place relation patch,
+/// which is what this function's `reresolve_file` predecessor used to do --
+/// is the correct, bounded-cost fix once this check comes back `true`.
+fn import_resolution_would_change(
     file: &SyntaxFileResult,
     available: &BTreeSet<String>,
     resolver: &WorkspaceResolver,
-) -> Option<SyntaxFileResult> {
-    let mut direct_imports = file.direct_imports.clone();
-    let mut resolution_changed = false;
-    for import in &mut direct_imports {
-        let resolved = resolver.resolve(&file.path, &import.specifier, available);
-        if resolved != import.target_path {
-            resolution_changed = true;
-        }
-        import.target_path = resolved;
-    }
-    let mut export_bindings = file.export_bindings.clone();
-    for binding in &mut export_bindings {
-        if let Some(specifier) = &binding.source_specifier {
-            let resolved = resolver.resolve(&file.path, specifier, available);
-            if resolved != binding.source_target_path {
-                resolution_changed = true;
-            }
-            binding.source_target_path = resolved;
-        }
-    }
-    let mut export_star_specifiers = file.export_star_specifiers.clone();
-    for star in &mut export_star_specifiers {
-        let resolved = resolver.resolve(&file.path, &star.specifier, available);
-        if resolved != star.target_path {
-            resolution_changed = true;
-        }
-        star.target_path = resolved;
-    }
-    if !resolution_changed {
-        return None;
-    }
-    let module_id = stable_entity_id(EntityKind::Module, &file.path, 0, &file.path);
-    let mut relations: Vec<SyntaxRelation> = file
-        .relations
-        .iter()
-        .filter(|relation| {
-            !(matches!(relation.kind, RelationKind::Import | RelationKind::Export)
-                && relation.source_id == module_id)
+) -> bool {
+    file.direct_imports.iter().any(|import| {
+        resolver.resolve(&file.path, &import.specifier, available) != import.target_path
+    }) || file.export_bindings.iter().any(|binding| {
+        binding.source_specifier.as_ref().is_some_and(|specifier| {
+            resolver.resolve(&file.path, specifier, available) != binding.source_target_path
         })
-        .cloned()
-        .collect();
-    // Ambient module resolution task (2026-09-04): delegates to the SAME
-    // shared decision `finish_import_relations` uses (`ambient_index: None`
-    // here too -- T1's add/remove-root sweep has no cross-file ambient
-    // picture either, same reasoning as the per-file parse call site; the
-    // separate `reresolve_ambient_relations` pass below is what applies
-    // ambient resolution). Before this fix, this loop rebuilt an
-    // unresolved edge's relation as unconditionally `Possible`/no-target,
-    // NEVER re-applying `classify_external_specifier` -- a latent bug this
-    // refactor also fixes: a bare external import untouched by THIS call's
-    // own resolution change (e.g. a sibling relative import in the same
-    // file DID change, forcing this whole relation list to rebuild) used
-    // to silently lose its external classification here.
-    let (import_export_relations, external_entities) =
-        build_import_export_facts(&file.path, &module_id, &direct_imports, None);
-    relations.extend(import_export_relations);
-    relations.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut entities: Vec<SyntaxEntity> = file
-        .entities
+    }) || file
+        .export_star_specifiers
         .iter()
-        .filter(|entity| entity.kind != EntityKind::ExternalModule)
-        .cloned()
-        .collect();
-    entities.extend(external_entities);
-    entities.sort_by(|left, right| left.id.cmp(&right.id));
-    Some(SyntaxFileResult {
-        path: file.path.clone(),
-        content_digest: file.content_digest.clone(),
-        language: file.language,
-        script_kind: file.script_kind,
-        byte_length: file.byte_length,
-        parsed: file.parsed,
-        direct_imports,
-        entities,
-        relations,
-        diagnostics: file.diagnostics.clone(),
-        export_bindings,
-        export_star_specifiers,
-        ambient_modules: file.ambient_modules.clone(),
-        ambient_globals: file.ambient_globals.clone(),
-        namespace_members: file.namespace_members.clone(),
-        // A4: `file`'s own byte content is untouched here (only import/
-        // export target-path resolution changed), so its line index is
-        // still valid unchanged -- see `SyntaxFileResult::line_index`'s own
-        // doc comment.
-        line_index: file.line_index.clone(),
-    })
+        .any(|star| resolver.resolve(&file.path, &star.specifier, available) != star.target_path)
 }
 
 /// Ambient module resolution task (2026-09-04), fix item 2: rebuilds ONLY

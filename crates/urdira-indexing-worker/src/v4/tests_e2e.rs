@@ -3099,6 +3099,270 @@ fn reresolved_file_keeps_an_unrelated_ambiguous_ambient_import_pending_and_match
     let _ = std::fs::remove_dir_all(&oracle_root);
 }
 
+/// Frente E-P0c (2026-09-07), Brecha A diagnostic: like `dump_dependency_
+/// set_diff`/`dump_records_set_diff` above, but for `CATEGORY_RELATION`
+/// records specifically -- these are exactly what the `graph` merkle root
+/// hashes over (`jsts:call`/`jsts:references`/`jsts:import`/... rows), and a
+/// phantom-reference regression (a relation present ONLY in the incremental
+/// side, never the reverse) is invisible in `dump_records_set_diff`'s own
+/// output whenever both sides otherwise agree on every OTHER category
+/// (`records` is deliberately unasserted everywhere in this file per
+/// decision 11, so it is never run to surface this on its own).
+fn dump_graph_set_diff(
+    incremental_structural_root: &Path,
+    incremental_generation: u64,
+    oracle_structural_root: &Path,
+    oracle_generation: u64,
+) {
+    fn visible_relations_by_identity(
+        structural_root: &Path,
+        generation: u64,
+    ) -> std::collections::HashMap<Vec<u8>, ([u8; 32], [u8; 32])> {
+        let reader = StoreReader::open(structural_root).expect("diagnostic store reader opens");
+        reader
+            .iter_visible(generation)
+            .filter(|view| view.category() == urdira_structural_store::row::CATEGORY_RELATION)
+            .map(|view| {
+                (
+                    view.identity_key().to_vec(),
+                    (view.record_id(), view.record_digest()),
+                )
+            })
+            .collect()
+    }
+    let incremental =
+        visible_relations_by_identity(incremental_structural_root, incremental_generation);
+    let oracle = visible_relations_by_identity(oracle_structural_root, oracle_generation);
+    let mut only_incremental: Vec<&Vec<u8>> = incremental
+        .keys()
+        .filter(|id| !oracle.contains_key(*id))
+        .collect();
+    let mut only_oracle: Vec<&Vec<u8>> = oracle
+        .keys()
+        .filter(|id| !incremental.contains_key(*id))
+        .collect();
+    only_incremental.sort();
+    only_oracle.sort();
+    eprintln!(
+        "graph (CATEGORY_RELATION) set diff: incremental has {} live relations, oracle has {} live relations; {} only-in-incremental (phantom), {} only-in-oracle (lost)",
+        incremental.len(),
+        oracle.len(),
+        only_incremental.len(),
+        only_oracle.len(),
+    );
+    for id in only_incremental.iter().take(20) {
+        eprintln!(
+            "  ONLY-INCREMENTAL (phantom) identity={}",
+            String::from_utf8_lossy(id)
+        );
+    }
+    for id in only_oracle.iter().take(20) {
+        eprintln!(
+            "  ONLY-ORACLE (lost) identity={}",
+            String::from_utf8_lossy(id)
+        );
+    }
+}
+
+/// Frente E-P0c (2026-09-07): real-scale confirmation that a `graph`
+/// MERKLE ROOT mismatch between a kept `--keep-data` incremental store
+/// (`scripts/v4-reconcile-threshold.mjs --git-switch --keep-data`) and its
+/// independent oracle is REPRESENTATIONAL (decision-11 identity chaining
+/// for the batch's genuinely-edited owners -- `docs/evidence/2026-09-03-v4-
+/// p3-1-incremental.md` §5.1, an already-documented limitation predating
+/// this task, orthogonal to Brecha A/B), not a real missing/phantom
+/// relation -- by comparing the `CATEGORY_RELATION` SET (`identity_key`,
+/// which decision 11 guarantees never chains) instead of the raw root.
+/// `#[ignore]`d: needs two `--keep-data` structural roots from a real run.
+/// ```text
+/// URDIRA_V4_GRAPH_SET_A=<delta-data>/structural \
+/// URDIRA_V4_GRAPH_SET_B=<oracle-data>/structural \
+/// cargo test -p urdira-indexing-worker --release \
+///   v4::tests_e2e::graph_identity_set_matches_between_two_kept_stores -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn graph_identity_set_matches_between_two_kept_stores() {
+    let a = std::env::var("URDIRA_V4_GRAPH_SET_A")
+        .expect("set URDIRA_V4_GRAPH_SET_A=<structural_root>");
+    let b = std::env::var("URDIRA_V4_GRAPH_SET_B")
+        .expect("set URDIRA_V4_GRAPH_SET_B=<structural_root>");
+    let a_root = PathBuf::from(a);
+    let b_root = PathBuf::from(b);
+    let a_reader = StoreReader::open(&a_root).expect("A store opens");
+    let b_reader = StoreReader::open(&b_root).expect("B store opens");
+    let a_gen = a_reader.generation();
+    let b_gen = b_reader.generation();
+    eprintln!("[test] A generation={a_gen} B generation={b_gen}");
+    let a_set: std::collections::BTreeSet<Vec<u8>> = a_reader
+        .iter_visible(a_gen)
+        .filter(|v| v.category() == urdira_structural_store::row::CATEGORY_RELATION)
+        .map(|v| v.identity_key().to_vec())
+        .collect();
+    let b_set: std::collections::BTreeSet<Vec<u8>> = b_reader
+        .iter_visible(b_gen)
+        .filter(|v| v.category() == urdira_structural_store::row::CATEGORY_RELATION)
+        .map(|v| v.identity_key().to_vec())
+        .collect();
+    eprintln!(
+        "[test] A relations={} B relations={}",
+        a_set.len(),
+        b_set.len()
+    );
+    dump_graph_set_diff(&a_root, a_gen, &b_root, b_gen);
+    assert_eq!(
+        a_set, b_set,
+        "graph relation identity-key SET must match even when the raw merkle root does not"
+    );
+}
+
+/// Frente E-P0c (2026-09-07), Brecha A: `docs/evidence/2026-09-06-v4-
+/// reconcile-threshold.md` §10.4 finding #2, reproduced at fixture scale.
+/// `a.ts` exports `interface I`; `b.ts` (never touched by this scan's own
+/// batch) imports `I` and references it three times (as a parameter type).
+/// Deleting `a.ts` is a PURE structural `Changed{Deleted}` batch -- `b.ts`'s
+/// own byte content never changes -- which used to go through `urdira-jsts-
+/// syntax-worker::lib.rs`'s `reresolve_file` (T1's bounded add/remove
+/// re-resolution): that function only ever rebuilt `b.ts`'s OWN `Import`/
+/// `Export`-kind relations (correctly flipping its `import { I } from
+/// './a'` to unresolved), but left every OTHER relation -- including the
+/// three already-`Confirmed` `jsts:references` rows the hybrid lane baked in
+/// at generation 1, each pointing at `jsts:interface:.../a.ts:...:I` --
+/// completely untouched, since `a.ts`'s own entities/records are gone from
+/// this generation but `b.ts`'s stale relations still name them: a phantom
+/// (only-in-incremental) `find_references`-visible answer pointing at a
+/// dangling, no-longer-existing interface. Fixed by promoting `reresolve_
+/// file`'s narrow patch to a full reparse of `b.ts` from its own (byte-
+/// identical) source whenever its own import resolution changed --
+/// `import_resolution_would_change`/the `stale_paths` loop in `analyze()`,
+/// `urdira-jsts-syntax-worker/src/lib.rs`.
+#[test]
+fn deleting_an_imported_files_export_drops_the_untouched_importers_stale_references_and_matches_an_independent_oracle()
+ {
+    let scratch_root = scratch_dir("delete-import-drops-stale-refs");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    std::fs::write(
+        workspace_root.join("src/a.ts"),
+        "export interface I {\n  value: number;\n}\n",
+    )
+    .expect("write a.ts");
+    std::fs::write(
+        workspace_root.join("src/b.ts"),
+        "import { I } from './a';\n\nexport function useOne(x: I): void {\n  void x;\n}\n\nexport function useTwo(x: I): void {\n  void x;\n}\n\nexport function useThree(x: I): void {\n  void x;\n}\n",
+    )
+    .expect("write b.ts");
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-delete-import-drops-stale-refs";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // PURE structural delete of `a.ts` -- `b.ts`'s own bytes never change.
+    std::fs::remove_file(workspace_root.join("src/a.ts")).expect("delete a.ts");
+
+    let deleted = run_scan(
+        "request:delete-a",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: "src/a.ts".to_string(),
+                kind: ChangeKind::Deleted,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&deleted),
+        2,
+        "a pure structural delete never needs the mixed-burst split"
+    );
+    let deleted_roots = roots_of(&deleted);
+    let deleted_pending = pending_site_set(&structural_root, &database_path, workspace_id);
+
+    let oracle_root = scratch_dir("delete-import-drops-stale-refs-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-delete-import-drops-stale-refs-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+    let oracle_pending = pending_site_set(
+        &oracle_structural,
+        &oracle_database,
+        "workspace:v4-e2e-delete-import-drops-stale-refs-oracle",
+    );
+
+    if deleted_roots.dependency != oracle_roots.dependency
+        || deleted_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&deleted),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+        dump_graph_set_diff(
+            &structural_root,
+            generation_of(&deleted),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        deleted_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle after deleting a file an \
+         untouched importer depends on"
+    );
+    assert_eq!(
+        deleted_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle -- b.ts's stale `jsts:references` \
+         to the now-deleted `I` interface must be dropped/re-pended, never left dangling as a \
+         phantom find_references answer"
+    );
+    assert_eq!(
+        deleted_pending, oracle_pending,
+        "pending.sites must match an independent from-scratch oracle for the untouched importer too"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
 /// The portion of the task brief's gate that IS achievable byte-for-byte
 /// against an independent from-scratch oracle: a pure file CREATION.
 /// Every record a new file produces has a brand-new `identity_key`
