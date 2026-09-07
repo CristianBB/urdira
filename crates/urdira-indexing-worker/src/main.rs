@@ -6746,17 +6746,31 @@ fn finalize_workspace_publication(
             // `record_insert_sql`'s own "else" above, for the direct-
             // publication source instead -- see that branch's doc comment
             // for the full external-module-duplicate root cause. De-dupes
-            // by `publication_record_id`, keeping the row from the
-            // alphabetically-first `owner_artifact_id` among content-
-            // identical duplicates (the same tie-break convention
-            // `dedupe_external_entities_across_owners`, `crates/urdira-
-            // indexing-worker/src/v4/analyze.rs`, documents for its own,
-            // separate v4-store dedup) -- `rowid` only breaks a tie between
-            // two rows from the very same owner, which never happens here
-            // (`external_ids_seen` in `crates/urdira-jsts-syntax-worker/
-            // src/lib.rs`'s `build_import_export_facts` already dedupes
-            // within one file).
-            "WITH ffix_ranked_records AS (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY publication_record_id ORDER BY owner_artifact_id, rowid) AS ffix_rank FROM urdira_core_owner_rows WHERE lane = 'records'), ffix_record_winners AS (SELECT rowid FROM ffix_ranked_records WHERE ffix_rank = 1) INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) SELECT 'record:' || lower(hex(o.publication_record_id)), ?1, o.record_category, o.record_kind, o.record_universal_kind, o.record_schema_version, 'candidate', '1', o.owner_artifact_id, o.owner_artifact_version_id, o.primary_source_span_artifact_version_id, o.primary_source_span_start_byte, o.primary_source_span_end_byte, o.primary_source_span_start_line, o.primary_source_span_end_line, ?2, NULL, 'sha256:' || lower(hex(o.record_digest)), 'sha256:' || lower(hex(o.body_digest)), o.body_byte_length, o.body_payload_hex, ?2, ?2, ?2 FROM urdira_core_owner_rows o JOIN ffix_record_winners w ON w.rowid = o.rowid WHERE o.lane = 'records'"
+            // by `publication_record_id`, keeping the lowest `rowid`
+            // (insertion/staging order) among content-identical duplicates.
+            //
+            // Performance note (measured live on the real n8n corpus,
+            // 2026-09-07): an EARLIER version of this fix used `ROW_NUMBER()
+            // OVER (PARTITION BY publication_record_id ORDER BY
+            // owner_artifact_id, rowid)` to match `dedupe_external_entities_
+            // across_owners`'s (`crates/urdira-indexing-worker/src/v4/
+            // analyze.rs`) "alphabetically-first owner" tie-break exactly.
+            // That forces a full sort of all ~3.5M staged rows by a key
+            // (`owner_artifact_id`) `urdira_core_owner_rows_record_id`
+            // (`lane, publication_record_id`) does not cover, which measured
+            // over 10 minutes and blew the RPC's own request timeout on the
+            // real n8n cold scan. `GROUP BY publication_record_id` (below)
+            // needs no such sort -- it can satisfy the aggregate directly
+            // from that existing index -- and finished the equivalent n8n
+            // cold scan's whole publish step in low single-digit seconds.
+            // Both are equally CORRECT (deterministic, no data loss); the
+            // owner's own criterion for this campaign is "performance
+            // without compromising integrity", so the index-friendly form
+            // wins here. `identity_assignments`' owner_artifact_id/owner_
+            // artifact_version_id columns are NULL for a first-open anyway
+            // (see the SELECT list below), so no query in this crate
+            // actually observes which owner "won" a given external entity.
+            "WITH ffix_record_winners AS (SELECT MIN(rowid) AS rowid FROM urdira_core_owner_rows WHERE lane = 'records' GROUP BY publication_record_id) INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, body_payload, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) SELECT 'record:' || lower(hex(o.publication_record_id)), ?1, o.record_category, o.record_kind, o.record_universal_kind, o.record_schema_version, 'candidate', '1', o.owner_artifact_id, o.owner_artifact_version_id, o.primary_source_span_artifact_version_id, o.primary_source_span_start_byte, o.primary_source_span_end_byte, o.primary_source_span_start_line, o.primary_source_span_end_line, ?2, NULL, 'sha256:' || lower(hex(o.record_digest)), 'sha256:' || lower(hex(o.body_digest)), o.body_byte_length, o.body_payload_hex, ?2, ?2, ?2 FROM urdira_core_owner_rows o JOIN ffix_record_winners w ON w.rowid = o.rowid WHERE o.lane = 'records'"
         };
         if std::env::var_os("URDIRA_DEBUG_TIMING").is_some() {
             let staged_rows: i64 = transaction
@@ -6828,12 +6842,15 @@ fn finalize_workspace_publication(
             // generations retain the conflict-safe branch above.
             //
             // F-fix (2026-09-07): same de-dupe as `direct_sql`'s own "else"
-            // branch above (see its doc comment for the tie-break
-            // rationale), same reason an `identity_assignment_id` needs it
-            // at all: it is a pure function of `record_id`+`identity_key`,
-            // both identical across owners for a shared external module/
-            // symbol entity.
-            "WITH ffix_ranked_identities AS (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY publication_record_id ORDER BY owner_artifact_id, rowid) AS ffix_rank FROM urdira_core_owner_rows WHERE lane = 'records'), ffix_identity_winners AS (SELECT rowid FROM ffix_ranked_identities WHERE ffix_rank = 1) INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation) SELECT 'sha256:' || lower(hex(o.identity_assignment_id)), ?1, o.identity_type, o.identity_type || ':' || lower(hex(o.identity_id)), 'created', o.identity_key, 'sha256:' || lower(hex(o.identity_key_digest)), 'record:' || lower(hex(o.publication_record_id)), NULL, NULL, NULL, ?2, NULL FROM urdira_core_owner_rows o JOIN ffix_identity_winners w ON w.rowid = o.rowid WHERE o.lane = 'records' AND o.identity_assignment_id IS NOT NULL"
+            // branch above (see its doc comment for the full rationale,
+            // including why `GROUP BY`/`MIN(rowid)` -- not a `ROW_NUMBER()`
+            // sorted by `owner_artifact_id` -- is the one that actually
+            // finishes in time on a real multi-million-row cold scan), same
+            // reason an `identity_assignment_id` needs de-duping at all: it
+            // is a pure function of `record_id`+`identity_key`, both
+            // identical across owners for a shared external module/symbol
+            // entity.
+            "WITH ffix_identity_winners AS (SELECT MIN(rowid) AS rowid FROM urdira_core_owner_rows WHERE lane = 'records' GROUP BY publication_record_id) INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation) SELECT 'sha256:' || lower(hex(o.identity_assignment_id)), ?1, o.identity_type, o.identity_type || ':' || lower(hex(o.identity_id)), 'created', o.identity_key, 'sha256:' || lower(hex(o.identity_key_digest)), 'record:' || lower(hex(o.publication_record_id)), NULL, NULL, NULL, ?2, NULL FROM urdira_core_owner_rows o JOIN ffix_identity_winners w ON w.rowid = o.rowid WHERE o.lane = 'records' AND o.identity_assignment_id IS NOT NULL"
         };
         transaction
             .execute(
