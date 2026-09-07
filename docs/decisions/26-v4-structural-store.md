@@ -619,3 +619,55 @@ so even the smallest fixture's pack is ~140 MB before compression.
   are unchanged.
 - **The `dependency` incremental-diff gap is CLOSED** (P3-2 §3 — a
   `dependency_id` recipe leak, not a store defect; decision 29).
+
+## Amendment (2026-09-07, Frente E-P0j): entity span fidelity, `entities.index` re-keyed off identity text
+
+Confirmed live (`docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
+§1.3): every entity producer in `urdira-jsts-syntax-worker` (`push_entity`/
+`push_entity_with_type_surface`/`push_namespace_entity`/`push_member_entities`,
+and `semantic_sites.rs`'s `parameter_entity_record`/`catch_variable_entity_record`)
+published `SyntaxEntity::start`/`.end` (and therefore `RecordRow::span_start_byte`/
+`.span_end_byte`, `records.meta`'s own fixed row above) as the declaration's
+NAME-IDENTIFIER span only — never the whole declaration, unlike v3's
+`analyzer.ts` (`entityForDeclaration`'s `identityStart` vs `node.getStart(file)`/
+`.getEnd()` split). This made `core:get_source`'s `body`/`signature` modes on a
+v4 entity return only the name, and made decision 17's 120-character semantic-
+eligibility threshold reject nearly every real function/variable.
+
+Fixed: every producer above now publishes `start`/`end` as the FULL
+declaration span (modifiers/decorators/`export`/`export default` through the
+closing, for functions/classes/interfaces/type aliases/enums/namespaces/class-
+and-interface members; the declarator `x = ...` for a variable; the whole
+`FormalParameter`/`CatchParameter`/parameter-property node, own annotation and
+default included, for a parameter). `SyntaxEntity` gained two new fields,
+`name_start`/`name_end`, carrying the OLD identifier-only span forward
+unchanged — `id`/`entity_id` (decision 11's identity contract, `find_references`
+on a parameter) were never derived from `start`/`end` in the first place, only
+from this same identifier position via `stable_entity_id`/`declaration_id`, so
+identity is completely unaffected by this task.
+
+**`entities.index`'s own key changes with it.** This section's own table above
+("`(owner_artifact u32, span_start u32, ordinal u32)`... `span_start`") and
+`urdira-indexing-worker::v4::residual`'s checker-site correlation both relied
+on `span_start_byte` being the identifier's own start (the ONLY thing tsgo
+ever reports a position for). Rather than adding a new stored column (a
+`records.meta` layout bump cascading through `urdira-native-core`'s kernel
+row shape, this crate's segment/layout modules, and the materialize pass, for
+information already durable elsewhere), `entities.index`'s build
+(`segment_io::entities_index_key_start`, both the flat and partitioned
+writers) now recovers the identifier start by PARSING it back out of the
+entity's own `identity_key` text (`jsts:{kind}:{path}:{name_start}:{name}`,
+new `identity_codec::entity_identity_name_start`, re-exported at the crate
+root) instead of reading `RecordRow::span_start_byte` directly. Falls back to
+`span_start_byte` (always `0`) for `jsts:external_module`/`external_symbol`,
+which have no per-file span at all. `StoreReader::entity_by_owner_and_start`
+itself is unchanged — every caller already passed it a tsgo-reported
+`name_start_utf16`, never a declaration span. **No `records.meta`/segment
+byte layout changed; `entities.index`'s own on-disk shape (three `u32`s,
+sorted by the first two) is byte-identical** — only WHICH value gets fed into
+column 2 at write time changed, so this table's own row above is unaffected.
+
+Records changed digest for every real v4 entity (a one-time fleet republish;
+`JAVASCRIPT_TYPESCRIPT_VERSION` bumped 0.4.0 -> 0.5.0, `docs/versioning.md`).
+n8n population floors and reference-parity (`v4_different_target = 0`)
+verified unaffected — see `docs/evidence/2026-09-07-v4-entity-declaration-spans.md`.

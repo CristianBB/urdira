@@ -2477,6 +2477,8 @@ mod tests {
             path: path.to_owned(),
             start,
             end: start + name.len() as u32,
+            name_start: start,
+            name_end: start + name.len() as u32,
             parent_id: None,
             qualified_name: None,
             is_test: None,

@@ -76,7 +76,7 @@ nativeDescribe("@urdira/native N-API batches", () => {
       files,
       work_item: {
         candidate_generation_id: "candidate:native-projection", workspace_id: "workspace:native-projection", artifact_id: "artifact:main",
-        target_artifact_version_id: "version:main", work_item_id: "work:main", plugin_id: "urdira:javascript_typescript", plugin_version: "0.4.0",
+        target_artifact_version_id: "version:main", work_item_id: "work:main", plugin_id: "urdira:javascript_typescript", plugin_version: "0.5.0",
         expected_replacement_scopes: [{ replacement_scope_id: "scope:main", owner_artifact_id: "artifact:main", owner_artifact_version_id: "version:main", capability: "core:semantic_preparation", record_categories: ["entity", "relation", "diagnostic"], record_kinds: ["jsts:entity_type", "jsts:entity_callable", "jsts:entity_container", "jsts:entity_parameter", "jsts:entity_variable", "jsts:entity_inferred_type", "jsts:relation_contains", "jsts:relation_import", "jsts:relation_export", "jsts:relation_references", "jsts:relation_call", "jsts:relation_implements", "jsts:relation_inherits", "jsts:relation_covers", "jsts:relation_type_of", "jsts:diagnostic"], base_record_set_digest: `sha256:${"0".repeat(64)}`, output_completeness: "accept_reported" }],
       },
       accepted_manifest: { plugin_input_access_manifest_id: "manifest:main", manifest_digest: `sha256:${"3".repeat(64)}`, artifact_version_entries: files.map((file) => ({ artifact_version_id: file.artifact_version_id })), record_entries: [] },
