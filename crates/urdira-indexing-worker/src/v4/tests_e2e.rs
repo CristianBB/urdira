@@ -7619,12 +7619,11 @@ fn dump_call_bodies_cold_only(structural_root: &Path, generation: u64, out_path:
 /// ACCEPTED n8n population figure (plan §0 rule R5, table §3.2, sourced from
 /// `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`
 /// §10.2 round 3 and the Q5 evidence's own references-parity numbers) --
-/// `jsts:entity_parameter`'s floor is PROVISIONAL (`74,021`, `0.99 ×
-/// 74,769`, the REFERENCED-only population this task's own F.2 change
-/// obsoletes) until a real n8n measurement of the "every declaration"
-/// population re-pins it (F.3, ola 2) -- expected to only ever go UP, since
-/// F.2 strictly adds unreferenced-parameter entities on top of the old
-/// population, never removes any.
+/// `jsts:entity_parameter`'s floor was re-pinned by F.3 (2026-09-07, ola 3)
+/// to `78,966` (`0.99 × 79,764`, the "every declaration" population
+/// measured cold on HEAD `d71669a`), superseding the old provisional floor
+/// (`74,021`, `0.99 × 74,769`, the REFERENCED-only population F.2 made
+/// obsolete).
 ///
 /// Counts by `kind` (the language-specific string stored in `Dictionaries::
 /// kinds`, e.g. `jsts:entity_parameter` -- NOT `universal_kind`, which would
@@ -7723,7 +7722,7 @@ fn n8n_population_floors() {
     // Table §3.2 floors (`0.99 ×` the accepted figure, R5).
     const FLOOR_ENTITY_CALLABLE: u64 = 29_921;
     const FLOOR_ENTITY_CONTAINER: u64 = 14_847;
-    const FLOOR_ENTITY_PARAMETER: u64 = 74_021; // provisional, see doc comment
+    const FLOOR_ENTITY_PARAMETER: u64 = 78_966; // 0.99 x 79,764 measured cold on HEAD d71669a (F.3, 2026-09-07)
     const FLOOR_ENTITY_TYPE: u64 = 14_047;
     const FLOOR_ENTITY_VARIABLE: u64 = 238_491;
     const FLOOR_RELATION_CONTAINS: u64 = 396_483;

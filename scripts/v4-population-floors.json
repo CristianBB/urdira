@@ -14,10 +14,10 @@
       "_note": "v4 accepted 14,997 / v3 14,082 = 1.0650; ratio stored at 0.99x = 1.0543."
     },
     "jsts:entity_parameter": {
-      "floor": 74021,
+      "floor": 78966,
       "ratio": 0,
       "v3_kind": null,
-      "_note": "v3 never materialized a standalone parameter-entity population (absent from the 2026-09-02 v3 oracle's own top-kind-by-count table) -- this is a v4-only population added 2026-09-04, no ratio derivable, hence 0. The floor itself is PROVISIONAL (0.99x 74,769, the OLD 'referenced-only' accepted figure) until F.2's own n8n measurement (plan §0 rule R5) re-pins it to 0.99x the freshly measured 'every declaration' population -- expected to only go UP, since F.2 strictly adds unreferenced-parameter entities on top of the old population."
+      "_note": "v3 never materialized a standalone parameter-entity population (absent from the 2026-09-02 v3 oracle's own top-kind-by-count table) -- this is a v4-only population added 2026-09-04, no ratio derivable, hence 0. F.3 (2026-09-07) re-pinned this floor to 0.99x the freshly measured 'every declaration' population (F.2 shipped in e384dfe/f44b8c4, prior to this measurement): n8n_population_floors measured jsts:entity_parameter=79,764 cold on HEAD d71669a; 0.99x79,764=78,966.36, floor stored as 78,966. Supersedes the OLD provisional floor (74,021, 0.99x the 'referenced-only' figure)."
     },
     "jsts:entity_type": {
       "floor": 14047,
