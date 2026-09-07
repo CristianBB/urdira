@@ -663,3 +663,91 @@ non-zero via `graph=false` before this fix). Two new e2e tests (`tests_e2e.rs`) 
 without the fix and pass with it; three new unit tests (`semantic_sites.rs`) cover cross-file/
 same-file/ambiguous resolution's dependency-recording contract, including decision 28's own
 "never guess under ambiguity" invariant (an ambiguous ambient global records no dependency).
+
+## Cross-module method-call reference resolution + owner surface criterion (Frente E-P0g, 2026-09-07)
+
+**Problem** (`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §15.4/§16): the SECOND root
+cause E-P0f's own §15.4 flagged and left open, closed here at real n8n scale (N=2015 and N=5037,
+25% of the frontier) plus two deeper, distinct root causes the same investigation surfaced along
+the way. All three share one symptom: an untouched owner keeps a stale `jsts:call`/`jsts:
+references` row a from-scratch oracle scan of the identically mutated tree never re-derives
+(`extra_untouched` in `records_logical_set_diff`'s own vocabulary).
+
+**Root cause 1 — a re-exporting barrel is never watched as a structural dependency.**
+`urdira-indexing-worker::v4::typeflow.rs::resolve_import_targets_for` resolves a needed type
+import's specifier to a `target_path` (`WorkspaceResolver::resolve`), then chases named/star
+re-exports through it via `resolve_named_export` to the FINAL declaring entity. `import_targets`'
+own value only ever stores that flattened final entity id, so `urdira_jsts_typeflow::ProgramIndex::
+link_importer` (keyed by `entity_owner[target_id]`) only ever registers the importer against the
+FINAL declaring file — never against a re-exporting barrel it went through on the way there.
+Removing/renaming ONLY the barrel (the declaring file itself untouched) therefore left nothing
+pointing back at the importer to reflow.
+
+**Root cause 2 — `apply_import_target_updates` could not detect "this owning path now resolves
+NOTHING".** `urdira-jsts-typeflow::ProgramIndex::apply_import_target_updates` derived which owning
+paths to clear/replace SOLELY from the fresh `import_targets` snapshot's own keys — correct as
+long as an owning path keeps at least one resolved import, silently wrong the moment its entire
+needed-import set stops resolving (the snapshot then has no key for it at all, so its stale,
+still-pointing-at-the-old-target entry survived forever). Fixed by passing the caller's own full
+`owning_paths_considered` set explicitly (`pending_target_updates`'s keys already reliably name
+every owning path re-resolved this call, per that map's own "one entry per queried path, even if
+empty" contract) instead of inferring it from `import_targets`' keys alone.
+
+**Root cause 3 — the reverse-import graph ignored re-export/barrel edges entirely.**
+`urdira-jsts-syntax-worker`'s `ImportReverseIndex::insert_file` and its from-scratch fallback
+`reverse_affected_closure` only ever read a file's `direct_imports` — a NAMED re-export
+(`export { X } from "./y"`) or a bare barrel (`export * from "./y"`) is exactly as much of a
+"this file depends on that path" edge, and a content edit at the far end of such a chain (e.g. a
+class member renamed) needs the SAME transitive reverse-BFS to reach every real caller through it.
+Both now also fold in `export_bindings`' `source_target_path` and `export_star_specifiers`'
+`target_path` — purely additive (widens the affected-closure BFS, never narrows it).
+
+**Owner surface criterion, widened** (the plan's own brief for this frente): `analyze.rs::
+exported_surface` used to track only a module's own top-level `export_bindings`/`export_star_
+specifiers` — a locally-exported CLASS/INTERFACE's member names (methods/getters/setters/
+properties/constructor) and a locally-exported FUNCTION's parameter names were invisible to it, so
+renaming/removing a member never counted as a "surface changed" edit and `run_scoped`'s P3-3
+narrowing (§ "Content-edit closure narrowing" above) incorrectly dropped every transitive importer
+back down to the literal edited path. Each member/parameter's identity in the surface set is
+`(container_name, member_name, kind)` — DELIBERATELY POSITION-INDEPENDENT (never the member's own
+span-keyed entity id): editing one method's BODY can shift a LATER sibling's `start` purely from
+byte-length growth, with no signature change at all, and using a span-keyed id there would make
+that a false "surface changed" positive, breaking the standing hub-edit memory gate ("editing a
+method's body without changing its signature must keep `owners == 1`"). No `EntityKind` carries a
+visibility modifier (confirmed by reading `SyntaxEntity`'s own field list), so this is deliberately
+every member kind a class/interface can declare, not only the ones that happen to be `public` --
+conservative by construction, matching every other unresolvable-precisely case in this module.
+
+**Also fixed along the way**: a multi-hop re-export chain (barrel re-exporting a barrel, e.g. a
+package-root `index.ts` re-exporting a nested `event-bus/index.ts` re-exporting the declaring
+file) needs EVERY hop watched, not just the specifier's own direct resolution target --
+`resolve_import_targets_for` walks the full chain (`collect_reexport_chain_paths`, mirroring
+`resolve_named_export_inner`'s own named-reexport/star-fallback rule, cycle-guarded and depth-capped
+the same way) and registers a watch for each hop. Kept as `TypeflowCache`'s OWN reverse index
+(`chain_watchers`/`owning_chain_targets`, `crates/urdira-indexing-worker/src/v4/typeflow.rs`) --
+deliberately NOT folded into `ProgramIndex`'s `pending_importers_of` (that field's own "still
+failing" contract is asserted empty once a need resolves cleanly by an existing test,
+`urdira-jsts-typeflow`'s `member_access_through_a_reexporting_barrel_edited_in_a_later_separate_
+build_index_call`; an earlier draft of this fix broke it by reusing that field for a genuinely
+resolved-through-a-chain edge instead of keeping the two concepts separate).
+
+**Tests added** (`urdira-indexing-worker::v4::tests_e2e`, new fixtures under `tests/fixtures/
+codebases/typescript/barrel-method-call/` and `.../multi-hop-barrel-rename/`):
+`barrel_rename_closes_a_method_call_relation_through_the_old_barrel_path` (root cause 1+2, single
+hop), `method_rename_reanalyzes_the_caller_and_closes_the_old_call_relation` (root cause 3 + the
+surface criterion, a plain same-file method rename with no barrel involved),
+`method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched` (the hub-edit memory gate,
+explicit regression coverage: record-id-set equality proof for both the barrel and the caller
+across a body-only edit), `nested_barrel_rename_in_a_mixed_batch_closes_a_transitive_property_
+reference` (the multi-hop fix, exercised through `delta.rs::run`'s own structural/content
+generation split for a mixed batch). Every pre-existing test in
+`urdira-jsts-syntax-worker`/`urdira-indexing-worker`/`urdira-jsts-typeflow` stays green unmodified.
+
+**Verified at real n8n scale** (`scripts/v4-reconcile-threshold.mjs --files N --keep-data`,
+corpus `~/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02`): N=2015 (this frente's own original
+target scale) and N=5037 (25% of the 20,148-file frontier, the task's own upper bound) both reach
+`extra_untouched=0`/`missing_untouched=0` (non-external) and `roots_ok.delta_all=true`
+(`dependency`+`graph` roots exactly match an independent oracle scan, `records` compared by the
+same logical-set invariant `deltaAllOk` always has, decision-11 chaining excepted) -- full delta-
+path logical parity against an independent oracle at both scales, closing E-P0f's own §15.4 finding
+and every further root cause this session's own re-investigation of it surfaced.

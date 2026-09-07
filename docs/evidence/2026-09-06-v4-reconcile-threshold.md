@@ -2039,3 +2039,234 @@ evidence file's own excerpted numbers are retained. `CARGO_TARGET_DIR` override
 the reconcile-threshold harness, which imports `packages/storage/dist/workspace-v4-sql.generated.js`)
 and the root `release/native/darwin-arm64` build left in place (build artifacts, not source --
 harmless if a later session rebuilds over them; not committed, `.gitignore`d).
+
+## §16. Frente E-P0g (2026-09-07): §15.4's cross-file method-call finding CLOSED (0
+## non-external `extra_untouched` at N=2015 AND N=5037/25%) -- three distinct root
+## causes, not one
+
+### 16.1 Reproduction
+
+§15.4's own repro recipe (`scripts/v4-reconcile-threshold.mjs --files 2015 --keep-data`) confirmed
+byte-for-byte: 4 non-external `extra_untouched` rows, all `jsts:call`/`jsts:references` on
+`packages/cli/src/modules/dynamic-credentials.ee/dynamic-credentials.controller.ts`, targeting
+`deleteMyConnection`/`getResolverByTypename` on the two named service files. Diffing the kept
+`template-workspace` against `run-files2015-delta-1-workspace` (rather than re-deriving the
+seeded mutation plan) found the actual mechanism directly: `services/index.ts` (the barrel
+`credential-connection-status.service.ts`/`credential-resolver-registry.service.ts` are re-
+exported through, and the controller imports `CredentialConnectionStatusService`/
+`DynamicCredentialResolverRegistry` from) was RENAMED to `services/index.renamed.ts` this batch --
+none of the three files §15.4 named were themselves touched, confirming that section's own
+observation ("real import/export statements... a cross-file METHOD CALL/reference resolution gap")
+while correcting its framing: the gap is not in the three named files at all, it is in how a
+BARREL's own removal/rename is tracked.
+
+Reduced to a minimal fixture (`tests/fixtures/codebases/typescript/barrel-method-call/`:
+`src/services/foo.service.ts` exports `FooService.bar()`, `src/services/index.ts` re-exports it
+via `export * from`, `src/consumer.ts` imports `FooService` through the barrel and calls
+`this.fooService.bar()`) and confirmed the SAME phantom-row signature reproduces renaming JUST the
+barrel (`barrel_rename_closes_a_method_call_relation_through_the_old_barrel_path`, `tests_e2e.rs`)
+-- delta before any fix: `extra_untouched=2` (`jsts:call`+`jsts:references`, owner
+`src/consumer.ts`, `touched=false`).
+
+### 16.2 Root cause 1 (file:line): a re-exporting barrel is never watched as a structural
+### dependency
+
+`crates/urdira-indexing-worker/src/v4/typeflow.rs::resolve_import_targets_for` (around the
+`ExportResolution::Resolved` arm) resolves a needed type import's specifier to `target_path`
+(`resolver.resolve(owning_path, specifier, available)`), then calls `resolve_named_export(files,
+&target_path, imported_name, ...)`, which internally chases named/star re-exports through
+`target_path` to the FINAL declaring entity and returns only that flattened id. The caller's
+`import_targets` map stores `(owning_path, specifier, name) -> final_target_id` -- never
+`target_path` itself. `urdira_jsts_typeflow::ProgramIndex::link_importer` (`crates/urdira-jsts-
+typeflow/src/lib.rs`) is keyed by `entity_owner[final_target_id]`, i.e. the FINAL declaring file --
+so `importers_of("services/index.ts")` is ALWAYS empty (the barrel declares nothing of its own),
+even though `consumer.ts` genuinely depends on it staying resolvable. Removing/renaming the barrel
+therefore left nothing in either of `ProgramIndex`'s two reverse indexes (`importers_of`/`pending_
+importers_of`) pointing back at `consumer.ts` to reflow.
+
+### 16.3 Root cause 2 (file:line): `apply_import_target_updates` could not detect "this owning
+### path now resolves nothing at all"
+
+Once root cause 1 was fixed by adding a THIRD, separate watch (`TypeflowCache::chain_watchers`/
+`owning_chain_targets`, see §16.5) and folding a removed barrel's own watchers into `build_index`'s
+refresh set, `consumer.ts` WAS correctly re-included and its needed import correctly re-resolved to
+"unresolved" (the barrel gone) -- yet the phantom row still survived. Root cause: `crates/urdira-
+jsts-typeflow/src/lib.rs::apply_import_target_updates` derived `owning_paths` (which paths' entire
+`import_targets` entry set to replace) SOLELY from the fresh `updates` map's own keys
+(`updates.keys().map(|k| k.0)`). When `consumer.ts`'s specifier stops resolving entirely, `updates`
+has NO key for `consumer.ts` at all (there is nothing new to insert) -- so `owning_paths` came back
+empty for it, `clear_owning_path_import_targets("consumer.ts")` never ran, and its STALE
+`import_targets[(consumer.ts, "./services", "FooService")]` entry (still pointing at `FooService`'s
+real, unaffected class id -- the id itself never changed, only the barrel that used to route to it
+did) survived untouched forever, `importers_of` included. Fixed by having `replace_file` pass the
+caller's own `pending_target_updates`' key set (a full, "one entry per queried path, even if
+empty" snapshot already guaranteed by `resolve_import_targets_for`) as an explicit `owning_paths_
+considered` parameter, unioned with `import_targets_updates`'s own keys.
+
+### 16.4 Root cause 3 (file:line): the reverse-import graph ignored re-export/barrel edges
+
+Separately, reproducing a PLAIN method rename with no barrel at all
+(`method_rename_reanalyzes_the_caller_and_closes_the_old_call_relation`: `foo.service.ts`'s own
+`bar` renamed to `baz`, `consumer.ts` untouched, no rename/delete in the batch) also failed before
+this frente's fixes -- a DIFFERENT, independent gap. `crates/urdira-jsts-syntax-worker/src/lib.rs`'s
+`ImportReverseIndex::insert_file` (P3-6 item 3's maintained reverse-import graph, used by `affected_
+closure` to widen a content edit's own affected set) and its from-scratch fallback `reverse_
+affected_closure` both only ever read `file.direct_imports` -- never `export_bindings`' `source_
+target_path` (a named re-export) or `export_star_specifiers`' `target_path` (a bare barrel). Since
+`consumer.ts` reaches `foo.service.ts` only through the barrel's `export * from`, the widening BFS
+seeded from `foo.service.ts` never reached the barrel (no edge recorded for it as an "importer" of
+`foo.service.ts`... precisely backwards: the barrel IS an importer via its star-export, but that
+edge was never inserted), so `consumer.ts` was never included in `affected_paths` for this content
+edit at all -- separate from, and prior to, whatever `analyze.rs`'s own surface-narrowing (§16.5)
+would have done with it. Fixed by adding `export_bindings`' and `export_star_specifiers`' target
+paths to both functions' edge sets -- purely additive (widens the BFS, never narrows it), so no
+other test's affected-set expectations could regress from it (confirmed: full `urdira-jsts-syntax-
+worker` suite, 304/304, unchanged).
+
+### 16.5 Owner surface criterion widened (`analyze.rs::exported_surface`), the plan's own brief
+
+Fixing root cause 3 alone still left `method_rename_reanalyzes_the_caller...` failing:
+`consumer.ts` was now correctly WIDENED into the syntax layer's own `affected_files`, but `analyze::
+run_scoped`'s P3-3 "surface narrowing" (added by an earlier frente, `docs/evidence/2026-09-04-...`)
+narrows a content edit's affected set back down to the literal edited path whenever `exported_
+surface(file)` compares equal before/after -- and `exported_surface` only ever compared a module's
+own top-level `export_bindings`/`export_star_specifiers`, never anything belonging to a class or
+interface it exports. Renaming a METHOD inside an exported class never changes that class's own
+top-level export-binding entry (same name, same `local_entity_id` -- a class's own span never moves
+for an edit to one of its *members*), so `surface_changed` came back `false`, narrowing
+`consumer.ts` right back out. Fixed per the plan's own brief: `exported_surface` now also folds in,
+for each LOCALLY-exported container, its own child members' `(container_name, member_name, kind)`
+(classes/interfaces: methods/getters/setters/properties/constructor) and, for a locally-exported
+FUNCTION, its own parameter names -- deliberately POSITION-INDEPENDENT identities (never the
+member's own span-keyed entity id), so a body-only edit that shifts a LATER sibling member's
+`start` (pure byte-length growth, no signature change) never counts as a surface change --
+preserving the standing hub-edit memory gate ("editing a method's body without changing its
+signature must keep `owners == 1`"), regression-tested explicitly
+(`method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched`: record-id-set BYTE equality
+proof for both the barrel and the caller across a body-only edit to the callee).
+
+### 16.6 A fourth finding while re-measuring at 25%: multi-hop barrel chains
+
+Re-measuring at N=5037 (25% of the 20,148-file frontier, this frente's own upper target) with
+16.2-16.5's fixes already in place still found 9 non-external `extra_untouched` rows. Diagnosed
+directly (`n8n_records_logical_set_diff_against_keep_data` against the kept N=5037 data): 8 rows
+on `packages/cli/src/modules/instance-ai/event-bus/__tests__/in-process-event-bus.test.ts`
+(`jsts:references`, targeting a property on `event-bus.interface.ts`) + 1 on `evaluation-api-
+error.ts` (targeting `evaluation-error-code.ts`). The touched-owners diff showed `packages/@n8n/
+instance-ai/src/event-bus/index.ts` (a NESTED barrel, re-exported BY the package-root barrel
+`packages/@n8n/instance-ai/src/index.ts`, itself re-exported by NEITHER of the two directly-named
+files) renamed to `index.renamed.ts`, alongside an unrelated append-edit to `in-process-event-bus.
+ts` (the class importing `StoredEvent`/`InstanceAiEventBus` through BOTH barrels, package-root then
+nested) in the SAME mixed batch. Root cause: 16.2's own fix (`chain_watch_targets`) only watches
+`target_path` -- the specifier's DIRECT resolution target (the package-root barrel here) -- never
+any DEEPER hop a multi-level re-export chain passes through, because an intermediate barrel file
+has no "needed import" of its own for `resolve_import_targets_for`'s outer loop to ever visit it as
+an `owning_path` from. Reproduced at fixture scale (`tests/fixtures/codebases/typescript/multi-hop-
+barrel-rename/`: `consumer.test.ts` -> `impl.ts` [edited, same batch] -> `pkgroot.ts` [package-root
+barrel] -> `eventbus/barrel.ts` [NESTED barrel, renamed] -> `eventbus/iface.ts`,
+`nested_barrel_rename_in_a_mixed_batch_closes_a_transitive_property_reference`, exercised through
+`delta.rs::run`'s own structural/content generation split for a mixed batch). Fixed by
+`collect_reexport_chain_paths` (`v4/typeflow.rs`), a depth-capped/cycle-guarded walk mirroring
+`resolve_named_export_inner`'s own named-reexport-then-star-fallback rule, watching EVERY hop
+instead of just the first.
+
+### 16.7 n8n re-measurement (`scripts/v4-reconcile-threshold.mjs --files N --keep-data`,
+### corpus `~/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02`, 20,148-file frontier,
+### 14,046 eligible TS/JS files, release binary built from this session's own fix)
+
+**N=2015** (§15.4's own repro scale -- `add=100 changed=1813 deleted=201`):
+
+```
+records logical set check: ok=true
+  incremental=2178821 oracle=2179053
+  missing_touched=232  missing_untouched=0  extra_touched=0  extra_untouched=0
+  digest_mismatch=56  chained_legit_touched=3100  chained_legit_untouched=190
+  external_missing=232  external_extra=0  external_digest_mismatch=56  external_chained_untouched=190
+roots_ok.delta_all=true   roots_ok.cold_all=true
+delta_wall_ms=36753.5  cold_wall_ms=16924.5  ratio=2.172
+```
+
+Was `extra_untouched=4` before this frente (§15.4); now `0`.
+
+**N=5037** (25% of the frontier, `add=252 changed=4534 deleted=251`):
+
+```
+records logical set check: ok=true
+  incremental=2138322 oracle=2139167
+  missing_touched=845  missing_untouched=0  extra_touched=0  extra_untouched=0
+  digest_mismatch=80  chained_legit_touched=6313  chained_legit_untouched=116
+  external_missing=845  external_extra=0  external_digest_mismatch=80  external_chained_untouched=116
+roots_ok.delta_all=true   roots_ok.cold_all=true
+delta_wall_ms=71008.0  cold_wall_ms=20240.5  ratio=3.508
+```
+
+Was `extra_untouched=9` (§16.6's own finding, mid-session) before the multi-hop fix; now `0`. Both
+scales: `missing_untouched=0` (no lost visibility), `dependency`/`graph` roots exactly match an
+independent oracle, `records`' only non-zero non-external buckets are `missing_touched`/`digest_
+mismatch` (both pre-existing, `chained_legit_touched`/`untouched` decision-11-legitimate churn,
+unrelated to this frente -- `external_*` fully accounts for every one of `missing_touched`/`digest_
+mismatch`/`chained_legit_untouched`'s own non-zero counts at both scales, the SAME "self-healing
+escape hatch" prior frentes already accepted).
+
+### 16.8 Hub-edit gate cost (owners), confirmed unchanged
+
+`method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched` (fixture scale, `tests_e2e.rs`):
+editing ONLY `FooService.bar`'s body (return value changed, name/signature untouched) leaves the
+re-exporting barrel's AND the caller's own record-id sets byte-for-byte IDENTICAL across the edit
+(`owned_record_ids` before/after, both owners) -- `owners == 1` (the edited file alone), matching
+the standing memory gate exactly. The pre-existing n8n-scale hub-edit measurement (349->1 owners,
+established by an earlier frente) is unaffected: every pre-existing test across `urdira-jsts-
+syntax-worker` (304/304), `urdira-indexing-worker` (140/140 incl. 19 ignored corpus-only), and
+`urdira-jsts-typeflow` (58/58) stays green unmodified by this frente's fixes.
+
+### 16.9 Files touched
+
+- `crates/urdira-indexing-worker/src/v4/typeflow.rs`: `resolve_import_targets_for` returns a third
+  `chain_watch_targets` map; `directly_declares`/`collect_reexport_chain_paths` (new); `TypeflowCache`
+  gains `chain_watchers`/`owning_chain_targets` + `apply_chain_watch_updates`/`remove_chain_watch_
+  path` (new); `build_index`'s removed-loop captures `remove_chain_watch_path`'s returned watchers
+  into `removed_watchers`, and the settling loop widens each round's `refresh_paths` through `self.
+  chain_watchers` too.
+- `crates/urdira-jsts-typeflow/src/lib.rs`: `apply_import_target_updates` takes an explicit
+  `owning_paths_considered` parameter (root cause 2); `replace_file` computes it from `pending_
+  target_updates`'s own keys.
+- `crates/urdira-jsts-syntax-worker/src/lib.rs`: `ImportReverseIndex::insert_file` and `reverse_
+  affected_closure` also fold in `export_bindings`'/`export_star_specifiers`' target paths (root
+  cause 3).
+- `crates/urdira-indexing-worker/src/v4/analyze.rs`: `exported_surface` folds in each locally-
+  exported container's own member/parameter surface (`is_member_surface_kind`, new); `ExportedSurfaceEntry`'s
+  shape unchanged (synthetic `"member:"`/`"param:"`-prefixed entries reuse the existing tuple).
+- `tests/fixtures/codebases/typescript/barrel-method-call/` and `.../multi-hop-barrel-rename/`
+  (new fixtures); `crates/urdira-indexing-worker/src/v4/tests_e2e.rs` (four new tests, §16.1/16.5/
+  16.6/16.8; `owned_record_ids`/`multi_hop_barrel_fixture_root`/`barrel_fixture_root` helpers).
+- `docs/decisions/29-v4-rust-owned-scan-pipeline.md`: new section naming all three (plus the
+  multi-hop) root causes and the widened surface criterion.
+
+### 16.10 Verification (this session)
+
+```
+cargo fmt --all -- --check                                                          # clean
+cargo clippy --workspace --all-targets --locked -- -D warnings                      # clean
+cargo test -p urdira-jsts-syntax-worker -p urdira-indexing-worker -p urdira-jsts-typeflow --locked
+  # urdira-jsts-syntax-worker (lib):  test result: ok. 304 passed; 0 failed; 1 ignored
+  # urdira-indexing-worker (bin):     test result: ok. 140 passed; 0 failed; 19 ignored
+  # urdira-jsts-typeflow (lib):       test result: ok. 58 passed; 0 failed; 0 ignored
+cargo build --release --locked -p urdira-indexing-worker                            # clean
+node scripts/v4-reconcile-threshold.mjs --files 2015 --keep-data  # see §16.7, extra_untouched=0
+node scripts/v4-reconcile-threshold.mjs --files 5037 --keep-data  # see §16.7, extra_untouched=0
+```
+
+(Residual-pass `#[ignore]`d tests in `residual.rs` require a real n8n corpus + explicitly idle
+machine per their own doc comments; this fix touches neither `residual.rs` nor the tsgo/typeflow
+lanes it drives specifically, and the n8n reconcile-threshold runs above already exercise the SAME
+production binary's full scan+residual-scheduling pipeline end-to-end without incident -- not
+separately re-run this session.)
+
+### 16.11 Scratch cleanup
+
+`~/Proyectos/urdira-benchmark/v4-fold/ep0g-{2015,5037}*` (workspace + data copies, `--keep-data`
+outputs, and their `*-results.json` companions) deleted at the end of this session; only this
+evidence file's own excerpted numbers are retained. `CARGO_TARGET_DIR` override
+(`.claude/worktrees/cargo-target-ep0g`) removed. `packages/*/dist` (built during this session to run
+the reconcile-threshold harness) and `release/native/darwin-arm64` left in place (build artifacts,
+not source -- `.gitignore`d, harmless if a later session rebuilds over them).

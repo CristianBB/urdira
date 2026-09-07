@@ -279,6 +279,26 @@ pub(crate) fn read_owner_source_text(
 /// source_target_path)` pair already.
 type ExportedSurfaceEntry = (String, Option<String>, Option<String>, Option<String>);
 
+/// Frente E-P0g: kinds counted as part of a locally-exported CLASS/
+/// INTERFACE's own "public surface" -- see `exported_surface`'s doc comment
+/// for why membership alone (unlike `EntityKind::Parameter`) matters here.
+/// No `EntityKind` carries a visibility modifier at all (`SyntaxEntity`'s
+/// own field list has none -- confirmed by reading `urdira-jsts-syntax-
+/// worker::lib.rs`), so this is deliberately every member kind a class or
+/// interface can declare, not merely the ones that happen to be `public`:
+/// conservative by construction, matching every other unresolvable-
+/// precisely case in this module (documented, not a guess).
+fn is_member_surface_kind(kind: urdira_jsts_syntax_worker::EntityKind) -> bool {
+    matches!(
+        kind,
+        urdira_jsts_syntax_worker::EntityKind::Method
+            | urdira_jsts_syntax_worker::EntityKind::Getter
+            | urdira_jsts_syntax_worker::EntityKind::Setter
+            | urdira_jsts_syntax_worker::EntityKind::Property
+            | urdira_jsts_syntax_worker::EntityKind::Constructor
+    )
+}
+
 /// Builds `file`'s exported surface (P3-3 item 2): every `export_bindings`
 /// entry, with a direct (non-re-exported) binding's local name resolved
 /// against `file.entities` (matching `SyntaxEntity::name` among top-level
@@ -290,6 +310,36 @@ type ExportedSurfaceEntry = (String, Option<String>, Option<String>, Option<Stri
 /// subset question a plain `Vec`/`HashSet` diff would not conveniently
 /// answer (see its doc comment: additions alone must not count as a
 /// surface change).
+///
+/// Frente E-P0g: a locally-exported CLASS/INTERFACE's own MEMBER names
+/// (methods/getters/setters/properties/constructor) and a locally-exported
+/// FUNCTION's own PARAMETER names are now ALSO part of this surface --
+/// previously only the container's own top-level export binding (its
+/// `exported_name`/`local_entity_id`/re-export pair) was tracked, so
+/// renaming/removing/adding a member never counted as a surface change: an
+/// importer whose own resolved `core:call`/`core:references` row targets
+/// that exact renamed-away member kept a stale row forever, since
+/// `run_scoped`'s narrowing (below) incorrectly treated the edit as
+/// "surface unchanged" and dropped every transitive importer from
+/// `affected_paths` entirely. Confirmed live at fixture scale
+/// (`method_rename_reanalyzes_the_caller_and_closes_the_old_call_relation`,
+/// `tests_e2e.rs`): renaming `FooService::bar` to `baz` (the class's own
+/// top-level export binding untouched -- same name, same `local_entity_id`,
+/// since a class's own span never moves for an edit to one of its members)
+/// left `consumer.ts`'s stale `bar`-targeting rows unresolved-but-present
+/// forever without this. Each member/parameter's identity here is
+/// DELIBERATELY POSITION-INDEPENDENT (`(container_name, member_name, kind)`
+/// -- never the member's own span-keyed `entity.id`, which embeds `start`):
+/// editing one member's BODY can shift a LATER sibling's `start` purely
+/// from the edited method's own body growing/shrinking, with no signature
+/// change at all -- using the span-keyed id here would make that a false
+/// "surface changed" positive and break the hub-edit memory gate ("editing
+/// a method's body without changing its signature must keep `owners == 1`",
+/// see `method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched`).
+/// A PURE ADDITION of a new member still passes the same subset check
+/// [`run_scoped`]'s own `surface_changed` comparison already applies to the
+/// top-level export set (adding a method never invalidates an EXISTING
+/// importer's already-resolved reference to a DIFFERENT, unchanged member).
 fn exported_surface(file: &SyntaxFileResult) -> BTreeSet<ExportedSurfaceEntry> {
     let mut surface: BTreeSet<ExportedSurfaceEntry> = file
         .export_bindings
@@ -332,6 +382,77 @@ fn exported_surface(file: &SyntaxFileResult) -> BTreeSet<ExportedSurfaceEntry> {
             star.target_path.clone(),
         )
     }));
+    // Frente E-P0g (see this function's own doc comment above): fold in
+    // each LOCALLY-declared exported container's own member/parameter
+    // surface. `"member:"`/`"param:"` prefixes are safe sentinels (never a
+    // real JS export name, matching the `"*"` convention just above),
+    // distinguishing these synthetic entries from any ordinary
+    // `export_bindings`/`export_star_specifiers` one without needing a
+    // wider tuple shape; the member's KIND rides in the `local_entity_id`
+    // slot (a plain `Debug` rendering, never a real entity id -- this slot
+    // is otherwise `Option<String>` and unused for these synthetic
+    // entries).
+    // Frente E-P0g: every top-level declaration's own entity carries
+    // `parent_id: Some(module_id)` (`urdira-jsts-syntax-worker::lib.rs`'s
+    // own `push_entity`), NEVER `None` -- `None` is reserved for the
+    // MODULE entity itself. Finding `module_entity` once up front (instead
+    // of re-deriving `module_id`'s string recipe here, a private helper in
+    // that crate) is what lets the loop below correctly identify a LOCAL
+    // export's own top-level container by `parent_id == Some(module_id)`
+    // rather than the `parent_id.is_none()` predicate this module's
+    // existing `local_entity_id` lookup above uses (a separate, narrower,
+    // pre-existing concern this task does not touch: it only ever needs
+    // ONE entity, so an always-empty match there costs it nothing beyond
+    // never distinguishing a shifted-position export -- out of this task's
+    // scope).
+    let module_id = file
+        .entities
+        .iter()
+        .find(|entity| entity.kind == urdira_jsts_syntax_worker::EntityKind::Module)
+        .map(|entity| entity.id.clone());
+    for binding in &file.export_bindings {
+        if binding.source_specifier.is_some() {
+            // A re-export's OWN member surface is the RE-EXPORTED file's
+            // concern (that file gets its own `exported_surface` call, and
+            // a re-export binding's `source_target_path` is already part
+            // of the entry above) -- nothing to add here.
+            continue;
+        }
+        let Some(container) = file.entities.iter().find(|entity| {
+            entity.parent_id.as_deref() == module_id.as_deref() && entity.name == binding.local_name
+        }) else {
+            continue;
+        };
+        for member in file
+            .entities
+            .iter()
+            .filter(|entity| entity.parent_id.as_deref() == Some(container.id.as_str()))
+        {
+            if is_member_surface_kind(member.kind) {
+                surface.insert((
+                    format!("member:{}.{}", binding.local_name, member.name),
+                    Some(format!("{:?}", member.kind)),
+                    None,
+                    None,
+                ));
+            } else if member.kind == urdira_jsts_syntax_worker::EntityKind::Parameter
+                && container.kind == urdira_jsts_syntax_worker::EntityKind::Function
+            {
+                // A directly-exported FUNCTION's own parameter NAME set
+                // (order-insensitive: a rename/add/remove is what this
+                // crate's own typeflow-mediated resolution can actually
+                // observe -- see this function's own doc comment for why
+                // position is deliberately not part of this identity
+                // either).
+                surface.insert((
+                    format!("param:{}.{}", binding.local_name, member.name),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
     surface
 }
 

@@ -46,6 +46,41 @@ fn fixture_root() -> PathBuf {
         .join("tests/fixtures/codebases/typescript/task-planner")
 }
 
+/// Frente E-P0g: a minimal fixture reproducing the exact n8n shape §15.4
+/// diagnosed live (`docs/evidence/2026-09-06-v4-reconcile-threshold.md`
+/// §15.4/§16): `src/consumer.ts` imports `FooService` through a BARREL
+/// directory-index re-export (`import { FooService } from './services'`,
+/// resolving to `src/services/index.ts`'s `export * from './foo.service'`),
+/// then calls a METHOD on a constructor-injected property typed by that
+/// import (`this.fooService.bar()`, resolved by typeflow, not the plain
+/// import/export resolver). The real n8n anomaly's own three named files
+/// (`dynamic-credentials.controller.ts`, its two `services/*.service.ts`
+/// targets) all sit behind this exact barrel shape.
+fn barrel_fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests/fixtures/codebases/typescript/barrel-method-call")
+}
+
+/// Frente E-P0g: a TWO-HOP barrel chain (`consumer.test.ts` -> `impl.ts`
+/// [imports a re-exported TYPE, edited in the SAME batch] -> `pkgroot.ts`
+/// [a package-root barrel] -> `eventbus/barrel.ts` [a NESTED barrel,
+/// RENAMED] -> `eventbus/iface.ts` [the real declaring interface]) --
+/// reproduces the exact n8n N=5037 anomaly `docs/evidence/2026-09-06-v4-
+/// reconcile-threshold.md` §16 root-caused: `packages/@n8n/instance-ai/src/
+/// event-bus/index.ts` (the NESTED barrel) renamed, `in-process-event-bus.
+/// ts` (the class importing THROUGH it, via the package-root barrel)
+/// edited in the SAME mixed batch, and `in-process-event-bus.test.ts`
+/// (an untouched, unrelated-on-disk caller) kept a stale property
+/// reference through the whole chain.
+fn multi_hop_barrel_fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests/fixtures/codebases/typescript/multi-hop-barrel-rename")
+}
+
 struct ColdScanOutput {
     structural_root: PathBuf,
     records: Vec<urdira_structural_store::row::RecordRow>,
@@ -4746,6 +4781,502 @@ fn incremental_rename_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
     let _ = std::fs::remove_dir_all(&oracle_root);
 }
 
+/// Frente E-P0g repro (plan `generic-waddling-hartmanis.md` §0/§2, this
+/// task's own Step 1): renaming the BARREL (`src/services/index.ts` ->
+/// `src/services/index.renamed.ts`) that `src/consumer.ts` imports
+/// `FooService` through must close `consumer.ts`'s `jsts:call`/`jsts:
+/// references` rows targeting `FooService::bar` -- a from-scratch oracle
+/// scan of the renamed tree never re-derives them (the barrel's OLD path no
+/// longer exists, so `import { FooService } from './services'` cannot
+/// resolve). Before this task's fix, `consumer.ts` (never itself touched by
+/// this batch) kept the STALE relation, an `extra_untouched` phantom row --
+/// exactly `n8n_records_logical_set_diff_against_keep_data`'s own N=2015
+/// finding (§15.4), reproduced here at fixture scale.
+#[test]
+fn barrel_rename_closes_a_method_call_relation_through_the_old_barrel_path() {
+    let scratch_root = scratch_dir("barrel-rename");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&barrel_fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-barrel-rename",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let old_relative = "src/services/index.ts";
+    let new_relative = "src/services/index.renamed.ts";
+    let old_absolute = workspace_root.join(old_relative);
+    let new_absolute = workspace_root.join(new_relative);
+    std::fs::rename(&old_absolute, &new_absolute).expect("rename succeeds");
+
+    let incremental = run_scan(
+        "request:incremental-barrel-rename",
+        "workspace:v4-e2e-barrel-rename",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![
+                ChangedPath {
+                    path: old_relative.to_string(),
+                    kind: ChangeKind::Deleted,
+                },
+                ChangedPath {
+                    path: new_relative.to_string(),
+                    kind: ChangeKind::Created,
+                },
+            ],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&incremental), 2);
+
+    let oracle_root = scratch_dir("barrel-rename-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-barrel-rename-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let touched_owners: std::collections::HashSet<String> =
+        [old_relative.to_string(), new_relative.to_string()]
+            .into_iter()
+            .collect();
+    let report = records_logical_set_diff(
+        &structural_root,
+        generation_of(&incremental),
+        &oracle_structural,
+        generation_of(&oracle),
+        &touched_owners,
+    );
+    report.assert_matches_oracle("barrel_rename_closes_a_method_call_relation");
+
+    let incremental_roots = roots_of(&incremental);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(incremental_roots.records, oracle_roots.records);
+    assert_eq!(incremental_roots.dependency, oracle_roots.dependency);
+    assert_eq!(incremental_roots.graph, oracle_roots.graph);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Frente E-P0g: `path`'s own record-id set at `generation`, resolved via
+/// `worker_state`'s CURRENT frontier entry for `path` (an edit mints a
+/// fresh `artifact_version_id`/dictionary ordinal, an untouched path keeps
+/// its original one -- see `delta.rs`'s own module doc, "A file's owner
+/// ordinal is NOT stable across a content edit") and `reader`'s
+/// dictionaries (opened AFTER every scan under test, so it can resolve
+/// either generation's ordinal). Sorted so two calls compare by VALUE, not
+/// by `by_owner`'s own incidental order.
+fn owned_record_ids(
+    reader: &StoreReader,
+    worker_state: &super::state::WorkerState,
+    workspace_id: &str,
+    path: &str,
+    generation: u64,
+) -> Vec<[u8; 32]> {
+    let dicts = reader.dictionaries();
+    let entry = worker_state
+        .get(workspace_id)
+        .expect("workspace state seeded by a prior scan")
+        .frontier
+        .present
+        .get(path)
+        .unwrap_or_else(|| panic!("{path} present in the current frontier"))
+        .clone();
+    let ordinal = dicts
+        .artifacts
+        .iter()
+        .position(|pair| *pair == (entry.artifact_id.clone(), entry.artifact_version_id.clone()))
+        .unwrap_or_else(|| panic!("{path} has a dictionary ordinal")) as u32;
+    let mut ids: Vec<[u8; 32]> = reader
+        .by_owner(ordinal, generation)
+        .into_iter()
+        .map(|view| view.record_id())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Frente E-P0g, plan `generic-waddling-hartmanis.md` §2 step 3's own
+/// explicit gate: editing a method's BODY without changing its exported
+/// surface/signature must still narrow the affected-owner set down to
+/// EXACTLY the literal edited file -- `services/index.ts` (the re-exporting
+/// barrel) and `consumer.ts` (the method's only caller) must both come out
+/// of the edit with their EXACT prior record-id sets, byte for byte
+/// (`owners == 1`, the hub-edit memory gate this fix must not regress: this
+/// frente's own reverse-dependency widening, folded into `TypeflowCache::
+/// build_index`'s settling loop, must never fire for a body-only edit that
+/// never touches `resolve_import_targets_for`'s needed-imports set at all).
+#[test]
+fn method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched() {
+    let scratch_root = scratch_dir("barrel-body-edit-gate");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&barrel_fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-barrel-body-edit";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let reader1 = StoreReader::open(&structural_root).expect("reader opens after cold");
+    let barrel_gen1 = owned_record_ids(
+        &reader1,
+        &worker_state,
+        workspace_id,
+        "src/services/index.ts",
+        1,
+    );
+    let consumer_gen1 =
+        owned_record_ids(&reader1, &worker_state, workspace_id, "src/consumer.ts", 1);
+    drop(reader1);
+
+    // Body-only edit: `bar()`'s return value changes, its name/parameter
+    // list/return type (its own exported surface) never do.
+    std::fs::write(
+        workspace_root.join("src/services/foo.service.ts"),
+        b"export class FooService {\n  public bar(): number {\n    return 2;\n  }\n}\n" as &[u8],
+    )
+    .expect("rewrite foo.service.ts");
+
+    let incremental = run_scan(
+        "request:incremental-body-edit",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: "src/services/foo.service.ts".to_string(),
+                kind: ChangeKind::Modified,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&incremental), 2);
+
+    let reader2 = StoreReader::open(&structural_root).expect("reader opens after incremental");
+    let barrel_gen2 = owned_record_ids(
+        &reader2,
+        &worker_state,
+        workspace_id,
+        "src/services/index.ts",
+        2,
+    );
+    let consumer_gen2 =
+        owned_record_ids(&reader2, &worker_state, workspace_id, "src/consumer.ts", 2);
+
+    assert_eq!(
+        barrel_gen1, barrel_gen2,
+        "the barrel's own record-id set must be byte-identical: a body-only \
+         edit to the file it re-exports must never reprocess it (owners == 1)"
+    );
+    assert_eq!(
+        consumer_gen1, consumer_gen2,
+        "consumer.ts's own record-id set must be byte-identical: its method- \
+         call resolution through the barrel is unaffected by a callee body \
+         edit (owners == 1, the hub-edit memory gate)"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
+/// Frente E-P0g, plan §2 step 3's second explicit test: a genuine SIGNATURE
+/// change (the called method is renamed) must (a) reanalyze the caller and
+/// (b) close its now-stale `jsts:call`/`jsts:references` rows -- paired
+/// against an independent from-scratch oracle scan of the identically
+/// renamed tree (root equality plus the same non-external logical-set
+/// invariant `barrel_rename_closes_a_method_call_relation_through_the_old_
+/// barrel_path` checks). Unlike that test, the barrel here is UNTOUCHED --
+/// only the method's own name changes, directly in its declaring file --
+/// confirming the fix's scope covers a plain method rename, not merely a
+/// barrel disappearing.
+#[test]
+fn method_rename_reanalyzes_the_caller_and_closes_the_old_call_relation() {
+    let scratch_root = scratch_dir("barrel-method-rename");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&barrel_fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-method-rename";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // Rename the METHOD (not the file): `bar` -> `baz`. `consumer.ts` still
+    // calls `this.fooService.bar()` -- a genuine signature change the
+    // caller must be reanalyzed against.
+    std::fs::write(
+        workspace_root.join("src/services/foo.service.ts"),
+        b"export class FooService {\n  public baz(): number {\n    return 1;\n  }\n}\n" as &[u8],
+    )
+    .expect("rewrite foo.service.ts");
+
+    let incremental = run_scan(
+        "request:incremental-method-rename",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: "src/services/foo.service.ts".to_string(),
+                kind: ChangeKind::Modified,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&incremental), 2);
+
+    let oracle_root = scratch_dir("barrel-method-rename-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-method-rename-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let touched_owners: std::collections::HashSet<String> =
+        ["src/services/foo.service.ts".to_string()]
+            .into_iter()
+            .collect();
+    let report = records_logical_set_diff(
+        &structural_root,
+        generation_of(&incremental),
+        &oracle_structural,
+        generation_of(&oracle),
+        &touched_owners,
+    );
+    report.assert_matches_oracle(
+        "method_rename_reanalyzes_the_caller_and_closes_the_old_call_relation",
+    );
+
+    let incremental_roots = roots_of(&incremental);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(incremental_roots.records, oracle_roots.records);
+    assert_eq!(incremental_roots.dependency, oracle_roots.dependency);
+    assert_eq!(incremental_roots.graph, oracle_roots.graph);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Frente E-P0g repro of the N=5037 n8n finding (§16): a NESTED barrel
+/// rename (`eventbus/barrel.ts` -> `eventbus/barrel.renamed.ts`) landing in
+/// the SAME mixed batch as an unrelated content edit to the file that
+/// imports THROUGH it via a package-root barrel (`impl.ts`, edited) --
+/// `delta.rs::run`'s own structural/content generation split (`has_
+/// structural && has_content`) -- must still close `consumer.test.ts`'s
+/// (never itself touched) stale property reference reached through the
+/// WHOLE chain (`consumer.test.ts` -> `impl.ts` -> `pkgroot.ts` -> the
+/// renamed `eventbus/barrel.ts` -> `eventbus/iface.ts`).
+#[test]
+fn nested_barrel_rename_in_a_mixed_batch_closes_a_transitive_property_reference() {
+    let scratch_root = scratch_dir("multi-hop-barrel-rename");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&multi_hop_barrel_fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-multi-hop-barrel-rename";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let old_relative = "src/eventbus/barrel.ts";
+    let new_relative = "src/eventbus/barrel.renamed.ts";
+    std::fs::rename(
+        workspace_root.join(old_relative),
+        workspace_root.join(new_relative),
+    )
+    .expect("rename succeeds");
+    // Pure trailing-comment append, mirroring the harness's own
+    // `applyEditFile` mutation -- never touches `impl.ts`'s own exported
+    // surface.
+    let impl_path = workspace_root.join("src/impl.ts");
+    let mut impl_source = std::fs::read(&impl_path).expect("read impl.ts");
+    impl_source.extend_from_slice(b"\n// urdira-bench 0\n");
+    std::fs::write(&impl_path, impl_source).expect("append to impl.ts");
+
+    let incremental = run_scan(
+        "request:incremental-mixed-batch",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![
+                ChangedPath {
+                    path: old_relative.to_string(),
+                    kind: ChangeKind::Deleted,
+                },
+                ChangedPath {
+                    path: new_relative.to_string(),
+                    kind: ChangeKind::Created,
+                },
+                ChangedPath {
+                    path: "src/impl.ts".to_string(),
+                    kind: ChangeKind::Modified,
+                },
+            ],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    // The structural (rename) half and the content (edit) half land as two
+    // SEPARATE generations (`delta.rs::run`'s own mixed-batch split).
+    assert_eq!(generation_of(&incremental), 3);
+
+    let oracle_root = scratch_dir("multi-hop-barrel-rename-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-multi-hop-barrel-rename-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let touched_owners: std::collections::HashSet<String> = [
+        old_relative.to_string(),
+        new_relative.to_string(),
+        "src/impl.ts".to_string(),
+    ]
+    .into_iter()
+    .collect();
+    let report = records_logical_set_diff(
+        &structural_root,
+        generation_of(&incremental),
+        &oracle_structural,
+        generation_of(&oracle),
+        &touched_owners,
+    );
+    report.assert_matches_oracle(
+        "nested_barrel_rename_in_a_mixed_batch_closes_a_transitive_property_reference",
+    );
+
+    // `records` root raw-byte equality is DELIBERATELY not asserted here,
+    // matching `scripts/v4-reconcile-threshold.mjs`'s own `deltaAllOk` gate
+    // (`records` component is the LOGICAL set check above, never raw root
+    // bytes) -- `impl.ts`'s own trailing-comment append changes its file
+    // length, which changes its `jsts:entity_container`'s `record_digest`
+    // (`end: source_end` is part of that record's body) while its
+    // `identity_key` stays the same, so decision 11 correctly CHAINS a
+    // fresh `record_id` for it (`H(digest, predecessor)`) instead of
+    // reusing a from-scratch oracle's unconditional `sha256(digest)` --
+    // the SAME documented, accepted residual `incremental_edit_produces_a_
+    // self_consistent_incremental_merkle_update`'s own doc comment names
+    // ("why edit roots do NOT equal a semantic from-scratch oracle"), an
+    // orthogonal, pre-existing concern this frente does not touch.
+    let incremental_roots = roots_of(&incremental);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(incremental_roots.dependency, oracle_roots.dependency);
+    assert_eq!(incremental_roots.graph, oracle_roots.graph);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
 /// P3-8a item 1: a real `fs.rename()` delivered by a watcher does not
 /// always arrive as ONE combined `Changed{[Deleted old, Created new]}`
 /// command the way `incremental_rename_roots_match_a_from_scratch_scan_of_
@@ -8691,5 +9222,493 @@ fn reconcile_delta_threshold_is_within_measured_bounds() {
         (0.01..=0.50).contains(&scan::RECONCILE_DELTA_THRESHOLD),
         "RECONCILE_DELTA_THRESHOLD={} must stay within the measured plan §0 R1 bounds [0.01, 0.50]",
         scan::RECONCILE_DELTA_THRESHOLD
+    );
+}
+
+// ============================================================================
+// Frente E-P0g adversarial review (2026-09-07, commit 55d367f): cost-
+// selectivity and correctness checks for the barrel/re-export reverse-
+// closure widening (`ImportReverseIndex::insert_file`/`reverse_affected_
+// closure` in `urdira-jsts-syntax-worker`) and the extended `exported_
+// surface` (member/parameter names of a locally-exported class/interface/
+// function, `analyze.rs`). See attack items 1/2 in this review's own
+// brief.
+// ============================================================================
+
+/// Frente E-P0g adversarial review: cold-scans `workspace_root`, applies
+/// one incremental content-edit batch (each `edits` entry OVERWRITES an
+/// EXISTING file's content -- no create/delete/rename, so `delta.rs`'s
+/// mixed-burst split never triggers), and returns the SORTED, deduped
+/// `owner_path` set `analyze::run_incremental` actually reprocessed.
+/// Mirrors `surface_unchanged_edit_narrows_the_affected_closure_to_the_
+/// literal_edit`'s own low-level cold-scan-then-incremental recipe (see
+/// that test for the full rationale behind each step -- this is the SAME
+/// sequence, generalized to N edited paths and a caller-chosen workspace,
+/// returning the full owner set instead of asserting on it directly) --
+/// used by the barrel-hub cost-selectivity checks below to measure "how
+/// many/which owners get reprocessed" against a synthetic re-export-heavy
+/// fixture too large to hand-author as a static `tests/fixtures/` tree.
+fn owners_after_incremental_edits(
+    workspace_root: &Path,
+    label: &str,
+    edits: &[(&str, &str)],
+) -> Vec<String> {
+    let scratch = scratch_dir(label);
+    let database_path = scratch.join("workspace.sqlite");
+    let structural_root = scratch.join("structural");
+    let cas_root = scratch.join("cas");
+    let workspace_id = format!("workspace:{label}");
+
+    let mut conn = catalog::open_and_ensure_schema(&database_path).expect("schema opens");
+    let outcome = catalog::run_full_scan(&mut conn, &workspace_id, workspace_root, &cas_root, 1)
+        .expect("cold catalog scan succeeds");
+    catalog::restore_steady_state_pragmas(&conn).expect("restoring pragmas succeeds");
+
+    let mut clock = ScanClock::start();
+    let mut syntax = SyntaxWorkerState::default();
+    let cas_signal = outcome
+        .cas_write_queue
+        .as_ref()
+        .expect("run_full_scan always populates cas_write_queue")
+        .signal();
+    let (cold_analysis, _cache, _typeflow_cache) = analyze::run_cold(
+        &outcome.frontier,
+        &cas_root,
+        &workspace_id,
+        &mut syntax,
+        &mut clock,
+        &cas_signal,
+    )
+    .expect("cold analyze succeeds");
+    let materialized =
+        materialize::materialize_cold(cold_analysis.owners).expect("materialize succeeds");
+    let request = scan::ScanRequest {
+        request_id: format!("request:{label}-cold"),
+        workspace_id: workspace_id.clone(),
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        database_path: database_path.to_string_lossy().into_owned(),
+        structural_root: structural_root.to_string_lossy().into_owned(),
+        cas_root: cas_root.to_string_lossy().into_owned(),
+        sidecar_root: scratch.join("sidecar").to_string_lossy().into_owned(),
+        scope: ScanScope::Full,
+        registry_snapshot_id: format!("registry:{label}"),
+        configuration_revision_id: format!("configuration:{label}"),
+        resolution_lock_id: format!("resolution:{label}"),
+        deadline_ms: None,
+        priority: ScanPriority::Interactive,
+    };
+    let mut on_queryable = |_event: IndexingEvent| -> Result<(), String> { Ok(()) };
+    publish::publish_cold(
+        &mut conn,
+        &request,
+        &structural_root,
+        1,
+        &outcome,
+        materialized,
+        &mut clock,
+        &mut on_queryable,
+    )
+    .expect("cold publish succeeds");
+
+    for (relative_path, new_content) in edits {
+        std::fs::write(workspace_root.join(relative_path), new_content)
+            .unwrap_or_else(|error| panic!("rewriting {relative_path}: {error}"));
+    }
+
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+    let workspace_state = super::state::ensure_workspace(&mut worker_state, &conn, &workspace_id)
+        .expect("workspace state available");
+    let cas = urdira_source_frontier::CasStore::open(&cas_root).expect("cas opens");
+    let rules = urdira_source_frontier::inclusion::default_workspace_inclusion();
+    let gitignore = urdira_source_frontier::inclusion::GitIgnoreRules {
+        enabled: false,
+        patterns: Vec::new(),
+    };
+    let changed_path_strings: Vec<String> =
+        edits.iter().map(|(path, _)| (*path).to_string()).collect();
+    let observations = urdira_source_frontier::Walker::observe_paths(
+        workspace_root,
+        &changed_path_strings,
+        &rules,
+        &gitignore,
+        Some(&cas),
+    );
+    let source_delta =
+        urdira_source_frontier::Delta::compute_partial(&workspace_state.frontier, &observations);
+    let now = super::now_iso8601();
+    let batch_meta = urdira_source_frontier::BatchMeta {
+        source_provider_binding_id: format!("urdira:v4-directory-walker:{workspace_id}"),
+        source_provider: "urdira:v4-directory-walker".to_string(),
+        source_provider_version: "1".to_string(),
+        started_at: now.clone(),
+        completed_at: now,
+        full_scan: false,
+    };
+    urdira_source_frontier::Catalog::apply(
+        &mut conn,
+        &workspace_id,
+        &mut workspace_state.frontier,
+        &source_delta,
+        2,
+        &batch_meta,
+    )
+    .expect("catalog delta applies");
+    catalog::restore_steady_state_pragmas(&conn).expect("restoring pragmas succeeds");
+
+    let mut changed_artifact_ids: Vec<String> = source_delta
+        .changed
+        .iter()
+        .filter_map(|observation| {
+            workspace_state
+                .frontier
+                .present
+                .get(&observation.normalized_uri)
+                .map(|entry| entry.artifact_id.clone())
+        })
+        .collect();
+    changed_artifact_ids.sort();
+    changed_artifact_ids.dedup();
+
+    workspace_state.source_cache = Some(
+        super::state::SourceCache::build_full(&workspace_state.frontier, &cas_root)
+            .expect("source cache builds"),
+    );
+    let source_cache = workspace_state.source_cache.as_ref().unwrap();
+    let mut typeflow_cache =
+        super::typeflow::TypeflowCache::build_full(&source_cache.files_vec(), None)
+            .expect("typeflow cache builds");
+
+    let mut incremental_clock = ScanClock::start();
+    let incremental_analysis = analyze::run_incremental(
+        source_cache.files_vec(),
+        source_cache.config_assets_vec(),
+        &workspace_id,
+        &mut syntax,
+        changed_artifact_ids,
+        &mut incremental_clock,
+        &mut typeflow_cache,
+        &[],
+    )
+    .expect("incremental analyze succeeds");
+
+    let mut owner_paths: Vec<String> = incremental_analysis
+        .owners
+        .iter()
+        .map(|owner| owner.owner_path.clone())
+        .collect();
+    owner_paths.sort();
+    owner_paths.dedup();
+    let _ = std::fs::remove_dir_all(&scratch);
+    owner_paths
+}
+
+/// Frente E-P0g adversarial review, attack #1: a synthetic workspace with
+/// `leaf_count` leaf modules (each its own file, one named export), ONE
+/// root barrel that bare-`export *`s every leaf (the exact `export_star_
+/// specifiers` edge shape `ImportReverseIndex::insert_file`/`reverse_
+/// affected_closure` now widen through -- matches `multi_hop_barrel_
+/// fixture_root`'s own `export * from` shape, not a named re-export), and
+/// `importer_count` importers, importer `i` importing ONLY leaf `i`'s own
+/// single named export through the barrel (never `import *`). This is the
+/// exact shape the review brief's item 1 asks for: "un `index.ts` raíz de
+/// paquete que re-exporta 300 módulos... 50 importadores del barrel".
+fn write_large_barrel_workspace(workspace_root: &Path, leaf_count: usize, importer_count: usize) {
+    std::fs::create_dir_all(workspace_root.join("leaves")).expect("leaves dir");
+    std::fs::create_dir_all(workspace_root.join("importers")).expect("importers dir");
+    for i in 0..leaf_count {
+        std::fs::write(
+            workspace_root.join(format!("leaves/leaf{i:03}.ts")),
+            format!("export function leaf{i:03}(): number {{\n  return {i};\n}}\n"),
+        )
+        .unwrap_or_else(|error| panic!("write leaf{i:03}.ts: {error}"));
+    }
+    let barrel_body: String = (0..leaf_count)
+        .map(|i| format!("export * from './leaves/leaf{i:03}';\n"))
+        .collect();
+    std::fs::write(workspace_root.join("barrel.ts"), barrel_body).expect("write barrel.ts");
+    for i in 0..importer_count {
+        std::fs::write(
+            workspace_root.join(format!("importers/importer{i:03}.ts")),
+            format!(
+                "import {{ leaf{i:03} }} from '../barrel';\nexport const IMPORTER_{i:03} = leaf{i:03}();\n"
+            ),
+        )
+        .unwrap_or_else(|error| panic!("write importer{i:03}.ts: {error}"));
+    }
+}
+
+/// Frente E-P0g adversarial review, attack #1, scenario A: a BODY-only
+/// edit to one leaf module re-exported through a 300-module barrel (its
+/// own exported name/signature untouched) must narrow to EXACTLY that
+/// literal path -- the barrel and its 50 importers (transitively reachable
+/// through the widened `export_star_specifiers` reverse edge this PR
+/// adds) must be entirely absent from `owners`, via the SAME `exported_
+/// surface`/`surface_changed` narrowing `surface_unchanged_edit_narrows_
+/// the_affected_closure_to_the_literal_edit` already exercises for a plain
+/// import chain. If this regresses, a body-only edit anywhere under a
+/// large barrel becomes an O(fan-in) reprocessing cost -- the exact
+/// "hub-edit gate" class of regression this codebase has repeatedly fixed.
+#[test]
+fn barrel_hub_leaf_body_only_edit_keeps_owners_to_the_literal_edit() {
+    let scratch = scratch_dir("barrel-hub-leaf-body-edit");
+    let workspace_root = scratch.join("workspace");
+    write_large_barrel_workspace(&workspace_root, 300, 50);
+    let owners = owners_after_incremental_edits(
+        &workspace_root,
+        "barrel-hub-leaf-body-edit",
+        &[(
+            "leaves/leaf007.ts",
+            "export function leaf007(): number {\n  return 999;\n}\n",
+        )],
+    );
+    assert_eq!(
+        owners,
+        vec!["leaves/leaf007.ts".to_string()],
+        "a body-only edit to one leaf module re-exported through a 300-module barrel must \
+         narrow to EXACTLY the literal edited path -- the barrel and its 50 importers must be \
+         entirely absent; got {owners:?} (len={})",
+        owners.len()
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Frente E-P0g adversarial review, attack #1, scenario B: renaming ONE
+/// leaf's exported name (a genuine surface change -- `exported_surface`'s
+/// pure-addition/subset narrowing correctly refuses to collapse this one)
+/// widens through the barrel's own `export_star_specifiers` edge (this
+/// PR's new `ImportReverseIndex`/`reverse_affected_closure` coverage) to
+/// EVERY DIRECT importer of the barrel, not just the one importer that
+/// actually names the renamed export -- `reverse_affected_closure`'s
+/// reverse graph is FILE-granularity, not per-imported-name, the SAME
+/// trade-off it already makes for a plain (non-barrel) import today (an
+/// unrelated importer of a plain module that renames an unrelated export
+/// is equally over-swept). This test PINS that measured, accepted cost
+/// bound -- `barrel.ts` + all 50 importers-of-the-barrel + the edited leaf
+/// -- as a regression guard: if a future change makes this UNBOUNDED
+/// (e.g. sweeping in the other 299 leaves too, or every TRANSITIVE
+/// importer of each of THOSE), this assertion catches it. See this
+/// review's own report for why full per-imported-name selectivity was
+/// judged out of scope for this pass (`reverse_affected_closure` is
+/// shared v3/v4 code with the SAME file-granularity trade-off for plain
+/// imports already).
+#[test]
+fn barrel_hub_leaf_rename_widens_to_the_barrel_and_all_its_direct_importers_but_no_further() {
+    let scratch = scratch_dir("barrel-hub-leaf-rename");
+    let workspace_root = scratch.join("workspace");
+    write_large_barrel_workspace(&workspace_root, 300, 50);
+    let owners = owners_after_incremental_edits(
+        &workspace_root,
+        "barrel-hub-leaf-rename",
+        &[(
+            "leaves/leaf007.ts",
+            "export function leaf007Renamed(): number {\n  return 999;\n}\n",
+        )],
+    );
+    let mut expected: Vec<String> = (0..50)
+        .map(|i| format!("importers/importer{i:03}.ts"))
+        .chain(["barrel.ts".to_string(), "leaves/leaf007.ts".to_string()])
+        .collect();
+    expected.sort();
+    assert_eq!(
+        owners,
+        expected,
+        "renaming one leaf's export through a 300-module barrel must widen to EXACTLY the \
+         barrel + its 50 direct importers + the edited leaf -- the OTHER 299 leaves must never \
+         appear (that would mean the closure walked back OUT through the barrel to every \
+         re-exported module, an unbounded blow-up), and no importer's OWN further importers \
+         (none exist in this fixture, but a regression here would still show as extra rows); \
+         got {} owners, expected {} (symmetric diff: {:?})",
+        owners.len(),
+        expected.len(),
+        {
+            let owners_set: std::collections::BTreeSet<&String> = owners.iter().collect();
+            let expected_set: std::collections::BTreeSet<&String> = expected.iter().collect();
+            let diff: Vec<String> = owners_set
+                .symmetric_difference(&expected_set)
+                .map(|s| (*s).clone())
+                .collect();
+            diff
+        }
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Frente E-P0g adversarial review, attack #1, scenario C: adding a brand
+/// new named re-export to the barrel (nobody could already import a name
+/// that did not exist before this edit) is a pure ADDITION to the
+/// barrel's own `exported_surface` -- `prior.is_subset(&next)` holds, so
+/// `surface_changed` must stay `false` and narrow `owners` down to
+/// EXACTLY the barrel itself, none of its 50 importers swept in.
+#[test]
+fn barrel_hub_adding_a_named_reexport_keeps_owners_to_the_barrel_itself() {
+    let scratch = scratch_dir("barrel-hub-add-named-reexport");
+    let workspace_root = scratch.join("workspace");
+    write_large_barrel_workspace(&workspace_root, 300, 50);
+    let mut barrel_body: String = (0..300)
+        .map(|i| format!("export * from './leaves/leaf{i:03}';\n"))
+        .collect();
+    barrel_body.push_str("export { leaf008 as leaf008Alias } from './leaves/leaf008';\n");
+    let owners = owners_after_incremental_edits(
+        &workspace_root,
+        "barrel-hub-add-named-reexport",
+        &[("barrel.ts", barrel_body.as_str())],
+    );
+    assert_eq!(
+        owners,
+        vec!["barrel.ts".to_string()],
+        "adding a NEW named re-export to a 300-module barrel (a pure surface addition) must \
+         narrow to EXACTLY the barrel itself -- none of its 50 importers may be swept in; got \
+         {owners:?}"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Frente E-P0g adversarial review, attack #2: a PRIVATE-in-spirit member
+/// (this crate has no visibility modifier at all on `SyntaxEntity` --
+/// `exported_surface`'s own doc comment documents this as "conservative by
+/// construction") ADDED to an exported class is a pure surface ADDITION
+/// (a brand-new `member:Foo.<name>` tuple, every prior entry untouched) --
+/// `prior.is_subset(&next)` holds, so it must NOT count as a surface
+/// change: `owners` narrows to exactly the edited file, its caller (which
+/// only ever used the class's PRE-EXISTING, untouched member) stays
+/// unswept. Also covers REORDERING two existing members: the tuple
+/// identity is `(container.member, kind)`, deliberately position-
+/// independent, so reordering produces the IDENTICAL set -- `owners` must
+/// still narrow to just the edited file.
+#[test]
+fn exported_class_member_addition_and_reorder_keep_owners_at_the_literal_edit_only() {
+    // Two INDEPENDENT workspaces, one per scenario -- `owners_after_
+    // incremental_edits` writes its `edits` straight to disk and never
+    // reverts them, so reusing one `workspace_root` across two sequential
+    // calls would let scenario 1's edit silently become scenario 2's
+    // baseline (confirmed live authoring this test: it turned "reorder"
+    // into an accidental member REMOVAL relative to scenario 1's already-
+    // edited file, a genuine surface change, not a test bug in the
+    // product).
+    let scratch = scratch_dir("member-surface-addition-reorder");
+
+    // Scenario 1: add a brand-new member (pure addition).
+    let addition_workspace = scratch.join("workspace-addition");
+    std::fs::create_dir_all(&addition_workspace).expect("workspace dir");
+    std::fs::write(
+        addition_workspace.join("service.ts"),
+        "export class Service {\n  foo(): number {\n    return 1;\n  }\n  bar(): number {\n    return 2;\n  }\n}\n",
+    )
+    .expect("write service.ts");
+    std::fs::write(
+        addition_workspace.join("consumer.ts"),
+        "import { Service } from './service';\nconst s = new Service();\nexport const RESULT = s.foo();\n",
+    )
+    .expect("write consumer.ts");
+    let owners_after_addition = owners_after_incremental_edits(
+        &addition_workspace,
+        "member-surface-addition",
+        &[(
+            "service.ts",
+            "export class Service {\n  foo(): number {\n    return 1;\n  }\n  bar(): number {\n    return 2;\n  }\n  baz(): number {\n    return 3;\n  }\n}\n",
+        )],
+    );
+    assert_eq!(
+        owners_after_addition,
+        vec!["service.ts".to_string()],
+        "adding a new member to an exported class is a pure surface addition -- consumer.ts \
+         (which never referenced the new member) must not be swept in; got {owners_after_addition:?}"
+    );
+
+    // Scenario 2: reorder the two EXISTING members (identity is position-
+    // independent) -- must produce the IDENTICAL surface set. A FRESH
+    // workspace, untouched by scenario 1's own edit.
+    let reorder_workspace = scratch.join("workspace-reorder");
+    std::fs::create_dir_all(&reorder_workspace).expect("workspace dir");
+    std::fs::write(
+        reorder_workspace.join("service.ts"),
+        "export class Service {\n  foo(): number {\n    return 1;\n  }\n  bar(): number {\n    return 2;\n  }\n}\n",
+    )
+    .expect("write service.ts");
+    std::fs::write(
+        reorder_workspace.join("consumer.ts"),
+        "import { Service } from './service';\nconst s = new Service();\nexport const RESULT = s.foo();\n",
+    )
+    .expect("write consumer.ts");
+    let owners_after_reorder = owners_after_incremental_edits(
+        &reorder_workspace,
+        "member-surface-reorder",
+        &[(
+            "service.ts",
+            "export class Service {\n  bar(): number {\n    return 2;\n  }\n  foo(): number {\n    return 1;\n  }\n}\n",
+        )],
+    );
+    assert_eq!(
+        owners_after_reorder,
+        vec!["service.ts".to_string()],
+        "reordering two existing members must never count as a surface change (member \
+         identity is position-independent by design) -- got {owners_after_reorder:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Frente E-P0g adversarial review, attack #2 (documented residual, NOT a
+/// regression this PR introduces): `exported_surface` operates entirely on
+/// `SyntaxFileResult` (`urdira-jsts-syntax-worker`'s own syntax-only
+/// layer, no type resolution at all -- confirmed by inspection: neither
+/// `SyntaxEntity` nor `SyntaxExportBinding` carries a return-type or
+/// parameter-type annotation anywhere) -- so an exported FUNCTION's own
+/// RETURN TYPE (or a parameter's TYPE, as opposed to its NAME, already
+/// tracked by this PR) changing, with the function's own name/parameter
+/// NAMES untouched, is invisible to this surface check. `surface_changed`
+/// stays `false`, `run_scoped` narrows `owners` down to the literal edited
+/// file alone -- a caller whose typeflow-mediated member-chain resolution
+/// depends on that return type (`makeThing().getBar()`, resolved through
+/// `ProgramIndex::function_return_types`, a SEPARATE, structurally-typed
+/// closure `TypeflowCache` maintains on its own `transitive_importers_
+/// closure`, entirely orthogonal to this syntax-level `affected_paths`
+/// gate) is silently excluded from `owners` and keeps a STALE resolved-call
+/// row. Confirmed live by this exact test. PRE-EXISTING: `exported_
+/// surface`'s top-level `export_bindings` entries never carried type
+/// information either, before OR after this PR -- this PR only added
+/// member/parameter NAME granularity (item 4 of its own commit message),
+/// never touched return-type tracking. Fixing this properly needs a
+/// structurally-typed signature comparison sourced from `TypeflowCache`'s
+/// own `DeclSummary` (which DOES carry a resolved `RawTypeRef` return type
+/// per function/method already, see `FunctionSummary::return_type`), not
+/// a text hack against `SyntaxFileResult` -- correctly sequencing a
+/// pre/post-edit `DeclSummary` comparison against `TypeflowCache`'s own
+/// build-index lifecycle is a properly-sized follow-up in its own right,
+/// judged out of scope for this review pass (this PR's own diff never
+/// touches return-type surface tracking; only member/parameter NAMES).
+/// Left `#[ignore]`d rather than deleted so the follow-up has a ready
+/// repro and a red/green target.
+#[test]
+#[ignore = "Frente E-P0g adversarial review 2026-09-07: documented PRE-EXISTING gap, not a \
+            regression this PR introduces -- exported_surface has no type-level signal at all \
+            (see this test's own doc comment); tracked as a follow-up, not fixed in this pass"]
+fn exported_function_return_type_change_should_reanalyze_a_type_dependent_caller() {
+    let scratch = scratch_dir("return-type-surface-gap");
+    let workspace_root = scratch.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+    std::fs::write(
+        workspace_root.join("a.ts"),
+        "export class FooV1 {\n  getBar(): number {\n    return 1;\n  }\n}\nexport class FooV2 {\n  getBar(): string {\n    return \"s\";\n  }\n}\nexport function makeThing(): FooV1 {\n  return new FooV1();\n}\n",
+    )
+    .expect("write a.ts");
+    std::fs::write(
+        workspace_root.join("consumer.ts"),
+        "import { makeThing } from './a';\nexport function run() {\n  return makeThing().getBar();\n}\n",
+    )
+    .expect("write consumer.ts");
+
+    let owners = owners_after_incremental_edits(
+        &workspace_root,
+        "return-type-surface-gap",
+        &[(
+            "a.ts",
+            "export class FooV1 {\n  getBar(): number {\n    return 1;\n  }\n}\nexport class FooV2 {\n  getBar(): string {\n    return \"s\";\n  }\n}\nexport function makeThing(): FooV2 {\n  return new FooV2();\n}\n",
+        )],
+    );
+    assert!(
+        owners.contains(&"consumer.ts".to_string()),
+        "changing makeThing's return type from FooV1 to FooV2 must reanalyze consumer.ts \
+         (its `.getBar()` call now resolves to a DIFFERENT method entity) -- got {owners:?}"
     );
 }

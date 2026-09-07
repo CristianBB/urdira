@@ -1128,10 +1128,41 @@ impl ImportReverseIndex {
     }
 
     fn insert_file(&mut self, path: &str, file: &SyntaxFileResult) {
+        // Frente E-P0g: a RE-EXPORT (`export { X } from "./y"`) or a bare
+        // barrel (`export * from "./y"`) is exactly as much of a "this file
+        // depends on that path" edge as a literal `import` statement --
+        // `resolver::resolve_named_export` chases BOTH the same way a plain
+        // import's specifier resolves, and a content edit to the re-
+        // exported/barrel-targeted file can change what THIS file's own
+        // named export ultimately resolves to (a member rename/removal
+        // inside a class the barrel re-exports, for instance) without
+        // touching this file's own bytes at all. Previously only `direct_
+        // imports` fed this graph, so an owner reachable ONLY through a
+        // re-export/barrel chain was never widened to on a content edit at
+        // the OTHER end of that chain -- confirmed live at fixture scale
+        // (`method_rename_reanalyzes_the_caller_and_closes_the_old_call_
+        // relation`, `urdira-indexing-worker::v4::tests_e2e`): renaming a
+        // method on a class re-exported through a barrel left every real
+        // caller's stale method-call resolution unrevisited, since NEITHER
+        // this graph NOR its `reverse_affected_closure` fallback (below)
+        // ever attributed the caller as reachable from the renamed
+        // method's own declaring file. Purely additive (only ever widens,
+        // matching this whole index's own "closure that CAN change" role;
+        // never narrows).
         let mut targets: Vec<String> = file
             .direct_imports
             .iter()
             .filter_map(|import| import.target_path.clone())
+            .chain(
+                file.export_bindings
+                    .iter()
+                    .filter_map(|binding| binding.source_target_path.clone()),
+            )
+            .chain(
+                file.export_star_specifiers
+                    .iter()
+                    .filter_map(|star| star.target_path.clone()),
+            )
             .collect();
         targets.sort_unstable();
         targets.dedup();
@@ -5043,11 +5074,29 @@ fn reverse_affected_closure(
     let mut reverse: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for files in [prior, Some(next)].into_iter().flatten() {
         for (source, result) in files {
-            for target in result
+            // Frente E-P0g: mirrors `ImportReverseIndex::insert_file`'s own
+            // fix (see that function's doc comment) -- this is its
+            // defensive from-scratch fallback, used when no maintained
+            // index exists yet for this project, so it must build the SAME
+            // (re-export/barrel-inclusive) graph or the two paths would
+            // silently disagree on which files a content edit affects.
+            let targets = result
                 .direct_imports
                 .iter()
                 .filter_map(|import| import.target_path.as_ref())
-            {
+                .chain(
+                    result
+                        .export_bindings
+                        .iter()
+                        .filter_map(|binding| binding.source_target_path.as_ref()),
+                )
+                .chain(
+                    result
+                        .export_star_specifiers
+                        .iter()
+                        .filter_map(|star| star.target_path.as_ref()),
+                );
+            for target in targets {
                 reverse
                     .entry(target.clone())
                     .or_default()

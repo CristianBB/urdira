@@ -91,6 +91,22 @@ pub struct TypeflowCache {
     /// Paths removed since `index` was last brought up to date -- drained
     /// by `build_index`, applied via `ProgramIndex::remove_file`.
     pending_removed: BTreeSet<String>,
+    /// Frente E-P0g: the reverse half of `chain_watch_targets` (`resolve_
+    /// import_targets_for`'s own doc comment) -- `target_path -> owning
+    /// paths whose needed-import resolution used target_path as a
+    /// successfully-resolved re-export HOP` (never the genuinely-failing
+    /// case, which stays on `ProgramIndex`'s own `pending_importers_of`).
+    /// Kept HERE, not on `ProgramIndex` (`urdira-jsts-typeflow`), so a
+    /// resolved-through-a-barrel edge can never be confused with that
+    /// crate's own "still failing" contract (see `apply_chain_watch_
+    /// updates`'s doc comment for the test this separation protects).
+    chain_watchers: HashMap<String, HashSet<String>>,
+    /// The forward half of `chain_watchers`: `owning_path -> target paths
+    /// it currently watches` -- needed to correctly CLEAR an owning path's
+    /// old watch edges before installing its fresh set (mirrors `urdira-
+    /// jsts-typeflow::ProgramIndex::file_import_keys`'s own role for
+    /// `import_targets`/`importers_of`).
+    owning_chain_targets: HashMap<String, HashSet<String>>,
 }
 
 impl TypeflowCache {
@@ -258,7 +274,7 @@ impl TypeflowCache {
     ) -> &ProgramIndex {
         if self.index.is_none() {
             let all_paths: Vec<&str> = self.summaries.keys().map(String::as_str).collect();
-            let (import_targets, pending_targets) = resolve_import_targets_for(
+            let (import_targets, pending_targets, chain_watch_targets) = resolve_import_targets_for(
                 &self.summaries,
                 all_paths.into_iter(),
                 resolver,
@@ -270,6 +286,11 @@ impl TypeflowCache {
                 &import_targets,
                 &pending_targets,
             ));
+            apply_chain_watch_updates(
+                &mut self.chain_watchers,
+                &mut self.owning_chain_targets,
+                &chain_watch_targets,
+            );
             self.pending_upserted.clear();
             self.pending_removed.clear();
             return self.index.as_ref().expect("just assigned above");
@@ -282,9 +303,52 @@ impl TypeflowCache {
                 .index
                 .as_mut()
                 .expect("checked Some via the is_none() branch above");
+            // Frente E-P0g: capture each REMOVED path's own `importers_of`/
+            // `pending_importers_of` watchers BEFORE `remove_file` purges
+            // those reverse-index entries (`purge_import_targets_targeting_
+            // file`/`self.pending_importers_of.remove(path)`, both inside
+            // `remove_file` itself) -- these are exactly the files whose
+            // OWN needed-import resolution used `path` either as a
+            // successfully-resolved re-export HOP (see `resolve_import_
+            // targets_for`'s `directly_declares` branch above) or as a
+            // still-pending target. `remove_file`'s own internal `reflow_
+            // files` only replays each affected file's EXISTING (now
+            // possibly stale) `import_targets` entries through the local
+            // 4-pass closure -- it never calls back into `resolver`/
+            // `available`/`files` to re-derive whether a specifier still
+            // resolves at all, since those three only exist at THIS
+            // caller's layer. Without re-resolving these watchers here,
+            // removing a barrel file left every real consumer's `import_
+            // targets` entry pointing at its (still valid, untouched)
+            // flattened target -- byte-identical to before the removal --
+            // confirmed live on n8n (§15.4/§16, `dynamic-credentials.
+            // controller.ts` kept a stale method-call resolution through a
+            // renamed `services/index.ts` barrel). Folded into the SAME
+            // settling loop `upserted` already runs through below (as
+            // `refresh_seed`) so a chain of removed-barrel -> importer ->
+            // that importer's OWN importers converges the identical way
+            // `upserted`'s own multi-hop case already does.
+            let mut removed_watchers: BTreeSet<String> = BTreeSet::new();
+            for path in &removed {
+                removed_watchers.extend(index.importers_of(path));
+                removed_watchers.extend(index.pending_importers_of(path));
+                // Frente E-P0g: `chain_watchers`/`owning_chain_targets` are
+                // this module's OWN reverse index, entirely separate from
+                // `index`'s (`ProgramIndex`'s) own two above -- see
+                // `resolve_import_targets_for`'s doc comment for why a
+                // resolved-through-a-barrel edge lives here instead.
+                removed_watchers.extend(remove_chain_watch_path(
+                    &mut self.chain_watchers,
+                    &mut self.owning_chain_targets,
+                    path,
+                ));
+            }
             for path in &removed {
                 index.remove_file(path);
             }
+            removed_watchers.retain(|path| !removed.contains(path));
+            let refresh_seed: BTreeSet<String> =
+                upserted.iter().cloned().chain(removed_watchers).collect();
             // Frente E-P0c fix (Brecha B "second finding", 2026-09-07): a
             // BOUNDED FIXED-POINT settling loop over `upserted`, not a
             // single pass. This function's own doc comment already names
@@ -350,23 +414,36 @@ impl TypeflowCache {
             const MAX_SETTLING_ROUNDS: usize = 8;
             let mut previous_round: Option<HashMap<(String, String, String), String>> = None;
             let mut previous_round_pending: Option<HashMap<String, HashSet<String>>> = None;
+            let mut previous_round_chain: Option<HashMap<String, HashSet<String>>> = None;
             for round in 0..MAX_SETTLING_ROUNDS {
                 let mut round_updates: HashMap<(String, String, String), String> = HashMap::new();
                 let mut round_pending: HashMap<String, HashSet<String>> = HashMap::new();
-                for path in &upserted {
+                let mut round_chain: HashMap<String, HashSet<String>> = HashMap::new();
+                for path in &refresh_seed {
                     let Some(summary) = self.summaries.get(path) else {
                         // Upserted then removed again before this
                         // `build_index` call ever ran (both edits landed
-                        // in the SAME generation's dirty set) --
-                        // `pending_removed` already handled it above;
-                        // nothing left to insert.
+                        // in the SAME generation's dirty set), OR a
+                        // removed-path watcher that turns out to ALSO be
+                        // one of `removed` itself (already filtered out
+                        // above, kept here only as a defensive belt) --
+                        // nothing left to insert either way.
                         continue;
                     };
                     let mut refresh_paths: BTreeSet<String> =
                         index.importers_of(path).into_iter().collect();
                     refresh_paths.extend(index.pending_importers_of(path));
+                    // Frente E-P0g: also widen through THIS module's own
+                    // `chain_watchers` -- a path reflowed this round (say,
+                    // the barrel itself, edited in the SAME batch as one of
+                    // its own re-exported declarations) may be a watched
+                    // HOP for some owning path `ProgramIndex`'s two reverse
+                    // indexes have no edge for (see `resolve_import_
+                    // targets_for`'s doc comment).
+                    refresh_paths
+                        .extend(self.chain_watchers.get(path).into_iter().flatten().cloned());
                     refresh_paths.insert(path.clone());
-                    let (updates, pending) = resolve_import_targets_for(
+                    let (updates, pending, chain) = resolve_import_targets_for(
                         &self.summaries,
                         refresh_paths.iter().map(String::as_str),
                         resolver,
@@ -380,12 +457,25 @@ impl TypeflowCache {
                             .or_default()
                             .extend(target_paths.iter().cloned());
                     }
+                    for (owning_path, target_paths) in &chain {
+                        round_chain
+                            .entry(owning_path.clone())
+                            .or_default()
+                            .extend(target_paths.iter().cloned());
+                    }
                     index.replace_file(path, summary.clone(), &updates, &pending);
+                    apply_chain_watch_updates(
+                        &mut self.chain_watchers,
+                        &mut self.owning_chain_targets,
+                        &chain,
+                    );
                 }
                 let converged = previous_round.as_ref() == Some(&round_updates)
-                    && previous_round_pending.as_ref() == Some(&round_pending);
+                    && previous_round_pending.as_ref() == Some(&round_pending)
+                    && previous_round_chain.as_ref() == Some(&round_chain);
                 previous_round = Some(round_updates);
                 previous_round_pending = Some(round_pending);
+                previous_round_chain = Some(round_chain);
                 if converged {
                     break;
                 }
@@ -438,6 +528,35 @@ impl TypeflowCache {
 /// this as a full snapshot (`apply_pending_target_updates`'s own "never a
 /// partial patch" contract) correctly clears a path's stale pending edges
 /// once it stops needing them.
+///
+/// Frente E-P0g: ALSO returns `chain_watch_targets` (same `owning_path ->
+/// target file paths` shape, same "one entry per queried path, even if
+/// empty" contract as `pending_targets`) -- deliberately a THIRD, SEPARATE
+/// map, not folded into `pending_targets`: a triple that resolves cleanly
+/// THROUGH a re-exporting barrel is genuinely resolved (`import_targets`
+/// gets its normal entry, `pending_importers_of`'s own "still failing"
+/// contract must NOT gain an entry for it -- `urdira-jsts-typeflow`'s own
+/// `member_access_through_a_reexporting_barrel_edited_in_a_later_separate_
+/// build_index_call` test asserts exactly that "now-resolved need must stop
+/// being retried" invariant, confirmed live when an earlier draft of this
+/// fix folded this into `pending_targets` instead and broke it) -- but the
+/// specifier's own DIRECT resolution target (the barrel `target_path`,
+/// before `resolve_named_export`'s own further chasing) still needs to be
+/// watched STRUCTURALLY: `import_targets`' VALUE only ever stores the
+/// flattened final entity id, so `ProgramIndex::link_importer` (keyed by
+/// `entity_owner[target_id]`) only ever registers `owning_path` as an
+/// importer of the FINAL declaring file, never of the barrel hop it went
+/// through -- removing/renaming/editing ONLY the barrel (the declaring file
+/// itself untouched) left nothing pointing back at `owning_path` to reflow.
+/// Confirmed live on n8n at N=2015 (`docs/evidence/2026-09-06-v4-reconcile-
+/// threshold.md` §15.4/§16): `dynamic-credentials.controller.ts` kept a
+/// stale `jsts:call`/`jsts:references` row targeting a service method
+/// through the renamed `services/index.ts` barrel, which a from-scratch
+/// oracle scan of the renamed tree never re-derived. `TypeflowCache` (this
+/// module) keeps this as its OWN reverse index (`chain_watchers`/
+/// `owning_chain_targets`, below), entirely separate from `ProgramIndex`'s
+/// own `pending_importers_of` -- see `apply_chain_watch_updates`'s doc
+/// comment.
 #[allow(clippy::type_complexity)]
 fn resolve_import_targets_for<'a>(
     summaries: &BTreeMap<String, DeclSummary>,
@@ -448,11 +567,14 @@ fn resolve_import_targets_for<'a>(
 ) -> (
     HashMap<(String, String, String), String>,
     HashMap<String, HashSet<String>>,
+    HashMap<String, HashSet<String>>,
 ) {
     let mut needed_imports: HashSet<(&str, &str, &str)> = HashSet::new();
     let mut pending_targets: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut chain_watch_targets: HashMap<String, HashSet<String>> = HashMap::new();
     for path in paths {
         pending_targets.entry(path.to_owned()).or_default();
+        chain_watch_targets.entry(path.to_owned()).or_default();
         let Some(summary) = summaries.get(path) else {
             continue;
         };
@@ -480,6 +602,42 @@ fn resolve_import_targets_for<'a>(
             urdira_jsts_syntax_worker::ExportPolicy::UniqueOrAmbiguous,
         ) {
             ExportResolution::Resolved(target_id) => {
+                // Frente E-P0g review fix: a NESTED re-export chain
+                // (`impl.ts` -> `pkgroot.ts` [re-exports] -> `barrel.ts`
+                // [re-exports] -> `iface.ts` [declares]) has MULTIPLE
+                // intermediate hops, not just `target_path` (the
+                // specifier's own DIRECT resolution target, `pkgroot.ts`
+                // here) -- `pkgroot.ts` itself has no needed-import of its
+                // OWN (`collect_needed_imports_for_summary` only scans
+                // classes/interfaces/functions, and a bare re-export
+                // declaration is none of those), so nothing else in this
+                // function's own loop ever visits `barrel.ts` as an
+                // `owning_path` to watch it FROM. Confirmed live on n8n at
+                // N=5037 (`docs/evidence/2026-09-06-v4-reconcile-
+                // threshold.md` §16): renaming the NESTED barrel `@n8n/
+                // instance-ai/src/event-bus/index.ts` (two hops beyond the
+                // package-root barrel `in-process-event-bus.ts` imports
+                // through) left a transitive caller's property reference
+                // stale, even after this function's own single-hop `target_
+                // path` watch (below) was already in place -- reproduced at
+                // fixture scale
+                // (`nested_barrel_rename_in_a_mixed_batch_closes_a_
+                // transitive_property_reference`, `tests_e2e.rs`).
+                // `collect_reexport_chain_paths` walks the SAME re-export/
+                // star-export rules `resolve_named_export` itself follows
+                // (a safe OVER-approximation: it also returns the terminal
+                // declaring file, redundant with -- never in conflict
+                // with -- `entity_owner`'s own tracking of that file, and
+                // bounded by the same cycle/depth guard that function
+                // uses), watching EVERY hop, not just the first.
+                for hop in collect_reexport_chain_paths(files, &target_path, imported_name) {
+                    if !directly_declares(files, &hop, imported_name) {
+                        chain_watch_targets
+                            .entry(owning_path.to_owned())
+                            .or_default()
+                            .insert(hop);
+                    }
+                }
                 import_targets.insert(key, target_id);
             }
             ExportResolution::Namespace(_)
@@ -492,7 +650,178 @@ fn resolve_import_targets_for<'a>(
             }
         }
     }
-    (import_targets, pending_targets)
+    (import_targets, pending_targets, chain_watch_targets)
+}
+
+/// Frente E-P0g: `true` when `path`'s OWN `export_bindings` directly (not
+/// through a further re-export -- `source_specifier.is_none()`) exports
+/// `name` -- i.e., `path` is where `name` is actually DECLARED, not merely
+/// a re-exporting hop on the way there. See `resolve_import_targets_for`'s
+/// `ExportResolution::Resolved` arm for why this distinction is what decides
+/// whether an extra `pending_importers_of` watch edge is needed.
+fn directly_declares(files: &BTreeMap<String, SyntaxFileResult>, path: &str, name: &str) -> bool {
+    files.get(path).is_some_and(|file| {
+        file.export_bindings
+            .iter()
+            .any(|binding| binding.exported_name == name && binding.source_specifier.is_none())
+    })
+}
+
+/// Frente E-P0g review fix: every file `resolving `name` starting from
+/// `start_path` would visit as a re-export HOP, following the SAME two
+/// rules `urdira-jsts-syntax-worker::resolver::resolve_named_export_inner`
+/// applies (named re-export first, bare `export * from` fallback only when
+/// no named re-export for `name` exists in that file) -- a deliberately
+/// SEPARATE, simpler walk from that function (it only needs to know WHICH
+/// files were visited, never the resolved entity id, which `resolve_named_
+/// export` already computed for the caller), used ONLY to decide which
+/// files `resolve_import_targets_for` must register a `chain_watch_
+/// targets` watch against. Includes `start_path` itself when it is NOT a
+/// direct declarer (the caller's own `directly_declares` filter, applied
+/// per returned path, drops anything that turns out to declare `name`
+/// directly -- including the terminal file this walk's own base case
+/// naturally reaches, a harmless redundant candidate with `entity_owner`'s
+/// unrelated tracking of that same file, never a conflict). Cycle-guarded
+/// and depth-capped exactly like `resolve_named_export_inner` (`visiting`/
+/// `MAX_CHAIN_DEPTH`, the SAME bound `resolver::MAX_EXPORT_RESOLUTION_
+/// DEPTH` uses) -- a safe OVER-approximation matters more here than an
+/// exact match: missing a hop silently reintroduces this task's own root
+/// cause, watching one hop too many only ever costs one extra, bounded
+/// reflow attempt.
+fn collect_reexport_chain_paths(
+    files: &BTreeMap<String, SyntaxFileResult>,
+    start_path: &str,
+    name: &str,
+) -> BTreeSet<String> {
+    const MAX_CHAIN_DEPTH: u8 = 8;
+    fn walk(
+        files: &BTreeMap<String, SyntaxFileResult>,
+        path: &str,
+        name: &str,
+        depth: u8,
+        visiting: &mut BTreeSet<(String, String)>,
+        out: &mut BTreeSet<String>,
+    ) {
+        if depth >= MAX_CHAIN_DEPTH || !visiting.insert((path.to_owned(), name.to_owned())) {
+            return;
+        }
+        let Some(file) = files.get(path) else {
+            return;
+        };
+        let matching: Vec<&urdira_jsts_syntax_worker::SyntaxExportBinding> = file
+            .export_bindings
+            .iter()
+            .filter(|binding| binding.exported_name == name)
+            .collect();
+        if matching
+            .iter()
+            .any(|binding| binding.source_specifier.is_none())
+        {
+            // A direct declaration for `name` right here -- the chain ends
+            // at `path` itself (already inserted by the caller before
+            // recursing in), nothing further to walk.
+            return;
+        }
+        let named_reexports: Vec<&urdira_jsts_syntax_worker::SyntaxExportBinding> = matching
+            .into_iter()
+            .filter(|binding| binding.source_specifier.is_some())
+            .collect();
+        if !named_reexports.is_empty() {
+            for binding in named_reexports {
+                if let Some(target) = &binding.source_target_path {
+                    out.insert(target.clone());
+                    walk(files, target, name, depth + 1, visiting, out);
+                }
+            }
+            return;
+        }
+        for star in &file.export_star_specifiers {
+            if let Some(target) = &star.target_path {
+                out.insert(target.clone());
+                walk(files, target, name, depth + 1, visiting, out);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    out.insert(start_path.to_owned());
+    let mut visiting = BTreeSet::new();
+    walk(files, start_path, name, 0, &mut visiting, &mut out);
+    out
+}
+
+/// Frente E-P0g: installs `updates` (`resolve_import_targets_for`'s own
+/// `chain_watch_targets` return value -- `owning_path -> target file paths
+/// it resolved THROUGH as a re-export hop`) into `TypeflowCache`'s own
+/// `chain_watchers`/`owning_chain_targets` pair, replacing each `owning_
+/// path` present in `updates`' keys entirely (never a partial patch --
+/// mirrors `urdira-jsts-typeflow::ProgramIndex::apply_pending_target_
+/// updates`'s own discipline for its sibling reverse index, and for the
+/// identical reason: an owning path whose need stopped resolving through
+/// ANY hop at all must have its old watch edges dropped, or `remove_chain_
+/// watch_path`'s BFS below would keep sweeping in a target that no longer
+/// matters). Deliberately a SEPARATE pair of maps from `ProgramIndex`'s own
+/// `importers_of`/`pending_importers_of` -- see `resolve_import_targets_
+/// for`'s doc comment for the test (`urdira-jsts-typeflow`'s `member_
+/// access_through_a_reexporting_barrel_edited_in_a_later_separate_build_
+/// index_call`) an earlier draft broke by folding this into `pending_
+/// importers_of` instead.
+fn apply_chain_watch_updates(
+    chain_watchers: &mut HashMap<String, HashSet<String>>,
+    owning_chain_targets: &mut HashMap<String, HashSet<String>>,
+    updates: &HashMap<String, HashSet<String>>,
+) {
+    for owning_path in updates.keys() {
+        if let Some(old_targets) = owning_chain_targets.remove(owning_path) {
+            for target in old_targets {
+                if let Some(set) = chain_watchers.get_mut(&target) {
+                    set.remove(owning_path);
+                    if set.is_empty() {
+                        chain_watchers.remove(&target);
+                    }
+                }
+            }
+        }
+    }
+    for (owning_path, targets) in updates {
+        if !targets.is_empty() {
+            owning_chain_targets.insert(owning_path.clone(), targets.clone());
+        }
+        for target in targets {
+            chain_watchers
+                .entry(target.clone())
+                .or_default()
+                .insert(owning_path.clone());
+        }
+    }
+}
+
+/// Frente E-P0g: `path` is being removed (`TypeflowCache::build_index`'s
+/// `removed` loop) -- drops it from BOTH halves of the chain-watch pair
+/// (it can no longer be watched, since it no longer exists; nor can it
+/// watch anything else) and returns every owning path that used to watch
+/// IT as a target, so the caller can fold them into its own reflow set
+/// exactly like `ProgramIndex::importers_of(path)`/`pending_importers_of
+/// (path)` already are (mirrors `ProgramIndex::remove_file`'s own two-
+/// sided cleanup, kept here since this reverse index lives on
+/// `TypeflowCache`, not `ProgramIndex` -- see `resolve_import_targets_
+/// for`'s doc comment).
+fn remove_chain_watch_path(
+    chain_watchers: &mut HashMap<String, HashSet<String>>,
+    owning_chain_targets: &mut HashMap<String, HashSet<String>>,
+    path: &str,
+) -> Vec<String> {
+    let watchers: Vec<String> = chain_watchers.remove(path).into_iter().flatten().collect();
+    if let Some(old_targets) = owning_chain_targets.remove(path) {
+        for target in old_targets {
+            if let Some(set) = chain_watchers.get_mut(&target) {
+                set.remove(path);
+                if set.is_empty() {
+                    chain_watchers.remove(&target);
+                }
+            }
+        }
+    }
+    watchers
 }
 
 /// One file's own contribution to `resolve_import_targets_for`'s
@@ -1675,6 +2004,139 @@ mod tests {
              identical final texts -- if this ever fails, it is EITHER a settling-loop \
              regression (item 5) or a minimal repro for §11.4's still-open gap (item 6); it \
              passes today at this reduced fixture scale (see this test's own doc comment)"
+        );
+    }
+
+    /// Frente E-P0g adversarial review, attack #4: a re-export CYCLE
+    /// (`a.ts` bare-`export *`s `b.ts`, `b.ts` bare-`export *`s `a.ts`,
+    /// neither ever directly declaring the queried name) must not spin
+    /// `collect_reexport_chain_paths` forever -- its own `visiting` cycle
+    /// guard (mirroring `resolver::resolve_named_export_inner`'s) must
+    /// terminate it after visiting each `(path, name)` pair at most once,
+    /// returning exactly the two files it actually walked through, never
+    /// looping forever nor silently returning an empty/partial set.
+    #[test]
+    fn collect_reexport_chain_paths_terminates_on_a_cycle() {
+        fn minimal_star_reexporter(path: &str, star_targets: &[&str]) -> SyntaxFileResult {
+            SyntaxFileResult {
+                path: path.to_owned(),
+                content_digest: "sha256:0".to_owned(),
+                language: urdira_jsts_syntax_worker::Language::Typescript,
+                script_kind: urdira_jsts_syntax_worker::ScriptKind::Ts,
+                byte_length: 0,
+                parsed: true,
+                direct_imports: Vec::new(),
+                entities: Vec::new(),
+                relations: Vec::new(),
+                diagnostics: Vec::new(),
+                export_bindings: Vec::new(),
+                export_star_specifiers: star_targets
+                    .iter()
+                    .map(|target| urdira_jsts_syntax_worker::ExportStarSpecifier {
+                        specifier: format!("./{target}"),
+                        target_path: Some((*target).to_owned()),
+                    })
+                    .collect(),
+                ambient_modules: Vec::new(),
+                ambient_globals: Vec::new(),
+                namespace_members: Vec::new(),
+                line_index: urdira_jsts_syntax_worker::LineIndex::from_text(""),
+            }
+        }
+        let mut files: BTreeMap<String, SyntaxFileResult> = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            minimal_star_reexporter("a.ts", &["b.ts"]),
+        );
+        files.insert(
+            "b.ts".to_owned(),
+            minimal_star_reexporter("b.ts", &["a.ts"]),
+        );
+
+        let visited = collect_reexport_chain_paths(&files, "a.ts", "NeverDeclaredAnywhere");
+
+        assert_eq!(
+            visited,
+            ["a.ts".to_owned(), "b.ts".to_owned()]
+                .into_iter()
+                .collect::<BTreeSet<String>>(),
+            "a re-export cycle must terminate at exactly the two files it actually visits"
+        );
+    }
+
+    /// Frente E-P0g adversarial review, attack #4 (nested/nonlinear chain,
+    /// no cycle): `a.ts` -> `b.ts` -> `c.ts` (bare `export *` all the way
+    /// down), `c.ts` directly declares the name -- confirms the walk
+    /// includes every intermediate hop (`a.ts`, `b.ts`, `c.ts`) and stops
+    /// AT the direct declarer rather than recursing past it (there is
+    /// nothing beyond `c.ts` to visit here, but a bug that ignored the
+    /// direct-declaration base case would still show up as a panic/loop
+    /// on a deliberately malformed `files` map elsewhere -- this pins the
+    /// straight-line case's exact expected set).
+    #[test]
+    fn collect_reexport_chain_paths_includes_every_hop_in_a_three_file_chain() {
+        fn direct_declarer(path: &str, name: &str) -> SyntaxFileResult {
+            SyntaxFileResult {
+                path: path.to_owned(),
+                content_digest: "sha256:0".to_owned(),
+                language: urdira_jsts_syntax_worker::Language::Typescript,
+                script_kind: urdira_jsts_syntax_worker::ScriptKind::Ts,
+                byte_length: 0,
+                parsed: true,
+                direct_imports: Vec::new(),
+                entities: Vec::new(),
+                relations: Vec::new(),
+                diagnostics: Vec::new(),
+                export_bindings: vec![urdira_jsts_syntax_worker::SyntaxExportBinding {
+                    exported_name: name.to_owned(),
+                    local_name: name.to_owned(),
+                    source_specifier: None,
+                    source_target_path: None,
+                }],
+                export_star_specifiers: Vec::new(),
+                ambient_modules: Vec::new(),
+                ambient_globals: Vec::new(),
+                namespace_members: Vec::new(),
+                line_index: urdira_jsts_syntax_worker::LineIndex::from_text(""),
+            }
+        }
+        fn star_reexporter(path: &str, target: &str) -> SyntaxFileResult {
+            SyntaxFileResult {
+                path: path.to_owned(),
+                content_digest: "sha256:0".to_owned(),
+                language: urdira_jsts_syntax_worker::Language::Typescript,
+                script_kind: urdira_jsts_syntax_worker::ScriptKind::Ts,
+                byte_length: 0,
+                parsed: true,
+                direct_imports: Vec::new(),
+                entities: Vec::new(),
+                relations: Vec::new(),
+                diagnostics: Vec::new(),
+                export_bindings: Vec::new(),
+                export_star_specifiers: vec![urdira_jsts_syntax_worker::ExportStarSpecifier {
+                    specifier: format!("./{target}"),
+                    target_path: Some(target.to_owned()),
+                }],
+                ambient_modules: Vec::new(),
+                ambient_globals: Vec::new(),
+                namespace_members: Vec::new(),
+                line_index: urdira_jsts_syntax_worker::LineIndex::from_text(""),
+            }
+        }
+        let mut files: BTreeMap<String, SyntaxFileResult> = BTreeMap::new();
+        files.insert("a.ts".to_owned(), star_reexporter("a.ts", "b.ts"));
+        files.insert("b.ts".to_owned(), star_reexporter("b.ts", "c.ts"));
+        files.insert("c.ts".to_owned(), direct_declarer("c.ts", "Thing"));
+
+        let visited = collect_reexport_chain_paths(&files, "a.ts", "Thing");
+
+        assert_eq!(
+            visited,
+            ["a.ts".to_owned(), "b.ts".to_owned(), "c.ts".to_owned()]
+                .into_iter()
+                .collect::<BTreeSet<String>>(),
+            "every intermediate hop plus the terminal declaring file must be visited; got \
+             {visited:?}"
         );
     }
 }
