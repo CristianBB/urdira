@@ -170,3 +170,77 @@ segment's own `(index, start_char, end_char)` is attached to that
 candidate's emitted value as `semantic_evidence.matched_segment`, letting a
 future snippet renderer point at the segment that actually matched instead
 of the whole entity's span.
+
+### Amendment 2026-09-07 (Frente S-C): embed performance measurements
+
+Profiled the local neural provider's real throughput on this reference
+machine (Apple Silicon, 10 physical/logical cores) before touching anything,
+per plan §4's own "perfila primero" instruction. Findings, each measured with
+a real batch of code segments extracted from this repo's own TypeScript
+sources (not synthetic text):
+
+- **Batching (R12) was already real**, not a regression to fix:
+  `createLocalNeuralProvider`'s `generateVectors` (`packages/embedding-local/src/index.ts`)
+  already flattens every input's segments into ONE ordered list and issues
+  real multi-item `extractor(chunk)` calls (chunked at `max_segments`), never
+  one `extractor` call per document. No change needed here.
+- **`intraOpNumThreads` explicit override: measured, REJECTED.** Default
+  (unconfigured) throughput: ~75 segs/s. Forced `intraOpNumThreads: 10`
+  (all physical cores): ~72-76 segs/s -- statistically indistinguishable from
+  default. Forced `intraOpNumThreads: 1`: ~19 segs/s (confirms onnxruntime's
+  own default already parallelizes internally, to roughly the same ceiling
+  10 explicit threads reaches). Shipping an explicit thread-count override
+  would bump `executable_binding_digest` (forcing a full re-embed for every
+  existing installation) for a measured ~0% throughput gain -- not shipped.
+- **CoreML execution provider: measured, REJECTED on both counts.**
+  `executionProviders: ["coreml", "cpu"]` measured ~7 segs/s -- roughly 10x
+  SLOWER than the CPU default, not faster (per-call marshaling/compilation
+  overhead for this small, dynamically-shaped quantized model swamps any ANE/GPU
+  benefit). It also fails the plan's own "same vector, tolerance 1e-4 cosine"
+  acceptance bar: measured cosine similarity between CPU-default and CoreML
+  vectors for the SAME text was ~0.994-0.995 (correlated but not the same
+  vector) -- a real accuracy divergence, not just noise. Not shipped, either
+  reason alone would have been disqualifying.
+- **Process-level parallelism (running several embedding processes at
+  once, each on its own shard of documents): measured, real but NOT shipped
+  this session.** 1 process: ~75 segs/s. 2 concurrent processes (default
+  internal threading each): ~108 segs/s combined (~1.44x). 4 concurrent
+  processes: ~100 segs/s combined -- WORSE than 2, from thread oversubscription
+  (each process's own internal thread pool competes with the others' once
+  process-count x per-process-threads exceeds the physical core count).
+  A real, moderate win exists at 2 concurrent processes on this machine, but
+  realizing it inside `reconcileSemanticProjection` means sharding ONE pass's
+  embedding work across multiple child processes and merging their counts/
+  abort/generation bookkeeping back into one result -- a real architectural
+  change to `semantic-process.ts`/`semantic-maintenance-process.ts`, not a
+  parameter tweak, and out of this session's remaining safe-change budget.
+  Documented here as a real, measured, ~1.44x lever for a future frente,
+  not silently dropped.
+- **Artifact-vector reuse from entity segments (R9's own suggested biggest
+  lever): designed, NOT implemented.** Reusing an already-embedded entity's
+  segment vectors for its owning artifact's mean vector (embedding only the
+  text NOT covered by any entity) requires the entity pass (step 5) to run
+  BEFORE the artifact pass (step 3) for the same file, and changes what an
+  artifact vector functionally IS (a function of entity vectors PLUS
+  uncovered-span vectors, not a fresh embed of the whole file) -- a real
+  redefinition of the artifact-grain document's own computation, needing its
+  own re-embed generation bump, its own eligibility/coverage-status edge
+  cases (a file with zero eligible entities still embeds exactly as today;
+  a file fully covered by entities needs an "empty uncovered span" fast
+  path), and dedicated tests before it can safely ship. Out of this session's
+  scope given the risk of a subtle correctness regression in the artifact
+  lane every workspace already depends on; reported as the single largest
+  designed-but-undone lever for a follow-up frente.
+- **`max_segments`: unchanged.** No new evidence in this session moved R8's
+  own already-measured decision (p99=31 segments, default cap 64 stays).
+
+Net effect on the embed-throughput ceiling on THIS machine: unchanged from
+before this session (~75 segs/s single-process) -- every lever measured
+either gave ~0% (threads), a regression (CoreML), or a real-but-unshipped
+gain requiring more architecture work than this session's risk budget
+allowed (process sharding, artifact-vector reuse). A full n8n-scale re-embed
+was NOT re-attempted in this session (the prior evidence doc's own 3h44m/
+10-27h-ETA measurement already established the order of magnitude on this
+same class of hardware, and no lever here changes that order of magnitude);
+see `docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
+for the full numbers and reasoning.

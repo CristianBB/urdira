@@ -76,6 +76,52 @@ export interface SemanticReconcilerContentReader {
   readonly read: (content_hash: string) => Promise<Uint8Array>;
 }
 
+/**
+ * v4 storage wiring (2026-09-07): one candidate entity-category record, already
+ * decoded, from whatever store actually holds the structural corpus -- v3's
+ * default source (below) reads `record_occurrences`/`record_value_nodes` via
+ * `sql`, exactly as this reconciler always has; a v4-storage caller
+ * (`packages/daemon/src/runtime.ts`/`semantic-maintenance-process.ts`) instead
+ * builds one on top of the native structural store's `CanonicalQuerySnapshotPort`
+ * (`createNativeSemanticEntityRecordSource`, `semantic-entity-source-v4.ts`),
+ * since `record_occurrences`/`record_value_nodes` do not exist at all in the
+ * v4 catalog schema (docs/evidence/2026-09-02-v4-p2-1-schema.md) -- every
+ * OTHER table this reconciler touches (`artifact_versions`, `source_artifacts`,
+ * `vector_projection_rows`, `semantic_document_status`, `semantic_index_state`)
+ * is kept byte-identical between v3 and v4, so only the entity-candidate
+ * enumeration and stale-visibility check below need a pluggable source at all.
+ * `body` is ALWAYS already decoded here (unlike `MissingEntityRow.body_payload`'s
+ * lazy v3 decode) -- a v4 native-store scan has already paid that cost by the
+ * time a record reaches this shape, so there is no laziness left to preserve.
+ */
+export interface SemanticEntityCandidateRow {
+  readonly record_id: string;
+  /** The record `kind` column value (e.g. `"jsts:entity_container"`, matching `INELIGIBLE_ENTITY_RECORD_KIND`, or a real entity kind). */
+  readonly record_kind: string;
+  readonly owner_artifact_id: string;
+  readonly owner_artifact_version_id: string;
+  readonly content_hash: string;
+  readonly byte_length: number;
+  readonly display_path: string | null;
+  readonly body: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Pluggable entity-record source (see `SemanticEntityCandidateRow`'s own doc
+ * comment for why this exists). `ReconcileSemanticProjectionInput.entity_record_source`
+ * left `undefined` (every v3 caller, and every existing test in
+ * `tests/semantic-maintenance.test.ts`) keeps this reconciler's original,
+ * unmodified `record_occurrences`/`record_value_nodes`-backed behavior byte-
+ * for-byte -- this interface, and the branches that consult it, are pure
+ * additions, never a rewrite of the v3 path.
+ */
+export interface SemanticEntityRecordSource {
+  /** Every visible entity-category candidate record at the workspace's CURRENT generation, including the ineligible container kind (the caller splits by `record_kind` itself, mirroring the two separate v3 SQL queries this replaces) and excluding any record whose owning file is missing/binary. Order is not contractually significant; callers that benefit from owner-version grouping (per-file CAS text caching) sort this themselves. */
+  entityCandidates(): Promise<readonly SemanticEntityCandidateRow[]>;
+  /** Of the given record ids, the subset that is STILL VISIBLE at the workspace's CURRENT generation -- used both for the entity stale-close step and the orphaned-status-row sweep. Documented simplification versus v3 (see `createNativeSemanticEntityRecordSource`'s own doc comment): a v4 caller cannot recover the EXACT generation a now-invisible record stopped being visible at, only that it currently is not -- every v4-sourced close/sweep therefore closes/deletes AS OF the pass's own current generation, never a historically exact one. */
+  visibleRecordIds(ids: readonly string[]): Promise<ReadonlySet<string>>;
+}
+
 export interface ReconcileSemanticProjectionInput {
   readonly database: WorkspaceDatabase;
   readonly workspace_id: string;
@@ -159,6 +205,20 @@ export interface ReconcileSemanticProjectionInput {
   /** Wait for foreground query work to drain before background generation or
    * a vector commit begins. */
   readonly wait_for_query_drain?: () => Promise<void>;
+  /**
+   * v4 storage wiring (2026-09-07): when provided, the entity stale-close
+   * step (4), the entity missing-insert step (5), and the two entity-shaped
+   * bulk status statements inside `syncDocumentStatusBulk` (the ineligible-
+   * container backfill and the orphan sweep) all use THIS source instead of
+   * their default `record_occurrences`/`record_value_nodes` SQL -- see
+   * `SemanticEntityRecordSource`'s own doc comment. Every other step
+   * (profile-swap close, artifact stale-close, artifact missing-insert,
+   * the artifact-shaped bulk status statements) is untouched by this field
+   * -- `artifact_versions`/`source_artifacts` are identical in v3 and v4.
+   * Left `undefined` (every v3 caller), this reconciler's original
+   * behavior is completely unmodified.
+   */
+  readonly entity_record_source?: SemanticEntityRecordSource;
 }
 
 export interface ReconcileSemanticProjectionResult {
@@ -207,6 +267,14 @@ export interface ReconcileSemanticProjectionResult {
 const DEFAULT_MAX_DOCUMENT_BYTES = 2_000_000;
 /** Default for `ReconcileSemanticProjectionInput.embed_batch_size` -- see its own doc comment. */
 const DEFAULT_EMBED_BATCH_SIZE = 16;
+/** v4 storage wiring: batch size for the `entity_record_source`-backed bulk status statements (`syncDocumentStatusBulk`'s container backfill and orphan sweep) -- bounds both the SQLite parameter/statement count per `sql.transaction`/`IN (...)` call and, for the sweep, keeps a single `IN` clause well under any runtime's bound-variable ceiling. */
+const ENTITY_STATUS_BATCH_SIZE = 200;
+
+function chunk<T>(values: readonly T[], size: number): readonly T[][] {
+  const out: T[][] = [];
+  for (let index = 0; index < values.length; index += size) out.push(values.slice(index, index + size));
+  return out;
+}
 // Frente S-B (2026-09-06, plan §4.4/S-B.1): `DEFAULT_MIN_ENTITY_SPAN_LENGTH`,
 // `evaluateEntityEligibility`, `renderEntityDocument`, `leadingDocComment`,
 // `decodeEntityRecordBody`, `EntityEligibility`, and the two ineligibility
@@ -478,6 +546,18 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   const sql = database.database;
   const profileId = provider.profile.embedding_profile_id;
   const executableBindingId = provider.binding.executable_binding_digest;
+  const entitySource = input.entity_record_source;
+  // Memoized: `entitySource.entityCandidates()` runs one full corpus scan
+  // (see its own doc comment) -- both `syncDocumentStatusBulk`'s container
+  // backfill and step 5's missing-insert loop need the SAME result within
+  // one pass, and this function never runs those two concurrently within a
+  // single invocation, so a plain memoized promise is enough (no cache
+  // invalidation needed across separate `reconcileSemanticProjection` calls).
+  let v4CandidatesPromise: Promise<readonly SemanticEntityCandidateRow[]> | undefined;
+  const getV4EntityCandidates = (): Promise<readonly SemanticEntityCandidateRow[]> => {
+    v4CandidatesPromise ??= entitySource!.entityCandidates();
+    return v4CandidatesPromise;
+  };
 
   const currentGeneration = async (): Promise<number | undefined> => {
     const row = await sql.get<{ current_generation: number }>("SELECT current_generation FROM workspace_current_state WHERE workspace_id = ?", [workspaceId]);
@@ -556,20 +636,36 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
           )`,
       [workspaceId, profileId, executableBindingId, generation, updatedAt, workspaceId, generation, generation, profileId, executableBindingId],
     );
-    await sql.run(
-      `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
-       SELECT ?, ?, ?, 'entity', record_occurrences.record_id, record_occurrences.owner_artifact_id, record_occurrences.owner_artifact_version_id, COALESCE(source_artifacts.display_path, record_occurrences.owner_artifact_id), 'unsupported', '["unsupported_kind"]', 0, ?, ?
-         FROM record_occurrences
-         JOIN source_artifacts ON source_artifacts.workspace_id = record_occurrences.workspace_id AND source_artifacts.artifact_id = record_occurrences.owner_artifact_id
-        WHERE record_occurrences.workspace_id = ? AND record_occurrences.category = 'entity' AND record_occurrences.kind = ?
-          AND record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
-          AND NOT EXISTS (
-            SELECT 1 FROM semantic_document_status
-             WHERE semantic_document_status.workspace_id = record_occurrences.workspace_id AND semantic_document_status.profile_id = ? AND semantic_document_status.executable_binding_id = ?
-               AND semantic_document_status.document_grain = 'entity' AND semantic_document_status.document_id = record_occurrences.record_id
-          )`,
-      [workspaceId, profileId, executableBindingId, generation, updatedAt, workspaceId, INELIGIBLE_ENTITY_RECORD_KIND, generation, generation, profileId, executableBindingId],
-    );
+    if (entitySource === undefined) {
+      await sql.run(
+        `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
+         SELECT ?, ?, ?, 'entity', record_occurrences.record_id, record_occurrences.owner_artifact_id, record_occurrences.owner_artifact_version_id, COALESCE(source_artifacts.display_path, record_occurrences.owner_artifact_id), 'unsupported', '["unsupported_kind"]', 0, ?, ?
+           FROM record_occurrences
+           JOIN source_artifacts ON source_artifacts.workspace_id = record_occurrences.workspace_id AND source_artifacts.artifact_id = record_occurrences.owner_artifact_id
+          WHERE record_occurrences.workspace_id = ? AND record_occurrences.category = 'entity' AND record_occurrences.kind = ?
+            AND record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM semantic_document_status
+               WHERE semantic_document_status.workspace_id = record_occurrences.workspace_id AND semantic_document_status.profile_id = ? AND semantic_document_status.executable_binding_id = ?
+                 AND semantic_document_status.document_grain = 'entity' AND semantic_document_status.document_id = record_occurrences.record_id
+            )`,
+        [workspaceId, profileId, executableBindingId, generation, updatedAt, workspaceId, INELIGIBLE_ENTITY_RECORD_KIND, generation, generation, profileId, executableBindingId],
+      );
+    } else {
+      // v4 equivalent: `INSERT OR IGNORE` makes this idempotent per row, so
+      // no upfront "already present" check is needed -- a container record
+      // this pass has already backfilled a status row for is simply a no-op
+      // conflict on every later pass.
+      const containers = (await getV4EntityCandidates()).filter((row) => row.record_kind === INELIGIBLE_ENTITY_RECORD_KIND);
+      for (const group of chunk(containers, ENTITY_STATUS_BATCH_SIZE)) {
+        await sql.transaction(group.map((row) => ({
+          kind: "run" as const,
+          sql: `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
+                VALUES (?, ?, ?, 'entity', ?, ?, ?, ?, 'unsupported', '["unsupported_kind"]', 0, ?, ?)`,
+          params: [workspaceId, profileId, executableBindingId, row.record_id, row.owner_artifact_id, row.owner_artifact_version_id, row.display_path ?? row.owner_artifact_id, generation, updatedAt],
+        })));
+      }
+    }
     await sql.run(
       `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
        SELECT vector_projection_rows.workspace_id, vector_projection_rows.profile_id, vector_projection_rows.executable_binding_id,
@@ -598,16 +694,32 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
           )`,
       [workspaceId, profileId, executableBindingId, generation, generation],
     );
-    await sql.run(
-      `DELETE FROM semantic_document_status
-        WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'entity'
-          AND NOT EXISTS (
-            SELECT 1 FROM record_occurrences
-             WHERE record_occurrences.workspace_id = semantic_document_status.workspace_id AND record_occurrences.record_id = semantic_document_status.document_id
-               AND record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
-          )`,
-      [workspaceId, profileId, executableBindingId, generation, generation],
-    );
+    if (entitySource === undefined) {
+      await sql.run(
+        `DELETE FROM semantic_document_status
+          WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'entity'
+            AND NOT EXISTS (
+              SELECT 1 FROM record_occurrences
+               WHERE record_occurrences.workspace_id = semantic_document_status.workspace_id AND record_occurrences.record_id = semantic_document_status.document_id
+                 AND record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
+            )`,
+        [workspaceId, profileId, executableBindingId, generation, generation],
+      );
+    } else {
+      const openStatusRows = await sql.all<{ document_id: string }>(
+        "SELECT document_id FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'entity'",
+        [workspaceId, profileId, executableBindingId],
+      );
+      const openIds = openStatusRows.map((row) => row.document_id);
+      const visible = await entitySource.visibleRecordIds(openIds);
+      const staleIds = openIds.filter((id) => !visible.has(id));
+      for (const group of chunk(staleIds, ENTITY_STATUS_BATCH_SIZE)) {
+        await sql.run(
+          `DELETE FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'entity' AND document_id IN (${group.map(() => "?").join(", ")})`,
+          [workspaceId, profileId, executableBindingId, ...group],
+        );
+      }
+    }
   };
 
   // Already-complete fast path: the completion marker is only ever written
@@ -1287,20 +1399,43 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // defensive case where no `record_occurrences` row is found at all, which
   // should not happen for a `document_ref` this reconciler itself wrote --
   // falls back to the CURRENT generation via `COALESCE`.
-  const staleEntityRows = await sql.all<StaleVectorRow>(
-    `SELECT vector_projection_rows.projection_record_id AS projection_record_id, vector_projection_rows.valid_from_generation AS valid_from_generation,
-            COALESCE(record_occurrences.valid_to_generation, ?) AS closing_generation, vector_projection_rows.document_ref AS document_id
-       FROM vector_projection_rows
-       LEFT JOIN record_occurrences ON record_occurrences.workspace_id = vector_projection_rows.workspace_id
-        AND record_occurrences.record_id = vector_projection_rows.document_ref
-      WHERE vector_projection_rows.workspace_id = ? AND vector_projection_rows.valid_to_generation IS NULL
-        AND vector_projection_rows.document_grain = 'entity'
-        AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
-        AND (record_occurrences.record_id IS NULL OR NOT (
-          record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
-        ))`,
-    [generation, workspaceId, profileId, executableBindingId, generation, generation],
-  );
+  // v4 storage wiring: `entitySource` present replaces the `record_occurrences`
+  // LEFT JOIN entirely -- fetch every OPEN entity-grain row's `document_ref`,
+  // ask the source which of those record ids are still visible, and treat
+  // the rest as stale, closing AS OF the current generation (see
+  // `SemanticEntityRecordSource.visibleRecordIds`'s own doc comment for why
+  // this cannot recover an exact historical `valid_to_generation` the way
+  // the v3 join does).
+  const staleEntityRows: readonly StaleVectorRow[] = entitySource === undefined
+    ? await sql.all<StaleVectorRow>(
+        `SELECT vector_projection_rows.projection_record_id AS projection_record_id, vector_projection_rows.valid_from_generation AS valid_from_generation,
+                COALESCE(record_occurrences.valid_to_generation, ?) AS closing_generation, vector_projection_rows.document_ref AS document_id
+           FROM vector_projection_rows
+           LEFT JOIN record_occurrences ON record_occurrences.workspace_id = vector_projection_rows.workspace_id
+            AND record_occurrences.record_id = vector_projection_rows.document_ref
+          WHERE vector_projection_rows.workspace_id = ? AND vector_projection_rows.valid_to_generation IS NULL
+            AND vector_projection_rows.document_grain = 'entity'
+            AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
+            AND (record_occurrences.record_id IS NULL OR NOT (
+              record_occurrences.valid_from_generation <= ? AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
+            ))`,
+        [generation, workspaceId, profileId, executableBindingId, generation, generation],
+      )
+    : await (async (): Promise<readonly StaleVectorRow[]> => {
+        const openRows = await sql.all<{ projection_record_id: string; valid_from_generation: number; document_ref: string }>(
+          `SELECT projection_record_id, valid_from_generation, document_ref
+             FROM vector_projection_rows
+            WHERE workspace_id = ? AND valid_to_generation IS NULL AND document_grain = 'entity'
+              AND profile_id = ? AND executable_binding_id = ?`,
+          [workspaceId, profileId, executableBindingId],
+        );
+        if (openRows.length === 0) return [];
+        const visible = await entitySource.visibleRecordIds([...new Set(openRows.map((row) => row.document_ref))]);
+        return openRows.filter((row) => !visible.has(row.document_ref)).map((row) => ({
+          projection_record_id: row.projection_record_id, valid_from_generation: row.valid_from_generation,
+          closing_generation: generation, document_id: row.document_ref,
+        }));
+      })();
   for (const row of staleEntityRows) {
     if (shouldAbort?.()) return buildResult(generation, false, true);
     // Plan 2026-09-06 (Frente S-A): same one-transaction close+delete as
@@ -1328,32 +1463,70 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // still asserted defensively even though no entity record can realistically
   // own a binary file (the JS/TS analyzer that produces entity records only
   // ever runs against text it already parsed).
-  const missingEntityRows = await sql.all<MissingEntityRow>(
-    `SELECT record_occurrences.record_id AS record_id, record_occurrences.kind AS record_kind,
-            record_occurrences.owner_artifact_id AS owner_artifact_id, record_occurrences.owner_artifact_version_id AS owner_artifact_version_id,
-            record_occurrences.valid_from_generation AS valid_from_generation,
-            artifact_versions.content_hash AS content_hash, artifact_versions.byte_length AS byte_length,
-            source_artifacts.display_path AS display_path, record_occurrences.body_payload AS body_payload
-       FROM record_occurrences
-       JOIN artifact_versions ON artifact_versions.workspace_id = record_occurrences.workspace_id
-        AND artifact_versions.artifact_id = record_occurrences.owner_artifact_id
-        AND artifact_versions.artifact_version_id = record_occurrences.owner_artifact_version_id
-       JOIN source_artifacts ON source_artifacts.workspace_id = record_occurrences.workspace_id AND source_artifacts.artifact_id = record_occurrences.owner_artifact_id
-      WHERE record_occurrences.workspace_id = ? AND record_occurrences.category = 'entity' AND record_occurrences.kind <> ?
-        AND artifact_versions.encoding <> 'binary'
-        AND record_occurrences.valid_from_generation <= ?
-        AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
-        AND NOT EXISTS (
-          SELECT 1 FROM vector_projection_rows
-           WHERE vector_projection_rows.workspace_id = record_occurrences.workspace_id
-             AND vector_projection_rows.document_grain = 'entity'
-             AND vector_projection_rows.document_ref = record_occurrences.record_id
-             AND vector_projection_rows.valid_to_generation IS NULL
-             AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
-        )
-      ORDER BY record_occurrences.owner_artifact_version_id, record_occurrences.record_id`,
-    [workspaceId, INELIGIBLE_ENTITY_RECORD_KIND, generation, generation, profileId, executableBindingId],
-  );
+  // v4 storage wiring: normalized row shape both branches populate --
+  // `body` is set (pre-decoded) only for a v4-sourced row; `body_payload` is
+  // set (or `null`, meaning "decode via `record_value_nodes`") only for a
+  // v3-sourced row. The per-row decode below stays exactly as lazy for v3 as
+  // it always was (only reached once `fileState.status === "ok"`); a v4 row
+  // has nothing left to decode, since `entityCandidates()` already returned
+  // it decoded.
+  type EntityInsertRow = {
+    readonly record_id: string;
+    readonly record_kind: string;
+    readonly owner_artifact_id: string;
+    readonly owner_artifact_version_id: string;
+    readonly valid_from_generation: number;
+    readonly content_hash: string;
+    readonly byte_length: number;
+    readonly display_path: string | null;
+    readonly body_payload?: Uint8Array | ArrayBuffer | null;
+    readonly body?: Readonly<Record<string, unknown>>;
+  };
+  const missingEntityRows: readonly EntityInsertRow[] = entitySource === undefined
+    ? await sql.all<MissingEntityRow>(
+        `SELECT record_occurrences.record_id AS record_id, record_occurrences.kind AS record_kind,
+                record_occurrences.owner_artifact_id AS owner_artifact_id, record_occurrences.owner_artifact_version_id AS owner_artifact_version_id,
+                record_occurrences.valid_from_generation AS valid_from_generation,
+                artifact_versions.content_hash AS content_hash, artifact_versions.byte_length AS byte_length,
+                source_artifacts.display_path AS display_path, record_occurrences.body_payload AS body_payload
+           FROM record_occurrences
+           JOIN artifact_versions ON artifact_versions.workspace_id = record_occurrences.workspace_id
+            AND artifact_versions.artifact_id = record_occurrences.owner_artifact_id
+            AND artifact_versions.artifact_version_id = record_occurrences.owner_artifact_version_id
+           JOIN source_artifacts ON source_artifacts.workspace_id = record_occurrences.workspace_id AND source_artifacts.artifact_id = record_occurrences.owner_artifact_id
+          WHERE record_occurrences.workspace_id = ? AND record_occurrences.category = 'entity' AND record_occurrences.kind <> ?
+            AND artifact_versions.encoding <> 'binary'
+            AND record_occurrences.valid_from_generation <= ?
+            AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM vector_projection_rows
+               WHERE vector_projection_rows.workspace_id = record_occurrences.workspace_id
+                 AND vector_projection_rows.document_grain = 'entity'
+                 AND vector_projection_rows.document_ref = record_occurrences.record_id
+                 AND vector_projection_rows.valid_to_generation IS NULL
+                 AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
+            )
+          ORDER BY record_occurrences.owner_artifact_version_id, record_occurrences.record_id`,
+        [workspaceId, INELIGIBLE_ENTITY_RECORD_KIND, generation, generation, profileId, executableBindingId],
+      )
+    : await (async (): Promise<readonly EntityInsertRow[]> => {
+        const openRows = await sql.all<{ document_ref: string }>(
+          `SELECT document_ref FROM vector_projection_rows
+            WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL
+              AND profile_id = ? AND executable_binding_id = ?`,
+          [workspaceId, profileId, executableBindingId],
+        );
+        const openIds = new Set(openRows.map((row) => row.document_ref));
+        const candidates = await getV4EntityCandidates();
+        return candidates
+          .filter((row) => row.record_kind !== INELIGIBLE_ENTITY_RECORD_KIND && !openIds.has(row.record_id))
+          .map((row): EntityInsertRow => ({
+            record_id: row.record_id, record_kind: row.record_kind, owner_artifact_id: row.owner_artifact_id,
+            owner_artifact_version_id: row.owner_artifact_version_id, valid_from_generation: generation,
+            content_hash: row.content_hash, byte_length: row.byte_length, display_path: row.display_path, body: row.body,
+          }))
+          .sort((left, right) => left.owner_artifact_version_id.localeCompare(right.owner_artifact_version_id) || left.record_id.localeCompare(right.record_id));
+      })();
 
   // Owning-file text state for the CURRENT `owner_artifact_version_id` group
   // -- read (and its oversized/undecodable outcome cached) exactly ONCE per
@@ -1396,9 +1569,14 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["binary"] });
       continue;
     }
-    const body = row.body_payload == null
-      ? decodeEntityRecordBody(hydrateRelationalValue(await sql.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [workspaceId, row.record_id, row.valid_from_generation])))
-      : decodeEntityRecordBody(decodeCanonical(row.body_payload instanceof Uint8Array ? row.body_payload : new Uint8Array(row.body_payload)));
+    // v4 storage wiring: `row.body` is already decoded (native-store scan) --
+    // never re-decode it, and never fall into the v3-only `record_value_nodes`
+    // fallback (that table does not exist in the v4 catalog schema at all).
+    const body = row.body !== undefined
+      ? row.body
+      : row.body_payload == null
+        ? decodeEntityRecordBody(hydrateRelationalValue(await sql.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [workspaceId, row.record_id, row.valid_from_generation])))
+        : decodeEntityRecordBody(decodeCanonical(row.body_payload instanceof Uint8Array ? row.body_payload : new Uint8Array(row.body_payload)));
     const eligibility = evaluateEntityEligibility(row.record_kind, body, fileState.text, minEntitySpanLength);
     if (!eligibility.eligible) {
       counts.entity_skipped_ineligible += 1;

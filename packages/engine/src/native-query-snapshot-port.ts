@@ -47,6 +47,7 @@ import {
 } from "./native-structural-store-binding.js";
 import { QueryPlanError } from "./query-plan.js";
 import { decodeRow, object, type RecordRow } from "./query-record-decode.js";
+import { INELIGIBLE_ENTITY_RECORD_KIND } from "./semantic-reconciler.js";
 import type { RecordBodyInterner } from "./record-body-interner.js";
 
 const VISIBLE_BATCH_SIZE = 4_096;
@@ -438,8 +439,32 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return this.sqlite.semantic_scope_counts!(scope, maxDocumentBytes);
   }
 
+  /**
+   * v4 storage wiring (2026-09-07): UNLIKE every sibling `semantic_*` method
+   * on this class, this one does NOT delegate to `this.sqlite` -- the
+   * SQLite port's own implementation counts visible `record_occurrences`
+   * rows directly, a table the v4 catalog schema does not have at all
+   * (docs/evidence/2026-09-02-v4-p2-1-schema.md); delegating unconditionally
+   * (this class's usual "catalog/snapshots/FTS/vectors stay in SQLite"
+   * convention, module doc comment) threw "no such table: record_occurrences"
+   * outright the first time `core:search_semantic`/`core:search_hybrid`
+   * asked for it against a v4 workspace. Counted here instead via the SAME
+   * full-corpus native scan `records_by_selector`'s own fallback uses,
+   * filtered to `category === "entity"` and the same ineligible whole-
+   * file/module kind `INELIGIBLE_ENTITY_RECORD_KIND` (`semantic-reconciler.ts`)
+   * that `SemanticEntityRecordSource`'s v4 source (`semantic-entity-source-v4.ts`)
+   * also excludes -- the exact SAME candidate-entity definition on both the
+   * write side (embedding) and this read side (coverage counting).
+   */
   async semantic_entity_scope_counts(scope: QueryScope): Promise<{ readonly entity_count: number }> {
-    return this.sqlite.semantic_entity_scope_counts!(scope);
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
+    const generation = await this.ensureGeneration(scope);
+    if (generation === undefined) return { entity_count: 0 };
+    let entityCount = 0;
+    for (const row of this.scanAll(generation)) {
+      if (row.category === "entity" && row.kind !== INELIGIBLE_ENTITY_RECORD_KIND) entityCount += 1;
+    }
+    return { entity_count: entityCount };
   }
 
   async semantic_document_status_counts(scope: QueryScope, profileId: string, executableBindingId: string): Promise<SemanticDocumentStatusCounts> {

@@ -1,6 +1,7 @@
 import { reconcileSemanticProjection } from "@urdira/engine";
 import { createDurableStorage } from "@urdira/storage";
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
+import { resolveV4SemanticEntitySource } from "./semantic-v4-wiring.js";
 import type { SemanticProcessJob } from "./semantic-process.js";
 import process from "node:process";
 
@@ -21,7 +22,12 @@ process.once("message", async (message: Message) => {
     storage = await createDurableStorage({ rootDir: message.job.data_root, skip_startup_recovery: true });
     const database = await storage.openWorkspace(message.job.workspace_id);
     const provider = await buildSemanticProvider(message.job.descriptor);
-    const result = await reconcileSemanticProjection({ database, workspace_id: message.job.workspace_id, content: storage.cas, provider, ...(message.job.max_document_bytes === undefined ? {} : { max_document_bytes: message.job.max_document_bytes }), ...(message.job.embed_batch_size === undefined ? {} : { embed_batch_size: message.job.embed_batch_size }), should_abort: () => aborted });
+    // v4 storage wiring (2026-09-07): `undefined` for a v3 workspace, which
+    // keeps `reconcileSemanticProjection`'s original `record_occurrences`/
+    // `record_value_nodes` SQL path completely unmodified -- see
+    // `resolveV4SemanticEntitySource`'s own doc comment.
+    const entityRecordSource = await resolveV4SemanticEntitySource(database, storage.cas, message.job.workspace_id);
+    const result = await reconcileSemanticProjection({ database, workspace_id: message.job.workspace_id, content: storage.cas, provider, ...(message.job.max_document_bytes === undefined ? {} : { max_document_bytes: message.job.max_document_bytes }), ...(message.job.embed_batch_size === undefined ? {} : { embed_batch_size: message.job.embed_batch_size }), ...(entityRecordSource === undefined ? {} : { entity_record_source: entityRecordSource }), should_abort: () => aborted });
     await database.close().catch(() => undefined);
     await storage.close().catch(() => undefined);
     storage = undefined;

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
 import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type ContentAddressedStore, type WorkspaceDatabase } from "../packages/storage/src/index.js";
-import { createHttpEmbeddingProvider, createLocalHashProvider, reconcileSemanticProjection, type ResolvedSemanticProvider, type SemanticReconcilerContentReader } from "../packages/engine/src/index.js";
+import { createHttpEmbeddingProvider, createLocalHashProvider, reconcileSemanticProjection, type ResolvedSemanticProvider, type SemanticEntityCandidateRow, type SemanticEntityRecordSource, type SemanticReconcilerContentReader } from "../packages/engine/src/index.js";
 
 // `reconcileSemanticProjection` is typed against `@urdira/storage`'s
 // published (dist) `WorkspaceDatabase` declaration, since that is the real
@@ -1400,6 +1400,151 @@ describe("decision 17 entity-eligibility policy digest (marker-level backfill tr
       const marker = await opened.projections.semanticIndexState();
       expect(marker?.entity_policy_digest).toMatch(/^sha256:/);
       expect(marker?.entity_policy_digest).not.toBe("sha256:old-policy");
+    });
+  });
+});
+
+// v4 storage wiring (2026-09-07): `entity_record_source` (`ReconcileSemanticProjectionInput`)
+// replaces the entity pass's `record_occurrences`/`record_value_nodes` SQL
+// with a pluggable source -- exercised here against a FAKE source (a v4
+// workspace's real source is `createNativeSemanticEntityRecordSource`,
+// `semantic-entity-source-v4.ts`, covered by its own native-store-facing
+// tests) since this reconciler itself must not care WHICH source it was
+// handed. `artifact_versions`/`source_artifacts` are seeded exactly like
+// every other test in this file (both tables are byte-identical between v3
+// and v4) -- no `record_occurrences` row is ever seeded in this describe
+// block, proving the entity pass never falls back to it when a source is
+// provided.
+function fakeEntitySource(initialCandidates: readonly SemanticEntityCandidateRow[]): SemanticEntityRecordSource & { readonly calls: { entityCandidates: number; visibleRecordIds: number }; setVisibleIds: (ids: readonly string[]) => void } {
+  let visible = new Set(initialCandidates.map((row) => row.record_id));
+  const calls = { entityCandidates: 0, visibleRecordIds: 0 };
+  return {
+    calls,
+    setVisibleIds: (ids: readonly string[]): void => { visible = new Set(ids); },
+    entityCandidates: async (): Promise<readonly SemanticEntityCandidateRow[]> => {
+      calls.entityCandidates += 1;
+      return initialCandidates.filter((row) => visible.has(row.record_id));
+    },
+    visibleRecordIds: async (ids: readonly string[]): Promise<ReadonlySet<string>> => {
+      calls.visibleRecordIds += 1;
+      return new Set(ids.filter((id) => visible.has(id)));
+    },
+  };
+}
+
+async function ownerFileMeta(opened: WorkspaceDatabase, artifactVersionId: string): Promise<{ readonly content_hash: string; readonly byte_length: number }> {
+  const row = await opened.database.get<{ content_hash: string; byte_length: number }>("SELECT content_hash, byte_length FROM artifact_versions WHERE artifact_version_id = ?", [artifactVersionId]);
+  if (row === undefined) throw new Error(`No artifact_versions row for ${artifactVersionId}.`);
+  return row;
+}
+
+type V4TestStatusRow = { readonly document_id: string; readonly status: string; readonly reason_codes: string };
+async function v4TestStatusRows(opened: WorkspaceDatabase, workspaceId: string, profileId: string, executableBindingId: string): Promise<readonly V4TestStatusRow[]> {
+  return opened.database.all<V4TestStatusRow>(
+    "SELECT document_id, status, reason_codes FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'entity' ORDER BY document_id",
+    [workspaceId, profileId, executableBindingId],
+  );
+}
+
+describe("reconcileSemanticProjection entity pass with entity_record_source (v4 storage wiring)", () => {
+  it("embeds eligible candidates and skips the ineligible container kind from ONE fake source, exactly like the v3 record_occurrences path", async () => {
+    const workspaceId = "ws-semantic-v4-entity-source";
+    const provider = createLocalHashProvider();
+    const functionBody = `export function v4SourceEligible() {\n  // ${ENTITY_SPAN_PADDING}\n  return 1;\n}`;
+    const funcStart = functionBody.indexOf("export");
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-v4", artifactVersionId: "artv-v4", text: functionBody, validFromGeneration: 1, displayPath: "src/v4.ts" });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const meta = await ownerFileMeta(opened, "artv-v4");
+
+      const source = fakeEntitySource([
+        { record_id: "entity-eligible", record_kind: "jsts:entity_callable", owner_artifact_id: "art-v4", owner_artifact_version_id: "artv-v4", content_hash: meta.content_hash, byte_length: meta.byte_length, display_path: "src/v4.ts", body: { kind: "function", name: "v4SourceEligible", start: funcStart, end: functionBody.length } },
+        { record_id: "entity-container", record_kind: "jsts:entity_container", owner_artifact_id: "art-v4", owner_artifact_version_id: "artv-v4", content_hash: meta.content_hash, byte_length: meta.byte_length, display_path: "src/v4.ts", body: { kind: "module", name: "v4.ts", start: 0, end: functionBody.length } },
+      ]);
+
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
+      expect(result.entity_inserted).toBe(1);
+      expect(result.entity_skipped_ineligible).toBe(0);
+      expect(result.entity_failed).toBe(0);
+      expect(result.marker_written).toBe(true);
+      // The v3 fallback path was never reached: no `record_occurrences` row
+      // exists for this workspace at all, so a SQL query against it would
+      // have thrown "no such table" (v4 catalog) or returned zero rows and
+      // failed this assertion outright (v3 schema, empty table) either way.
+      expect(source.calls.entityCandidates).toBe(1);
+
+      const entityRows = await opened.database.all<{ document_ref: string | null }>(
+        "SELECT document_ref FROM vector_projection_rows WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL", [workspaceId],
+      );
+      expect(entityRows.map((row) => row.document_ref)).toEqual(["entity-eligible"]);
+
+      const statusRowsResult = await v4TestStatusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const containerStatus = statusRowsResult.find((row) => row.document_id === "entity-container");
+      expect(containerStatus).toMatchObject({ status: "unsupported", reason_codes: JSON.stringify(["unsupported_kind"]) });
+    });
+  });
+
+  it("closes an entity vector once the fake source reports its record no longer visible", async () => {
+    const workspaceId = "ws-semantic-v4-entity-stale";
+    const provider = createLocalHashProvider();
+    const functionBody = `export function v4SourceStale() {\n  // ${ENTITY_SPAN_PADDING}\n  return 1;\n}`;
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-stale", artifactVersionId: "artv-stale", text: functionBody, validFromGeneration: 1, displayPath: "src/stale.ts" });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const meta = await ownerFileMeta(opened, "artv-stale");
+      const candidate: SemanticEntityCandidateRow = { record_id: "entity-stale", record_kind: "jsts:entity_callable", owner_artifact_id: "art-stale", owner_artifact_version_id: "artv-stale", content_hash: meta.content_hash, byte_length: meta.byte_length, display_path: "src/stale.ts", body: { kind: "function", name: "v4SourceStale", start: functionBody.indexOf("export"), end: functionBody.length } };
+      const source = fakeEntitySource([candidate]);
+
+      const first = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
+      expect(first.entity_inserted).toBe(1);
+
+      // The record disappears from the source entirely (e.g. its owning
+      // declaration was deleted) without any workspace generation bump --
+      // `visibleRecordIds` now reports it absent.
+      source.setVisibleIds([]);
+      await setCurrentGeneration(opened, workspaceId, 2);
+      const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
+      expect(second.entity_closed).toBe(1);
+      expect(second.entity_inserted).toBe(0);
+
+      const openRow = await opened.database.get<{ document_ref: string }>("SELECT document_ref FROM vector_projection_rows WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL", [workspaceId]);
+      expect(openRow).toBeUndefined();
+    });
+  });
+
+  it("a reconcile no-op (unchanged generation/provider/policy) never calls the entity source again -- proves the fast path skips re-embedding, not just re-inserting", async () => {
+    const workspaceId = "ws-semantic-v4-entity-noop";
+    const provider = createLocalHashProvider();
+    const functionBody = `export function v4SourceNoop() {\n  // ${ENTITY_SPAN_PADDING}\n  return 1;\n}`;
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-noop", artifactVersionId: "artv-noop", text: functionBody, validFromGeneration: 1, displayPath: "src/noop.ts" });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const meta = await ownerFileMeta(opened, "artv-noop");
+      const source = fakeEntitySource([
+        { record_id: "entity-noop", record_kind: "jsts:entity_callable", owner_artifact_id: "art-noop", owner_artifact_version_id: "artv-noop", content_hash: meta.content_hash, byte_length: meta.byte_length, display_path: "src/noop.ts", body: { kind: "function", name: "v4SourceNoop", start: functionBody.indexOf("export"), end: functionBody.length } },
+      ]);
+
+      const first = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
+      expect(first.entity_inserted).toBe(1);
+      expect(first.marker_written).toBe(true);
+      expect(source.calls.entityCandidates).toBe(1);
+      // One call from `syncDocumentStatusBulk`'s orphan sweep, which always
+      // runs at the end of a full pass (including the very first one) once
+      // ANY entity-grain status row exists to check -- not from step 4
+      // (nothing was open yet to consider stale on a first pass).
+      expect(source.calls.visibleRecordIds).toBe(1);
+      const callsAfterFirst = { ...source.calls };
+
+      // Simulates the daemon's own `runV4WorkspaceScan` -> `submitSemanticMaintenance`
+      // sequence after a `ScanScope::Reconcile` no-op (generation unchanged,
+      // nothing published): re-running against the IDENTICAL generation must
+      // hit `reconcileSemanticProjection`'s own already-complete fast path
+      // (marker + `hasAnyDocumentStatus()` both already satisfied) and never
+      // touch the entity source again -- not even the orphan sweep, which
+      // the fast path skips entirely once status rows already exist.
+      const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
+      expect(second).toEqual({ ...first, closed: 0, inserted: 0, entity_inserted: 0 });
+      expect(source.calls).toEqual(callsAfterFirst);
     });
   });
 });

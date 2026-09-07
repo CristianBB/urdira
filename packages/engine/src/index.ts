@@ -440,7 +440,10 @@ export {
   type SemanticReconcilerContentReader,
   type ReconcileSemanticProjectionInput,
   type ReconcileSemanticProjectionResult,
+  type SemanticEntityCandidateRow,
+  type SemanticEntityRecordSource,
 } from "./semantic-reconciler.js";
+export { createNativeSemanticEntityRecordSource, type EntityScanPort } from "./semantic-entity-source-v4.js";
 export {
   SemanticUpdater,
   type SemanticCoverageStatus,
