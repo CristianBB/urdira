@@ -80,12 +80,24 @@
 //! path` reverse index built once from the workspace's `Frontier`
 //! (mirrors `delta.rs`'s own `old_owner_ordinal` reverse-lookup pattern).
 //! An entity's own id is recovered the same way: this module's own
-//! `(path, name_start) -> record_id` index, built from every visible
-//! entity record's `span_start_byte` (which -- for THIS pipeline's entity
-//! producer, `urdira-jsts-syntax-worker`'s `push_entity` -- is already the
-//! NAME identifier's own UTF-16 start, not the whole declaration's span;
-//! see `crate::v4::materialize`'s module doc and `lib.rs`'s
-//! `SyntaxCollector::push_entity`).
+//! `(path, name_start) -> record_id` index (`EntityLookup`, below), backed
+//! by `entities.index`'s own `(owner_artifact, name_start, ordinal)`
+//! triples (`StoreReader::entity_by_owner_and_start`).
+//!
+//! Frente E-P0j (2026-09-07): before this task, `entities.index` was keyed
+//! by `RecordRow::span_start_byte` directly, because every entity producer
+//! published THAT field as the identifier's own UTF-16 start (`urdira-jsts-
+//! syntax-worker`'s `push_entity`). That task moved `span_start_byte`
+//! (the record's own PUBLISHED span, `SyntaxEntity::start`/`.end`) to the
+//! WHOLE DECLARATION for fidelity -- so `entities.index`'s own build now
+//! recovers the identifier start from each entity's `identity_key` text
+//! instead (`urdira_structural_store::entity_identity_name_start`, called
+//! from `segment_io::entities_index_key_start` at write time), since
+//! identity itself is UNCHANGED, still anchored to the identifier
+//! (decision 11). This module's own lookups (`EntityLookup::lookup`,
+//! `try_synthesize_member_entity`'s cache key, ...) are entirely
+//! unaffected: they already always passed a tsgo-reported `name_start_
+//! utf16`, never a declaration span, in.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
@@ -1967,9 +1979,17 @@ fn collect<'a>(
                 let Some(path) = owner_path(view.owner_artifact()) else {
                     continue;
                 };
+                // Frente E-P0j: keyed by the identifier's own start
+                // (recovered from `identity_key`, same as the `Section`
+                // variant's own `entities.index` build), NOT `span_start_
+                // byte` any more -- see `urdira_structural_store::
+                // entity_identity_name_start`'s doc comment.
+                let name_start =
+                    urdira_structural_store::entity_identity_name_start(&view.identity_key())
+                        .unwrap_or_else(|| view.span_start_byte());
                 entity_entries.push((
                     path,
-                    view.span_start_byte() as i32,
+                    name_start as i32,
                     materialize::hex_encode(&view.record_id()),
                 ));
             }
@@ -4171,7 +4191,12 @@ mod tests {
             let Some(path) = owner_path(view.owner_artifact()) else {
                 continue;
             };
-            let start = view.span_start_byte() as i32;
+            // Frente E-P0j: group by the SAME key `entities.index`/
+            // `EntityLookup` both now use -- the identifier's own start,
+            // recovered from `identity_key` -- not `span_start_byte`
+            // (the whole declaration's span, as of this task).
+            let start = urdira_structural_store::entity_identity_name_start(&view.identity_key())
+                .unwrap_or_else(|| view.span_start_byte()) as i32;
             let entry = candidates_by_key
                 .entry((path, start))
                 .or_insert_with(|| (view.owner_artifact(), Vec::new()));

@@ -108,6 +108,55 @@ pub fn reconstruct_entity(kind: &str, path: &str, start: u32, name: &str) -> Vec
     out
 }
 
+/// Frente E-P0j (2026-09-07): recovers an entity record's own NAME-
+/// IDENTIFIER start offset from its `identity_key` text -- `entities.
+/// index`'s own build key (`segment_io::is_entities_index_row`'s call
+/// sites) needs this, not `RecordRow::span_start_byte` any more.
+///
+/// Before this task, `entities.index` was keyed directly off `RecordRow::
+/// span_start_byte`, because every entity producer published that field as
+/// the identifier's own span. This task moves the PUBLISHED `start`/`end`
+/// (`span_start_byte`/`span_end_byte`) to the WHOLE DECLARATION's span for
+/// fidelity (a real function/variable/class/... is now byte-sliceable from
+/// its own record) -- but `urdira-indexing-worker::v4::residual`'s checker-
+/// site correlation, and `entities.index` itself, both still need "which
+/// entity record starts at THIS identifier position" (a tsgo-reported
+/// `name_start_utf16`), never "which entity's declaration CONTAINS this
+/// position". Rather than adding a new stored column (a store-format bump
+/// touching `urdira-native-core`'s kernel row shape, this crate's row/
+/// segment/layout modules, AND `urdira-indexing-worker`'s materialize pass
+/// -- out of proportion to what is, in the end, already-stored information),
+/// this recovers the identifier start from the SAME text every entity
+/// identity already carries: every producer's `jsts:{kind}:{path}:
+/// {name_start}:{name}` recipe (`stable_entity_id`/`declaration_id` in
+/// `urdira-jsts-syntax-worker`, unaffected by this task -- identity stays
+/// anchored to the identifier, decision 11) -- so this is a PARSE of
+/// already-durable bytes, not a new fact.
+///
+/// Parses the SECOND-TO-LAST `:`-delimited segment as a decimal `u32`
+/// (`name` is the last segment, mirroring `urdira-indexing-worker::v4::
+/// materialize::identity_key_name`'s own `rsplit(':').next()` convention
+/// and sharing its same known limitation: a `name`/`path` containing a
+/// literal `:` is not handled -- workspace paths never do, by this
+/// codebase's own established convention, e.g. `confirmed_relation_kind`'s
+/// identical assumption). Returns `None` for a shape with no such segment
+/// at all (`jsts:external_module:{specifier}`/`jsts:external_symbol:
+/// {specifier}`, which have no per-file span -- `start`/`end` are always
+/// `0` for those two kinds, see `external_module_entity`/`external_symbol_
+/// entity`'s own doc comments) or one whose candidate segment does not
+/// parse as a plain `u32` -- callers fall back to `0` in both cases,
+/// matching those two kinds' own always-`0` span.
+pub fn entity_identity_name_start(identity_key: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(identity_key).ok()?;
+    let mut parts: Vec<&str> = text.split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    parts.pop(); // name
+    let start_text = parts.pop()?;
+    start_text.parse::<u32>().ok()
+}
+
 /// `jsts:{rel}:{path}:{start}:{end}:{source_identity_key}:
 /// {target_identity_key}` -- `source_key`/`target_key` are the two
 /// endpoints' own (possibly themselves reconstructed) identity key BYTES,
