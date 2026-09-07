@@ -2265,6 +2265,7 @@ fn unaffected_transitive_importer_produces_identical_records_across_an_increment
         changed_artifact_ids,
         &mut incremental_clock,
         &mut typeflow_cache,
+        &[],
     )
     .expect("incremental analyze succeeds");
 
@@ -2612,6 +2613,7 @@ fn surface_unchanged_edit_narrows_the_affected_closure_to_the_literal_edit() {
         changed_artifact_ids,
         &mut incremental_clock,
         &mut typeflow_cache,
+        &[],
     )
     .expect("incremental analyze succeeds");
 
@@ -4253,6 +4255,286 @@ fn incremental_ambient_declaration_flips_a_previously_external_importer() {
     assert_eq!(incremental_roots.records, oracle_roots.records);
     assert_eq!(incremental_roots.dependency, oracle_roots.dependency);
     assert_eq!(incremental_roots.graph, oracle_roots.graph);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Frente E-P0f (2026-09-07, ambient-global-dependents integrity fix):
+/// `docs/evidence/2026-09-06-v4-reconcile-threshold.md` §14.3's own repro,
+/// minimized to this crate's fixture -- a SCRIPT file (no top-level
+/// `import`/`export` of its own) declaring an interface and a `declare
+/// const` extends the shared global scope with NO import statement
+/// anywhere for the ordinary reverse-import machinery to find; a separate
+/// MODULE file uses both names with no import either. Deleting the script
+/// must leave the module's `core:references` rows to those two names
+/// exactly as an independent from-scratch scan of the post-delete tree
+/// would (gone, not dangling) -- before this fix, they survived untouched
+/// (§14.3's own "4 stale `jsts:references` relations" finding).
+#[test]
+fn incremental_delete_of_an_ambient_global_declaring_script_reprocesses_its_dependent() {
+    let scratch_root = scratch_dir("incremental-ambient-global-delete");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let globals_relative = "src/domain/urdira-harness-ambient-globals.ts";
+    let globals_text = "interface Summary {\n  total: number;\n}\ndeclare const VERSION: string;\n";
+    std::fs::write(workspace_root.join(globals_relative), globals_text)
+        .expect("write ambient-globals script");
+
+    let report_relative = "src/domain/urdira-harness-ambient-report.ts";
+    let report_text = "export function describe(input: Summary): string {\n  return VERSION + String(input.total);\n}\n";
+    std::fs::write(workspace_root.join(report_relative), report_text).expect("write report module");
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-ambient-global-delete",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // Sanity check (and direct proof of the producer side, `OwnerSemantics::
+    // ambient_global_dependencies`/`deps.rs::DEPENDENCY_ROLE_AMBIENT_GLOBAL_
+    // INPUT`): at generation 1, `report_relative` must carry a `core:
+    // references` relation targeting each of `Summary`/`VERSION`, AND a
+    // persisted `DependencyRow` (role `AMBIENT_GLOBAL_DEPENDENCY_ROLE`)
+    // naming `globals_relative` as its dependency target -- the exact edge
+    // §14.3 found missing.
+    {
+        let reader = StoreReader::open(&structural_root).expect("StoreReader opens");
+        let dicts = reader.dictionaries();
+        let conn =
+            catalog::open_and_ensure_schema(&database_path).expect("catalog opens for lookup");
+        let frontier =
+            urdira_source_frontier::Frontier::load(&conn, "workspace:v4-e2e-ambient-global-delete")
+                .expect("frontier loads");
+        drop(conn);
+        let report_entry = frontier
+            .present
+            .get(report_relative)
+            .expect("report file present in frontier");
+        let report_ordinal = dicts
+            .artifacts
+            .iter()
+            .position(|pair| {
+                pair.0 == report_entry.artifact_id && pair.1 == report_entry.artifact_version_id
+            })
+            .expect("report artifact interned") as u32;
+        let deps = reader.deps_by_owner(report_ordinal, 1);
+        let ambient_deps: Vec<_> = deps
+            .iter()
+            .filter(|d| d.role() == super::deps::DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT)
+            .collect();
+        assert!(
+            !ambient_deps.is_empty(),
+            "expected at least one ambient-global DependencyRow for {report_relative}, got {} total deps",
+            deps.len()
+        );
+        let globals_entry = frontier
+            .present
+            .get(globals_relative)
+            .expect("globals file present in frontier");
+        let globals_ordinal = dicts
+            .artifacts
+            .iter()
+            .position(|pair| {
+                pair.0 == globals_entry.artifact_id && pair.1 == globals_entry.artifact_version_id
+            })
+            .expect("globals artifact interned") as u32;
+        assert!(
+            ambient_deps
+                .iter()
+                .any(|d| d.dep_artifact() == globals_ordinal),
+            "expected the ambient DependencyRow to target {globals_relative}"
+        );
+    }
+
+    std::fs::remove_file(workspace_root.join(globals_relative)).expect("remove ambient script");
+
+    let incremental = run_scan(
+        "request:incremental-ambient-global-delete",
+        "workspace:v4-e2e-ambient-global-delete",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: globals_relative.to_string(),
+                kind: ChangeKind::Deleted,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&incremental), 2);
+
+    let oracle_root = scratch_dir("incremental-ambient-global-delete-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-ambient-global-delete-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    let incremental_roots = roots_of(&incremental);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(
+        incremental_roots.records, oracle_roots.records,
+        "records root must match a from-scratch scan of the post-delete tree (pure delete: no decision-11 chaining)"
+    );
+    assert_eq!(
+        incremental_roots.dependency, oracle_roots.dependency,
+        "dependency root must match -- the ambient DependencyRow itself must close along with the deleted owner"
+    );
+    assert_eq!(
+        incremental_roots.graph, oracle_roots.graph,
+        "graph root must match -- this is exactly §14.3's own regression: 4 stale jsts:references rows diverging graph"
+    );
+
+    let incremental_pending = pending_site_set(
+        &structural_root,
+        &database_path,
+        "workspace:v4-e2e-ambient-global-delete",
+    );
+    let oracle_pending = pending_site_set(
+        &oracle_structural,
+        &oracle_database,
+        "workspace:v4-e2e-ambient-global-delete-oracle",
+    );
+    assert_eq!(
+        incremental_pending, oracle_pending,
+        "pending-site set must match a from-scratch scan after the ambient script's deletion"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// Frente E-P0f sibling case: EDITING the declaring script (renaming
+/// `Summary` -> `Summary2`, so the module's OWN reference to `Summary` no
+/// longer has anything to resolve to) must reprocess the dependent exactly
+/// like a delete does -- same reverse-dependency edge, different trigger
+/// (`ChangeKind::Modified` instead of `Deleted`, exercising this fix's own
+/// `touched_old_ordinals` filter's OTHER branch).
+#[test]
+fn incremental_edit_of_an_ambient_global_declaring_script_reprocesses_its_dependent() {
+    let scratch_root = scratch_dir("incremental-ambient-global-edit");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let globals_relative = "src/domain/urdira-harness-ambient-globals-edit.ts";
+    let globals_text_v1 = "interface Summary {\n  total: number;\n}\n";
+    std::fs::write(workspace_root.join(globals_relative), globals_text_v1)
+        .expect("write ambient-globals script v1");
+
+    let report_relative = "src/domain/urdira-harness-ambient-report-edit.ts";
+    let report_text =
+        "export function describe(input: Summary): number {\n  return input.total;\n}\n";
+    std::fs::write(workspace_root.join(report_relative), report_text).expect("write report module");
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-ambient-global-edit",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // Rename the declared interface -- `report_relative`'s own bytes never
+    // change, so it is never in `changed_artifact_ids` on its own; only the
+    // reverse-dependent widening this fix adds can pull it back in.
+    let globals_text_v2 = "interface Summary2 {\n  total: number;\n}\n";
+    std::fs::write(workspace_root.join(globals_relative), globals_text_v2)
+        .expect("rewrite ambient-globals script v2");
+
+    let incremental = run_scan(
+        "request:incremental-ambient-global-edit",
+        "workspace:v4-e2e-ambient-global-edit",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: globals_relative.to_string(),
+                kind: ChangeKind::Modified,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&incremental), 2);
+
+    let oracle_root = scratch_dir("incremental-ambient-global-edit-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-ambient-global-edit-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+
+    // A content EDIT can legitimately chain (decision 11) unlike a pure
+    // delete -- compare the logical record set the same way every other
+    // `Delta`+edit test in this module does, via `dependency`/`graph`
+    // (never chained) plus a direct logical-set check on `records`.
+    let incremental_roots = roots_of(&incremental);
+    let oracle_roots = roots_of(&oracle);
+    assert_eq!(
+        incremental_roots.dependency, oracle_roots.dependency,
+        "dependency root must match -- report_relative's own ambient dependency must repoint (or close) exactly like an independent oracle's"
+    );
+    assert_eq!(
+        incremental_roots.graph, oracle_roots.graph,
+        "graph root must match -- report_relative's stale core:references to the OLD name Summary must not survive the rename"
+    );
 
     let _ = std::fs::remove_dir_all(&scratch_root);
     let _ = std::fs::remove_dir_all(&oracle_root);

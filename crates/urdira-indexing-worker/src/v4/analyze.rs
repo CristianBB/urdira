@@ -20,6 +20,7 @@
 //! brief: v4 does not emit them).
 
 use super::ScanError;
+use super::deps::AMBIENT_GLOBAL_DEPENDENCY_ROLE;
 use super::timings::ScanClock;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -344,6 +345,27 @@ pub fn run_scoped(
     clock: &mut ScanClock,
     typeflow: &mut super::typeflow::TypeflowCache,
     cas_signal: Option<&CasWrittenSignal>,
+    // Frente E-P0f (2026-09-07, ambient-global-dependents integrity fix):
+    // paths the CALLER (`delta::run_one`) already proved need reprocessing
+    // via a store-level reverse-dependency lookup (`StoreReader::
+    // deps_reverse` over `DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT` rows) that
+    // `syntax.analyze()` itself has no way to discover on its own -- see
+    // that call site's own doc comment for the full root-cause writeup.
+    // Deliberately NOT folded into `change_set`'s `changed_artifact_ids`:
+    // `authoritative_changed_paths` (`urdira-jsts-syntax-worker::lib.rs`)
+    // validates that set against the retained/current manifest's OWN
+    // content-diff, byte for byte -- declaring a byte-IDENTICAL file's
+    // artifact id there is rejected outright ("do not match the retained
+    // manifest transition"), a real bug this fix's first draft hit live.
+    // Unioned into `affected_paths` below, AFTER `syntax.analyze()` returns
+    // (never before it runs, and never validated against it) -- `facts_
+    // for_paths`/the hybrid lane both read straight from `syntax`'s already
+    // -cached per-file state, so a path that is affected but never
+    // reparsed this call works exactly the same way `ambient_affected`
+    // (ambient MODULE reprocessing, `syntax.analyze()`'s own internal
+    // mechanism) already does at the syntax-worker layer -- this is that
+    // same shape, one level up, for ambient GLOBAL reprocessing instead.
+    extra_affected_paths: &[String],
 ) -> Result<ColdAnalysis, ScanError> {
     if files.is_empty() {
         return Ok(ColdAnalysis { owners: Vec::new() });
@@ -521,6 +543,18 @@ pub fn run_scoped(
     // supposed to be skipped for THIS caller's purposes.
     if is_full_change_set {
         affected_paths = files.iter().map(|file| file.path.clone()).collect();
+    }
+
+    // Frente E-P0f: fold in the caller's own reverse-ambient-dependent
+    // widening (see this parameter's own doc comment) -- a no-op Vec for
+    // `run_cold`/every OTHER `run_incremental` caller (a `Full` scan's
+    // `affected_paths` already names every present path; a genuinely
+    // reverse-dependent path never resolvable through this scan's own
+    // membership diff needs this only on the `Exact` incremental path).
+    if !extra_affected_paths.is_empty() {
+        let mut widened: BTreeSet<String> = affected_paths.into_iter().collect();
+        widened.extend(extra_affected_paths.iter().cloned());
+        affected_paths = widened.into_iter().collect();
     }
 
     let files_by_path: HashMap<&str, &SourceInput> = files
@@ -834,6 +868,66 @@ pub fn run_scoped(
         owner.records.extend(semantics.external_contains_rows);
         owner.pending_sites = semantics.pending_sites;
         owner.pending_site_rows = semantics.pending_site_rows;
+        // Frente E-P0f (2026-09-07, ambient-global-dependents integrity
+        // fix): turn every cross-file ambient-global dependency this
+        // owner's hybrid lane just proved (`OwnerSemantics::ambient_
+        // global_dependencies`) into a `ProposedRecordDependency` on the
+        // SAME channel `deps.rs::materialize_dependencies` already uses
+        // for ordinary import/export dependencies -- see that field's own
+        // doc comment for the full root-cause writeup: without a
+        // persisted `DependencyRow` here, a LATER generation's delta
+        // computation has no edge to walk when the declaring script
+        // itself is edited/deleted/created, so this owner's own stale
+        // `core:references` rows (materialized THIS generation, from THIS
+        // exact resolution) would survive untouched forever.
+        //
+        // `dependency_target_path`/`dependency_artifact_id`/`_version_id`
+        // are resolved the same way `owner.owner_artifact_id`/`_version_id`
+        // are above (line ~579): straight from this SAME scan's own
+        // `files_by_path`, never `project.source_metadata` (that map lives
+        // inside `urdira-jsts-syntax-worker`'s private `ProjectState`, not
+        // exposed to this crate) -- the declaring path came from `ambient_
+        // index`, itself built from this SAME `project_files`/`files`
+        // snapshot, so it is always a member of `files_by_path` too.
+        // `proposed_dependency_id`/`proposal_record_key` are deliberately
+        // NOT built the `resolved_dependencies` way (hashed from an
+        // underlying `core:import`/`core:export` relation's own `id`) --
+        // an ambient-global dependency has no single relation it
+        // exclusively backs (one script -> declarer edge can underlie
+        // several distinct `core:references` occurrences in this owner),
+        // so `record_ordinal_by_proposal_key` is expected to (and always
+        // does) miss for these, leaving `DependencyRow.record` `None` --
+        // exactly the same "handled defensively" case `deps.rs::
+        // materialize_dependencies`'s own doc comment already documents
+        // for a dependency with no attached relation record.
+        for declaring_path in &semantics.ambient_global_dependencies {
+            let Some(declaring_file) = files_by_path.get(declaring_path.as_str()) else {
+                // Defensive only: `declaring_path` was proven live by THIS
+                // SAME scan's own `ambient_index` (built from `project_
+                // files`, itself derived from `files`), so it is always
+                // present here too.
+                continue;
+            };
+            owner.dependencies.push(ProposedRecordDependency {
+                proposed_dependency_id: format!(
+                    "jsts:ambient-global-dependency:{}->{declaring_path}",
+                    owner.owner_path,
+                ),
+                proposal_record_key: format!(
+                    "jsts:ambient-global-dependency-record:{}->{declaring_path}",
+                    owner.owner_path,
+                ),
+                dependency_artifact_id: declaring_file.artifact_id.clone(),
+                dependency_artifact_version_id: declaring_file.artifact_version_id.clone(),
+                dependency_target_path: declaring_path.clone(),
+                dependency_role: AMBIENT_GLOBAL_DEPENDENCY_ROLE,
+                dependency_basis: "ambient_global_resolution",
+                source_reference: serde_json::json!({
+                    "reference_type": "ambient_global",
+                    "declaring_path": declaring_path,
+                }),
+            });
+        }
     }
 
     let mut owners: Vec<OwnerFacts> = owners.into_values().collect();
@@ -962,6 +1056,7 @@ pub fn run_cold(
         clock,
         &mut typeflow_cache,
         Some(cas_signal),
+        &[],
     )?;
     Ok((analysis, cache, typeflow_cache))
 }
@@ -982,6 +1077,7 @@ pub fn run_cold(
 /// current catalog delta to its cached `WorkspaceState.source_cache`
 /// BEFORE calling this, so this function itself does zero frontier-walking
 /// work.
+#[allow(clippy::too_many_arguments)]
 pub fn run_incremental(
     files: Vec<SourceInput>,
     config_assets: Vec<ConfigAssetInput>,
@@ -990,6 +1086,7 @@ pub fn run_incremental(
     changed_artifact_ids: Vec<String>,
     clock: &mut ScanClock,
     typeflow: &mut super::typeflow::TypeflowCache,
+    extra_affected_paths: &[String],
 ) -> Result<ColdAnalysis, ScanError> {
     // `None`: `delta::run` (this function's only production caller) writes
     // every changed path's CAS blob SYNCHRONOUSLY, via a bare `CasStore`
@@ -1007,6 +1104,7 @@ pub fn run_incremental(
         clock,
         typeflow,
         None,
+        extra_affected_paths,
     )
 }
 

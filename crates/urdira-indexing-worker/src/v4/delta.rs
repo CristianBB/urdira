@@ -557,6 +557,124 @@ fn run_one(
         })
         .collect();
 
+    // Frente E-P0f (2026-09-07, ambient-global-dependents integrity fix):
+    // reverse-dependent widening for the ambient-global `DependencyRow`s
+    // `analyze::run_scoped` now writes (`deps::AMBIENT_GLOBAL_DEPENDENCY_
+    // ROLE`/`DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT`) -- see `urdira_jsts_
+    // syntax_worker::OwnerSemantics::ambient_global_dependencies`'s own
+    // doc comment for the root cause this closes (`docs/evidence/2026-09-
+    // 06-v4-reconcile-threshold.md` §14.3): a script file with no top-
+    // level `import`/`export` extends the shared global scope with no
+    // import statement anywhere for the ordinary reverse-import machinery
+    // to find, so DELETING or EDITING it left every consumer's stale
+    // `core:references` rows dangling forever -- nothing else in this
+    // batch's own `changed_artifact_ids` (built below) ever named the
+    // consumer.
+    //
+    // A touched path that was DELETED or MODIFIED may be the declaring
+    // script of one or more ambient globals a PRIOR generation's hybrid
+    // lane resolved a cross-file reference through -- `old_entries`
+    // (just captured, still pre-`Catalog::apply`) names its OLD
+    // `(artifact_id, artifact_version_id)` pair, which `ordinal_of`
+    // (below, built from the STORE's own `prev_generation` dictionaries,
+    // i.e. exactly the ordinal space the PRIOR generation's own
+    // `DependencyRow.dep_artifact` values were minted against) resolves
+    // to an ordinal `StoreReader::deps_reverse` can query directly -- the
+    // SAME store-level primitive `residual.rs`'s `expand_with_dependency_
+    // closure` already uses for the forward direction. A CREATED path has
+    // no "old" self to be a dependency target of (nothing could have
+    // depended on a file that did not exist yet) -- deliberately excluded,
+    // not a gap this fix closes (see this module's evidence doc entry for
+    // the narrower, still-open "newly created script resolves a
+    // PREVIOUSLY pending reference" case).
+    //
+    // Every dependent path this finds is passed to `analyze::run_
+    // incremental` as `extra_affected_paths` (NOT folded into `changed_
+    // artifact_ids`: `urdira_jsts_syntax_worker::lib.rs`'s own
+    // `authoritative_changed_paths` validates that set against the
+    // retained/current manifest's OWN byte-for-byte content diff --
+    // declaring an UNCHANGED file's artifact id there is rejected outright
+    // as "does not match the retained manifest transition", a real bug
+    // this fix's first draft hit live). `run_scoped` unions
+    // `extra_affected_paths` into `affected_paths` straight from
+    // `syntax`'s already-cached per-file state -- no reparse needed, but
+    // it now lands in `analysis.owners`, so the hybrid lane re-resolves
+    // its identifiers against THIS generation's freshly-rebuilt `ambient_
+    // index` (which no longer -- or differently -- declares the touched
+    // name), replacing its stale `Confirmed` reference with the correct
+    // `checker_pending`/re-resolved outcome. Bounded by the touched set's
+    // own real ambient fan-out (`deps_reverse` is an O(1)-amortized
+    // reverse-adjacency lookup, never a corpus scan) -- a real corpus
+    // keeps ambient-global cross-file fan-out rare, matching
+    // `AmbientModuleIndex::rebuild`'s own "ambient declarations are rare"
+    // cost rationale.
+    let mut ambient_dependent_paths: Vec<String> = Vec::new();
+    {
+        let touched_old_ordinals: Vec<u32> = if changed_paths
+            .iter()
+            .any(|p| matches!(p.kind, ChangeKind::Deleted | ChangeKind::Modified))
+        {
+            let store_reader = workspace_state
+                .store_reader
+                .as_ref()
+                .expect("opened/refreshed above");
+            let early_dicts = store_reader.dictionaries();
+            let early_ordinal_of = owner_ordinal_lookup(&early_dicts);
+            changed_paths
+                .iter()
+                .filter(|p| matches!(p.kind, ChangeKind::Deleted | ChangeKind::Modified))
+                .filter_map(|p| {
+                    let entry = old_entries.get(&p.path)?.as_ref()?;
+                    early_ordinal_of
+                        .get(&(entry.artifact_id.clone(), entry.artifact_version_id.clone()))
+                        .copied()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !touched_old_ordinals.is_empty() {
+            let store_reader = workspace_state
+                .store_reader
+                .as_ref()
+                .expect("opened/refreshed above");
+            let early_dicts = store_reader.dictionaries();
+            let mut path_by_pair: HashMap<(String, String), String> = HashMap::new();
+            for (path, entry) in &workspace_state.frontier.present {
+                path_by_pair.insert(
+                    (entry.artifact_id.clone(), entry.artifact_version_id.clone()),
+                    path.clone(),
+                );
+            }
+            let mut dependent_paths: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for &dep_ordinal in &touched_old_ordinals {
+                for dep in store_reader.deps_reverse(dep_ordinal, prev_generation) {
+                    if dep.role() != super::deps::DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT {
+                        continue;
+                    }
+                    let Some(owner_pair) = early_dicts.artifacts.get(dep.owner_artifact() as usize)
+                    else {
+                        continue;
+                    };
+                    if let Some(path) = path_by_pair.get(owner_pair) {
+                        dependent_paths.insert(path.clone());
+                    }
+                }
+            }
+            ambient_dependent_paths = dependent_paths.iter().cloned().collect();
+            if std::env::var_os("URDIRA_DEBUG_TIMING").is_some()
+                && !ambient_dependent_paths.is_empty()
+            {
+                eprintln!(
+                    "[urdira-indexing-worker] v4 delta DEBUG: ambient-global reverse-dependents widened this batch: touched_old_ordinals={} dependents={:?}",
+                    touched_old_ordinals.len(),
+                    dependent_paths,
+                );
+            }
+        }
+    }
+
     // --- Catalog delta (plan §4.1/§6.2 step 1) ---
     let catalog_started = std::time::Instant::now();
     let cas = CasStore::open(cas_root)
@@ -799,6 +917,7 @@ fn run_one(
         changed_artifact_ids,
         clock,
         typeflow_cache,
+        &ambient_dependent_paths,
     )?;
     let affected_owner_paths: Vec<String> = analysis
         .owners

@@ -1843,3 +1843,199 @@ mutfix-run1,mutfix-run2,mutfix-run3,smoke100}*` (workspace + data copies, `--kee
 their `*-results.json`/`report.json` companions) deleted at the end of this session; only this
 evidence file's own excerpted numbers are retained. `CARGO_TARGET_DIR` override
 (`.claude/worktrees/cargo-target-ep0e`) removed.
+
+## §15. Frente E-P0f (2026-09-07): §14.3's ambient-global-dependents finding CLOSED (0
+## phantom rows at N=1008, the exact repro scale); a SECOND, unrelated (method-call/typeflow)
+## root cause found live at N=2015, out of this frente's scope, flagged not fixed
+
+Base: `main` at `176c333` (E-P0e's own merge commit). Branch `frente-ep0f-ambient-dependents`.
+Worktree `.claude/worktrees/agent-a4bb0e80478c00959`, own `CARGO_TARGET_DIR`
+(`.claude/worktrees/cargo-target-ep0f`, removed at the end). Machine shared with other concurrent
+agent sessions the whole time (`uptime` load1 ranged 4-17); the reconcile-threshold harness's own
+`waitForQuietMachine` backoff absorbed this (proceeds after 20×15s regardless).
+
+### 15.1 Root cause (recap, with file:line)
+
+`k6-summary.ts`-shaped case (§14.3): a TypeScript file with **zero** top-level `import`/`export`
+statements is a SCRIPT, not a MODULE -- every one of its top-level declarations (interfaces,
+`declare const`s, classes, ...) becomes an AMBIENT GLOBAL, visible workspace-wide with no import
+needed at the use site. `crates/urdira-jsts-syntax-worker/src/resolver.rs::AmbientModuleIndex::
+resolve_global` (line 1690) already resolves such a reference correctly (`GlobalLookup::Unique {
+entity_id, declaring_path }`), and `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs::
+resolve_ambient_global` (line 2232, pre-fix `&self`) already turns that into a real
+`core:references` row. But **no dependency edge was ever recorded** for this resolution: `crates/
+urdira-indexing-worker/src/v4/deps.rs::materialize_dependencies` only ever reads `ProposedRecordDependency`s
+built from `core:import`/`core:export` relations (`urdira-jsts-syntax-worker::lib.rs::resolved_
+dependencies`, line 3081 pre-fix, filters `RelationKind::Import | RelationKind::Export` only) --
+an ambient global reference has no such relation by construction (there is no import statement to
+derive one from). Deleting/editing the declaring script therefore left every consumer's `core:
+references` rows to it dangling forever: the incremental pipeline's own reverse-dependent/affected-
+owner scheduling (`urdira-jsts-syntax-worker::lib.rs::analyze()`'s `ambient_affected`/`import_
+resolution_would_change` machinery, and `urdira-indexing-worker`'s own `affected_owner_paths`) had
+no edge to walk to rediscover the consumer at all.
+
+### 15.2 Fix: a real, persisted "ambient" `DependencyRow`, on the same channel as import deps,
+### plus a store-level reverse-dependent widening the caller runs BEFORE `analyze()`
+
+**Producer (`urdira-jsts-syntax-worker`)**:
+- `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`: `OwnerSemantics` gains `pub ambient_
+  global_dependencies: Vec<String>` (line 295) -- every OTHER file's path this owner depends on for
+  an identifier that resolved through `resolve_ambient_global`, deduped/sorted. `SemanticWalker`
+  gains a mirroring `BTreeSet<String>` field, populated inside `resolve_ambient_global` (now `&mut
+  self`, line 2232) on the `GlobalLookup::Unique` arm, ONLY when `declaring_path != self.path`
+  (never for a same-file `declare global {}` self-reference, never for `Ambiguous`/`Absent`).
+  `finish()` drains it into the new field. Deliberately scoped to `resolve_ambient_global`'s own
+  call path (plain identifier references) -- `resolve_root_namespace`'s SEPARATE ambient-namespace
+  fallback (qualified names, `jest.Foo`-shaped) stays `&self`, out of this fix's scope, flagged in
+  that field's own doc comment as a narrower, still-open gap (never a guess either way: it still
+  resolves correctly within one generation, it just cannot yet trigger cross-generation
+  reprocessing the way this fix's target case now does).
+- Added 3 unit tests (`semantic_sites.rs`): `cross_file_ambient_global_reference_records_an_
+  ambient_dependency`, `same_file_ambient_global_reference_records_no_ambient_dependency`,
+  `ambiguous_ambient_global_reference_records_no_ambient_dependency` (decision 28's own "never
+  guess under ambiguity" invariant, applied to this new tracking).
+
+**Materialization (`urdira-indexing-worker`)**:
+- `crates/urdira-indexing-worker/src/v4/deps.rs`: new `DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT: u8 = 2`
+  (line 109) and `AMBIENT_GLOBAL_DEPENDENCY_ROLE: &str = "jsts:ambient_global_input"` (line 117),
+  `role_byte` extended to map the new role text to the new byte (was a 2-value `if`, now a 3-arm
+  `match`). No schema change to `DependencyRow` itself -- `role: u8` already had 254 unused values.
+- `crates/urdira-indexing-worker/src/v4/analyze.rs::run_scoped` (per-owner loop, after the existing
+  `owner.records.extend(semantics.external_contains_rows)`): for each `semantics.ambient_global_
+  dependencies` entry, pushes a `ProposedRecordDependency` (role `AMBIENT_GLOBAL_DEPENDENCY_ROLE`,
+  `dependency_target_path` = declaring path, artifact id/version resolved from THIS SAME scan's own
+  `files_by_path`) into `owner.dependencies` -- the SAME `Vec` `deps.rs::materialize_dependencies`
+  already turns into `DependencyRow`s for ordinary import deps, so `StoreReader::deps_by_owner`/
+  `deps_reverse`, `residual.rs::expand_with_dependency_closure`, and any future consumer of the
+  dependency graph see it for free, no ambient-specific special-casing downstream of `deps.rs`.
+
+**Reprocessing on delete/edit (`urdira-indexing-worker::v4::delta.rs::run_one`)**: the actual
+"who needs reprocessing" trigger. Right after `old_entries` is captured (pre-`Catalog::apply`), for
+every touched path with `ChangeKind::Deleted | Modified`, resolves its OLD ordinal (via the STORE's
+OWN `prev_generation` dictionaries -- exactly the ordinal space the prior generation's `DependencyRow.
+dep_artifact` values were minted against) and calls `StoreReader::deps_reverse(old_ordinal,
+prev_generation)`, filtered to `role() == DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT`, to find every
+dependent owner. **First draft bug, found and fixed live**: folding these dependent paths into
+`changed_artifact_ids` (the channel E-P0c's own `import_resolution_would_change` uses) is REJECTED
+by `urdira-jsts-syntax-worker::lib.rs::authoritative_changed_paths` -- it validates that set against
+the retained/current manifest's own byte-for-byte content diff, and an unchanged file's artifact id
+there fails as "does not match the retained manifest transition". Fixed by adding a genuinely new,
+separate channel instead: `analyze::run_scoped`/`run_incremental` gain an `extra_affected_paths:
+&[String]` parameter, unioned into `affected_paths` AFTER `syntax.analyze()` returns (never
+validated against it) -- `facts_for_paths`/the hybrid lane both read straight from `syntax`'s
+already-cached per-file state, so a path that is affected but never reparsed works the same way
+`ambient_affected` (E-P0b's ambient MODULE mechanism) already does at the syntax-worker layer, one
+level up, for ambient GLOBALS instead. `delta.rs::run_one` passes its reverse-dependent set as this
+new argument to `analyze::run_incremental`.
+
+### 15.3 Tests added (`crates/urdira-indexing-worker/src/v4/tests_e2e.rs`)
+
+- `incremental_delete_of_an_ambient_global_declaring_script_reprocesses_its_dependent`: a script
+  (`interface Summary`, `declare const VERSION`) + a module referencing both with no import;
+  DIRECTLY asserts a `DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT` `DependencyRow` exists at generation 1
+  (producer-side proof), then deletes the script and asserts `records`/`dependency`/`graph` roots
+  AND the pending-site set match an independent from-scratch oracle of the post-delete tree exactly.
+- `incremental_edit_of_an_ambient_global_declaring_script_reprocesses_its_dependent`: same shape,
+  `ChangeKind::Modified` (rename `Summary`->`Summary2` inside the script) instead of delete --
+  exercises the fix's OTHER `touched_old_ordinals` branch.
+- Both tests independently CONFIRMED to fail without the fix (`if !extra_affected_paths.is_empty()`
+  short-circuited to `if false && ...` live during this session): delete test failed on `records`
+  root mismatch, edit test failed on `dependency` root mismatch -- reverted immediately after
+  confirming, both pass with the real fix restored.
+
+### 15.4 n8n re-measurement (`scripts/v4-reconcile-threshold.mjs --files N --keep-data`,
+### corpus `~/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02`, 20,148-file frontier,
+### 14,046 eligible TS/JS files, release binary built from this session's own fix)
+
+**N=1008** (§14.3's own repro scale -- `add=50 changed=908 deleted=100`):
+
+```
+records logical set check: ok=true
+  incremental=2189131 oracle=2189237
+  missing_touched=106 missing_untouched=0 extra_touched=0 extra_untouched=0
+  digest_mismatch=52 chained_legit_touched=1740 chained_legit_untouched=249
+  external_missing=106 external_extra=0 external_digest_mismatch=52 external_chained_untouched=249
+roots_ok.delta = { records: false (decision-11 chaining, expected -- logical set is `ok=true`),
+                   dependency: true, graph: true }
+roots_ok.delta_all = true    roots_ok.cold_all = true
+delta_wall_ms=35449.5  cold_wall_ms=27880.0  ratio=1.272
+```
+
+`graph` was `false` at this exact scale before this fix (§14.3/§9.3's own finding). It is now
+`true`, and the non-external `extra_untouched` count (the phantom-row signature) is exactly `0` --
+this frente's own target finding is closed at the scale it was found.
+
+**N=2015** (`add=100 changed=1813 deleted=201`, double the touched count):
+
+```
+records logical set check: ok=false
+  incremental=2178825 oracle=2179053
+  missing_touched=232 missing_untouched=0 extra_touched=0 extra_untouched=4
+  digest_mismatch=56 chained_legit_touched=3100 chained_legit_untouched=190
+roots_ok.delta = { records: false, dependency: true, graph: false }
+roots_ok.delta_all = false   roots_ok.cold_all = true
+delta_wall_ms=35937  cold_wall_ms=16580.5  ratio=2.167
+```
+
+`dependency` root still matches exactly (this frente's own mechanism holds at 2x scale). The 4
+`extra_untouched` rows were diagnosed directly (`n8n_records_logical_set_diff_against_keep_data`,
+`--nocapture`, against this run's own `--keep-data` output) -- **all 4 are `jsts:call`/`jsts:
+references` rows on `packages/cli/src/modules/dynamic-credentials.ee/dynamic-credentials.
+controller.ts`, targeting `deleteMyConnection`/`getResolverByTypename` METHODS** on
+`credential-connection-status.service.ts`/`credential-resolver-registry.service.ts` respectively.
+**Confirmed NOT an ambient-global case**: all three files have real top-level `import`/`export`
+statements (21/10/4 respectively, `grep -cE "^import |^export "`) -- this is a cross-file METHOD
+CALL/reference resolution gap (almost certainly typeflow's own reverse-dependency tracking for a
+member-lookup chain, an entirely different mechanism from `AmbientModuleIndex`/`resolve_ambient_
+global`), independently reproduced at 2x this frente's own target scale. **Disposition: found live,
+NOT fixed, out of this frente's authorized scope** (E-P0f's brief is specifically ambient-global
+script dependents) -- flagged for the owner's queue as a NEW, narrower root cause alongside F.3's
+own already-isolated `DependencyPill.vue` external-alias contributor to the same N≥1008 `graph`
+divergence symptom; repro: `scripts/v4-reconcile-threshold.mjs --files 2015 --keep-data`, then
+`n8n_records_logical_set_diff_against_keep_data` against the kept `run-files2015-delta-1-data`/
+`oracle-files2015-data` structural roots (delta generation 3, oracle generation 1).
+
+### 15.5 Cost: owners reprocessed by deleting one script (n8n, N=1008 cell)
+
+The reverse-dependent widening (`delta.rs::run_one`, §15.2) is bounded by `StoreReader::deps_
+reverse`'s O(1)-amortized reverse-adjacency lookup over exactly the touched paths' own real ambient
+fan-out -- for the `k6-summary.ts`-shaped case in this corpus, that is `test-report.ts` alone (1
+dependent), confirmed both by the original §14.3 finding (4 phantom rows, all on that one owner) and
+by this session's own fixture tests (exactly 1 dependent per declaring script). No corpus-wide scan
+is ever performed; cost is proportional to the deleted/edited script's own real ambient-global
+fan-in, never to frontier size.
+
+### 15.6 Verification (this session)
+
+```
+cargo fmt --all -- --check                                                          # clean
+cargo clippy -p urdira-jsts-syntax-worker -p urdira-indexing-worker
+  -p urdira-structural-store --locked --all-targets -- -D warnings                   # clean
+cargo clippy --workspace --all-targets --locked -- -D warnings                       # clean
+cargo test -p urdira-jsts-syntax-worker -p urdira-indexing-worker
+  -p urdira-structural-store --locked
+  # urdira-jsts-syntax-worker (lib):  test result: ok. 303 passed; 0 failed; 0 ignored
+  # urdira-indexing-worker (bin):     test result: ok. 136 passed; 0 failed; 19 ignored
+  # urdira-structural-store (all suites + doctests): every "test result: ok", 0 failed
+cargo build --release --locked -p urdira-indexing-worker                             # clean
+node scripts/build-native.mjs                                                        # clean
+CI=true ./node_modules/.bin/vitest run tests/phase-daemon-v4-reconcile.test.ts
+  tests/v4-scan.test.ts                                                              # 3 passed, 4 skipped, 0 failed
+node scripts/v4-reconcile-threshold.mjs --files 1008 --keep-data  # see §15.4, delta_all=true
+node scripts/v4-reconcile-threshold.mjs --files 2015 --keep-data  # see §15.4, NEW unrelated finding
+```
+
+(Residual-pass `#[ignore]`d tests in `residual.rs` require a real n8n corpus + explicitly idle
+machine per their own doc comments -- not re-run this session: this fix touches neither `residual.rs`
+nor the tsgo/typeflow lanes it drives, and the n8n reconcile-threshold runs above already exercise
+the SAME production binary's full scan+residual-scheduling pipeline end-to-end without incident.)
+
+### 15.7 Scratch cleanup
+
+`~/Proyectos/urdira-benchmark/v4-fold/ep0f-{1008,2015}*` (workspace + data copies, `--keep-data`
+outputs, and their `*-results.json` companions) deleted at the end of this session; only this
+evidence file's own excerpted numbers are retained. `CARGO_TARGET_DIR` override
+(`.claude/worktrees/cargo-target-ep0f`) removed. `packages/*/dist` (built during this session to run
+the reconcile-threshold harness, which imports `packages/storage/dist/workspace-v4-sql.generated.js`)
+and the root `release/native/darwin-arm64` build left in place (build artifacts, not source --
+harmless if a later session rebuilds over them; not committed, `.gitignore`d).
