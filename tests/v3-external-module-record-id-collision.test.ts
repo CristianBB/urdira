@@ -1,12 +1,11 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, lstat, mkdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { defaultDaemonOptions, runUrdira } from "../apps/urdira/src/index.js";
-import { hostNativeTarget, nativeArtifactNames } from "../scripts/native-release.mjs";
-import { prepareNativeRoot } from "../scripts/indexing-structural-preflight.mjs";
+import { hostNativeTarget, nativeArtifactNames, stageNativeArtifacts } from "../scripts/native-release.mjs";
 
 /**
  * F-fix (v3 `record_occurrences.record_id` collision, plan
@@ -55,6 +54,40 @@ const LODASH_FIXTURE: Readonly<Record<string, string>> = {
 async function writeFixture(root: string, files: Readonly<Record<string, string>>): Promise<void> {
   await mkdir(root, { recursive: true });
   for (const [name, contents] of Object.entries(files)) await writeFile(join(root, name), contents, "utf8");
+}
+
+interface PreparedNativeRoot {
+  readonly native_root: string;
+  readonly cleanup: () => Promise<void>;
+}
+
+/** Inlined equivalent of `scripts/indexing-structural-preflight.mjs`'s own
+ * `prepareNativeRoot` (not imported directly: that module's transitive
+ * `.mjs` import graph defeats `tsc --build`'s named-export inference for
+ * `prepareNativeRoot` specifically, `error TS2305`, even though the export
+ * exists and works fine at runtime -- `native-release.mjs` alone, already
+ * imported cleanly by `tests/v4-daemon-e2e.test.ts`, is all this needs). If
+ * `artifactRoot` already carries a `manifest.json` (a real release
+ * artifact directory), returns it as-is; otherwise stages a throwaway copy
+ * with one via `stageNativeArtifacts`. */
+async function prepareNativeRoot(artifactRoot: string): Promise<PreparedNativeRoot> {
+  const directManifest = join(artifactRoot, "manifest.json");
+  if ((await lstat(directManifest).catch(() => undefined))?.isFile() === true) {
+    return { native_root: artifactRoot, cleanup: async () => undefined };
+  }
+  const target = hostNativeTarget();
+  if (target === undefined) throw new Error(`unsupported native host ${process.platform}/${process.arch}.`);
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "urdira-v3xm-native-"));
+  try {
+    await stageNativeArtifacts({ artifactRoot, stageRoot: temporaryRoot, target });
+  } catch (error) {
+    await rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    native_root: join(temporaryRoot, "native"),
+    cleanup: async () => rm(temporaryRoot, { recursive: true, force: true }),
+  };
 }
 
 async function pollWorkspaceReady(
