@@ -2270,3 +2270,236 @@ evidence file's own excerpted numbers are retained. `CARGO_TARGET_DIR` override
 (`.claude/worktrees/cargo-target-ep0g`) removed. `packages/*/dist` (built during this session to run
 the reconcile-threshold harness) and `release/native/darwin-arm64` left in place (build artifacts,
 not source -- `.gitignore`d, harmless if a later session rebuilds over them).
+
+## §17. Frente E-P0h (2026-09-07): the last known incremental-narrowing gap -- a TYPE-ONLY edit to
+## an exported declaration's own return/parameter/property type (name, parameter NAMES, and member
+## list all untouched) never invalidated `exported_surface` -- CLOSED, n8n delta logical parity
+## confirmed at N=1008 and N=2015, hub-edit cost gate confirmed unchanged
+
+### 17.1 Reproduction
+
+E-P0g's own adversarial review (§16, `exported_function_return_type_change_should_reanalyze_a_
+type_dependent_caller`, left `#[ignore]`d) documented the gap directly: `analyze.rs::exported_
+surface` operates entirely on `SyntaxFileResult` (`urdira-jsts-syntax-worker`'s own syntax-only
+layer), which carried NO type information anywhere -- `SyntaxEntity` had no field for it, and
+neither `SyntaxExportBinding` nor any of E-P0g's own new member/parameter surface entries encoded a
+type. Changing an exported function's return type, an exported class member's declared/return
+type, an exported function's parameter type, or an exported type alias's own RHS -- all while
+leaving the declaration's NAME, its parameter NAMES, and its member LIST untouched -- left
+`exported_surface`'s before/after comparison reporting "unchanged", so `run_scoped`'s P3-3 surface
+narrowing incorrectly dropped every transitive importer back down to the literal edited file, even
+when that importer's typeflow-mediated resolution (a member-chain call, a `ProgramIndex::function_
+return_types`/`member_type_ref` lookup) depended on exactly that type. Confirmed live: un-`#[ignore]`ing
+the reviewer's own test failed before this frente's fix, exactly as documented.
+
+### 17.2 Mechanism -- a syntax-worker-local digest, no type resolution, no large structures moved
+
+Per the plan's own brief ("expón lo mínimo... en vez de mover estructuras grandes"): `RawTypeRef`/
+`DeclSummary`/`FunctionSummary` (the crate that DOES carry a resolved/classified type per
+declaration) live entirely in `urdira-jsts-typeflow`, computed with `Scoping`/`import_specifiers`
+machinery `analyze.rs` has no cheap way to reach at exactly the moment `exported_surface` needs to
+compare pre/post-edit shapes (and `TypeflowCache`'s own `summaries` map is ALREADY the POST-edit
+`DeclSummary` by the time `run_scoped` runs -- `delta.rs` calls `typeflow_cache.replace_file_from_
+owner` BEFORE invoking `analyze::run_incremental`, so there is no "prior" snapshot left to diff
+against without threading an extra pre-edit capture one level up, exactly the kind of "move a large
+structure across a crate boundary" the brief steers away from). Instead:
+
+- **`crates/urdira-jsts-syntax-worker/src/lib.rs`**: `SyntaxEntity` gains `type_surface_digest:
+  Option<String>` -- a normalized, POSITION-INDEPENDENT fingerprint of a declaration's own WRITTEN
+  type, computed entirely from spans this file's OWN AST walk already visits (no semantic
+  resolution, no cross-file lookup). Populated for:
+  - a top-level `function`'s own parameter types + return type (`visit_function`);
+  - a top-level `const X: T = ...`'s own `T` (`visit_variable_declaration`);
+  - a top-level `export type X = ...`'s own RHS (`visit_ts_type_alias_declaration`, always present,
+    never optional);
+  - a class/interface member's own declared/return type (`method`/`getter`/`setter`/`constructor`/
+    `property`, via `push_member_entities`, sourced from `MemberDeclaration`'s two new fields
+    below).
+  - Deliberately `None` for `Module`/`Class`/`Interface`/`Enum`/`Namespace`/a constructor
+    parameter-property (`Parameter` kind) -- no type surface of their own to track here (a class/
+    interface's MEMBERSHIP is E-P0g's own concern; a parameter-property's type is out of this
+    frente's scope, see 17.6).
+  - `Utf16ByteMap` (new): maps a UTF-16 code-unit offset -- the ONLY span domain this crate's
+    `Visit` walk ever observes, post-`Utf8ToUtf16::convert_program` -- back to the file's own
+    UTF-8 BYTE offset, so a type annotation's span can be sliced out of the original source text
+    directly. Built once per parse, O(n), the same asymptotic cost `LineIndex::from_text`'s own
+    single pass already pays; used ONLY transiently (never persisted on `SyntaxFileResult`).
+  - `normalize_type_text` (new): strips C-style comments and every whitespace character OUTSIDE a
+    string/template literal (whose own contents are copied verbatim -- `"a b"` and `"ab"` must
+    stay distinguishable). Can only ever COLLAPSE two comment/whitespace-different-but-otherwise-
+    identical inputs to the same digest, never merge two genuinely different ones -- so a real type
+    change can never go undetected, only a purely cosmetic edit is correctly not over-counted
+    (matching the standing hub-edit cost gate's own discipline).
+  - `type_surface_digest` (new free function): joins each parameter slot (`'\u{1}'`-delimited, an
+    unannotated parameter is a distinct present-but-empty slot -- `f(a: string, b)` and `f(a, b:
+    string)` can never collide) and the return/declared-type slot (`'\u{2}'`-delimited) into one
+    string; `None` only when NEITHER exists at all (an entirely unannotated declaration has nothing
+    to ever invalidate a caller over).
+- **`crates/urdira-jsts-typeflow/src/lib.rs`**: `MemberDeclaration` (already threaded from this
+  crate to `urdira-jsts-syntax-worker`'s `push_member_entities` for E-P0g's own member-identity
+  work) gains `type_surface_params: Vec<Option<(u32, u32)>>` and `type_surface_return: Option<(u32,
+  u32)>` -- RAW UTF-16 SPANS only (never a resolved `RawTypeRef`), computed in `class_element_type_
+  surface`/`signature_type_surface`/`formal_parameters_type_surface` (new) right where this crate
+  already walks each class element/interface signature's own AST node for identity purposes. This
+  is the ENTIRE cross-crate surface added: two `Vec`/`Option` fields of plain integer pairs, not
+  `DeclSummary`, not `RawTypeRef`, not `Scoping`.
+- **`crates/urdira-indexing-worker/src/v4/analyze.rs::exported_surface`**: for each locally-exported
+  binding, folds in `("type:{name}", Some(digest), None, None)` when the container entity itself
+  carries a `type_surface_digest` (function/variable/type-alias), and `("member_type:{container}.
+  {member}", Some(digest), None, None)` for each surface member that carries one -- SEPARATE
+  entries from E-P0g's own `member:`/`param:` ones (never merged into them), reusing the exact same
+  `BTreeSet`/subset-comparison machinery `run_scoped`'s `surface_changed` check already applies:
+  a digest CHANGE removes the old tuple and inserts a different one under the same key prefix, so
+  `prior ⊄ next` fires exactly like a member rename already does.
+
+### 17.3 Tests (`urdira-indexing-worker::v4::tests_e2e`)
+
+Un-`#[ignore]`d the reviewer's own repro (`exported_function_return_type_change_should_reanalyze_a_
+type_dependent_caller`) -- now green. Four new variants, one per the plan's own enumerated cases
+(the fifth, interface member add/remove, is E-P0g's own `exported_class_member_addition_and_
+reorder_keep_owners_at_the_literal_edit_only`, confirmed still green, unmodified by this frente):
+
+- `exported_function_parameter_type_change_should_reanalyze_a_type_dependent_caller` -- `make(x:
+  number)` -> `make(x: string)`, name/return type untouched; exercises the top-level `type:make`
+  entry over a PARAMETER-only change.
+- `exported_class_property_type_change_should_reanalyze_a_type_dependent_caller` -- `Config.value:
+  number` -> `: string`, member list untouched; exercises `member_type:Config.value`.
+- `exported_class_method_return_type_change_should_reanalyze_a_type_dependent_caller` -- `Service.
+  get(): number` -> `: string`, member list untouched; the class-member counterpart of the reviewer's
+  own top-level-function test.
+- `exported_type_alias_body_change_should_reanalyze_a_type_dependent_caller` -- `export type R = A;`
+  -> `= B;`, the alias's own NAME and every USER of it (`makeR(): R`, annotation text byte-identical
+  before/after) untouched; only the alias declaration's OWN `type:R` entry can ever catch this.
+  Confirms the chain through typeflow's own `alias_targets` resolution: `makeR().foo()` resolves
+  through `R` to a DIFFERENT class's `foo` after the edit, and `owners` correctly includes
+  `consumer.ts`.
+
+All five: `owners.contains(&"consumer.ts")` after the type-only edit.
+
+### 17.4 Hub-edit cost gate, confirmed unchanged
+
+`method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched` (pre-existing, E-P0g's own
+regression coverage) stays green: editing a method's BODY only (no signature/type change) still
+leaves the re-exporting barrel's and the caller's own record-id sets byte-for-byte identical,
+`owners == 1`. This frente's own digest join is by construction insensitive to a body-only edit (no
+type-annotation span in the edited region moves in a way that changes what gets sliced for a
+DIFFERENT, untouched declaration -- `Utf16ByteMap`/spans are recomputed fresh each parse, but the
+COMPARISON is keyed by declaration NAME, never by a span-shifted entity id, mirroring E-P0g's own
+position-independence discipline exactly).
+
+### 17.5 n8n re-measurement (`scripts/v4-reconcile-threshold.mjs --files N --keep-data`, corpus
+### `~/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02`, 20,148-file frontier, release binary built
+### from this session's own fix)
+
+**N=1008** (`add=50 changed=908 deleted=100`):
+
+```
+records logical set check: ok=true
+  incremental=2189131 oracle=2189237
+  missing_touched=106  missing_untouched=0  extra_touched=0  extra_untouched=0
+  digest_mismatch=52  chained_legit_touched=1740  chained_legit_untouched=249
+  external_missing=106  external_extra=0  external_digest_mismatch=52  external_chained_untouched=249
+roots_ok.delta_all=true   roots_ok.cold_all=true
+delta_wall_ms=24423.0  cold_wall_ms=16203.5  ratio=1.507
+```
+
+**N=2015** (§16.7's own repro scale, `add=100 changed=1813 deleted=201`):
+
+```
+records logical set check: ok=true
+  incremental=2178821 oracle=2179053
+  missing_touched=232  missing_untouched=0  extra_touched=0  extra_untouched=0
+  digest_mismatch=56  chained_legit_touched=3100  chained_legit_untouched=190
+  external_missing=232  external_extra=0  external_digest_mismatch=56  external_chained_untouched=190
+roots_ok.delta_all=true   roots_ok.cold_all=true
+delta_wall_ms=37257.5  cold_wall_ms=18105.5  ratio=2.058
+```
+
+Both scales: `extra_untouched=0`/`missing_untouched=0` (non-external), `roots_ok.delta_all=true`/
+`roots_ok.cold_all=true` (`dependency`/`graph` roots exactly match an independent oracle),
+`records`' only non-zero non-external buckets (`missing_touched`/`digest_mismatch`/`chained_legit_
+untouched`) are FULLY accounted for by `external_*`'s own identical counts -- the same
+decision-11-legitimate-chaining/self-healing pattern every prior frente already accepted, unrelated
+to this frente's own fix. N=2015's numbers are consistent with §16.7's own prior measurement of the
+SAME scale (`missing_touched=232`/`digest_mismatch=56` byte-identical; wall times differ only by
+measurement noise -- this session's machine load was visibly higher, `load1` regularly 6-9 during
+both runs per the harness's own throttling log, an unrelated background process on this machine,
+not a regression from this frente's own change).
+
+### 17.6 Scope boundaries (documented, not silently dropped)
+
+- A constructor's own PARAMETER-PROPERTY member (`constructor(public x: T)`) gets a `type_surface_
+  params[0]` span computed in `urdira-jsts-typeflow` (uniform code path with every other member),
+  but `push_member_entities` deliberately does not turn it into a `SyntaxEntity::type_surface_
+  digest` (`declaration.kind_word == "parameter"` short-circuits to `None`), and `exported_surface`
+  never had a `member:`/`member_type:` entry for a `Parameter`-kind member at all (E-P0g's own `is_
+  member_surface_kind` predicate excludes it) -- out of this frente's own enumerated variant list;
+  a real, narrower follow-up if ever needed, not attempted here.
+- A PURE ADDITION of a type annotation where none existed before (`foo()` -> `foo(): number`) is
+  treated the same permissive way `exported_surface`'s own subset check already treats a brand-new
+  export appearing (E-P0g's own doc comment: "an importer that already carries an UNRESOLVED import
+  naming exactly the newly-added export... stays unresolved one generation longer... an existing,
+  pre-P3-3 limitation... not one this narrowing introduces new") -- consistent with the rest of this
+  function, not a new gap.
+- `apps/urdira` does not build in this worktree (`tsc --build apps/urdira` fails on `Cannot find
+  module '@urdira/{cli,daemon,native,storage,engine,mcp,web,plugin-javascript-typescript}'` even
+  after every one of those packages is independently built with `tsc --build` first -- confirmed a
+  pre-existing, worktree-symlinked-`node_modules` limitation, not caused by this frente's own diff:
+  the SAME failure reproduces on a clean build with none of this session's Rust changes in the
+  loop). Per the task's own fallback ("si no puede por enlaces, ejecuta el gate a escala de
+  fixture"), `scripts/v4-mutation-harness.mjs --verify-roots final` (which needs `apps/urdira/dist`)
+  was not run; §17.4's fixture-scale test IS this frente's hub-edit cost gate.
+
+### 17.7 Files touched
+
+- `crates/urdira-jsts-syntax-worker/src/lib.rs`: `SyntaxEntity` gains `type_surface_digest`;
+  `SyntaxCollector` gains a lifetime + `text`/`utf16_map` fields; `push_entity` splits into a thin
+  wrapper over new `push_entity_with_type_surface`; `visit_function`/`visit_variable_declaration`/
+  `visit_ts_type_alias_declaration` compute a digest; `push_member_entities` computes one from
+  `MemberDeclaration`'s new spans; new free functions `Utf16ByteMap`, `normalize_type_text`,
+  `type_surface_digest`, `type_annotation_span`. Every other `SyntaxEntity` construction site
+  (external module/symbol entities, namespace entities, parameter/catch-variable "referenced-only"
+  producers in `semantic_sites.rs`, test helpers in `resolver.rs`/`semantic_sites.rs`) gets an
+  explicit `type_surface_digest: None`.
+- `crates/urdira-jsts-typeflow/src/lib.rs`: `MemberDeclaration` gains `type_surface_params`/`type_
+  surface_return`; new `type_annotation_span`/`formal_parameters_type_surface`/`class_element_type_
+  surface`/`signature_type_surface` (+ `TypeSurfaceSpans` type alias for clippy's `type_complexity`);
+  wired into `push_class_member_declarations`/`push_interface_member_declarations`/`push_
+  constructor_parameter_property_declarations`.
+- `crates/urdira-indexing-worker/src/v4/analyze.rs`: `exported_surface` folds in `type:`/`member_
+  type:` entries; doc comment updated.
+- `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`: un-`#[ignore]`d the reviewer's test; four new
+  variant tests (§17.3).
+- `docs/decisions/29-v4-rust-owned-scan-pipeline.md`: new amendment section naming the mechanism.
+
+### 17.8 Verification (this session)
+
+```
+cargo fmt --all -- --check                                                          # clean
+cargo clippy --workspace --all-targets --locked -- -D warnings                      # clean
+cargo test -p urdira-jsts-syntax-worker -p urdira-indexing-worker -p urdira-jsts-typeflow --locked
+  # urdira-jsts-syntax-worker (lib):  test result: ok. 304 passed; 0 failed; 1 ignored (pre-existing corpus-only)
+  # urdira-indexing-worker (bin):     test result: ok. 151 passed; 0 failed; 19 ignored
+  # urdira-jsts-typeflow (lib):       test result: ok. 59 passed; 0 failed; 0 ignored
+cargo test -p urdira-indexing-worker --locked -- --ignored \
+  dump_remaining_classification_mismatches scan_for_any_all_zero_identity_or_digest \
+  residual_emits_types_and_diagnostics_with_zero_pending_sites \
+  inferred_types_and_diagnostics_across_two_runs_and_an_edit \
+  residual_first_pass_sees_a_multi_file_edits_transitive_type_dependency_outside_the_edited_set
+  # (URDIRA_TSGO_BINARY set to the pnpm-vendored @typescript/typescript-darwin-arm64 tsc)
+  # test result: ok. 5 passed; 0 failed
+cargo build --release --locked -p urdira-indexing-worker                            # clean
+CI=true ./node_modules/.bin/vitest run tests/phase-daemon-v4-reconcile.test.ts tests/v4-scan.test.ts
+  # Test Files  2 passed (2)  Tests  3 passed | 4 skipped (7)
+node scripts/v4-reconcile-threshold.mjs --files 1008 --keep-data  # see §17.5, extra_untouched=0
+node scripts/v4-reconcile-threshold.mjs --files 2015 --keep-data  # see §17.5, extra_untouched=0
+```
+
+### 17.9 Scratch cleanup
+
+`~/Proyectos/urdira-benchmark/v4-fold/ep0h-{1008,2015}*` (workspace + data copies, `--keep-data`
+outputs, and their `*-results.json` companions) deleted at the end of this session; only this
+evidence file's own excerpted numbers are retained. `CARGO_TARGET_DIR` override (`.claude/
+worktrees/cargo-target-ep0h`) removed. `packages/*/dist` (built this session, via `tsc --build`, to
+run the reconcile-threshold harness) and `release/native/darwin-arm64` left in place (build
+artifacts, not source -- `.gitignore`d, harmless if a later session rebuilds over them).

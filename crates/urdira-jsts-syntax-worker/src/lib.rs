@@ -7,7 +7,8 @@ use oxc_ast::ast::{
     ExportNamedDeclaration, ExportSpecifier, Expression, Function, FunctionType, ImportDeclaration,
     ImportDeclarationSpecifier, ImportExpression, ModuleExportName, Statement, TSEnumDeclaration,
     TSExportAssignment, TSGlobalDeclaration, TSInterfaceDeclaration, TSModuleDeclaration,
-    TSModuleDeclarationBody, TSModuleDeclarationName, TSTypeAliasDeclaration, VariableDeclaration,
+    TSModuleDeclarationBody, TSModuleDeclarationName, TSTypeAliasDeclaration, TSTypeAnnotation,
+    VariableDeclaration,
 };
 use oxc_ast_visit::{
     Visit,
@@ -21,7 +22,7 @@ use oxc_ast_visit::{
     },
 };
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::scope::ScopeFlags;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -759,6 +760,34 @@ pub struct SyntaxEntity {
     pub qualified_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_test: Option<bool>,
+    /// Frente E-P0h (2026-09-07): a POSITION-INDEPENDENT fingerprint of this
+    /// declaration's own WRITTEN type surface -- a top-level `function`'s
+    /// parameter types + return type, a top-level `const X: T = ...`'s own
+    /// `T`, an `export type X = ...`'s RHS, or a class/interface `method`/
+    /// `getter`/`setter`/`constructor`/`property` member's own parameter
+    /// types/return type/declared type (never a `class`/`interface`/`enum`
+    /// entity itself, whose own MEMBERSHIP surface `analyze::exported_
+    /// surface` already tracks separately, see that function's own doc
+    /// comment). `None` for an entity kind this never applies to (`Module`/
+    /// `Class`/`Interface`/`Enum`/a `Parameter`-kind constructor property/
+    /// any entity with no type annotation of its own at all -- an
+    /// unannotated `function f(a, b) {}` has NOTHING to ever invalidate a
+    /// caller over here, matching `type_surface_digest`'s (the free
+    /// function computing this) own doc comment). `Some` is a normalized
+    /// (comments and whitespace outside a string/template literal
+    /// stripped, see `normalize_type_text`), DETERMINISTIC function of
+    /// exactly this declaration's own type-annotation source text --
+    /// stable across two parses of byte-identical source, and changed by
+    /// (only) a real edit to that text. `analyze::exported_surface` folds
+    /// this into a locally-exported declaration's own comparable surface
+    /// entry so a TYPE-ONLY edit (no name/parameter-name/member-list
+    /// change) is no longer invisible to the P3-3 narrowing gate this frente
+    /// closes -- see that function's own doc comment and `docs/evidence/
+    /// 2026-09-06-v4-reconcile-threshold.md` §16's own adversarial-review
+    /// finding (`exported_function_return_type_change_should_reanalyze_a_
+    /// type_dependent_caller`) for the gap this closes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_surface_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -2959,6 +2988,7 @@ pub(crate) fn external_module_entity(specifier: &str) -> SyntaxEntity {
         parent_id: None,
         qualified_name: None,
         is_test: None,
+        type_surface_digest: None,
     }
 }
 
@@ -2983,6 +3013,7 @@ pub(crate) fn external_symbol_entity(specifier: &str, name: &str, is_type: bool)
         parent_id: Some(resolver::external_module_id(specifier)),
         qualified_name: Some(format!("{specifier}.{name}")),
         is_test: None,
+        type_surface_digest: None,
     }
 }
 
@@ -3410,6 +3441,200 @@ fn decode_config_assets_inner(
     Ok(decoded)
 }
 
+/// Frente E-P0h (2026-09-07): maps a UTF-16 code-unit offset -- the ONLY
+/// span domain this crate's `Visit` walk ever observes, post-`Utf8ToUtf16::
+/// convert_program` (see `SyntaxFileResult::line_index`'s own doc comment
+/// for the same fact, applied there to line numbers instead) -- back to the
+/// matching UTF-8 BYTE offset into the file's own original `text`, so a
+/// type annotation's span can be sliced out of `text` directly (`&str`
+/// indexing needs byte offsets, never UTF-16 code-unit counts). Built once
+/// per parse, in one O(n) pass over `text.char_indices()` (the same
+/// asymptotic cost `LineIndex::from_text`'s own single pass already pays),
+/// and used ONLY transiently while extracting `SyntaxEntity::type_surface_
+/// digest` -- never persisted on `SyntaxFileResult` itself (unlike
+/// `LineIndex`, which every `ProposedRecord` producer needs for every scan,
+/// this table is discarded with the `SyntaxCollector` at the end of
+/// `parse_source`).
+struct Utf16ByteMap {
+    /// `utf16[i]` is the UTF-16 offset at which the character starting at
+    /// `byte[i]` begins; both strictly increasing, with one trailing
+    /// sentinel entry for the file's own end-of-text offset (a span's `end`
+    /// may legitimately equal the file's total UTF-16 length).
+    utf16: Vec<u32>,
+    byte: Vec<u32>,
+}
+
+impl Utf16ByteMap {
+    fn from_text(text: &str) -> Self {
+        let mut utf16 = Vec::with_capacity(text.len() + 1);
+        let mut byte = Vec::with_capacity(text.len() + 1);
+        let mut offset16: u32 = 0;
+        for (byte_index, ch) in text.char_indices() {
+            utf16.push(offset16);
+            byte.push(byte_index as u32);
+            offset16 = offset16.saturating_add(ch.len_utf16() as u32);
+        }
+        utf16.push(offset16);
+        byte.push(text.len() as u32);
+        Self { utf16, byte }
+    }
+
+    /// The BYTE offset matching `offset_utf16`, when it lands exactly on a
+    /// character boundary -- always true for a span this crate's own `Visit`
+    /// walk produces (an AST node's span start/end is never mid-character).
+    /// `None` (never a guess/nearest-neighbor) for anything else, so a
+    /// caller can never silently slice `text` at the wrong boundary.
+    fn byte_offset(&self, offset_utf16: u32) -> Option<u32> {
+        let index = self.utf16.partition_point(|&u| u < offset_utf16);
+        (self.utf16.get(index) == Some(&offset_utf16)).then(|| self.byte[index])
+    }
+
+    /// `text[start_utf16..end_utf16]`, translated through this table --
+    /// `None` if either endpoint does not land on a character boundary this
+    /// table recorded, or `text` itself does not agree (defensive; never
+    /// panics on a malformed span).
+    fn slice<'t>(&self, text: &'t str, start_utf16: u32, end_utf16: u32) -> Option<&'t str> {
+        let start = self.byte_offset(start_utf16)?;
+        let end = self.byte_offset(end_utf16)?;
+        text.get(start as usize..end as usize)
+    }
+}
+
+/// Frente E-P0h: normalizes one type annotation's own raw source text into
+/// a canonical, comment/whitespace-insensitive fingerprint -- see
+/// `SyntaxEntity::type_surface_digest`'s own doc comment for the mechanism
+/// this feeds. Strips every C-style comment (`//...`, `/*...*/`) and every
+/// OTHER whitespace character (never semantically significant anywhere in a
+/// TS type expression outside a string/template literal), while preserving
+/// a string/template literal's own contents VERBATIM (its whitespace IS
+/// semantically significant: `"a b"` and `"ab"` are different literal
+/// types). This can only ever COLLAPSE two textually-identical-modulo-
+/// comments-and-whitespace inputs to the same output, never merge two
+/// otherwise-different inputs -- so it can never cause a real type change
+/// to go undetected (a correctness requirement; see this function's own
+/// caller, `type_surface_digest`), only avoid over-counting a purely
+/// cosmetic edit as one (a cost requirement, matching the standing hub-edit
+/// memory gate's own "no signature change, no reanalysis" discipline).
+fn normalize_type_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '/' if chars.peek() == Some(&'/') => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev_star = false;
+                for c in chars.by_ref() {
+                    if prev_star && c == '/' {
+                        break;
+                    }
+                    prev_star = c == '*';
+                }
+            }
+            '\'' | '"' => {
+                out.push(ch);
+                let quote = ch;
+                let mut escaped = false;
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == quote {
+                        break;
+                    }
+                }
+            }
+            '`' => {
+                out.push(ch);
+                let mut escaped = false;
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '`' {
+                        break;
+                    }
+                    // Deliberately not entering/exiting a special state for
+                    // `${...}` interpolation inside a template literal TYPE
+                    // -- worst case this leaves some interpolated whitespace
+                    // un-stripped, which can only make two genuinely-
+                    // identical types compare NOT-equal (over-counts, never
+                    // under-counts -- see this function's own doc comment).
+                }
+            }
+            c if c.is_whitespace() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Frente E-P0h: `annotation`'s own `TSType` span, in UTF-16 code units --
+/// `None` when unannotated. Mirrors `urdira_jsts_typeflow`'s own private
+/// helper of the same name/shape exactly (that crate needs the identical
+/// span for the SAME purpose -- see `MemberDeclaration::type_surface_
+/// params`'s own doc comment for why the two crates each keep their own
+/// copy rather than sharing one: neither crate depends on the other for
+/// this, and it is three lines).
+fn type_annotation_span(annotation: Option<&TSTypeAnnotation>) -> Option<(u32, u32)> {
+    let annotation = annotation?;
+    let span = annotation.type_annotation.span();
+    Some((span.start, span.end))
+}
+
+/// Frente E-P0h: `SyntaxEntity::type_surface_digest`'s own value, computed
+/// from a declaration's raw (UTF-16) type-annotation spans -- `params` in
+/// declaration order (an unannotated parameter is `None`, a distinct
+/// POSITIONED slot, see `urdira_jsts_typeflow::MemberDeclaration::type_
+/// surface_params`'s own doc comment for why), `returns` last. `None` when
+/// NEITHER is present at all -- an entirely unannotated declaration has no
+/// type surface to ever invalidate a caller over (matches `exported_
+/// surface`'s own "nothing to compare, nothing counts as changed"
+/// contract for an untyped codebase). Each present span is sliced out of
+/// `text` via `utf16_map` and run through `normalize_type_text`; missing
+/// spans are still separately delimited (`'\u{1}'` between parameters,
+/// `'\u{2}'` before the return slot -- both control characters, never
+/// producible by `normalize_type_text`'s own output) so position within the
+/// parameter list is never lost to the join.
+fn type_surface_digest(
+    text: &str,
+    utf16_map: &Utf16ByteMap,
+    params: &[Option<(u32, u32)>],
+    returns: Option<(u32, u32)>,
+) -> Option<String> {
+    if params.iter().all(Option::is_none) && returns.is_none() {
+        return None;
+    }
+    let mut joined = String::new();
+    for (index, param) in params.iter().enumerate() {
+        if index > 0 {
+            joined.push('\u{1}');
+        }
+        if let Some((start, end)) = *param
+            && let Some(slice) = utf16_map.slice(text, start, end)
+        {
+            joined.push_str(&normalize_type_text(slice));
+        }
+    }
+    joined.push('\u{2}');
+    if let Some((start, end)) = returns
+        && let Some(slice) = utf16_map.slice(text, start, end)
+    {
+        joined.push_str(&normalize_type_text(slice));
+    }
+    Some(joined)
+}
+
 fn parse_source(
     source: &DecodedSource,
     available: &BTreeSet<String>,
@@ -3428,7 +3653,17 @@ fn parse_source(
     let allocator = Allocator::default();
     let mut parsed = Parser::new(&allocator, text, source_type).parse();
     Utf8ToUtf16::new(text).convert_program(&mut parsed.program);
-    let mut collector = SyntaxCollector::new(&source.path, text.encode_utf16().count() as u32);
+    // Frente E-P0h: built from `text` alone (independent of the UTF-16
+    // conversion above), used only to slice type-annotation spans while
+    // populating `SyntaxEntity::type_surface_digest` -- see `Utf16ByteMap`'s
+    // own doc comment.
+    let utf16_map = Utf16ByteMap::from_text(text);
+    let mut collector = SyntaxCollector::new(
+        &source.path,
+        text.encode_utf16().count() as u32,
+        text,
+        &utf16_map,
+    );
     collector.visit_program(&parsed.program);
     // Ambient module resolution task (2026-09-04) follow-up: patch every
     // `declare module` block this file collected with the file's real
@@ -3582,9 +3817,23 @@ enum ImportedName {
     Namespace,
 }
 
-struct SyntaxCollector {
+struct SyntaxCollector<'t> {
     path: String,
     module_id: String,
+    /// Frente E-P0h (2026-09-07): this file's own ORIGINAL UTF-8 source
+    /// text, plus the matching UTF-16-code-unit-to-byte-offset table -- both
+    /// carried ONLY to slice+normalize a type annotation's own raw source
+    /// text into [`SyntaxEntity::type_surface_digest`] (`type_surface_
+    /// digest`, the free function). Every span this crate's `Visit` walk
+    /// observes is a UTF-16 code-unit offset (`Utf8ToUtf16::convert_program`
+    /// runs before `visit_program`, see `parse_source`), never a byte
+    /// offset into `text` directly -- `utf16_map` bridges the two, built
+    /// once per parse exactly like [`LineIndex::from_text`]'s own single
+    /// O(n) pass (see [`Utf16ByteMap::from_text`]'s own doc comment).
+    /// Neither field is ever persisted on [`SyntaxFileResult`] itself --
+    /// both are dropped with this collector at the end of `parse_source`.
+    text: &'t str,
+    utf16_map: &'t Utf16ByteMap,
     imports: Vec<DirectImport>,
     entities: Vec<SyntaxEntity>,
     relations: Vec<SyntaxRelation>,
@@ -3621,12 +3870,14 @@ struct SyntaxCollector {
     imported_locals: HashMap<String, (String, ImportedName)>,
 }
 
-impl SyntaxCollector {
-    fn new(path: &str, source_end: u32) -> Self {
+impl<'t> SyntaxCollector<'t> {
+    fn new(path: &str, source_end: u32, text: &'t str, utf16_map: &'t Utf16ByteMap) -> Self {
         let module_id = stable_entity_id(EntityKind::Module, path, 0, path);
         Self {
             path: path.to_owned(),
             module_id: module_id.clone(),
+            text,
+            utf16_map,
             imports: Vec::new(),
             entities: vec![SyntaxEntity {
                 id: module_id,
@@ -3639,6 +3890,7 @@ impl SyntaxCollector {
                 parent_id: None,
                 qualified_name: None,
                 is_test: None,
+                type_surface_digest: None,
             }],
             relations: Vec::new(),
             node_test_from: false,
@@ -3684,6 +3936,25 @@ impl SyntaxCollector {
         kind: EntityKind,
         universal_kind: UniversalKind,
     ) {
+        self.push_entity_with_type_surface(identifier, kind, universal_kind, None);
+    }
+
+    /// Frente E-P0h: [`Self::push_entity`], plus an optional [`SyntaxEntity::
+    /// type_surface_digest`] for the three top-level declaration kinds that
+    /// carry one of their own (`Function`/`Variable`/`Type` -- see that
+    /// field's own doc comment) -- `push_entity` itself stays the plain,
+    /// five-argument call every OTHER kind (`Class`/`Enum`/`Interface`/
+    /// `Namespace`, none of which has a "type surface" of its own; a class/
+    /// interface's own MEMBER surface is tracked separately, on each
+    /// member's own entity, by [`Self::push_member_entities`]) keeps using
+    /// unchanged.
+    fn push_entity_with_type_surface(
+        &mut self,
+        identifier: &BindingIdentifier<'_>,
+        kind: EntityKind,
+        universal_kind: UniversalKind,
+        type_surface_digest: Option<String>,
+    ) {
         let name = identifier.name.as_str();
         let id = stable_entity_id(kind, &self.path, identifier.span.start, name);
         self.entities.push(SyntaxEntity {
@@ -3697,6 +3968,7 @@ impl SyntaxCollector {
             parent_id: Some(self.module_id.clone()),
             qualified_name: Some(format!("{}.{}", self.path, name)),
             is_test: None,
+            type_surface_digest,
         });
         self.push_relation(
             RelationKind::Contains,
@@ -3741,6 +4013,7 @@ impl SyntaxCollector {
             parent_id: Some(self.module_id.clone()),
             qualified_name: Some(format!("{}.{}", self.path, name)),
             is_test: None,
+            type_surface_digest: None,
         });
         self.push_relation(
             RelationKind::Contains,
@@ -3803,6 +4076,24 @@ impl SyntaxCollector {
                 // declarations`'s own exhaustive match) -- never reached.
                 _ => continue,
             };
+            // Frente E-P0h: a `parameter` (constructor parameter property)
+            // has no "type surface" entry of its own in `exported_surface`
+            // today (out of this frente's scope -- see this crate's own
+            // `MemberDeclaration::type_surface_return`'s doc comment for
+            // why its own annotation still lives in `type_surface_params`
+            // regardless), so its digest is never computed; every other
+            // member kind gets one from `declaration`'s own raw spans, sliced
+            // and normalized against THIS file's own text/offset table.
+            let type_surface_digest = if declaration.kind_word == "parameter" {
+                None
+            } else {
+                type_surface_digest(
+                    self.text,
+                    self.utf16_map,
+                    &declaration.type_surface_params,
+                    declaration.type_surface_return,
+                )
+            };
             self.entities.push(SyntaxEntity {
                 id: declaration.entity_id.clone(),
                 name: declaration.name.clone(),
@@ -3817,6 +4108,7 @@ impl SyntaxCollector {
                     self.path, declaration.container_name, declaration.name
                 )),
                 is_test: None,
+                type_surface_digest,
             });
             self.push_relation(
                 RelationKind::Contains,
@@ -4438,7 +4730,7 @@ fn ambient_default_member(
     }
 }
 
-impl<'a> Visit<'a> for SyntaxCollector {
+impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
     fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
         if declaration.specifiers.is_some() && declaration.source.value == "node:test" {
             self.node_test_from = true;
@@ -4776,7 +5068,25 @@ impl<'a> Visit<'a> for SyntaxCollector {
             FunctionType::FunctionDeclaration | FunctionType::TSDeclareFunction
         ) && let Some(identifier) = &function.id
         {
-            self.push_entity(identifier, EntityKind::Function, UniversalKind::Callable);
+            // Frente E-P0h: a top-level function's own type surface --
+            // every parameter's own annotation (never its name -- that is
+            // already tracked, position-independently, by `analyze::
+            // exported_surface`'s own `param:` entries) plus the return
+            // type, if any.
+            let param_spans: Vec<Option<(u32, u32)>> = function
+                .params
+                .items
+                .iter()
+                .map(|param| type_annotation_span(param.type_annotation.as_deref()))
+                .collect();
+            let return_span = type_annotation_span(function.return_type.as_deref());
+            let digest = type_surface_digest(self.text, self.utf16_map, &param_spans, return_span);
+            self.push_entity_with_type_surface(
+                identifier,
+                EntityKind::Function,
+                UniversalKind::Callable,
+                digest,
+            );
         }
         walk_function(self, function, flags);
     }
@@ -4800,7 +5110,18 @@ impl<'a> Visit<'a> for SyntaxCollector {
         // `declarator_owns_entity`.
         for declarator in &declaration.declarations {
             if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
-                self.push_entity(identifier, EntityKind::Variable, UniversalKind::Value);
+                // Frente E-P0h: a top-level `const X: T = ...`'s own
+                // declared type (never its INITIALIZER's own inferred shape
+                // -- see `MemberDeclaration::type_surface_return`'s doc
+                // comment for the analogous class-member rule).
+                let return_span = type_annotation_span(declarator.type_annotation.as_deref());
+                let digest = type_surface_digest(self.text, self.utf16_map, &[], return_span);
+                self.push_entity_with_type_surface(
+                    identifier,
+                    EntityKind::Variable,
+                    UniversalKind::Value,
+                    digest,
+                );
             }
         }
         walk_variable_declaration(self, declaration);
@@ -4812,7 +5133,25 @@ impl<'a> Visit<'a> for SyntaxCollector {
     }
 
     fn visit_ts_type_alias_declaration(&mut self, declaration: &TSTypeAliasDeclaration<'a>) {
-        self.push_entity(&declaration.id, EntityKind::Type, UniversalKind::Type);
+        // Frente E-P0h: `type X = <RHS>`'s own RHS -- always present
+        // (unlike every other `type_surface_digest` call site, a type
+        // alias's own type is never optional), so `returns` is always
+        // `Some`. `type_surface_digest` still returns `Some` here
+        // unconditionally (its own "both `None`" early return can never
+        // fire), matching every other typed declaration's contract.
+        let rhs_span = declaration.type_annotation.span();
+        let digest = type_surface_digest(
+            self.text,
+            self.utf16_map,
+            &[],
+            Some((rhs_span.start, rhs_span.end)),
+        );
+        self.push_entity_with_type_surface(
+            &declaration.id,
+            EntityKind::Type,
+            UniversalKind::Type,
+            digest,
+        );
         walk_ts_type_alias_declaration(self, declaration);
     }
 
@@ -7878,12 +8217,23 @@ declare module 'markdown-it-task-lists' {
         assert_eq!(replayed_affected, affected_files);
     }
 
-    fn collect(path: &str, source_text: &str) -> SyntaxCollector {
+    fn collect<'t>(path: &str, source_text: &'t str) -> SyntaxCollector<'t> {
         let source_type = SourceType::from_path(std::path::Path::new(path)).expect("source type");
         let allocator = Allocator::default();
         let mut parsed = Parser::new(&allocator, source_text, source_type).parse();
         Utf8ToUtf16::new(source_text).convert_program(&mut parsed.program);
-        let mut collector = SyntaxCollector::new(path, source_text.encode_utf16().count() as u32);
+        // Test-only leak: `collect`'s own return type ties `SyntaxCollector`'s
+        // borrow to `source_text` (caller-owned, outlives this call), but the
+        // map itself is built HERE -- `Box::leak` gives it that same
+        // lifetime cheaply, acceptable for a test helper only ever called a
+        // bounded number of times per test binary run.
+        let utf16_map: &'t Utf16ByteMap = Box::leak(Box::new(Utf16ByteMap::from_text(source_text)));
+        let mut collector = SyntaxCollector::new(
+            path,
+            source_text.encode_utf16().count() as u32,
+            source_text,
+            utf16_map,
+        );
         collector.visit_program(&parsed.program);
         collector
     }
