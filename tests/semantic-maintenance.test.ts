@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
 import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type ContentAddressedStore, type SqliteValue, type WorkspaceDatabase } from "../packages/storage/src/index.js";
-import { createHttpEmbeddingProvider, createLocalHashProvider, reconcileSemanticProjection, shardIndexFor, vectorValues, type ResolvedSemanticProvider, type SemanticEntityCandidateRow, type SemanticEntityRecordSource, type SemanticReconcilerContentReader } from "../packages/engine/src/index.js";
+import { createHttpEmbeddingProvider, createLocalHashProvider, reconcileSemanticProjection, shardIndexFor, vectorValues, mergeSpans, complementSpans, type ResolvedSemanticProvider, type SemanticEntityCandidateRow, type SemanticEntityRecordSource, type SemanticReconcilerContentReader } from "../packages/engine/src/index.js";
 
 // `reconcileSemanticProjection` is typed against `@urdira/storage`'s
 // published (dist) `WorkspaceDatabase` declaration, since that is the real
@@ -1422,15 +1422,23 @@ describe("decision 17 entity-eligibility policy digest (marker-level backfill tr
 // and v4) -- no `record_occurrences` row is ever seeded in this describe
 // block, proving the entity pass never falls back to it when a source is
 // provided.
+// Frente S-E (2026-09-07): `entityCandidates` is now a page-callback (see
+// `SemanticEntityRecordSource.entityCandidates`'s own doc comment for why --
+// the prior "return one array" shape OOM'd a real semantic maintenance
+// child at n8n scale). This fake delivers every candidate as ONE page
+// (fixture-sized, never a real memory concern for a test) -- `calls.entityCandidates`
+// now counts CALLS TO THE METHOD (once per consumer: the container backfill
+// and the entity missing-insert step each call it separately), not pages.
 function fakeEntitySource(initialCandidates: readonly SemanticEntityCandidateRow[]): SemanticEntityRecordSource & { readonly calls: { entityCandidates: number; visibleRecordIds: number }; setVisibleIds: (ids: readonly string[]) => void } {
   let visible = new Set(initialCandidates.map((row) => row.record_id));
   const calls = { entityCandidates: 0, visibleRecordIds: 0 };
   return {
     calls,
     setVisibleIds: (ids: readonly string[]): void => { visible = new Set(ids); },
-    entityCandidates: async (): Promise<readonly SemanticEntityCandidateRow[]> => {
+    entityCandidates: async (onPage: (page: readonly SemanticEntityCandidateRow[]) => Promise<void>): Promise<void> => {
       calls.entityCandidates += 1;
-      return initialCandidates.filter((row) => visible.has(row.record_id));
+      const page = initialCandidates.filter((row) => visible.has(row.record_id));
+      if (page.length > 0) await onPage(page);
     },
     visibleRecordIds: async (ids: readonly string[]): Promise<ReadonlySet<string>> => {
       calls.visibleRecordIds += 1;
@@ -1478,7 +1486,12 @@ describe("reconcileSemanticProjection entity pass with entity_record_source (v4 
       // exists for this workspace at all, so a SQL query against it would
       // have thrown "no such table" (v4 catalog) or returned zero rows and
       // failed this assertion outright (v3 schema, empty table) either way.
-      expect(source.calls.entityCandidates).toBe(1);
+      // Frente S-E (2026-09-07): `entityCandidates` is now called TWICE on a
+      // clean pass -- once by step 5's missing-insert streaming, once by
+      // `syncDocumentStatusBulk`'s container backfill (a streaming source
+      // cannot be replayed from a single cached call the way the old
+      // memoized-array shape allowed).
+      expect(source.calls.entityCandidates).toBe(2);
 
       const entityRows = await opened.database.all<{ document_ref: string | null }>(
         "SELECT document_ref FROM vector_projection_rows WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL", [workspaceId],
@@ -1534,7 +1547,10 @@ describe("reconcileSemanticProjection entity pass with entity_record_source (v4 
       const first = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
       expect(first.entity_inserted).toBe(1);
       expect(first.marker_written).toBe(true);
-      expect(source.calls.entityCandidates).toBe(1);
+      // Frente S-E (2026-09-07): called TWICE on a clean pass -- step 5's
+      // missing-insert streaming, then `syncDocumentStatusBulk`'s container
+      // backfill (see the identical doc comment on the test above).
+      expect(source.calls.entityCandidates).toBe(2);
       // One call from `syncDocumentStatusBulk`'s orphan sweep, which always
       // runs at the end of a full pass (including the very first one) once
       // ANY entity-grain status row exists to check -- not from step 4
@@ -1719,6 +1735,84 @@ async function allVectorRowSignatures(opened: WorkspaceDatabase, cas: ContentAdd
   return out.sort();
 }
 
+// Frente S-E (2026-09-07, adversarial review): the sharding test above only
+// ever compared `vector_projection_rows` -- the plan's own criterion is
+// "2 shards ⇒ exactamente las mismas filas (vectores, semantic_document_status,
+// cache) que 1 shard", so this also compares `semantic_document_status`
+// (every document's status/reason_codes/segment_count, which
+// `syncDocumentStatusBulk` only ever runs from the orchestrator's own
+// unsharded finalize call) and `semantic_segment_cache` (every embedded
+// segment's cached vector, written identically regardless of which
+// shard/process happened to embed it first).
+async function documentStatusSignatures(opened: WorkspaceDatabase, workspaceId: string): Promise<readonly string[]> {
+  const rows = await opened.database.all<{ document_grain: string; document_id: string; status: string; reason_codes: string; segment_count: number }>(
+    "SELECT document_grain, document_id, status, reason_codes, segment_count FROM semantic_document_status WHERE workspace_id = ?",
+    [workspaceId],
+  );
+  return rows.map((row) => `${row.document_grain}:${row.document_id}:${row.status}:${row.reason_codes}:${row.segment_count}`).sort();
+}
+
+async function segmentCacheSignatures(opened: WorkspaceDatabase, workspaceId: string): Promise<readonly string[]> {
+  const rows = await opened.database.all<{ executable_binding_id: string; segment_digest: string; vector: Uint8Array }>(
+    "SELECT executable_binding_id, segment_digest, vector FROM semantic_segment_cache WHERE workspace_id = ?",
+    [workspaceId],
+  );
+  return rows.map((row) => `${row.executable_binding_id}:${row.segment_digest}:${Buffer.from(row.vector).toString("hex")}`).sort();
+}
+
+// Frente S-E (2026-09-07, adversarial review of Lever 1): `mergeSpans`/
+// `complementSpans` power the artifact-vector composition's "which text is
+// already covered by an eligible entity" decision. The current entity
+// eligibility policy (column-0 top-level declarations only) makes a
+// method-nested-inside-a-class overlap rare in practice (a method's own
+// line is indented, failing the column-0 check) -- but these two functions
+// must still be correct for ANY overlapping span set, not just the ones
+// today's policy happens to produce, since a future policy change (or a
+// different language's entities) could easily introduce one.
+describe("Frente S-E (2026-09-07): mergeSpans/complementSpans overlap correctness", () => {
+  it("merges a span nested entirely inside another (e.g. a method inside its owning class) into ONE region, never double-counting the overlap", () => {
+    // classSpan [0, 100) fully contains methodSpan [20, 40) -- the class
+    // "covers" its method, exactly the scenario plan §4's adversarial
+    // review calls out.
+    const merged = mergeSpans([{ start: 0, end: 100 }, { start: 20, end: 40 }]);
+    expect(merged).toEqual([{ start: 0, end: 100 }]);
+    // The gap computation over a 120-char file sees exactly one covered
+    // region (the merged class span) and one gap after it -- the method's
+    // own span never appears as a SEPARATE covered region, so it can never
+    // be double-counted as its own gap-adjacent boundary either.
+    expect(complementSpans(merged, 120)).toEqual([{ start: 100, end: 120 }]);
+  });
+
+  it("merges partially-overlapping spans (not nested, not merely adjacent) into their union", () => {
+    const merged = mergeSpans([{ start: 10, end: 50 }, { start: 30, end: 70 }]);
+    expect(merged).toEqual([{ start: 10, end: 70 }]);
+  });
+
+  it("merges adjacent (touching, non-overlapping) spans into one region", () => {
+    const merged = mergeSpans([{ start: 0, end: 20 }, { start: 20, end: 40 }]);
+    expect(merged).toEqual([{ start: 0, end: 40 }]);
+  });
+
+  it("keeps disjoint (non-touching) spans separate, regardless of input order", () => {
+    const merged = mergeSpans([{ start: 50, end: 60 }, { start: 0, end: 10 }]);
+    expect(merged).toEqual([{ start: 0, end: 10 }, { start: 50, end: 60 }]);
+  });
+
+  it("handles THREE mutually overlapping spans (a chain: A overlaps B, B overlaps C, A does not directly overlap C) as one merged region", () => {
+    const merged = mergeSpans([{ start: 0, end: 30 }, { start: 20, end: 50 }, { start: 45, end: 80 }]);
+    expect(merged).toEqual([{ start: 0, end: 80 }]);
+  });
+
+  it("complementSpans returns the whole text as one gap when there are zero eligible entities (the fallback case)", () => {
+    expect(complementSpans([], 100)).toEqual([{ start: 0, end: 100 }]);
+  });
+
+  it("complementSpans returns no gaps at all when eligible entities cover the entire file end-to-end", () => {
+    const merged = mergeSpans([{ start: 0, end: 50 }, { start: 50, end: 100 }]);
+    expect(complementSpans(merged, 100)).toEqual([]);
+  });
+});
+
 describe("Frente S-D (2026-09-07): parallel reconciler sharding (Lever 2)", () => {
   const shardDocs = [1, 2, 3, 4, 5, 6].map((index) => ({
     artifactId: `art-shard-${index}`,
@@ -1747,11 +1841,13 @@ describe("Frente S-D (2026-09-07): parallel reconciler sharding (Lever 2)", () =
     expect(assignments.size).toBeGreaterThan(0);
   });
 
-  it("2 shards + one finalize pass produce the same rows as a single unsharded pass", async () => {
+  it("2 shards + one finalize pass produce the same rows as a single unsharded pass -- vectors, semantic_document_status, AND the segment cache", async () => {
     const provider = createLocalHashProvider();
 
     const baselineWorkspace = "ws-semantic-shard-baseline";
     let baselineRows: readonly string[] = [];
+    let baselineStatus: readonly string[] = [];
+    let baselineCache: readonly string[] = [];
     await withWorkspace(baselineWorkspace, async (opened, cas) => {
       await seedShardCorpus(opened, cas, baselineWorkspace);
       const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: baselineWorkspace, content: cas, provider });
@@ -1759,8 +1855,13 @@ describe("Frente S-D (2026-09-07): parallel reconciler sharding (Lever 2)", () =
       expect(result.inserted).toBe(shardDocs.length);
       expect(result.entity_inserted).toBe(shardDocs.length);
       baselineRows = await allVectorRowSignatures(opened, cas);
+      baselineStatus = await documentStatusSignatures(opened, baselineWorkspace);
+      baselineCache = await segmentCacheSignatures(opened, baselineWorkspace);
     });
     expect(baselineRows).toHaveLength(shardDocs.length * 2); // 1 artifact + 1 entity vector per document
+    // Every artifact + every entity got a `covered` status row -- both grains.
+    expect(baselineStatus).toHaveLength(shardDocs.length * 2);
+    expect(baselineCache.length).toBeGreaterThan(0);
 
     const shardedWorkspace = "ws-semantic-shard-2way";
     await withWorkspace(shardedWorkspace, async (opened, cas) => {
@@ -1782,11 +1883,83 @@ describe("Frente S-D (2026-09-07): parallel reconciler sharding (Lever 2)", () =
 
       const shardedRows = await allVectorRowSignatures(opened, cas);
       expect(shardedRows).toEqual(baselineRows);
+      // `semantic_document_status` (written per-document by EACH shard's own
+      // insert loop, not just the finalize pass) must exactly match the
+      // unsharded baseline -- proves the sharded run's status bookkeeping
+      // (covered/reason_codes/segment_count) is identical, not just its
+      // vector bytes.
+      const shardedStatus = await documentStatusSignatures(opened, shardedWorkspace);
+      expect(shardedStatus).toEqual(baselineStatus);
+      // The segment cache (populated independently by each shard process AND
+      // the finalize pass, `INSERT OR IGNORE`-deduplicated) must also match
+      // byte-for-byte -- proves Lever 2 (sharding) and Lever 3 (the segment
+      // cache) compose correctly under concurrency, not just each in
+      // isolation.
+      const shardedCache = await segmentCacheSignatures(opened, shardedWorkspace);
+      expect(shardedCache).toEqual(baselineCache);
     });
   });
 
   it("a shard with index >= count throws (defensive input validation)", () => {
     expect(() => shardIndexFor("art-x", 0)).toThrow();
+  });
+
+  // Frente S-E (2026-09-07, adversarial review): the two shards above run
+  // SEQUENTIALLY (`await`ed one after the other) -- real sharding
+  // (`runSemanticReconcileSharded`, `packages/daemon/src/semantic-process.ts`)
+  // runs them as GENUINELY CONCURRENT child processes, each with its OWN
+  // SQLite connection to the SAME sidecar database. This test opens the
+  // SAME workspace through two SEPARATE `DurableStorage` instances (the
+  // closest a single Node process can get to "two OS processes, two
+  // connections, one file" without actually forking) and runs both shards'
+  // `reconcileSemanticProjection` calls via a real `Promise.all` --
+  // proving the existing `busy_timeout`/WAL configuration (every
+  // `openWorkspace` connection already gets both, `packages/storage/src/sqlite.ts`)
+  // is sufficient to serialize genuinely concurrent shard writes without
+  // either call ever surfacing a raw `SQLITE_BUSY` error, and that the
+  // resulting rows still match a sequential baseline exactly.
+  it("2 shards running as GENUINELY CONCURRENT writers (two separate DurableStorage connections to the same file) never surface SQLITE_BUSY, and still produce byte-identical rows to the unsharded baseline", async () => {
+    const provider = createLocalHashProvider();
+    const contentionWorkspace = "ws-semantic-shard-contention";
+
+    const root = await mkdtemp(join(tmpdir(), "urdira-semantic-shard-contention-"));
+    // A short busy_timeout (still real SQLite-level blocking-retry, just a
+    // lower ceiling than production's 5000ms) makes a genuine contention
+    // failure fail FAST and loudly in this test rather than masking it
+    // behind a long, cooperative wait -- if the two connections ever
+    // legitimately needed longer than this to serialize, that would itself
+    // be worth knowing.
+    const storageA = await createDurableStorage({ rootDir: root, busyTimeoutMs: 2_000 });
+    const storageB = await createDurableStorage({ rootDir: root, busyTimeoutMs: 2_000 });
+    try {
+      await storageA.catalog.registerWorkspace(workspaceRegistration(contentionWorkspace));
+      const openedA = await storageA.openWorkspace(contentionWorkspace);
+      const openedB = await storageB.openWorkspace(contentionWorkspace);
+      try {
+        await seedShardCorpus(openedA, storageA.cas, contentionWorkspace);
+        const [shard0, shard1] = await Promise.all([
+          reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(openedA), workspace_id: contentionWorkspace, content: storageA.cas, provider, shard: { index: 0, count: 2 } }),
+          reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(openedB), workspace_id: contentionWorkspace, content: storageB.cas, provider, shard: { index: 1, count: 2 } }),
+        ]);
+        expect(shard0.marker_written).toBe(false);
+        expect(shard1.marker_written).toBe(false);
+        expect(shard0.inserted + shard1.inserted).toBe(shardDocs.length);
+        expect(shard0.entity_inserted + shard1.entity_inserted).toBe(shardDocs.length);
+
+        const finalize = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(openedA), workspace_id: contentionWorkspace, content: storageA.cas, provider });
+        expect(finalize.marker_written).toBe(true);
+
+        const contentionRows = await allVectorRowSignatures(openedA, storageA.cas);
+        expect(contentionRows).toHaveLength(shardDocs.length * 2);
+      } finally {
+        await openedA.close();
+        await openedB.close();
+      }
+    } finally {
+      await storageA.close();
+      await storageB.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1884,6 +2057,42 @@ describe("Frente S-D (2026-09-07): segment cache (Lever 3)", () => {
       expect(third.entity_inserted).toBe(1);
       expect(third.inserted).toBe(1);
       expect(calls).toBe(callsAfterFirst); // the new document's segment was a 100% cache hit -- zero new provider calls
+    });
+  });
+
+  // Frente S-E (2026-09-07, adversarial review): the cache had NO eviction
+  // at all before this fix -- its own DDL comment admitted "no LRU yet ...
+  // pruned only by a future retention pass". A provider swap (the reconciler
+  // already handles this correctly for `vector_projection_rows` -- see
+  // "closes every old-profile vector..." above) must not leave the RETIRED
+  // binding's segment-cache rows behind forever.
+  it("prunes every OTHER executable_binding_id's cache rows once a clean pass writes the marker for the CURRENT binding", async () => {
+    const workspaceId = "ws-semantic-cache-prune";
+    const providerA = createLocalHashProvider();
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ data: [{ embedding: [1, 0, 0, 0] }] }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+    const providerB: ResolvedSemanticProvider = createHttpEmbeddingProvider({ endpoint: "https://embeddings.example.test/v1/prune", model: "prune-model", dimensions: 4, fetch_impl: fetchImpl });
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-prune-1", artifactVersionId: "artv-prune-1", text: "function pruneCacheContentOne() {}", validFromGeneration: 1 });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const engineDatabase = asEngineWorkspaceDatabase(opened);
+
+      const initial = await reconcileSemanticProjection({ database: engineDatabase, workspace_id: workspaceId, content: cas, provider: providerA });
+      expect(initial.marker_written).toBe(true);
+      const cacheAfterA = await opened.database.all<{ executable_binding_id: string }>("SELECT executable_binding_id FROM semantic_segment_cache WHERE workspace_id = ?", [workspaceId]);
+      expect(cacheAfterA.length).toBeGreaterThan(0);
+      expect(cacheAfterA.every((row) => row.executable_binding_id === providerA.binding.executable_binding_digest)).toBe(true);
+
+      // Swap to provider B at the SAME generation: providerA's rows close,
+      // providerB's rows insert fresh, and (this fix) providerA's own
+      // segment-cache rows are pruned once providerB's pass writes its own
+      // marker cleanly.
+      const swapped = await reconcileSemanticProjection({ database: engineDatabase, workspace_id: workspaceId, content: cas, provider: providerB });
+      expect(swapped.marker_written).toBe(true);
+      const cacheAfterB = await opened.database.all<{ executable_binding_id: string }>("SELECT executable_binding_id FROM semantic_segment_cache WHERE workspace_id = ?", [workspaceId]);
+      expect(cacheAfterB.length).toBeGreaterThan(0);
+      expect(cacheAfterB.every((row) => row.executable_binding_id === providerB.binding.executable_binding_digest)).toBe(true);
+      expect(cacheAfterB.some((row) => row.executable_binding_id === providerA.binding.executable_binding_digest)).toBe(false);
     });
   });
 });

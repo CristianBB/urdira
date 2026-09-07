@@ -317,3 +317,55 @@ retry budget; measurements instead use a real, substantial n8n subset
 Parts 1-3 for the full numbers (embed throughput per lever on that subset,
 cache hit-rate on an edit, latency before/after) and §0.5 for why a subset,
 not the full corpus, was used.
+
+## Amendment (2026-09-07, Frente S-E): both P0s from the prior amendment
+## root-fixed, not just mitigated; segment cache gained pruning
+
+**`spawn EBADF`** is fixed at the daemon-fd-count level, not just retried
+around: see decision 16's own S-E amendment -- the real root cause was
+`@parcel/watcher`'s kqueue backend holding one fd per corpus file, now
+bounded (`KQUEUE_FILE_WATCH_BUDGET`, falls back to fs-events above 2,000
+files). The bounded-retry wrapper (`runSemanticReconcileInProcessWithRetry`)
+is KEPT as defense in depth, not removed.
+
+**Entity-candidate enumeration OOM** is fixed at the source, not just
+mitigated with a raised heap ceiling. `SemanticEntityRecordSource.entityCandidates()`
+(`packages/engine/src/semantic-reconciler.ts`) is no longer
+`Promise<readonly SemanticEntityCandidateRow[]>` (one array holding every
+candidate, confirmed to OOM at n8n scale: 326,817 candidates materialized
+at once) -- it is now a page-callback:
+`entityCandidates(onPage: (page) => Promise<void>): Promise<void>`.
+`createNativeSemanticEntityRecordSource` (`semantic-entity-source-v4.ts`)
+streams `ENTITY_CANDIDATE_PAGE_SIZE`-row (2,000) pages from the native
+port's own `records_for_query_batches` (itself already internally
+keyset-paginated), resolving each page's OWN owner-CAS metadata rather than
+a corpus-wide owner-id set, so this source's own peak memory is O(page),
+never O(corpus). The reconciler's two consumers (the container backfill in
+`syncDocumentStatusBulk` and the entity missing-insert loop, step 5) each
+call `entityCandidates` separately and process pages incrementally -- a
+streaming source cannot be replayed from a single cached call the way the
+old memoized-array shape allowed, so this trades one extra full corpus scan
+for O(page) memory, accepted as a fair trade against an unconditional OOM.
+Owning-file text caching for the entity missing-insert loop's "one CAS read
+per file" optimization moved from a single-slot "current owner" pointer to
+a bounded (64-entry) LRU, since a streaming source can no longer guarantee
+cross-page owner adjacency the way a full `ORDER BY owner_artifact_version_id`
+sort could. `SEMANTIC_CHILD_MAX_OLD_SPACE_MB`'s raised ceiling
+(`packages/daemon/src/semantic-process.ts`) is KEPT as defense in depth for
+the rest of a semantic child's own memory footprint, not because the
+eager-materialization bug it was sized against is still present.
+
+**Segment cache (Lever 3) gained pruning.** Its own DDL comment previously
+admitted "no LRU yet ... pruned only by a future retention pass" -- it now
+never grows past one active vector space's worth of distinct segment
+content: `reconcileSemanticProjection` prunes every `semantic_segment_cache`
+row whose `executable_binding_id` is not the CURRENT one, immediately after
+a clean pass writes the completion marker (a retired vector space's cached
+segments can never be a cache hit again, since every lookup/write is scoped
+to the current binding alone).
+
+See `docs/evidence/2026-09-07-v4-semantic-close.md` for the adversarial
+review of every other S-D lever (sharding row-for-row parity extended to
+`semantic_document_status`/the segment cache, artifact/entity composition
+edge cases, `nativeTopKChunked` tie-breaking under ties spanning chunk
+boundaries) and the final embed/latency/incremental-edit measurements.

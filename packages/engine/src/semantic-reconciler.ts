@@ -116,8 +116,30 @@ export interface SemanticEntityCandidateRow {
  * additions, never a rewrite of the v3 path.
  */
 export interface SemanticEntityRecordSource {
-  /** Every visible entity-category candidate record at the workspace's CURRENT generation, including the ineligible container kind (the caller splits by `record_kind` itself, mirroring the two separate v3 SQL queries this replaces) and excluding any record whose owning file is missing/binary. Order is not contractually significant; callers that benefit from owner-version grouping (per-file CAS text caching) sort this themselves. */
-  entityCandidates(): Promise<readonly SemanticEntityCandidateRow[]>;
+  /**
+   * Streams every visible entity-category candidate record at the
+   * workspace's CURRENT generation, including the ineligible container kind
+   * (the caller splits by `record_kind` itself, mirroring the two separate
+   * v3 SQL queries this replaces) and excluding any record whose owning
+   * file is missing/binary. Frente S-E (2026-09-07): this used to return
+   * one `Promise<readonly SemanticEntityCandidateRow[]>` holding EVERY
+   * candidate at once -- a confirmed OOM at n8n scale (326,817 candidates,
+   * see `createNativeSemanticEntityRecordSource`'s own doc comment). Now a
+   * page-callback: `onPage` is invoked once per bounded page (order not
+   * contractually significant -- NOT globally sorted, since a streaming
+   * source cannot guarantee cross-page adjacency; callers that benefit from
+   * owner-version grouping for CAS text-read locality must cache across
+   * pages themselves, e.g. a small bounded LRU), and the returned promise
+   * resolves once every page has been delivered and every `onPage` call has
+   * itself resolved. A caller that needs the data more than once (this
+   * reconciler's container-backfill step and its entity missing-insert step
+   * both do) must call this method AGAIN for the second need -- a streaming
+   * source cannot be replayed from a cache without reintroducing the exact
+   * O(corpus) buffering this change removes. This trades one extra full
+   * corpus scan for O(page) memory, a fair trade against an unconditional
+   * OOM.
+   */
+  entityCandidates(onPage: (page: readonly SemanticEntityCandidateRow[]) => Promise<void>): Promise<void>;
   /** Of the given record ids, the subset that is STILL VISIBLE at the workspace's CURRENT generation -- used both for the entity stale-close step and the orphaned-status-row sweep. Documented simplification versus v3 (see `createNativeSemanticEntityRecordSource`'s own doc comment): a v4 caller cannot recover the EXACT generation a now-invisible record stopped being visible at, only that it currently is not -- every v4-sourced close/sweep therefore closes/deletes AS OF the pass's own current generation, never a historically exact one. */
   visibleRecordIds(ids: readonly string[]): Promise<ReadonlySet<string>>;
 }
@@ -352,8 +374,16 @@ function chunk<T>(values: readonly T[], size: number): readonly T[][] {
  * `spans`. Used by `reconcileSemanticProjection`'s artifact-vector
  * composition to turn a file's ELIGIBLE entity spans into the covered-region
  * set before `complementSpans` computes the "gap" (not-covered) text.
+ * Frente S-E (2026-09-07): exported (was module-private) so
+ * `tests/semantic-maintenance.test.ts` exercises this exact merge algorithm
+ * directly -- in particular the "a method's span nested inside its owning
+ * class's span" case (both eligible under a hypothetical looser policy, or
+ * simply two spans that happen to overlap): the wider span absorbs the
+ * narrower one into ONE merged region, so `complementSpans`'s gap
+ * computation -- and therefore the composed artifact vector's mean-pool --
+ * never double-counts the overlapping text as two separate components.
  */
-function mergeSpans(spans: readonly { readonly start: number; readonly end: number }[]): readonly { readonly start: number; readonly end: number }[] {
+export function mergeSpans(spans: readonly { readonly start: number; readonly end: number }[]): readonly { readonly start: number; readonly end: number }[] {
   if (spans.length === 0) return [];
   const sorted = [...spans].sort((left, right) => left.start - right.start || left.end - right.end);
   const merged: Array<{ start: number; end: number }> = [{ ...sorted[0]! }];
@@ -374,7 +404,7 @@ function mergeSpans(spans: readonly { readonly start: number; readonly end: numb
  * pequeño"). An empty `coveredSpans` returns `[{start: 0, end: length}]` (the
  * whole text is one gap) -- the "zero eligible entities" fallback case.
  */
-function complementSpans(coveredSpans: readonly { readonly start: number; readonly end: number }[], length: number): readonly { readonly start: number; readonly end: number }[] {
+export function complementSpans(coveredSpans: readonly { readonly start: number; readonly end: number }[], length: number): readonly { readonly start: number; readonly end: number }[] {
   const gaps: Array<{ start: number; end: number }> = [];
   let cursor = 0;
   for (const span of coveredSpans) {
@@ -681,17 +711,14 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   const profileId = provider.profile.embedding_profile_id;
   const executableBindingId = provider.binding.executable_binding_digest;
   const entitySource = input.entity_record_source;
-  // Memoized: `entitySource.entityCandidates()` runs one full corpus scan
-  // (see its own doc comment) -- both `syncDocumentStatusBulk`'s container
-  // backfill and step 5's missing-insert loop need the SAME result within
-  // one pass, and this function never runs those two concurrently within a
-  // single invocation, so a plain memoized promise is enough (no cache
-  // invalidation needed across separate `reconcileSemanticProjection` calls).
-  let v4CandidatesPromise: Promise<readonly SemanticEntityCandidateRow[]> | undefined;
-  const getV4EntityCandidates = (): Promise<readonly SemanticEntityCandidateRow[]> => {
-    v4CandidatesPromise ??= entitySource!.entityCandidates();
-    return v4CandidatesPromise;
-  };
+  // Frente S-E (2026-09-07): NO LONGER memoized into one cached array --
+  // `entitySource.entityCandidates()` now streams bounded pages (see its own
+  // doc comment for why: the prior "materialize everything once, memoize
+  // it" shape is exactly the O(corpus) buffering that OOM'd a semantic
+  // maintenance child at n8n scale). `syncDocumentStatusBulk`'s container
+  // backfill and step 5's missing-insert loop each call `entityCandidates`
+  // SEPARATELY (a streaming source cannot be replayed from a cache) -- one
+  // extra full corpus scan, traded for O(page) memory instead of O(corpus).
 
   const currentGeneration = async (): Promise<number | undefined> => {
     const row = await sql.get<{ current_generation: number }>("SELECT current_generation FROM workspace_current_state WHERE workspace_id = ?", [workspaceId]);
@@ -789,16 +816,22 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       // v4 equivalent: `INSERT OR IGNORE` makes this idempotent per row, so
       // no upfront "already present" check is needed -- a container record
       // this pass has already backfilled a status row for is simply a no-op
-      // conflict on every later pass.
-      const containers = (await getV4EntityCandidates()).filter((row) => row.record_kind === INELIGIBLE_ENTITY_RECORD_KIND);
-      for (const group of chunk(containers, ENTITY_STATUS_BATCH_SIZE)) {
-        await sql.transaction(group.map((row) => ({
-          kind: "run" as const,
-          sql: `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
-                VALUES (?, ?, ?, 'entity', ?, ?, ?, ?, 'unsupported', '["unsupported_kind"]', 0, ?, ?)`,
-          params: [workspaceId, profileId, executableBindingId, row.record_id, row.owner_artifact_id, row.owner_artifact_version_id, row.display_path ?? row.owner_artifact_id, generation, updatedAt],
-        })));
-      }
+      // conflict on every later pass. Frente S-E (2026-09-07): streamed
+      // page-by-page (never accumulating the workspace's whole container
+      // set) -- each page's own containers are chunked and inserted
+      // immediately, so this step's own peak memory is O(page), not
+      // O(corpus).
+      await entitySource!.entityCandidates(async (page) => {
+        const containers = page.filter((row) => row.record_kind === INELIGIBLE_ENTITY_RECORD_KIND);
+        for (const group of chunk(containers, ENTITY_STATUS_BATCH_SIZE)) {
+          await sql.transaction(group.map((row) => ({
+            kind: "run" as const,
+            sql: `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
+                  VALUES (?, ?, ?, 'entity', ?, ?, ?, ?, 'unsupported', '["unsupported_kind"]', 0, ?, ?)`,
+            params: [workspaceId, profileId, executableBindingId, row.record_id, row.owner_artifact_id, row.owner_artifact_version_id, row.display_path ?? row.owner_artifact_id, generation, updatedAt],
+          })));
+        }
+      });
     }
     await sql.run(
       `INSERT OR IGNORE INTO semantic_document_status (workspace_id, profile_id, executable_binding_id, document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes, segment_count, generation, updated_at)
@@ -1715,99 +1748,62 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     readonly body_payload?: Uint8Array | ArrayBuffer | null;
     readonly body?: Readonly<Record<string, unknown>>;
   };
-  const missingEntityRows: readonly EntityInsertRow[] = entitySource === undefined
-    ? await sql.all<MissingEntityRow>(
-        `SELECT record_occurrences.record_id AS record_id, record_occurrences.kind AS record_kind,
-                record_occurrences.owner_artifact_id AS owner_artifact_id, record_occurrences.owner_artifact_version_id AS owner_artifact_version_id,
-                record_occurrences.valid_from_generation AS valid_from_generation,
-                artifact_versions.content_hash AS content_hash, artifact_versions.byte_length AS byte_length,
-                source_artifacts.display_path AS display_path, record_occurrences.body_payload AS body_payload
-           FROM record_occurrences
-           JOIN artifact_versions ON artifact_versions.workspace_id = record_occurrences.workspace_id
-            AND artifact_versions.artifact_id = record_occurrences.owner_artifact_id
-            AND artifact_versions.artifact_version_id = record_occurrences.owner_artifact_version_id
-           JOIN source_artifacts ON source_artifacts.workspace_id = record_occurrences.workspace_id AND source_artifacts.artifact_id = record_occurrences.owner_artifact_id
-          WHERE record_occurrences.workspace_id = ? AND record_occurrences.category = 'entity' AND record_occurrences.kind <> ?
-            AND artifact_versions.encoding <> 'binary'
-            AND record_occurrences.valid_from_generation <= ?
-            AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
-            AND NOT EXISTS (
-              SELECT 1 FROM vector_projection_rows
-               WHERE vector_projection_rows.workspace_id = record_occurrences.workspace_id
-                 AND vector_projection_rows.document_grain = 'entity'
-                 AND vector_projection_rows.document_ref = record_occurrences.record_id
-                 AND vector_projection_rows.valid_to_generation IS NULL
-                 AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
-            )
-          ORDER BY record_occurrences.owner_artifact_version_id, record_occurrences.record_id`,
-        [workspaceId, INELIGIBLE_ENTITY_RECORD_KIND, generation, generation, profileId, executableBindingId],
-      )
-    : await (async (): Promise<readonly EntityInsertRow[]> => {
-        const openRows = await sql.all<{ document_ref: string }>(
-          `SELECT document_ref FROM vector_projection_rows
-            WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL
-              AND profile_id = ? AND executable_binding_id = ?`,
-          [workspaceId, profileId, executableBindingId],
-        );
-        const openIds = new Set(openRows.map((row) => row.document_ref));
-        const candidates = await getV4EntityCandidates();
-        return candidates
-          .filter((row) => row.record_kind !== INELIGIBLE_ENTITY_RECORD_KIND && !openIds.has(row.record_id))
-          .map((row): EntityInsertRow => ({
-            record_id: row.record_id, record_kind: row.record_kind, owner_artifact_id: row.owner_artifact_id,
-            owner_artifact_version_id: row.owner_artifact_version_id, valid_from_generation: generation,
-            content_hash: row.content_hash, byte_length: row.byte_length, display_path: row.display_path, body: row.body,
-          }))
-          .sort((left, right) => left.owner_artifact_version_id.localeCompare(right.owner_artifact_version_id) || left.record_id.localeCompare(right.record_id));
-      })();
-  // Frente S-D (2026-09-07, Lever 2): shard filter -- BY OWNING ARTIFACT, so
-  // an entity and its owning file's artifact document always land in the
-  // SAME shard (see `shard`'s own doc comment). A plain array filter (not a
-  // SQL `WHERE`) keeps the query itself unchanged for every non-sharded
-  // caller and costs only a cheap in-memory pass over lightweight metadata
-  // rows (no CAS reads have happened yet for any of them).
-  const shardedMissingEntityRows = input.shard === undefined ? missingEntityRows : missingEntityRows.filter((row) => shardIndexFor(row.owner_artifact_id, input.shard!.count) === input.shard!.index);
-
-  // Owning-file text state for the CURRENT `owner_artifact_version_id` group
-  // -- read (and its oversized/undecodable outcome cached) exactly ONCE per
-  // distinct owning artifact version, never once per entity record, per the
-  // embed-throughput constraint's "one CAS text read per owning file, no
-  // per-entity CAS reads". Rows are grouped by `ORDER BY
-  // record_occurrences.owner_artifact_version_id` above, so a plain
-  // "did the owner id change" check below is sufficient -- no separate GROUP
-  // BY or sort step needed.
+  // Frente S-E (2026-09-07): owning-file text state, read (and its
+  // oversized/undecodable outcome cached) once per distinct owning artifact
+  // version -- a bounded LRU (not a single "current owner" slot) because the
+  // v4 streaming path below (see `entitySource.entityCandidates`'s own doc
+  // comment) can no longer guarantee every entity from the same owning file
+  // arrives adjacently: pages come from `records_for_query_batches` in
+  // whatever order the store's own keyset pagination yields, not sorted by
+  // owner. A single-slot cache would silently degrade to "re-read on every
+  // row" the instant two different owners interleave across a page boundary
+  // -- the v3 path (still `ORDER BY owner_artifact_version_id`) only ever
+  // needs slot 1 of this cache in practice, so this is a strict superset of
+  // its old behavior, never a regression for it.
+  const OWNER_FILE_STATE_CACHE_CAP = 64;
   type OwningFileState = { readonly status: "ok"; readonly text: string } | { readonly status: "oversized" } | { readonly status: "undecodable" };
-  let currentOwnerVersionId: string | undefined;
-  let currentFileState: OwningFileState | undefined;
+  const ownerFileStateCache = new Map<string, OwningFileState>();
+  const ownerFileState = async (ownerVersionId: string, byteLength: number, contentHash: string): Promise<OwningFileState> => {
+    const cached = ownerFileStateCache.get(ownerVersionId);
+    if (cached !== undefined) {
+      // Refresh recency (Map iteration/insertion order) for the LRU evict below.
+      ownerFileStateCache.delete(ownerVersionId);
+      ownerFileStateCache.set(ownerVersionId, cached);
+      return cached;
+    }
+    let state: OwningFileState;
+    if (byteLength > maxDocumentBytes) state = { status: "oversized" };
+    else {
+      const bytes = await content.read(contentHash);
+      const text = decodeText(bytes);
+      state = text === undefined ? { status: "undecodable" } : { status: "ok", text };
+    }
+    ownerFileStateCache.set(ownerVersionId, state);
+    if (ownerFileStateCache.size > OWNER_FILE_STATE_CACHE_CAP) {
+      const oldest = ownerFileStateCache.keys().next().value;
+      if (oldest !== undefined) ownerFileStateCache.delete(oldest);
+    }
+    return state;
+  };
 
   let entityPendingBatch: PendingEmbedItem[] = [];
-  for (const row of shardedMissingEntityRows) {
+  let entityLoopAborted = false;
+  const processMissingEntityRow = async (row: EntityInsertRow): Promise<void> => {
     // Same batch-scoped abort checkpoint as step 3's loop -- see its own
-    // comment. The owning-file read below (when the owner id changes) is
-    // part of "this row's own work" the checkpoint protects, exactly like
-    // step 3's `content.read` call.
-    if (entityPendingBatch.length === 0 && shouldAbort?.()) return buildResult(generation, false, true);
-    if (row.owner_artifact_version_id !== currentOwnerVersionId) {
-      currentOwnerVersionId = row.owner_artifact_version_id;
-      if (row.byte_length > maxDocumentBytes) {
-        currentFileState = { status: "oversized" };
-      } else {
-        const bytes = await content.read(row.content_hash);
-        const text = decodeText(bytes);
-        currentFileState = text === undefined ? { status: "undecodable" } : { status: "ok", text };
-      }
-    }
-    const fileState = currentFileState!;
+    // comment. The owning-file read below is part of "this row's own work"
+    // the checkpoint protects, exactly like step 3's `content.read` call.
+    if (entityPendingBatch.length === 0 && shouldAbort?.()) { entityLoopAborted = true; return; }
+    const fileState = await ownerFileState(row.owner_artifact_version_id, row.byte_length, row.content_hash);
     const entityDisplayPath = row.display_path ?? row.owner_artifact_id;
     if (fileState.status === "oversized") {
       counts.entity_skipped_oversized += 1;
       await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["oversized"] });
-      continue;
+      return;
     }
     if (fileState.status === "undecodable") {
       counts.entity_skipped_undecodable += 1;
       await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["binary"] });
-      continue;
+      return;
     }
     // v4 storage wiring: `row.body` is already decoded (native-store scan) --
     // never re-decode it, and never fall into the v3-only `record_value_nodes`
@@ -1830,7 +1826,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       const bodyKind = typeof body["kind"] === "string" ? body["kind"] as string : undefined;
       const reasonCode = bodyKind !== undefined && INELIGIBLE_ENTITY_BODY_KINDS.has(bodyKind) ? "unsupported_kind" : "below_min_length";
       await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: reasonCode === "unsupported_kind" ? "unsupported" : "excluded", reasonCodes: [reasonCode] });
-      continue;
+      return;
     }
     const spanText = fileState.text.slice(eligibility.start, eligibility.end);
     const docComment = leadingDocComment(fileState.text, eligibility.start);
@@ -1838,7 +1834,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     if (!EMBEDDABLE_TOKEN_PATTERN.test(embeddingText)) {
       counts.entity_skipped_empty += 1;
       await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["below_min_length"] });
-      continue;
+      return;
     }
     // Identity is a pure function of the RECORD id alone (see
     // `entityDocumentId`'s own doc comment) -- back-dated to the RECORD's own
@@ -1862,7 +1858,7 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       // treated the same as the empty-text skip immediately above it.
       counts.entity_skipped_empty += 1;
       await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["below_min_length"] });
-      continue;
+      return;
     }
     // Registered BEFORE any of this record's segment items are pushed into
     // `entityPendingBatch` -- see `EntityDocumentAggregate`'s own doc
@@ -1890,7 +1886,82 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       await embedAndCommitBatch(entityPendingBatch);
       entityPendingBatch = [];
     }
+  };
+
+  if (entitySource === undefined) {
+    // v3 path: UNCHANGED shape (one `ORDER BY owner_artifact_version_id,
+    // record_id` query, one array, one `for` loop) -- `record_occurrences`
+    // is small enough at v3 scale that this never needed streaming, and this
+    // frente never rewrites the v3 path (see this file's own recurring
+    // doc-comment convention).
+    const missingEntityRows = await sql.all<MissingEntityRow>(
+      `SELECT record_occurrences.record_id AS record_id, record_occurrences.kind AS record_kind,
+              record_occurrences.owner_artifact_id AS owner_artifact_id, record_occurrences.owner_artifact_version_id AS owner_artifact_version_id,
+              record_occurrences.valid_from_generation AS valid_from_generation,
+              artifact_versions.content_hash AS content_hash, artifact_versions.byte_length AS byte_length,
+              source_artifacts.display_path AS display_path, record_occurrences.body_payload AS body_payload
+         FROM record_occurrences
+         JOIN artifact_versions ON artifact_versions.workspace_id = record_occurrences.workspace_id
+          AND artifact_versions.artifact_id = record_occurrences.owner_artifact_id
+          AND artifact_versions.artifact_version_id = record_occurrences.owner_artifact_version_id
+         JOIN source_artifacts ON source_artifacts.workspace_id = record_occurrences.workspace_id AND source_artifacts.artifact_id = record_occurrences.owner_artifact_id
+        WHERE record_occurrences.workspace_id = ? AND record_occurrences.category = 'entity' AND record_occurrences.kind <> ?
+          AND artifact_versions.encoding <> 'binary'
+          AND record_occurrences.valid_from_generation <= ?
+          AND (record_occurrences.valid_to_generation IS NULL OR record_occurrences.valid_to_generation > ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM vector_projection_rows
+             WHERE vector_projection_rows.workspace_id = record_occurrences.workspace_id
+               AND vector_projection_rows.document_grain = 'entity'
+               AND vector_projection_rows.document_ref = record_occurrences.record_id
+               AND vector_projection_rows.valid_to_generation IS NULL
+               AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
+          )
+        ORDER BY record_occurrences.owner_artifact_version_id, record_occurrences.record_id`,
+      [workspaceId, INELIGIBLE_ENTITY_RECORD_KIND, generation, generation, profileId, executableBindingId],
+    );
+    // Frente S-D (2026-09-07, Lever 2): shard filter -- BY OWNING ARTIFACT (see `shard`'s own doc comment).
+    const shardedMissingEntityRows = input.shard === undefined ? missingEntityRows : missingEntityRows.filter((row) => shardIndexFor(row.owner_artifact_id, input.shard!.count) === input.shard!.index);
+    for (const row of shardedMissingEntityRows) {
+      if (entityLoopAborted) break;
+      await processMissingEntityRow(row);
+    }
+  } else {
+    // Frente S-E (2026-09-07): v4 path -- STREAMS pages from
+    // `entitySource.entityCandidates` instead of materializing one
+    // corpus-wide array (see that method's own doc comment for the OOM this
+    // fixes). `openIds` (which entities already have an open vector row) is
+    // its own small, bounded query -- unrelated to the OOM this fixes, since
+    // it holds only ids, not decoded bodies.
+    const openRows = await sql.all<{ document_ref: string }>(
+      `SELECT document_ref FROM vector_projection_rows
+        WHERE workspace_id = ? AND document_grain = 'entity' AND valid_to_generation IS NULL
+          AND profile_id = ? AND executable_binding_id = ?`,
+      [workspaceId, profileId, executableBindingId],
+    );
+    const openIds = new Set(openRows.map((row) => row.document_ref));
+    await entitySource.entityCandidates(async (page) => {
+      if (entityLoopAborted) return;
+      const missing = page
+        .filter((row) => row.record_kind !== INELIGIBLE_ENTITY_RECORD_KIND && !openIds.has(row.record_id))
+        .filter((row) => input.shard === undefined || shardIndexFor(row.owner_artifact_id, input.shard.count) === input.shard.index)
+        .map((row): EntityInsertRow => ({
+          record_id: row.record_id, record_kind: row.record_kind, owner_artifact_id: row.owner_artifact_id,
+          owner_artifact_version_id: row.owner_artifact_version_id, valid_from_generation: generation,
+          content_hash: row.content_hash, byte_length: row.byte_length, display_path: row.display_path, body: row.body,
+        }))
+        // Page-local sort only (see `ownerFileState`'s own doc comment for
+        // why a global sort is no longer possible/needed): maximizes
+        // consecutive-same-owner runs WITHIN this page, cheap (one page's
+        // worth of lightweight rows, no CAS reads yet).
+        .sort((left, right) => left.owner_artifact_version_id.localeCompare(right.owner_artifact_version_id) || left.record_id.localeCompare(right.record_id));
+      for (const row of missing) {
+        if (entityLoopAborted) break;
+        await processMissingEntityRow(row);
+      }
+    });
   }
+  if (entityLoopAborted) return buildResult(generation, false, true);
   if (entityPendingBatch.length > 0) await embedAndCommitBatch(entityPendingBatch);
 
   // Step 3 (insert missing, ARTIFACT grain): every version visible at
@@ -2124,7 +2195,29 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   const generationAfter = await currentGeneration();
   const cleanPass = counts.failed === 0 && counts.entity_failed === 0;
   const markerWritten = generationAfter === generation && cleanPass;
-  if (markerWritten) await database.projections.markSemanticComplete({ completed_generation: generation, profile_id: profileId, executable_binding_id: executableBindingId, document_grains: ["artifact", "entity"], entity_policy_digest: entityPolicyDigest });
+  if (markerWritten) {
+    await database.projections.markSemanticComplete({ completed_generation: generation, profile_id: profileId, executable_binding_id: executableBindingId, document_grains: ["artifact", "entity"], entity_policy_digest: entityPolicyDigest });
+    // Frente S-E (2026-09-07, adversarial review of Lever 3): the segment
+    // cache (`semantic_segment_cache`) had no eviction at all -- its own DDL
+    // comment admitted "no LRU yet ... pruned only by a future retention
+    // pass". A cleanly-completed generation (the marker was just written,
+    // above) is the natural point to prune: every row belonging to a NO
+    // LONGER ACTIVE `executable_binding_id` (a retired provider/segmenter
+    // version -- see `semanticVectorProjectionRecordId`'s own doc comment
+    // for why a vector space retires wholesale on a provider swap) can never
+    // be a cache hit again, since every embed call this reconciler makes is
+    // scoped to the CURRENT `executableBindingId` alone
+    // (`readCachedSegmentVector`/`writeCachedSegmentVector`, above). This
+    // bounds the cache to at most one active vector space's worth of
+    // distinct segment content per workspace, rather than accumulating one
+    // generation of history per provider swap forever. Best-effort: a
+    // failure here never fails the pass that already committed real vectors
+    // and the marker -- the cache is purely an optimization, exactly like
+    // its own read/write helpers' doc comments already establish.
+    try {
+      await sql.run("DELETE FROM semantic_segment_cache WHERE workspace_id = ? AND executable_binding_id <> ?", [workspaceId, executableBindingId]);
+    } catch { /* best-effort pruning, see this block's own doc comment */ }
+  }
 
   return buildResult(generation, markerWritten);
 }

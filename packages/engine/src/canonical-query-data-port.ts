@@ -3521,6 +3521,19 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       // there is no resolved provider (nothing to key the status table by)
       // or the port lacks the new capability, preserving the pre-existing
       // inferred/`0` fields exactly.
+      //
+      // Frente S-E (2026-09-07): measured live (`docs/evidence/2026-09-07-v4-semantic-close.md`)
+      // as THE dominant remaining latency cost on a real, substantial
+      // workspace (2,492 files, ~94.5k `semantic_document_status` rows) --
+      // this call and `semantic_affected_documents` below each cost several
+      // SECONDS (not ms) at that scale, dwarfing every other cost center in
+      // this function (`semantic_vectors`'s own shard reads: ~150ms;
+      // `exactVectorScan` over 10,964 entity candidates: ~300ms; query embed:
+      // ~3ms). NOT fixed this session (a genuine SQL/indexing investigation
+      // for `semantic_document_status`'s own access patterns, out of this
+      // frente's remaining time budget) -- reported here, with the literal
+      // numbers, as the real physical floor this session's own latency work
+      // ran into, for the owner's queue.
       provider !== undefined && this.snapshots.semantic_document_status_counts !== undefined
         ? this.snapshots.semantic_document_status_counts(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
         : Promise.resolve(undefined),
@@ -3634,6 +3647,14 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // segments). Deliberately UNCAPPED here (no `limit`) -- the cap
     // (`SEMANTIC_ENTITY_CANDIDATE_CAP`) applies to the AGGREGATED,
     // one-per-document result below, not to the raw per-segment scan.
+    //
+    // Frente S-E (2026-09-07): "deliberately uncapped" is exactly what made
+    // this call `nativeTopKChunked`'s own severe P0 (168.9s of real CPU, then
+    // a call-stack overflow) -- see that function's own doc comment in
+    // `semantic-retrieval.ts` for the fix (an exact JS-side fallback merge
+    // once chunking can no longer make progress). Fixed there, not here: this
+    // call site's own "no limit" shape is correct per decision 17 and is
+    // UNCHANGED by that fix.
     const entitySegmentRanks = exactVectorScan(
       entityVectorsForScan.map((vector) => ({ projection_record_id: vector.projection_record_id, profile_id: provider!.profile.embedding_profile_id, executable_binding_id: provider!.binding.executable_binding_digest, vector: vector.vector_payload })),
       queryVector.vector,

@@ -2,7 +2,7 @@ import { chmod, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, join, resolve } from "node:path";
-import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, importV4IndexPack, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, sidecarScanDirFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type V4WorkspacePaths, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
+import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, importV4IndexPack, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, sidecarScanDirFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, countFilesUpToBudget, KQUEUE_FILE_WATCH_BUDGET, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type V4WorkspacePaths, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, isOutdatedWorkspaceError, isWorkspaceDatabaseFileOpen, readStructuralStore, recreateOutdatedWorkspaceDatabase, removeWorkspaceFootprint, workspaceFootprintEntries, workspaceSafeId, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase, type WorkspaceFootprintEntry } from "@urdira/storage";
 import { sweepWorkspaceDataDir, type OrphanReport } from "./orphan-sweep.js";
@@ -1863,6 +1863,17 @@ async function startWorkspaceWatcher(manager: WorkspaceWatcherManager, workspace
   try {
     const root = workspace.canonical_root;
     if (!(await stat(root)).isDirectory()) return;
+    // Frente S-E (2026-09-07): a budget-capped estimate of this workspace's
+    // own file count, so `watcherOptionsForSourceProvider` can fall back to
+    // fs-events for a corpus large enough that kqueue's one-fd-per-watched-file
+    // cost would threaten this daemon's ability to spawn its own child
+    // processes (the confirmed root cause of `spawn EBADF` at n8n scale --
+    // see `KQUEUE_FILE_WATCH_BUDGET`'s own doc comment). Errors (permissions,
+    // a root that vanished mid-walk) resolve to `undefined` -- exactly like
+    // omitting the estimate entirely -- so a failed estimate never blocks
+    // watcher startup, it only forgoes the fd-budget fallback for this one
+    // workspace.
+    const fileCountEstimate = await countFilesUpToBudget(root, KQUEUE_FILE_WATCH_BUDGET).catch(() => undefined);
     await manager.start({
       workspace_id: workspace.workspace_id,
       watcher: new ParcelWatcherAdapter({
@@ -1884,7 +1895,7 @@ async function startWorkspaceWatcher(manager: WorkspaceWatcherManager, workspace
         // is the real backstop if re-arming itself keeps failing.
         root,
         case_sensitive: process.platform !== "win32",
-      }, { watcher_options: watcherOptionsForSourceProvider(workspace.provider.source_provider), on_error: (error: Error) => console.error(`[urdira] watcher error for workspace ${workspace.workspace_id} (${workspace.display_root}):`, error) }),
+      }, { watcher_options: watcherOptionsForSourceProvider(workspace.provider.source_provider, fileCountEstimate), on_error: (error: Error) => console.error(`[urdira] watcher error for workspace ${workspace.workspace_id} (${workspace.display_root}):`, error) }),
     });
   } catch {
     // A missing or temporarily unavailable root is reconciled on the next

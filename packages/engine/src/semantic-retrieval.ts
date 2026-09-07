@@ -138,6 +138,59 @@ function fastCandidateBytes(vector: readonly number[] | Uint8Array, dimensions: 
 const NATIVE_BATCH_BYTE_BUDGET = 4 * 1024 * 1024 - 64 * 1024; // 64KiB headroom under the native 4MiB bound
 const NATIVE_BATCH_RECORD_BUDGET = 4096 - 1; // headroom under the native 4,096-candidate bound
 
+/**
+ * Frente S-E (2026-09-07): a NEW, severe P0 found live -- `nativeTopKChunked`
+ * never terminated (168.9s of real CPU, then `RangeError: Maximum call stack
+ * size exceeded`) for the entity-grain lane's own real call shape:
+ * `trySemanticSearch` (`canonical-query-data-port.ts`) calls `exactVectorScan`
+ * for entities with NO `limit` at all -- deliberately uncapped before the
+ * per-document max-similarity aggregation (decision 17: "cap 100 tras
+ * agregar", not before). `exactVectorScan` then defaults `limit` to
+ * `eligible.length` -- i.e., "give me the full sorted order of every single
+ * candidate", not a true top-K query. The chunk-then-merge recursion's own
+ * termination argument ("each merge round strictly shrinks the candidate set
+ * ... until it fits in a single native call") is FALSE whenever `limit` is
+ * not meaningfully smaller than a chunk's own size: `Math.min(limit,
+ * chunkCandidates.length)` degenerates to `chunkCandidates.length` itself, so
+ * EVERY candidate in EVERY chunk survives as a "winner" -- the recursive call
+ * on `winners` receives the EXACT SAME SIZE as `eligible` (nothing was ever
+ * filtered out), so the very same "chunk it again" branch runs again,
+ * forever, until the JS call stack itself overflows. This made
+ * `core:search_semantic`/`core:search_hybrid` completely unusable on ANY
+ * real corpus whose entity-grain vector count exceeds the native per-call
+ * bound (~1,300 for 384-dim vectors) -- exactly n8n scale, and the
+ * `packages/cli` 2,492-file subset this session's own embed measurement
+ * used (10,964 open entity vectors).
+ *
+ * Fix: this is a fundamental property, not a tunable -- chunking can only
+ * ever REDUCE a candidate set when the requested `limit` is meaningfully
+ * smaller than a chunk's own size; when it is not (a near-`eligible.length`
+ * or fully uncapped request), NO chunk-then-merge strategy can shrink the
+ * winner set at all, so the recursive descent must never be re-attempted
+ * once a round demonstrably made no progress. `winners.length <
+ * eligible.length` is checked after every round: on genuine progress,
+ * recursion continues exactly as before (unchanged behavior, unchanged
+ * exactness argument, for every REAL top-K query this shipped with -- the
+ * existing 9,000-candidate/limit-10 test already covers this path). On NO
+ * progress, this falls back to `exactDistanceSort` -- the SAME JS-side
+ * exact distance computation and tie-break (`values`/`distance`/`utf8Compare`)
+ * `exactVectorScan`'s own non-native branch already uses when no native
+ * kernel is configured at all -- computed ONCE over the (already
+ * native-chunk-sorted, but not yet globally merged) `winners`, which is
+ * always finite and no larger than `eligible.length`. This is still EXACT
+ * (identical distance formula and tie-break as the native path), always
+ * terminates (a single O(N log N) JS sort, no further native calls), and
+ * costs meaningfully less than the crash it replaces even at n8n's own
+ * uncapped entity-candidate scale.
+ */
+function exactDistanceSort(candidates: readonly ExactVectorCandidate[], vectors: readonly Uint8Array[], queryValues: readonly number[], dimensions: number, elementType: "float32_le" | "float64_le", limit: number, metric: "cosine" | "squared_l2"): readonly ExactVectorMatch[] {
+  const jsElementType = elementType === "float32_le" ? "float32" as const : "float64" as const;
+  const ranked = candidates
+    .map((candidate, index) => ({ id: candidate.projection_record_id, distance: distance(values(vectors[index]!, dimensions, jsElementType), queryValues, metric) }))
+    .sort((left, right) => left.distance - right.distance || utf8Compare(left.id, right.id));
+  return ranked.slice(0, Math.min(limit, ranked.length)).map((entry, index) => ({ projection_record_id: entry.id, rank: index + 1 }));
+}
+
 function nativeTopKChunked(eligible: readonly ExactVectorCandidate[], packedVectors: readonly Uint8Array[], identifiers: readonly string[], queryBytes: Uint8Array, dimensions: number, elementType: "float32_le" | "float64_le", limit: number, metric: "cosine" | "squared_l2"): readonly ExactVectorMatch[] {
   const idByteLengths = identifiers.map((id) => textEncoder.encode(id).length);
   const totalIdBytes = idByteLengths.reduce((sum, value) => sum + value, 0);
@@ -177,6 +230,17 @@ function nativeTopKChunked(eligible: readonly ExactVectorCandidate[], packedVect
       winners.push(chunkCandidates[index]!);
       winnerVectors.push(chunkVectors[index]!);
     }
+  }
+  // Frente S-E (2026-09-07): see this function's own updated doc comment
+  // above `exactDistanceSort` -- a round that made NO progress (every
+  // candidate in every chunk survived) can never make progress on a further
+  // recursive attempt either (the SAME `limit`/chunk-size relationship still
+  // holds), so recursing again would loop forever. Fall back to an exact JS
+  // merge instead of ever re-entering the native chunking branch with an
+  // unchanged candidate count.
+  if (winners.length >= eligible.length) {
+    const queryValues = values(queryBytes, dimensions, elementType === "float32_le" ? "float32" : "float64");
+    return exactDistanceSort(winners, winnerVectors, queryValues, dimensions, elementType, limit, metric);
   }
   return nativeTopKChunked(winners, winnerVectors, winners.map((candidate) => candidate.projection_record_id), queryBytes, dimensions, elementType, limit, metric);
 }

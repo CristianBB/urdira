@@ -317,4 +317,113 @@ describeIfBuilt("v4 daemon semantic maintenance end-to-end (real urdira-indexing
       await rm(workspaceRoot, { recursive: true, force: true });
     }
   }, 180_000);
+
+  // Frente S-E (2026-09-07): reproduces and fixes the `core:coverage_incomplete`
+  // regression found live on a real 2,492-file v4 workspace, whose
+  // `core:index_status` reported EVERY capability complete at the SAME
+  // moment `core:search_semantic` still threw `core:coverage_incomplete`
+  // with `blocking_stage: "3"` and `capabilities` listing nearly every
+  // STRUCTURAL capability (`core:type_information`, `core:control_flow`,
+  // ...) -- none of which `core:search_semantic`/`core:search_hybrid`/
+  // `core:semantic_affected_page` ever depend on (their whole answer comes
+  // from `semantic_document_status`/`vector_projection_rows`, the pinned
+  // spec's own "must never pay corpus-load cost" framing). Root cause:
+  // `packages/contracts/src/registries.ts`'s `operationFrontiers` pinned
+  // `required_stage: 3` for these three operations -- the SAME bar as
+  // `core:compare`/`core:build_context`, which genuinely need full
+  // structural completeness -- so the daemon's OWN admission gate
+  // (`packages/daemon/src/runtime.ts`'s `requiredStructuralStage` check, run
+  // BEFORE the engine's own semantic fast path) blocked on structural stage
+  // 3 for an operation that only ever needed the SEPARATE, already-correct
+  // `semantic` frontier gate. Fixed to `required_stage: 0` (matching
+  // `core:search_text`/`core:get_source`'s own source-frontier-only
+  // admission).
+  //
+  // This test races `core:search_semantic` against a workspace whose
+  // structural scan has not yet settled (called immediately after
+  // `core:workspace_add` resolves, before `pollUntilStructuralReady`) --
+  // deterministically NOT structural-ready yet on a real multi-file scan.
+  // Before the fix, this reliably threw with a `details.capabilities` array
+  // naming structural capabilities and `details.blocking_stage: "3"` (the
+  // BUGGY gate). After the fix, if the query is not yet answerable it must
+  // fail (or succeed) through the SEMANTIC frontier gate alone --
+  // `details.required_frontier: "semantic"`, no `capabilities` field at all
+  // (that field is only ever populated by the structural-stage gate this
+  // fix bypasses for these three operations) -- and once semantic
+  // materialization genuinely completes, the SAME query succeeds with a
+  // real answer, proving the operation was never permanently blocked, only
+  // correctly gated on the frontier it actually needs.
+  it("core:search_semantic never blocks on structural completeness -- races a real scan and asserts any coverage_incomplete names the semantic frontier, never a structural capability list", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-sem-admission-"));
+    const workspaceRoot = await seedFixtureWorkspace();
+    let runtime: DaemonRuntime | undefined;
+    const sessions = new Map<string, IndexingCoreProcessTransport>();
+    try {
+      process.env["URDIRA_V4"] = "1";
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-v4-daemon-semantic-e2e-admission",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        resolve_plugin_provider: async (): Promise<WorkspaceScanPluginProvider> => { throw new Error("resolve_plugin_provider must not be called for a v4 workspace."); },
+        resolve_workspace_scan_transport: async (workspace) => {
+          let transport = sessions.get(workspace.workspace_id);
+          if (transport === undefined) {
+            transport = createIndexingCoreProcessTransport({ command: workerPath!, request_timeout_ms: 120_000 });
+            sessions.set(workspace.workspace_id, transport);
+          }
+          return transport;
+        },
+        semantic_descriptor: { kind: "hash" },
+        reconciliation_sweep_interval_ms: 0,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+      const added = await client.call("core:workspace_add", { args: [workspaceRoot], confirmed: true });
+      expect(added.outcome, JSON.stringify(added)).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+
+      // Raced immediately -- may observe a still-blocked answer (structural
+      // not ready yet) or, on a very fast machine, an already-complete one.
+      // Either outcome is acceptable; only a STRUCTURAL-shaped block is a
+      // regression.
+      const searchOptions = {
+        freshness: "current", wait_timeout_ms: 0, coverage_requirement: "accept_reported",
+        evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: true },
+        snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 },
+        registry: { registry: "used", include_payload_schemas: false }, response_budget: { max_items: 1_000, max_characters: 4_000_000 },
+      };
+      const raced = await client.call("core:query", {
+        api_version: 3, scope: { scope_type: "single_workspace", workspace_id: workspaceId },
+        expression: { expression_type: "operation", operation: "core:search_semantic", arguments: { query_text: ELIGIBLE_ENTITY_NAME, query_class: "identifier" } },
+        options: searchOptions,
+      });
+      if (raced.outcome === "error" && raced.error?.code === "core:coverage_incomplete") {
+        const details = raced.error.details as { readonly capabilities?: readonly string[]; readonly required_frontier?: string; readonly blocking_stage?: string } | undefined;
+        expect(details?.capabilities, `regression: core:search_semantic blocked on a structural capability list: ${JSON.stringify(details)}`).toBeUndefined();
+        expect(details?.required_frontier).toBe("semantic");
+      } else {
+        // Not blocked at all (structural/semantic already settled, or a
+        // different, unrelated outcome) -- also acceptable; the assertion
+        // above only fires on the specific regression shape.
+        expect(["success", "error"]).toContain(raced.outcome);
+      }
+
+      // The SAME query must genuinely succeed once semantic materialization
+      // actually completes -- proves this is a real gate, not a permanently
+      // broken one.
+      await pollUntilStructuralReady(client, workspaceId);
+      await pollUntilSemanticCurrent(client, workspaceId, 60_000);
+      const settled = await queryStreams(client, workspaceId, "core:search_semantic", { query_text: ELIGIBLE_ENTITY_NAME, query_class: "identifier" });
+      expect((settled["candidates"]?.items ?? []).length).toBeGreaterThan(0);
+    } finally {
+      if (runtime) await runtime.stop();
+      for (const transport of sessions.values()) {
+        await transport.shutdown().catch(() => undefined);
+        await transport.terminate().catch(() => undefined);
+      }
+      delete process.env["URDIRA_V4"];
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 180_000);
 });

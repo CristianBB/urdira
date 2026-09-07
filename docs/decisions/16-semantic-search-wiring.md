@@ -280,3 +280,113 @@ sequential, snippet-budget-order-dependent per-candidate CAS read).
 Measured before/after on n8n (hot, full row set) and a small workspace: see
 `docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md` Part
 3.
+
+## Amendment (2026-09-07, Frente S-E): daemon fd leak found and fixed (root
+## cause: kqueue watches one file per corpus file, not a code bug); `core:coverage_incomplete`
+## admission bug fixed; entity-candidate enumeration streamed
+
+**Daemon file-descriptor "leak" at large-corpus scale -- root cause found: it
+is `@parcel/watcher`'s own kqueue backend, not a forgotten `close()`
+anywhere in this codebase.** Reproduced live (`lsof -p <daemon pid>` before
+and after `ready` on a 2,492-file and a 20-file v4 workspace): the daemon
+holds exactly one open `REG`-type file descriptor per corpus source file,
+for the ENTIRE daemon lifetime, matching the corpus file count 1:1.
+Exhaustively ruled out every code-level candidate this codebase owns
+(`DirectorySourceProvider`/`NODE_DIRECTORY_FILE_SYSTEM`'s `read_file_stream`/
+`read_file`, `@urdira/security`'s `regularFileMediaType`, the CAS `putStreamsMany`
+drain, the semantic-child and structural-worker processes' own file
+descriptors) via direct instrumentation of the actual running daemon -- NONE
+of them were ever invoked for the v4 scan path that reproduces this. Root
+cause: `packages/engine/src/watchers.ts`'s `watcherOptionsForSourceProvider`
+selects `@parcel/watcher`'s kqueue backend by default on macOS (a deliberate
+P3-7 choice: fs-events showed an unacceptable ~12s median detection delay
+at n8n scale). `@parcel/watcher`'s kqueue backend registers one kernel-level
+`EVFILT_VNODE` watch PER FILE at `subscribe()` time (confirmed by its own
+documented behavior), and `EVFILT_VNODE` requires an open file descriptor
+per watched file for the life of the subscription -- this is inherent to
+kqueue-based per-file change detection, not a bug in any file-reading code
+path. It went undetected by two PRIOR evidence docs
+(`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §14.5,
+`docs/evidence/2026-09-03-v4-p3-1-incremental.md` §7.7) because both only
+checked the KQUEUE-TYPE descriptor count (small, ~5) without realizing
+kqueue's per-file registration descriptor is opened as an ordinary
+REGULAR-file descriptor, not a second kqueue instance.
+
+**Fix**: `watcherOptionsForSourceProvider` gained an optional
+`fileCountEstimate` parameter and a `KQUEUE_FILE_WATCH_BUDGET` (2,000
+files); above the budget it falls back to the fs-events backend instead of
+kqueue, trading kqueue's latency win away only once its fd cost threatens
+the daemon's own process stability (the confirmed cause of `spawn EBADF`
+once enough files are watched -- see the entry below). `startWorkspaceWatcher`
+(`packages/daemon/src/runtime.ts`) computes this estimate via a new,
+budget-capped `countFilesUpToBudget` (`watchers.ts`) that stops walking the
+instant the count is proven over budget, so a huge tree costs only enough
+`readdir` fan-out to prove it is over budget, never a full enumeration.
+Every pre-existing caller (no estimate passed) keeps kqueue-by-default
+exactly as P3-7 shipped it. Verified live: a 2,492-file workspace (previously
+3,039 open fds after `ready`) now holds 33 total fds after `ready` -- O(1)
+with respect to corpus size, under the plan's own "< 200 + parcel watchers"
+target.
+
+**`core:coverage_incomplete` on a fully-indexed 2,492-file workspace for
+`core:search_semantic`/`core:search_hybrid`/`core:semantic_affected_page` --
+root cause found and fixed.** Reproduced live: `core:index_status` reported
+every capability `complete`, yet the same query threw `core:coverage_incomplete`
+with `blocking_stage: "3"` and a `capabilities` array naming structural
+capabilities (`core:type_information`, `core:control_flow`, ...) these three
+operations never depend on. Root cause: `packages/contracts/src/registries.ts`'s
+`operationFrontiers` pinned `required_stage: 3` for all three -- the SAME bar
+as `core:compare`/`core:build_context`, which genuinely need full structural
+completeness -- so the daemon's OWN RPC admission gate
+(`packages/daemon/src/runtime.ts`'s `requiredStructuralStage` check, run
+BEFORE the engine's own semantic fast path in `canonical-query-data-port.ts`'s
+`trySemanticSearch`) blocked on structural completeness for an operation
+that only ever needed the separate, already-correct `semantic` frontier gate.
+Directly contradicted this decision's own "must never pay corpus-load cost"
+framing. **Fixed**: `required_stage: 0` for all three (matching
+`core:search_text`/`core:get_source`'s own source-frontier-only admission);
+the SEPARATE `semantic` frontier gate (`readiness.semantic_ready`) is now the
+only readiness check these operations pay, and it correctly reports which
+generation is missing when semantic materialization genuinely lags.
+
+**Entity-candidate enumeration OOM -- root cause fixed, not just mitigated
+with a larger heap.** See decision 17's amendment for the full description
+(`entityCandidates()` now streams bounded pages instead of materializing the
+whole corpus).
+
+**A NEW, severe P0 found live while measuring this decision's own latency
+target: `core:search_semantic` was, in effect, completely unusable (168.9s
+of real CPU, then a call-stack overflow) on any real corpus whose
+entity-grain candidate count exceeds the native per-call bound (~1,300 for
+384-dim vectors) -- exactly n8n scale.** Root cause: `nativeTopKChunked`
+(`packages/engine/src/semantic-retrieval.ts`, Frente S-D) assumed every
+chunk-then-merge round strictly shrinks the candidate set -- true for a real
+top-K query, but the entity lane's own call (deliberately uncapped per
+decision 17, "cap 100 tras agregar" applies AFTER aggregation, not before)
+defaults its `limit` to the full candidate count, degenerating every
+"shrink" round into a no-op and recursing forever. Fixed with an exact
+JS-side merge fallback once a round demonstrably makes no progress -- see
+`docs/evidence/2026-09-07-v4-semantic-close.md` Part 2.4 for the full
+diagnosis and the before/after numbers (168,963ms crash -> ~6s success on a
+real 2,492-file/10,964-entity-vector workspace). This is the single most
+severe correctness bug found across the whole S-frente, and per this plan's
+own §0 priority ("función invocable = 100% funcional" before latency), its
+fix took priority over closing the remaining latency gap below.
+
+**Query latency at real corpus scale remains well above the 250ms target
+after the above fix** -- ~5,850-6,180ms p50-p99 on the 2,492-file workspace,
+~200-225ms p50-p99 even on a 100-file workspace (matching S-D's own prior
+100-file number). The dominant cost (~5-5.4 SECONDS at the larger scale) is
+now three of the seven parallel `Promise.all`'d snapshot-port reads in
+`trySemanticSearch` -- `semantic_document_status_counts`, `semantic_affected_documents`,
+and `semantic_scope_counts`/`semantic_index_state`/`semantic_entity_scope_counts`
+all cluster within ~300ms of each other at 5+ seconds, consistent with
+contention over the shared SQLite worker thread rather than five
+independently slow queries, at `semantic_document_status`'s own ~94,500-row
+scale for this corpus. NOT fixed this session (a genuine SQL/indexing
+investigation, reported with root-cause hypothesis for the owner's queue)
+-- see the evidence doc's own Part 3.2 for the full per-stage decomposition.
+
+See `docs/evidence/2026-09-07-v4-semantic-close.md` for full reproduction
+steps, literal counts, and the final embed/latency/incremental-edit
+measurements.
