@@ -842,6 +842,33 @@ export async function run(options) {
   let daemonOptions;
   let originalWarn;
   const fallbackWarnings = [];
+  // `spawn EBADF` diagnosis (Frente E-P0e, 2026-09-07): `daemon start`
+  // above runs the FULL v4 daemon runtime IN this same process (`runUrdira`
+  // called from a script, not the detached `startDetachedDaemon` fork the
+  // real `urdira` CLI binary uses) -- confirmed live via `lsof -p <this
+  // pid>`: fd count jumps from ~26 to ~24,900 within seconds of `daemon
+  // start`/`workspace add` (one fd per corpus file's own filesystem
+  // watcher) and stays there, flat, for the ENTIRE run. `--verify-roots
+  // final`'s own `oracleVerify` used to run its `execFile`
+  // (`scripts/v4-scan.mjs`, a brand-new child process) while ALL ~24,900 of
+  // those watcher fds were still held open by this process -- `spawn
+  // EBADF` reproduced 3/3 in that state (`docs/evidence/2026-09-07-v4-f3-
+  // cold-incremental-floors-parity-threshold.md` §3.1's own finding).
+  // `stopDaemonOnce` (below) releases every one of those fds (the
+  // daemon-runtime's own file watchers, DB handles, mmap'd segments) BEFORE
+  // any post-run `execFile` call -- `oracleVerify` only ever reads the
+  // ALREADY-DURABLE on-disk structural store (`engineExports.
+  // structuralStoreDirFor`), so the daemon does not need to still be
+  // running for it. Idempotent (`daemon stop` on an already-stopped daemon
+  // is a documented no-op, `state: "already_stopped"`) -- the `finally`
+  // block below still calls it unconditionally as a safety net for any
+  // early-return/thrown-error path that never reached this point.
+  let daemonStopped = false;
+  const stopDaemonOnce = async () => {
+    if (daemonStopped || runtime === undefined || daemonOptions === undefined) return;
+    daemonStopped = true;
+    await runtime.runUrdira(["daemon", "stop", "--json"], { daemon: daemonOptions }).catch(() => undefined);
+  };
 
   try {
     if (options.owners !== undefined) await createSlice(options.corpus, corpusRoot, options.owners);
@@ -996,7 +1023,14 @@ export async function run(options) {
     }
 
     let finalOracle;
-    if (options.verify_roots === "final") finalOracle = await oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, tmpRoot, label: "final", engineExports });
+    if (options.verify_roots === "final") {
+      // Stop the daemon (and release its ~24,900 held fds) BEFORE spawning
+      // the oracle's own `v4-scan.mjs` child process -- see the
+      // `stopDaemonOnce` doc comment above for why this is safe and what
+      // bug it fixes.
+      await stopDaemonOnce();
+      finalOracle = await oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, tmpRoot, label: "final", engineExports });
+    }
 
     return {
       schema_version: 1,
@@ -1012,9 +1046,7 @@ export async function run(options) {
     };
   } finally {
     if (originalWarn !== undefined) console.warn = originalWarn;
-    if (runtime !== undefined && daemonOptions !== undefined) {
-      await runtime.runUrdira(["daemon", "stop", "--json"], { daemon: daemonOptions }).catch(() => undefined);
-    }
+    await stopDaemonOnce();
     await nativeClosure?.cleanup().catch(() => undefined);
     await rm(tmpRoot, { recursive: true, force: true }).catch(() => undefined);
     if (corpusParent !== tmpRoot) await rm(corpusParent, { recursive: true, force: true }).catch(() => undefined);

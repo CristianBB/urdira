@@ -335,6 +335,74 @@ function rootsDiff(a, b) {
   return { records: a.records === b.records, dependency: a.dependency === b.dependency, graph: a.graph === b.graph };
 }
 
+/**
+ * Frente E-P0e (2026-09-07): the raw `records` Merkle root is NOT a
+ * meaningful comparability criterion between a `Delta`-forced reconcile and
+ * an independent from-scratch oracle -- decision 11's own predecessor/
+ * reopen/migration chaining (`docs/decisions/11-content-derived-record-
+ * identity.md`'s own new "v4 incremental `records` root is not comparable"
+ * section) legitimately mints a DIFFERENT `record_id` for any TOUCHED
+ * identity, even though both sides observe byte-identical final content.
+ * `rootsDiff`'s plain `===` on the raw root (above) is kept for
+ * visibility/backward compatibility, but `records` is no longer part of
+ * `deltaAllOk`/`coldAllOk`'s gate (see call sites) -- THIS function is the
+ * real, decision-11-aware criterion: it shells out to the Rust-side
+ * `records_logical_set_diff`/`RecordsLogicalSetReport::assert_matches_
+ * oracle` comparator (`crates/urdira-indexing-worker/src/v4/tests_e2e.rs`,
+ * exposed as the `#[ignore]`d `n8n_records_logical_set_diff_against_keep_
+ * data` test -- same pattern E-P0/E-P0b already established: a temporary
+ * `--keep-data` output read back by a dedicated Rust diagnostic), which
+ * only requires (1) no missing/phantom identity, (2) no same-identity
+ * digest mismatch, (3) no untouched-owner rechain -- all EXCEPT the
+ * documented, owner-approved cross-owner external-entity dedup exception
+ * the Rust comparator's own `external_*` counters carry (see that
+ * function's doc comment). Only callable when `--keep-data` kept the
+ * delta/oracle structural roots on disk (`deltaStructuralRoot`/
+ * `oracleStructuralRoot` must still exist) -- returns `undefined`
+ * otherwise (the caller only invokes this when `options.keepData` is set).
+ */
+async function checkRecordsLogicalSet({ deltaStructuralRoot, deltaGeneration, oracleStructuralRoot, oracleGeneration, touchedOwners, scratchDir }) {
+  const touchedOwnersFile = join(scratchDir, "touched-owners.txt");
+  await writeFile(touchedOwnersFile, `${touchedOwners.join("\n")}\n`);
+  const env = {
+    ...process.env,
+    URDIRA_V4_DELTA_STRUCTURAL_ROOT: deltaStructuralRoot,
+    URDIRA_V4_DELTA_GENERATION: String(deltaGeneration),
+    URDIRA_V4_ORACLE_STRUCTURAL_ROOT: oracleStructuralRoot,
+    URDIRA_V4_ORACLE_GENERATION: String(oracleGeneration),
+    URDIRA_V4_TOUCHED_OWNERS_FILE: touchedOwnersFile,
+  };
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      "cargo",
+      ["test", "--release", "-p", "urdira-indexing-worker", "--locked", "n8n_records_logical_set_diff_against_keep_data", "--", "--ignored", "--nocapture"],
+      { cwd: root, env, maxBuffer: 64 * 1024 * 1024 },
+    );
+    const summaryLine = `${stdout}\n${stderr}`.split("\n").find((line) => line.includes("records logical diff summary:"));
+    return { ok: true, summary: summaryLine };
+  } catch (error) {
+    const output = `${error.stdout ?? ""}\n${error.stderr ?? ""}`;
+    const summaryLine = output.split("\n").find((line) => line.includes("records logical diff summary:"));
+    return { ok: false, summary: summaryLine, error: summaryLine === undefined ? String(error.message ?? error) : undefined };
+  }
+}
+
+/** `plan`'s own touched relative paths (Frente E-P0e's `checkRecordsLogicalSet`
+ * needs this to classify a live record's owner as touched/untouched --
+ * see `docs/decisions/11-content-derived-record-identity.md`'s new
+ * section). `edit`/`delete` contribute `relPath`; `rename` contributes
+ * BOTH `relPath` (the old, now-gone name -- harmless to include, no live
+ * row can be owned by a deleted path) and `renamedTo` (the new, live
+ * name, the one that actually matters). */
+function touchedOwnersOfPlan(plan) {
+  const paths = new Set();
+  for (const step of plan) {
+    paths.add(step.relPath);
+    if (step.kind === "rename") paths.add(step.renamedTo);
+  }
+  return [...paths];
+}
+
 function median(values) {
   const sorted = [...values].sort((x, y) => x - y);
   const mid = Math.floor(sorted.length / 2);
@@ -414,6 +482,14 @@ async function runFractionSweep(options) {
     let coldSummary;
     let deltaRoots;
     let coldRoots;
+    // Frente E-P0e: repeat 1's own delta structural root/generation --
+    // every repeat replays the IDENTICAL seeded `plan` against a fresh copy
+    // of the SAME template, so any repeat's own delta store is equally
+    // valid for the records-logical-set check; repeat 1 is simplest. Only
+    // meaningful (and only survives past this cell's own loop) when
+    // `keepData` is set -- see `checkRecordsLogicalSet`'s call site below.
+    let firstDeltaStructuralRoot;
+    let firstDeltaGeneration;
 
     for (let r = 1; r <= repeat; r += 1) {
       // Forced Delta (T=1.0): fresh unmutated copy, cold-scanned and THEN
@@ -427,6 +503,10 @@ async function runFractionSweep(options) {
       deltaWalls.push(deltaEvent.completed_at_ms);
       deltaSummary = deltaEvent.reconcile;
       deltaRoots = deltaEvent.roots;
+      if (r === 1 && keepData) {
+        firstDeltaStructuralRoot = join(deltaDataDir, "structural");
+        firstDeltaGeneration = deltaEvent.generation;
+      }
       if (!keepData) {
         await rm(deltaWorkspace, { recursive: true, force: true });
         await rm(deltaDataDir, { recursive: true, force: true });
@@ -458,6 +538,8 @@ async function runFractionSweep(options) {
     // p=0: an unmutated tree's oracle is the template's own cold scan).
     let oracleRoots = templateCold.roots;
     let oracleWallMs = templateWallMs;
+    let oracleStructuralRoot;
+    let oracleGeneration;
     if (p !== 0) {
       const oracleWorkspace = join(data, `oracle-${label}-workspace`);
       const oracleData = join(data, `oracle-${label}-data`);
@@ -469,6 +551,10 @@ async function runFractionSweep(options) {
       const oracleEvent = await runFullScan(oracleWorkspace, oracleDataPaths, `${workspaceId}:oracle:${label}`);
       oracleWallMs = performance.now() - oracleStart;
       oracleRoots = oracleEvent.roots;
+      if (keepData) {
+        oracleStructuralRoot = join(oracleData, "structural");
+        oracleGeneration = oracleEvent.generation;
+      }
       if (!keepData) {
         await rm(oracleWorkspace, { recursive: true, force: true });
         await rm(oracleData, { recursive: true, force: true });
@@ -477,9 +563,40 @@ async function runFractionSweep(options) {
       }
     }
 
+    // Frente E-P0e: the LOGICAL records-set comparability check (see
+    // `checkRecordsLogicalSet`'s own doc comment and decision 11's new
+    // section) -- only computable when `--keep-data` kept both the delta
+    // and oracle structural roots on disk, and only meaningful once an
+    // independent oracle actually ran (`p !== 0`; at `p=0` both sides are
+    // the identical `Noop` path, nothing to chain).
+    let recordsLogicalSet;
+    if (keepData && p !== 0 && firstDeltaStructuralRoot !== undefined && oracleStructuralRoot !== undefined) {
+      recordsLogicalSet = await checkRecordsLogicalSet({
+        deltaStructuralRoot: firstDeltaStructuralRoot,
+        deltaGeneration: firstDeltaGeneration,
+        oracleStructuralRoot,
+        oracleGeneration,
+        touchedOwners: touchedOwnersOfPlan(plan),
+        scratchDir: data,
+      });
+      console.log(`[fraction ${p}] records logical set check: ok=${recordsLogicalSet.ok}${recordsLogicalSet.summary === undefined ? "" : ` ${recordsLogicalSet.summary}`}`);
+    }
+
     const deltaRootsOk = rootsDiff(deltaRoots, oracleRoots);
     const coldRootsOk = rootsDiff(coldRoots, oracleRoots);
-    const deltaAllOk = deltaRootsOk.records && deltaRootsOk.dependency && deltaRootsOk.graph;
+    // Frente E-P0e: `deltaRootsOk.records` (raw root equality) is kept in
+    // the report for visibility/backward compat, but no longer decides
+    // `deltaAllOk` -- decision 11's own chaining means it can legitimately
+    // be `false` even when nothing is wrong (see `checkRecordsLogicalSet`'s
+    // doc comment). `deltaAllOk`'s `records` component is the LOGICAL set
+    // check when computable (`--keep-data`, `p!==0`); when not computable,
+    // `records` is simply not part of the gate here either -- unchanged
+    // from this script's own prior behavior (`Delta` was never hard-gated
+    // on ANY root; only `coldAllOk` below throws). `dependency`/`graph`
+    // remain raw-root-gated for `deltaAllOk`, per the task's own "sigue
+    // exigiendo raíz idéntica para el resto" instruction.
+    const deltaRecordsOk = recordsLogicalSet === undefined ? true : recordsLogicalSet.ok;
+    const deltaAllOk = deltaRecordsOk && deltaRootsOk.dependency && deltaRootsOk.graph;
     const coldAllOk = coldRootsOk.records && coldRootsOk.dependency && coldRootsOk.graph;
     // `Cold`-forced reconciles re-run the FULL pipeline (`run_full_from`)
     // against the SAME authoritative enumeration the oracle used -- no
@@ -490,31 +607,26 @@ async function runFractionSweep(options) {
     if (!coldAllOk) {
       throw new Error(`fraction ${p}: Cold roots mismatch vs oracle (this pipeline has no scope-narrowing -- should always match exactly) -- cold=${JSON.stringify(coldRootsOk)}`);
     }
-    // `Delta`-forced reconciles: NOT hard-gated on any root (see
-    // `docs/evidence/2026-09-06-v4-reconcile-threshold.md`'s "P0 finding"
-    // section for the full writeup). `delta.rs`'s own module-level doc
-    // comment ("Documented scope narrowing versus the plan's exact
-    // wording") already flags that dependency rows are diffed at OWNER
-    // granularity (closed/reopened unconditionally for every touched/
-    // deleted owner, never by `dependency_id`) and calls this "a residual
-    // precision gap for whichever task next tightens dependency identity"
-    // -- explicitly deferred, not E.6's to fix. Confirmed live measuring
-    // THIS harness on n8n: at p=0.01 (202 files, 10 deletes/10 renames)
-    // `dependency`/`records` differed but `graph` matched; at p=0.05 (1008
-    // files, 50/50) ALL THREE differed under `Delta` while the identical
-    // mutation under forced `Cold` matched the oracle exactly (`publish.rs`
-    // derives `graph_entries` FROM the records/relations set passed in, so
-    // any owner `delta::run`'s closure-bounded diff misses -- e.g. an
-    // untouched owner holding a relation INTO a deleted/renamed identity --
-    // can propagate from a stale `dependency` row into a stale `graph`
-    // entry too). This is the SAME documented gap, just more fully
-    // characterized at real-corpus scale than the single-kind, small-scale
-    // existing tests (`reconcile_{delete,rename}_roots_match_...`) ever
-    // exercised. `Cold`'s hard gate above is what actually protects
-    // correctness here: R2/R3 aside, this measurement's own job is the
-    // delta/cold WALL-TIME crossover, which is unaffected by root identity;
-    // roots are still recorded per fraction below for whoever picks up the
-    // follow-up.
+    // `Delta`-forced reconciles: NOT hard-gated on any root here either
+    // (unchanged from this script's original behavior -- `Cold`'s hard
+    // gate above is the actual correctness backstop; `deltaAllOk` is
+    // reported, not enforced). History, superseded by Frente E-P0e
+    // (2026-09-07) -- kept for context, not current behavior: this
+    // section originally reported "ALL THREE roots differ under Delta at
+    // p=0.05", attributed to `dependency` rows being diffed at OWNER
+    // granularity. Frentes E-P0/E-P0b/E-P0c/E-P0d (2026-09-06/07) fixed
+    // that: `dependency` now matches the independent oracle exactly at
+    // every fraction tested (0.01 through 0.50, `docs/evidence/2026-09-06-
+    // v4-reconcile-threshold.md` §14), and `graph` matches up to ~2%
+    // touched (a SEPARATE, still-open resolver-consistency gap past that,
+    // same doc). `records`' raw root was NEVER the right criterion under
+    // `Delta` to begin with (decision 11's chaining, see
+    // `docs/decisions/11-content-derived-record-identity.md`'s new
+    // section) -- `deltaAllOk`'s `records` component is now the LOGICAL
+    // set check (`checkRecordsLogicalSet`, above) when `--keep-data` made
+    // it computable, which correctly tolerates chaining on touched owners
+    // while still catching a real missing/phantom/digest-mismatched
+    // identity or an untouched-owner rechain.
 
     rows.push({
       p,
@@ -529,7 +641,7 @@ async function runFractionSweep(options) {
       delta_reconcile_summary: deltaSummary,
       cold_reconcile_summary: coldSummary,
       oracle_wall_ms: oracleWallMs,
-      roots_ok: { delta: deltaRootsOk, cold: coldRootsOk, delta_all: deltaAllOk, cold_all: coldAllOk },
+      roots_ok: { delta: deltaRootsOk, cold: coldRootsOk, delta_all: deltaAllOk, cold_all: coldAllOk, delta_records_logical_set: recordsLogicalSet },
     });
     console.log(`[fraction ${p}] delta_wall_ms=${median(deltaWalls).toFixed(1)} cold_wall_ms=${median(coldWalls).toFixed(1)} ratio=${(median(deltaWalls) / median(coldWalls)).toFixed(3)} roots_ok.delta_all=${deltaAllOk} roots_ok.cold_all=${coldAllOk}`);
   }

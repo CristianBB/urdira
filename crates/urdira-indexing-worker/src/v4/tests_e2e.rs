@@ -1428,6 +1428,332 @@ fn dump_records_set_diff(
     }
 }
 
+/// Frente E-P0e, Part 1: the `records` root's own raw-hash comparison is
+/// NOT the right gate against an independent oracle, by design (decision
+/// 11, `docs/decisions/11-content-derived-record-identity.md`;
+/// `reconcile_modify_produces_a_self_consistent_incremental_merkle_update`'s
+/// and `reconcile_batches_match_cold_at_1_5_10_25_50_percent`'s own doc
+/// comments already establish this at fixture scale). `chained_record_id`
+/// (`diff.rs`) mints `H(record_digest, predecessor_record_id)` for a
+/// replaced/reopened/migrated identity; a from-scratch oracle always mints
+/// the kernel-cold `sha256(record_digest)` instead -- so a TOUCHED
+/// identity's `record_id` legitimately diverges even when both sides
+/// observe the exact same final content. This is the LOGICAL set-equality
+/// comparator that replaces raw root equality for `records`: it keys by
+/// `identity_key` (workspace/history-independent, decision 11's own
+/// comparable unit) and separately checks `record_digest` (a PURE function
+/// of an identity's CURRENT logical content -- decision 11: "ProposedRecord
+/// contains logical record content only" -- so both an incremental store
+/// and an independent oracle scanning the SAME final tree must always
+/// agree on it, whether or not that identity was ever chained) from
+/// `record_id` (which decision 11 explicitly allows to diverge for a
+/// chained identity).
+///
+/// Categories (`missing`/`extra` and `chained_legit` further split by
+/// whether the identity's owner path is in the caller-supplied
+/// `touched_owners` set, so an untouched-owner divergence -- undue
+/// reanalysis, lost visibility, or a rechain nothing should have triggered
+/// -- is never silently folded into the expected/legitimate bucket):
+///   - `missing_*`/`extra_*`: identity present on only one side. ALWAYS a
+///     real bug (data loss or a phantom row) regardless of touched status.
+///   - `digest_mismatch`: same identity, different `record_digest`. ALWAYS
+///     a real bug -- decision 11 never sanctions a digest difference, only
+///     an id difference; a digest depends solely on current content, which
+///     both sides read identically off the SAME final tree.
+///   - `chained_legit_touched`: same identity, same digest, different
+///     `record_id`, under a TOUCHED owner. Decision 11's expected,
+///     legitimate chaining outcome -- NOT a bug.
+///   - `chained_legit_untouched`: the same shape, but under an owner
+///     nothing touched. A cold/oracle scan never chains, so a chained id
+///     can only ever originate from THIS incremental run's own
+///     reprocessing -- an untouched owner should never be reprocessed at
+///     all, so this bucket being nonzero means undue reanalysis, which
+///     `assert_matches_oracle` below treats as a bug.
+///
+/// **`external_*` sibling counters (Frente E-P0e, live n8n-scale finding,
+/// 2026-09-07)**: every `missing`/`digest_mismatch`/`chained_legit_
+/// untouched` anomaly measured at real n8n scale (N=202, N=1008) landed
+/// EXCLUSIVELY on `jsts:external_module:*`/`jsts:external_symbol:*`
+/// identities (0 for every other kind, both scales) -- and
+/// `analyze.rs::dedupe_external_entities_across_owners`'s own doc comment
+/// already documents exactly this shape as a PRE-EXISTING, OWNER-APPROVED
+/// escape hatch, not a bug: cross-owner dedup keeps only the
+/// alphabetically-first CURRENTLY-SCANNED owner's proposal; editing/
+/// deleting that owner while a DIFFERENT, unscanned importer still needs
+/// the entity closes it (temporarily -- self-healing on the next scan that
+/// touches any surviving importer, or on any full cold rescan), and the
+/// eventual reopen/reattribution mints a fresh chained id under whichever
+/// owner reopens it, indistinguishable from the touched/untouched split
+/// above without also knowing every OTHER importer's own identity. These
+/// counters are mirrored out of `missing_*`/`digest_mismatch`/
+/// `chained_legit_untouched` (not double-counted) into their own,
+/// deliberately UNASSERTED buckets so real, non-external anomalies are
+/// never masked by this already-decided design tradeoff.
+#[derive(Default, Debug)]
+pub(super) struct RecordsLogicalSetReport {
+    pub missing_touched: usize,
+    pub missing_untouched: usize,
+    pub extra_touched: usize,
+    pub extra_untouched: usize,
+    pub digest_mismatch: usize,
+    pub chained_legit_touched: usize,
+    pub chained_legit_untouched: usize,
+    /// Subset of the six counters above whose identity is
+    /// `jsts:external_module:*`/`jsts:external_symbol:*` -- see the
+    /// struct's own doc comment. Never asserted to be zero.
+    pub external_missing: usize,
+    pub external_extra: usize,
+    pub external_digest_mismatch: usize,
+    pub external_chained_untouched: usize,
+}
+
+impl RecordsLogicalSetReport {
+    /// The only invariant decision 11 sanctions for `records` under
+    /// `Delta`/`Reconcile`: zero missing, zero extra, zero digest
+    /// mismatches, and zero untouched-owner chaining, at every scale --
+    /// EXCEPT for the cross-owner-deduped external-entity domain
+    /// (`jsts:external_module:*`/`jsts:external_symbol:*`), whose own
+    /// counters are mirrored into the `external_*` fields and deliberately
+    /// excluded from these assertions (see the struct's own doc comment:
+    /// an already-documented, owner-approved, self-healing escape hatch,
+    /// not a bug this gate should fail on). `chained_legit_touched` is
+    /// deliberately NOT asserted here either (it is the expected,
+    /// decision-11-legitimate outcome, reported for visibility only).
+    pub fn assert_matches_oracle(&self, context: &str) {
+        assert_eq!(
+            self.missing_touched - self.external_missing,
+            0,
+            "{context}: identities missing from the incremental store under a TOUCHED owner (non-external)"
+        );
+        assert_eq!(
+            self.missing_untouched, 0,
+            "{context}: identities missing from the incremental store under an UNTOUCHED owner (lost-visibility bug)"
+        );
+        assert_eq!(
+            self.extra_touched - self.external_extra,
+            0,
+            "{context}: phantom identities only in the incremental store under a TOUCHED owner (non-external)"
+        );
+        assert_eq!(
+            self.extra_untouched, 0,
+            "{context}: phantom identities only in the incremental store under an UNTOUCHED owner (undue-reanalysis bug)"
+        );
+        assert_eq!(
+            self.digest_mismatch - self.external_digest_mismatch,
+            0,
+            "{context}: same-identity digest mismatch (non-external) -- digest is a pure function of current content, never legitimate"
+        );
+        assert_eq!(
+            self.chained_legit_untouched - self.external_chained_untouched,
+            0,
+            "{context}: an UNTOUCHED owner's non-external record was rechained (undue-reanalysis bug -- decision 11 chaining should only ever touch reprocessed owners)"
+        );
+    }
+}
+
+/// `jsts:external_module:*`/`jsts:external_symbol:*` -- the two
+/// cross-owner-deduped kinds `analyze.rs::dedupe_external_entities_across_
+/// owners`'s own doc comment names explicitly.
+fn is_cross_owner_deduped_external_identity(identity_key: &[u8]) -> bool {
+    identity_key.starts_with(b"jsts:external_module:")
+        || identity_key.starts_with(b"jsts:external_symbol:")
+}
+
+pub(super) fn records_logical_set_diff(
+    incremental_structural_root: &Path,
+    incremental_generation: u64,
+    oracle_structural_root: &Path,
+    oracle_generation: u64,
+    touched_owners: &std::collections::HashSet<String>,
+) -> RecordsLogicalSetReport {
+    struct Row {
+        record_id: [u8; 32],
+        record_digest: [u8; 32],
+        owner_path: String,
+    }
+    fn collect(structural_root: &Path, generation: u64) -> std::collections::HashMap<Vec<u8>, Row> {
+        let reader = StoreReader::open(structural_root).expect("diagnostic store reader opens");
+        let dicts = reader.dictionaries();
+        reader
+            .iter_visible(generation)
+            .map(|view| {
+                let owner_path = dicts
+                    .artifact_paths
+                    .get(view.owner_artifact() as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                (
+                    view.identity_key().to_vec(),
+                    Row {
+                        record_id: view.record_id(),
+                        record_digest: view.record_digest(),
+                        owner_path,
+                    },
+                )
+            })
+            .collect()
+    }
+    let incremental = collect(incremental_structural_root, incremental_generation);
+    let oracle = collect(oracle_structural_root, oracle_generation);
+
+    let mut report = RecordsLogicalSetReport::default();
+    for (id, row) in &oracle {
+        if !incremental.contains_key(id) {
+            let touched = touched_owners.contains(&row.owner_path);
+            let external = is_cross_owner_deduped_external_identity(id);
+            if touched {
+                report.missing_touched += 1;
+            } else {
+                report.missing_untouched += 1;
+            }
+            if external {
+                report.external_missing += 1;
+            }
+            // Every "should never happen" category is printed in FULL
+            // (never sample-capped) -- these are meant to be zero
+            // (`external=true` excepted, see the struct's own doc
+            // comment), so a truncated sample would hide real anomalies
+            // behind whichever ones happened to iterate first out of a
+            // `HashMap`. Only the EXPECTED `chained_legit_touched` bucket
+            // (below) is sampled.
+            eprintln!(
+                "records logical diff: MISSING identity={} owner={} touched={touched} external={external}",
+                String::from_utf8_lossy(id),
+                row.owner_path
+            );
+        }
+    }
+    for (id, row) in &incremental {
+        if !oracle.contains_key(id) {
+            let touched = touched_owners.contains(&row.owner_path);
+            let external = is_cross_owner_deduped_external_identity(id);
+            if touched {
+                report.extra_touched += 1;
+            } else {
+                report.extra_untouched += 1;
+            }
+            if external {
+                report.external_extra += 1;
+            }
+            eprintln!(
+                "records logical diff: EXTRA identity={} owner={} touched={touched} external={external}",
+                String::from_utf8_lossy(id),
+                row.owner_path
+            );
+        }
+    }
+    let mut chained_legit_touched_samples = 0usize;
+    for (id, inc) in &incremental {
+        let Some(ora) = oracle.get(id) else { continue };
+        let external = is_cross_owner_deduped_external_identity(id);
+        if inc.record_digest != ora.record_digest {
+            report.digest_mismatch += 1;
+            if external {
+                report.external_digest_mismatch += 1;
+            }
+            eprintln!(
+                "records logical diff: DIGEST-MISMATCH identity={} owner={} external={external} incremental_digest={} oracle_digest={}",
+                String::from_utf8_lossy(id),
+                inc.owner_path,
+                urdira_structural_store::to_prefixed_hex(&inc.record_digest),
+                urdira_structural_store::to_prefixed_hex(&ora.record_digest),
+            );
+        } else if inc.record_id != ora.record_id {
+            let touched = touched_owners.contains(&inc.owner_path);
+            if touched {
+                report.chained_legit_touched += 1;
+                if chained_legit_touched_samples < 10 {
+                    eprintln!(
+                        "records logical diff: chained-legit (touched, sample) identity={} owner={}",
+                        String::from_utf8_lossy(id),
+                        inc.owner_path
+                    );
+                    chained_legit_touched_samples += 1;
+                }
+            } else {
+                report.chained_legit_untouched += 1;
+                if external {
+                    report.external_chained_untouched += 1;
+                }
+                eprintln!(
+                    "records logical diff: UNEXPECTED-CHAIN (untouched owner) identity={} owner={} external={external}",
+                    String::from_utf8_lossy(id),
+                    inc.owner_path
+                );
+            }
+        }
+    }
+    eprintln!(
+        "records logical diff summary: incremental={} oracle={} missing_touched={} missing_untouched={} extra_touched={} extra_untouched={} digest_mismatch={} chained_legit_touched={} chained_legit_untouched={} | external_missing={} external_extra={} external_digest_mismatch={} external_chained_untouched={}",
+        incremental.len(),
+        oracle.len(),
+        report.missing_touched,
+        report.missing_untouched,
+        report.extra_touched,
+        report.extra_untouched,
+        report.digest_mismatch,
+        report.chained_legit_touched,
+        report.chained_legit_untouched,
+        report.external_missing,
+        report.external_extra,
+        report.external_digest_mismatch,
+        report.external_chained_untouched,
+    );
+    report
+}
+
+/// Frente E-P0e, Part 1, step 1: standalone diagnostic reading two ALREADY
+/// PUBLISHED stores off disk -- produced OUTSIDE this test by
+/// `scripts/v4-reconcile-threshold.mjs --files N --keep-data` against the
+/// real n8n corpus (this crate cannot itself drive a real n8n-scale scan
+/// inside a fast unit test binary). `#[ignore]`d: only runs when pointed at
+/// a real `--keep-data` output via env vars.
+///
+/// Env (all required):
+/// - `URDIRA_V4_DELTA_STRUCTURAL_ROOT` / `URDIRA_V4_DELTA_GENERATION`
+/// - `URDIRA_V4_ORACLE_STRUCTURAL_ROOT` / `URDIRA_V4_ORACLE_GENERATION`
+/// - `URDIRA_V4_TOUCHED_OWNERS_FILE`: a newline-separated list of
+///   workspace-relative paths the harness's own mutation plan touched
+///   (create/delete/rename/edit) -- this test has no visibility into the
+///   JS harness's seeded RNG plan, so the caller computes it externally
+///   (e.g. a recursive diff between the harness's own pre-mutation
+///   `template-workspace` and the delta run's mutated workspace).
+#[test]
+#[ignore]
+fn n8n_records_logical_set_diff_against_keep_data() {
+    fn env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
+    }
+    let delta_root = PathBuf::from(env("URDIRA_V4_DELTA_STRUCTURAL_ROOT"));
+    let delta_generation: u64 = env("URDIRA_V4_DELTA_GENERATION")
+        .parse()
+        .expect("URDIRA_V4_DELTA_GENERATION must be a u64");
+    let oracle_root = PathBuf::from(env("URDIRA_V4_ORACLE_STRUCTURAL_ROOT"));
+    let oracle_generation: u64 = env("URDIRA_V4_ORACLE_GENERATION")
+        .parse()
+        .expect("URDIRA_V4_ORACLE_GENERATION must be a u64");
+    let touched_owners_file = env("URDIRA_V4_TOUCHED_OWNERS_FILE");
+    let touched_owners: std::collections::HashSet<String> =
+        std::fs::read_to_string(&touched_owners_file)
+            .unwrap_or_else(|e| panic!("reading {touched_owners_file}: {e}"))
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+    eprintln!(
+        "n8n_records_logical_set_diff_against_keep_data: delta={delta_root:?}@{delta_generation} oracle={oracle_root:?}@{oracle_generation} touched_owners={}",
+        touched_owners.len()
+    );
+    let report = records_logical_set_diff(
+        &delta_root,
+        delta_generation,
+        &oracle_root,
+        oracle_generation,
+        &touched_owners,
+    );
+    report.assert_matches_oracle("n8n keep-data");
+}
+
 /// Runs one `WorkspaceScan` (the real `scan::run` entry point -- not the
 /// manual step-by-step pipeline `run_cold_scan` above drives) and returns
 /// its terminal `ScanCompleted` event.
@@ -4860,9 +5186,14 @@ fn reconcile_modify_produces_a_self_consistent_incremental_merkle_update() {
     // above (`recompute_roots_from_scratch`, the manual `graph_entries`
     // rebuild) only prove the persisted Merkle roots match a recomputation
     // over this store's OWN row set -- they cannot catch a bug that put the
-    // WRONG rows in that set to begin with. `records` is legitimately
-    // excluded from an independent-oracle comparison (decision 11's
-    // predecessor chaining, this test's own doc comment above) -- but
+    // WRONG rows in that set to begin with. The raw `records` ROOT is
+    // legitimately excluded from an independent-oracle comparison (decision
+    // 11's predecessor chaining, this test's own doc comment above), but
+    // Frente E-P0e (2026-09-07) replaces that skip with the LOGICAL
+    // set-equality comparator (`records_logical_set_diff`): decision 11
+    // never sanctions a missing/extra identity or a digest mismatch, only a
+    // chained `record_id` under a TOUCHED owner, so this still catches a
+    // real bug even though the raw root can never match here.
     // `dependency`/`graph`/pending sites carry no such chaining (dependency
     // rows are re-materialized wholesale per touched owner, relation/graph
     // records key on subject/target IDENTITY, not the volatile chained
@@ -4893,6 +5224,20 @@ fn reconcile_modify_produces_a_self_consistent_incremental_merkle_update() {
     );
     assert_eq!(generation_of(&oracle), 1);
     let oracle_roots = roots_of(&oracle);
+    let touched_owners: std::collections::HashSet<String> =
+        std::collections::HashSet::from([modified_relative.to_string()]);
+    let records_report = records_logical_set_diff(
+        &structural_root,
+        generation2,
+        &oracle_structural,
+        generation_of(&oracle),
+        &touched_owners,
+    );
+    records_report.assert_matches_oracle("reconcile_modify vs independent oracle");
+    assert!(
+        records_report.chained_legit_touched > 0,
+        "the edited file's own identities should show up in the expected decision-11 chained bucket (got 0 -- comparator or fixture wiring is wrong)"
+    );
     assert_eq!(
         reconciled_roots.dependency, oracle_roots.dependency,
         "a content edit must not disturb the dependency root vs an independent oracle: \
@@ -5115,33 +5460,35 @@ fn reconcile_rename_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
 /// roots.
 ///
 /// **Decided in implementation, deviating from the plan's literal "90%
-/// comment added" mutation recipe**: a CREATE at each batch size, not a
-/// content EDIT to an existing file. Diagnosed live while writing this
+/// comment added" mutation recipe**: a CREATE at each batch size, not (only)
+/// a content EDIT to an existing file. Diagnosed live while writing this
 /// family (see `reconcile_modify_produces_a_self_consistent_incremental_
 /// merkle_update`'s own doc comment and `full_scan_twice_in_the_same_
 /// process_matches_a_from_scratch_oracle`): a content edit's `Delta`
 /// branch legitimately chains an existing identity's `record_id` per
 /// decision 11, which by design never matches an independent from-scratch
-/// oracle -- true of `Changed` today, inherited by `reconcile`'s `Delta`
-/// branch unchanged, NOT a reconcile-specific gap. A pure CREATE has no
-/// prior identity to chain against on EITHER branch, so it is the correct
-/// choice for a test whose whole point is oracle-parity across both
-/// branches at once; content-edit batches are exactly what `scripts/v4-
-/// reconcile-threshold.mjs` (plan §2.6, real n8n corpus) exercises instead,
-/// where wall-clock measurement -- not root parity -- is the point, and a
-/// `delta`-vs-`cold` comparison at `T=1.0`/`T=0.0` on the SAME edit-heavy
-/// mutation is expected to (and, per this finding, will) diverge on any
-/// touched file's own chained record while still validating everything
-/// else; that script's own "abortar si no" gate should compare its DELTA
-/// run's roots against its OWN COLD run (both mutated identically), never
-/// against a fully independent oracle, for exactly this reason. (This
-/// fixture is also far too small for the percentages themselves to be
-/// meaningful load figures -- that calibration is the threshold script's
-/// job -- this test only proves the parity invariant holds at several
-/// distinct batch sizes.)
+/// oracle's RAW root -- true of `Changed` today, inherited by `reconcile`'s
+/// `Delta` branch unchanged, NOT a reconcile-specific gap. A pure CREATE has
+/// no prior identity to chain against on EITHER branch, so it remains the
+/// backbone of this test's batch-size sweep.
+///
+/// **Frente E-P0e (2026-09-07) addition**: each batch ALSO edits one
+/// existing fixture file (`src/domain/task.ts`), on top of the CREATEs --
+/// exercising exactly the case the note above used to justify excluding
+/// entirely. This is possible now because `records_logical_set_diff`
+/// (decision 11's logical set-equality comparator) replaces the RAW
+/// `records` root comparison for the `Delta` branch below: it still catches
+/// a real bug (a missing/extra identity, or a digest mismatch, both of
+/// which decision 11 never sanctions) while correctly tolerating the
+/// expected chained `record_id` on the edited file's own owner. The `Cold`
+/// branch's `records` root is asserted RAW as before (`ReconcileMode::Cold`
+/// runs the same `run_full_from` cold pipeline as a real cold scan -- no
+/// prior-generation chaining exists there at all, confirmed by
+/// `full_scan_twice_with_a_content_edit_matches_a_from_scratch_oracle`).
 #[test]
 fn reconcile_batches_match_cold_at_1_5_10_25_50_percent() {
     let total = 8_usize;
+    let edited_relative = "src/domain/task.ts";
 
     for fraction in [0.01_f64, 0.05, 0.10, 0.25, 0.50] {
         let touched_count = ((fraction * total as f64).ceil() as usize).max(1);
@@ -5160,7 +5507,15 @@ fn reconcile_batches_match_cold_at_1_5_10_25_50_percent() {
                 )
                 .expect("write created file");
             }
+            let edited_absolute = workspace_root.join(edited_relative);
+            let mut text = std::fs::read_to_string(&edited_absolute).expect("read edited file");
+            text.push_str(&format!("\n// urdira-harness-{label}-edit-marker\n"));
+            std::fs::write(&edited_absolute, text).expect("write edited file");
         };
+        let touched_owners: std::collections::HashSet<String> = (0..touched_count)
+            .map(|index| format!("src/domain/urdira-harness-{label}-created-{index}.ts"))
+            .chain(std::iter::once(edited_relative.to_string()))
+            .collect();
 
         // Forced Delta.
         let delta_scratch = scratch_dir(&format!("{label}-delta"));
@@ -5197,7 +5552,11 @@ fn reconcile_batches_match_cold_at_1_5_10_25_50_percent() {
             &mut delta_syntax,
             &mut delta_state,
         );
-        assert_eq!(generation_of(&delta_event), 2);
+        // A mixed batch (this test's own CREATEs + the E-P0e edit addition,
+        // in ONE `Changed`/`Delta` command) splits into TWO sequential
+        // internal generations (`delta.rs`'s own module doc, "P3-2 item 5":
+        // structural changes first, then the edit) -- generation 3, not 2.
+        assert_eq!(generation_of(&delta_event), 3);
         assert_eq!(
             reconcile_summary_of(&delta_event).mode,
             urdira_worker_protocol::ReconcileMode::Delta,
@@ -5272,9 +5631,23 @@ fn reconcile_batches_match_cold_at_1_5_10_25_50_percent() {
         let delta_roots = roots_of(&delta_event);
         let cold_roots = roots_of(&cold_event);
         let oracle_roots = roots_of(&oracle_event);
-        assert_eq!(
-            delta_roots.records, oracle_roots.records,
-            "fraction={fraction} touched={touched_count}: delta records root vs oracle"
+        // `Delta`'s `records` root is compared via the LOGICAL set
+        // (decision 11 chaining on the edited/created owners is expected
+        // and legitimate here, not a bug) -- see this test's own doc
+        // comment above.
+        let delta_records_report = records_logical_set_diff(
+            &delta_structural,
+            generation_of(&delta_event),
+            &oracle_structural,
+            generation_of(&oracle_event),
+            &touched_owners,
+        );
+        delta_records_report.assert_matches_oracle(&format!(
+            "fraction={fraction} touched={touched_count}: delta records logical set vs oracle"
+        ));
+        assert!(
+            delta_records_report.chained_legit_touched > 0,
+            "fraction={fraction} touched={touched_count}: expected at least one decision-11 chained record on the edited owner"
         );
         assert_eq!(
             delta_roots.dependency, oracle_roots.dependency,
