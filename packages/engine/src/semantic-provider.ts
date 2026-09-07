@@ -22,9 +22,27 @@ import { canonicalVectorBytes, CHARS_PER_TOKEN_ESTIMATE, DEFAULT_MAX_SEGMENTS, D
  * `max_segments` per R8's own measurement clause) is a single shared string
  * shape that bumps every provider's identity together, forcing the one-time
  * full re-embed R10 accepts as its cost.
+ *
+ * Frente S-D (2026-09-07, embed-performance): bumped to `v3` -- the
+ * ARTIFACT-grain vector's own computation changed (`semantic-reconciler.ts`'s
+ * `reconcileSemanticProjection`, step 3): when the reconciler already has
+ * fresh, current-generation entity-segment vectors for a file (computed by
+ * this SAME pass's entity step, moved earlier), the artifact vector is now
+ * the L2-renormalized mean of (those entity segment vectors) union (fresh
+ * segment vectors of only the file's text NOT covered by any eligible
+ * entity span), instead of always being a fresh whole-file embed. This
+ * changes what bytes an artifact vector contains for any file with at least
+ * one eligible entity, for EVERY provider that implements `.segment` (all
+ * three shipped ones) -- exactly the kind of "vector space changed" event
+ * `executable_binding_digest` exists to signal, so it forces the one-time
+ * full re-embed R10 already accepts, uniformly, without any provider needing
+ * its own separate bump. A file with zero eligible (or zero fresh-this-pass)
+ * entities keeps computing its artifact vector exactly as `v2` did (a fresh
+ * whole-file embed) -- only the BYTES this digest gates change meaning, not
+ * every document's actual output.
  */
 export function segmenterIdentity(maxSegments: number, windowTokens: number = DEFAULT_SEGMENT_WINDOW_TOKENS, overlapTokens: number = DEFAULT_SEGMENT_OVERLAP_TOKENS): string {
-  return `segmenter:v2:w${windowTokens}:o${overlapTokens}:max${maxSegments}`;
+  return `segmenter:v3:w${windowTokens}:o${overlapTokens}:max${maxSegments}`;
 }
 
 /**

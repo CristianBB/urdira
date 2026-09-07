@@ -114,3 +114,26 @@ CREATE TABLE IF NOT EXISTS semantic_document_status (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS semantic_document_status_affected
   ON semantic_document_status (workspace_id, profile_id, executable_binding_id, status, display_path, artifact_id, document_id);
+-- Frente S-D (2026-09-07, Lever 3): content-addressed cache of already-
+-- embedded SEGMENT vectors, keyed by (executable_binding_id, segment_digest)
+-- -- a digest of the exact normalized segment text this vector space would
+-- embed. Lets the reconciler skip a provider call entirely for a segment
+-- whose (text, binding) pair was already embedded by ANY document, in ANY
+-- prior generation (an edited file typically keeps ~90% of its segments
+-- unchanged across an edit -- plan section 4's own framing). Additive
+-- (CREATE TABLE IF NOT EXISTS); never referenced by a FOREIGN KEY (same
+-- cross-file-safety reasoning as vector_projection_rows/semantic_document_status
+-- above). Vector bytes are stored INLINE (not shard-packed) since a cache
+-- row's own lifecycle (no LRU yet, grows with distinct segment content,
+-- pruned only by a future retention pass) is unrelated to vector_shards'
+-- append-only packing.
+CREATE TABLE IF NOT EXISTS semantic_segment_cache (
+  workspace_id TEXT NOT NULL,
+  executable_binding_id TEXT NOT NULL,
+  segment_digest TEXT NOT NULL,
+  vector BLOB NOT NULL,
+  dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+  element_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, executable_binding_id, segment_digest)
+) STRICT;

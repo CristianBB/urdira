@@ -27,7 +27,7 @@ process.once("message", async (message: Message) => {
     // `record_value_nodes` SQL path completely unmodified -- see
     // `resolveV4SemanticEntitySource`'s own doc comment.
     const entityRecordSource = await resolveV4SemanticEntitySource(database, storage.cas, message.job.workspace_id);
-    const result = await reconcileSemanticProjection({ database, workspace_id: message.job.workspace_id, content: storage.cas, provider, ...(message.job.max_document_bytes === undefined ? {} : { max_document_bytes: message.job.max_document_bytes }), ...(message.job.embed_batch_size === undefined ? {} : { embed_batch_size: message.job.embed_batch_size }), ...(entityRecordSource === undefined ? {} : { entity_record_source: entityRecordSource }), should_abort: () => aborted });
+    const result = await reconcileSemanticProjection({ database, workspace_id: message.job.workspace_id, content: storage.cas, provider, ...(message.job.max_document_bytes === undefined ? {} : { max_document_bytes: message.job.max_document_bytes }), ...(message.job.embed_batch_size === undefined ? {} : { embed_batch_size: message.job.embed_batch_size }), ...(entityRecordSource === undefined ? {} : { entity_record_source: entityRecordSource }), ...(message.job.shard === undefined ? {} : { shard: message.job.shard }), should_abort: () => aborted });
     await database.close().catch(() => undefined);
     await storage.close().catch(() => undefined);
     storage = undefined;

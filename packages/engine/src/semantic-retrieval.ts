@@ -1,4 +1,4 @@
-import { canonicalVectorBytes } from "./semantic-runtime.js";
+import { canonicalVectorBytes, type SemanticVectorConfiguration } from "./semantic-runtime.js";
 import { nativeExactVectorTopK, nativeExactVectorTopKConfigured } from "./native-exact-vector.js";
 
 export type SemanticMetadata = Readonly<Record<string, string | number | boolean | readonly string[]>>;
@@ -68,6 +68,40 @@ function distance(left: readonly number[], right: readonly number[], metric: Exa
   return 1 - left.reduce((sum, value, index) => sum + (value * (right[index] ?? 0)), 0) / (leftNorm * rightNorm);
 }
 
+/**
+ * Frente S-D (2026-09-07, latency): `canonicalVectorBytes` for a Uint8Array
+ * candidate whose byte length already matches `dimensions`/`element_type`
+ * costs a full decode -> optional-renormalize -> re-encode round trip PER
+ * CANDIDATE -- real, measured JS-side CPU proportional to candidate count x
+ * dimensions on every query (`docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
+ * §3.3's own `rank-scan` cost center), independent of whether the native or
+ * JS-fallback distance computation runs afterward. Every candidate reaching
+ * this function has ALREADY been filtered (by `exactVectorScan`, just above
+ * each call site) to share this exact call's `profile_id` AND
+ * `executable_binding_id` -- the SAME vector-space identity that controlled
+ * its OWN canonicalization the one time it was ever written
+ * (`WorkspaceProjectionRepository.canonicalVectorBytes`, `@urdira/storage`'s
+ * `putVectors`, the only writer of `vector_projection_rows`/its packed CAS
+ * shards). A byte-length match against `dimensions`/`element_type` is
+ * therefore sufficient proof this candidate's bytes are ALREADY exactly what
+ * this function's own re-canonicalization would produce (already finite,
+ * already normalized per this same profile's own `normalization` setting) --
+ * skipping the redundant round trip relies on the WRITE path's own
+ * guarantee, never on skipping validation the read path would otherwise be
+ * the only place to enforce. A raw `readonly number[]` candidate (never
+ * written by this codebase's own storage layer, but structurally accepted by
+ * `ExactVectorCandidate.vector` for a caller/test that hands in un-encoded
+ * values) or a length MISMATCH always falls through to the full
+ * `canonicalVectorBytes` call, unchanged.
+ */
+function fastCandidateBytes(vector: readonly number[] | Uint8Array, dimensions: number, configuration: SemanticVectorConfiguration): Uint8Array {
+  if (vector instanceof Uint8Array) {
+    const width = configuration.element_type === "float32" ? 4 : 8;
+    if (vector.byteLength === dimensions * width) return vector;
+  }
+  return canonicalVectorBytes(vector, configuration);
+}
+
 export function exactVectorScan(candidates: readonly ExactVectorCandidate[], query: readonly number[] | Uint8Array, options: ExactVectorScanOptions): readonly ExactVectorMatch[] {
   if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit <= 0)) throw new Error("Exact semantic scan limit must be positive.");
   const elementType = options.element_type ?? "float32";
@@ -82,7 +116,7 @@ export function exactVectorScan(candidates: readonly ExactVectorCandidate[], que
   if (nativeExactVectorTopKConfigured()) {
     const width = options.dimensions * (elementType === "float32" ? 4 : 8);
     const packedCandidates = new Uint8Array(eligible.length * width);
-    eligible.forEach((candidate, index) => packedCandidates.set(canonicalVectorBytes(candidate.vector, configuration), index * width));
+    eligible.forEach((candidate, index) => packedCandidates.set(fastCandidateBytes(candidate.vector, options.dimensions, configuration), index * width));
     const native = nativeExactVectorTopK({
       query: queryBytes,
       candidates: packedCandidates,
@@ -95,7 +129,7 @@ export function exactVectorScan(candidates: readonly ExactVectorCandidate[], que
     if (native === undefined) throw new Error("Native exact vector top-k configuration changed during the query.");
     return native;
   }
-  const vectors = eligible.map((candidate) => canonicalVectorBytes(candidate.vector, configuration));
+  const vectors = eligible.map((candidate) => fastCandidateBytes(candidate.vector, options.dimensions, configuration));
   const ranked = eligible
     .map((candidate, index) => ({ id: candidate.projection_record_id, distance: distance(values(vectors[index]!, options.dimensions, elementType), queryValues, options.distance_metric) }))
     .sort((left, right) => left.distance - right.distance || utf8Compare(left.id, right.id));

@@ -111,7 +111,22 @@ export function segmentByChars(text: string, options: SegmentByCharsOptions): Se
   return { segments, truncated };
 }
 
-function vectorValues(value: readonly number[] | Uint8Array, configuration: SemanticVectorConfiguration): number[] {
+/**
+ * Decodes a packed (`Uint8Array`) or already-raw (`readonly number[]`) vector
+ * into a plain raw `number[]`, without any normalization -- the DECODE half
+ * of what `canonicalVectorBytes` below does end-to-end (decode, optionally
+ * L2-normalize, re-encode). Exported (Frente S-D, 2026-09-07) so
+ * `semantic-reconciler.ts`'s artifact-vector composition (deriving one
+ * artifact vector from several already-embedded entity/gap segment vectors)
+ * can decode each packed component back to raw values, elementwise-mean
+ * them, and hand the raw mean to `canonicalVectorBytes` for the SAME
+ * canonical normalize-and-encode pass every other vector this codebase
+ * writes goes through -- never a second, hand-duplicated decode routine that
+ * could silently drift from this one (the exact failure mode
+ * `canonicalVectorBytes`'s own storage-package counterpart's doc comment
+ * warns about).
+ */
+export function vectorValues(value: readonly number[] | Uint8Array, configuration: SemanticVectorConfiguration): number[] {
   const width = configuration.element_type === "float32" ? 4 : 8;
   if (value instanceof Uint8Array) {
     if (value.byteLength !== configuration.dimensions * width) throw new Error("Semantic vector byte length does not match its dimensions.");

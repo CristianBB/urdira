@@ -1,12 +1,12 @@
 import { existsSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
-import { homedir } from "node:os";
+import { cpus, homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { type ArtifactWorkItem, type ProposedRecord, type ProposedRecordDependency, type ReplacementScope, type SnapshotCapabilityStateEntry } from "@urdira/contracts";
 import { parseCliArgs, runCli, type CliCommand, type CliResult } from "@urdira/cli";
-import { createPersistentWorkspaceRegistry, DAEMON_PRIVATE_INTERFACE_VERSION, DaemonClient, DaemonError, DaemonRuntime, EndpointDescriptorStore, ProcessLock, daemonPaths, type DaemonErrorCode, type DaemonRuntimeOptions, type DaemonStartupPhase, type IpcProgress, type SemanticProviderDescriptor } from "@urdira/daemon";
+import { createPersistentWorkspaceRegistry, DAEMON_PRIVATE_INTERFACE_VERSION, DaemonClient, DaemonError, DaemonRuntime, EndpointDescriptorStore, ProcessLock, daemonPaths, resolveSemanticShardCount, type DaemonErrorCode, type DaemonRuntimeOptions, type DaemonStartupPhase, type IpcProgress, type SemanticProviderDescriptor } from "@urdira/daemon";
 import {
   candidateTargetRegistryFromSnapshot,
   configureNativeExactVectorTopKPort,
@@ -2381,6 +2381,12 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   // story. `positiveIntegerEnv` rejects `0`/negative/non-numeric values the
   // same way every other env-sourced numeric override in this file does.
   const semanticEmbedBatchSize = positiveIntegerEnv("URDIRA_SEMANTIC_EMBED_BATCH");
+  // Frente S-D (2026-09-07, Lever 2): how many concurrent semantic
+  // reconciler child processes to run -- see `DaemonRuntimeOptions.semantic_shard_count`'s
+  // own doc comment (`packages/daemon/src/runtime.ts`) and `resolveSemanticShardCount`'s
+  // (`packages/daemon/src/semantic-process.ts`) for the default (2, capped
+  // at `cpuCount / 4`) and the `URDIRA_SEMANTIC_WORKERS` override.
+  const semanticShardCount = resolveSemanticShardCount(cpus().length, process.env["URDIRA_SEMANTIC_WORKERS"]);
   // Lives under the daemon's own data root, NOT per-workspace: durable
   // entries are content-addressed and workspace-agnostic by construction
   // (nothing workspace-scoped feeds `durableAnalysisCacheKey` or the stored
@@ -2538,6 +2544,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
     ...(semanticThread ? {} : { semantic_thread: false }),
     ...(semanticProcess ? {} : { semantic_process: false }),
     ...(semanticEmbedBatchSize === undefined ? {} : { semantic_embed_batch_size: semanticEmbedBatchSize }),
+    semantic_shard_count: semanticShardCount,
     ...(warmRecordsBudgetMb === undefined ? {} : { warm_records_budget_mb: warmRecordsBudgetMb }),
     scheduler: {
       pool_concurrency: { source: 1, structural: structuralConcurrency, semantic: 1, query: 1 },

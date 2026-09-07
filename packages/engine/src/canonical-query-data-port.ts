@@ -418,6 +418,8 @@ const DELTA_CHURN_FALLBACK_RATIO = 0.3;
 const DELTA_ID_CHUNK_SIZE = 200;
 /** Bounds concurrent CAS reads in `semantic_vectors` (Frente S-C, 2026-09-07) -- same magnitude as `source-indexer.ts`'s `DEFAULT_READ_CONCURRENCY`/`directory-provider.ts`'s `DEFAULT_WALK_CONCURRENCY`. */
 const SEMANTIC_SHARD_READ_CONCURRENCY = 16;
+/** Bounds concurrent per-candidate snippet hydration in `hydrateSemanticCandidates` (Frente S-D, 2026-09-07) -- same magnitude as `SEMANTIC_SHARD_READ_CONCURRENCY` above. */
+const SEMANTIC_HYDRATION_CONCURRENCY = 16;
 // A selector can legally contain a large registered kind/category set.  Keep
 // every generated statement below SQLite's smallest supported variable limit,
 // including the five visibility parameters added by queryRecordRows().
@@ -3351,20 +3353,41 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const hydratedEntities = entityIds.length > 0 ? await this.snapshots.records_by_ids?.(scope, entityIds) ?? [] : [];
     const byVersionId = new Map(hydratedArtifacts.map((record) => [record.owner_artifact_version_id, record]));
     const byRecordId = new Map(hydratedEntities.map((record) => [record.record_id, record]));
-    const items: QueryStreamItem[] = [];
     // Plan 2026-09-06 (Frente N, SNIPPET_POLICY): "line" over
     // `semantic_evidence.matched_segment.start_char` once Frente S-B
     // populates it on `rankedEntries`, else "signature" -- `rankedEntries`
     // carries no segment offset in this worktree (S-B not merged here), so
     // this always takes the "signature" branch today.
-    let remainingCandidateSnippetBudget = INLINE_SNIPPET_TOTAL_BUDGET;
-    for (const entry of rankedEntries) {
+    //
+    // Frente S-D (2026-09-07, latency): the ORDER-DEPENDENT shared budget
+    // this used to decrement one candidate at a time (`remainingCandidateSnippetBudget`)
+    // forced every `sourceSnippet` call to run SEQUENTIALLY -- a real,
+    // measured cost center (`docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
+    // §3.3's own `hydrate` bucket, 85-100ms on a 45-file corpus). Replaced
+    // with a FIXED, EQUAL per-candidate share of the same total budget,
+    // computed once up front (never revised as candidates settle), which
+    // makes every candidate's own snippet fetch independent of every other
+    // one's outcome -- safe to run with BOUNDED concurrency
+    // (`SEMANTIC_HYDRATION_CONCURRENCY`, same magnitude as `semantic_vectors`'s
+    // own `SEMANTIC_SHARD_READ_CONCURRENCY`) instead of one at a time. This
+    // is a deliberate behavior change from "earlier-ranked candidates can
+    // consume a LARGER share of the budget" to "every candidate gets an
+    // EQUAL share" -- the total budget spent is the same order of magnitude,
+    // but no longer order-dependent; `context_lines: 0` (the literal `0`
+    // argument below) is unchanged.
+    const perCandidateBudget = rankedEntries.length === 0 ? INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET : Math.max(1, Math.min(INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, Math.floor(INLINE_SNIPPET_TOTAL_BUDGET / rankedEntries.length)));
+    const snippets = await mapWithConcurrency(rankedEntries, SEMANTIC_HYDRATION_CONCURRENCY, async (entry) => {
+      const record = entry.grain === "entity" ? byRecordId.get(entry.id) : byVersionId.get(entry.id);
+      if (record === undefined) return undefined;
+      return sourceSnippet(this.snapshots, scope, record, "signature", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, perCandidateBudget);
+    });
+    const items: QueryStreamItem[] = [];
+    for (let index = 0; index < rankedEntries.length; index += 1) {
+      const entry = rankedEntries[index]!;
       const record = entry.grain === "entity" ? byRecordId.get(entry.id) : byVersionId.get(entry.id);
       if (record === undefined) continue;
       const matchedSegment = entry.grain === "entity" ? matchedSegmentsByDocumentRef?.get(entry.id) : undefined;
-      const snippet = await sourceSnippet(this.snapshots, scope, record, "signature", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, remainingCandidateSnippetBudget);
-      if (snippet !== undefined) remainingCandidateSnippetBudget -= snippet.text.length;
-      items.push(semanticCandidateItem(record, items.length + 1, snippet, matchedSegment));
+      items.push(semanticCandidateItem(record, items.length + 1, snippets[index], matchedSegment));
     }
     return items;
   }
