@@ -9677,12 +9677,11 @@ fn exported_class_member_addition_and_reorder_keep_owners_at_the_literal_edit_on
 /// build-index lifecycle is a properly-sized follow-up in its own right,
 /// judged out of scope for this review pass (this PR's own diff never
 /// touches return-type surface tracking; only member/parameter NAMES).
-/// Left `#[ignore]`d rather than deleted so the follow-up has a ready
-/// repro and a red/green target.
+/// Frente E-P0h (2026-09-07): CLOSED -- `exported_surface` now folds in
+/// each locally-exported declaration's own `SyntaxEntity::type_surface_
+/// digest` (see that field's own doc comment and `exported_surface`'s own
+/// updated doc comment for the mechanism). No longer `#[ignore]`d.
 #[test]
-#[ignore = "Frente E-P0g adversarial review 2026-09-07: documented PRE-EXISTING gap, not a \
-            regression this PR introduces -- exported_surface has no type-level signal at all \
-            (see this test's own doc comment); tracked as a follow-up, not fixed in this pass"]
 fn exported_function_return_type_change_should_reanalyze_a_type_dependent_caller() {
     let scratch = scratch_dir("return-type-surface-gap");
     let workspace_root = scratch.join("workspace");
@@ -9710,5 +9709,153 @@ fn exported_function_return_type_change_should_reanalyze_a_type_dependent_caller
         owners.contains(&"consumer.ts".to_string()),
         "changing makeThing's return type from FooV1 to FooV2 must reanalyze consumer.ts \
          (its `.getBar()` call now resolves to a DIFFERENT method entity) -- got {owners:?}"
+    );
+}
+
+/// Frente E-P0h variant: an exported FUNCTION's own PARAMETER type (as
+/// opposed to its NAME, already tracked at name granularity by E-P0g's
+/// `param:` entries) changes -- name/parameter-NAME/return-type all
+/// untouched. `exported_surface`'s own `("type:make", digest, ..)` entry
+/// (folding in the WHOLE function's parameter-types+return-type digest, not
+/// just the changed parameter) must still differ before/after, widening
+/// `owners` to `consumer.ts`.
+#[test]
+fn exported_function_parameter_type_change_should_reanalyze_a_type_dependent_caller() {
+    let scratch = scratch_dir("param-type-surface-gap");
+    let workspace_root = scratch.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+    std::fs::write(
+        workspace_root.join("a.ts"),
+        "export function make(x: number): void {}\n",
+    )
+    .expect("write a.ts");
+    std::fs::write(
+        workspace_root.join("consumer.ts"),
+        "import { make } from './a';\nexport function run() {\n  make(1);\n}\n",
+    )
+    .expect("write consumer.ts");
+
+    let owners = owners_after_incremental_edits(
+        &workspace_root,
+        "param-type-surface-gap",
+        &[("a.ts", "export function make(x: string): void {}\n")],
+    );
+    assert!(
+        owners.contains(&"consumer.ts".to_string()),
+        "changing make's own PARAMETER type (number -> string), name/return-type \
+         untouched, must still reanalyze consumer.ts -- got {owners:?}"
+    );
+}
+
+/// Frente E-P0h variant: an exported CLASS's own PUBLIC PROPERTY declared
+/// type changes -- member name/kind/list untouched (already covered by
+/// E-P0g), only the property's own `: T` annotation. Exercises
+/// `exported_surface`'s new `member_type:Config.value` entry.
+#[test]
+fn exported_class_property_type_change_should_reanalyze_a_type_dependent_caller() {
+    let scratch = scratch_dir("property-type-surface-gap");
+    let workspace_root = scratch.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+    std::fs::write(
+        workspace_root.join("a.ts"),
+        "export class Config {\n  value: number = 1;\n}\n",
+    )
+    .expect("write a.ts");
+    std::fs::write(
+        workspace_root.join("consumer.ts"),
+        "import { Config } from './a';\nexport function run() {\n  const c = new Config();\n  return c.value;\n}\n",
+    )
+    .expect("write consumer.ts");
+
+    let owners = owners_after_incremental_edits(
+        &workspace_root,
+        "property-type-surface-gap",
+        &[(
+            "a.ts",
+            "export class Config {\n  value: string = \"1\";\n}\n",
+        )],
+    );
+    assert!(
+        owners.contains(&"consumer.ts".to_string()),
+        "changing Config.value's own declared type (number -> string), name/member-list \
+         untouched, must still reanalyze consumer.ts -- got {owners:?}"
+    );
+}
+
+/// Frente E-P0h variant: an exported CLASS's own PUBLIC METHOD return type
+/// changes -- the class's own top-level export binding AND the method's own
+/// name/member-list are both untouched (E-P0g's own `member:` entry alone
+/// cannot see this). Exercises `exported_surface`'s new `member_type:
+/// Service.get` entry, the class-member counterpart of the top-level
+/// `makeThing` return-type test above.
+#[test]
+fn exported_class_method_return_type_change_should_reanalyze_a_type_dependent_caller() {
+    let scratch = scratch_dir("method-return-type-surface-gap");
+    let workspace_root = scratch.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+    std::fs::write(
+        workspace_root.join("a.ts"),
+        "export class Service {\n  get(): number {\n    return 1;\n  }\n}\n",
+    )
+    .expect("write a.ts");
+    std::fs::write(
+        workspace_root.join("consumer.ts"),
+        "import { Service } from './a';\nexport function run() {\n  return new Service().get();\n}\n",
+    )
+    .expect("write consumer.ts");
+
+    let owners = owners_after_incremental_edits(
+        &workspace_root,
+        "method-return-type-surface-gap",
+        &[(
+            "a.ts",
+            "export class Service {\n  get(): string {\n    return \"1\";\n  }\n}\n",
+        )],
+    );
+    assert!(
+        owners.contains(&"consumer.ts".to_string()),
+        "changing Service.get's own return type (number -> string), name/member-list \
+         untouched, must still reanalyze consumer.ts -- got {owners:?}"
+    );
+}
+
+/// Frente E-P0h variant: an exported TYPE ALIAS's own RHS changes
+/// (`export type R = A;` -> `= B;`) -- the alias's own NAME is untouched,
+/// and every declaration that USES the alias by name (`makeR(): R`) has an
+/// UNCHANGED annotation text of its own (`R`, byte-identical before and
+/// after) -- only `exported_surface`'s new `type:R` entry (the alias
+/// declaration's OWN digest, over its RHS) can ever detect this. Confirms
+/// the chain through typeflow's own `alias_targets` resolution actually
+/// observes the retargeted alias (`makeR().foo()` resolves through `R` to a
+/// DIFFERENT class's `foo` after the edit).
+#[test]
+fn exported_type_alias_body_change_should_reanalyze_a_type_dependent_caller() {
+    let scratch = scratch_dir("alias-body-surface-gap");
+    let workspace_root = scratch.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+    std::fs::write(
+        workspace_root.join("a.ts"),
+        "export class A {\n  foo(): number {\n    return 1;\n  }\n}\nexport class B {\n  foo(): string {\n    return \"s\";\n  }\n}\nexport type R = A;\nexport function makeR(): R {\n  return new A();\n}\n",
+    )
+    .expect("write a.ts");
+    std::fs::write(
+        workspace_root.join("consumer.ts"),
+        "import { makeR } from './a';\nexport function run() {\n  return makeR().foo();\n}\n",
+    )
+    .expect("write consumer.ts");
+
+    let owners = owners_after_incremental_edits(
+        &workspace_root,
+        "alias-body-surface-gap",
+        &[(
+            "a.ts",
+            "export class A {\n  foo(): number {\n    return 1;\n  }\n}\nexport class B {\n  foo(): string {\n    return \"s\";\n  }\n}\nexport type R = B;\nexport function makeR(): R {\n  return new B();\n}\n",
+        )],
+    );
+    assert!(
+        owners.contains(&"consumer.ts".to_string()),
+        "changing type alias R's own RHS (A -> B), R's own name and makeR's own \
+         `: R` annotation text both untouched, must still reanalyze consumer.ts \
+         (its `.foo()` call now resolves through R to a DIFFERENT class) -- got {owners:?}"
     );
 }

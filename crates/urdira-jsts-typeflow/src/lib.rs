@@ -42,7 +42,7 @@ use oxc_ast::ast::{
 use oxc_ast_visit::utf8_to_utf16::Utf8ToUtf16;
 use oxc_parser::Parser;
 use oxc_semantic::{Scoping, SemanticBuilder};
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::symbol::SymbolId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2332,6 +2332,106 @@ pub struct MemberDeclaration {
     pub container_entity_id: String,
     pub container_name: String,
     pub is_static: bool,
+    /// Frente E-P0h (2026-09-07): the RAW (UTF-16, same convention as every
+    /// other span this struct/crate hands back -- see `entity_id`'s own doc
+    /// comment) source span of each declared PARAMETER's own type
+    /// annotation, in declaration order -- `None` for an unannotated
+    /// parameter, a distinct POSITIONED "absent" slot (never simply
+    /// omitted), so `f(a: string, b)` and `f(a, b: string)` can never
+    /// collide once `urdira_jsts_syntax_worker` slices/normalizes/joins
+    /// these spans into `SyntaxEntity::type_surface_digest`. Empty for a
+    /// `property`/`getter` member (see `type_surface_return` for those);
+    /// one entry for a `setter`/`constructor`-parameter-property member
+    /// (its own single parameter). Deliberately a RAW SPAN, never a
+    /// resolved/classified `RawTypeRef`: this crate's heavier import-
+    /// resolution machinery (`raw_type_ref_of_ts_type`, needs `Scoping`/
+    /// `import_specifiers`, cross-file) is not needed to detect "this
+    /// member's OWN written type changed" -- only `urdira_jsts_syntax_
+    /// worker` holds this file's raw source text and UTF-16-to-byte offset
+    /// table to turn a span into a comparable digest, so the span alone is
+    /// the minimal fact to hand across this crate boundary (see `analyze::
+    /// exported_surface`'s own doc comment for the full mechanism this
+    /// feeds).
+    pub type_surface_params: Vec<Option<(u32, u32)>>,
+    /// Frente E-P0h: this member's own declared RETURN type (`method`/
+    /// `getter`) or declared TYPE (`property`) -- `None` when unannotated,
+    /// and always `None` for `setter`/`constructor`/a parameter-property
+    /// member (TypeScript never allows annotating any of those with a
+    /// "return" type of their own; a parameter-property's OWN type lives in
+    /// `type_surface_params[0]` instead).
+    pub type_surface_return: Option<(u32, u32)>,
+}
+
+/// Frente E-P0h: the `(params, returns)` shape every one of this module's
+/// type-surface producers returns -- see `MemberDeclaration::type_surface_
+/// params`/`type_surface_return`'s own doc comments for what each half
+/// means. Factored into a named alias purely to keep every signature below
+/// readable (clippy's own `type_complexity` lint).
+type TypeSurfaceSpans = (Vec<Option<(u32, u32)>>, Option<(u32, u32)>);
+
+/// Frente E-P0h: `annotation`'s own `TSType` span, in UTF-16 code units
+/// (matching every other span this crate produces) -- `None` when
+/// unannotated. A thin wrapper so every one of this module's member/
+/// function/property producers shares the exact same "absent vs present"
+/// convention `MemberDeclaration::type_surface_params`'s own doc comment
+/// documents.
+fn type_annotation_span(annotation: Option<&TSTypeAnnotation>) -> Option<(u32, u32)> {
+    let annotation = annotation?;
+    let span = annotation.type_annotation.span();
+    Some((span.start, span.end))
+}
+
+/// Frente E-P0h: a `method`/`getter`/`setter`/`constructor` class element or
+/// interface method signature's own type surface -- every declared
+/// parameter's type span (declaration order) plus the return type span, if
+/// any. Shared by `class_element_type_surface`/`push_interface_member_
+/// declarations` so a method's and a method SIGNATURE's own extraction can
+/// never drift apart.
+fn formal_parameters_type_surface(
+    params: &oxc_ast::ast::FormalParameters,
+    return_type: Option<&TSTypeAnnotation>,
+) -> TypeSurfaceSpans {
+    let param_spans = params
+        .items
+        .iter()
+        .map(|param| type_annotation_span(param.type_annotation.as_deref()))
+        .collect();
+    (param_spans, type_annotation_span(return_type))
+}
+
+/// Frente E-P0h: `element`'s own type surface -- see `MemberDeclaration::
+/// type_surface_params`/`type_surface_return`'s own doc comments. A
+/// non-method/property element (an accessor pair's static block, ...;
+/// `class_element_member_shape` already filtered those out before this is
+/// ever called, so this arm is defensive only) contributes nothing.
+fn class_element_type_surface(element: &ClassElement) -> TypeSurfaceSpans {
+    match element {
+        ClassElement::MethodDefinition(method) => formal_parameters_type_surface(
+            &method.value.params,
+            method.value.return_type.as_deref(),
+        ),
+        ClassElement::PropertyDefinition(property) => (
+            Vec::new(),
+            type_annotation_span(property.type_annotation.as_deref()),
+        ),
+        _ => (Vec::new(), None),
+    }
+}
+
+/// Frente E-P0h: `signature`'s own type surface -- the interface-member
+/// counterpart of `class_element_type_surface`, see that function's doc
+/// comment.
+fn signature_type_surface(signature: &TSSignature) -> TypeSurfaceSpans {
+    match signature {
+        TSSignature::TSMethodSignature(method) => {
+            formal_parameters_type_surface(&method.params, method.return_type.as_deref())
+        }
+        TSSignature::TSPropertySignature(property) => (
+            Vec::new(),
+            type_annotation_span(property.type_annotation.as_deref()),
+        ),
+        _ => (Vec::new(), None),
+    }
 }
 
 /// Walks `program`'s top-level (module/`export`/`export default`)
@@ -2418,6 +2518,7 @@ fn push_class_member_declarations(class: &Class, path: &str, out: &mut Vec<Membe
         };
         let member_entity_id = declaration_id(shape.kind_word, path, shape.key_start, &shape.name);
         let is_constructor = shape.kind_word == "constructor";
+        let (type_surface_params, type_surface_return) = class_element_type_surface(element);
         out.push(MemberDeclaration {
             entity_id: member_entity_id.clone(),
             name: shape.name,
@@ -2427,6 +2528,8 @@ fn push_class_member_declarations(class: &Class, path: &str, out: &mut Vec<Membe
             container_entity_id: container_entity_id.clone(),
             container_name: container_name.clone(),
             is_static: shape.is_static,
+            type_surface_params,
+            type_surface_return,
         });
         // Parameter properties (see `constructor_parameter_property_
         // params`'s doc comment): only a constructor can declare one, and
@@ -2507,6 +2610,13 @@ fn push_constructor_parameter_property_declarations(
             container_entity_id: constructor_entity_id.to_owned(),
             container_name: constructor_qualified_name_segment.to_owned(),
             is_static: false,
+            // A parameter property's own type surface is ITS OWN
+            // annotation (see `MemberDeclaration::type_surface_return`'s
+            // doc comment) -- a single-slot `type_surface_params`, never a
+            // `type_surface_return` (TypeScript never allows a "return"
+            // type on a parameter).
+            type_surface_params: vec![type_annotation_span(param.type_annotation.as_deref())],
+            type_surface_return: None,
         });
     }
 }
@@ -2527,6 +2637,7 @@ fn push_interface_member_declarations(
         let Some(shape) = signature_member_shape(signature) else {
             continue;
         };
+        let (type_surface_params, type_surface_return) = signature_type_surface(signature);
         out.push(MemberDeclaration {
             entity_id: declaration_id(shape.kind_word, path, shape.key_start, &shape.name),
             name: shape.name,
@@ -2536,6 +2647,8 @@ fn push_interface_member_declarations(
             container_entity_id: container_entity_id.clone(),
             container_name: container_name.clone(),
             is_static: false,
+            type_surface_params,
+            type_surface_return,
         });
     }
 }

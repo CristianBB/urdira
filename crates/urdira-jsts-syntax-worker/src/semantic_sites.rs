@@ -4774,6 +4774,7 @@ fn parameter_entity_record(
         parent_id: Some(fact.parent_id.clone()),
         qualified_name: Some(fact.qualified_name.clone()),
         is_test: None,
+        type_surface_digest: None,
     };
     crate::proposal_entity_record(&entity, language, Some(line_index))
 }
@@ -4833,6 +4834,7 @@ fn catch_variable_entity_record(
         parent_id: Some(fact.parent_id.clone()),
         qualified_name: Some(fact.qualified_name.clone()),
         is_test: None,
+        type_surface_digest: None,
     };
     crate::proposal_entity_record(&entity, language, Some(line_index))
 }
@@ -8034,6 +8036,7 @@ mod tests {
             parent_id: None,
             qualified_name: None,
             is_test: None,
+            type_surface_digest: None,
         }
     }
 
@@ -9564,6 +9567,7 @@ mod tests {
                 parent_id: None,
                 qualified_name: None,
                 is_test: Some(true),
+                type_surface_digest: None,
             }],
             vec![],
         )

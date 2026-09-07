@@ -2480,6 +2480,7 @@ mod tests {
             parent_id: None,
             qualified_name: None,
             is_test: None,
+            type_surface_digest: None,
         }
     }
 

@@ -751,3 +751,43 @@ target scale) and N=5037 (25% of the 20,148-file frontier, the task's own upper 
 same logical-set invariant `deltaAllOk` always has, decision-11 chaining excepted) -- full delta-
 path logical parity against an independent oracle at both scales, closing E-P0f's own §15.4 finding
 and every further root cause this session's own re-investigation of it surfaced.
+
+## Owner surface criterion, widened again: a declaration's own TYPE (Frente E-P0h, 2026-09-07)
+
+**Problem** (`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §16.5's own adversarial-review
+finding, `#[ignore]`d there): the surface criterion the previous amendment describes (a locally-
+exported container's member/parameter NAMES) still had no TYPE-level signal at all -- an exported
+function's return type, an exported class member's declared/return type, an exported function's
+parameter's type, or an exported type alias's own RHS changing, with the declaration's own name/
+parameter-NAMES/member-list untouched, left `surface_changed` `false` and incorrectly narrowed away
+every caller whose typeflow-mediated resolution (a member-chain call resolved through `ProgramIndex::
+function_return_types`/`member_type_ref`, entirely orthogonal to this syntax-level gate) depended on
+that exact type.
+
+**Fix, minimal cross-crate surface** (the plan's own brief: expose the minimum, not `DeclSummary`/
+`RawTypeRef` wholesale): `urdira-jsts-syntax-worker`'s `SyntaxEntity` gains `type_surface_digest:
+Option<String>` -- a normalized (comments/whitespace outside a string/template literal stripped),
+POSITION-INDEPENDENT fingerprint of a declaration's own WRITTEN type, computed ENTIRELY from this
+crate's own already-parsed AST spans (a new `Utf16ByteMap` translates the UTF-16 offsets this
+crate's `Visit` walk always sees back to UTF-8 byte offsets into the file's own source text, so the
+type annotation's raw text can be sliced and normalized without any semantic type resolution at
+all). `urdira-jsts-typeflow`'s `MemberDeclaration` (already threaded to this crate's own member-
+entity producer for the prior amendment's member-identity work) gains two plain fields --
+`type_surface_params`/`type_surface_return`, RAW UTF-16 spans, never a resolved `RawTypeRef` -- the
+entire cross-crate addition. `analyze.rs::exported_surface` folds in a `("type:{name}", digest, ..)`
+entry for a directly-exported function/variable/type-alias and a `("member_type:{container}.
+{member}", digest, ..)` entry per typed class/interface member, reusing the SAME subset-comparison
+`surface_changed` check already applies -- a digest change removes the old tuple and inserts a
+different one, correctly widening the affected set exactly like a member rename already does.
+
+**Tests**: the reviewer's own `#[ignore]`d repro (`exported_function_return_type_change_should_
+reanalyze_a_type_dependent_caller`) is now green, plus four new variants (exported function
+parameter type, exported class property type, exported class method return type, exported type
+alias RHS) -- all confirm `owners` widens to the type-dependent caller. The standing hub-edit cost
+gate (`method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched`) stays green unmodified.
+
+**Verified at real n8n scale**: N=1008 (`add=50 changed=908 deleted=100`) and N=2015 (§16's own
+repro scale, `add=100 changed=1813 deleted=201`) both reach `extra_untouched=0`/`missing_
+untouched=0` (non-external) and `roots_ok.delta_all=true`/`roots_ok.cold_all=true` -- see `docs/
+evidence/2026-09-06-v4-reconcile-threshold.md` §17 for the full numbers and every non-zero bucket's
+`external_*` accounting.

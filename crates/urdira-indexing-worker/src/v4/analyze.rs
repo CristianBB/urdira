@@ -340,6 +340,28 @@ fn is_member_surface_kind(kind: urdira_jsts_syntax_worker::EntityKind) -> bool {
 /// [`run_scoped`]'s own `surface_changed` comparison already applies to the
 /// top-level export set (adding a method never invalidates an EXISTING
 /// importer's already-resolved reference to a DIFFERENT, unchanged member).
+///
+/// Frente E-P0h (2026-09-07): a locally-exported declaration's own DECLARED
+/// TYPE (a function's parameter types + return type, a class/interface
+/// member's own return/declared type, a `const X: T`'s own `T`, an
+/// `export type X = ...`'s own RHS) is now ALSO part of this surface --
+/// `urdira-jsts-syntax-worker`'s own `SyntaxEntity::type_surface_digest`
+/// (see that field's own doc comment for the full normalize-and-hash
+/// mechanism, computed entirely inside the syntax worker from this file's
+/// own raw source text -- no cross-file type RESOLUTION, `RawTypeRef`, or
+/// `TypeflowCache::DeclSummary` correlation needed here: the syntax worker
+/// already has this file's own text/spans in hand at parse time, and a
+/// type-only surface check only needs "did THIS declaration's own written
+/// type change", never what it resolves to). Closes the gap E-P0g's own
+/// adversarial review found and left `#[ignore]`d (`docs/evidence/
+/// 2026-09-06-v4-reconcile-threshold.md` §16.5's own writeup,
+/// `exported_function_return_type_change_should_reanalyze_a_type_dependent_
+/// caller`): changing `makeThing`'s return type from `FooV1` to `FooV2`
+/// (same name, same parameter NAMES) previously left `surface_changed`
+/// `false` -- this fold-in gives it a `("type:makeThing", Some(new_digest),
+/// None, None)` entry that differs from the pre-edit one, correctly
+/// widening the affected set to `makeThing`'s callers exactly like a
+/// member rename already does.
 fn exported_surface(file: &SyntaxFileResult) -> BTreeSet<ExportedSurfaceEntry> {
     let mut surface: BTreeSet<ExportedSurfaceEntry> = file
         .export_bindings
@@ -423,6 +445,30 @@ fn exported_surface(file: &SyntaxFileResult) -> BTreeSet<ExportedSurfaceEntry> {
         }) else {
             continue;
         };
+        // Frente E-P0h (2026-09-07): the container's OWN declared TYPE
+        // surface -- a directly-exported FUNCTION's own parameter types +
+        // return type, a directly-exported `const X: T = ...`'s own `T`, or
+        // an `export type X = ...`'s own RHS (see `SyntaxEntity::type_
+        // surface_digest`'s own doc comment for exactly which entity kinds
+        // ever carry one). A `class`/`interface`/`enum`/`namespace`
+        // container's own digest is always `None` (no-op here -- their
+        // MEMBERS' own digests are folded in by the loop below instead).
+        // Closes the gap `docs/evidence/2026-09-06-v4-reconcile-threshold.md`
+        // §16's adversarial review documented and deliberately left
+        // `#[ignore]`d (`exported_function_return_type_change_should_
+        // reanalyze_a_type_dependent_caller`): before this, a type-ONLY
+        // edit to an exported declaration (name/parameter-NAMES/member-list
+        // unchanged) left `surface_changed` `false`, incorrectly narrowing
+        // `run_scoped`'s affected set away from every caller whose
+        // typeflow-mediated resolution depends on that exact type.
+        if let Some(digest) = &container.type_surface_digest {
+            surface.insert((
+                format!("type:{}", binding.local_name),
+                Some(digest.clone()),
+                None,
+                None,
+            ));
+        }
         for member in file
             .entities
             .iter()
@@ -435,6 +481,21 @@ fn exported_surface(file: &SyntaxFileResult) -> BTreeSet<ExportedSurfaceEntry> {
                     None,
                     None,
                 ));
+                // Frente E-P0h: this member's own declared type (a
+                // method/getter's return type, a setter's parameter type, a
+                // property's declared type, a constructor's own -- always
+                // `None`, see `type_surface_digest`'s own doc comment) --
+                // a SEPARATE entry from `member:` above (never merged into
+                // it), so an existing test asserting that entry's exact
+                // shape is unaffected by this frente.
+                if let Some(digest) = &member.type_surface_digest {
+                    surface.insert((
+                        format!("member_type:{}.{}", binding.local_name, member.name),
+                        Some(digest.clone()),
+                        None,
+                        None,
+                    ));
+                }
             } else if member.kind == urdira_jsts_syntax_worker::EntityKind::Parameter
                 && container.kind == urdira_jsts_syntax_worker::EntityKind::Function
             {
