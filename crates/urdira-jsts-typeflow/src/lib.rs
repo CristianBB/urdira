@@ -3614,13 +3614,34 @@ impl ProgramIndex {
     }
 
     /// P3-8a: replaces every `import_targets` entry belonging to each
-    /// owning path present in `updates`' keys with EXACTLY `updates`' own
+    /// owning path in `owning_paths_considered` with EXACTLY `updates`' own
     /// entries for that path (a full per-file snapshot, never a partial
     /// patch -- the caller re-resolves and hands over that file's WHOLE
     /// current needed-imports set, so a specifier that stopped resolving,
     /// or stopped being needed at all, is correctly dropped rather than
-    /// left stale). An owning path absent from `updates` entirely keeps
-    /// its previous entries untouched.
+    /// left stale). An owning path absent from `owning_paths_considered`
+    /// entirely keeps its previous entries untouched.
+    ///
+    /// Frente E-P0g fix: `owning_paths_considered` used to be derived
+    /// SOLELY from `updates`' own keys (`updates.keys().map(|k| k.0)`) --
+    /// correct as long as an owning path keeps AT LEAST ONE resolved
+    /// import, but silently wrong the moment a path's ENTIRE needed-import
+    /// set stops resolving (a specifier's target file disappears/renames):
+    /// `updates` then has NO entry at all for that owning path (there is
+    /// nothing to insert), so the old derivation's `owning_paths` came back
+    /// empty for it and `clear_owning_path_import_targets` never ran --
+    /// the STALE `import_targets`/`importers_of` edge (still pointing at
+    /// the last entity it ever resolved to) survived forever, byte-
+    /// identical to before the specifier broke. Confirmed live on n8n
+    /// (`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §15.4/§16):
+    /// removing/renaming a re-exporting barrel left a real consumer's
+    /// method-call resolution through it unchanged. The caller now passes
+    /// `owning_paths_considered` explicitly -- exactly the owning-path
+    /// universe it re-resolved this call (`v4/typeflow.rs`'s own
+    /// `resolve_import_targets_for` already computes this reliably via
+    /// `pending_targets`' guaranteed one-entry-per-queried-path contract,
+    /// see that function's own doc comment), so a path that resolved NOTHING
+    /// this round is still correctly cleared.
     ///
     /// Deliberately does NOT call `link_importer` itself -- a `replace_
     /// file`/`add_file` update's target entity (typically `path`'s OWN
@@ -3638,8 +3659,10 @@ impl ProgramIndex {
     fn apply_import_target_updates(
         &mut self,
         updates: &HashMap<(String, String, String), String>,
+        owning_paths_considered: &HashSet<String>,
     ) -> Vec<((String, String, String), String)> {
-        let owning_paths: HashSet<String> = updates.keys().map(|key| key.0.clone()).collect();
+        let mut owning_paths: HashSet<String> = updates.keys().map(|key| key.0.clone()).collect();
+        owning_paths.extend(owning_paths_considered.iter().cloned());
         for owning_path in &owning_paths {
             self.clear_owning_path_import_targets(owning_path);
         }
@@ -3851,7 +3874,17 @@ impl ProgramIndex {
     ) {
         let affected = self.transitive_importers_closure(path);
         self.purge_import_targets_targeting_file(path);
-        let pending_links = self.apply_import_target_updates(import_targets_updates);
+        // Frente E-P0g: `pending_target_updates`' own keys reliably name
+        // EVERY owning path the caller re-resolved this call (see
+        // `resolve_import_targets_for`'s "one entry per queried path,
+        // even if empty" contract) -- `apply_import_target_updates` needs
+        // that full universe, not just the subset that happened to resolve
+        // something, to correctly clear a path whose entire needed-import
+        // set just went stale. See that function's own doc comment.
+        let owning_paths_considered: HashSet<String> =
+            pending_target_updates.keys().cloned().collect();
+        let pending_links =
+            self.apply_import_target_updates(import_targets_updates, &owning_paths_considered);
         self.apply_pending_target_updates(pending_target_updates);
         self.remove_file_contributions(path);
         self.summaries.insert(path.to_owned(), summary);
