@@ -1608,3 +1608,238 @@ edges); one test-coverage gap (cross-generation persistence never actually exerc
 new, passing test; both §12.6 out-of-scope findings re-attempted with targeted synthetics through the
 real production path and NOT reproduced, recorded as negative results per plan §0. The real
 `tags-3-months` n8n switch remains `graph=true`/`dependency=true` with this session's fix applied.
+
+## §14. Frente E-P0e (2026-09-07): `records` chaining confirmed purely representational at N=202/1008 (with one documented exception + one new, narrow, real finding); `spawn EBADF` fixed, 3/3 green
+
+Base: `main` at `57a6675` (F.3's own commit). Branch `frente-ep0e-records-parity`. Worktree
+`.claude/worktrees/agent-ad10bb1c83f4474c6`, own `CARGO_TARGET_DIR`
+(`.claude/worktrees/cargo-target-ep0e`, removed at the end). Machine shared with several other
+concurrent agent sessions the whole time (`uptime` load1 ranged 5-28 throughout); two runs failed
+for pure resource-contention reasons unrelated to this task's own code (an N=1008 cold scan
+SIGKILLed once, a mutation-harness confirmation run hit `Indexing-core worker is unavailable` once)
+-- both retried clean, noted here rather than silently re-run.
+
+### 14.1 Part 1: is `records` root divergence under `Delta` purely decision-11 chaining?
+
+**Tooling**: `crates/urdira-indexing-worker/src/v4/tests_e2e.rs` gained
+`records_logical_set_diff`/`RecordsLogicalSetReport` (keyed by `identity_key`, decision 11's own
+comparable unit) plus the `#[ignore]`d `n8n_records_logical_set_diff_against_keep_data` test (env
+vars: `URDIRA_V4_DELTA_STRUCTURAL_ROOT`/`_GENERATION`, `URDIRA_V4_ORACLE_STRUCTURAL_ROOT`/
+`_GENERATION`, `URDIRA_V4_TOUCHED_OWNERS_FILE`). Chosen over a JSON-dump-plus-node-script pipeline
+(the task's own "o" alternative): the Rust test already has direct, simultaneous `StoreReader`
+access to both stores in-process, which is both simpler and far cheaper than round-tripping ~2.2M
+records through JSON for a diff a separate script would have to reimplement anyway.
+
+**Method**: `scripts/v4-reconcile-threshold.mjs --files N --keep-data` (N=202 ≈ F.3's p=0.01 cell,
+N=1008 ≈ p=0.05) against the shared n8n corpus, own scratch under `v4-fold/ep0e-n202`/`ep0e-n1008`.
+The script's own `template-workspace` is deleted unconditionally at the very end of a run (even with
+`--keep-data`) -- for N=202 the touched-file diff was taken against it before that happened; for
+N=1008 (which finished before this was noticed) the diff was taken against the shared read-only
+corpus itself instead, filtered to `.ts`/`.tsx`/`.js`/`.jsx`/`.mjs`/`.cjs` paths only (a handful of
+spurious `Only in ...` lines under `.claude/plugins/...` appeared from a `diff -rq` traversal quirk
+unrelated to the mutation -- confirmed byte-identical by hand, filtered out; the extension filter
+recovers EXACTLY the expected 908+50+100=1058 touched-path count for N=1008; 202's own filtered
+count is 212, exactly 182 edits + 10 deletes + 2x10 rename-halves).
+
+**N=202** (`run-files202-delta-1-data/structural`@generation 3 vs an independent `v4-scan.mjs`
+oracle of the identically mutated tree@generation 1; touched-owner file: 212 paths):
+
+```
+records logical diff summary: incremental=2196580 oracle=2196604
+  missing_touched=24  missing_untouched=0  extra_touched=0  extra_untouched=0
+  digest_mismatch=34  chained_legit_touched=517  chained_legit_untouched=399
+  | external_missing=24 external_extra=0 external_digest_mismatch=34 external_chained_untouched=399
+```
+
+Raw roots: `dependency` IDENTICAL (`sha256:785a36d7...df0d16bb` both sides), `graph` IDENTICAL,
+`records` differs (expected). **Every single one of the six anomaly counters equals its own
+`external_*` mirror exactly** -- i.e. `missing_touched - external_missing = 0`,
+`extra_untouched - external_extra = 0`, `digest_mismatch - external_digest_mismatch = 0`,
+`chained_legit_untouched - external_chained_untouched = 0`: **zero non-external anomalies of any
+kind.** `n8n_records_logical_set_diff_against_keep_data` (with the `external_*` exception wired in,
+§14.2) passes clean at N=202.
+
+**N=1008** (`run-files1008-delta-1-data/structural`@generation 3 vs oracle@generation 1;
+touched-owner file: 1058 paths, exactly 908 edits + 50 deletes + 2x50 rename-halves):
+
+```
+records logical diff summary: incremental=2189135 oracle=2189237
+  missing_touched=106  missing_untouched=0  extra_touched=0  extra_untouched=4
+  digest_mismatch=52  chained_legit_touched=1740  chained_legit_untouched=249
+  | external_missing=106 external_extra=0 external_digest_mismatch=52 external_chained_untouched=249
+```
+
+Raw roots: `dependency` IDENTICAL (`sha256:8de19928...b468ede` both sides -- matches F.3's own
+finding that E-P0/b/c/d's fix holds at every tested scale), `records` differs (expected), **`graph`
+DIFFERS** (matches F.3 §9.3's own "graph still diverges at N≥~1008" finding, not new). Of the six
+anomaly counters, five equal their `external_*` mirror exactly (0 non-external
+missing/digest-mismatch/chained-untouched) -- **except `extra_untouched=4`, of which
+`external_extra=0`: 4 REAL, non-external, untouched-owner phantom records**, root-caused below
+(§14.3). `n8n_records_logical_set_diff_against_keep_data` correctly FAILS at N=1008 on this one
+non-external anomaly (by design -- the comparator does not, and should not, paper over it).
+
+### 14.2 Verdict: representational, with one pre-existing documented exception
+
+**Confirmed**: decision 11's replacement/reopen/migration chaining (`chained_record_id = H(digest,
+predecessor)` vs. an oracle's kernel-cold `sha256(digest)`) fully explains the `records` root
+divergence for every ordinary (non-cross-owner-deduped) identity, at both scales tested, with
+**zero** missing rows, **zero** phantom rows, and **zero** digest mismatches outside one already
+existing, already-decided design exception. `docs/decisions/11-content-derived-record-identity.md`
+gained a new section recording this (raw root is not comparable under `Delta`; the logical set,
+keyed by `identity_key` with `record_digest` equality and touched-owner-scoped `record_id` chaining,
+is); `records_logical_set_diff`/`assert_matches_oracle` implement exactly that gate.
+
+**The one documented exception**: `jsts:external_module:*`/`jsts:external_symbol:*` identities are
+cross-owner-deduped (`analyze.rs::dedupe_external_entities_across_owners`'s own doc comment, an
+EXISTING, owner-approved, self-healing escape hatch predating this session -- "editing/deleting the
+alphabetically-first CURRENTLY-SCANNED importer while another, unscanned importer still needs the
+identity closes it (temporarily; reopens, chained, on the next scan that touches any surviving
+importer, or always on a full cold rescan)"). 100% of every anomaly at both N=202 and N=1008 landed
+on this exact identity-kind pair; 0% on any other kind. `RecordsLogicalSetReport` mirrors these into
+unasserted `external_*` counters rather than either silently dropping them or letting them mask a
+real bug.
+
+### 14.3 New finding: 4 stale `jsts:references` relations at N=1008, root-caused (not fixed) -- an ambient-global-scope reverse-dependency the incremental pipeline cannot track
+
+The 4 non-external `extra_untouched` anomalies are all `CATEGORY_RELATION` rows owned by
+`packages/@n8n/benchmark/src/test-execution/test-report.ts` (confirmed BYTE-IDENTICAL between the
+corpus and the mutated tree -- genuinely untouched by this cell's own plan), each a `jsts:references`
+edge from one of its own local functions (`k6CounterToCounter`, `buildTestReport`, `k6CheckToCheck`,
+`k6TrendToTrend`) to an interface (`K6CounterMetric`, `K6EndOfTestSummary`, `K6Check`,
+`K6TrendMetric`) declared in `packages/@n8n/benchmark/src/test-execution/k6-summary.ts` -- one of
+this cell's 50 DELETED files.
+
+**Root cause**: `k6-summary.ts` has **zero** top-level `import`/`export` statements
+(`grep -cE "^import |^export "` = 0) -- under TypeScript's own module-vs-script rule, a file with no
+import/export is a global SCRIPT, not a module, so every one of its top-level declarations (its four
+interfaces) is an AMBIENT GLOBAL, visible workspace-wide with no import needed at the use site
+(confirmed: `test-report.ts` uses `K6CounterMetric` etc. with zero matching import line anywhere in
+the file). Because there is no import statement, `deps.rs`'s dependency-edge derivation (which
+reads import/require statements) records **no** `(test-report.ts, k6-summary.ts)` dependency edge at
+all -- so when `k6-summary.ts` is deleted, the incremental pipeline's reverse-dependent/affected-
+owner closure (which walks the DEPENDENCY graph to decide who else needs reprocessing) has no edge
+to follow and never re-touches `test-report.ts`. Its four stale `references` rows (materialized at
+generation 1, pointing at identities that no longer exist post-delete) survive untouched, dangling.
+An independent oracle re-scanning the final (`k6-summary.ts`-deleted) tree never manufactures these
+edges at all (the target no longer exists), hence "extra" (only-in-incremental).
+
+**Disposition**: reported, NOT fixed. A correct fix requires the incremental pipeline to track
+"who resolves an ambient global from which file" as an implicit dependency edge (the same shape
+`AmbientModuleIndex`/"ambient index rebuild" already solves for wildcard MODULE declarations,
+`analyze.rs`'s own existing machinery, but not for ambient-global TYPE/VALUE declarations
+specifically) -- a real, if architecturally deep, gap, out of this task's authorized scope (Part 1
+is a diagnostic task over `delta.rs`'s OWNER-vs-EDGE granularity for records, not a new
+dependency-tracking subsystem) and far too narrow (4 of 2,189,237 live records, 0.00018%) to justify
+an unreviewed, time-pressured fix to a mechanism this deep. **This is very likely a second,
+independent contributor to F.3 §9.3's own "graph still diverges at N≥~1008, [root cause] not yet
+isolated" finding** (`jsts:references` is `CATEGORY_RELATION`, so 4 phantom relation rows propagate
+straight into a `graph` root mismatch, confirmed here: `roots_ok.delta.graph=false` at N=1008,
+`=true` at N=202, exactly the scale threshold F.3 already measured) -- alongside F.3's own
+already-isolated cause (external-module alias-resolution consistency for `DependencyPill.vue`).
+**Recommended for the owner's queue**: fold into the SAME "records/graph identity under
+Delta-scope diffing" follow-up frente F.3 §5.3 already recommended, now with a second, fully
+root-caused repro (this section) in hand. Repro: `scripts/v4-reconcile-threshold.mjs --files 1008
+--keep-data`, then `n8n_records_logical_set_diff_against_keep_data` against the kept
+`run-files1008-delta-1-data`/`oracle-files1008-data` structural roots with a touched-owners file
+built from `plan`'s own `relPath`/`renamedTo`.
+
+### 14.4 Gate changes
+
+- **`crates/urdira-indexing-worker/src/v4/tests_e2e.rs`**: `records_logical_set_diff`,
+  `RecordsLogicalSetReport` (incl. `external_*` counters), `is_cross_owner_deduped_external_identity`,
+  `n8n_records_logical_set_diff_against_keep_data` (new, `#[ignore]`d, n8n-scale diagnostic).
+  `reconcile_modify_produces_a_self_consistent_incremental_merkle_update` (a `Changed`+edit test)
+  now asserts the logical set against its own independent oracle instead of skipping `records`
+  entirely, plus `chained_legit_touched > 0` (the edited file's own module entity really did chain).
+  `reconcile_batches_match_cold_at_1_5_10_25_50_percent` now mutates an EXISTING file
+  (`src/domain/task.ts`) in addition to its original per-fraction CREATEs (previously deliberately
+  CREATE-only to dodge the raw-root mismatch this session's comparator now handles correctly) --
+  `Delta`'s `records` assertion uses the logical set (with a `chained_legit_touched > 0` sanity
+  check), `Cold`'s stays raw (`Cold` never chains, confirmed by
+  `full_scan_twice_with_a_content_edit_matches_a_from_scratch_oracle`). The CREATE+EDIT mixed batch
+  now splits into two internal generations per `delta.rs`'s own documented mixed-burst handling, so
+  `generation_of(&delta_event)` is 3, not 2 -- updated with a doc comment explaining why.
+- **`scripts/v4-reconcile-threshold.mjs`**: `checkRecordsLogicalSet`/`touchedOwnersOfPlan` (new).
+  `deltaAllOk`'s `records` component is now the logical-set check (shelling out to `cargo test ...
+  n8n_records_logical_set_diff_against_keep_data -- --ignored --nocapture` against the kept delta/
+  oracle structural roots + a touched-owners file built from `plan`) when computable (`--keep-data`,
+  `p!==0`); `dependency`/`graph` remain raw-root-gated, unchanged. `rootsDiff`'s raw `records` field
+  is kept in the JSON report for visibility/backward-compat, no longer decides `deltaAllOk`.
+  `coldAllOk` (the one HARD-gated, throwing check) is completely unchanged -- `Cold` never chains,
+  raw comparison remains the correct, always-exact criterion there. Verified live: a fresh
+  `--files 100 --keep-data` smoke run logged `records logical set check: ok=true ... |
+  external_missing=6 ... external_chained_untouched=474` (all non-external counters zero) and
+  `roots_ok.delta_all=true` (previously `false` under the old raw-root gate at this same scale).
+- **`docs/decisions/11-content-derived-record-identity.md`**: new "v4 incremental `records` root is
+  not comparable to a cold oracle" section (the gate criterion, its rationale, and the one documented
+  exception).
+- This file: §14.
+
+### 14.5 Part 2: `spawn EBADF` root cause and fix
+
+**Root cause, confirmed live via `lsof -p <harness pid>`, sampled every 5s for the whole run**:
+`daemon start` in `scripts/v4-mutation-harness.mjs` calls `runUrdira(["daemon", "start", ...])` from
+a script (`apps/urdira/src/index.ts`'s `runUrdira`, not the real `urdira` CLI binary's own
+`startDetachedDaemon` fork) -- the FULL v4 daemon runtime (file watchers, DB handles, mmap'd
+structural-store segments) runs IN THIS SAME process. Measured: fd count jumps from ~26 to ~24,900
+within 5 seconds of `daemon start`/`workspace add` and stays flat there for the entire ~4.5-minute,
+32-generation run (one fd per corpus file's own watcher, roughly). `--verify-roots final`'s own
+`oracleVerify` spawns `scripts/v4-scan.mjs` as a brand-new child process (`execFileWithEbadfRetry`,
+already retries 3x on `EBADF` -- exhausted every time) WHILE the daemon (and all ~24,900 of its fds)
+was STILL fully running -- the `finally` block's own `daemon stop` only happens AFTER this spawn, in
+the ORIGINAL code order. Reproduced 2/2 pre-fix attempts (both `--mutation-kinds
+edit,hub_edit,create,delete,rename --repeat 3` -- the smaller `--mutation-kinds edit --repeat 1`
+repro the task suggested did NOT reproduce it in 1/1 attempt here, consistent with F.3's own note
+that this needs real process/fd churn, not just any spawn).
+
+**Fix**: `scripts/v4-mutation-harness.mjs` -- a new `stopDaemonOnce()` helper (idempotent, guarded by
+a `daemonStopped` flag) is called BEFORE `--verify-roots final`'s own `oracleVerify` (releasing every
+one of the daemon's held fds first: `oracleVerify` only ever reads the ALREADY-DURABLE on-disk
+structural store via `engineExports.structuralStoreDirFor`, so the daemon does not need to still be
+running for it), and the `finally` block now calls the SAME helper (a no-op safety net for any
+earlier-thrown-error path). `--verify-roots each`'s OWN per-mutation `oracleVerify` calls are
+untouched (the daemon must stay alive between mutations there).
+
+**Verification -- 3/3 green** (`--mutation-kinds edit,hub_edit,create,delete,rename --repeat 3
+--verify-roots final`, fresh `--data-root` each time, `nohup`+foreground-poll per run, one retry
+needed on run 2 for an UNRELATED `Indexing-core worker is unavailable` -- a real resource-contention
+failure on this heavily shared machine, not `EBADF`, not this fix's own doing):
+
+| run | mutation_count | crash? | `final.roots_equal.dependency` | `final.roots_equal.records` | `final.fallback_full` |
+|---|---:|---|---|---|---|
+| 1 | 21 | no | `true` | `false` (expected, §14.2) | `false` |
+| 2 | 21 | no | `true` | `false` (expected) | `false` |
+| 3 | 21 | no | `true` | `false` (expected) | `false` |
+
+All three completed every one of their 32 generations (1 cold + 1 warm-up + 30 timed mutations) AND
+the final oracle verify with zero `EBADF`. `dependency=true` on all 3 (the harness's own
+`compareRootSets` does not carry `graph` at all -- a pre-existing limitation `MANIFEST.roots` itself
+doesn't persist, unrelated to this fix); `records=false` on all 3 is the EXPECTED decision-11
+divergence (§14.1-14.2) after 30 real generations of chaining, not a regression.
+
+### 14.6 Verification (this session)
+
+```
+cargo fmt --all -- --check                                              # clean
+cargo test -p urdira-indexing-worker --locked reconcile                  # 13 passed, 0 failed
+cargo test -p urdira-indexing-worker --locked --release
+  n8n_records_logical_set_diff_against_keep_data -- --ignored --nocapture # pass @N=202, FAILS @N=1008
+                                                                           # (§14.3, expected/reported)
+node --check scripts/v4-mutation-harness.mjs                              # syntax clean
+node --check scripts/v4-reconcile-threshold.mjs                           # syntax clean
+3x scripts/v4-mutation-harness.mjs --mutation-kinds
+  edit,hub_edit,create,delete,rename --repeat 3 --verify-roots final      # 3/3 green (§14.5)
+```
+
+(Full `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo build --release
+--locked -p urdira-indexing-worker`, and `CI=true vitest run tests/v4-mutation-harness.test.ts
+tests/phase-daemon-v4-reconcile.test.ts` per this task's own required gate -- see the commit history
+for the exact pass/fail counts recorded at commit time.)
+
+### 14.7 Scratch cleanup
+
+`~/Proyectos/urdira-benchmark/v4-fold/ep0e-{n202,n1008,mutrepro,mutrepro-full,mutrepro-diag,
+mutfix-run1,mutfix-run2,mutfix-run3,smoke100}*` (workspace + data copies, `--keep-data` outputs, and
+their `*-results.json`/`report.json` companions) deleted at the end of this session; only this
+evidence file's own excerpted numbers are retained. `CARGO_TARGET_DIR` override
+(`.claude/worktrees/cargo-target-ep0e`) removed.
