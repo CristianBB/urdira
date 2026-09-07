@@ -508,6 +508,58 @@ pub fn reset_ambiguous_ambient_would_be_external_count() {
     AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Frente E-P0i (2026-09-07), n8n references-parity regression
+/// (`v4_different_target=673`, docs/evidence/2026-09-07-v4-n8n-parity-and-
+/// semantic-segments.md §A.2): a process-wide counter of every module-
+/// specifier `AmbientResolution::Resolved` outcome (`resolve_named_binding_
+/// via_specifier`/`resolve_external_namespace_member`/`visit_import_
+/// namespace_specifier`) that this fix demotes to the SAME "confirmed
+/// external" classification `AmbientResolution::NoDeclaration` already
+/// gets, instead of confirming the ambient block's own member/namespace
+/// entity as the reference target.
+///
+/// Root cause (see the evidence doc's own trace, `crates/urdira-indexing-
+/// worker/src/main.rs`'s `hybrid_handle` closure): v3 -- the oracle this
+/// crate's own `core:references` output is measured against -- runs this
+/// EXACT resolver through a lexical "hybrid" pre-pass first, deliberately
+/// wired with `AmbientModuleIndex::default()` (empty), on the documented
+/// assumption that "v3's own real TypeScript checker (downstream) already
+/// resolves a `declare module` block natively". That assumption does not
+/// hold: the E1c cutover invariant (same file, `hybrid_semantics` join
+/// comment) makes the checker skip any site the hybrid pass already
+/// resolved -- and an empty ambient index means `resolve_export` can only
+/// ever return `NoDeclaration`, so the hybrid pass ALWAYS confirms these
+/// sites as external before the checker gets a chance to disagree. Queried
+/// directly against the retained v3 oracle DB for this exact corpus (see
+/// the evidence doc), v3 has ZERO confirmed `core:references` rows whose
+/// target lives inside ANY workspace `declare module { ... }` block reached
+/// through a cross-file import specifier -- not one, regardless of how many
+/// files declare that specifier. v3's own disagreement is therefore
+/// unconditional on candidate count: a lone declaring file is exactly as
+/// unconfirmable as two. This crate's `AmbientModuleIndex`/`resolve_export`
+/// itself already never guesses among multiple candidates (that discipline
+/// stays, both here and in `resolve_global`'s own callers) -- the gap this
+/// counter tracks is narrower and different: even the CERTAIN, single-
+/// candidate case must not be confirmed as a reference target, because v3
+/// structurally never will be able to confirm it either. `resolve_export`'s
+/// namespace-entity/member creation and `has_any_declaration`-based import/
+/// export dependency-fact edges (`build_import_export_facts`, lib.rs) are
+/// untouched -- only reference-TARGET confirmation for a cross-file
+/// specifier import changes. Read via `resolved_ambient_would_be_external_
+/// count`, reset via `reset_resolved_ambient_would_be_external_count`.
+static RESOLVED_AMBIENT_WOULD_BE_EXTERNAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// See [`RESOLVED_AMBIENT_WOULD_BE_EXTERNAL`]'s own doc comment.
+pub fn resolved_ambient_would_be_external_count() -> u64 {
+    RESOLVED_AMBIENT_WOULD_BE_EXTERNAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// See [`RESOLVED_AMBIENT_WOULD_BE_EXTERNAL`]'s own doc comment.
+pub fn reset_resolved_ambient_would_be_external_count() {
+    RESOLVED_AMBIENT_WOULD_BE_EXTERNAL.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Pending reasons. These are the exhaustive set of reasons E1a can attach
 /// to a `checker_pending` site.
 const REASON_UNRESOLVED_GLOBAL: &str = "unresolved_global";
@@ -1229,15 +1281,16 @@ enum RootNamespaceLookup {
 }
 
 /// Ambient module resolution task (2026-09-04): `resolve_external_
-/// namespace_member`'s outcome -- see that method's own doc comment.
+/// namespace_member`'s outcome -- see that method's own doc comment. Frente
+/// E-P0i (2026-09-07) removed the sibling `Ambient(String)` variant this
+/// enum used to carry (a workspace `declare module` block's own member,
+/// confirmed with no `emit_external_use` side effect) -- see
+/// `RESOLVED_AMBIENT_WOULD_BE_EXTERNAL`'s own doc comment for why that
+/// outcome must never confirm a reference target at all now, matching v3.
 enum NamespaceMemberResolution {
     /// A genuine external package/builtin member read: `emit_external_use`
     /// still needs to fire (canonical specifier, resolved `target_id`).
     External(String, String),
-    /// Resolved through a workspace `declare module` block instead: the
-    /// target already exists, published by the DECLARING file's own
-    /// producers -- no `emit_external_use` side effect.
-    Ambient(String),
 }
 
 /// Everything `analyze_owner_semantics_with_context` needs to close an
@@ -1900,24 +1953,28 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 .resolver
                 .resolve(&self.path, source_specifier, self.ctx.available)
         else {
-            // Ambient module resolution task (2026-09-04), fix item 2: a
-            // workspace `declare module "source_specifier" { ... }` block
-            // gets first refusal, BEFORE the external-entity classification
-            // below -- see `resolver::AmbientModuleIndex::resolve_export`'s
-            // own doc comment for the exact contract (resolve with
-            // certainty, stay pending, or fall through to external -- NEVER
-            // fabricate an external entity for a specifier proven to be
-            // ambiently declared somewhere in this workspace).
+            // Ambient module resolution task (2026-09-04), fix item 2,
+            // narrowed by Frente E-P0i (2026-09-07, see `RESOLVED_AMBIENT_
+            // WOULD_BE_EXTERNAL`'s own doc comment for the full trace): a
+            // workspace `declare module "source_specifier" { ... }` block's
+            // `Ambiguous` outcome still gets first refusal, BEFORE the
+            // external-entity classification below (never guess among
+            // several candidates). A UNIQUE (`Resolved`) candidate no
+            // longer short-circuits to it, though: v3 -- the oracle this
+            // output is measured against -- can never confirm a reference
+            // through this path AT ALL, certain or not (its own hybrid
+            // pre-pass always sees an empty ambient index), so `Resolved`
+            // now falls through to the SAME external classification
+            // `NoDeclaration` already reaches, exactly like it, just with
+            // this counter incremented first.
             match self
                 .ctx
                 .ambient_index
                 .resolve_export(source_specifier, name)
             {
-                resolver::AmbientResolution::Resolved(target_id) => {
-                    return ReferenceResolution::Resolved {
-                        target_id,
-                        cross_file: true,
-                    };
+                resolver::AmbientResolution::Resolved(_) => {
+                    RESOLVED_AMBIENT_WOULD_BE_EXTERNAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 resolver::AmbientResolution::Ambiguous => {
                     if resolver::classify_external_specifier(source_specifier).is_some() {
@@ -2058,16 +2115,21 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // internal-target sibling of this function) owns this case.
             return None;
         }
-        // Ambient module resolution task (2026-09-04), fix item 2: same
-        // first-refusal order as every other specifier-keyed resolution in
-        // this file.
+        // Ambient module resolution task (2026-09-04), fix item 2, narrowed
+        // by Frente E-P0i (2026-09-07): same first-refusal order as every
+        // other specifier-keyed resolution in this file -- `Ambiguous`
+        // still never guesses. A `Resolved` (unique) candidate no longer
+        // confirms either; see `RESOLVED_AMBIENT_WOULD_BE_EXTERNAL`'s own
+        // doc comment for why even the certain, single-candidate case must
+        // fall through to the external classification below, matching v3.
         match self
             .ctx
             .ambient_index
             .resolve_export(specifier, member_name)
         {
-            resolver::AmbientResolution::Resolved(target_id) => {
-                return Some(NamespaceMemberResolution::Ambient(target_id));
+            resolver::AmbientResolution::Resolved(_) => {
+                RESOLVED_AMBIENT_WOULD_BE_EXTERNAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             resolver::AmbientResolution::Ambiguous => {
                 if resolver::classify_external_specifier(specifier).is_some() {
@@ -5093,42 +5155,40 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 .resolve(&self.path, source, self.ctx.available)
                 .is_none()
         });
-        // Ambient module resolution task (2026-09-04), fix item 2: same
-        // first-refusal order as `resolve_named_binding_via_specifier` --
-        // `import * as ns from "specifier"`'s own binding, used as a bare
-        // VALUE (not a `ns.member` access, see `resolve_external_namespace_
-        // member` for that), resolves to the ambient block's own namespace
-        // entity when `specifier` is uniquely ambiently declared.
-        let ambient = unresolved_source.and_then(|source| {
-            match self.ctx.ambient_index.resolve_export(source, "*") {
-                resolver::AmbientResolution::Resolved(target_id) => Some(target_id),
-                _ => None,
+        // Ambient module resolution task (2026-09-04), fix item 2, narrowed
+        // by Frente E-P0i (2026-09-07, see `RESOLVED_AMBIENT_WOULD_BE_
+        // EXTERNAL`'s own doc comment for the full trace): `import * as ns
+        // from "specifier"`'s own binding, used as a bare VALUE (not a
+        // `ns.member` access, see `resolve_external_namespace_member` for
+        // that), no longer confirms through the ambient block's own
+        // namespace entity even when `specifier` is uniquely ambiently
+        // declared -- v3 (the oracle) can never confirm this either, so a
+        // unique candidate now falls through to the SAME external
+        // classification an undeclared `source` already reaches (counted
+        // separately from the `Ambiguous` arm below, which still never
+        // guesses and stays pending exactly as before).
+        let ambient_lookup =
+            unresolved_source.map(|source| self.ctx.ambient_index.resolve_export(source, "*"));
+        let external = match ambient_lookup {
+            Some(resolver::AmbientResolution::Resolved(_)) => {
+                RESOLVED_AMBIENT_WOULD_BE_EXTERNAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                unresolved_source.and_then(resolver::classify_external_specifier)
             }
-        });
-        // `source` ambiently declared but NOT uniquely resolved (several
-        // declaring files, or a shorthand block) stays pending here too --
-        // `has_any_declaration` gates the external fallback exactly like
-        // `resolve_named_binding_via_specifier`'s own `Ambiguous` arm does.
-        let external = match ambient {
-            Some(_) => None,
-            None => unresolved_source.and_then(|source| {
-                if self.ctx.ambient_index.has_any_declaration(source) {
-                    if resolver::classify_external_specifier(source).is_some() {
-                        AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    None
-                } else {
-                    resolver::classify_external_specifier(source)
+            Some(resolver::AmbientResolution::Ambiguous) => {
+                if let Some(source) = unresolved_source
+                    && resolver::classify_external_specifier(source).is_some()
+                {
+                    AMBIGUOUS_AMBIENT_WOULD_BE_EXTERNAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            }),
-        };
-        let resolution = if let Some(target_id) = ambient {
-            ReferenceResolution::Resolved {
-                target_id,
-                cross_file: true,
+                None
             }
-        } else if let Some(canonical) = external {
+            Some(resolver::AmbientResolution::NoDeclaration) | None => {
+                unresolved_source.and_then(resolver::classify_external_specifier)
+            }
+        };
+        let resolution = if let Some(canonical) = external {
             self.emit_external_use(
                 &canonical,
                 "*",
@@ -5318,8 +5378,7 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
             );
         }
         let external_target_id = external.map(|resolution| match resolution {
-            NamespaceMemberResolution::External(_, target_id)
-            | NamespaceMemberResolution::Ambient(target_id) => target_id,
+            NamespaceMemberResolution::External(_, target_id) => target_id,
         });
         match resolved.or(external_target_id) {
             Some(target_id) => {
@@ -8244,14 +8303,24 @@ mod tests {
         }
     }
 
-    /// Fix item 1-2: a bare, otherwise-unresolvable specifier that a
-    /// workspace `.d.ts` file declares via `declare module "specifier" {
-    /// export function configure(): void; }` -- `import { configure } from
-    /// "eslint-plugin-lodash"` must resolve to THAT declaration, never to a
-    /// synthetic `jsts:external_symbol:...` entity. Regression fixture for
-    /// the 677 n8n `v4_different_target` rows this task closes.
+    /// Frente E-P0i (2026-09-07) reverses the 2026-09-04 "fix item 1-2"
+    /// decision this test used to assert (a bare, otherwise-unresolvable
+    /// specifier that a workspace `.d.ts` file declares via `declare module
+    /// "specifier" { export function configure(): void; }` resolving to
+    /// THAT declaration) -- see `RESOLVED_AMBIENT_WOULD_BE_EXTERNAL`'s own
+    /// doc comment for the full trace of why: the 2026-09-04 fix was
+    /// validated against a v3 oracle whose cold scan crashed before
+    /// completing (fixed later, commits 135a26c/376b233/62e1ece); against
+    /// the COMPLETE oracle, v3 has zero confirmed `core:references` rows
+    /// reached through a cross-file ambient-module specifier, ever -- so
+    /// `import { configure } from "eslint-plugin-lodash"` must now resolve
+    /// EXTERNALLY (`jsts:external_symbol:eslint-plugin-lodash#configure`),
+    /// matching v3, even though the workspace unambiguously declares
+    /// exactly one candidate. Regression fixture for the 673 n8n
+    /// `v4_different_target` rows this task closes (docs/evidence/
+    /// 2026-09-07-v4-n8n-parity-and-semantic-segments.md §A.2).
     #[test]
-    fn ambient_named_import_resolves_to_the_inner_declaration() {
+    fn ambient_named_import_resolves_externally_never_to_the_inner_declaration() {
         let mut files = BTreeMap::new();
         files.insert(
             "plugins.d.ts".to_owned(),
@@ -8271,21 +8340,28 @@ mod tests {
         let source = "import { configure } from \"eslint-plugin-lodash\";\nconfigure();\n";
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
-        let target_id = "jsts:function:plugins.d.ts:40:configure";
+        let inner_target_id = "jsts:function:plugins.d.ts:40:configure";
+        let external_target_id = "jsts:external_symbol:eslint-plugin-lodash#configure";
         let rows = resolved(&semantics);
         assert!(
-            rows.iter().any(|row| row.3 == target_id),
-            "expected a reference row targeting {target_id}, got {rows:?}"
+            rows.iter().any(|row| row.3 == external_target_id),
+            "expected a reference row targeting {external_target_id}, got {rows:?}"
         );
         assert!(
-            semantics.external_entity_rows.is_empty(),
-            "an ambiently-resolved specifier must never fabricate an external entity: {:?}",
+            rows.iter().all(|row| row.3 != inner_target_id),
+            "a unique ambient module candidate must never confirm to its own inner \
+             declaration -- v3 cannot confirm this either: {rows:?}"
+        );
+        assert!(
+            !semantics.external_entity_rows.is_empty(),
+            "a specifier with exactly one ambient candidate must now still fabricate \
+             the SAME external entity a wholly-undeclared specifier would, matching v3: {:?}",
             semantics.external_entity_rows
         );
     }
 
     #[test]
-    fn ambient_default_import_resolves_to_the_inner_declaration() {
+    fn ambient_default_import_resolves_externally_never_to_the_inner_declaration() {
         let mut files = BTreeMap::new();
         files.insert(
             "plugins.d.ts".to_owned(),
@@ -8305,23 +8381,31 @@ mod tests {
         let source = "import Widget from \"my-widget\";\nnew Widget();\n";
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
-        let target_id = "jsts:class:plugins.d.ts:50:Widget";
+        let inner_target_id = "jsts:class:plugins.d.ts:50:Widget";
+        let external_target_id = "jsts:external_symbol:my-widget#default";
         let rows = resolved(&semantics);
         assert!(
-            rows.iter().any(|row| row.3 == target_id),
-            "expected a reference row targeting {target_id}, got {rows:?}"
+            rows.iter().any(|row| row.3 == external_target_id),
+            "expected a reference row targeting {external_target_id}, got {rows:?}"
         );
-        assert!(semantics.external_entity_rows.is_empty());
+        assert!(rows.iter().all(|row| row.3 != inner_target_id));
+        assert!(!semantics.external_entity_rows.is_empty());
     }
 
-    /// n8n corpus regression: `declare module '~icons/*' { const component:
-    /// T; export default component; }` -- a WILDCARD pattern specifier
-    /// (`~icons/*`, matching any `~icons/...` import) whose default export
-    /// names a BARE, never-itself-`export`ed local declaration. Both must
-    /// resolve for a real `import IconFoo from "~icons/foo"` to stop
-    /// falling through to an external entity.
+    /// n8n corpus regression (real fixture: `packages/frontend/@n8n/chat/
+    /// src/env.d.ts` declares `declare module '~icons/*' { const component:
+    /// T; export default component; }`, leaking into every OTHER package's
+    /// `~icons/*` icon import, e.g. `packages/frontend/@n8n/design-system/
+    /// src/components/N8nIcon/icons.ts` -- 649 of the 673 `different`
+    /// rows): a WILDCARD pattern specifier's default export naming a BARE,
+    /// never-itself-`export`ed local declaration must resolve to the SAME
+    /// external classification a wholly-undeclared specifier gets, exactly
+    /// like the literal-specifier case above -- the wildcard mechanics
+    /// (`resolver::AmbientModuleIndex::resolve_export`/`declarations_for`)
+    /// are unchanged and still correct in isolation (see `resolver::tests`
+    /// for those); only THIS caller's confirmation policy changed.
     #[test]
-    fn ambient_wildcard_default_export_of_a_bare_declaration_resolves() {
+    fn ambient_wildcard_default_export_of_a_bare_declaration_resolves_externally() {
         let mut files = BTreeMap::new();
         files.insert(
             "env.d.ts".to_owned(),
@@ -8342,13 +8426,110 @@ mod tests {
             "import IconFoo from \"~icons/lucide/message-square\";\nconsole.log(IconFoo);\n";
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
-        let target_id = "jsts:variable:env.d.ts:60:component";
+        let inner_target_id = "jsts:variable:env.d.ts:60:component";
+        let external_target_id = "jsts:external_symbol:~icons/lucide/message-square#default";
         let rows = resolved(&semantics);
         assert!(
-            rows.iter().any(|row| row.3 == target_id),
-            "expected a reference row targeting {target_id}, got {rows:?}"
+            rows.iter().any(|row| row.3 == external_target_id),
+            "expected a reference row targeting {external_target_id}, got {rows:?}"
+        );
+        assert!(rows.iter().all(|row| row.3 != inner_target_id));
+        assert!(!semantics.external_entity_rows.is_empty());
+    }
+
+    /// Frente E-P0i companion to the wildcard test above: TWO different
+    /// workspace files each declaring the SAME wildcard specifier is
+    /// unaffected by this fix -- it was already, and remains, `Ambiguous`
+    /// (never resolved, never promoted to external either) at the resolver
+    /// level; this asserts the full `resolve_named_binding_via_specifier`
+    /// caller still honors that after E-P0i's change (only the `Resolved`
+    /// arm changed, not `Ambiguous`).
+    #[test]
+    fn ambient_wildcard_declared_by_two_files_stays_pending_never_external_or_internal() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "env-a.d.ts".to_owned(),
+            target_file_with_ambient(
+                "env-a.d.ts",
+                vec![ambient_decl(
+                    "~icons/*",
+                    "env-a.d.ts",
+                    20,
+                    true,
+                    vec![],
+                    Some(ambient_member("variable", "env-a.d.ts", 60, "component")),
+                )],
+            ),
+        );
+        files.insert(
+            "env-b.d.ts".to_owned(),
+            target_file_with_ambient(
+                "env-b.d.ts",
+                vec![ambient_decl(
+                    "~icons/*",
+                    "env-b.d.ts",
+                    20,
+                    true,
+                    vec![],
+                    Some(ambient_member("variable", "env-b.d.ts", 60, "component")),
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source =
+            "import IconFoo from \"~icons/lucide/message-square\";\nconsole.log(IconFoo);\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter()
+                .all(|row| !row.3.starts_with("jsts:external_symbol:")),
+            "two declaring files must never guess by falling through to external either: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.3.contains("env-a.d.ts") && !row.3.contains("env-b.d.ts")),
+            "two declaring files must never guess which one wins: {rows:?}"
         );
         assert!(semantics.external_entity_rows.is_empty());
+    }
+
+    /// Frente E-P0i companion: a wildcard pattern that does NOT actually
+    /// match the specifier's shape (`*.svg` requires a literal `.svg`
+    /// suffix, `~icons/foo` has none) must not resolve at all -- confirms
+    /// `wildcard_prefix_match`'s suffix check (already covered in isolation
+    /// by `resolver::tests`) also holds through this full caller, and that
+    /// a non-matching wildcard falls through to the ordinary external
+    /// classification exactly like having no ambient declaration at all.
+    #[test]
+    fn ambient_wildcard_that_does_not_truly_match_never_resolves_ambiently() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "assets.d.ts".to_owned(),
+            target_file_with_ambient(
+                "assets.d.ts",
+                vec![ambient_decl(
+                    "*.svg",
+                    "assets.d.ts",
+                    20,
+                    true,
+                    vec![],
+                    Some(ambient_member("variable", "assets.d.ts", 60, "content")),
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import IconFoo from \"~icons/foo\";\nconsole.log(IconFoo);\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let inner_target_id = "jsts:variable:assets.d.ts:60:content";
+        let external_target_id = "jsts:external_symbol:~icons/foo#default";
+        let rows = resolved(&semantics);
+        assert!(rows.iter().all(|row| row.3 != inner_target_id));
+        assert!(
+            rows.iter().any(|row| row.3 == external_target_id),
+            "a non-matching wildcard is exactly like no ambient declaration at all: {rows:?}"
+        );
     }
 
     /// Fix item 3: a bodyless `declare module "specifier";` types the whole

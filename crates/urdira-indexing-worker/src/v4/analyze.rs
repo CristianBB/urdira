@@ -32,6 +32,7 @@ use urdira_jsts_syntax_worker::{
     WorkspaceResolver, ambiguous_ambient_would_be_external_count,
     analyze_owner_semantics_with_context, decode_config_assets,
     reset_ambiguous_ambient_would_be_external_count,
+    reset_resolved_ambient_would_be_external_count, resolved_ambient_would_be_external_count,
 };
 use urdira_source_frontier::CasWrittenSignal;
 use urdira_source_frontier::cas::object_relative_path;
@@ -943,6 +944,10 @@ pub fn run_scoped(
     let debug_ambient_modules = std::env::var_os("URDIRA_V4_DEBUG_AMBIENT_MODULES").is_some();
     if debug_ambient_modules {
         reset_ambiguous_ambient_would_be_external_count();
+        // Frente E-P0i (2026-09-07): see `RESOLVED_AMBIENT_WOULD_BE_
+        // EXTERNAL`'s own doc comment -- reset alongside its `Ambiguous`
+        // sibling so both counters cover exactly this scan.
+        reset_resolved_ambient_would_be_external_count();
     }
     let hybrid_call_started = std::time::Instant::now();
     let hybrid_results = run_hybrid_semantics(&hybrid_owners, &ctx, cas_signal)?;
@@ -958,6 +963,15 @@ pub fn run_scoped(
         eprintln!(
             "[urdira-indexing-worker] v4 ambient-ambiguous-would-be-external this scan: {}",
             ambiguous_ambient_would_be_external_count(),
+        );
+        // Frente E-P0i (2026-09-07): count of sites that WOULD have
+        // confirmed to a unique ambient module declaration's own member
+        // (pre-fix behavior) and now confirm to the external classification
+        // instead, matching v3 -- see `RESOLVED_AMBIENT_WOULD_BE_EXTERNAL`'s
+        // own doc comment.
+        eprintln!(
+            "[urdira-indexing-worker] v4 ambient-resolved-demoted-to-external this scan: {}",
+            resolved_ambient_would_be_external_count(),
         );
     }
     clock.record_resolve(resolve_started.elapsed());

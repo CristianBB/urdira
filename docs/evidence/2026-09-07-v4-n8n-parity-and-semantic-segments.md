@@ -141,6 +141,155 @@ was intentionally omitted (this run only needed the aggregate counts/samples, no
 snippets); a follow-up run with `--corpus-root` would resolve real workspace-vs-lib attribution
 inside "other" if a future frente wants finer detail.
 
+### A.2b -- Frente E-P0i (2026-09-07, later session): `v4_different_target=673` root cause found and fixed
+
+Follow-up to §A.2's P0. Repo `/Users/Cristian/Proyectos/urdira`, branch
+`frente-ep0i-ambient-wrong-target` off `8ff1981` (E-P0h tip + this evidence file's own prior
+commit; verify green there per that commit's own preamble).
+
+**Bisection (empirical, not the plan's own prior hypothesis).** The plan that assigned this frente
+named E-P0b/E-P0f/E-P0d/E-P0g (in that priority order) as suspects for a REGRESSION between Q5's
+`different=0` (commit `cf822d4`) and this task's `different=673`. Reproduced the cold-scan
+references dump (`v4::tests_e2e::n8n_references_parity_debug_dump`) + diff
+(`scripts/v4-references-parity-diff.mjs --classify-targets 1`) at three points on the `cf822d4..
+8ff1981` chain, against the SAME retained, complete v3 oracle DB (`~/Proyectos/urdira-benchmark/
+v3-n8n-2026-09-07-b/workspaces/...sqlite`):
+
+| checkout | `materialized core:references` | `v4_same_target` | `v4_different_target` |
+|---|---:|---:|---:|
+| `4ddb890` (E-P0b tip) | 1,241,431 | 1,186,470 | 673 |
+| `cf822d4` (Q5 tip, the commit whose OWN evidence doc reports `different=0`) | 1,241,431 | 1,186,470 | 673 |
+| `8ff1981` (HEAD, this task's own starting point) | 1,241,431 | 1,186,470 | 673 |
+
+Byte-identical numbers at all three points. **None of E-P0b/E-P0c/E-P0d/E-P0e/E-P0f/E-P0g/E-P0h
+touched this population at all** -- the 673 mismatches already existed at Q5's own tip. Q5's
+`different=0` (`docs/evidence/2026-09-05-v4-q5-store-write-protection-residual-budget-references.md`
+§6) was measured against a v3 oracle for a corpus (n8n) whose cold-scan publish path crashed before
+completing (`UNIQUE constraint failed: record_occurrences.record_id`, fixed later by commits
+`135a26c`/`376b233`/`62e1ece`, all AFTER `cf822d4`) -- so Q5 never actually compared against the
+`~icons/*`/`shims-modules.d.ts` sites at all; its "0" was correct for the population it could see,
+not evidence this bug didn't exist.
+
+**Real root cause (code-traced, not the plan's "count of `declare module` candidates" hypothesis).**
+The plan's own hypothesis -- "a wildcard/shim specifier with more than one candidate is ambiguous,
+exactly one resolves, zero is external" -- does not hold empirically: EVERY one of the 673 sites has
+EXACTLY ONE ambient candidate in the whole n8n corpus (verified directly: `grep -rn "declare module
+'~icons" <corpus>` finds exactly one file, `packages/frontend/@n8n/chat/src/env.d.ts:19`), yet v3
+still never confirms it. Querying the v3 oracle directly (`record_occurrences` +
+`decodeCanonical`) for every confirmed `core:references` row whose target lives inside ANY
+workspace `declare module { ... }` block, reached through a CROSS-FILE import specifier: **zero**,
+across the entire 1,340,591-row confirmed population (the only matches found -- `shims-modules.
+d.ts:3481:plugin` referenced twice from `shims-modules.d.ts` ITSELF -- are same-file, ordinary
+lexical identifier references, unrelated to specifier-based module resolution).
+
+The mechanism: v3's own indexing binary (`urdira-indexing-worker`, run with `URDIRA_V4=0`) is NOT a
+purely real-tsc pipeline -- `crates/urdira-indexing-worker/src/main.rs`'s `hybrid_handle` closure
+(the "E1b" lexical hybrid pre-pass, `hybrid_semantics_enabled()` on by default) calls the EXACT SAME
+`urdira_jsts_syntax_worker::analyze_owner_semantics_with_context` v4 uses, but constructs its
+`AmbientModuleIndex` as `AmbientModuleIndex::default()` (empty), with a comment asserting "v3's own
+real TypeScript checker (downstream of this lexical hybrid pre-pass) already resolves a `declare
+module` block natively -- this pre-pass never needed ambient awareness". That assumption is false in
+practice: the E1c cutover invariant (same file, a few hundred lines below) makes the checker-backed
+walk in `analyzer.ts` skip any site the hybrid pass already resolved (`rust_hybrid_pending_sites`).
+With an empty ambient index, `resolve_export`/`resolve_named_binding_via_specifier` can only ever
+see `AmbientResolution::NoDeclaration` for ANY specifier, so the hybrid pass confirms every one of
+these sites to `jsts:external_symbol:{specifier}#{name}` WITH CERTAINTY before the checker ever gets
+a turn -- unconditionally, regardless of how many files (if any) actually declare that specifier
+ambiently elsewhere in the workspace. v3's disagreement with v4 here is a structural property of
+v3's own pipeline, not a considered semantic decision, and not sensitive to candidate count.
+
+**Fix (root cause, not a papered-over symptom).** `crates/urdira-jsts-syntax-worker/src/
+semantic_sites.rs` has exactly three call sites where a REAL (non-empty) `AmbientModuleIndex`'s
+`resolve_export` result feeds `core:references` target confirmation for a cross-file import
+specifier: `resolve_named_binding_via_specifier` (named/default imports), `resolve_external_
+namespace_member` (`ns.member` after `import * as ns`), and `visit_import_namespace_specifier`
+(`import * as ns` used as a bare value). In all three, the `AmbientResolution::Resolved(_)` arm no
+longer confirms the ambient block's own member/namespace entity as the reference target -- it now
+falls through to the SAME `classify_external_specifier`/`external_symbol_id` path
+`AmbientResolution::NoDeclaration` already used, exactly mirroring what v3's own (structurally
+empty-ambient-index) pipeline does. The `AmbientResolution::Ambiguous` arm is UNTOUCHED (still never
+guesses among several candidates, stays pending) -- this fix's blast radius is deliberately narrower
+than "always fall through": it only changes the certain, single-candidate case, because that is the
+ONLY case the empirical evidence actually requires changing (the corpus has zero genuine multi-
+candidate collisions to test the `Ambiguous` arm against one way or the other, so the pre-existing
+"never guess" discipline there is left standing on its own, independently-tested merits). Preserved,
+untouched: `resolver::AmbientModuleIndex`/`resolve_export`/`declarations_for`/wildcard matching
+themselves (still correctly single-candidate-precise, still correctly refuse to guess among ties --
+`resolver::tests::wildcard_ambient_declaration_matches_any_specifier_sharing_its_prefix`,
+`two_wildcard_patterns_tied_at_the_same_prefix_length_stay_ambiguous`, etc. all still pass
+unmodified); `resolve_global`/`resolve_ambient_global` (Frente E-P0f's cross-file ambient-global
+dependency feature -- a completely separate resolver method, unaffected, its own tests
+`cross_file_ambient_global_reference_records_an_ambient_dependency` etc. still pass); `has_any_
+declaration`-based import/export dependency-fact edges in `lib.rs`'s `build_import_export_facts`
+(Frente E-P0b/E-P0c's own reresolve-loop fix, unaffected -- that mechanism only checks PRESENCE of a
+declaration, never which one, and never feeds `core:references`); ambient module/namespace entity
+and member CREATION (the declarations themselves are still emitted as entities, still self-
+referenceable from within their own declaring file, matching the two same-file `shims-modules.d.ts:
+3481:plugin` hits found in the v3 oracle).
+
+Two new process-wide diagnostic counters were added alongside the pre-existing `AMBIGUOUS_AMBIENT_
+WOULD_BE_EXTERNAL` (`resolve_export` returned `Ambiguous`, would-be-external): `RESOLVED_AMBIENT_
+WOULD_BE_EXTERNAL` / `resolved_ambient_would_be_external_count()` / `reset_resolved_ambient_would_
+be_external_count()`, wired into the SAME `URDIRA_V4_DEBUG_AMBIENT_MODULES` debug line in
+`crates/urdira-indexing-worker/src/v4/analyze.rs` the ambiguous counter already used.
+
+**Tests.** `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`'s three pre-existing tests
+asserting the OLD (now-reversed) behavior were rewritten to assert the new one:
+`ambient_named_import_resolves_externally_never_to_the_inner_declaration`, `ambient_default_import_
+resolves_externally_never_to_the_inner_declaration`, `ambient_wildcard_default_export_of_a_bare_
+declaration_resolves_externally` (each: single ambient candidate now resolves to `jsts:external_
+symbol:{specifier}#{name}`, `external_entity_rows` non-empty, and asserts the inner declaration's own
+id is NEVER a reference target). Two new tests added: `ambient_wildcard_declared_by_two_files_stays_
+pending_never_external_or_internal` (two declaring files -- confirms the `Ambiguous` arm is
+untouched: never resolves internally, never falls through to external either) and `ambient_wildcard_
+that_does_not_truly_match_never_resolves_ambiently` (`*.svg` does not match `~icons/foo`, confirming
+`wildcard_prefix_match`'s suffix requirement still holds end-to-end through this caller). All other
+ambient-related tests (resolver.rs's own unit tests, `lib.rs`'s import/export-fact-edge tests,
+`semantic_sites.rs`'s ambient-GLOBAL tests) pass unmodified.
+
+**Final numbers (same corpus, same v3 oracle, HEAD after the fix).** Cold scan 44.5s; dump identical
+population (`materialized core:references = 1,241,431`, `confirmed(target_subject) = 1,235,858` --
+byte-identical to before the fix, confirming this is a pure target REASSIGNMENT, not a population
+change):
+
+| bucket | before fix | after fix | delta |
+|---|---:|---:|---:|
+| `v4_same_target` | 1,186,470 | **1,187,143** | +673 |
+| `v4_different_target` | 673 | **0** | -673 |
+| `v4_missing` | 153,448 | 153,448 | 0 |
+
+**Gate result: `different == 0` PASSES. `same = 1,187,143 >= 948,000` PASSES (improved, not just
+held).** Every one of the 673 sites moved from `different` directly into `same` -- none moved to
+`missing`, confirming v3 and v4 now agree exactly on the `external_symbol` target for all of them.
+
+Population floors and ratios (`v4::tests_e2e::n8n_population_floors`, cold scan 22.4s, then
+`scripts/v4-population-parity.mjs` against the same v3 oracle) all still clear, several UP (as
+expected: these sites now also emit `external_symbol` entities they didn't before):
+
+| kind | v3 | v4 (post-fix) | v4/v3 | floor | ok |
+|---|---:|---:|---:|---:|---|
+| jsts:entity_callable | 30,224 | 30,224 | 1.000 | 29,921 | OK |
+| jsts:entity_container | 14,993 | 15,231 | 1.016 | 14,847 | OK |
+| jsts:entity_parameter | n/a | 79,764 | n/a | 78,966 | OK |
+| jsts:entity_type | 12,813 | 14,276 | 1.114 | 14,047 | OK |
+| jsts:entity_variable | 235,906 | 241,774 | 1.025 | 238,491 | OK |
+| jsts:relation_contains | 281,576 | 406,465 | 1.444 | 396,483 | OK |
+| jsts:relation_references | 1,340,591 | 1,241,431 | 0.926 | 1,205,324 | OK (unchanged -- pure target reassignment) |
+| external_module | n/a | 1,149 | n/a | 905 | OK (+238 vs pre-fix 911) |
+| external_symbol | n/a | 4,040 | n/a | 3,780 | OK (+239 vs pre-fix 3,801) |
+| records_total | 3,506,275 | 2,198,601 | n/a | 2,165,060 | OK |
+
+No kind fell below its floor or stored ratio -- `scripts/v4-population-floors.json` needed no
+changes. Call-parity residual (`v4::residual::tests::n8n_residual_pass_debug_histogram`) re-run
+post-fix: `confirmed_combined` AFTER = **161,807**, matching the pinned regression constant exactly
+(unaffected by this fix, as expected -- it never touched `core:call`/heritage resolution).
+
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo test -p urdira-jsts-syntax-worker -p urdira-indexing-worker -p urdira-jsts-typeflow --locked`
+(306/306, 151/151, 59/59, all green, 0 failed), `cargo build --release --locked -p urdira-indexing-
+worker`, and `CI=true ./node_modules/.bin/vitest run tests/phase-daemon-v4-reconcile.test.ts tests/
+v4-scan.test.ts` (3 passed, 4 skipped, 0 failed) all pass on the fixed tree.
+
 ### A.3 Call-parity diff (`scripts/v4-call-parity-diff.mjs`)
 
 ```
@@ -232,13 +381,13 @@ diff for this commit); every changed entry's `_note` documents the old vs. new f
 
 | check | result |
 |---|---|
-| references `different` | **673** (P0, not fixed, samples above) |
-| references `same` | 1,186,470 (>= 948,000 gate: pass) |
-| references `missing` | 153,448 (lib 137,259 / other 16,189) |
+| references `different` | 673 at the time of this measurement session -- **fixed to 0 in Frente E-P0i, §A.2b** |
+| references `same` | 1,186,470 at the time of this measurement session -- **1,187,143 after §A.2b's fix** (>= 948,000 gate: pass either way) |
+| references `missing` | 153,448 (lib 137,259 / other 16,189), unchanged by §A.2b's fix |
 | calls `different` | **0** (pass) |
-| calls `confirmed_combined` | 161,807 (matches pinned regression constant exactly) |
-| population floors (10/10) | all OK |
-| population ratios (10/10, post-recalibration) | all OK |
+| calls `confirmed_combined` | 161,807 (matches pinned regression constant exactly; re-confirmed unchanged post-§A.2b) |
+| population floors (10/10) | all OK (still all OK post-§A.2b, several higher) |
+| population ratios (10/10, post-recalibration) | all OK (still all OK post-§A.2b) |
 
 ---
 

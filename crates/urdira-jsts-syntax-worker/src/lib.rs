@@ -49,6 +49,7 @@ pub use semantic_sites::{
     SiteDisposition, SiteKind, TypeflowOracleHit, ambiguous_ambient_would_be_external_count,
     analyze_owner_semantics, analyze_owner_semantics_with_context,
     reset_ambiguous_ambient_would_be_external_count,
+    reset_resolved_ambient_would_be_external_count, resolved_ambient_would_be_external_count,
 };
 
 pub const WORKER_BUILD_IDENTITY: &str = "urdira:jsts-syntax-worker:0.3.0+oxc-0.142.0.fact-groups-v1.protobuf-v3.authoritative-changes-v1.bounded-row-identities-v1.definition-syntax-v1";
