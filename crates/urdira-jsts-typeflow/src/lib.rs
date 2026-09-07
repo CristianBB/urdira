@@ -2242,9 +2242,23 @@ struct MemberShape {
     key_start: u32,
     key_end: u32,
     is_static: bool,
+    /// Frente E-P0j (2026-09-07): the member's own FULL declaration span --
+    /// from the start of its modifiers/decorators/accessibility keyword
+    /// through its closing (the member node's own `GetSpan::span()`) --
+    /// distinct from `key_start`/`key_end` (the name-identifier span alone,
+    /// still used for identity, see `MemberDeclaration::entity_id`'s own
+    /// doc comment). `None` for a signature member shape (interface
+    /// members have no modifiers/decorators to speak of; `signature_member_
+    /// shape` still fills this from the signature's own span for
+    /// consistency, never actually `None` in practice today, kept `Option`
+    /// only so a future member kind lacking a full-node span has somewhere
+    /// safe to fall back to `(key_start, key_end)`).
+    decl_start: u32,
+    decl_end: u32,
 }
 
 fn class_element_member_shape(element: &ClassElement) -> Option<MemberShape> {
+    let full_span = element.span();
     match element {
         ClassElement::MethodDefinition(method) => {
             let (key_start, key_end, name) = property_key_span(&method.key)?;
@@ -2260,6 +2274,8 @@ fn class_element_member_shape(element: &ClassElement) -> Option<MemberShape> {
                 key_start,
                 key_end,
                 is_static: method.r#static,
+                decl_start: full_span.start,
+                decl_end: full_span.end,
             })
         }
         ClassElement::PropertyDefinition(property) => {
@@ -2273,6 +2289,8 @@ fn class_element_member_shape(element: &ClassElement) -> Option<MemberShape> {
                 key_start,
                 key_end,
                 is_static: property.r#static,
+                decl_start: full_span.start,
+                decl_end: full_span.end,
             })
         }
         _ => None,
@@ -2280,6 +2298,7 @@ fn class_element_member_shape(element: &ClassElement) -> Option<MemberShape> {
 }
 
 fn signature_member_shape(signature: &TSSignature) -> Option<MemberShape> {
+    let full_span = signature.span();
     match signature {
         TSSignature::TSMethodSignature(method) => {
             let (key_start, key_end, name) = property_key_span(&method.key)?;
@@ -2294,6 +2313,8 @@ fn signature_member_shape(signature: &TSSignature) -> Option<MemberShape> {
                 key_start,
                 key_end,
                 is_static: false,
+                decl_start: full_span.start,
+                decl_end: full_span.end,
             })
         }
         TSSignature::TSPropertySignature(property) => {
@@ -2304,6 +2325,8 @@ fn signature_member_shape(signature: &TSSignature) -> Option<MemberShape> {
                 key_start,
                 key_end,
                 is_static: false,
+                decl_start: full_span.start,
+                decl_end: full_span.end,
             })
         }
         _ => None,
@@ -2329,6 +2352,17 @@ pub struct MemberDeclaration {
     pub kind_word: &'static str,
     pub key_start: u32,
     pub key_end: u32,
+    /// Frente E-P0j (2026-09-07): this member's own FULL declaration span
+    /// (modifiers/decorators/accessibility keyword through the closing) --
+    /// see `MemberShape::decl_start`'s own doc comment. `key_start`/
+    /// `key_end` (the name span alone) remain the IDENTITY anchor
+    /// (`entity_id`'s own recipe, unchanged) and are what a v4 residual-pass
+    /// consumer keyed by "where does the checker say this identifier
+    /// starts" must keep using -- only the PUBLISHED `SyntaxEntity::start`/
+    /// `.end` a caller (`push_member_entities`, lib.rs) builds from these
+    /// two fields move to the full declaration.
+    pub decl_start: u32,
+    pub decl_end: u32,
     pub container_entity_id: String,
     pub container_name: String,
     pub is_static: bool,
@@ -2525,6 +2559,8 @@ fn push_class_member_declarations(class: &Class, path: &str, out: &mut Vec<Membe
             kind_word: shape.kind_word,
             key_start: shape.key_start,
             key_end: shape.key_end,
+            decl_start: shape.decl_start,
+            decl_end: shape.decl_end,
             container_entity_id: container_entity_id.clone(),
             container_name: container_name.clone(),
             is_static: shape.is_static,
@@ -2601,12 +2637,21 @@ fn push_constructor_parameter_property_declarations(
             continue;
         };
         let name = param_ident.name.as_str().to_owned();
+        let full_span = param.span;
         out.push(MemberDeclaration {
             entity_id: declaration_id("parameter", path, param_ident.span.start, &name),
             name,
             kind_word: "parameter",
             key_start: param_ident.span.start,
             key_end: param_ident.span.end,
+            // Frente E-P0j: a parameter property's own full span -- "the
+            // parameter with its own annotation and default" (task brief)
+            // -- covers its accessibility/`readonly` modifiers through its
+            // default value, exactly `param.span()` (oxc's `FormalParameter`
+            // span already starts at the first modifier keyword, same
+            // convention every other member's `decl_start` uses).
+            decl_start: full_span.start,
+            decl_end: full_span.end,
             container_entity_id: constructor_entity_id.to_owned(),
             container_name: constructor_qualified_name_segment.to_owned(),
             is_static: false,
@@ -2644,6 +2689,8 @@ fn push_interface_member_declarations(
             kind_word: shape.kind_word,
             key_start: shape.key_start,
             key_end: shape.key_end,
+            decl_start: shape.decl_start,
+            decl_end: shape.decl_end,
             container_entity_id: container_entity_id.clone(),
             container_name: container_name.clone(),
             is_static: false,

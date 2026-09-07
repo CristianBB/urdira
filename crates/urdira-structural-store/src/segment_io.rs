@@ -934,7 +934,7 @@ pub fn write_hot_and_secondary_files(
                     .filter_map(|(k, &i)| {
                         let r = &rows[i as usize];
                         is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id)
-                            .then_some((r.owner_artifact, r.span_start_byte, k as u32))
+                            .then(|| (r.owner_artifact, entities_index_key_start(r), k as u32))
                     })
                     .collect();
                 // A2 (2026-09-05): pack `(owner_artifact, span_start)` into
@@ -1393,7 +1393,7 @@ pub fn write_hot_and_secondary_files_partitioned(
                         is_entities_index_row(r.category, r.kind_id, inferred_type_kind_id)
                             .then_some((
                                 r.owner_artifact,
-                                r.span_start_byte,
+                                entities_index_key_start(r),
                                 global_k(&row_base, nib, local),
                             ))
                     })
@@ -1841,6 +1841,24 @@ pub fn inferred_type_kind_id(dicts: &Dictionaries) -> Option<u16> {
         .iter()
         .position(|k| k == "jsts:entity_inferred_type")
         .map(|i| i as u16)
+}
+
+/// Frente E-P0j (2026-09-07): the `entities.index` sort/lookup key for one
+/// entity row -- the record's own NAME-IDENTIFIER start, recovered from its
+/// `identity_key` text (see `identity_codec::entity_identity_name_start`'s
+/// doc comment for why this crate no longer uses `RecordRow::span_start_
+/// byte` here: that field moved to the WHOLE DECLARATION's span this task,
+/// but `entities.index`/`StoreReader::entity_by_owner_and_start` -- and,
+/// through it, `urdira-indexing-worker::v4::residual`'s checker-site
+/// correlation -- both still need the identifier's own position). Falls
+/// back to `r.span_start_byte` when the identity text has no parseable
+/// start segment (`jsts:external_module:*`/`jsts:external_symbol:*`, whose
+/// `span_start_byte` is always `0` anyway -- see that function's own doc
+/// comment) so every entity row still gets SOME deterministic key, matching
+/// this index's pre-existing behavior for those two kinds exactly.
+#[inline]
+fn entities_index_key_start(row: &RecordRow) -> u32 {
+    identity_codec::entity_identity_name_start(&row.identity_key).unwrap_or(row.span_start_byte)
 }
 
 /// F4 4.3: `true` for exactly the rows `entities.index` carries -- a

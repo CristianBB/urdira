@@ -753,8 +753,37 @@ pub struct SyntaxEntity {
     pub kind: EntityKind,
     pub universal_kind: UniversalKind,
     pub path: String,
+    /// Frente E-P0j (2026-09-07, fidelity fix): the entity's own FULL
+    /// declaration span -- from the start of its modifiers/decorators/
+    /// export keyword through its closing (a variable entity's own
+    /// declarator, `x = ...`, not the enclosing `const`/`let`/`var`
+    /// statement -- see `visit_variable_declaration`'s own doc comment).
+    /// Before this fix, EVERY entity kind published the IDENTIFIER's own
+    /// span here instead (`identifier.span.start`/`.end`) -- confirmed live
+    /// against a real v4 scan (`docs/evidence/2026-09-07-v4-semantic-
+    /// wiring-and-embed-performance.md` §1.3): a multi-line function body
+    /// was measured against decision 17's 120-character semantic-
+    /// eligibility threshold using only its ~15-50-character NAME, so no
+    /// real function/variable declaration could ever be eligible. `name_
+    /// start`/`name_end` below carry the OLD identifier-only span forward,
+    /// unchanged, for identity/positional correlation.
     pub start: u32,
     pub end: u32,
+    /// Frente E-P0j: the declaration's own NAME-IDENTIFIER span (what
+    /// `start`/`end` used to publish before this fix) -- the anchor
+    /// `stable_entity_id`/`declaration_id` already used for `id` before
+    /// this task and STILL use (decision 11's identity contract, and
+    /// `find_references` on a parameter, are unaffected by this task:
+    /// identity was never derived from `start`/`end` in the first place,
+    /// only from this same identifier position, now ALSO published
+    /// explicitly here). `urdira-structural-store`'s `entities.index`/
+    /// `StoreReader::entity_by_owner_and_start` and `urdira-indexing-
+    /// worker::v4::residual`'s checker-site correlation both key off this
+    /// position (recovered from `id`'s own text, see `urdira_structural_
+    /// store::identity_codec::entity_identity_name_start`'s doc comment),
+    /// never off the wider `start`/`end` above.
+    pub name_start: u32,
+    pub name_end: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2811,11 +2840,16 @@ fn proposal_entity_record(
         language
     };
     // A3b: fields written in strict lexicographic key order (`end`,
-    // `is_test`?, `kind`, `language`, `name`, `parent_id`?, `path`,
-    // `qualified_name`?, `start`) -- the same order `serde_json::Map`'s
-    // `BTreeMap` iteration already produced for the equivalent `Value`
-    // tree (no `preserve_order` feature anywhere in this workspace).
-    let mut field_count = 6;
+    // `is_test`?, `kind`, `language`, `name`, `name_end`, `name_start`,
+    // `parent_id`?, `path`, `qualified_name`?, `start`) -- the same order
+    // `serde_json::Map`'s `BTreeMap` iteration already produced for the
+    // equivalent `Value` tree (no `preserve_order` feature anywhere in this
+    // workspace). Frente E-P0j (2026-09-07): `name_start`/`name_end` are
+    // new, additive fields -- the entity's own IDENTIFIER span (what
+    // `start`/`end` used to publish before this task) -- so a body-decoding
+    // consumer can still recover "where is this declaration's own name",
+    // never just its wider (as of this task) `start`/`end`.
+    let mut field_count = 8;
     if entity.parent_id.is_some() {
         field_count += 1;
     }
@@ -2847,6 +2881,14 @@ fn proposal_entity_record(
         .expect("string never fails");
     encoder.key("name").expect("entity body key order");
     encoder.string(&entity.name).expect("string never fails");
+    encoder.key("name_end").expect("entity body key order");
+    encoder
+        .uint(u64::from(entity.name_end))
+        .expect("entity name_end is a finite u32");
+    encoder.key("name_start").expect("entity body key order");
+    encoder
+        .uint(u64::from(entity.name_start))
+        .expect("entity name_start is a finite u32");
     if let Some(parent_id) = &entity.parent_id {
         encoder.key("parent_id").expect("entity body key order");
         encoder.string(parent_id).expect("string never fails");
@@ -2986,6 +3028,8 @@ pub(crate) fn external_module_entity(specifier: &str) -> SyntaxEntity {
         path: format!("external:{specifier}"),
         start: 0,
         end: 0,
+        name_start: 0,
+        name_end: 0,
         parent_id: None,
         qualified_name: None,
         is_test: None,
@@ -3011,6 +3055,8 @@ pub(crate) fn external_symbol_entity(specifier: &str, name: &str, is_type: bool)
         path: format!("external:{specifier}"),
         start: 0,
         end: 0,
+        name_start: 0,
+        name_end: 0,
         parent_id: Some(resolver::external_module_id(specifier)),
         qualified_name: Some(format!("{specifier}.{name}")),
         is_test: None,
@@ -3869,6 +3915,22 @@ struct SyntaxCollector<'t> {
     /// for a purely re-exported import, and stayed `Unresolved` forever).
     /// Never cleared/consulted across files (one `SyntaxCollector` per file).
     imported_locals: HashMap<String, (String, ImportedName)>,
+    /// Frente E-P0j (2026-09-07): `Some(export_span_start)` for exactly the
+    /// span between `visit_export_named_declaration`/`visit_export_default_
+    /// declaration` setting it (a DIRECT `export`/`export default` wrapping
+    /// a nameable Function/Class/Interface/Enum/Type/Namespace declaration
+    /// -- never a `VariableDeclaration`, see those two visitors' own doc
+    /// comments for why) and the very next `push_entity_with_type_surface`
+    /// call consuming it via `.take()` -- that next call is always the
+    /// WRAPPED declaration's own entity push, reached through the
+    /// unconditional recursive walk immediately following, before any
+    /// nested declaration could ever reach `push_entity_with_type_surface`
+    /// itself. Lets that one entity's published `start` move left to cover
+    /// the `export`/`export default` keyword(s) too ("para exports export
+    /// default function… incluir el export", task brief), without
+    /// threading an extra parameter through every visitor that does not
+    /// need it.
+    pending_export_span_start: Option<u32>,
 }
 
 impl<'t> SyntaxCollector<'t> {
@@ -3888,6 +3950,8 @@ impl<'t> SyntaxCollector<'t> {
                 path: path.to_owned(),
                 start: 0,
                 end: source_end,
+                name_start: 0,
+                name_end: source_end,
                 parent_id: None,
                 qualified_name: None,
                 is_test: None,
@@ -3901,6 +3965,7 @@ impl<'t> SyntaxCollector<'t> {
             ambient_globals: Vec::new(),
             namespace_members: Vec::new(),
             imported_locals: HashMap::new(),
+            pending_export_span_start: None,
         }
     }
 
@@ -3936,36 +4001,55 @@ impl<'t> SyntaxCollector<'t> {
         identifier: &BindingIdentifier<'_>,
         kind: EntityKind,
         universal_kind: UniversalKind,
+        decl_span: (u32, u32),
     ) {
-        self.push_entity_with_type_surface(identifier, kind, universal_kind, None);
+        self.push_entity_with_type_surface(identifier, kind, universal_kind, None, decl_span);
     }
 
     /// Frente E-P0h: [`Self::push_entity`], plus an optional [`SyntaxEntity::
     /// type_surface_digest`] for the three top-level declaration kinds that
     /// carry one of their own (`Function`/`Variable`/`Type` -- see that
     /// field's own doc comment) -- `push_entity` itself stays the plain,
-    /// five-argument call every OTHER kind (`Class`/`Enum`/`Interface`/
+    /// six-argument call every OTHER kind (`Class`/`Enum`/`Interface`/
     /// `Namespace`, none of which has a "type surface" of its own; a class/
     /// interface's own MEMBER surface is tracked separately, on each
     /// member's own entity, by [`Self::push_member_entities`]) keeps using
     /// unchanged.
+    ///
+    /// Frente E-P0j (2026-09-07): `decl_span` is the caller's own natural
+    /// declaration span (e.g. `function.span`/`class.span`/a variable's own
+    /// declarator span) BEFORE any `export`/`export default` prefix --
+    /// `self.pending_export_span_start` (set by `visit_export_named_
+    /// declaration`/`visit_export_default_declaration` immediately before
+    /// the recursive walk reaches here) widens it left to cover the
+    /// keyword(s) when present, consumed via `.take()` so it can never leak
+    /// into an unrelated, later entity. `identifier.span` (the NAME) is
+    /// published separately as `name_start`/`name_end` and is still what
+    /// `id` (identity, decision 11, unaffected by this task) is built from.
     fn push_entity_with_type_surface(
         &mut self,
         identifier: &BindingIdentifier<'_>,
         kind: EntityKind,
         universal_kind: UniversalKind,
         type_surface_digest: Option<String>,
+        decl_span: (u32, u32),
     ) {
         let name = identifier.name.as_str();
         let id = stable_entity_id(kind, &self.path, identifier.span.start, name);
+        let (mut decl_start, decl_end) = decl_span;
+        if let Some(export_start) = self.pending_export_span_start.take() {
+            decl_start = export_start;
+        }
         self.entities.push(SyntaxEntity {
             id: id.clone(),
             name: name.to_owned(),
             kind,
             universal_kind,
             path: self.path.clone(),
-            start: identifier.span.start,
-            end: identifier.span.end,
+            start: decl_start,
+            end: decl_end,
+            name_start: identifier.span.start,
+            name_end: identifier.span.end,
             parent_id: Some(self.module_id.clone()),
             qualified_name: Some(format!("{}.{}", self.path, name)),
             is_test: None,
@@ -3975,8 +4059,8 @@ impl<'t> SyntaxCollector<'t> {
             RelationKind::Contains,
             self.module_id.clone(),
             Some(id),
-            identifier.span.start,
-            identifier.span.end,
+            decl_start,
+            decl_end,
             RelationClassification::Confirmed,
         );
     }
@@ -3999,6 +4083,7 @@ impl<'t> SyntaxCollector<'t> {
         &mut self,
         name: &str,
         identity_start: u32,
+        identity_end: u32,
         decl_start: u32,
         decl_end: u32,
     ) -> String {
@@ -4011,6 +4096,8 @@ impl<'t> SyntaxCollector<'t> {
             path: self.path.clone(),
             start: decl_start,
             end: decl_end,
+            name_start: identity_start,
+            name_end: identity_end,
             parent_id: Some(self.module_id.clone()),
             qualified_name: Some(format!("{}.{}", self.path, name)),
             is_test: None,
@@ -4101,8 +4188,16 @@ impl<'t> SyntaxCollector<'t> {
                 kind,
                 universal_kind,
                 path: self.path.clone(),
-                start: declaration.key_start,
-                end: declaration.key_end,
+                // Frente E-P0j: the member's own FULL declaration span
+                // (modifiers/decorators through the closing) -- see
+                // `MemberDeclaration::decl_start`'s own doc comment.
+                // `key_start`/`key_end` (the name span) move to `name_
+                // start`/`name_end` below, unchanged as the identity
+                // anchor `declaration.entity_id` was already built from.
+                start: declaration.decl_start,
+                end: declaration.decl_end,
+                name_start: declaration.key_start,
+                name_end: declaration.key_end,
                 parent_id: Some(declaration.container_entity_id.clone()),
                 qualified_name: Some(format!(
                     "{}.{}.{}",
@@ -4115,8 +4210,8 @@ impl<'t> SyntaxCollector<'t> {
                 RelationKind::Contains,
                 declaration.container_entity_id.clone(),
                 Some(declaration.entity_id.clone()),
-                declaration.key_start,
-                declaration.key_end,
+                declaration.decl_start,
+                declaration.decl_end,
                 RelationClassification::Confirmed,
             );
         }
@@ -4812,10 +4907,20 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
             // under its own name.
             let names = declaration_export_names(inner);
             self.push_direct_export_names(names);
+            // Frente E-P0j: widen the WRAPPED declaration's own published
+            // span to cover this `export` keyword too -- never for a
+            // `VariableDeclaration` (task brief: a variable's own span is
+            // its declarator, `x = ...`, and several declarators can share
+            // one `export`/`const` prefix, so there is no single "the
+            // export's own declarator" to widen).
+            if !matches!(inner, Declaration::VariableDeclaration(_)) {
+                self.pending_export_span_start = Some(declaration.span.start);
+            }
         }
         // Sourceless specifier form (`export { a, b as c }`) is handled by
         // `visit_export_specifier` below, reached through the default walk.
         walk_export_named_declaration(self, declaration);
+        self.pending_export_span_start = None;
     }
 
     /// Sourceless local re-export (`export { a, b as c }`, no `from`
@@ -4996,7 +5101,23 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
                 source_target_path: None,
             });
         }
+        // Frente E-P0j: `export default function foo() {}`/`export default
+        // class Foo {}`/`export default interface Foo {}` -- widen the
+        // wrapped declaration's own published span to cover `export
+        // default` too, same mechanism `visit_export_named_declaration`
+        // uses (never for `ExportDefaultDeclarationKind::Identifier` --
+        // `export default someLocalThing;` names no NEW declaration here at
+        // all, nothing for `pending_export_span_start` to ever attach to).
+        if matches!(
+            declaration.declaration,
+            ExportDefaultDeclarationKind::FunctionDeclaration(_)
+                | ExportDefaultDeclarationKind::ClassDeclaration(_)
+                | ExportDefaultDeclarationKind::TSInterfaceDeclaration(_)
+        ) {
+            self.pending_export_span_start = Some(declaration.span.start);
+        }
         walk_export_default_declaration(self, declaration);
+        self.pending_export_span_start = None;
     }
 
     /// h1 (2026-09-05): `export = <identifier>;` -- CommonJS's own default-
@@ -5087,6 +5208,7 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
                 EntityKind::Function,
                 UniversalKind::Callable,
                 digest,
+                (function.span.start, function.span.end),
             );
         }
         walk_function(self, function, flags);
@@ -5096,7 +5218,12 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
         if class.r#type == ClassType::ClassDeclaration
             && let Some(identifier) = &class.id
         {
-            self.push_entity(identifier, EntityKind::Class, UniversalKind::Type);
+            self.push_entity(
+                identifier,
+                EntityKind::Class,
+                UniversalKind::Type,
+                (class.span.start, class.span.end),
+            );
         }
         walk_class(self, class);
     }
@@ -5117,11 +5244,18 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
                 // comment for the analogous class-member rule).
                 let return_span = type_annotation_span(declarator.type_annotation.as_deref());
                 let digest = type_surface_digest(self.text, self.utf16_map, &[], return_span);
+                // Frente E-P0j: a variable entity's own declaration span is
+                // its DECLARATOR (`x = ...`), never the enclosing `const`/
+                // `let`/`var` statement (or its `export` prefix, if any) --
+                // `declarator.span` already covers exactly that (binding
+                // pattern start through initializer end, or through the
+                // pattern's own end for an uninitialized `let x;`).
                 self.push_entity_with_type_surface(
                     identifier,
                     EntityKind::Variable,
                     UniversalKind::Value,
                     digest,
+                    (declarator.span.start, declarator.span.end),
                 );
             }
         }
@@ -5129,7 +5263,12 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
     }
 
     fn visit_ts_enum_declaration(&mut self, declaration: &TSEnumDeclaration<'a>) {
-        self.push_entity(&declaration.id, EntityKind::Enum, UniversalKind::Type);
+        self.push_entity(
+            &declaration.id,
+            EntityKind::Enum,
+            UniversalKind::Type,
+            (declaration.span.start, declaration.span.end),
+        );
         walk_ts_enum_declaration(self, declaration);
     }
 
@@ -5152,12 +5291,18 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
             EntityKind::Type,
             UniversalKind::Type,
             digest,
+            (declaration.span.start, declaration.span.end),
         );
         walk_ts_type_alias_declaration(self, declaration);
     }
 
     fn visit_ts_interface_declaration(&mut self, declaration: &TSInterfaceDeclaration<'a>) {
-        self.push_entity(&declaration.id, EntityKind::Interface, UniversalKind::Type);
+        self.push_entity(
+            &declaration.id,
+            EntityKind::Interface,
+            UniversalKind::Type,
+            (declaration.span.start, declaration.span.end),
+        );
         walk_ts_interface_declaration(self, declaration);
     }
 
@@ -5209,7 +5354,12 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
     /// export`'s own doc comment for the full mechanism.
     fn visit_ts_module_declaration(&mut self, declaration: &TSModuleDeclaration<'a>) {
         if let TSModuleDeclarationName::Identifier(identifier) = &declaration.id {
-            self.push_entity(identifier, EntityKind::Namespace, UniversalKind::Type);
+            self.push_entity(
+                identifier,
+                EntityKind::Namespace,
+                UniversalKind::Type,
+                (declaration.span.start, declaration.span.end),
+            );
             // D.3 (2026-09-05, references-parity task): this LOCAL
             // namespace's own directly-`export`ed members -- see
             // `SyntaxFileResult::namespace_members`'s own doc comment. Only
@@ -5240,6 +5390,7 @@ impl<'a, 't> Visit<'a> for SyntaxCollector<'t> {
             let namespace_entity_id = self.push_namespace_entity(
                 &specifier,
                 literal.span.start,
+                literal.span.end,
                 declaration.span.start,
                 declaration.span.end,
             );
@@ -6200,10 +6351,33 @@ mod tests {
         assert_eq!(namespace_entity.body.to_value()["kind"], "namespace");
         assert_eq!(namespace_entity.universal_kind, "core:type");
         assert_eq!(namespace_entity.body.to_value()["name"], "Foo");
+        // Frente E-P0j: published `start`/`end` cover the WHOLE declaration
+        // (`export` keyword through the closing `}`), while `name_start`/
+        // `name_end` still carry the bare `Foo` identifier span (the
+        // identity anchor, unchanged).
+        assert_eq!(namespace_entity.body.to_value()["start"], 0);
+        assert_eq!(
+            namespace_entity.body.to_value()["end"],
+            text.rfind('}')
+                .expect("namespace block has a closing brace") as u64
+                + 1
+        );
+        assert_eq!(namespace_entity.body.to_value()["name_start"], name_start);
+        assert_eq!(namespace_entity.body.to_value()["name_end"], name_end);
 
         let module_id = stable_entity_id(EntityKind::Module, "ns.ts", 0, "ns.ts");
+        // Frente E-P0j (2026-09-07): the `contains` relation's own span --
+        // like the namespace entity's own published `start`/`end` -- now
+        // covers the WHOLE declaration (`export namespace Foo { ... }`,
+        // `export` included) rather than just the `Foo` identifier
+        // (`name_start`/`name_end` above, still the IDENTITY anchor).
+        let decl_start = 0u32; // "export namespace Foo {" starts at the file's own start.
+        let decl_end = (text
+            .rfind('}')
+            .expect("namespace block has a closing brace")
+            + 1) as u32;
         let contains_id =
-            format!("jsts:contains:ns.ts:{name_start}:{name_end}:{module_id}:{namespace_id}");
+            format!("jsts:contains:ns.ts:{decl_start}:{decl_end}:{module_id}:{namespace_id}");
         let contains_relation = records
             .iter()
             .find(|record| record.identity_key == contains_id)
@@ -6807,7 +6981,9 @@ mod tests {
                 urdira_jsts_typeflow::declaration_id(
                     kind,
                     "a.ts",
-                    record.body.to_value()["start"].as_u64().unwrap() as u32,
+                    // Frente E-P0j: identity is anchored to the NAME span (`name_start`), never the
+                    // declaration's own wider `start` (now published for fidelity).
+                    record.body.to_value()["name_start"].as_u64().unwrap() as u32,
                     name
                 ),
                 "identity for {name}:{kind} matches typeflow's declaration_id"
@@ -6835,7 +7011,9 @@ mod tests {
                 urdira_jsts_typeflow::declaration_id(
                     kind,
                     "a.ts",
-                    record.body.to_value()["start"].as_u64().unwrap() as u32,
+                    // Frente E-P0j: identity is anchored to the NAME span (`name_start`), never the
+                    // declaration's own wider `start` (now published for fidelity).
+                    record.body.to_value()["name_start"].as_u64().unwrap() as u32,
                     name
                 ),
             );

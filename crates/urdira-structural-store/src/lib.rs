@@ -60,6 +60,16 @@ pub use writer::{SegmentSummary, SegmentWriter};
 /// items already existed as `pub(crate)`/private items inside `segment_io`.
 pub use segment_io::{N_NIBBLES, nibble_of};
 
+/// Frente E-P0j (2026-09-07): re-exported so `urdira-indexing-worker::v4::
+/// residual`'s own debug-only full-scan `EntityLookup` variant (`URDIRA_
+/// V4_ENTITY_INDEX=scan`) can key its in-memory index the SAME way
+/// `entities.index`'s real on-disk build now does (`segment_io::
+/// entities_index_key_start`, not exported -- this crate's own writer
+/// already applies it internally) -- see `identity_codec::entity_identity_
+/// name_start`'s own doc comment for why. Additive: already `pub fn` inside
+/// the (crate-private) `identity_codec` module.
+pub use identity_codec::entity_identity_name_start;
+
 /// Re-exported so callers can interpret roots without a direct
 /// dependency on `urdira-indexing-core`.
 pub use urdira_indexing_core::merkle_bucket::{

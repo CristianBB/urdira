@@ -63,7 +63,19 @@ export const JAVASCRIPT_TYPESCRIPT_NAMESPACE = "jsts" as const;
 // 0.3.4 -> 0.4.0: Urdira v3 changes the analyzer's observable publication
 // contract, native batch transport, and core dependency identities. MINOR:
 // pre-1.0 output or behavior changes use the minor slot by policy.
-export const JAVASCRIPT_TYPESCRIPT_VERSION = "0.4.0" as const;
+// 0.4.0 -> 0.5.0 (Frente E-P0j, 2026-09-07): v4's Rust structural producer
+// (`crates/urdira-jsts-syntax-worker`) now publishes an entity's `start`/
+// `end` as its WHOLE DECLARATION span (modifiers/decorators/`export`
+// through the closing, a variable's own declarator, a parameter's own
+// annotation+default) instead of just its identifier's span -- a real
+// output/digest change for every v4 entity record (identity, keyed on the
+// identifier's position, is unaffected). This constant is a shared identity
+// token across both the v3 TS analyzer and the v4 Rust pipeline's own
+// plugin-resolution-lock/durable-cache gating (see `docs/versioning.md`'s
+// "What the plugin version mechanically gates"), so bumping it here is what
+// forces the one-time fleet republish every already-scanned v4 workspace
+// needs to pick up the new span shape. MINOR: pre-1.0 output change.
+export const JAVASCRIPT_TYPESCRIPT_VERSION = "0.5.0" as const;
 export const TYPESCRIPT_COMPILER_VERSION = TYPESCRIPT_VERSION;
 
 /** Ordered structural publication stages for the bundled analyzer. */

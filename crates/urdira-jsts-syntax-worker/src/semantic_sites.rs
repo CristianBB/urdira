@@ -1363,13 +1363,21 @@ struct ParamOwner {
 /// span`, matching every other entity's "name span" convention -- e.g.
 /// `push_entity`'s `identifier.span` -- never the whole `FormalParameter`
 /// span, which would also cover a type annotation/decorators/accessibility
-/// modifier/default value).
+/// modifier/default value) -- this is `id`'s own identity anchor (decision
+/// 11, unaffected by Frente E-P0j) and is what `SyntaxEntity::name_start`/
+/// `.name_end` publish. `decl_start`/`decl_end` (Frente E-P0j, 2026-09-07)
+/// are the WHOLE parameter's own span (its own accessibility/`readonly`
+/// modifiers, if any, through its type annotation and default value) --
+/// what `SyntaxEntity::start`/`.end` publish since that task ("el parámetro
+/// con su anotación y default", task brief).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParameterDeclarationFact {
     entity_id: String,
     name: String,
     start: u32,
     end: u32,
+    decl_start: u32,
+    decl_end: u32,
     parent_id: String,
     qualified_name: String,
 }
@@ -4831,8 +4839,14 @@ fn parameter_entity_record(
         kind: crate::EntityKind::Parameter,
         universal_kind: crate::UniversalKind::Parameter,
         path: path.to_owned(),
-        start: fact.start,
-        end: fact.end,
+        // Frente E-P0j: the parameter's own FULL span (modifiers/
+        // annotation/default) -- `fact.start`/`.end` (the name span) move
+        // to `name_start`/`name_end`, still the identity anchor `fact.
+        // entity_id` was already built from.
+        start: fact.decl_start,
+        end: fact.decl_end,
+        name_start: fact.start,
+        name_end: fact.end,
         parent_id: Some(fact.parent_id.clone()),
         qualified_name: Some(fact.qualified_name.clone()),
         is_test: None,
@@ -4855,7 +4869,7 @@ fn parameter_contains_record(
 ) -> ProposedRecord {
     let id = format!(
         "jsts:contains:{path}:{}:{}:{}:{}",
-        fact.start, fact.end, fact.parent_id, fact.entity_id
+        fact.decl_start, fact.decl_end, fact.parent_id, fact.entity_id
     );
     let relation = crate::SyntaxRelation {
         id,
@@ -4863,8 +4877,8 @@ fn parameter_contains_record(
         source_id: fact.parent_id.clone(),
         target_id: Some(fact.entity_id.clone()),
         path: path.to_owned(),
-        start: fact.start,
-        end: fact.end,
+        start: fact.decl_start,
+        end: fact.decl_end,
         classification: crate::RelationClassification::Confirmed,
     };
     crate::proposal_relation_record(&relation, Some(line_index))
@@ -4891,8 +4905,10 @@ fn catch_variable_entity_record(
         kind: crate::EntityKind::Variable,
         universal_kind: crate::UniversalKind::Value,
         path: path.to_owned(),
-        start: fact.start,
-        end: fact.end,
+        start: fact.decl_start,
+        end: fact.decl_end,
+        name_start: fact.start,
+        name_end: fact.end,
         parent_id: Some(fact.parent_id.clone()),
         qualified_name: Some(fact.qualified_name.clone()),
         is_test: None,
@@ -4911,7 +4927,7 @@ fn catch_variable_contains_record(
 ) -> ProposedRecord {
     let id = format!(
         "jsts:contains:{path}:{}:{}:{}:{}",
-        fact.start, fact.end, fact.parent_id, fact.entity_id
+        fact.decl_start, fact.decl_end, fact.parent_id, fact.entity_id
     );
     let relation = crate::SyntaxRelation {
         id,
@@ -4919,8 +4935,8 @@ fn catch_variable_contains_record(
         source_id: fact.parent_id.clone(),
         target_id: Some(fact.entity_id.clone()),
         path: path.to_owned(),
-        start: fact.start,
-        end: fact.end,
+        start: fact.decl_start,
+        end: fact.decl_end,
         classification: crate::RelationClassification::Confirmed,
     };
     crate::proposal_relation_record(&relation, Some(line_index))
@@ -6417,6 +6433,8 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                         name: ident.name.as_str().to_owned(),
                         start: ident.span.start,
                         end: ident.span.end,
+                        decl_start: parameter.span.start,
+                        decl_end: parameter.span.end,
                         parent_id,
                         qualified_name: format!("{parent_qualified_name}.{}", ident.name.as_str()),
                     },
@@ -6463,6 +6481,8 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                     name: ident.name.as_str().to_owned(),
                     start: ident.span.start,
                     end: ident.span.end,
+                    decl_start: param.span.start,
+                    decl_end: param.span.end,
                     parent_id,
                     qualified_name: format!("{parent_qualified_name}.{}", ident.name.as_str()),
                 },
@@ -6511,6 +6531,8 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                     name: ident.name.as_str().to_owned(),
                     start: ident.span.start,
                     end: ident.span.end,
+                    decl_start: parameter.span.start,
+                    decl_end: parameter.span.end,
                     parent_id,
                     qualified_name: format!("{parent_qualified_name}.{}", ident.name.as_str()),
                 },
@@ -8092,6 +8114,8 @@ mod tests {
             path: path.to_owned(),
             start,
             end: start + name.len() as u32,
+            name_start: start,
+            name_end: start + name.len() as u32,
             parent_id: None,
             qualified_name: None,
             is_test: None,
@@ -9745,6 +9769,8 @@ mod tests {
                 path: path.to_owned(),
                 start: 0,
                 end: 0,
+                name_start: 0,
+                name_end: 0,
                 parent_id: None,
                 qualified_name: None,
                 is_test: Some(true),
