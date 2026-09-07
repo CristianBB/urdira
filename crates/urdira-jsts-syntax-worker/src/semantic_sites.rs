@@ -257,6 +257,42 @@ pub struct OwnerSemantics {
     /// `walkRustSemanticOwner`/`beginRustSemanticOwnerGroup` already treat as
     /// "do the full, un-cut-over walk for this one".
     pub jsdoc_typed_file: bool,
+    /// Frente E-P0f (2026-09-07, ambient-global-dependents integrity fix):
+    /// every OTHER file's path this owner depends on for an identifier
+    /// reference that resolved through `resolver::AmbientModuleIndex::
+    /// resolve_global` (an ambient GLOBAL declaration -- a script file's
+    /// un-imported top-level interface/const/class/etc, or a `declare
+    /// global { ... }` block anywhere), deduped and sorted ascending
+    /// (`SemanticWalker::ambient_global_dependencies` is a `BTreeSet`).
+    /// Root cause this closes (`docs/evidence/2026-09-06-v4-reconcile-
+    /// threshold.md` §14.3): a script file with no top-level `import`/
+    /// `export` is a TypeScript SCRIPT, not a module -- its top-level
+    /// declarations are visible workspace-wide with NO import statement at
+    /// the use site, so `deps.rs`'s import/export-derived `DependencyRow`s
+    /// (built from `resolved_dependencies`, which only ever reads `core:
+    /// import`/`core:export` relations) never record an edge for this kind
+    /// of cross-file reference at all -- deleting/editing the declaring
+    /// script therefore left every consumer's stale `core:references` rows
+    /// dangling forever (no edge for the incremental pipeline's reverse-
+    /// dependent closure to walk). `urdira-indexing-worker::v4::analyze::
+    /// run_scoped` turns each entry here into a `ProposedRecordDependency`
+    /// with `dependency_role: "jsts:ambient_global_input"` (see that
+    /// module's own doc comment), which `deps.rs::materialize_dependencies`
+    /// then writes into the SAME `DependencyRow` channel ordinary import
+    /// dependencies use -- so `StoreReader::deps_by_owner`/`deps_reverse`,
+    /// `residual.rs::expand_with_dependency_closure`, and this generation's
+    /// own reverse-dependent scheduling all see it for free, with no
+    /// ambient-specific special-casing anywhere downstream of `deps.rs`.
+    /// Never populated for a same-file resolution (`declaring_path ==
+    /// self.path`, e.g. a `declare global {}` block referenced later in
+    /// the SAME file) -- that case has no cross-file dependency to record.
+    /// Deliberately narrower than `resolve_root_namespace`'s own ambient-
+    /// global fallback (a qualified-name ROOT resolving to an ambient
+    /// NAMESPACE, e.g. `jest.Foo`): that call site stays `&self` and is
+    /// out of this fix's scope (a real, narrower, out-of-scope gap, not
+    /// silently dropped -- flagged here rather than reproduced, matching
+    /// this crate's own convention for such gaps elsewhere).
+    pub ambient_global_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1634,6 +1670,12 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// callers in `finish` below), so this single index is always the right
     /// one -- no per-record path comparison needed.
     line_index: LineIndex,
+    /// Frente E-P0f: accumulator for `OwnerSemantics::ambient_global_
+    /// dependencies` -- see that field's own doc comment. A `BTreeSet` so
+    /// repeated references to the SAME ambient global (common: a type used
+    /// in several signatures across one file) collapse to one dependency
+    /// edge, and `finish()`'s conversion needs no separate sort/dedup pass.
+    ambient_global_dependencies: BTreeSet<String>,
 }
 
 impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
@@ -1700,6 +1742,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             namespace_reexport_targets: HashMap::new(),
             is_test_source,
             line_index,
+            ambient_global_dependencies: BTreeSet::new(),
         }
     }
 
@@ -2186,15 +2229,29 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// call site always returned before this task -- byte-identical
     /// outcome for every name with no ambient global declaration anywhere
     /// in the workspace.
-    fn resolve_ambient_global(&self, name: &str) -> ReferenceResolution {
+    fn resolve_ambient_global(&mut self, name: &str) -> ReferenceResolution {
         match self.ctx.ambient_index.resolve_global(name, &self.path) {
             resolver::GlobalLookup::Unique {
                 entity_id,
                 declaring_path,
-            } => ReferenceResolution::Resolved {
-                target_id: entity_id,
-                cross_file: declaring_path != self.path,
-            },
+            } => {
+                // Frente E-P0f: record the cross-file dependency THIS
+                // resolution just proved exists, on the same `!=self.path`
+                // condition `cross_file` below already uses -- see
+                // `OwnerSemantics::ambient_global_dependencies`'s own doc
+                // comment for why this edge must be persisted (a same-call
+                // revisit alone is not enough for a LATER generation's
+                // delta to find this owner again once the declaring script
+                // changes).
+                if declaring_path != self.path {
+                    self.ambient_global_dependencies
+                        .insert(declaring_path.clone());
+                }
+                ReferenceResolution::Resolved {
+                    target_id: entity_id,
+                    cross_file: declaring_path != self.path,
+                }
+            }
             resolver::GlobalLookup::Ambiguous => {
                 ReferenceResolution::Pending(REASON_UNRESOLVED_GLOBAL_AMBIGUOUS)
             }
@@ -2204,7 +2261,10 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         }
     }
 
-    fn resolve_identifier_reference(&self, ident: &IdentifierReference<'a>) -> ReferenceResolution {
+    fn resolve_identifier_reference(
+        &mut self,
+        ident: &IdentifierReference<'a>,
+    ) -> ReferenceResolution {
         if self.jsdoc_typed_file {
             return ReferenceResolution::Pending(REASON_JSDOC_TYPED_FILE);
         }
@@ -4191,6 +4251,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             pending_sites,
             sites_digest,
             jsdoc_typed_file: self.jsdoc_typed_file,
+            ambient_global_dependencies: self.ambient_global_dependencies.into_iter().collect(),
         }
     }
     /// D.3: what `visit_ts_qualified_name` resolves `name.right` to, or the
@@ -8472,6 +8533,130 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.3 == target_id),
             "expected a reference row targeting {target_id}, got {rows:?}"
+        );
+    }
+
+    /// Frente E-P0f (2026-09-07, ambient-global-dependents integrity fix):
+    /// the SAME cross-file resolution `declare_global_block_member_
+    /// resolves_from_another_file` proves above must ALSO record a
+    /// persisted-dependency-worthy fact on `OwnerSemantics::ambient_
+    /// global_dependencies` -- this is the producer side of the fix
+    /// `docs/evidence/2026-09-06-v4-reconcile-threshold.md` §14.3 found
+    /// missing: without this, `urdira-indexing-worker::v4::deps.rs` never
+    /// learns "a.ts" depends on "globals.ts" at all, so deleting/editing
+    /// "globals.ts" in a LATER generation never reprocesses "a.ts".
+    #[test]
+    fn cross_file_ambient_global_reference_records_an_ambient_dependency() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "globals.ts".to_owned(),
+            target_file_with_globals(
+                "globals.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Variable,
+                    "globals.ts",
+                    30,
+                    "foo",
+                    crate::GlobalScope::DeclareGlobal,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "function use() {\n  return foo + 1;\n}\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert_eq!(
+            semantics.ambient_global_dependencies,
+            vec!["globals.ts".to_string()],
+            "a cross-file ambient global resolution must record exactly one dependency, on the declaring path"
+        );
+    }
+
+    /// Companion to the test above: a `declare global {}` block referenced
+    /// again LATER IN THE SAME FILE (the exact scenario `declare_global_
+    /// self_reference_in_the_declaring_test_file_is_not_cross_file` below
+    /// proves is NOT `cross_file`) must record NO dependency -- there is no
+    /// cross-file edge to protect; `resolve_ambient_global`'s own `!=
+    /// self.path` guard must never fire for a same-file declaration.
+    #[test]
+    fn same_file_ambient_global_reference_records_no_ambient_dependency() {
+        let declaring_file = target_file_with_globals(
+            "globals.ts",
+            vec![ambient_global(
+                crate::EntityKind::Variable,
+                "globals.ts",
+                30,
+                "foo",
+                crate::GlobalScope::DeclareGlobal,
+            )],
+        );
+        let mut files = BTreeMap::new();
+        files.insert("globals.ts".to_owned(), declaring_file);
+        let ctx = helper_ctx(files);
+        let source =
+            "declare global {\n  var foo: number;\n}\nfunction use() {\n  return foo + 1;\n}\n";
+        let semantics = analyze_owner_semantics_with_context("globals.ts", source, &ctx)
+            .expect("analysis succeeds");
+        assert!(
+            semantics.ambient_global_dependencies.is_empty(),
+            "a same-file ambient global self-reference must record no dependency, got {:?}",
+            semantics.ambient_global_dependencies
+        );
+    }
+
+    /// Decision 28's own invariant (never guess under ambiguity) applied to
+    /// this fix: two files declaring the SAME non-namespace global name
+    /// stay `GlobalLookup::Ambiguous` (`resolve_global`'s own documented
+    /// behavior, unchanged by this task) -- `resolve_ambient_global` must
+    /// record NO dependency for an `Ambiguous`/`Absent` outcome, only for
+    /// `Unique`, so an ambiguous reference never fabricates a misleading
+    /// edge to just one of the two candidates.
+    #[test]
+    fn ambiguous_ambient_global_reference_records_no_ambient_dependency() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a-globals.ts".to_owned(),
+            target_file_with_globals(
+                "a-globals.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Variable,
+                    "a-globals.ts",
+                    30,
+                    "shared",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        files.insert(
+            "b-globals.ts".to_owned(),
+            target_file_with_globals(
+                "b-globals.ts",
+                vec![ambient_global(
+                    crate::EntityKind::Variable,
+                    "b-globals.ts",
+                    30,
+                    "shared",
+                    crate::GlobalScope::ScriptTopLevel,
+                )],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "function use() {\n  return shared + 1;\n}\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.ambient_global_dependencies.is_empty(),
+            "an ambiguous ambient global must never record a dependency, got {:?}",
+            semantics.ambient_global_dependencies
+        );
+        let shared_start = source.find("shared").unwrap() as u32;
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.start_utf16 == shared_start),
+            "the ambiguous reference must stay pending, never a guess: {:?}",
+            semantics.pending_sites
         );
     }
 

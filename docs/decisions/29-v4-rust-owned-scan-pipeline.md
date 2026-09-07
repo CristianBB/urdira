@@ -1,7 +1,7 @@
 # Decision 29: v4 Rust-owned worker scan pipeline (cold and incremental)
 
 Status: **Approved; cold, `Full`↔`Changed` incremental, typeflow, possible rows, and the background residual-checker generation are implemented and daemon-wired; v4 is the default for newly added workspaces since 2026-09-04 (opt out with `URDIRA_V4=0`). Cold numeric gates (Queryable ≤ 8 s, ScanCompleted ≤ 12 s, RSS ≤ 3 GiB) are NOT met; the worker-only incremental gate is met for every mutation kind; the daemon-observed edit gate ("durable < 1 s") is NOT met. One open critical data-integrity bug (identity_key zeroing, P2-2m).**
-Last updated: 2026-09-05
+Last updated: 2026-09-07 (Frente E-P0f: ambient-global dependency tracking, see new section below)
 Depends on: [v4 structural store](26-v4-structural-store.md), [v4 merkle bucket digests](27-v4-merkle-bucket-digests.md), [v4 Rust semantics and residual checker](28-v4-rust-semantics-and-residual-checker.md), [Native pipeline and relational storage](21-native-pipeline-relational-storage.md), [Content-derived record identity](11-content-derived-record-identity.md)
 Campaign summary (Spanish, non-normative): `docs/evidence/2026-09-05-v4-campaign-summary.md`
 
@@ -622,3 +622,44 @@ import reproduction, copying the whole data dir onto a fresh location and
 reconciling from a brand-new `WorkerState` — and
 `reconcile_same_byte_length_different_content_is_never_equivalent`). Every
 pre-existing `incremental_*`/`reconcile_*` test stays green unmodified.
+
+## Ambient global dependencies (Frente E-P0f, 2026-09-07)
+
+**Problem** (`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §14.3): a TypeScript SCRIPT file
+(no top-level `import`/`export` of its own) makes every one of its top-level declarations an
+AMBIENT GLOBAL, visible workspace-wide with no import statement anywhere. `resolver::
+AmbientModuleIndex::resolve_global` already resolves a cross-file reference to one correctly, but
+`deps.rs`'s dependency-edge derivation only ever reads `core:import`/`core:export` relations — there
+is no import statement to derive an edge from, so deleting or editing the declaring script left
+every consumer's `core:references` rows to it dangling: the incremental pipeline's own reverse-
+dependent scheduling had no edge to walk to rediscover the consumer.
+
+**Fix**: `resolve_ambient_global` (`urdira-jsts-syntax-worker::semantic_sites.rs`) now records the
+cross-file dependency it just proved onto a new `OwnerSemantics::ambient_global_dependencies: Vec
+<String>` field (declaring paths, deduped, never populated for a same-file or ambiguous
+resolution). `analyze::run_scoped` turns each entry into a `ProposedRecordDependency` with a NEW
+role, `jsts:ambient_global_input` (`deps::DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT = 2`, `DependencyRow.
+role` byte) — the SAME channel ordinary import-derived dependencies use, so `StoreReader::deps_by_
+owner`/`deps_reverse` and any dependency-graph consumer (`residual.rs::expand_with_dependency_
+closure` included) see it for free. `delta.rs::run_one` uses `deps_reverse` (keyed by the touched
+path's OLD ordinal, from the store's own `prev_generation` dictionaries) to find every ambient
+dependent of a deleted/edited path, and passes that set to `analyze::run_incremental`/`run_scoped`
+via a NEW `extra_affected_paths` parameter — unioned into `affected_paths` AFTER `syntax.analyze()`
+returns, deliberately NOT folded into `changed_artifact_ids` (that channel is validated byte-for-
+byte against the manifest's own content diff by `authoritative_changed_paths` and rejects an
+unchanged file's id outright — a real bug this fix's first draft hit and fixed live).
+
+**Scope boundary, explicitly not fixed**: `resolve_root_namespace`'s separate ambient-namespace
+fallback (a qualified name's root, `jest.Foo`-shaped) does not record a dependency — narrower,
+flagged in that field's own doc comment, not reproduced at corpus scale. A SECOND, unrelated root
+cause (a cross-file METHOD CALL/reference resolution gap, all three files real modules with real
+imports — nothing to do with ambient globals) was found live re-measuring at N=2015 on n8n; not
+fixed here, flagged for the owner's queue (`docs/evidence/2026-09-06-v4-reconcile-threshold.md`
+§15.4).
+
+**Verified**: n8n re-measurement at N=1008 (§14.3's own repro scale) — `graph`/`dependency` roots
+now match an independent oracle exactly, non-external `extra_untouched` phantom-row count `0` (was
+non-zero via `graph=false` before this fix). Two new e2e tests (`tests_e2e.rs`) confirmed to FAIL
+without the fix and pass with it; three new unit tests (`semantic_sites.rs`) cover cross-file/
+same-file/ambiguous resolution's dependency-recording contract, including decision 28's own
+"never guess under ambiguity" invariant (an ambiguous ambient global records no dependency).

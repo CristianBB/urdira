@@ -97,17 +97,34 @@ use urdira_structural_store::DependencyRow;
 
 const DEPENDENCY_ROLE_UNKNOWN: u8 = 0;
 const DEPENDENCY_ROLE_RESOLUTION_INPUT: u8 = 1;
+/// Frente E-P0f (2026-09-07, ambient-global-dependents integrity fix): a
+/// consumer -> declaring-script dependency for an identifier that resolved
+/// through `resolver::AmbientModuleIndex::resolve_global` (a script file's
+/// un-imported top-level interface/const/etc, or a `declare global {}`
+/// block) rather than through an ordinary `core:import`/`core:export`
+/// relation -- see `urdira_jsts_syntax_worker::OwnerSemantics::
+/// ambient_global_dependencies`'s own doc comment for the full root-cause
+/// writeup and why this needs its own persisted `DependencyRow`, not just a
+/// same-call revisit.
+pub(super) const DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT: u8 = 2;
+
+/// The `ProposedRecordDependency::dependency_role` text
+/// `urdira-indexing-worker::v4::analyze::run_scoped`/`run_cold` set on every
+/// `ProposedRecordDependency` built from `OwnerSemantics::ambient_global_
+/// dependencies` -- shared here (rather than re-typed at each call site) so
+/// the string `role_byte` matches below can never drift from what the
+/// producer actually writes.
+pub(super) const AMBIENT_GLOBAL_DEPENDENCY_ROLE: &str = "jsts:ambient_global_input";
 
 /// `dependency_role` is TEXT in v3 (`jsts:resolution_input`, per
 /// `urdira-jsts-native-projection`'s `project_owner`); `DependencyRow.role`
-/// is `u8`. Only one role exists in this pipeline's producers today, so
-/// this is a two-value enum rather than a dictionary -- promote to a
-/// dictionary if a second role is ever introduced.
+/// is `u8`. Two roles exist in this pipeline's producers as of Frente
+/// E-P0f -- promote to a dictionary if a third is ever introduced.
 fn role_byte(role: &str) -> u8 {
-    if role == "jsts:resolution_input" {
-        DEPENDENCY_ROLE_RESOLUTION_INPUT
-    } else {
-        DEPENDENCY_ROLE_UNKNOWN
+    match role {
+        "jsts:resolution_input" => DEPENDENCY_ROLE_RESOLUTION_INPUT,
+        AMBIENT_GLOBAL_DEPENDENCY_ROLE => DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT,
+        _ => DEPENDENCY_ROLE_UNKNOWN,
     }
 }
 

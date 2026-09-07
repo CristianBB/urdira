@@ -8352,6 +8352,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let error = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true)
@@ -8387,6 +8388,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, false)
@@ -8423,6 +8425,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true)
@@ -8486,6 +8489,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true)
@@ -8554,6 +8558,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, false)
@@ -8591,6 +8596,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true)
@@ -8684,6 +8690,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true)
@@ -8756,6 +8763,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true)
@@ -8870,6 +8878,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true)
@@ -8970,6 +8979,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true).expect(
@@ -9061,6 +9071,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:test".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true).expect(
@@ -9132,6 +9143,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:empty".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         let owner = synthetic_hybrid_owner();
         let stats = merge_hybrid_reference_rows(&mut observations, &semantics, &owner, true)
@@ -9161,6 +9173,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:empty".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         assert!(hybrid_owner_can_skip_checker(&semantics, false, false));
     }
@@ -9191,6 +9204,7 @@ mod tests {
             }],
             sites_digest: "jsts:sites:sha256:nonempty".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         assert!(!hybrid_owner_can_skip_checker(&semantics, false, false));
     }
@@ -9219,6 +9233,7 @@ mod tests {
             pending_sites: vec![],
             sites_digest: "jsts:sites:sha256:empty".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         assert!(!hybrid_owner_can_skip_checker(&semantics, true, false));
     }
@@ -9254,6 +9269,7 @@ mod tests {
             }],
             sites_digest: "jsts:sites:sha256:nonempty".into(),
             jsdoc_typed_file: false,
+            ambient_global_dependencies: vec![],
         };
         assert!(hybrid_owner_can_skip_checker(&semantics, true, true));
     }
