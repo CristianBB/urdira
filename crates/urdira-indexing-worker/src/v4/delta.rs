@@ -1106,6 +1106,22 @@ fn run_one(
     let mut pending_closures: Vec<(PendingSiteKey, u32)> = Vec::new();
 
     let mut diff_one_owner = |prev_ordinal: Option<u32>,
+                              // Frente E-P0c fix (Brecha B root cause,
+                              // 2026-09-07): `true` exactly when THIS
+                              // owner's OWN ordinal changed this generation
+                              // (a genuine edit of the owner path itself --
+                              // "owner ordinal is not stable across a
+                              // content edit", P3-1 evidence doc `docs/
+                              // evidence/2026-09-03-v4-p3-1-incremental.md`
+                              // §4's own documented fact) -- as opposed to
+                              // this owner merely being REPROCESSED for an
+                              // unrelated reason (another path's own
+                              // create/delete/rename widened `affected_
+                              // owner_paths` to include it) while its own
+                              // ordinal stayed put. See the dependency-diff
+                              // branch below for why this distinction is
+                              // now load-bearing, not just informational.
+                              owner_identity_changed: bool,
                               next_records: Vec<RecordRow>,
                               next_deps: Vec<DependencyRow>,
                               next_pending: Vec<PendingSiteRow>| {
@@ -1211,15 +1227,54 @@ fn run_one(
             for dep in &prev_deps {
                 let id = dep.dependency_id();
                 prev_dep_ids.insert(id);
-                if !next_dep_ids.contains(&id) {
+                // Frente E-P0c fix (Brecha B root cause): a dependency
+                // present in BOTH `prev` and `next` (same `dependency_id`)
+                // used to be left ENTIRELY untouched here, unconditionally
+                // -- correct, and worth keeping, for the case P0-1's fix
+                // above was written for (this owner merely REPROCESSED,
+                // its OWN ordinal unchanged: `owner_identity_changed ==
+                // false`). But when THIS owner's own ordinal DID change
+                // (`owner_identity_changed == true`, i.e. a real edit of
+                // this owner path -- ordinals are never stable across a
+                // content edit, P3-1 evidence doc §4), leaving the row
+                // untouched leaves it PERMANENTLY attributed to the
+                // now-stale OLD ordinal: `StoreReader::deps_by_owner`
+                // (queried against the file's CURRENT/new ordinal, exactly
+                // what a residual pass or any other "what does this owner
+                // currently depend on" caller needs) then finds NOTHING
+                // for that owner, even though the logical dependency is
+                // very much still there -- confirmed live via `urdira-
+                // indexing-worker`'s own `residual_first_pass_sees_a_
+                // multi_file_edits_transitive_type_dependency_outside_the_
+                // edited_set` fixture (`v4/residual.rs`): editing two
+                // mutually-referencing files whose OWN dependency SET never
+                // changes left `deps_by_owner(new_ordinal, ...)` empty for
+                // both, even though the identical edges were plainly
+                // "visible" under their old, dangling ordinals via `iter_
+                // visible_deps` (which is why this was invisible to every
+                // prior root-vs-oracle Merkle comparison in this codebase:
+                // `dependency_id`/`dependency_logical` never encode an
+                // ordinal at all, so the GLOBAL set/root is unaffected --
+                // only an owner-SCOPED query like `deps_by_owner` ever sees
+                // the gap). Closing the old row and opening the fresh one
+                // (already correctly tagged with the NEW ordinal in `next_
+                // deps`) is safe to do WITHIN this same generation --
+                // `Segment::deps_effective_valid_to`'s own `valid_from`-
+                // gated closure map (added by P0-1's own "second,
+                // independent half") already handles a same-generation
+                // close+reopen of the identical `dependency_id` correctly
+                // (exactly the shape `pending.sites`' own unconditional
+                // wholesale-replace already relies on, per that accessor's
+                // own doc comment) -- P0-1's "leave untouched" choice was a
+                // deliberate WRITE-COUNT optimization for the unrelated-
+                // reprocessing case, never a correctness requirement here.
+                if !next_dep_ids.contains(&id) || owner_identity_changed {
                     deps_closures.push((id, generation_u32));
                 }
             }
-            opened_deps.extend(
-                next_deps
-                    .into_iter()
-                    .filter(|dep| !prev_dep_ids.contains(&dep.dependency_id)),
-            );
+            opened_deps.extend(next_deps.into_iter().filter(|dep| {
+                owner_identity_changed || !prev_dep_ids.contains(&dep.dependency_id)
+            }));
             for pending in store_reader.pending_sites_by_owner(ordinal, prev_generation) {
                 pending_closures.push((pending.key(), generation_u32));
             }
@@ -1245,14 +1300,28 @@ fn run_one(
         let next_pending = pending_sites_by_owner
             .remove(&new_ordinal)
             .unwrap_or_default();
-        diff_one_owner(old_ordinal, next_records, next_deps, next_pending);
+        // Frente E-P0c: `true` exactly when this owner path's OWN ordinal
+        // changed this generation (`old_ordinal` is `Some` -- it existed
+        // before -- and differs from its fresh `new_ordinal`) -- i.e. a
+        // genuine edit of THIS owner, not merely a reprocessing triggered
+        // by an unrelated path elsewhere in the batch.
+        let owner_identity_changed = old_ordinal.is_some_and(|old| old != new_ordinal);
+        diff_one_owner(
+            old_ordinal,
+            owner_identity_changed,
+            next_records,
+            next_deps,
+            next_pending,
+        );
     }
 
     // Deleted owners: no fresh rows at all, close everything under their
     // OLD ordinal (`deleted_owner_ordinals` computed once, above, ahead of
-    // the external-entity close-protection pass).
+    // the external-entity close-protection pass). Not an "owner identity
+    // changed" case (there is no NEW ordinal to migrate to -- the owner is
+    // simply gone), so `false` here.
     for ordinal in deleted_owner_ordinals {
-        diff_one_owner(Some(ordinal), Vec::new(), Vec::new(), Vec::new());
+        diff_one_owner(Some(ordinal), false, Vec::new(), Vec::new(), Vec::new());
     }
     // Zombie-owned external entities with no remaining protector (see the
     // "Zombie owner" case above): explicit closures, since no owner's own

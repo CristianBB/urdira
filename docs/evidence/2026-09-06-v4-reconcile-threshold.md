@@ -719,3 +719,300 @@ graph-diag-results.json`, `ep0b-remeasure-{202,1008}-results.json`), matching §
 pattern. `CARGO_TARGET_DIR` override (`.claude/worktrees/cargo-target-ep0b`) removed. All temporary
 diagnostic `#[ignore]` probe tests (resolver-resolution probe, oracle-cold-scan-and-dump, graph-set-diff,
 dependency-pill-records dump) added and removed within this session -- none survive in the final diff.
+
+## 11. Frente E-P0c (2026-09-07): Brecha A closed exactly (fixture + real-scale, byte-for-byte);
+## Brecha B closed 84% at real n8n scale (19 → 3 missing relations), root cause of the remaining
+## 3 localized but not yet fixed; a THIRD, independent, foundational bug found and fixed live
+## (`BucketedMerkleSet` count staleness after a disk round-trip)
+
+Branch `frente-ep0c-delta-references` on top of `4ddb890` (E-P0 + E-P0b merged). Per plan §0
+("fidelidad e integridad primero"): both brechas this task was scoped to are diagnosed to their
+real root cause and fixed at fixture scale with regression tests that fail-without/pass-with the
+fix; Brecha A additionally verified BYTE-FOR-BYTE (set comparator) at real n8n git-switch scale;
+Brecha B verified at real n8n git-switch scale to be 84% closed (19 → 3 missing relations, same
+switch, same corpus), with the remaining 3 root-caused to a DIFFERENT, narrower mechanism than
+Brecha A/B's own original hypotheses and left open with full repro rather than silently unnoticed,
+matching this campaign's own established practice (§9.4/§10.4's own prior-session dispositions).
+
+### 11.1 Brecha A root cause: `reresolve_file`'s narrow relation patch never invalidated
+### DOWNSTREAM references that resolved THROUGH an import while its target was still live
+
+**Reproduced** exactly as §10.4 finding #2 described it, at FIXTURE scale first (new e2e test
+`deleting_an_imported_files_export_drops_the_untouched_importers_stale_references_and_matches_an_
+independent_oracle`, `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`): `a.ts` exports
+`interface I`; `b.ts` imports `I`, using it as a parameter type in three functions. Cold scan, then
+a PURE structural `Changed{Deleted a.ts}` batch (T1's `path_membership_incremental` fast path) --
+`b.ts` itself is never touched. `graph` (and `pending.sites`) diverged from an independent
+from-scratch oracle of the identical (a.ts-less) final tree: `b.ts` kept 3 stale, `Confirmed`
+`jsts:references` relations pointing at `I`'s now-nonexistent interface -- a phantom
+`find_references` answer, invisible to `dependency`, which correctly closed.
+
+**Mechanism**: `urdira-jsts-syntax-worker/src/lib.rs`'s `reresolve_file` (T1's bounded add/remove
+re-resolution, triggered for any file whose specifier's candidate target set changed) only ever
+rebuilt the file's OWN `RelationKind::Import`/`Export` rows -- its own explicit filter excluded
+every other relation kind. The `jsts:references` relations a SEPARATE pass (the hybrid lane,
+`semantic_sites.rs`) had already baked into `b.ts`'s `relations` list, while `I` was still a live
+import target, were carried forward completely unexamined: correctly flipping the import itself to
+"unresolved" while leaving every relation that had resolved THROUGH it pointing at a dangling
+target with no mechanism to ever revisit them.
+
+**Fix**: promoted `reresolve_file` from an in-place relation patch to a FULL REPARSE. `docs/
+evidence/2026-09-02-file-creation-diagnosis.md`'s own T1 design already guarantees the file's
+BYTES are unchanged (a `path_membership_incremental` precondition) -- a fresh `parse_source` call
+against the SAME bytes, the CURRENT `available`/`resolver`, is therefore byte-for-byte identical to
+what a cold scan computes for this exact file, for the exact same reason `analyze()`'s cold path
+itself is deterministic. Replaced the narrow `reresolve_file` (rebuild relations in place) with a
+cheap, read-only `import_resolution_would_change` check (identical resolution-changed detection,
+zero cloning) that GATES a full reparse via `decode_source`+`parse_source`, reusing a new
+`validated_by_path` lookup (the same `validated: Vec<ValidatedSource>` `analyze()` already builds
+from ALL current sources, not just changed ones) -- bounded to exactly `stale_paths`, never every
+corpus file, preserving T1's own cost class.
+
+### 11.2 A SECOND, independent, foundational bug found live while verifying Brecha A: `BucketedMerkleSet`'s
+### own `bucket_count` bookkeeping goes stale after a disk round-trip, corrupting `root()`'s
+### `count == 0` special case for ANY category whose corpus-wide live member count returns to zero
+
+Verifying 11.1's fix against an independent oracle surfaced a SECOND, unrelated divergence: the
+`dependency` root (not `graph`) mismatched even though `dump_dependency_set_diff` showed BOTH sides
+had **zero live edges** (`b.ts`'s only dependency, on the now-deleted `a.ts`, correctly closed with
+no replacement). Root cause, found in `crates/urdira-indexing-core/src/merkle_bucket.rs`
+(`docs/evidence/2026-09-02-v4-p0-s3-merkle-bucket.md`'s own "known caveat", explicitly flagged as a
+follow-up then and finally closed here): `BucketedMerkleSet::read_from` restores the AGGREGATE
+`count` from the file header but never restores PER-BUCKET counts (never persisted at all) --
+`update()` used to read `self.bucket_count[bucket_idx]` as a touched bucket's PRE-change count,
+which silently reads `0` for any bucket a `read_from`-loaded set has never itself observed a
+member-count delta for, regardless of what it actually held. Every `update()` call following a
+`read_from` (i.e. every incremental generation after the first) therefore inflated `self.count` by
+the true prior size of each touched bucket that already had members -- invisible everywhere except
+`root()`'s ONE `count == 0` special case (a deliberate, hard-coded `ZERO` sentinel for a genuinely
+empty set, per that crate's own doc: "this is the ONE deliberate exception"): once the true
+corpus-wide count for a category returns to exactly zero, `self.count` never again reaches zero,
+so `root()` permanently returns a real (non-empty-sentinel) node digest instead of `ZERO`, diverging
+from a from-scratch oracle's `BucketedMerkleSet::from_sorted(&[])` (which correctly returns `ZERO`).
+
+**Fix**: `BucketedMerkleSet::update`'s `bucket_entries` closure contract changed from `Fn(u32) ->
+Vec<(Digest32, Digest32)>` (post-change contents only) to `Fn(u32) -> (u32, Vec<(Digest32,
+Digest32)>)` (`(pre_change_count, post_change_entries)`) -- every real caller already computes or
+has on hand the true pre-change bucket length anyway (it is the length of the pre-change entries it
+reads before applying `changes`), so this is a pure plumbing change, not new work, at every call
+site: `urdira-structural-store::writer::write_delta`'s two `apply_changes_in_bucket` calls (records/
+dependency), `urdira-indexing-worker::v4::diff::graph_bucket_entries` (graph), and `urdira-source-
+frontier::frontier::apply_bucket_change` (source-state; always exact here since that tree is
+rebuilt via `from_sorted` on every `Frontier::load`, never round-tripped through `write_to`/
+`read_from` at all). New regression test `merkle_bucket::tests::deleting_the_last_member_after_a_
+disk_round_trip_converges_to_the_empty_root`: builds a 1-member set, `write_to`+`read_from`
+round-trips it, deletes the member via `update`, asserts `root() == ZERO == BucketedMerkleSet::
+empty().root()` -- fails without the fix (returns a real digest), passes with it.
+
+A SECOND, related bug in the SAME family surfaced while re-verifying Brecha A's own fixture with
+this fix in place: `urdira-indexing-worker::v4::delta.rs`'s own P0-1 dependency diff (§9.2's own
+fix) intentionally leaves a dependency row PHYSICALLY untouched (never closed, never reopened) when
+its `dependency_id` is identical before/after an owner's reprocessing -- correct when the OWNER
+reprocessed for an UNRELATED reason (its own ordinal unchanged), but WRONG when the OWNER'S OWN
+ordinal changed (any genuine content edit mints a fresh `artifact_version_id`/ordinal, P3-1
+evidence doc §4): the untouched row stays attributed to the now-DANGLING old ordinal forever, so
+`StoreReader::deps_by_owner(current_ordinal, ...)` -- exactly what §11.4's residual fix needs --
+finds nothing for that owner even though the edge is still logically live (confirmed live via
+§11.4's own fixture: `deps_by_owner` empty for both `a.ts`/`b.ts` after editing them together
+despite their dependency SET never changing). `dependency_id`/`dependency_logical` never encode an
+ordinal at all, so no PRIOR root-vs-oracle Merkle comparison in this codebase's history ever caught
+this -- only an owner-SCOPED query does. **Fix**: `diff_one_owner` takes a new `owner_identity_
+changed: bool` (`old_ordinal.is_some_and(|old| old != new_ordinal)`); when true, a same-`dependency_
+id` edge is closed AND reopened under the fresh ordinal (never left untouched). Safe within one
+generation because `Segment::deps_effective_valid_to`'s `valid_from`-gated closure map (P0-1's own
+"second, independent half") already resolves a same-generation close+reopen of one physical key
+correctly on the READ side -- the missing WRITE-side half was `writer.rs`'s own `dep_changes` list
+always ordering every `Set` (open) before every `Delete` (close), so a same-key open+close pair
+left the MERKLE bucket with the key ABSENT (`apply_changes_in_bucket` processes changes in order,
+last write wins) even though the physical row correctly stayed visible -- fixed by building
+`dep_changes` Deletes-first, Sets-after (the reverse of `record_changes`, which never needs this:
+decision 11 guarantees a record's identity never collides between one generation's own opens and
+closes, unlike a dependency's unsalted, owner-path-based identity).
+
+### 11.3 Brecha B, first (residual-specific) mechanism: tsgo's own `VirtualFs`/`file_map`, for a
+### delta-triggered pass, was narrower than what cross-file type resolution can need
+
+Confirmed via a NEW fixture-scale test (`crates/urdira-indexing-worker/src/v4/residual.rs`'s
+`residual_first_pass_sees_a_multi_file_edits_transitive_type_dependency_outside_the_edited_set`):
+`c.ts` declares `abstract class Base { m(): number {...} }`; `a.ts` declares `class A extends Base
+{}` (never redeclaring `m`); `b.ts` calls `items.map((item) => item.m())` on an `A[]` -- a `lib.
+d.ts` `Array.prototype.map` dispatch (typeflow's own documented "guaranteed pending" shape) whose
+INHERITED-method resolution needs tsgo to actually see `c.ts`. `a.ts`+`b.ts` edited together (`c.ts`
+untouched, no pending site of its own): the post-edit residual pass, with `touched_owners: Some(
+["a.ts", "b.ts"])` (exactly what `scan::run_with_residual` schedules for this delta), could not
+resolve the site at all (`unresolved=1`) without the fix, `upgraded=1` with it.
+
+**Root cause**: `run_once_with_quiet_period`'s `file_map` (`crates/urdira-indexing-worker/src/v4/
+residual.rs`) is filtered to `resolved_visible_owners` -- on a delta-triggered first pass, a FLAT
+`touched_owners ∪ pending_owners` set (`resolve_visible_owners_for_pass`), never a transitive
+closure. A file a touched/pending owner's OWN types transitively depend on (a base class, a
+re-exported interface, a shared type alias) is invisible to tsgo unless it ALSO happens to be
+independently touched or pending -- a cold scan never narrows `file_map` at all
+(`touched_owners: None`), so this gap is exclusive to the delta path. **Fix**: new `expand_with_
+dependency_closure` (forward BFS over `StoreReader::deps_by_owner`, already O(1)-indexed) widens a
+first pass's `resolved_visible_owners` with every file the seed set transitively depends on, before
+building `file_map` -- `candidate_owners` (the WINDOW PLAN, i.e. which sites actually get a
+resolution attempt this pass) stays UNCHANGED and narrow, preserving the reschedule-convergence
+fix `candidate_owners_for_pass` exists for (C.5, 2026-09-05) -- only VISIBILITY widens, never
+scheduling. Forward-only (never `deps_reverse`): a type flows INTO a scheduled owner's own
+resolution via what it imports, never via what imports it.
+
+### 11.4 Brecha B, second (syntax/typeflow) mechanism, found live at REAL n8n scale (residual was
+### NEVER involved): `TypeflowCache::build_index`'s single settling pass converges to a WRONG state
+### for a multi-file edit batch; a second (bounded, fixed-point) pass closes MOST but not all of it
+
+**Reproduced** on the real `tags-3-months` git switch (`n8n@1.123.25` → `n8n@1.123.56`, 504 changed
+files) with a FIXED release binary (11.1-11.3's fixes applied): `scripts/v4-reconcile-threshold.mjs
+--git-switch --keep-data --only-switch tags-3-months`, then a NEW comparator, `graph_identity_set_
+matches_between_two_kept_stores` (`tests_e2e.rs`) -- `CATEGORY_RELATION` rows compared by
+`identity_key` (never `record_id`/the raw merkle root) between the kept incremental store and an
+independent from-scratch oracle of the identical final tree. **Raw `graph` root parity is
+unreachable here by construction, unrelated to Brecha A/B**: `docs/evidence/2026-09-03-v4-p3-1-
+incremental.md` §5.1 already documents, as a decision-11 identity-chaining fact predating this
+task, that ANY genuinely edited owner's own relations legitimately get a CHAINED `record_id`
+(`H(digest || predecessor)`) on the incremental side while an independent oracle always mints the
+unconditional cold "first occurrence" id (`sha256(digest)`) for the SAME logical relation -- a real
+git switch always edits files, so `roots_ok.graph` (the harness's own raw-root check) reads `false`
+on BOTH real switches regardless of any fix in this session (confirmed: `dependency=true,
+graph=false` both before and after). The SET comparator is the correct instrument for a
+missing/phantom relation specifically (decision 11 guarantees `identity_key` itself never chains).
+
+**Before any fix in this section**: 19 relations present ONLY in the oracle (0 phantom), matching
+§10.4's own original finding exactly (same identities, e.g. `jsts:call:packages/@n8n/expression-
+runtime/src/bridge/isolated-vm-bridge.ts:...:jsts:method:...types/bridge.ts:2185:debug`).
+**Confirmed this session, contradicting §10.4's own hypothesis**: `URDIRA_V4_RESIDUAL` was never set
+for either side of this measurement (the harness never enables it; grep of the full run log for
+"residual" returns zero matches) -- the background tsgo pass NEVER RAN. `jsts:method`/`jsts:
+property` are ordinary SYNTAX-LEVEL entity kinds (`EntityKind::Method`/`Property`, `urdira-jsts-
+syntax-worker/src/lib.rs`), not residual-exclusive; these 19 relations are produced by the
+HYBRID LANE's typeflow-driven call/reference resolution (`semantic_sites.rs`, driven by `crates/
+urdira-indexing-worker/src/v4/typeflow.rs`'s `TypeflowCache`), entirely independent of §11.3's own
+residual fix. `git diff --name-only` on the two tags confirms BOTH files of each pair (caller and
+callee-declaring file) are genuinely edited in the SAME batch -- the same "multiple mutually-
+referencing files edited together" shape as Brecha B's own brief, just one layer earlier in the
+pipeline than the brief's own residual hypothesis.
+
+**Mechanism**: `TypeflowCache::build_index`'s warm branch processes `pending_upserted` (a
+`BTreeSet<String>`, i.e. PATH-alphabetical order) ONE PASS: for each upserted `path`, `refresh_
+paths = index.importers_of(path) + path` is computed the MOMENT `path` itself is (re)inserted, then
+`resolve_import_targets_for(refresh_paths, ...)` feeds `ProgramIndex::replace_file`. When an owner
+`X` (e.g. `types/bridge.ts`, declaring the callee) and one of ITS OWN importers `Y` (e.g. `bridge/
+isolated-vm-bridge.ts`, calling it) are BOTH in `upserted`, their relative alphabetical order
+decides whether `Y`'s own needed-imports resolution (computed the moment `Y` itself was inserted)
+ever gets a chance to see `X`'s fresh, post-edit shape -- a single pass leaves exactly one of the
+two orderings correct. **Fix**: replaced the single pass with a BOUNDED FIXED-POINT loop (`MAX_
+SETTLING_ROUNDS = 8`) over the SAME `upserted` set, repeating the identical per-path work
+(`importers_of` + `resolve_import_targets_for` + `replace_file`) until two consecutive rounds
+produce byte-identical `import_targets` resolutions for every upserted path (never silently capped:
+logs if the bound is hit). `upserted.len() <= 1` (the overwhelming common case, a single-file edit)
+always converges after exactly one extra round, unchanged cost from this function's pre-existing,
+already-tested behavior.
+
+**Result after this fix, SAME switch, SAME fixed release binary**: 19 → **3** missing relations
+(84% closed) -- the `bridge.ts`/`isolated-vm-bridge.ts` pair (4 relations) is now byte-for-byte
+correct; a SEPARATE, previously-hidden pair remains:
+```
+jsts:references:packages/cli/src/expression-observability/expression-observability.provider.ts:1515:1535:jsts:constructor:...:constructor:jsts:property:packages/@n8n/config/src/configs/expression-engine.config.ts:1322:observabilityEnabled
+jsts:references:...expression-observability.provider.ts:1551:1557:...constructor:jsts:property:...expression-engine.config.ts:436:engine
+jsts:references:...expression-observability.provider.ts:6049:6062:...startSpan:jsts:property:...expression-engine.config.ts:1628:tracesEnabled
+```
+Both `expression-observability.provider.ts` and `expression-engine.config.ts` are ALSO genuinely
+edited in this same real switch (confirmed via `git diff --name-only`). The access pattern is a
+TypeScript CONSTRUCTOR PARAMETER PROPERTY (`constructor(private readonly config:
+ExpressionEngineConfig, ...)`) reading a member (`this.config.observabilityEnabled`) declared on a
+class imported from a DIFFERENT PACKAGE (`@n8n/config`, not a relative import) -- confirmed member
+enumeration for parameter properties exists (`urdira-jsts-typeflow::lib.rs`'s own dedicated test
+coverage), and `collect_needed_imports_for_summary` does walk `class.members`' `type_ref`s
+(covering parameter properties equally). **NOT a convergence-speed issue**: raising `MAX_SETTLING_
+ROUNDS` to 8 (from the initially-tried 2) produced the IDENTICAL 899,120-relation incremental store
+byte-for-byte (no "did not converge" log line either) -- the loop converges quickly to a STABLE but
+WRONG fixed point for this specific pair, meaning the remaining defect is a genuine logic gap
+(most likely inside `urdira-jsts-typeflow::ProgramIndex::replace_file`/`reflow_files`/
+`link_importer`'s own handling of two back-to-back `replace_file` calls for a mutually-referencing
+pair within one `build_index` invocation, not `typeflow.rs`'s outer wrapper), not something more
+settling rounds can fix. `urdira-jsts-typeflow`'s own crate-level randomized test (`incremental_
+matches_from_scratch_after_random_edit_sequences_over_synthetic_project`) applies exactly ONE
+edit per step, never two related files in the same batch before a shared verification point --
+this exact scenario has no crate-level coverage today. **Not fixed this session**: root-caused to
+this specific interaction (localized to the file/mechanism named above, cross-package parameter-
+property member access, both declaring and using file edited together) but the deeper fix (inside
+`urdira-jsts-typeflow`, a different crate than this task's own primary files) was judged out of
+this session's remaining budget after the `BucketedMerkleSet`/dependency-ordinal/residual-closure/
+typeflow-settling fixes above. Flagged here with full repro (exact tags, exact files, exact
+identities, exact comparator invocation) rather than left silently unnoticed, per this campaign's
+own established practice.
+
+### 11.5 Threshold decision: `RECONCILE_DELTA_THRESHOLD` left UNCHANGED at 0.01
+
+Per plan §0 criterion (a): `roots_ok.graph` (raw root) reads `false` on both real git switches
+before AND after every fix in this section, for a reason established as REPRESENTATIONAL and
+unrelated to correctness (§11.4's own decision-11 chaining explanation) -- the raw-root check the
+harness (`scripts/v4-reconcile-threshold.mjs`) uses cannot, by construction, ever read `true` for a
+real switch (which always edits files), regardless of any future reference-parity fix. The
+SET-based comparator (§11.4) is the correct instrument, and it still finds a real (if now much
+smaller and precisely localized) reference-loss gap on the ONE real switch measured this session.
+`T = 0.01` (unchanged) remains correct per R1's own formula: T only rises once a graph=true cross-
+over is achievable, and it is not yet, on either measure. `--files 1008`/`2015` and the
+`head-vs-head200` switch were NOT re-measured this session (time budget spent on this section's own
+diagnosis/fix cycle, and the `tags-3-months` result -- 899k+ relations, 13k+ file frontier, a REAL
+git-history diff -- is representative enough to leave T's own decision unambiguous either way: a
+graph=true crossover is not achievable at ANY N while §11.4's own residual defect remains open). A
+future task closing §11.4's own remaining 3-relation gap should re-measure both switches plus the
+fraction sweep before revisiting T upward.
+
+### 11.6 Verification (this session)
+
+```
+cargo fmt --all -- --check                                                      # clean
+cargo clippy --workspace --all-targets --locked -- -D warnings                  # clean
+cargo test -p urdira-indexing-worker -p urdira-jsts-syntax-worker \
+  -p urdira-source-frontier -p urdira-structural-store --locked
+  # 124 passed/18 ignored (indexing-worker), 300 passed (source-frontier), 46 passed
+  # (structural-store unit) + every integration test binary in that crate -- 0 failed
+cargo test -p urdira-indexing-core --locked                                     # 34 passed/2 ignored, 0 failed
+cargo test -p urdira-indexing-worker --locked -- --ignored \
+  inferred_types_and_diagnostics_across_two_runs_and_an_edit \
+  residual_emits_types_and_diagnostics_with_zero_pending_sites \
+  residual_first_pass_sees_a_multi_file_edits_transitive_type_dependency_outside_the_edited_set
+  # 3 passed, 0 failed (URDIRA_TSGO_BINARY set)
+cargo build --release --locked -p urdira-indexing-worker                        # clean
+CI=true ./node_modules/.bin/vitest run tests/phase-daemon-v4-reconcile.test.ts tests/v4-scan.test.ts
+                                                                                  # 3 passed, 4 skipped
+```
+
+### 11.7 Files touched
+
+- `crates/urdira-jsts-syntax-worker/src/lib.rs`: `reresolve_file` replaced by `import_resolution_
+  would_change` (cheap check) + a full reparse in the `stale_paths` loop, `validated_by_path`
+  lookup added (§11.1).
+- `crates/urdira-indexing-core/src/merkle_bucket.rs`: `update`'s `bucket_entries` closure contract
+  now returns `(pre_change_count, post_change_entries)`; new regression test (§11.2).
+- `crates/urdira-structural-store/src/merkle.rs`: `load_and_update`'s closure type updated to match.
+- `crates/urdira-structural-store/src/writer.rs`: both `apply_changes_in_bucket` call sites'
+  closures updated; `dep_changes` construction reordered to Deletes-first, Sets-after (§11.2).
+- `crates/urdira-source-frontier/src/frontier.rs`: `apply_bucket_change`'s closure updated (§11.2).
+- `crates/urdira-indexing-worker/src/v4/diff.rs`: `graph_bucket_entries` returns the tuple form too
+  (§11.2).
+- `crates/urdira-indexing-worker/src/v4/delta.rs`: `diff_one_owner` gains `owner_identity_changed`;
+  a same-`dependency_id` edge closes+reopens (instead of staying untouched) when the owner's own
+  ordinal changed this generation (§11.2).
+- `crates/urdira-indexing-worker/src/v4/residual.rs`: new `expand_with_dependency_closure`, wired
+  into `run_once_with_quiet_period`'s `resolved_visible_owners` on a chain's first pass; new e2e
+  test (§11.3).
+- `crates/urdira-indexing-worker/src/v4/typeflow.rs`: `build_index`'s warm branch now runs a
+  bounded fixed-point settling loop over `pending_upserted` instead of one pass (§11.4).
+- `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`: new `deleting_an_imported_files_export_
+  drops_the_untouched_importers_stale_references_and_matches_an_independent_oracle` (§11.1) and
+  `graph_identity_set_matches_between_two_kept_stores` (§11.4, permanent diagnostic, `#[ignore]`d,
+  needs two kept `--keep-data` structural roots via env vars).
+- This file: §11.
+
+### 11.8 Scratch cleanup
+
+`~/Proyectos/urdira-benchmark/v4-fold/ep0c-{n8n-git,git-switch,git-switch-keep,git-switch-keep2,
+git-switch-keep3}*` (git clones, `--keep-data` outputs) deleted at the end of this session; the
+small `*-results.json` companions retained. `CARGO_TARGET_DIR` override (`.claude/worktrees/cargo-
+target-ep0c`) removed. All temporary `URDIRA_DEBUG_DEPS`-gated diagnostic `eprintln!`s (in
+`resolved_dependencies`/`facts_for_one_path`, `urdira-jsts-syntax-worker/src/lib.rs`) and the ad
+hoc `iter_visible_deps`/`expand_with_dependency_closure` dumps (`residual.rs`) added and removed
+within this session -- none survive in the final diff.

@@ -275,21 +275,31 @@ pub fn group_changes_by_bucket(
 /// bucket-index check below is now a cheap, redundant safety net over an
 /// already-tiny slice, not the hot path.
 ///
-/// **Must return POST-change contents**, not the pre-delta snapshot:
-/// `BucketedMerkleSet::update`'s own contract (`urdira-structural-store`'s
-/// `writer::write_delta` applies this same pattern for `records`/
-/// `dependency` via its private `apply_changes_in_bucket`, which this is a
-/// by-necessity duplicate of -- that helper is not `pub`, and duplicating
-/// ~15 lines was cheaper than widening that crate's API surface for one
-/// caller). Missing this update-application step was a real bug found live
-/// by `tests_e2e.rs`'s incremental edit test: the graph root diverged from
-/// a from-scratch rebuild over the SAME final key set until fixed.
+/// **Must return `(pre_change_count, post_change_entries)`**, never just
+/// the post-change snapshot: `BucketedMerkleSet::update`'s own contract
+/// (`urdira-structural-store`'s `writer::write_delta` applies this same
+/// pattern for `records`/`dependency` via its private `apply_changes_in_
+/// bucket`, which this is a by-necessity duplicate of -- that helper is not
+/// `pub`, and duplicating ~15 lines was cheaper than widening that crate's
+/// API surface for one caller). Missing the update-application step here
+/// was a real bug found live by `tests_e2e.rs`'s incremental edit test: the
+/// graph root diverged from a from-scratch rebuild over the SAME final key
+/// set until fixed. Missing `pre_change_count` (Frente E-P0c, 2026-09-07)
+/// was a SECOND, narrower real bug: `store.visible_entries_in_bucket(...)`
+/// (this bucket's own PRE-change length, always correct) is exactly what
+/// `BucketedMerkleSet::update` now requires as its own caller-supplied
+/// pre-change count, instead of trusting its own (unreliable after a
+/// `read_from`) `bucket_count` bookkeeping -- see that function's own doc
+/// comment for the full mechanism and the `graph`/`dependency` root
+/// mismatch it caused whenever a category's corpus-wide live member count
+/// returned to exactly zero after having been nonzero in an earlier
+/// generation.
 pub fn graph_bucket_entries(
     store: &StoreReader,
     bucket_idx: u32,
     prev_generation: u64,
     changes: &[urdira_indexing_core::merkle_bucket::Change],
-) -> Vec<(merkle::Digest32, merkle::Digest32)> {
+) -> (u32, Vec<(merkle::Digest32, merkle::Digest32)>) {
     let mut entries: Vec<(merkle::Digest32, merkle::Digest32)> = store
         .visible_entries_in_bucket(bucket_idx, prev_generation)
         .into_iter()
@@ -299,6 +309,7 @@ pub fn graph_bucket_entries(
                 .is_some_and(|view| view.category() == CATEGORY_RELATION)
         })
         .collect();
+    let pre_change_count = entries.len() as u32;
     for change in changes {
         match change {
             urdira_indexing_core::merkle_bucket::Change::Set { key, logical }
@@ -315,7 +326,7 @@ pub fn graph_bucket_entries(
             _ => {}
         }
     }
-    entries
+    (pre_change_count, entries)
 }
 
 #[cfg(test)]

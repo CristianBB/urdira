@@ -21,6 +21,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use urdira_indexing_core::merkle_bucket::{Change, SetKind, to_prefixed_hex};
 
+/// `BucketedMerkleSet::update`'s own `bucket_entries` return shape:
+/// `(pre_change_count, post_change_entries)` -- see that function's doc
+/// comment (Frente E-P0c) for why the count can never be derived from the
+/// loaded set itself.
+type BucketEntries = (u32, Vec<([u8; 32], [u8; 32])>);
+
 pub struct SegmentSummary {
     /// `bytes[file_name] = (total_bytes_incl_header, xxh3_of_data)`.
     pub files: BTreeMap<String, (u64, u64)>,
@@ -656,21 +662,51 @@ impl SegmentWriter {
             .collect();
         record_changes.extend(closures.iter().map(|(k, _)| Change::Delete { key: *k }));
 
-        let mut dep_changes: Vec<Change> = deps_opened
+        // Frente E-P0c fix (Brecha B root cause, 2026-09-07): DELETES
+        // first, Sets after -- the reverse order of `record_changes` above.
+        // `record_id` (decision 11: same identity + different digest MUST
+        // chain to a FRESH id) can never collide between one generation's
+        // own `opened_rows`/`closures`, so that order never matters there.
+        // `dependency_id` has no such guarantee -- it is a pure, unsalted
+        // function of `(owner_path, dep_path, role)` (`deps.rs::
+        // dependency_id`) -- and `delta.rs`'s own dependency diff
+        // (`diff_one_owner`) now legitimately closes AND reopens the
+        // IDENTICAL `dependency_id` within one generation whenever an
+        // owner's OWN ordinal changes (a genuine edit of that owner) but
+        // its dependency set does not: the fresh row (tagged with the
+        // owner's NEW ordinal) must survive, superseding the stale one
+        // (tagged with the owner's OLD, now-dangling ordinal) being closed
+        // in the SAME batch. With the old Set-before-Delete order, `merkle::
+        // load_and_update`'s `apply_changes_in_bucket` (`urdira-structural-
+        // store`) / `diff::graph_bucket_entries`-style appliers process
+        // changes strictly in list order, so a same-key `[Set, Delete]`
+        // pair left the bucket with the key ABSENT -- vanishing from the
+        // `dependency` merkle tree/root even though the physical storage
+        // row remains correctly visible (`Segment::deps_effective_valid_to`'s
+        // own `valid_from`-gated closure map, unaffected by list order,
+        // already resolves a same-generation close+reopen of one PHYSICAL
+        // key correctly on the READ side -- this fix is the WRITE-side
+        // merkle counterpart). Deletes-first, Sets-after makes a same-key
+        // pair resolve to "present" (Set is the more authoritative, later-
+        // written state), matching the physical row's own correct
+        // visibility, while a key that is ONLY ever closed (no matching
+        // Set at all -- a genuinely removed dependency) is unaffected: the
+        // Delete still runs, nothing re-adds the key afterward.
+        let mut dep_changes: Vec<Change> = deps_closures
             .iter()
-            .filter(|r| {
-                r.valid_from as u64 <= generation
-                    && (r.valid_to == 0 || r.valid_to as u64 > generation)
-            })
-            .map(|r| Change::Set {
-                key: r.dependency_id,
-                logical: merkle::dependency_logical(r),
-            })
+            .map(|(k, _)| Change::Delete { key: *k })
             .collect();
         dep_changes.extend(
-            deps_closures
+            deps_opened
                 .iter()
-                .map(|(k, _)| Change::Delete { key: *k }),
+                .filter(|r| {
+                    r.valid_from as u64 <= generation
+                        && (r.valid_to == 0 || r.valid_to as u64 > generation)
+                })
+                .map(|r| Change::Set {
+                    key: r.dependency_id,
+                    logical: merkle::dependency_logical(r),
+                }),
         );
 
         // Load + apply both trees' updates in memory (no I/O beyond the
@@ -701,7 +737,7 @@ impl SegmentWriter {
         let records_update = if record_changes.is_empty() {
             None
         } else {
-            let bucket_entries = |idx: u32| -> Vec<([u8; 32], [u8; 32])> {
+            let bucket_entries = |idx: u32| -> BucketEntries {
                 apply_changes_in_bucket(
                     current_reader.visible_entries_in_bucket(idx, prev_generation),
                     record_changes_by_bucket
@@ -726,7 +762,7 @@ impl SegmentWriter {
         let deps_update = if dep_changes.is_empty() {
             None
         } else {
-            let bucket_entries = |idx: u32| -> Vec<([u8; 32], [u8; 32])> {
+            let bucket_entries = |idx: u32| -> BucketEntries {
                 apply_changes_in_bucket(
                     current_reader.visible_dep_entries_in_bucket(idx, prev_generation),
                     dep_changes_by_bucket
@@ -857,11 +893,18 @@ fn group_changes_by_bucket(changes: &[Change]) -> HashMap<u32, Vec<Change>> {
     grouped
 }
 
+/// Applies `changes` to `entries` (this bucket's PRE-change, visible
+/// contents) and returns `(pre_change_count, post_change_entries)` --
+/// `entries.len()` before this function mutates it is exactly the true
+/// pre-change count `BucketedMerkleSet::update` now requires from its
+/// caller (Frente E-P0c: never derivable from the tree itself after a
+/// `read_from`, see that function's own doc comment).
 fn apply_changes_in_bucket(
     mut entries: Vec<([u8; 32], [u8; 32])>,
     changes: &[Change],
     bucket_idx: u32,
-) -> Vec<([u8; 32], [u8; 32])> {
+) -> BucketEntries {
+    let pre_change_count = entries.len() as u32;
     for change in changes {
         match change {
             Change::Set { key, logical } if merkle::bucket_index_of(key) == bucket_idx => {
@@ -874,7 +917,7 @@ fn apply_changes_in_bucket(
             _ => {}
         }
     }
-    entries
+    (pre_change_count, entries)
 }
 
 fn qualify_files(

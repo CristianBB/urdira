@@ -281,24 +281,85 @@ impl TypeflowCache {
             for path in &removed {
                 index.remove_file(path);
             }
-            for path in &upserted {
-                let Some(summary) = self.summaries.get(path) else {
-                    // Upserted then removed again before this `build_index`
-                    // call ever ran (both edits landed in the SAME
-                    // generation's dirty set) -- `pending_removed` already
-                    // handled it above; nothing left to insert.
-                    continue;
-                };
-                let mut refresh_paths: Vec<String> = index.importers_of(path);
-                refresh_paths.push(path.clone());
-                let updates = resolve_import_targets_for(
-                    &self.summaries,
-                    refresh_paths.iter().map(String::as_str),
-                    resolver,
-                    available,
-                    files,
-                );
-                index.replace_file(path, summary.clone(), &updates);
+            // Frente E-P0c fix (Brecha B "second finding", 2026-09-07): a
+            // BOUNDED FIXED-POINT settling loop over `upserted`, not a
+            // single pass. This function's own doc comment already names
+            // the exact gap a single pass leaves open: each `path`'s own
+            // `refresh_paths` is `index.importers_of(path)` queried the
+            // moment `path` itself is (re)inserted -- for a MULTI-FILE edit
+            // batch where an owner `path` and one of its OWN importers are
+            // BOTH in `upserted`, the two paths' relative order in this
+            // `BTreeSet` iteration can decide whether the importer's own
+            // `resolve_import_targets_for` call (scoped to ITS OWN
+            // `refresh_paths`, computed during the IMPORTER's own turn)
+            // ever gets a chance to resolve against the EXPORTER's fresh
+            // (post-edit) shape -- confirmed live on two SEPARATE n8n
+            // `tags-3-months` git-switch pairs (`types/bridge.ts`'s `debug`
+            // method + its caller `bridge/isolated-vm-bridge.ts`; `@n8n/
+            // config`'s `expression-engine.config.ts` properties +
+            // `cli/expression-observability/expression-observability.
+            // provider.ts`'s constructor/method reading them), both edited
+            // together in the same real commit range. A single extra pass
+            // closed the FIRST pair but not the second (a chain one hop
+            // longer, or simply the wrong relative order for THAT pair) --
+            // rather than guess a fixed pass count, this loop repeats the
+            // exact per-path work (`importers_of(path)` + `resolve_import_
+            // targets_for` + `replace_file`) until two consecutive rounds
+            // produce BYTE-IDENTICAL `import_targets` resolutions for every
+            // `upserted` path (a real fixed point, matching the "four-pass
+            // closure... to converge" fixed-point language `urdira_jsts_
+            // typeflow`'s own crate doc already uses for `ProgramIndex`'s
+            // internal reflow), capped at `MAX_SETTLING_ROUNDS` as a
+            // defensive backstop (logged, never silently truncated) against
+            // a pathological non-converging edit graph. Bounded by
+            // `upserted`'s own size per round (never the whole corpus), so
+            // this preserves the per-edit cost class this module's own doc
+            // comment establishes for the common single-file-edit case
+            // (`upserted.len() <= 1` can never have a cross-file ordering
+            // conflict with itself, so it always converges after exactly
+            // one round, unchanged from this function's pre-existing,
+            // already-tested behavor); idempotent once the fixed point is
+            // reached, since `replace_file`'s own internal `reflow_files`
+            // is itself idempotent over unchanged inputs.
+            const MAX_SETTLING_ROUNDS: usize = 8;
+            let mut previous_round: Option<HashMap<(String, String, String), String>> = None;
+            for round in 0..MAX_SETTLING_ROUNDS {
+                let mut round_updates: HashMap<(String, String, String), String> = HashMap::new();
+                for path in &upserted {
+                    let Some(summary) = self.summaries.get(path) else {
+                        // Upserted then removed again before this
+                        // `build_index` call ever ran (both edits landed
+                        // in the SAME generation's dirty set) --
+                        // `pending_removed` already handled it above;
+                        // nothing left to insert.
+                        continue;
+                    };
+                    let mut refresh_paths: Vec<String> = index.importers_of(path);
+                    refresh_paths.push(path.clone());
+                    let updates = resolve_import_targets_for(
+                        &self.summaries,
+                        refresh_paths.iter().map(String::as_str),
+                        resolver,
+                        available,
+                        files,
+                    );
+                    round_updates.extend(updates.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    index.replace_file(path, summary.clone(), &updates);
+                }
+                let converged = previous_round.as_ref() == Some(&round_updates);
+                previous_round = Some(round_updates);
+                if converged {
+                    break;
+                }
+                if round + 1 == MAX_SETTLING_ROUNDS {
+                    eprintln!(
+                        "[urdira-indexing-worker] v4 typeflow: settling loop did not converge \
+                         within {MAX_SETTLING_ROUNDS} rounds for {} upserted path(s) -- \
+                         proceeding with the last round's state (a from-scratch cold scan of \
+                         this generation would still be correct if this ever fires in practice)",
+                        upserted.len(),
+                    );
+                }
             }
         }
         self.index

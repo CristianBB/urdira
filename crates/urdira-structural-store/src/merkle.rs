@@ -122,13 +122,15 @@ pub fn persist(set: &BucketedMerkleSet, dir: &Path, kind: SetKind, generation: u
 /// Loads the existing `dir/<set>.tree` and applies `changes` in memory
 /// (no I/O beyond the initial read). Returns the mutated set and the
 /// touched bucket indices for a later [`persist_slots`] call.
-/// `bucket_entries` must return the current (post-change) contents of a
-/// given bucket.
+/// `bucket_entries` must return `(pre_change_count, post_change_entries)`
+/// for a given bucket -- see `BucketedMerkleSet::update`'s own doc comment
+/// for why `pre_change_count` can never be derived from the loaded set
+/// itself (`read_from` never restores per-bucket counts).
 pub fn load_and_update(
     dir: &Path,
     kind: SetKind,
     changes: &[Change],
-    bucket_entries: impl Fn(u32) -> Vec<(Digest32, Digest32)>,
+    bucket_entries: impl Fn(u32) -> (u32, Vec<(Digest32, Digest32)>),
 ) -> Result<(BucketedMerkleSet, Vec<u32>)> {
     let path = dir.join(tree_filename(kind));
     let (mut set, _read_kind, _read_generation) = BucketedMerkleSet::read_from(&path)?;
