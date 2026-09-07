@@ -840,6 +840,81 @@ describe("reconcileSemanticProjection: semantic_document_status (plan 2026-09-06
       expect(containerRow).toMatchObject({ status: "unsupported", reason_codes: JSON.stringify(["unsupported_kind"]) });
     });
   });
+
+  // Frente S-F (2026-09-08): the reconciler now materializes exactly one
+  // `semantic_coverage_summary` row per clean pass -- `buildSemanticCoverageView`'s
+  // fast path reads this instead of recomputing `semantic_document_status_counts`/
+  // `semantic_affected_documents` live on every query
+  // (`docs/evidence/2026-09-07-v4-semantic-close.md` measured that live pair
+  // at 5.0-5.4s EACH at ~94,500 rows).
+  type SummaryRow = {
+    readonly generation: number;
+    readonly unsupported_artifact_count: number;
+    readonly failed_artifact_count: number;
+    readonly entity_count: number;
+    readonly covered_entity_count: number;
+    readonly affected_artifact_count: number;
+    readonly affected_artifact_set_id: string;
+    readonly affected_first_page: string;
+  };
+
+  async function summaryRow(opened: WorkspaceDatabase, workspaceId: string, profileId: string, executableBindingId: string): Promise<SummaryRow | undefined> {
+    return opened.database.get<SummaryRow>(
+      "SELECT generation, unsupported_artifact_count, failed_artifact_count, entity_count, covered_entity_count, affected_artifact_count, affected_artifact_set_id, affected_first_page FROM semantic_coverage_summary WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? ORDER BY generation DESC LIMIT 1",
+      [workspaceId, profileId, executableBindingId],
+    );
+  }
+
+  it("Frente S-F: materializes a semantic_coverage_summary row at the close of a clean pass, matching the computed semantic_document_status counts exactly", async () => {
+    const workspaceId = "ws-semantic-coverage-summary";
+    const provider = createLocalHashProvider();
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-covered", artifactVersionId: "artv-covered", text: "function summaryCoveredContent() {}", validFromGeneration: 1, displayPath: "src/covered.ts" });
+      await seedBinaryVersion(opened, cas, workspaceId, "art-excluded", "artv-excluded", 1);
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(result.marker_written).toBe(true);
+
+      const rows = await statusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const affectedRows = rows.filter((row) => row.status !== "covered");
+      const summary = await summaryRow(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(summary).toBeDefined();
+      expect(summary!.generation).toBe(1);
+      expect(summary!.affected_artifact_count).toBe(affectedRows.length);
+      const page = JSON.parse(summary!.affected_first_page) as readonly { readonly document_id: string; readonly status: string }[];
+      expect(page.map((entry) => entry.document_id)).toEqual(affectedRows.map((row) => row.document_id));
+      expect(page.every((entry) => entry.status !== "covered")).toBe(true);
+      // unsupported_artifact_count/failed_artifact_count/entity_count/
+      // covered_entity_count all 0 here -- no unsupported/failed/entity rows
+      // in this seed.
+      expect(summary).toMatchObject({ unsupported_artifact_count: 0, failed_artifact_count: 0, entity_count: 0, covered_entity_count: 0 });
+    });
+  });
+
+  it("Frente S-F: the materialized summary changes with the generation -- a second clean pass over new content writes a NEW row, not a stale one", async () => {
+    const workspaceId = "ws-semantic-coverage-summary-gen";
+    const provider = createLocalHashProvider();
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1", text: "function summaryGenContentOne() {}", validFromGeneration: 1, displayPath: "src/one.ts" });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      const firstSummary = await summaryRow(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(firstSummary?.generation).toBe(1);
+      expect(firstSummary?.affected_artifact_count).toBe(0);
+
+      await seedBinaryVersion(opened, cas, workspaceId, "art-2", "artv-2", 2);
+      await setCurrentGeneration(opened, workspaceId, 2);
+      const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider });
+      expect(second.marker_written).toBe(true);
+      const secondSummary = await summaryRow(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(secondSummary?.generation).toBe(2);
+      // The new binary version is excluded -- affected_artifact_count and
+      // affected_artifact_set_id both change; the row is not a stale copy
+      // of generation 1's own summary.
+      expect(secondSummary?.affected_artifact_count).toBe(1);
+      expect(secondSummary?.affected_artifact_set_id).not.toBe(firstSummary?.affected_artifact_set_id);
+    });
+  });
 });
 
 // Decision 17: entity-grain semantic documents. `reconcileSemanticProjection`

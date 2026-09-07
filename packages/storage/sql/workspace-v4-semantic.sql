@@ -112,8 +112,73 @@ CREATE TABLE IF NOT EXISTS semantic_document_status (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (workspace_id, profile_id, executable_binding_id, document_grain, document_id)
 ) STRICT;
-CREATE INDEX IF NOT EXISTS semantic_document_status_affected
-  ON semantic_document_status (workspace_id, profile_id, executable_binding_id, status, display_path, artifact_id, document_id);
+-- Frente S-F (2026-09-08): superseded by semantic_document_status_affected_v2
+-- below -- the original index's column list ends at (status, display_path,
+-- artifact_id, document_id); a `status <> 'covered'` (or even `status IN
+-- (...)`) predicate only lets SQLite range-scan the trailing
+-- (display_path, artifact_id, document_id) order WITHIN one status value at
+-- a time, never across the whole set, so `semantic_affected_documents`'s own
+-- `ORDER BY display_path, artifact_id, document_id` still needed a real sort
+-- (TEMP B-TREE), and document_grain/artifact_version_id/reason_codes were
+-- not covered (a rowid lookup per matched row). Measured live
+-- (docs/evidence/2026-09-07-v4-semantic-close.md §3.2) at ~94,500 rows:
+-- 5.0-5.4s per query. Dropped unconditionally on every schema apply -- a
+-- real one-time drop on a pre-existing database, a harmless no-op on a
+-- fresh one -- so no workspace keeps paying both indexes' write-side upkeep
+-- once this schema string next runs against it.
+DROP INDEX IF EXISTS semantic_document_status_affected;
+-- `semantic_affected_documents`'s query now reads `ORDER BY status,
+-- display_path, artifact_id, document_id` (status FIRST, matching this
+-- index's own leading order) with `status IN (...)` instead of `<>`, which
+-- SQLite satisfies as one single-pass, already-sorted SEARCH over this
+-- index -- confirmed via EXPLAIN QUERY PLAN: no SCAN, no TEMP B-TREE.
+-- document_grain/artifact_version_id/reason_codes are trailing covering
+-- columns so the same scan also skips a rowid lookup per row
+-- (segment_count/generation/updated_at are never read by that query, so
+-- they stay out of the index). This groups the affected page's own display
+-- order by status first, then path, instead of pure alphabetical across
+-- every status -- a deliberate, documented trade (plan §0: performance
+-- without compromising the operation's own contract, which never promised a
+-- pure-alphabetical cross-status order, only a stable deterministic one).
+CREATE INDEX IF NOT EXISTS semantic_document_status_affected_v2
+  ON semantic_document_status (workspace_id, profile_id, executable_binding_id, status, display_path, artifact_id, document_id, document_grain, artifact_version_id, reason_codes);
+-- Frente S-F (2026-09-08): materialized per-generation coverage summary --
+-- `buildSemanticCoverageView` (canonical-query-data-port.ts) previously
+-- recomputed `semantic_document_status_counts`/`semantic_affected_documents`
+-- from scratch on EVERY core:search_semantic/core:search_hybrid call (5.0-5.4s
+-- each at n8n-subset scale, docs/evidence/2026-09-07-v4-semantic-close.md
+-- §3.2). The reconciler now writes exactly ONE row here, in the SAME
+-- transaction as its own semantic_index_state completion marker, at the
+-- close of every pass that reaches a clean/stable state (mirroring
+-- semantic_index_state's own "replaced ... on each successful reconcile
+-- pass" contract -- see semantic-reconciler.ts). `buildSemanticCoverageView`
+-- then reads the newest row for (workspace_id, profile_id,
+-- executable_binding_id) with one indexed point lookup (`ORDER BY
+-- generation DESC LIMIT 1`, satisfied by this table's own PRIMARY KEY, no
+-- extra index needed) instead of two full-table computations. A caller
+-- needing a page PAST the embedded first one still calls
+-- `core:semantic_affected_page`, which queries `semantic_document_status`
+-- directly (via the covering `semantic_document_status_affected_v2` index
+-- above) -- this table only ever serves the FIRST page for free. Additive
+-- (CREATE TABLE IF NOT EXISTS, R22); never referenced by a FOREIGN KEY for
+-- the same cross-file-safety reason semantic_document_status has none
+-- above. One row per (workspace, profile, binding, generation) is kept
+-- (never overwritten across generations) as a small, bounded audit trail.
+CREATE TABLE IF NOT EXISTS semantic_coverage_summary (
+  workspace_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  executable_binding_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  unsupported_artifact_count INTEGER NOT NULL,
+  failed_artifact_count INTEGER NOT NULL,
+  entity_count INTEGER NOT NULL,
+  covered_entity_count INTEGER NOT NULL,
+  affected_artifact_count INTEGER NOT NULL,
+  affected_artifact_set_id TEXT NOT NULL,
+  affected_first_page TEXT NOT NULL, -- canonical JSON array of SemanticAffectedDocumentRow, already limit-capped
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, profile_id, executable_binding_id, generation)
+) STRICT;
 -- Frente S-D (2026-09-07, Lever 3): content-addressed cache of already-
 -- embedded SEGMENT vectors, keyed by (executable_binding_id, segment_digest)
 -- -- a digest of the exact normalized segment text this vector space would
