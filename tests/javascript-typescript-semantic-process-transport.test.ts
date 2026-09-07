@@ -136,7 +136,7 @@ describe("JavaScript/TypeScript semantic process transport", () => {
           work_item: {
             candidate_generation_id: "candidate:semantic-group", workspace_id: "workspace:semantic-group",
             artifact_id: owner.artifact_id, target_artifact_version_id: owner.artifact_version_id,
-            work_item_id: `work:semantic-group:${index}`, plugin_id: "urdira:javascript_typescript", plugin_version: "0.5.0",
+            work_item_id: `work:semantic-group:${index}`, plugin_id: "urdira:javascript_typescript", plugin_version: "0.6.0",
             expected_replacement_scopes: [{
               replacement_scope_id: `scope:semantic-group:${index}`, owner_artifact_id: owner.artifact_id,
               owner_artifact_version_id: owner.artifact_version_id, capability: "core:call_relationships",

@@ -135,11 +135,18 @@ pub fn reconstruct_entity(kind: &str, path: &str, start: u32, name: &str) -> Vec
 ///
 /// Parses the SECOND-TO-LAST `:`-delimited segment as a decimal `u32`
 /// (`name` is the last segment, mirroring `urdira-indexing-worker::v4::
-/// materialize::identity_key_name`'s own `rsplit(':').next()` convention
-/// and sharing its same known limitation: a `name`/`path` containing a
-/// literal `:` is not handled -- workspace paths never do, by this
-/// codebase's own established convention, e.g. `confirmed_relation_kind`'s
-/// identical assumption). Returns `None` for a shape with no such segment
+/// materialize::identity_key_name`'s own `rsplit(':').next()` convention).
+/// Adversarial review correction (2026-09-07, fix-ep0j-review): a `path`
+/// containing a literal `:` is FINE -- popping from the end of the
+/// `:`-split vector always recovers the true `start`/`name` regardless of
+/// how many colons `path` (or `kind`) itself contributes, since only the
+/// LAST two elements are ever consulted (verified live,
+/// `entity_identity_name_start_table_by_kind`'s weird-path case). The one
+/// real limitation is a literal `:` inside `name` itself -- never produced
+/// by any real producer (a JS/TS identifier cannot contain `:`; `module`'s
+/// own `name == path` case still parses correctly since `path` is popped
+/// FIRST as `name` there, colons and all). Returns `None` for a shape with
+/// no such segment
 /// at all (`jsts:external_module:{specifier}`/`jsts:external_symbol:
 /// {specifier}`, which have no per-file span -- `start`/`end` are always
 /// `0` for those two kinds, see `external_module_entity`/`external_symbol_
@@ -852,5 +859,100 @@ mod tests {
         malformed.identity_key = b"not-jsts-shaped".to_vec();
         let new_words = collect_new_entity_kinds(&[relation, malformed], &[]);
         assert!(new_words.is_empty());
+    }
+
+    /// E-P0j adversarial review (2026-09-07, fix-ep0j-review): table-driven
+    /// coverage for [`entity_identity_name_start`] -- `Frente E-P0j` (the
+    /// task this function belongs to) shipped it with ZERO direct unit
+    /// tests (confirmed against `git diff 9b49e82..12ce43c`: this function
+    /// has no `#[test]` anywhere touching it), despite `entities.index`/
+    /// the v4 residual pass both depending on it to recover the identifier
+    /// position from `identity_key` text for every kind
+    /// `urdira-jsts-syntax-worker`/`urdira-jsts-typeflow` produce. One row
+    /// per real `identity_key` recipe (`stable_entity_id`/`declaration_id`,
+    /// `jsts:{kind}:{path}:{start}:{name}`), covering: an ordinary kind at a
+    /// two/three/four-digit start; the two per-file-spanless synthetic
+    /// kinds (`external_module`/`external_symbol`, whose `identity_key` has
+    /// no numeric start segment at all -- `None` expected, matching
+    /// `entities_index_key_start`'s own `unwrap_or(row.span_start_byte)`
+    /// fallback for those two kinds, `segment_io.rs`); and -- the doc
+    /// comment's own claimed limitation -- a `path` containing a literal
+    /// `:` (a workspace CAN contain such a path; git/npm scoped tags rarely
+    /// use it but nothing forbids it). That last case is included because,
+    /// contrary to the doc comment's blanket "not handled" claim, popping
+    /// from the END of the `:`-split vector recovers `start`/`name`
+    /// correctly regardless of how many colons `path` itself contributes --
+    /// only a `:` inside `name` itself (never produced by any real
+    /// producer; JS/TS identifiers cannot contain `:`) would actually break
+    /// this parser.
+    #[test]
+    fn entity_identity_name_start_table_by_kind() {
+        let cases: &[(&[u8], Option<u32>)] = &[
+            (b"jsts:variable:src/a.ts:7:x", Some(7)),
+            (b"jsts:function:src/a.ts:42:doThing", Some(42)),
+            (b"jsts:class:src/a.ts:1234:Widget", Some(1234)),
+            (b"jsts:method:src/a.ts:5001:perimeter", Some(5001)),
+            (b"jsts:parameter:src/a.ts:88:arg", Some(88)),
+            (b"jsts:namespace:src/a.ts:0:NS", Some(0)),
+            // Module identity uses its own path as `name` too
+            // (`jsts:module:{path}:0:{path}`) -- still parses: `name` is
+            // popped first regardless of its own content, then `start`.
+            (b"jsts:module:src/a.ts:0:src/a.ts", Some(0)),
+            // The two synthetic, per-file-spanless kinds: no numeric start
+            // segment exists in their identity text at all.
+            (b"jsts:external_module:lodash", None),
+            (b"jsts:external_symbol:lodash#default", None),
+            // A `path` containing a literal `:` does NOT break recovery --
+            // popping from the end still lands on the true `start`/`name`
+            // regardless of how many colons `path` itself contains.
+            (b"jsts:variable:weird:path/with:colons.ts:12:x", Some(12)),
+            // Malformed/too-short input: no start segment to pop.
+            (b"jsts:external_module", None),
+            (b"not-jsts-shaped", None),
+        ];
+        for (identity_key, expected) in cases {
+            assert_eq!(
+                entity_identity_name_start(identity_key),
+                *expected,
+                "identity_key={:?}",
+                std::str::from_utf8(identity_key).unwrap_or("<invalid utf8>")
+            );
+        }
+    }
+
+    /// Every real per-kind `identity_key` this codebase's own producers
+    /// build (`stable_entity_id`/`declaration_id`, both
+    /// `jsts:{kind}:{path}:{start}:{name}`) round-trips through
+    /// [`entity_identity_name_start`] back to the exact `start` it was
+    /// built from -- the property `entities.index`/the residual pass both
+    /// actually rely on, not just the hand-picked cases above.
+    #[test]
+    fn entity_identity_name_start_round_trips_every_producer_recipe() {
+        let kinds = [
+            "module",
+            "function",
+            "class",
+            "interface",
+            "type",
+            "enum",
+            "variable",
+            "method",
+            "constructor",
+            "getter",
+            "setter",
+            "property",
+            "parameter",
+            "namespace",
+        ];
+        for kind in kinds {
+            for start in [0u32, 1, 42, 65535, 4_000_000] {
+                let identity_key = format!("jsts:{kind}:src/some/nested/path.ts:{start}:someName");
+                assert_eq!(
+                    entity_identity_name_start(identity_key.as_bytes()),
+                    Some(start),
+                    "identity_key={identity_key}"
+                );
+            }
+        }
     }
 }

@@ -1082,11 +1082,29 @@ interface BundleDescriptor {
   readonly isCompactSnippetStyle: boolean;
 }
 
-/** Best-effort line number: only ever present when a producer already attached one (see the module doc comment above) -- never derived from a byte/character offset here. */
+/**
+ * Best-effort line number: only ever present when a producer already
+ * attached one (see the module doc comment above) -- never derived from a
+ * byte/character offset here.
+ *
+ * E-P0j adversarial review (2026-09-07, fix-ep0j-review): `body["name_
+ * start_line"]` (additive, `urdira-jsts-syntax-worker::proposal_entity_
+ * record`) is checked BEFORE `span?.["start_line"]` -- `span` is the
+ * record's own `primary_source_span`, whose `start_line` is the WHOLE
+ * declaration's first line as of Frente E-P0j (2026-09-07), which for a
+ * decorated class/interface member is that member's own leading
+ * decorator's line, not the line its name/signature actually appears on
+ * (confirmed live, `urdira-jsts-syntax-worker`'s
+ * `decl_span_covers_member_decorators_but_not_a_top_level_declarations_own_leading_decorator`).
+ * Still falls back to `span?.["start_line"]` for every record kind that
+ * never publishes `name_start_line` (non-jsts subjects, and any record
+ * predating this field) -- byte-identical to before this fix in that case.
+ */
 function describeLine(body: JsonRecord, span: JsonRecord | undefined): string | undefined {
   return firstNonEmptyString(
     typeof body["start_line"] === "number" ? String(body["start_line"]) : body["start_line"],
     typeof body["line"] === "number" ? String(body["line"]) : body["line"],
+    typeof body["name_start_line"] === "number" ? String(body["name_start_line"]) : body["name_start_line"],
     span?.["start_line"],
   );
 }

@@ -31,7 +31,7 @@ describe("public npm package graph", () => {
     expect(versions.get("@urdira/daemon")).toBe("0.3.3");
     expect(versions.get("@urdira/mcp")).toBe("0.3.3");
     expect(versions.get("@urdira/web")).toBe("0.3.3");
-    expect(versions.get("@urdira/plugin-javascript-typescript")).toBe("0.5.0");
+    expect(versions.get("@urdira/plugin-javascript-typescript")).toBe("0.6.0");
     for (const name of NATIVE_NPM_PACKAGE_NAMES) expect(versions.get(name), name).toBe(versions.get("@urdira/native"));
     expect(versions.has("@urdira/testkit")).toBe(false);
 

@@ -75,7 +75,17 @@ export const JAVASCRIPT_TYPESCRIPT_NAMESPACE = "jsts" as const;
 // "What the plugin version mechanically gates"), so bumping it here is what
 // forces the one-time fleet republish every already-scanned v4 workspace
 // needs to pick up the new span shape. MINOR: pre-1.0 output change.
-export const JAVASCRIPT_TYPESCRIPT_VERSION = "0.5.0" as const;
+// 0.5.0 -> 0.6.0 (E-P0j adversarial review, 2026-09-07, fix-ep0j-review):
+// entity records gain one more additive body field, `name_start_line`
+// (`urdira-jsts-syntax-worker::proposal_entity_record`) -- the identifier's
+// own 1-based line number, needed because `start`'s own line (published as
+// `primary_source_span.start_line`) can be a class/interface member's
+// leading decorator's line, not the member's own line (confirmed live: a
+// decorated member's `start` begins at `@Decorator`, per `ClassElement::
+// span()`). Backwards-compatible addition (new optional-in-practice field,
+// old readers unaffected) -- MINOR per `docs/versioning.md`'s own table
+// ("backwards-compatible additions... minor" while pre-1.0).
+export const JAVASCRIPT_TYPESCRIPT_VERSION = "0.6.0" as const;
 export const TYPESCRIPT_COMPILER_VERSION = TYPESCRIPT_VERSION;
 
 /** Ordered structural publication stages for the bundled analyzer. */
