@@ -102,6 +102,85 @@ function fastCandidateBytes(vector: readonly number[] | Uint8Array, dimensions: 
   return canonicalVectorBytes(vector, configuration);
 }
 
+/**
+ * Frente S-D (2026-09-07, latency): the native `exactVectorTopKBatch` port
+ * enforces two generic batch limits shared by several unrelated native batch
+ * operations (`crates/urdira-native-core/src/lib.rs`): `MAX_BATCH_RECORDS`
+ * (4,096 candidates) and `MAX_BATCH_FRAMED_BYTES` (4MiB, computed there as
+ * `(query_scalar_count + sum(candidate_scalar_counts)) * 8 +
+ * sum(identifier_byte_lengths)` -- SCALAR counts, not raw wire bytes, since
+ * the native side decodes every candidate to `f64` internally regardless of
+ * the wire `element_type`). Discovered live: n8n-scale entity-grain
+ * candidate counts (deliberately UNCAPPED before ranking, per decision 17's
+ * own max-similarity aggregation) routinely exceed BOTH bounds for 384-dim
+ * vectors (the byte bound alone caps out around ~1,300 candidates) -- the
+ * native call previously received every eligible candidate in ONE batch and
+ * threw outright ("Exact vector batch exceeds the ... byte bound"),
+ * making `core:search_semantic` completely unusable on any real corpus past
+ * that size (confirmed live on a 2,492-file corpus with ~11k open
+ * entity-grain vectors).
+ *
+ * `NATIVE_BATCH_BYTE_BUDGET`/`NATIVE_BATCH_RECORD_BUDGET` below mirror the
+ * native bounds (with headroom subtracted for this TS-side estimate's own
+ * imprecision), and `nativeTopKChunked` recovers EXACTNESS (decision 06: no
+ * ANN, no sampling) by chunking eligible candidates into native-sized
+ * batches, computing each chunk's OWN top-`limit` natively, then recursively
+ * merging and re-ranking the (much smaller) union of chunk winners. This is
+ * provably exact, not an approximation: any candidate that could appear in
+ * the GLOBAL top-`limit` must also appear in its OWN chunk's top-`limit`
+ * (if it did not, at least `limit` OTHER candidates in that same chunk would
+ * already outrank it, so at least `limit` candidates would outrank it
+ * globally too) -- so no candidate is ever wrongly excluded, and the
+ * recursion terminates because each merge round strictly shrinks the
+ * candidate set (from `eligible.length` down to at most `chunk_count x
+ * limit`) until it fits in a single native call.
+ */
+const NATIVE_BATCH_BYTE_BUDGET = 4 * 1024 * 1024 - 64 * 1024; // 64KiB headroom under the native 4MiB bound
+const NATIVE_BATCH_RECORD_BUDGET = 4096 - 1; // headroom under the native 4,096-candidate bound
+
+function nativeTopKChunked(eligible: readonly ExactVectorCandidate[], packedVectors: readonly Uint8Array[], identifiers: readonly string[], queryBytes: Uint8Array, dimensions: number, elementType: "float32_le" | "float64_le", limit: number, metric: "cosine" | "squared_l2"): readonly ExactVectorMatch[] {
+  const idByteLengths = identifiers.map((id) => textEncoder.encode(id).length);
+  const totalIdBytes = idByteLengths.reduce((sum, value) => sum + value, 0);
+  const totalBytes = (dimensions + eligible.length * dimensions) * 8 + totalIdBytes;
+  if (totalBytes <= NATIVE_BATCH_BYTE_BUDGET && eligible.length <= NATIVE_BATCH_RECORD_BUDGET) {
+    const width = dimensions * (elementType === "float32_le" ? 4 : 8);
+    const packedCandidates = new Uint8Array(eligible.length * width);
+    packedVectors.forEach((bytes, index) => packedCandidates.set(bytes, index * width));
+    const native = nativeExactVectorTopK({ query: queryBytes, candidates: packedCandidates, projectionRecordIds: identifiers, dimensions, elementType, k: Math.min(limit, eligible.length), metric });
+    if (native === undefined) throw new Error("Native exact vector top-k configuration changed during the query.");
+    return native;
+  }
+  // Chunk sizing: the byte bound's per-candidate cost is `dimensions * 8 +
+  // this candidate's own identifier byte length` -- using the AVERAGE
+  // identifier length here (not each one's exact length) is a conservative
+  // estimate only for SIZING chunks; every chunk is re-measured exactly
+  // (recursing back into this same function, which re-derives `totalBytes`
+  // precisely for that chunk) before ever being sent to the native port, so
+  // an unlucky distribution of identifier lengths can only make a chunk
+  // smaller than strictly necessary, never one that still overflows.
+  const averageIdBytes = eligible.length === 0 ? 0 : totalIdBytes / eligible.length;
+  const byteBudgetForCandidates = Math.max(1, NATIVE_BATCH_BYTE_BUDGET - dimensions * 8);
+  const maxPerChunkByBytes = Math.max(1, Math.floor(byteBudgetForCandidates / (dimensions * 8 + averageIdBytes)));
+  const maxPerChunk = Math.max(1, Math.min(maxPerChunkByBytes, NATIVE_BATCH_RECORD_BUDGET));
+  const winners: ExactVectorCandidate[] = [];
+  const winnerVectors: Uint8Array[] = [];
+  for (let start = 0; start < eligible.length; start += maxPerChunk) {
+    const end = Math.min(start + maxPerChunk, eligible.length);
+    const chunkCandidates = eligible.slice(start, end);
+    const chunkVectors = packedVectors.slice(start, end);
+    const chunkIds = identifiers.slice(start, end);
+    const chunkMatches = nativeTopKChunked(chunkCandidates, chunkVectors, chunkIds, queryBytes, dimensions, elementType, Math.min(limit, chunkCandidates.length), metric);
+    const idToIndex = new Map(chunkIds.map((id, index) => [id, index] as const));
+    for (const match of chunkMatches) {
+      const index = idToIndex.get(match.projection_record_id);
+      if (index === undefined) throw new Error("Native exact vector top-k returned an identifier outside its own chunk.");
+      winners.push(chunkCandidates[index]!);
+      winnerVectors.push(chunkVectors[index]!);
+    }
+  }
+  return nativeTopKChunked(winners, winnerVectors, winners.map((candidate) => candidate.projection_record_id), queryBytes, dimensions, elementType, limit, metric);
+}
+
 export function exactVectorScan(candidates: readonly ExactVectorCandidate[], query: readonly number[] | Uint8Array, options: ExactVectorScanOptions): readonly ExactVectorMatch[] {
   if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit <= 0)) throw new Error("Exact semantic scan limit must be positive.");
   const elementType = options.element_type ?? "float32";
@@ -114,20 +193,8 @@ export function exactVectorScan(candidates: readonly ExactVectorCandidate[], que
   if (new Set(identifiers).size !== identifiers.length) throw new Error("Exact semantic scan candidate identifiers must be unique.");
   const limit = Math.min(options.limit ?? eligible.length, eligible.length);
   if (nativeExactVectorTopKConfigured()) {
-    const width = options.dimensions * (elementType === "float32" ? 4 : 8);
-    const packedCandidates = new Uint8Array(eligible.length * width);
-    eligible.forEach((candidate, index) => packedCandidates.set(fastCandidateBytes(candidate.vector, options.dimensions, configuration), index * width));
-    const native = nativeExactVectorTopK({
-      query: queryBytes,
-      candidates: packedCandidates,
-      projectionRecordIds: identifiers,
-      dimensions: options.dimensions,
-      elementType: elementType === "float32" ? "float32_le" : "float64_le",
-      k: limit,
-      metric: options.distance_metric,
-    });
-    if (native === undefined) throw new Error("Native exact vector top-k configuration changed during the query.");
-    return native;
+    const packedVectors = eligible.map((candidate) => fastCandidateBytes(candidate.vector, options.dimensions, configuration));
+    return nativeTopKChunked(eligible, packedVectors, identifiers, queryBytes, options.dimensions, elementType === "float32" ? "float32_le" : "float64_le", limit, options.distance_metric);
   }
   const vectors = eligible.map((candidate) => fastCandidateBytes(candidate.vector, options.dimensions, configuration));
   const ranked = eligible

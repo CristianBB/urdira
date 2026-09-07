@@ -21,16 +21,22 @@ export interface SemanticProcessRun {
 /**
  * Frente S-D (2026-09-07): default bounded-retry parameters for
  * `runSemanticReconcileInProcessWithRetry` -- see that function's own doc
- * comment. 6 attempts / 500ms base backoff (vs. `execFileWithEbadfRetry`'s
- * 3/250ms) because THIS caller's own fd-pressure condition (one fd per
- * watched corpus file, ~24,900 observed at n8n scale) is sustained for the
- * whole scan/maintenance window, not a single transient race -- a few more,
- * further-spaced attempts give the file-watcher subsystem more chances to
- * settle (or another concurrent fd churn on this shared machine to clear)
- * before giving up.
+ * comment. Confirmed live via `lsof -p <daemon pid>` at n8n scale: the
+ * daemon holds one REAL, OPEN regular-file descriptor per corpus file for
+ * its ENTIRE lifetime (20,281 files inspected -> 20,281 open `REG` fds,
+ * exact match, plus ~4,600 open `DIR` fds) -- a sustained condition, not a
+ * momentary spike, so `spawn()`'s own `EBADF` failure rate under it is high
+ * enough that even 6 attempts / 500ms (this constant's own first, smaller
+ * revision) were exhausted in one observed run. 20 attempts / 1000ms base
+ * (~20s worst-case total, paid ONCE per maintenance submission, never in a
+ * query hot path) empirically clears it far more often -- still bounded and
+ * still not a claim the underlying condition is fixed (see this function's
+ * own doc comment for why genuinely fixing it -- likely a scan-time file
+ * handle never closed, or a `@parcel/watcher` backend choice -- is out of
+ * this module's scope).
  */
-const SEMANTIC_SPAWN_RETRY_ATTEMPTS = 6;
-const SEMANTIC_SPAWN_RETRY_BACKOFF_MS = 500;
+const SEMANTIC_SPAWN_RETRY_ATTEMPTS = 20;
+const SEMANTIC_SPAWN_RETRY_BACKOFF_MS = 1000;
 
 /** Frente S-D (2026-09-07): `true` for the exact error shape Node's `child_process` module reports for a failed `spawn()` syscall with `errno EBADF` -- mirrors `scripts/v4-mutation-harness.mjs`'s own `execFileWithEbadfRetry` check (`error.code === "EBADF" || error.errno === -9`, the numeric POSIX errno for EBADF on every platform this codebase ships for). */
 function isEbadfSpawnError(error: unknown): boolean {

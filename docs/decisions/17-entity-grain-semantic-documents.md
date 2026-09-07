@@ -244,3 +244,76 @@ was NOT re-attempted in this session (the prior evidence doc's own 3h44m/
 same class of hardware, and no lever here changes that order of magnitude);
 see `docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
 for the full numbers and reasoning.
+
+## Amendment (2026-09-07, Frente S-D): the two designed-but-undone levers, shipped
+
+Both levers this decision's own §"designed, NOT implemented" section flagged
+are now implemented and tested, in `packages/engine/src/semantic-reconciler.ts`:
+
+- **Artifact-vector reuse from entity segments (Lever 1)**: step 5 (entity
+  insert) now runs BEFORE step 3 (artifact insert) within one reconcile
+  pass. As step 5 commits a fresh entity's segments, it also records that
+  entity's file-absolute span and packed vectors into an in-memory
+  `entityCoverageByOwner` map, keyed by owning `artifact_version_id`. Step
+  3, for a document with a non-empty coverage entry, computes the complement
+  of the (merged) covered spans over the file's own text ("gap" text,
+  typically imports/exports/comments), embeds only that gap (capped, an
+  `entity_policy.max_gap_segments` knob, unused by default -- R8's own
+  segment cap already bounds it in practice), and combines (mean +
+  L2-renormalize, `combineVectorsMeanNormalized`) the entity vectors and gap
+  vectors into ONE composed artifact vector -- the SAME primitive
+  (`canonicalVectorBytes`, `@urdira/engine`'s `semantic-runtime.ts`) every
+  other vector in this codebase is normalized through. A file with zero
+  fresh-this-pass entity coverage (no eligible entities, or every one of
+  them reopened rather than freshly inserted -- see the map's own doc
+  comment for that narrow, documented fallback) embeds exactly as before
+  (byte-for-byte the pre-Lever-1 whole-file path). `segmenterIdentity`
+  (`semantic-provider.ts`) bumped `v2` -> `v3` to force the one-time
+  re-embed this changes the meaning of, uniformly across all three shipped
+  providers. `semantic_document_status.segment_count` for a composed
+  artifact now reflects the REAL component count (entities + gap segments),
+  with `reason_codes: ["segments_truncated"]` folded in when a gap was
+  capped -- never silent, per R8.
+- **Parallel reconciler sharding (Lever 2)**: `runSemanticReconcileSharded`
+  (`packages/daemon/src/semantic-process.ts`) runs `N` concurrent semantic
+  maintenance child processes, each given `reconcileSemanticProjection`'s
+  new `shard: {index, count}` field -- deterministic assignment by owning
+  `artifact_id` (`shardIndexFor`, SHA-256-based, so a file and every one of
+  its own entities always land in the SAME shard, preserving Lever 1's
+  composition inside a sharded pass). Steps 1/2/4 (workspace-wide,
+  grain-agnostic-or-stale-close) run only in shard 0; every sharded call
+  skips bulk status maintenance and the completion marker entirely. Once
+  every shard resolves, ONE MORE unsharded "finalize" call runs -- finds
+  nothing left to embed in the common case, reaches the marker-write logic
+  naturally, and self-heals any single shard's `failed`/`entity_failed`
+  rows as a side effect of retrying them unsharded. Default 2 workers
+  (`URDIRA_SEMANTIC_WORKERS`, capped at `cpuCount / 4`), matching this
+  decision's own measured ~1.44x at 2 concurrent processes.
+- **Segment cache (Lever 3, new -- not previously designed in this
+  decision)**: a new additive table, `semantic_segment_cache(workspace_id,
+  executable_binding_id, segment_digest, vector, dimensions, element_type,
+  created_at)`, lets the reconciler skip re-embedding any segment whose
+  exact rendered text was already embedded under the SAME vector space, by
+  ANY document, in ANY prior generation (or by another concurrent shard
+  process) -- `embedAndCommitBatch`/`embedPlainTexts` check it before every
+  provider call and populate it after every fresh embed.
+
+Two real, PRE-EXISTING bugs were found live while measuring these levers
+against the real n8n corpus, neither caused by this amendment's own levers
+(both reproduce with `URDIRA_SEMANTIC_WORKERS=1`): a `child_process.fork()`
+`EBADF` failure under the daemon's own large-corpus fd load, and the v4
+entity-candidate enumeration (`semantic-entity-source-v4.ts`) OOMing a
+default-heap Node child. Both are mitigated (bounded retry;
+`--max-old-space-size`) but NOT root-fixed in this session -- see
+`docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md`
+Part 0 for the full diagnosis, reported there as separate P0s for the
+owner's queue.
+
+A genuine full-n8n-scale (20,281-file) embed could not be completed within
+this session given the `EBADF` finding above recurring even at a widened
+retry budget; measurements instead use a real, substantial n8n subset
+(`packages/cli`, 2,492 files) -- see
+`docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md`
+Parts 1-3 for the full numbers (embed throughput per lever on that subset,
+cache hit-rate on an edit, latency before/after) and §0.5 for why a subset,
+not the full corpus, was used.
