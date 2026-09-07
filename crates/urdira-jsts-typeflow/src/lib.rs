@@ -2811,6 +2811,45 @@ pub struct ProgramIndex {
     /// the reverse import graph `transitive_importers_closure` walks to
     /// find the affected component of an edit.
     importers_of: HashMap<String, HashSet<String>>,
+    /// E-P0d (2026-09-07): `target file path -> set of OTHER files that
+    /// currently have at least one named-import need whose specifier
+    /// resolved to THIS file (`WorkspaceResolver::resolve` succeeded) but
+    /// whose named export did NOT (`resolve_named_export` returned anything
+    /// other than `Resolved` -- absent, ambiguous, or an unfollowed
+    /// namespace re-export)`. Unlike `importers_of` (built only from
+    /// SUCCESSFUL resolutions, via `link_importer`), this is the reverse
+    /// graph for STILL-FAILING ones -- populated directly by the caller
+    /// (`v4/typeflow.rs`'s `resolve_import_targets_for`, which alone knows
+    /// the difference between "no target file at all" and "target file
+    /// found, export not") via `apply_pending_target_updates`, since
+    /// resolving a specifier to a file path needs `WorkspaceResolver`/
+    /// `available`, neither of which this crate holds.
+    ///
+    /// **Why this exists**: `transitive_importers_closure`/`build_index`'s
+    /// warm settling loop can only widen an edit's own affected/refresh set
+    /// through `importers_of` -- an edge that has never yet resolved has no
+    /// entry there, so a file whose ONLY link to a just-added declaring
+    /// file happens to fail on its first attempt (e.g. because the target
+    /// is reached through a THIRD file's re-export, and that third file's
+    /// own content edit lands in a LATER, separate `build_index` call --
+    /// `crates/urdira-indexing-worker/src/v4/delta.rs`'s own structural/
+    /// content generation split for a mixed batch) is never revisited once
+    /// `TypeflowCache`'s `pending_upserted` entry for it is drained --
+    /// found live on real n8n (`docs/evidence/2026-09-06-v4-reconcile-
+    /// threshold.md` §11.4/§12): `expression-observability.provider.ts`
+    /// (added) needs `ExpressionEngineConfig` (declared in ANOTHER added
+    /// file) through `@n8n/config`'s barrel `index.ts`, which is separately
+    /// EDITED in the same batch to add both the re-export and the barrel's
+    /// own new member typed with it; the barrel lands in the CONTENT
+    /// generation, after the structural generation already tried and failed
+    /// to resolve `provider.ts`'s need against the barrel's stale (pre-edit)
+    /// exports, permanently. Widening `transitive_importers_closure` to
+    /// ALSO walk this graph means the barrel's own later `replace_file`
+    /// call correctly sweeps `provider.ts` back into `refresh_paths`/
+    /// `affected`, re-resolving it against the barrel's now-current
+    /// exports -- exactly like a from-scratch rebuild, which sees the final
+    /// tree in one pass and never has this ordering problem at all.
+    pending_importers_of: HashMap<String, HashSet<String>>,
     /// D.2 (2026-09-05, references-parity task): every top-level `type X =
     /// ...` declaration's own id, mapped to its FINAL (hop-chased through
     /// any number of other aliases, cycle-guarded) `ResolvedTypeRef` -- see
@@ -3025,6 +3064,35 @@ fn insert_file_pass1(
         }
         owned_entities.push(variable.entity_id.clone());
         entity_owner.insert(variable.entity_id.clone(), path.to_owned());
+    }
+    // E-P0d (2026-09-07): every top-level `type X = ...` declaration's OWN
+    // id also needs an `entity_owner` entry -- found live on a real n8n
+    // `head-vs-head200` git switch: `resolve_named_export` can resolve a
+    // named import straight to a TYPE ALIAS's own id (`export type
+    // IExecuteFunctions = ...`, `jsts:type:...`), and `link_importer`
+    // (called right after this function, for every successfully-resolved
+    // `import_targets` entry) requires `entity_owner.get(target_entity_id)`
+    // to succeed to register the importer edge at all -- without this loop,
+    // `entity_owner` never held a type alias's own id (only classes/
+    // interfaces/functions/callable-variables/object-shapes/variables did),
+    // so `link_importer` silently no-op'd for EVERY import resolving to a
+    // type alias, meaning `importers_of`/`transitive_importers_closure`
+    // could never widen an edit's own affected set to reach a file that
+    // only imports something through a type alias -- an UNEDITED importer
+    // permanently kept its FIRST-EVER (cold-scan) resolution, silently
+    // stale after any later edit that shifted the alias's own `start`-
+    // keyed id. This registration is purely additive for `link_importer`'s
+    // own lookup: `containers`/`function_return_types`/`variable_types`
+    // deliberately stay untouched here (a raw alias id is never queried
+    // against them directly -- every consumer of `import_targets`
+    // immediately runs the resolved id through `dealias_entity` first, see
+    // `resolve_raw_type_ref`'s own `Imported` arm, so `containers.get`
+    // never sees a bare alias id) and `alias_targets` (built wholesale by
+    // `build_alias_targets`, independent of `entity_owner`) is unaffected
+    // either way.
+    for alias in &summary.type_aliases {
+        owned_entities.push(alias.id.clone());
+        entity_owner.insert(alias.id.clone(), path.to_owned());
     }
     deferred
 }
@@ -3304,9 +3372,16 @@ impl ProgramIndex {
     /// `run_fixed_point_pass3`/`4`) -- a from-scratch `build` and an index
     /// that reached the same state incrementally are computed by identical
     /// code, just over a different-sized file set each call.
+    ///
+    /// `pending_targets`: `owning_path -> set of target file paths` this
+    /// call's own needed-imports scan resolved a specifier to but could not
+    /// resolve the named export within (see `pending_importers_of`'s own
+    /// doc comment) -- inverted here into that field exactly like
+    /// `import_targets` is inverted into `importers_of` below.
     pub fn build(
         summaries: &BTreeMap<String, DeclSummary>,
         import_targets: &HashMap<(String, String, String), String>,
+        pending_targets: &HashMap<String, HashSet<String>>,
     ) -> Self {
         let alias_targets = build_alias_targets(summaries, import_targets);
         let mut me = Self {
@@ -3320,12 +3395,21 @@ impl ProgramIndex {
             entity_owner: HashMap::new(),
             file_entities: HashMap::new(),
             importers_of: HashMap::new(),
+            pending_importers_of: HashMap::new(),
         };
         for key in import_targets.keys() {
             me.file_import_keys
                 .entry(key.0.clone())
                 .or_default()
                 .insert(key.clone());
+        }
+        for (owning_path, target_paths) in pending_targets {
+            for target_path in target_paths {
+                me.pending_importers_of
+                    .entry(target_path.clone())
+                    .or_default()
+                    .insert(owning_path.clone());
+            }
         }
 
         let mut deferred_functions = Vec::new();
@@ -3410,6 +3494,20 @@ impl ProgramIndex {
             .unwrap_or_default()
     }
 
+    /// E-P0d: the direct set of files that currently have at least one
+    /// named-import need whose specifier resolves to `path` but whose named
+    /// export does not (yet) -- see `pending_importers_of`'s (the field)
+    /// own doc comment. A caller (`v4/typeflow.rs`'s `build_index` warm
+    /// loop) widens its own `refresh_paths` with this, alongside
+    /// `importers_of`, so a file whose only link to `path` has never
+    /// resolved still gets re-attempted when `path` changes.
+    pub fn pending_importers_of(&self, path: &str) -> Vec<String> {
+        self.pending_importers_of
+            .get(path)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// P3-8a: `{path}` plus every file transitively reachable by following
     /// `importers_of` edges -- the affected component an edit to `path`
     /// must reflow for the fixed point (pass 3/4) to converge to the same
@@ -3418,6 +3516,12 @@ impl ProgramIndex {
     /// no separate iteration cap -- capping this would be a correctness
     /// bug, not a performance one: an uncapped chain simply means an
     /// uncapped chain of real cross-file type dependencies exists).
+    ///
+    /// E-P0d: ALSO follows `pending_importers_of` edges, same BFS, same
+    /// queue -- a file with only a still-failing link to `path` must be
+    /// reflowed too, exactly like a successfully-linked importer, so its
+    /// own needed-imports get a fresh chance against `path`'s current
+    /// (post-edit) shape.
     fn transitive_importers_closure(&self, path: &str) -> Vec<String> {
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: Vec<String> = vec![path.to_owned()];
@@ -3426,6 +3530,13 @@ impl ProgramIndex {
         while let Some(next) = queue.pop() {
             order.push(next.clone());
             if let Some(importers) = self.importers_of.get(&next) {
+                for importer in importers {
+                    if visited.insert(importer.clone()) {
+                        queue.push(importer.clone());
+                    }
+                }
+            }
+            if let Some(importers) = self.pending_importers_of.get(&next) {
                 for importer in importers {
                     if visited.insert(importer.clone()) {
                         queue.push(importer.clone());
@@ -3544,6 +3655,41 @@ impl ProgramIndex {
         for key in &old_keys {
             if let Some(old_target) = self.import_targets.remove(key) {
                 self.unlink_importer(&old_target, owning_path);
+            }
+        }
+    }
+
+    /// E-P0d: `pending_importers_of`'s own counterpart to `apply_import_
+    /// target_updates` -- replaces EVERY `pending_importers_of` edge whose
+    /// importer is one of `updates`' own keys (owning paths) with EXACTLY
+    /// `updates`' fresh set of still-unresolved target files for that path
+    /// (a full per-owning-path snapshot, never a partial patch, same
+    /// discipline `apply_import_target_updates` uses for the resolved-edge
+    /// graph -- a path whose need just resolved, or stopped being needed at
+    /// all, must stop being retried, or `transitive_importers_closure`
+    /// would keep sweeping it in forever). An owning path absent from
+    /// `updates` entirely keeps its previous pending edges untouched (the
+    /// caller did not re-resolve it this call).
+    ///
+    /// Bounded by `self.pending_importers_of`'s own size (real corpora keep
+    /// this small: it only ever holds a specifier that resolved to a KNOWN
+    /// file but not yet to a specific export -- most unresolved imports
+    /// never reach a target file at all, e.g. a third-party package or an
+    /// unrelated resolver miss, and are never recorded here).
+    fn apply_pending_target_updates(&mut self, updates: &HashMap<String, HashSet<String>>) {
+        for owning_path in updates.keys() {
+            for importers in self.pending_importers_of.values_mut() {
+                importers.remove(owning_path);
+            }
+        }
+        self.pending_importers_of
+            .retain(|_, importers| !importers.is_empty());
+        for (owning_path, target_paths) in updates {
+            for target_path in target_paths {
+                self.pending_importers_of
+                    .entry(target_path.clone())
+                    .or_default()
+                    .insert(owning_path.clone());
             }
         }
     }
@@ -3678,15 +3824,23 @@ impl ProgramIndex {
     /// of whether the caller remembered to refresh it, so a stale
     /// (dangling) id can never survive into `containers`/`function_return_
     /// types` the way `remove_file`'s own doc comment found live.
+    /// E-P0d: `pending_target_updates` is the same kind of full, fresh
+    /// snapshot `import_targets_updates` is (see `apply_pending_target_
+    /// updates`'s own doc comment) -- covering the SAME owning-path
+    /// universe the caller re-resolved to produce `import_targets_updates`
+    /// (`path` itself, plus `importers_of(path)`/`pending_importers_of
+    /// (path)` under the pre-edit graph), never a partial patch.
     pub fn replace_file(
         &mut self,
         path: &str,
         summary: DeclSummary,
         import_targets_updates: &HashMap<(String, String, String), String>,
+        pending_target_updates: &HashMap<String, HashSet<String>>,
     ) {
         let affected = self.transitive_importers_closure(path);
         self.purge_import_targets_targeting_file(path);
         let pending_links = self.apply_import_target_updates(import_targets_updates);
+        self.apply_pending_target_updates(pending_target_updates);
         self.remove_file_contributions(path);
         self.summaries.insert(path.to_owned(), summary);
         self.reflow_files(&affected);
@@ -3711,8 +3865,14 @@ impl ProgramIndex {
         path: &str,
         summary: DeclSummary,
         import_targets_updates: &HashMap<(String, String, String), String>,
+        pending_target_updates: &HashMap<String, HashSet<String>>,
     ) {
-        self.replace_file(path, summary, import_targets_updates);
+        self.replace_file(
+            path,
+            summary,
+            import_targets_updates,
+            pending_target_updates,
+        );
     }
 
     /// P3-8a: drops `path` entirely (no replacement `DeclSummary`) and
@@ -3747,6 +3907,10 @@ impl ProgramIndex {
         self.remove_file_contributions(path);
         self.summaries.remove(path);
         self.clear_owning_path_import_targets(path);
+        // E-P0d: `path` no longer has any needs of its own (resolved or
+        // still-pending) to retry later -- mirrors `clear_owning_path_
+        // import_targets` just above, for the pending-edge graph.
+        self.apply_pending_target_updates(&HashMap::from([(path.to_owned(), HashSet::new())]));
         let reflow_targets: Vec<String> = affected.into_iter().filter(|f| f != path).collect();
         self.reflow_files(&reflow_targets);
     }
@@ -5046,7 +5210,7 @@ mod tests {
         let c_id = file_summary.classes[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&c_id, "m", false),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5070,7 +5234,7 @@ mod tests {
         );
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&synthetic_id, "a", false),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5105,7 +5269,7 @@ mod tests {
         );
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.members(&i_id, "greet", false),
             MemberLookup::One(base_greet_id.clone())
@@ -5129,7 +5293,7 @@ mod tests {
         let c_id = file_summary.classes[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(index.member_type_ref(&c_id, "m", false), None);
     }
 
@@ -5152,7 +5316,7 @@ mod tests {
         let c_id = file_summary.classes[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&c_id, "m", false),
             Some(ResolvedTypeRef::Union(vec![
@@ -5177,7 +5341,7 @@ mod tests {
         let c_id = file_summary.classes[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(index.member_type_ref(&c_id, "m", false), None);
     }
 
@@ -5210,10 +5374,231 @@ mod tests {
             ),
             alias_id,
         );
-        let index = ProgramIndex::build(&summaries, &import_targets);
+        let index = ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
         assert_eq!(
             index.member_type_ref(&c_id, "m", false),
             Some(ResolvedTypeRef::Entity(base_id))
+        );
+    }
+
+    /// E-P0d regression: `entity_owner` never held a TYPE ALIAS's own id
+    /// (only classes/interfaces/functions/callable-variables/object-shapes/
+    /// variables did -- `insert_file_pass1`'s own loops, before this fix),
+    /// so `link_importer` (which requires `entity_owner.get(target_entity_
+    /// id)` to succeed) silently no-op'd for EVERY import resolving to a
+    /// type alias -- `importers_of`/`transitive_importers_closure` could
+    /// never widen an edit's own affected set to reach a file that only
+    /// imports something through a type alias. Found live on a real n8n
+    /// `head-vs-head200` git switch (`docs/evidence/2026-09-06-v4-
+    /// reconcile-threshold.md` §12): `workflow/src/interfaces.ts` exports
+    /// `IExecuteFunctions` as `export type IExecuteFunctions = ...`; an
+    /// UNEDITED test file's own `function createMockContext():
+    /// IExecuteFunctions` return type was correctly resolved at COLD scan
+    /// time, but after `interfaces.ts` was later edited (shifting `
+    /// IExecuteFunctions`'s own id, among others), the test file's stale
+    /// reference was NEVER revisited (its edge was never in `importers_of`
+    /// to begin with) -- 23 real `jsts:references` relations lost. This
+    /// test reduces that to two files, asserts `importers_of` itself
+    /// (the mechanism, not just the end symptom), and confirms the
+    /// end-to-end member-type-ref result after an incremental edit matches
+    /// a from-scratch rebuild of the same final tree.
+    #[test]
+    fn importers_of_tracks_a_file_that_only_imports_a_type_alias_and_survives_the_aliased_files_own_edit()
+     {
+        let base_v1 = "export class Base {}\nexport type Alias = Base;\n";
+        // Two leading blank lines shift BOTH `Base`'s and `Alias`'s own
+        // `start`-keyed entity ids -- the exact "an edit moves the target's
+        // id" shape `replace_file`'s own doc comment addresses.
+        let base_v2 = "\n\nexport class Base {}\nexport type Alias = Base;\n";
+        let user_source = "import { Alias } from \"./base\";\nclass C {\n  m(): Alias { return undefined as any; }\n}\n";
+
+        let base_summary_v1 = summary_for("base.ts", base_v1);
+        let user_summary = summary_for("user.ts", user_source);
+        let alias_id_v1 = base_summary_v1.type_aliases[0].id.clone();
+        let c_id = user_summary.classes[0].entity_id.clone();
+
+        let mut summaries = BTreeMap::new();
+        summaries.insert("base.ts".to_owned(), base_summary_v1);
+        summaries.insert("user.ts".to_owned(), user_summary.clone());
+        let mut import_targets = HashMap::new();
+        import_targets.insert(
+            (
+                "user.ts".to_owned(),
+                "./base".to_owned(),
+                "Alias".to_owned(),
+            ),
+            alias_id_v1,
+        );
+        let mut index = ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
+
+        // The mechanism itself: `user.ts` must be a KNOWN importer of
+        // `base.ts` -- BEFORE this fix, `link_importer` never registered
+        // this edge at all (an alias id was never in `entity_owner`), so
+        // this would read back empty.
+        assert_eq!(
+            index.importers_of("base.ts"),
+            vec!["user.ts".to_owned()],
+            "user.ts's import of a TYPE ALIAS declared in base.ts must be \
+             tracked as an importer edge"
+        );
+
+        // Incrementally edit ONLY base.ts (user.ts is never touched) --
+        // mirrors `TypeflowCache::build_index`'s own warm-loop recipe:
+        // refresh base.ts's own needs (none) AND every already-known
+        // importer's needs (queried above, BEFORE this edit).
+        let base_summary_v2 = extract_decl_summary("base.ts", base_v2).expect("parses");
+        let base_id_v2 = base_summary_v2.classes[0].entity_id.clone();
+        let alias_id_v2 = base_summary_v2.type_aliases[0].id.clone();
+        let mut updates = HashMap::new();
+        updates.insert(
+            (
+                "user.ts".to_owned(),
+                "./base".to_owned(),
+                "Alias".to_owned(),
+            ),
+            alias_id_v2.clone(),
+        );
+        index.replace_file(
+            "base.ts",
+            base_summary_v2.clone(),
+            &updates,
+            &HashMap::new(),
+        );
+
+        let incremental_result = index.member_type_ref(&c_id, "m", false);
+        assert_eq!(
+            incremental_result,
+            Some(ResolvedTypeRef::Entity(base_id_v2.clone())),
+            "user.ts's C.m must re-point at Base's NEW (post-edit) id, not \
+             stay stale or unresolved"
+        );
+
+        // Oracle: an independent from-scratch build of the SAME final tree.
+        let mut fresh_summaries = BTreeMap::new();
+        fresh_summaries.insert("base.ts".to_owned(), base_summary_v2);
+        fresh_summaries.insert("user.ts".to_owned(), user_summary);
+        let mut fresh_import_targets = HashMap::new();
+        fresh_import_targets.insert(
+            (
+                "user.ts".to_owned(),
+                "./base".to_owned(),
+                "Alias".to_owned(),
+            ),
+            alias_id_v2,
+        );
+        let fresh = ProgramIndex::build(&fresh_summaries, &fresh_import_targets, &HashMap::new());
+        assert_eq!(incremental_result, fresh.member_type_ref(&c_id, "m", false));
+    }
+
+    /// E-P0d root-cause mechanism, at the raw `ProgramIndex` API level:
+    /// `consumer.ts` needs `Repo` from `declarer.ts`, but at the point this
+    /// index is first built `declarer.ts` does not export `Repo` yet (the
+    /// specifier resolves to a KNOWN file, the named export does not) --
+    /// exactly the real n8n shape (`docs/evidence/2026-09-06-v4-reconcile-
+    /// threshold.md` §11.4/§12: a consuming file's first attempt to resolve
+    /// through a barrel fails because the barrel's own re-export/content
+    /// edit has not landed in `files`/`project_files` YET, in a SEPARATE,
+    /// earlier `build_index` call than the one that fixes it -- reduced
+    /// here to the raw mechanism, independent of the structural/content
+    /// generation split that triggers it in production). `pending_targets`
+    /// records this (mirroring what `v4/typeflow.rs`'s `resolve_import_
+    /// targets_for` computes for a real `Unresolved`/`Ambiguous`/
+    /// `Namespace` outcome after a successful file-level resolution), and
+    /// `declarer.ts`'s own LATER `replace_file` call -- adding the export --
+    /// must sweep `consumer.ts` back into its own `transitive_importers_
+    /// closure` via `pending_importers_of`, exactly like a successfully-
+    /// linked importer would via `importers_of`.
+    #[test]
+    fn pending_importers_of_lets_a_later_edit_satisfy_a_previously_unresolved_import() {
+        let declarer_v1 = "export class Other {}\n";
+        let declarer_v2 =
+            "export class Other {}\nexport class Repo {\n  find(): number { return 1; }\n}\n";
+        let consumer_source = "import { Repo } from \"./declarer\";\nclass C {\n  m(): Repo { return undefined as any; }\n}\n";
+
+        let declarer_summary_v1 = summary_for("declarer.ts", declarer_v1);
+        let consumer_summary = summary_for("consumer.ts", consumer_source);
+        let c_id = consumer_summary.classes[0].entity_id.clone();
+
+        let mut summaries = BTreeMap::new();
+        summaries.insert("declarer.ts".to_owned(), declarer_summary_v1);
+        summaries.insert("consumer.ts".to_owned(), consumer_summary.clone());
+        // `consumer.ts` resolved the SPECIFIER to `declarer.ts` (a known
+        // file) but not the named export `Repo` (it does not exist yet) --
+        // the exact "pending" shape, never `Unresolved`-with-no-target-file
+        // at all (which would never be tracked here).
+        let mut pending_targets: HashMap<String, HashSet<String>> = HashMap::new();
+        pending_targets.insert(
+            "consumer.ts".to_owned(),
+            HashSet::from(["declarer.ts".to_owned()]),
+        );
+        let mut index = ProgramIndex::build(&summaries, &HashMap::new(), &pending_targets);
+
+        assert_eq!(
+            index.member_type_ref(&c_id, "m", false),
+            None,
+            "Repo does not exist yet -- must stay unresolved, never a guess"
+        );
+        assert_eq!(
+            index.pending_importers_of("declarer.ts"),
+            vec!["consumer.ts".to_owned()],
+            "consumer.ts's still-failing need must be tracked against declarer.ts"
+        );
+
+        // `declarer.ts` is later edited to add the export `consumer.ts` was
+        // waiting on. Mirrors `TypeflowCache::build_index`'s own warm-loop
+        // recipe: `refresh_paths` for `declarer.ts`'s own turn includes
+        // `pending_importers_of("declarer.ts")` (queried above), so
+        // `consumer.ts`'s own needed imports get recomputed fresh here too.
+        let declarer_summary_v2 = extract_decl_summary("declarer.ts", declarer_v2).expect("parses");
+        let repo_id = declarer_summary_v2.classes[1].entity_id.clone();
+        let mut updates = HashMap::new();
+        updates.insert(
+            (
+                "consumer.ts".to_owned(),
+                "./declarer".to_owned(),
+                "Repo".to_owned(),
+            ),
+            repo_id.clone(),
+        );
+        // consumer.ts no longer has any pending need -- a full (now empty)
+        // snapshot for it, same "never a partial patch" discipline
+        // `apply_pending_target_updates` documents.
+        let mut pending_after: HashMap<String, HashSet<String>> = HashMap::new();
+        pending_after.insert("consumer.ts".to_owned(), HashSet::new());
+        index.replace_file(
+            "declarer.ts",
+            declarer_summary_v2.clone(),
+            &updates,
+            &pending_after,
+        );
+
+        assert_eq!(
+            index.member_type_ref(&c_id, "m", false),
+            Some(ResolvedTypeRef::Entity(repo_id.clone())),
+            "consumer.ts's C.m must now resolve to Repo, exactly like a from-scratch rebuild"
+        );
+        assert!(
+            index.pending_importers_of("declarer.ts").is_empty(),
+            "consumer.ts's resolved need must stop being retried"
+        );
+
+        // Oracle: an independent from-scratch build of the SAME final tree.
+        let mut fresh_summaries = BTreeMap::new();
+        fresh_summaries.insert("declarer.ts".to_owned(), declarer_summary_v2);
+        fresh_summaries.insert("consumer.ts".to_owned(), consumer_summary);
+        let mut fresh_import_targets = HashMap::new();
+        fresh_import_targets.insert(
+            (
+                "consumer.ts".to_owned(),
+                "./declarer".to_owned(),
+                "Repo".to_owned(),
+            ),
+            repo_id,
+        );
+        let fresh = ProgramIndex::build(&fresh_summaries, &fresh_import_targets, &HashMap::new());
+        assert_eq!(
+            index.member_type_ref(&c_id, "m", false),
+            fresh.member_type_ref(&c_id, "m", false)
         );
     }
 
@@ -5240,7 +5625,7 @@ mod tests {
             ),
             base_entity_id,
         );
-        let index = ProgramIndex::build(&summaries, &import_targets);
+        let index = ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
         assert_eq!(
             index.members(&derived_id, "shout", false),
             MemberLookup::One(derived_shout_id)
@@ -5265,7 +5650,7 @@ mod tests {
         let impl_id = file_summary.classes[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.members(&impl_id, "greet", false),
             MemberLookup::One(greeter_greet_id)
@@ -5274,7 +5659,7 @@ mod tests {
 
     #[test]
     fn members_is_none_for_unknown_container() {
-        let index = ProgramIndex::build(&BTreeMap::new(), &HashMap::new());
+        let index = ProgramIndex::build(&BTreeMap::new(), &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.members("jsts:class:missing.ts:0:X", "y", false),
             MemberLookup::None
@@ -5344,7 +5729,7 @@ mod tests {
         let b_id = file_summary.classes[2].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.members_of_union(&[a_id, b_id], "run", false),
             MemberLookup::One(base_run_id)
@@ -5368,7 +5753,7 @@ mod tests {
         let b_id = file_summary.classes[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         let MemberLookup::UnionCandidates(mut candidates) =
             index.members_of_union(&[a_id, b_id], "run", false)
         else {
@@ -5387,7 +5772,7 @@ mod tests {
         let b_id = file_summary.classes[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.members_of_union(&[a_id, b_id], "run", false),
             MemberLookup::None
@@ -5416,7 +5801,7 @@ mod tests {
         let context_id = file_summary.interfaces[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&context_id, "escape", false),
             Some(ResolvedTypeRef::Entity(literal_id.clone()))
@@ -5442,7 +5827,7 @@ mod tests {
         let z_id = file_summary.object_shapes[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert!(index.is_container(&z_id));
         assert_eq!(
             index.member_type_ref(&z_id, "class", false),
@@ -5459,7 +5844,7 @@ mod tests {
         let tool_id = file_summary.classes[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&tool_id, "description", false),
             Some(ResolvedTypeRef::ThisType)
@@ -5474,7 +5859,7 @@ mod tests {
         let holder_id = file_summary.classes[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&holder_id, "items", false),
             Some(ResolvedTypeRef::ArrayOf(Box::new(ResolvedTypeRef::Entity(
@@ -5493,7 +5878,7 @@ mod tests {
         let derived_id = file_summary.classes[2].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&derived_id, "build", false),
             Some(ResolvedTypeRef::Entity(result_id))
@@ -5533,7 +5918,7 @@ mod tests {
         );
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.members(&class_id, "defaultConfig", false),
             MemberLookup::One(own_member_id)
@@ -5550,7 +5935,7 @@ mod tests {
         let make_id = file_summary.functions[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.function_return_type(&make_id),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5567,7 +5952,7 @@ mod tests {
         let load_id = file_summary.functions[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.function_return_type(&load_id),
             Some(ResolvedTypeRef::PromiseOf(Box::new(
@@ -5593,7 +5978,7 @@ mod tests {
             ("user.ts".to_owned(), "./base".to_owned(), "Foo".to_owned()),
             foo_id.clone(),
         );
-        let index = ProgramIndex::build(&summaries, &import_targets);
+        let index = ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
         assert_eq!(
             index.function_return_type(&make_id),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5613,7 +5998,7 @@ mod tests {
         assert!(file_summary.functions[0].pending_return.is_some());
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.function_return_type(&make_id),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5630,7 +6015,7 @@ mod tests {
         let make_id = file_summary.functions[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.function_return_type(&make_id),
             Some(ResolvedTypeRef::PromiseOf(Box::new(
@@ -5653,7 +6038,7 @@ mod tests {
         let agent_id = file_summary.classes[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&agent_id, "resume", false),
             Some(ResolvedTypeRef::Entity(result_id.clone()))
@@ -5673,7 +6058,7 @@ mod tests {
         let tool_id = file_summary.classes[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&tool_id, "describe", false),
             Some(ResolvedTypeRef::ThisType)
@@ -5693,7 +6078,7 @@ mod tests {
         let wrap_id = file_summary.functions[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.function_return_type(&wrap_id),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5710,7 +6095,7 @@ mod tests {
         let make_id = file_summary.functions[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.function_return_type(&make_id),
             Some(ResolvedTypeRef::PromiseOf(Box::new(
@@ -5728,7 +6113,7 @@ mod tests {
         let make_id = file_summary.functions[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(index.function_return_type(&make_id), None);
     }
 
@@ -5755,7 +6140,7 @@ mod tests {
         let z_id = file_summary.object_shapes[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&z_id, "make", false),
             Some(ResolvedTypeRef::Entity(zod_class_id))
@@ -5777,7 +6162,7 @@ mod tests {
         let context_id = file_summary.interfaces[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&context_id, "schemaBuilder", false),
             Some(ResolvedTypeRef::Entity(builder_id))
@@ -5797,7 +6182,7 @@ mod tests {
         let context_id = file_summary.interfaces[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&context_id, "schemaBuilder", false),
             Some(ResolvedTypeRef::Entity(builder_id))
@@ -5830,7 +6215,7 @@ mod tests {
             ),
             summaries["builder.ts"].functions[0].entity_id.clone(),
         );
-        let index = ProgramIndex::build(&summaries, &import_targets);
+        let index = ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
         assert_eq!(
             index.member_type_ref(&context_id, "schemaBuilder", false),
             Some(ResolvedTypeRef::Entity(builder_id))
@@ -5847,7 +6232,7 @@ mod tests {
         let holder_id = file_summary.interfaces[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&holder_id, "foo", false),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5864,7 +6249,7 @@ mod tests {
         let holder_id = file_summary.interfaces[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&holder_id, "foo", false),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5881,7 +6266,7 @@ mod tests {
         let holder_id = file_summary.interfaces[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         for member in ["a", "b", "c", "d", "e", "f"] {
             assert_eq!(
                 index.member_type_ref(&holder_id, member, false),
@@ -5901,7 +6286,7 @@ mod tests {
         let holder_id = file_summary.interfaces[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&holder_id, "items", false),
             Some(ResolvedTypeRef::RecordOf(Box::new(
@@ -5933,7 +6318,7 @@ mod tests {
         let a_shared = file_summary.interfaces[0].members[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         let Some(ResolvedTypeRef::Entity(x_entity)) = index.member_type_ref(&holder_id, "x", false)
         else {
             panic!("expected an Entity resolution for the intersection");
@@ -5966,7 +6351,7 @@ mod tests {
         let holder_id = file_summary.interfaces[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&holder_id, "x", false),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -5982,7 +6367,7 @@ mod tests {
         let holder_id = file_summary.interfaces[1].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(index.member_type_ref(&holder_id, "x", false), None);
     }
 
@@ -6020,7 +6405,7 @@ mod tests {
             ),
             summaries["dsl.ts"].callable_variables[0].entity_id.clone(),
         );
-        let index = ProgramIndex::build(&summaries, &import_targets);
+        let index = ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
         let Some(ResolvedTypeRef::Entity(schema_builder_shape_id)) =
             index.member_type_ref(&context_id, "schemaBuilder", false)
         else {
@@ -6042,7 +6427,7 @@ mod tests {
         let holder_id = file_summary.interfaces[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(
             index.member_type_ref(&holder_id, "x", false),
             Some(ResolvedTypeRef::Entity(foo_id))
@@ -6058,7 +6443,7 @@ mod tests {
         let holder_id = file_summary.interfaces[0].entity_id.clone();
         let mut summaries = BTreeMap::new();
         summaries.insert("a.ts".to_owned(), file_summary);
-        let index = ProgramIndex::build(&summaries, &HashMap::new());
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         assert_eq!(index.member_type_ref(&holder_id, "x", false), None);
     }
     // -----------------------------------------------------------------
@@ -6295,12 +6680,30 @@ mod tests {
     /// is `{changed file} ∪ importers_of(changed file)` -- the same
     /// two-mode use `v4/typeflow.rs`'s real wiring makes of this same
     /// recipe).
+    /// E-P0d: also returns the `pending_targets` map `ProgramIndex::build`/
+    /// `replace_file`/`add_file` now take -- an owning path whose specifier
+    /// resolves to a KNOWN file but whose named export does not (yet) is
+    /// distinguished here from one whose specifier never resolves to any
+    /// file at all (never recorded as pending -- see `pending_importers_of`
+    /// (the field)'s own doc comment), exactly like the production caller
+    /// (`v4/typeflow.rs`'s `resolve_import_targets_for`) does. Every path in
+    /// `paths` gets an entry in the returned map (possibly empty), never
+    /// only the ones with an actual pending edge -- so a caller applying
+    /// this as a full snapshot (`apply_pending_target_updates`'s own "never
+    /// a partial patch" contract) correctly clears a path's stale pending
+    /// edges even when it has none anymore.
+    #[allow(clippy::type_complexity)]
     fn compute_import_targets_for(
         paths: impl Iterator<Item = String>,
         project: &BTreeMap<String, DeclSummary>,
-    ) -> HashMap<(String, String, String), String> {
+    ) -> (
+        HashMap<(String, String, String), String>,
+        HashMap<String, HashSet<String>>,
+    ) {
         let mut resolved = HashMap::new();
+        let mut pending: HashMap<String, HashSet<String>> = HashMap::new();
         for path in paths {
+            pending.entry(path.clone()).or_default();
             let Some(summary) = project.get(&path) else {
                 continue;
             };
@@ -6310,18 +6713,23 @@ mod tests {
                 let Some(target_path) = resolve_specifier_to_path(&specifier, project) else {
                     continue;
                 };
-                let Some(target_id) = resolve_named_export_in(project, &target_path, &name) else {
-                    continue;
-                };
-                resolved.insert((owning_path, specifier, name), target_id);
+                match resolve_named_export_in(project, &target_path, &name) {
+                    Some(target_id) => {
+                        resolved.insert((owning_path, specifier, name), target_id);
+                    }
+                    None => {
+                        pending.entry(owning_path).or_default().insert(target_path);
+                    }
+                }
             }
         }
-        resolved
+        (resolved, pending)
     }
 
     fn build_oracle(project: &BTreeMap<String, DeclSummary>) -> ProgramIndex {
-        let import_targets = compute_import_targets_for(project.keys().cloned(), project);
-        ProgramIndex::build(project, &import_targets)
+        let (import_targets, pending_targets) =
+            compute_import_targets_for(project.keys().cloned(), project);
+        ProgramIndex::build(project, &import_targets, &pending_targets)
     }
 
     /// Compares every PUBLICLY-OBSERVABLE piece of state `ProgramIndex`
@@ -6470,32 +6878,38 @@ mod tests {
                     let summary =
                         extract_decl_summary(&path, &source).expect("synthetic source parses");
                     project.insert(path.clone(), summary.clone());
-                    let updates =
+                    let (updates, pending) =
                         compute_import_targets_for(std::iter::once(path.clone()), &project);
-                    incremental.add_file(&path, summary, &updates);
+                    incremental.add_file(&path, summary, &updates, &pending);
                 }
                 _ => {
                     // Replace an existing file's content -- refresh
                     // `import_targets` for the file itself AND every file
-                    // that (before this edit) imported from it, since the
-                    // edit may shift an exported entity's `start`-keyed id.
+                    // that (before this edit) imported from it (successfully
+                    // OR, E-P0d, still-pending -- see `pending_importers_of`
+                    // (the field)'s own doc comment for why a not-yet-
+                    // resolved importer must be retried too), since the edit
+                    // may shift an exported entity's `start`-keyed id, or
+                    // simply be the fix a pending importer was waiting on.
                     let keys: Vec<String> = project.keys().cloned().collect();
                     let path = keys[rng.next_usize(keys.len())].clone();
                     let i = index_of_path(&path);
-                    let importers_before = incremental.importers_of(&path);
+                    let mut importers_before = incremental.importers_of(&path);
+                    importers_before.extend(incremental.pending_importers_of(&path));
                     let source = random_source_for(i, &project, &mut rng);
                     let summary =
                         extract_decl_summary(&path, &source).expect("synthetic source parses");
                     project.insert(path.clone(), summary.clone());
                     let mut refresh: Vec<String> = importers_before.clone();
                     refresh.push(path.clone());
-                    let updates = compute_import_targets_for(refresh.into_iter(), &project);
+                    let (updates, pending) =
+                        compute_import_targets_for(refresh.into_iter(), &project);
                     if std::env::var_os("URDIRA_DEBUG_TYPEFLOW_TEST").is_some() {
                         eprintln!(
-                            "step {step}: REPLACE {path} importers_before={importers_before:?} updates={updates:?}"
+                            "step {step}: REPLACE {path} importers_before={importers_before:?} updates={updates:?} pending={pending:?}"
                         );
                     }
-                    incremental.replace_file(&path, summary, &updates);
+                    incremental.replace_file(&path, summary, &updates, &pending);
                 }
             }
 

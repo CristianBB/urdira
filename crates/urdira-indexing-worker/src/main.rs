@@ -947,7 +947,18 @@ fn build_typeflow_program_index(
             import_targets.insert(key, target_id);
         }
     }
-    urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets)
+    // E-P0d (2026-09-07): `ProgramIndex::build` gained a `pending_targets`
+    // parameter (`pending_importers_of`'s own doc comment,
+    // `urdira-jsts-typeflow/src/lib.rs`) so an incremental caller can retry
+    // an import that resolved to a known file but not yet to a specific
+    // export, once that file's content changes. This v3 prototype always
+    // rebuilds `ProgramIndex` from scratch on every generation (this
+    // function's own doc comment: "rebuilt from EVERY current file's source
+    // text"), never calls `replace_file`/`add_file` incrementally, so it
+    // has no equivalent retry mechanism to feed -- an empty map here is
+    // behavior-neutral (mirrors this call's own pre-existing cold-rebuild
+    // semantics exactly).
+    urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets, &HashMap::new())
 }
 
 /// Push `(owning_path, specifier, imported_name)` into `out` when `target`

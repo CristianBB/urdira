@@ -1016,3 +1016,267 @@ target-ep0c`) removed. All temporary `URDIRA_DEBUG_DEPS`-gated diagnostic `eprin
 `resolved_dependencies`/`facts_for_one_path`, `urdira-jsts-syntax-worker/src/lib.rs`) and the ad
 hoc `iter_visible_deps`/`expand_with_dependency_closure` dumps (`residual.rs`) added and removed
 within this session -- none survive in the final diff.
+
+## 12. Frente E-P0d (2026-09-07): Brecha B's remaining 3 relations CLOSED exactly (0 missing/0
+## phantom, raw `graph` root parity on BOTH real git switches); two NEW, narrower, out-of-scope
+## gaps found live and deferred (not silently dropped)
+
+### 12.1 Reproduction: the real n8n pair is a THREE-file interaction, not two
+
+§11.4's own hypothesis ("most likely inside `ProgramIndex::replace_file`/`reflow_files`/
+`link_importer`'s own handling of two back-to-back `replace_file` calls for a mutually-referencing
+pair") was refined by re-running `scripts/v4-reconcile-threshold.mjs --git-switch --keep-data
+--only-switch tags-3-months` (same tags, same command) and reading the real `git diff` for both
+named files directly (`git --git-dir=<tags-clone>/.git diff <refA> <refB> -- <path>`):
+
+- `packages/@n8n/config/src/configs/expression-engine.config.ts`: `new file mode 100644` -- BRAND
+  NEW, not merely edited.
+- `packages/cli/src/expression-observability/expression-observability.provider.ts`: ALSO `new file
+  mode 100644` -- BRAND NEW.
+- `packages/@n8n/config/src/index.ts` (the package's own barrel/re-export file): PRE-EXISTING,
+  separately EDITED in the exact same diff to add BOTH `import { ExpressionEngineConfig } from
+  './configs/expression-engine.config'` + `export { ExpressionEngineConfig } from './configs/
+  expression-engine.config'` AND a new member of its own, `GlobalConfig.expressionEngine:
+  ExpressionEngineConfig`.
+
+So the real shape is: two BRAND NEW files (declarer + consumer), linked through a THIRD,
+PRE-EXISTING file (the barrel) that is itself EDITED in the same batch to add the re-export the
+consumer needs. `delta.rs::run`'s own structural/content generation split (its own doc comment,
+§2 above) puts the two `Created` files in the FIRST (structural) generation and the barrel's own
+`Modified` edit in the SECOND (content) generation.
+
+### 12.2 Root cause #1 (`urdira-jsts-typeflow`): a resolution that fails in one `build_index` call
+### has no way to be retried once its target becomes resolvable in a LATER, separate call
+
+Confirmed live by temporary `eprintln!` instrumentation (added and fully reverted this session,
+gated behind ad hoc env vars never referenced in production code, source-scanned clean with
+`grep -rn "ep0d.*debug\|URDIRA_EP0D_DEBUG" crates/` returning empty at every checkpoint below) at
+`crates/urdira-indexing-worker/src/v4/typeflow.rs`'s `resolve_import_targets_for` and `build_index`:
+in the STRUCTURAL generation, `expression-observability.provider.ts`'s own `ExpressionEngineConfig`
+need resolves against the barrel's STALE (pre-edit) `export_bindings` (still cached in `files`/
+`project_files` for that call) -> `Unresolved`. Since `ProgramIndex::replace_file`'s own
+`link_importer` call (`crates/urdira-jsts-typeflow/src/lib.rs:3454`) only ever fires for a
+SUCCESSFUL `import_targets` entry, `importers_of[barrel.ts]` never learns about this edge. In the
+CONTENT generation (barrel.ts's own `replace_file` call), `refresh_paths` was `importers_of(path)
++ path` only (`typeflow.rs:337`, pre-fix) -- the consumer, having no successful edge, is never
+swept back in, even though `TypeflowCache`'s own `pending_upserted` entry for it was already
+drained after the structural generation's own `build_index` call. A stable, wrong fixed point:
+raising `MAX_SETTLING_ROUNDS` (§11.4) cannot help, because the gap spans TWO SEPARATE `build_index`
+invocations, not rounds within one.
+
+**Fix** (`crates/urdira-jsts-typeflow/src/lib.rs`): a new `ProgramIndex` field, `pending_importers_
+of: HashMap<String, HashSet<String>>` (`:2852`, doc comment there has the full rationale) -- the
+reverse graph for "specifier resolved to a KNOWN file, named export did not (yet)", the exact
+counterpart to `importers_of`'s "successfully resolved" graph. `ProgramIndex::build` (`:3381`) now
+takes a `pending_targets: &HashMap<String, HashSet<String>>` parameter and inverts it into the new
+field, mirroring how `import_targets` is inverted into `importers_of`. `replace_file`/`add_file`
+(`:3763`/`:3800`ish, exact lines shifted by the doc comments added) take a matching
+`pending_target_updates` parameter, applied via a new `apply_pending_target_updates` (`:3679`,
+mirrors `apply_import_target_updates`'s own "full snapshot per owning path, never a partial patch"
+discipline). `transitive_importers_closure` (`ProgramIndex`'s own BFS the affected/reflow set is
+built from) now ALSO walks `pending_importers_of` edges, alongside `importers_of`. `remove_file`
+clears a removed path's own outgoing pending edges too, for symmetry with `clear_owning_path_
+import_targets`. New public accessor `pending_importers_of(&self, path) -> Vec<String>` mirrors
+`importers_of`.
+
+Caller side (`crates/urdira-indexing-worker/src/v4/typeflow.rs`): `resolve_import_targets_for`
+(`:442`) now returns `(HashMap<(String,String,String),String>, HashMap<String,HashSet<String>>)`
+-- the second element records, for EVERY path it was asked about (an empty set when there is
+nothing pending, so a caller applying it as a snapshot correctly clears stale pending edges too),
+which target files a `resolve_named_export` call left `Unresolved`/`Ambiguous`/`Namespace` against.
+`build_index`'s warm settling loop (`:253` onward) widens `refresh_paths` with `index.pending_
+importers_of(path)` alongside `index.importers_of(path)`, and the convergence check now also
+compares the round's merged `pending` map (`previous_round_pending`), not just `round_updates`.
+
+### 12.3 Root cause #2 (`urdira-jsts-typeflow`): `entity_owner` never held a TYPE ALIAS's own id,
+### so `link_importer` silently no-op'd for every import resolving to one
+
+Found while re-verifying `head-vs-head200` (a much larger real switch, 1971 changed files) after
+fix #1: `graph=false` still, with a NEW, DIFFERENT 23-relation gap. `git diff --name-status`
+confirmed the affected test files (`packages/workflow/test/metadata-utils.test.ts`, two
+`scoped-jwt.strategy*.test.ts`) are byte-IDENTICAL at both ends of the switch (never edited, never
+added) -- pure "unedited importer of an edited file" cases, the ORIGINAL id-shift scenario §11.4
+already partially fixed. Debug instrumentation showed the culprit: `workflow/src/interfaces.ts`
+exports `IExecuteFunctions` as `export type IExecuteFunctions = ...` (a TYPE ALIAS, resolved to
+`jsts:type:...`, not a class/interface). `insert_file_pass1` (`crates/urdira-jsts-typeflow/src/
+lib.rs`) registers `entity_owner` for classes/interfaces/functions/callable-variables/object-
+shapes/variables (six separate loops) but NEVER for `summary.type_aliases` -- so `link_importer`'s
+own `self.entity_owner.get(target_entity_id)` lookup (`:3495`-ish) always missed for a type-alias
+target, meaning `importers_of`/`transitive_importers_closure` could NEVER widen to reach a file
+whose only edge to another file goes through a type alias. Confirmed via `refresh_paths.len()=38,
+contains_metadata_test=false` when processing `interfaces.ts`'s own turn, even though the SAME
+file's `IExecuteFunctions` resolution had ALREADY succeeded at cold-scan time (an id existed,
+`link_importer` was called, it just silently did nothing).
+
+**Fix**: `insert_file_pass1` gains a seventh loop, over `summary.type_aliases`, registering
+`entity_owner`/`owned_entities` for each alias id (`crates/urdira-jsts-typeflow/src/lib.rs:3093`).
+Deliberately does NOT touch `containers`/`function_return_types`/`variable_types` (a raw alias id
+is never queried against them -- every `import_targets` consumer runs the id through `dealias_
+entity` first, per `resolve_raw_type_ref`'s own `Imported` arm) and does not touch `alias_targets`
+(built wholesale by `build_alias_targets`, independent of `entity_owner`) -- purely additive for
+`link_importer`'s own lookup.
+
+### 12.4 Result: both real git switches now graph-identical to an independent oracle
+
+Re-ran `scripts/v4-reconcile-threshold.mjs --git-switch --keep-data` for both switches against the
+SAME fixed release binary (both fixes applied):
+
+| switch | changed files | `roots_ok.dependency` | `roots_ok.graph` (raw root) | `CATEGORY_RELATION` set diff |
+|---|---:|---|---|---|
+| `tags-3-months` (`n8n@1.123.25` -> `n8n@1.123.56`) | 504 | true | **true** | incremental 899,123 / oracle 899,123 -- 0 phantom, 0 lost |
+| `head-vs-head200` (`HEAD~200` -> `HEAD`) | 1,971 | true | **true** | incremental 1,817,090 / oracle 1,817,090 -- 0 phantom, 0 lost |
+
+Both switches now clear the RAW Merkle root check (`graph=true`), not merely the SET comparator --
+stronger than the task's own bar ("relaciones faltantes = 0 y `graph` set-equal"). `dependency`
+was already `true` both before and after (unaffected by this fix). Full `cargo test -p urdira-
+indexing-worker --release --locked v4::tests_e2e::graph_identity_set_matches_between_two_kept_
+stores -- --ignored --nocapture` output (both switches) retained this session's own terminal
+history; the counts above are copied verbatim from those runs.
+
+### 12.5 Tests added
+
+`crates/urdira-jsts-typeflow/src/lib.rs` (crate-level, raw `ProgramIndex` API, both against an
+independent from-scratch oracle):
+- `importers_of_tracks_a_file_that_only_imports_a_type_alias_and_survives_the_aliased_files_own_
+  edit` -- regression for §12.3: asserts `importers_of` itself (the mechanism) includes the
+  importer, then that an incremental edit of the aliased file matches a fresh rebuild.
+- `pending_importers_of_lets_a_later_edit_satisfy_a_previously_unresolved_import` -- regression for
+  §12.2 at the raw API level: a consumer's need is initially unresolved (target file known, export
+  not), asserts `pending_importers_of` tracks it, then that the declarer's later edit (adding the
+  export) both satisfies it and clears the pending edge.
+
+`crates/urdira-indexing-worker/src/v4/typeflow.rs` (`TypeflowCache`/`build_index`, real
+`SyntaxWorkerState::analyze`-backed `files` maps, both path orders where relevant, all against an
+independent from-scratch oracle):
+- `member_access_through_a_constructor_parameter_property_survives_a_same_batch_multi_file_edit_
+  {declarer_first,user_first}` -- two PRE-EXISTING files edited together (§11.4's own original
+  brief), both orders.
+- `member_access_through_a_constructor_parameter_property_survives_an_add_add_batch_{declarer_
+  first,user_first}` -- both files BRAND NEW in the same batch, added to an already-warm cache.
+- `member_access_through_a_reexporting_barrel_edited_in_the_same_batch_{matches_real_n8n_path_
+  order,reverse_path_order}` -- the ACTUAL real n8n shape: declarer + consumer NEW, a THIRD,
+  pre-existing barrel EDITED in the same batch to re-export the declarer and gain its own new
+  member typed with it.
+
+Note: the first two pairs above do NOT by themselves reproduce §12.2's own gap (confirmed
+empirically -- both pass even against the pre-fix code, since the 2-file interaction alone always
+resolves correctly regardless of `BTreeSet` iteration order; only the 3-file barrel shape does).
+Kept anyway as coverage for the interaction space the reduction ruled out, and because the module's
+own doc comment now needs *some* test proving each of those two shapes independently. `cargo test
+-p urdira-jsts-typeflow -p urdira-indexing-worker --locked`: **130 passed** (urdira-indexing-worker,
+18 ignored -- tsgo/residual/manual-diagnostic), **57 passed** (urdira-jsts-typeflow, 0 ignored), 0
+failed.
+
+An e2e test in `tests_e2e.rs` reproducing the full 3-file shape through the REAL production path
+(`scan::run_with_residual` -> `delta::run`'s own structural/content split) was attempted and then
+DELIBERATELY NOT KEPT -- see §12.6 for why, and what it found instead.
+
+### 12.6 Two NEW, narrower, out-of-scope gaps found by the (removed) e2e attempt -- flagged, not
+### fixed, not reproduced at real n8n scale
+
+Building the 3-file fixture (barrel pre-existing + edited, declarer + consumer brand new, both in
+one mixed `ScanScope::Changed` batch) through the real pipeline (`crates/urdira-indexing-worker/
+src/v4/tests_e2e.rs`) surfaced relations STILL missing even with both §12.2/§12.3 fixes applied,
+all attributable to `urdira-jsts-syntax-worker` (a DIFFERENT crate, out of this task's own "only
+`urdira-jsts-typeflow`, `typeflow.rs`/`analyze.rs` call points" scope, confirmed by grep: `REASON_
+IMPORT_BINDING`/`resolve_import_binding`/`import_bindings_ref` in `semantic_sites.rs`, nothing to
+do with `urdira-jsts-typeflow`):
+
+1. **A brand-new consumer's OWN import-declaration reference is resolved once, never retried
+   across generations.** `import { Repo } from './barrel'`'s own `jsts:references` relation
+   (source `jsts:module:...:0:...`, i.e. the import statement's own token, not typeflow-mediated
+   at all) is computed when the consumer is FIRST analyzed (the structural generation, before the
+   barrel's own edit lands) and is never recomputed once the barrel becomes resolvable, because a
+   brand-new file has no PRIOR state for `urdira-jsts-syntax-worker`'s own "import resolution would
+   change" reparse trigger to compare against.
+2. **A swept-in (not-directly-edited) owner can be reprocessed against a STALE dependency
+   snapshot.** Adding a second import (`Other`, already resolvable since cold, mirroring
+   `GlobalConfig` in the real n8n pair) DOES get the consumer's reverse-affected edge established,
+   and it IS revisited in the content generation -- but the resulting relation used the barrel's
+   OLD (pre-edit) entity id for `Other`, not the new one, while the SAME generation's `files` map
+   is confirmed fresh (typeflow's own resolution against it succeeds correctly). Some part of
+   `urdira-jsts-syntax-worker`'s own incremental caching, for an owner that is "affected" but not
+   itself in `changed_artifact_ids`, appears to reuse a previously-computed resolution rather than
+   recomputing it against the current generation's data.
+
+Neither is reproduced by the real `tags-3-months`/`head-vs-head200` verification (§12.4: 0 missing,
+0 phantom, `graph=true` on both) -- real n8n consumers of a shared barrel consistently import
+MULTIPLE names, at least one already resolvable before the edit (exactly like the `Other`/
+`GlobalConfig` pattern above), which is enough for `urdira-jsts-syntax-worker`'s own reverse-
+affected closure to sweep them back in; only finding (2) would still apply there, and it evidently
+does not manifest at real corpus scale for reasons not further investigated this session (possibly
+narrower conditions than this fixture's own minimal reduction hits). Per plan §0 criteria (a)-(c):
+neither blocks E-P0d's own acceptance bar (both real switches fully green), both are genuine,
+reproducible-by-reduction gaps in a crate this task is not scoped to touch, and are recorded here
+with full repro (fixture shape, exact relation identities, exact file/line pointers into `semantic_
+sites.rs`) rather than left silently unnoticed, per this campaign's own established practice --
+follow-up for whoever next owns `urdira-jsts-syntax-worker`'s own reverse-affected-closure/
+incremental-caching layer.
+
+### 12.7 Threshold decision: `RECONCILE_DELTA_THRESHOLD` left UNCHANGED at 0.01
+
+R1's own formula (T = crossover ratio x 0.8, only once a `graph=true` crossover is achievable) is
+NOW achievable in principle (§12.4), which R1 itself names as the precondition to re-measure and
+possibly RAISE T. Re-measuring requires the full fraction-sweep harness (`--fractions 0.01,0.05,
+0.10,0.25,0.50 --repeat 2`, §2's own original methodology) against a fresh n8n corpus copy --
+a separate, comparably expensive measurement this session's own remaining budget (spent on the
+diagnosis/fix/re-verification cycle across two real git-switch corpora, §12.1-§12.4) did not
+cover. T=0.01 remains SAFE regardless: T only ever moves which pipeline runs (delta vs cold), never
+the result (`run_reconcile`'s own doc comment, R1's own invariant, now proven true end-to-end by
+§12.4's own `graph=true` result at T=1 forcing the delta path on both real switches) -- leaving T
+unchanged costs nothing but a still-conservative threshold, never a correctness risk. Flagged as
+the natural next measurement for a follow-up session, not attempted here as it would have displaced
+this session's own diagnosis work without changing the acceptance criteria's own outcome.
+
+### 12.8 Verification (this session)
+
+- `cargo fmt --all -- --check`: clean (after `cargo fmt --all` reformatted the new test bodies).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean (two `#[allow(clippy::
+  type_complexity)]` added for the new `(HashMap<(String,String,String),String>,
+  HashMap<String,HashSet<String>>)` return type shared by `resolve_import_targets_for` in both
+  `urdira-jsts-typeflow`'s own test-local mirror and `v4/typeflow.rs`'s real one; one `to_owned()`
+  removed on an already-`&str` parameter).
+- `cargo test -p urdira-jsts-typeflow -p urdira-indexing-worker --locked`: 130 + 57 passed, 0
+  failed, 18 ignored (tsgo/residual/manual-diagnostic-env-var tests, unaffected by this session).
+- `cargo test -p urdira-indexing-worker --locked -- --ignored inferred_types_and_diagnostics_
+  across_two_runs_and_an_edit residual_emits_types_and_diagnostics_with_zero_pending_sites`
+  (`test:native`'s own curated residual gate, `URDIRA_TSGO_BINARY` set): both `ok`.
+- `cargo build --release --locked -p urdira-indexing-worker`: succeeds.
+- `git diff --stat -- packages/plugin-javascript-typescript/src/indexing-core-process-transport.
+  ts`: empty (temporary debug-env-var forwarding added and fully reverted; confirmed via `grep -rn
+  "ep0d.*debug\|URDIRA_EP0D_DEBUG" crates/ packages/plugin-javascript-typescript/src/` returning
+  nothing at the final checkpoint).
+- `crates/urdira-indexing-worker/src/main.rs` and `crates/urdira-jsts-syntax-worker/src/semantic_
+  sites.rs` needed a MECHANICAL, behavior-neutral third-argument update at their own (pre-existing,
+  test-only for the latter) `ProgramIndex::build` call sites, since this task's own `pending_
+  targets` parameter is not optional -- `main.rs`'s own v3 prototype always cold-rebuilds (never
+  calls `replace_file` incrementally, so an empty map is exactly its own pre-existing behavior);
+  `semantic_sites.rs`'s 7 call sites are all inside its own `#[cfg(test)]` module.
+
+### 12.9 Files touched
+
+- `crates/urdira-jsts-typeflow/src/lib.rs`: new `ProgramIndex::pending_importers_of` field +
+  accessor; `build`/`replace_file`/`add_file`/`remove_file`/`transitive_importers_closure` gain
+  `pending_target(s)`-flavored parameters/widening; new `apply_pending_target_updates`;
+  `insert_file_pass1` gains a `type_aliases` -> `entity_owner` loop (§12.3); test-local `compute_
+  import_targets_for` gains a matching `pending` return; 2 new tests (§12.5).
+- `crates/urdira-indexing-worker/src/v4/typeflow.rs`: `resolve_import_targets_for` returns a
+  `(import_targets, pending_targets)` tuple; `build_index`'s warm settling loop widens
+  `refresh_paths` with `pending_importers_of` and tracks `pending` convergence too; 6 new tests
+  (§12.5).
+- `crates/urdira-indexing-worker/src/main.rs`: `build_typeflow_program_index`'s own `ProgramIndex::
+  build` call gains an empty `pending_targets` argument (mechanical, behavior-neutral, §12.8).
+- `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`: 7 test-only `ProgramIndex::build` call
+  sites gain the same empty argument (mechanical, behavior-neutral, §12.8).
+- This file: §12.
+
+### 12.10 Scratch cleanup
+
+`~/Proyectos/urdira-benchmark/v4-fold/ep0d-{vcswitch,vcswitch2,vcswitch3,vcswitch4,vcswitch5,
+vcswitch-fixed,head200-safe,head200-fixed,head200-debug,head200-debug2,tags-final,git-switch}*`
+(git clones, `--keep-data` outputs) deleted at the end of this session; the small `*-results.json`
+companions retained. `CARGO_TARGET_DIR` override (`.claude/worktrees/cargo-target-ep0d`) removed.
+All temporary `URDIRA_EP0D_DEBUG*`-gated diagnostic `eprintln!`s (in `resolve_raw_type_ref`/
+`resolve_import_targets_for`/`build_index`, both crates) and the matching temporary env-var
+forwarding line in `indexing-core-process-transport.ts` added and removed within this session --
+confirmed absent from the final diff (§12.8).
