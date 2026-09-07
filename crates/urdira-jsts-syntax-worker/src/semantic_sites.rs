@@ -9575,7 +9575,8 @@ mod tests {
                 urdira_jsts_typeflow::extract_decl_summary(path, text).expect("parses"),
             );
         }
-        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new());
+        let index =
+            urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
         let resolver = WorkspaceResolver::default();
         let available: BTreeSet<String> = BTreeSet::new();
@@ -10373,7 +10374,8 @@ mod tests {
             ),
             z_id.clone(),
         );
-        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets);
+        let index =
+            urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
         let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
 
         let mut files = BTreeMap::new();
@@ -10469,7 +10471,8 @@ mod tests {
             "base.ts".to_owned(),
             urdira_jsts_typeflow::extract_decl_summary("base.ts", base_source).expect("parses"),
         );
-        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new());
+        let index =
+            urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
         let mut files = BTreeMap::new();
         files.insert(
@@ -10530,7 +10533,8 @@ mod tests {
             "base.ts".to_owned(),
             urdira_jsts_typeflow::extract_decl_summary("base.ts", base_source).expect("parses"),
         );
-        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new());
+        let index =
+            urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
         let mut files = BTreeMap::new();
         files.insert(
@@ -10579,7 +10583,8 @@ mod tests {
             "base.ts".to_owned(),
             urdira_jsts_typeflow::extract_decl_summary("base.ts", base_source).expect("parses"),
         );
-        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new());
+        let index =
+            urdira_jsts_typeflow::ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
         let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
         let mut files = BTreeMap::new();
         files.insert(
@@ -10664,7 +10669,11 @@ mod tests {
                 vec![export_binding("stringSimilarity", "stringSimilarity")],
             ),
         );
-        let index = urdira_jsts_typeflow::ProgramIndex::build(&BTreeMap::new(), &HashMap::new());
+        let index = urdira_jsts_typeflow::ProgramIndex::build(
+            &BTreeMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
         let mut ctx = helper_ctx(files);
         ctx.typeflow_index = Some(index);
@@ -10867,7 +10876,8 @@ mod tests {
             ),
             "jsts:class:column.ts:13:Column".to_owned(),
         );
-        let index = urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets);
+        let index =
+            urdira_jsts_typeflow::ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
         let index: &'static urdira_jsts_typeflow::ProgramIndex = Box::leak(Box::new(index));
         let not_null_start =
             column_source.find("get notNull").unwrap() as u32 + "get ".len() as u32;

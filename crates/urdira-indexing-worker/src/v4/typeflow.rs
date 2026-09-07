@@ -258,14 +258,18 @@ impl TypeflowCache {
     ) -> &ProgramIndex {
         if self.index.is_none() {
             let all_paths: Vec<&str> = self.summaries.keys().map(String::as_str).collect();
-            let import_targets = resolve_import_targets_for(
+            let (import_targets, pending_targets) = resolve_import_targets_for(
                 &self.summaries,
                 all_paths.into_iter(),
                 resolver,
                 available,
                 files,
             );
-            self.index = Some(ProgramIndex::build(&self.summaries, &import_targets));
+            self.index = Some(ProgramIndex::build(
+                &self.summaries,
+                &import_targets,
+                &pending_targets,
+            ));
             self.pending_upserted.clear();
             self.pending_removed.clear();
             return self.index.as_ref().expect("just assigned above");
@@ -321,10 +325,34 @@ impl TypeflowCache {
             // already-tested behavor); idempotent once the fixed point is
             // reached, since `replace_file`'s own internal `reflow_files`
             // is itself idempotent over unchanged inputs.
+            //
+            // E-P0d (2026-09-07): `refresh_paths` ALSO widens through
+            // `index.pending_importers_of(path)` (not just `importers_of`)
+            // -- root-caused live on real n8n: a THIRD file's re-export edit
+            // (a package barrel, `packages/@n8n/config/src/index.ts`)
+            // lands in a LATER, SEPARATE `build_index` call than the two
+            // brand-new files it mediates between (`crates/urdira-indexing-
+            // worker/src/v4/delta.rs`'s own structural/content generation
+            // split for a mixed batch -- see `delta.rs::run`'s own doc
+            // comment). The consuming file's FIRST attempt to resolve
+            // through the barrel fails (the barrel's stale, pre-edit
+            // exports, still cached in `files`/`project_files` for THAT
+            // call), and since `link_importer` only ever runs for a
+            // SUCCESSFUL resolution, `importers_of(barrel)` never learns
+            // about it -- `pending_importers_of` is `ProgramIndex`'s OWN
+            // reverse index for exactly this "tried, target file found,
+            // export not (yet)" case (see that field's own doc comment in
+            // `urdira-jsts-typeflow`), and it persists on `self.index`
+            // across SEPARATE `build_index` calls the same way `importers_
+            // of` does, so the barrel's own LATER `replace_file` call (in
+            // the content generation) correctly re-attempts the consumer
+            // against the barrel's now-current exports.
             const MAX_SETTLING_ROUNDS: usize = 8;
             let mut previous_round: Option<HashMap<(String, String, String), String>> = None;
+            let mut previous_round_pending: Option<HashMap<String, HashSet<String>>> = None;
             for round in 0..MAX_SETTLING_ROUNDS {
                 let mut round_updates: HashMap<(String, String, String), String> = HashMap::new();
+                let mut round_pending: HashMap<String, HashSet<String>> = HashMap::new();
                 for path in &upserted {
                     let Some(summary) = self.summaries.get(path) else {
                         // Upserted then removed again before this
@@ -334,9 +362,11 @@ impl TypeflowCache {
                         // nothing left to insert.
                         continue;
                     };
-                    let mut refresh_paths: Vec<String> = index.importers_of(path);
-                    refresh_paths.push(path.clone());
-                    let updates = resolve_import_targets_for(
+                    let mut refresh_paths: BTreeSet<String> =
+                        index.importers_of(path).into_iter().collect();
+                    refresh_paths.extend(index.pending_importers_of(path));
+                    refresh_paths.insert(path.clone());
+                    let (updates, pending) = resolve_import_targets_for(
                         &self.summaries,
                         refresh_paths.iter().map(String::as_str),
                         resolver,
@@ -344,10 +374,18 @@ impl TypeflowCache {
                         files,
                     );
                     round_updates.extend(updates.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    index.replace_file(path, summary.clone(), &updates);
+                    for (owning_path, target_paths) in &pending {
+                        round_pending
+                            .entry(owning_path.clone())
+                            .or_default()
+                            .extend(target_paths.iter().cloned());
+                    }
+                    index.replace_file(path, summary.clone(), &updates, &pending);
                 }
-                let converged = previous_round.as_ref() == Some(&round_updates);
+                let converged = previous_round.as_ref() == Some(&round_updates)
+                    && previous_round_pending.as_ref() == Some(&round_pending);
                 previous_round = Some(round_updates);
+                previous_round_pending = Some(round_pending);
                 if converged {
                     break;
                 }
@@ -385,15 +423,36 @@ impl TypeflowCache {
 /// plus-importers set) rather than always sweeping every cached summary --
 /// see this module's own doc comment for why that scoping matters for the
 /// per-edit cost target.
+///
+/// E-P0d: also returns a `pending_targets` map (`owning_path -> target file
+/// paths it still cannot fully resolve`), the exact input `ProgramIndex::
+/// build`/`replace_file`/`add_file` now take for `pending_importers_of`
+/// (see that field's own doc comment in `urdira-jsts-typeflow`) -- a triple
+/// whose specifier resolves to a KNOWN file (`resolver.resolve` succeeds)
+/// but whose named export does not (`resolve_named_export` returns
+/// anything other than `Resolved`) is recorded there, distinct from a
+/// specifier that never resolves to any file at all (never recorded --
+/// there is no file whose future edit could ever fix that one). Every path
+/// in `paths` gets an entry in the returned map (possibly an empty set),
+/// never only the ones with an actual pending edge, so a caller applying
+/// this as a full snapshot (`apply_pending_target_updates`'s own "never a
+/// partial patch" contract) correctly clears a path's stale pending edges
+/// once it stops needing them.
+#[allow(clippy::type_complexity)]
 fn resolve_import_targets_for<'a>(
     summaries: &BTreeMap<String, DeclSummary>,
     paths: impl Iterator<Item = &'a str>,
     resolver: &WorkspaceResolver,
     available: &BTreeSet<String>,
     files: &BTreeMap<String, SyntaxFileResult>,
-) -> HashMap<(String, String, String), String> {
+) -> (
+    HashMap<(String, String, String), String>,
+    HashMap<String, HashSet<String>>,
+) {
     let mut needed_imports: HashSet<(&str, &str, &str)> = HashSet::new();
+    let mut pending_targets: HashMap<String, HashSet<String>> = HashMap::new();
     for path in paths {
+        pending_targets.entry(path.to_owned()).or_default();
         let Some(summary) = summaries.get(path) else {
             continue;
         };
@@ -414,16 +473,26 @@ fn resolve_import_targets_for<'a>(
         // gained a policy parameter; `UniqueOrAmbiguous` reproduces this
         // call's exact prior behavior (typeflow's own import-target
         // resolution is unrelated to the overload/reference-vs-call split).
-        if let ExportResolution::Resolved(target_id) = resolve_named_export(
+        match resolve_named_export(
             files,
             &target_path,
             imported_name,
             urdira_jsts_syntax_worker::ExportPolicy::UniqueOrAmbiguous,
         ) {
-            import_targets.insert(key, target_id);
+            ExportResolution::Resolved(target_id) => {
+                import_targets.insert(key, target_id);
+            }
+            ExportResolution::Namespace(_)
+            | ExportResolution::Ambiguous
+            | ExportResolution::Unresolved => {
+                pending_targets
+                    .entry(owning_path.to_owned())
+                    .or_default()
+                    .insert(target_path);
+            }
         }
     }
-    import_targets
+    (import_targets, pending_targets)
 }
 
 /// One file's own contribution to `resolve_import_targets_for`'s
@@ -810,6 +879,596 @@ mod tests {
             index.member_type_ref(&opts_id, "memory", false),
             Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(base_id)),
             "Opts.memory (aliased to an IMPORTED Base) must resolve through the needed-imports scan"
+        );
+    }
+
+    /// Runs one `SyntaxWorkerState::analyze` generation over `sources` and
+    /// returns its `project_files` map (cloned) for the given `project_key`
+    /// -- shared by `member_access_through_a_constructor_parameter_property_
+    /// survives_a_same_batch_multi_file_edit`'s cold and post-edit
+    /// generations below, and by its independent from-scratch oracle.
+    fn analyze_project_files(
+        project_key: &str,
+        paths: &[&str],
+        sources: &[SourceInput],
+    ) -> BTreeMap<String, SyntaxFileResult> {
+        let mut syntax_state = urdira_jsts_syntax_worker::SyntaxWorkerState::default();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        syntax_state
+            .analyze(
+                "test:analyze".to_owned(),
+                "test:analyze".to_owned(),
+                project_key.to_owned(),
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
+                paths.iter().map(|p| p.to_string()).collect(),
+                sources.to_vec(),
+                Vec::new(),
+                urdira_worker_protocol::AuthoritativeChangeSet::Full,
+                urdira_jsts_syntax_worker::AnalysisBudgets {
+                    max_output_bytes: 64 * 1024 * 1024,
+                    max_files: 16,
+                    max_source_bytes: u32::MAX,
+                    enforce_output_bytes: false,
+                },
+                &cancelled,
+            )
+            .expect("syntax analyze succeeds");
+        syntax_state
+            .project_files(project_key)
+            .expect("project files present")
+            .clone()
+    }
+
+    /// E-P0d repro/regression: a constructor PARAMETER PROPERTY
+    /// (`constructor(private readonly repo: Repo) {}`) whose declared type
+    /// is IMPORTED from another file, read via `this.<prop>.<member>()`
+    /// inside a method -- with BOTH the declaring file (`repo_path`, whose
+    /// edit both shifts its class's own `start`-keyed entity id AND adds the
+    /// new member being accessed) and the using file (`svc_path`, whose edit
+    /// adds the new access) upserted in the very SAME `build_index` batch,
+    /// exactly the shape `docs/evidence/2026-09-06-v4-reconcile-threshold.md`
+    /// §11.4 root-caused live on real n8n (`expression-observability.
+    /// provider.ts` / `expression-engine.config.ts`, both genuinely edited
+    /// together in the same git-switch commit range). Parameterized over
+    /// which of the two paths sorts first in `BTreeSet<String>` (path-
+    /// alphabetical) order -- `TypeflowCache::build_index`'s warm settling
+    /// loop iterates `pending_upserted` in THAT order, and §11.4 found the
+    /// defect specifically in `ProgramIndex::replace_file`/`reflow_files`'s
+    /// own handling of two back-to-back calls for a mutually-referencing
+    /// pair, not in the settling loop's own round count -- so both
+    /// processing orders are exercised as two separate `#[test]`s below,
+    /// both against the identical oracle: an INDEPENDENT `TypeflowCache`
+    /// built cold, directly from the two files' FINAL (post-edit) text.
+    fn assert_member_access_through_parameter_property_survives_batch_edit(
+        repo_path: &str,
+        svc_path: &str,
+    ) {
+        let dir = scratch_dir("typeflow-param-property-batch-edit");
+        let repo_blob = dir.join("repo.blob");
+        let svc_blob = dir.join("svc.blob");
+
+        let repo_v1 = "export class Repo {\n  find(): number {\n    return 1;\n  }\n}\n";
+        // Shifts `Repo`'s own `start`-keyed entity id (two leading blank
+        // lines) AND adds the NEW member (`count`) the batch edit's other
+        // file starts reading -- exactly the "declaring file's edit moves
+        // the target id AND grows its member set" shape §11.4 describes.
+        let repo_v2 = "\n\nexport class Repo {\n  find(): number {\n    return 1;\n  }\n  count(): number {\n    return 2;\n  }\n}\n";
+        let svc_v1 = format!(
+            "import {{ Repo }} from './{repo_stem}';\nexport class Svc {{\n  constructor(private readonly repo: Repo) {{}}\n  run(): number {{\n    return this.repo.find();\n  }}\n}}\n",
+            repo_stem = repo_path.trim_end_matches(".ts"),
+        );
+        // Same class declaration (Svc's own entity id stays put) -- only a
+        // NEW method is added, reading the declaring file's NEW member
+        // through the SAME pre-existing parameter property.
+        let svc_v2 = format!(
+            "import {{ Repo }} from './{repo_stem}';\nexport class Svc {{\n  constructor(private readonly repo: Repo) {{}}\n  run(): number {{\n    return this.repo.find();\n  }}\n  run2(): number {{\n    return this.repo.count();\n  }}\n}}\n",
+            repo_stem = repo_path.trim_end_matches(".ts"),
+        );
+
+        let sources_v1 = vec![
+            owner(repo_path, &repo_blob, repo_v1),
+            owner(svc_path, &svc_blob, &svc_v1),
+        ];
+        let project_key = format!("typeflow-param-property-batch-edit-{repo_path}-{svc_path}");
+        let files_v1 = analyze_project_files(&project_key, &[repo_path, svc_path], &sources_v1);
+
+        let mut cache =
+            TypeflowCache::build_full(&sources_v1, None).expect("build_full succeeds (v1)");
+        let resolver = WorkspaceResolver::build(&[]);
+        let available_v1: BTreeSet<String> = files_v1.keys().cloned().collect();
+        let _ = cache.build_index(&resolver, &available_v1, &files_v1);
+
+        // The batch edit: BOTH files upserted before the NEXT `build_index`
+        // call -- `pending_upserted` (a `BTreeSet`) will iterate them in
+        // path-alphabetical order regardless of the order these two
+        // `replace_file` calls happen in, so this order is not what the
+        // two `#[test]`s below vary (see their own doc comment: it's
+        // `repo_path`/`svc_path`'s own alphabetical relationship that
+        // matters).
+        cache.replace_file(repo_path, repo_v2);
+        cache.replace_file(svc_path, &svc_v2);
+
+        let repo_id_v2 = cache.summaries[repo_path].classes[0].entity_id.clone();
+        let svc_id = cache.summaries[svc_path].classes[0].entity_id.clone();
+
+        let sources_v2 = vec![
+            owner(repo_path, &repo_blob, repo_v2),
+            owner(svc_path, &svc_blob, &svc_v2),
+        ];
+        let files_v2 = analyze_project_files(&project_key, &[repo_path, svc_path], &sources_v2);
+        let available_v2: BTreeSet<String> = files_v2.keys().cloned().collect();
+
+        let incremental_index = cache.build_index(&resolver, &available_v2, &files_v2);
+        let incremental_repo_type = incremental_index.member_type_ref(&svc_id, "repo", false);
+        let incremental_count = incremental_index.members(&repo_id_v2, "count", false);
+        let incremental_find = incremental_index.members(&repo_id_v2, "find", false);
+
+        // Oracle: an INDEPENDENT `TypeflowCache`, built cold directly from
+        // the SAME final (v2) text -- never touched by the warm settling
+        // loop at all.
+        let mut fresh =
+            TypeflowCache::build_full(&sources_v2, None).expect("build_full succeeds (fresh)");
+        let fresh_index = fresh.build_index(&resolver, &available_v2, &files_v2);
+        let fresh_repo_type = fresh_index.member_type_ref(&svc_id, "repo", false);
+        let fresh_count = fresh_index.members(&repo_id_v2, "count", false);
+        let fresh_find = fresh_index.members(&repo_id_v2, "find", false);
+
+        assert_eq!(
+            incremental_repo_type, fresh_repo_type,
+            "Svc.repo's declared type (a constructor parameter property, imported \
+             from the file edited in the SAME batch) must match a from-scratch \
+             rebuild of the final tree"
+        );
+        assert_eq!(
+            incremental_repo_type,
+            Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(
+                repo_id_v2.clone()
+            )),
+            "Svc.repo must resolve to Repo's NEW (post-edit, id-shifted) entity id, \
+             not stay unresolved or point at the stale pre-edit id"
+        );
+        assert_eq!(
+            incremental_count, fresh_count,
+            "Repo.count (the NEW member the same-batch edit both adds and starts \
+             reading through the parameter property) must match a from-scratch \
+             rebuild"
+        );
+        assert!(
+            matches!(
+                incremental_count,
+                urdira_jsts_typeflow::MemberLookup::One(_)
+            ),
+            "this.repo.count() must resolve through the parameter property's \
+             declared type, exactly like a from-scratch rebuild would: {incremental_count:?}"
+        );
+        assert_eq!(
+            incremental_find, fresh_find,
+            "Repo.find (the PRE-EXISTING member, still read by the pre-existing \
+             `run()` method) must also match a from-scratch rebuild"
+        );
+    }
+
+    #[test]
+    fn member_access_through_a_constructor_parameter_property_survives_a_same_batch_multi_file_edit_declarer_first()
+     {
+        // "repo.ts" < "svc.ts": the declaring file sorts FIRST in
+        // `pending_upserted`'s `BTreeSet` iteration order.
+        assert_member_access_through_parameter_property_survives_batch_edit("repo.ts", "svc.ts");
+    }
+
+    #[test]
+    fn member_access_through_a_constructor_parameter_property_survives_a_same_batch_multi_file_edit_user_first()
+     {
+        // "a_svc.ts" < "z_repo.ts": the USING file sorts FIRST -- the
+        // reverse order from the test above, matching real n8n's own
+        // `packages/@n8n/config/...` (sorts before) / `packages/cli/...`
+        // pairing being the OTHER way around from this crate's synthetic
+        // "repo"/"svc" naming, so both relative orders get exercised across
+        // the two tests.
+        assert_member_access_through_parameter_property_survives_batch_edit(
+            "z_repo.ts",
+            "a_svc.ts",
+        );
+    }
+
+    /// E-P0d ACTUAL root cause (found by reducing the real `tags-3-months`
+    /// n8n git-switch repro, `docs/evidence/2026-09-06-v4-reconcile-
+    /// threshold.md` §11.4/§12): both `expression-engine.config.ts` (the
+    /// declaring file) AND `expression-observability.provider.ts` (the
+    /// using file, reading `this.config.<member>` through a constructor
+    /// parameter property) are `git diff`-confirmed BRAND NEW files (`new
+    /// file mode 100644` on BOTH sides of the real diff) -- NOT pre-existing
+    /// files merely edited together, the scenario the two tests above (and
+    /// §11.4's own "84%-fixed" settling-loop round) actually cover. This is
+    /// the ADD/ADD case, added to an ALREADY-WARM cache (`index.is_some()`
+    /// -- exactly `TypeflowCache`'s real production lifetime: the workspace
+    /// was cold-scanned long before this specific reconcile batch), which
+    /// this crate's own doc comment (`TypeflowCache`'s "Known, accepted
+    /// scope gap" paragraph) already names but describes as one-sided (an
+    /// EXISTING file's previously-broken import getting satisfied by a
+    /// later create) -- an entirely NEW file whose OWN needed-imports are
+    /// resolved for the FIRST time, importing ANOTHER brand-new file added
+    /// in the very same batch, is a different case that gap's own text does
+    /// not cover, and turns out to share its exact mechanism: `svc_path`'s
+    /// (the importer's) `refresh_paths` is seeded from `index.importers_of
+    /// (svc_path)` -- who imports svc_path, never what svc_path itself
+    /// imports -- so a brand-new svc_path's own first-time resolution is
+    /// entirely correct via `resolve_import_targets_for` regardless of
+    /// order... UNLESS a run BEFORE this one already tried and failed to
+    /// resolve `Repo` for some THIRD, pre-existing file that also names it
+    /// (see the module-level test below for the confirmed three-file
+    /// interaction) -- kept here as the fixture that isolates the ADD/ADD
+    /// shape alone, which this test demonstrates does NOT by itself
+    /// reproduce the defect (both settle correctly) -- see `three_file_add_add_add_...`
+    /// below for the shape that DOES.
+    fn assert_member_access_through_parameter_property_survives_add_add_batch(
+        repo_path: &str,
+        svc_path: &str,
+    ) {
+        let dir = scratch_dir("typeflow-param-property-add-add-batch");
+        let seed_blob = dir.join("seed.blob");
+        let repo_blob = dir.join("repo.blob");
+        let svc_blob = dir.join("svc.blob");
+
+        // An unrelated file, cold-built alone first, purely to put `cache`
+        // into the WARM (`index.is_some()`) state before `repo_path`/
+        // `svc_path` are ever added -- `TypeflowCache`'s real production
+        // lifetime (`state::WorkspaceState::typeflow_cache`) is NEVER
+        // freshly cold for a real reconcile/delta batch (the workspace was
+        // cold-scanned long before), so exercising the truly-cold `build`
+        // path (as every OTHER test in this module does, including the two
+        // above) would not be representative here.
+        let seed_text = "export class Seed {}\n";
+        let repo_text = "export class Repo {\n  find(): number {\n    return 1;\n  }\n}\n";
+        let svc_text = format!(
+            "import {{ Repo }} from './{repo_stem}';\nexport class Svc {{\n  constructor(private readonly repo: Repo) {{}}\n  run(): number {{\n    return this.repo.find();\n  }}\n}}\n",
+            repo_stem = repo_path.trim_end_matches(".ts"),
+        );
+
+        let seed_sources = vec![owner("seed.ts", &seed_blob, seed_text)];
+        let project_key = format!("typeflow-add-add-batch-{repo_path}-{svc_path}");
+        let seed_files = analyze_project_files(&project_key, &["seed.ts"], &seed_sources);
+        let mut cache =
+            TypeflowCache::build_full(&seed_sources, None).expect("build_full succeeds (seed)");
+        let resolver = WorkspaceResolver::build(&[]);
+        let seed_available: BTreeSet<String> = seed_files.keys().cloned().collect();
+        let _ = cache.build_index(&resolver, &seed_available, &seed_files);
+
+        // The ADD/ADD batch: BOTH `repo_path` and `svc_path` are BRAND NEW
+        // (never seen by `cache` before), upserted together before the
+        // NEXT `build_index` call.
+        cache.replace_file(repo_path, repo_text);
+        cache.replace_file(svc_path, &svc_text);
+        let repo_id = cache.summaries[repo_path].classes[0].entity_id.clone();
+        let svc_id = cache.summaries[svc_path].classes[0].entity_id.clone();
+
+        let all_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner(repo_path, &repo_blob, repo_text),
+            owner(svc_path, &svc_blob, &svc_text),
+        ];
+        let all_files = analyze_project_files(
+            &project_key,
+            &["seed.ts", repo_path, svc_path],
+            &all_sources,
+        );
+        let available: BTreeSet<String> = all_files.keys().cloned().collect();
+
+        let incremental_index = cache.build_index(&resolver, &available, &all_files);
+        let incremental_repo_type = incremental_index.member_type_ref(&svc_id, "repo", false);
+        let incremental_find = incremental_index.members(&repo_id, "find", false);
+
+        let mut fresh =
+            TypeflowCache::build_full(&all_sources, None).expect("build_full succeeds (fresh)");
+        let fresh_index = fresh.build_index(&resolver, &available, &all_files);
+        let fresh_repo_type = fresh_index.member_type_ref(&svc_id, "repo", false);
+        let fresh_find = fresh_index.members(&repo_id, "find", false);
+
+        assert_eq!(
+            incremental_repo_type, fresh_repo_type,
+            "Svc.repo (a constructor parameter property on a BRAND-NEW file, \
+             importing ANOTHER brand-new file added in the SAME batch) must \
+             match a from-scratch rebuild"
+        );
+        assert_eq!(
+            incremental_repo_type,
+            Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(repo_id)),
+            "Svc.repo must resolve to Repo's entity id, not stay unresolved"
+        );
+        assert_eq!(incremental_find, fresh_find);
+        assert!(matches!(
+            incremental_find,
+            urdira_jsts_typeflow::MemberLookup::One(_)
+        ));
+    }
+
+    #[test]
+    fn member_access_through_a_constructor_parameter_property_survives_an_add_add_batch_declarer_first()
+     {
+        assert_member_access_through_parameter_property_survives_add_add_batch("repo.ts", "svc.ts");
+    }
+
+    #[test]
+    fn member_access_through_a_constructor_parameter_property_survives_an_add_add_batch_user_first()
+    {
+        assert_member_access_through_parameter_property_survives_add_add_batch(
+            "z_repo.ts",
+            "a_svc.ts",
+        );
+    }
+
+    /// E-P0d CONFIRMED root cause: the real n8n `tags-3-months` diff
+    /// (`git diff n8n@1.123.25 n8n@1.123.56`) shows THREE files, not two --
+    /// `expression-engine.config.ts` is a brand-new file (declares the
+    /// class), `expression-observability.provider.ts` is ALSO brand new
+    /// (the constructor-parameter-property consumer), and
+    /// `packages/@n8n/config/src/index.ts` (the package's own BARREL/
+    /// re-export file, a THIRD, PRE-EXISTING file with MANY existing
+    /// importers) is separately EDITED in the exact same commit range to
+    /// add BOTH `export { ExpressionEngineConfig } from './configs/
+    /// expression-engine.config'` AND a NEW member of its own (`GlobalConfig
+    /// .expressionEngine: ExpressionEngineConfig`) -- confirmed via `git
+    /// diff`, NOT present in either of the two-file reductions above (both
+    /// of which pass). Reduced here to three files with the exact same
+    /// three roles: `repo_path` (new, declares), `barrel_path` (PRE-
+    /// EXISTING, edited in the batch, re-exports `repo_path`'s class AND
+    /// gains its own new member typed with it), `svc_path` (new, imports
+    /// THROUGH the barrel via a constructor parameter property).
+    fn assert_member_access_through_a_reexporting_barrel_edited_in_the_same_batch(
+        repo_path: &str,
+        barrel_path: &str,
+        svc_path: &str,
+    ) {
+        let dir = scratch_dir("typeflow-param-property-barrel-batch");
+        let seed_blob = dir.join("seed.blob");
+        let barrel_blob = dir.join("barrel.blob");
+        let repo_blob = dir.join("repo.blob");
+        let svc_blob = dir.join("svc.blob");
+
+        let seed_text = "export class Seed {}\n";
+        let barrel_v1 = "export class Other {}\n";
+        let repo_text = "export class Repo {\n  find(): number {\n    return 1;\n  }\n}\n";
+        let repo_stem = repo_path.trim_end_matches(".ts");
+        let barrel_stem = barrel_path.trim_end_matches(".ts");
+        // The barrel: pre-existing, edited in the SAME batch to (a)
+        // re-export the brand-new declaring file's class and (b) gain its
+        // OWN new member typed with it -- byte-identical shape to real
+        // n8n's `@n8n/config/src/index.ts` gaining both `export {
+        // ExpressionEngineConfig } from './configs/expression-engine.
+        // config'` and `GlobalConfig.expressionEngine: ExpressionEngineConfig`
+        // in the same diff.
+        let barrel_v2 = format!(
+            "import {{ Repo }} from './{repo_stem}';\nexport {{ Repo }} from './{repo_stem}';\nexport class Other {{\n  repo: Repo;\n}}\n",
+        );
+        let svc_text = format!(
+            "import {{ Repo }} from './{barrel_stem}';\nexport class Svc {{\n  constructor(private readonly repo: Repo) {{}}\n  run(): number {{\n    return this.repo.find();\n  }}\n}}\n",
+        );
+
+        let seed_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner(barrel_path, &barrel_blob, barrel_v1),
+        ];
+        let project_key = format!("typeflow-barrel-batch-{repo_path}-{barrel_path}-{svc_path}");
+        let seed_files =
+            analyze_project_files(&project_key, &["seed.ts", barrel_path], &seed_sources);
+        let mut cache =
+            TypeflowCache::build_full(&seed_sources, None).expect("build_full succeeds (seed)");
+        let resolver = WorkspaceResolver::build(&[]);
+        let seed_available: BTreeSet<String> = seed_files.keys().cloned().collect();
+        let _ = cache.build_index(&resolver, &seed_available, &seed_files);
+
+        // The batch: `barrel_path` EDITED (pre-existing), `repo_path` and
+        // `svc_path` ADDED (brand new) -- all three upserted together
+        // before the next `build_index` call, exactly like one real v4
+        // reconcile generation over a real git diff.
+        cache.replace_file(barrel_path, &barrel_v2);
+        cache.replace_file(repo_path, repo_text);
+        cache.replace_file(svc_path, &svc_text);
+        let repo_id = cache.summaries[repo_path].classes[0].entity_id.clone();
+        let svc_id = cache.summaries[svc_path].classes[0].entity_id.clone();
+
+        let all_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner(barrel_path, &barrel_blob, &barrel_v2),
+            owner(repo_path, &repo_blob, repo_text),
+            owner(svc_path, &svc_blob, &svc_text),
+        ];
+        let all_files = analyze_project_files(
+            &project_key,
+            &["seed.ts", barrel_path, repo_path, svc_path],
+            &all_sources,
+        );
+        let available: BTreeSet<String> = all_files.keys().cloned().collect();
+
+        let incremental_index = cache.build_index(&resolver, &available, &all_files);
+        let incremental_repo_type = incremental_index.member_type_ref(&svc_id, "repo", false);
+        let incremental_find = incremental_index.members(&repo_id, "find", false);
+
+        let mut fresh =
+            TypeflowCache::build_full(&all_sources, None).expect("build_full succeeds (fresh)");
+        let fresh_index = fresh.build_index(&resolver, &available, &all_files);
+        let fresh_repo_type = fresh_index.member_type_ref(&svc_id, "repo", false);
+        let fresh_find = fresh_index.members(&repo_id, "find", false);
+
+        assert_eq!(
+            incremental_repo_type, fresh_repo_type,
+            "Svc.repo (imported THROUGH a re-exporting barrel that is itself \
+             edited in the SAME batch) must match a from-scratch rebuild -- \
+             this is the exact shape E-P0d root-caused on real n8n"
+        );
+        assert_eq!(
+            incremental_repo_type,
+            Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(repo_id)),
+            "Svc.repo must resolve to Repo's entity id through the barrel re-export, \
+             not stay unresolved"
+        );
+        assert_eq!(incremental_find, fresh_find);
+        assert!(
+            matches!(incremental_find, urdira_jsts_typeflow::MemberLookup::One(_)),
+            "this.repo.find() must resolve through the barrel-mediated parameter \
+             property type, exactly like a from-scratch rebuild: {incremental_find:?}"
+        );
+    }
+
+    #[test]
+    fn member_access_through_a_reexporting_barrel_edited_in_the_same_batch_matches_real_n8n_path_order()
+     {
+        // Path order mirrors the REAL n8n diff exactly: declaring file
+        // sorts first ("a_" < "b_" < "c_", matching "configs/expression-
+        // engine.config.ts" < "index.ts" < "packages/cli/...").
+        assert_member_access_through_a_reexporting_barrel_edited_in_the_same_batch(
+            "a_repo.ts",
+            "b_barrel.ts",
+            "c_svc.ts",
+        );
+    }
+
+    #[test]
+    fn member_access_through_a_reexporting_barrel_edited_in_the_same_batch_reverse_path_order() {
+        assert_member_access_through_a_reexporting_barrel_edited_in_the_same_batch(
+            "z_repo.ts",
+            "y_barrel.ts",
+            "x_svc.ts",
+        );
+    }
+
+    /// E-P0d review addition: the ACTUAL production shape this whole task
+    /// exists to fix is NOT "three files upserted in one `build_index`
+    /// batch" (every test above this one) -- it is `delta.rs::run`'s own
+    /// structural/content generation split, which upserts the two brand-new
+    /// files (`repo.ts`, `svc.ts`) in ONE `build_index` call and the
+    /// pre-existing barrel's own content edit in a LATER, SEPARATE
+    /// `build_index` call, with `TypeflowCache`/`ProgramIndex` PERSISTING on
+    /// `self` across the two (see `pending_importers_of`'s own field doc
+    /// comment: "it persists on `self.index` across SEPARATE `build_index`
+    /// calls the same way `importers_of` does"). None of the six tests
+    /// above this one actually exercises that persistence -- every one
+    /// upserts all three files before a SINGLE `build_index` call, which
+    /// only ever needs the WARM SETTLING LOOP's within-one-call fixed point
+    /// (bounded by `MAX_SETTLING_ROUNDS`), never the cross-call
+    /// `pending_importers_of` persistence this task's own first root cause
+    /// (§12.2) specifically targets. This test calls `build_index` TWICE,
+    /// with the barrel's own edit landing in the second, separate call --
+    /// the literal repro shape.
+    #[test]
+    fn member_access_through_a_reexporting_barrel_edited_in_a_later_separate_build_index_call() {
+        let dir = scratch_dir("typeflow-barrel-two-generations");
+        let seed_blob = dir.join("seed.blob");
+        let barrel_blob = dir.join("barrel.blob");
+        let repo_blob = dir.join("repo.blob");
+        let svc_blob = dir.join("svc.blob");
+
+        let seed_text = "export class Seed {}\n";
+        let barrel_v1 = "export class Other {}\n";
+        let repo_text = "export class Repo {\n  find(): number {\n    return 1;\n  }\n}\n";
+        let barrel_v2 = "import { Repo } from './repo';\nexport { Repo } from './repo';\nexport class Other {\n  repo: Repo;\n}\n";
+        let svc_text = "import { Repo } from './barrel';\nexport class Svc {\n  constructor(private readonly repo: Repo) {}\n  run(): number {\n    return this.repo.find();\n  }\n}\n";
+
+        // Cold seed: just `seed.ts` + the barrel at v1 (no re-export yet) --
+        // mirrors a workspace already `ready` before the git switch lands.
+        let seed_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner("barrel.ts", &barrel_blob, barrel_v1),
+        ];
+        let project_key = "typeflow-barrel-two-generations";
+        let seed_files =
+            analyze_project_files(project_key, &["seed.ts", "barrel.ts"], &seed_sources);
+        let mut cache =
+            TypeflowCache::build_full(&seed_sources, None).expect("build_full succeeds (seed)");
+        let resolver = WorkspaceResolver::build(&[]);
+        let seed_available: BTreeSet<String> = seed_files.keys().cloned().collect();
+        let _ = cache.build_index(&resolver, &seed_available, &seed_files);
+
+        // GENERATION 1 (structural, `delta.rs`'s own vocabulary): the two
+        // BRAND-NEW files land. `barrel.ts` is untouched, still v1 --
+        // `svc.ts`'s own need resolves the specifier to `barrel.ts` (a known
+        // file) but not the named export `Repo` (barrel does not re-export
+        // it yet): the exact "pending", not "no target file at all", shape.
+        cache.replace_file("repo.ts", repo_text);
+        cache.replace_file("svc.ts", svc_text);
+        let repo_id = cache.summaries["repo.ts"].classes[0].entity_id.clone();
+        let svc_id = cache.summaries["svc.ts"].classes[0].entity_id.clone();
+        let gen1_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner("barrel.ts", &barrel_blob, barrel_v1),
+            owner("repo.ts", &repo_blob, repo_text),
+            owner("svc.ts", &svc_blob, svc_text),
+        ];
+        let gen1_files = analyze_project_files(
+            project_key,
+            &["seed.ts", "barrel.ts", "repo.ts", "svc.ts"],
+            &gen1_sources,
+        );
+        let gen1_available: BTreeSet<String> = gen1_files.keys().cloned().collect();
+        let gen1_index = cache.build_index(&resolver, &gen1_available, &gen1_files);
+        assert_eq!(
+            gen1_index.member_type_ref(&svc_id, "repo", false),
+            None,
+            "GEN 1: barrel.ts has not re-exported Repo yet -- must stay \
+             unresolved, never a guess"
+        );
+        assert_eq!(
+            gen1_index.pending_importers_of("barrel.ts"),
+            vec!["svc.ts".to_owned()],
+            "GEN 1: svc.ts's still-failing need must be tracked against \
+             barrel.ts, so it survives into the NEXT, separate build_index \
+             call"
+        );
+
+        // GENERATION 2 (content): ONLY the pre-existing barrel is upserted
+        // this time -- a SEPARATE, LATER `build_index` call, exactly like
+        // `delta.rs::run`'s own second sub-batch for a mixed
+        // Created+Modified generation split. `repo.ts`/`svc.ts` are NOT
+        // touched again here.
+        cache.replace_file("barrel.ts", barrel_v2);
+        let gen2_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner("barrel.ts", &barrel_blob, barrel_v2),
+            owner("repo.ts", &repo_blob, repo_text),
+            owner("svc.ts", &svc_blob, svc_text),
+        ];
+        let gen2_files = analyze_project_files(
+            project_key,
+            &["seed.ts", "barrel.ts", "repo.ts", "svc.ts"],
+            &gen2_sources,
+        );
+        let gen2_available: BTreeSet<String> = gen2_files.keys().cloned().collect();
+        let incremental_index = cache.build_index(&resolver, &gen2_available, &gen2_files);
+        let incremental_repo_type = incremental_index.member_type_ref(&svc_id, "repo", false);
+        let incremental_find = incremental_index.members(&repo_id, "find", false);
+
+        let mut fresh =
+            TypeflowCache::build_full(&gen2_sources, None).expect("build_full succeeds (fresh)");
+        let fresh_index = fresh.build_index(&resolver, &gen2_available, &gen2_files);
+        let fresh_repo_type = fresh_index.member_type_ref(&svc_id, "repo", false);
+        let fresh_find = fresh_index.members(&repo_id, "find", false);
+
+        assert_eq!(
+            incremental_repo_type, fresh_repo_type,
+            "Svc.repo must match a from-scratch rebuild even when the \
+             barrel's own re-export edit lands in a SEPARATE, LATER \
+             build_index call than the two brand-new files it mediates \
+             between -- the literal production repro shape"
+        );
+        assert_eq!(
+            incremental_repo_type,
+            Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(repo_id)),
+            "Svc.repo must resolve to Repo's entity id through the barrel \
+             re-export once it lands, not stay permanently unresolved"
+        );
+        assert_eq!(incremental_find, fresh_find);
+        assert!(
+            matches!(incremental_find, urdira_jsts_typeflow::MemberLookup::One(_)),
+            "this.repo.find() must resolve through the barrel-mediated \
+             parameter property type across the generation boundary: \
+             {incremental_find:?}"
+        );
+        assert!(
+            incremental_index
+                .pending_importers_of("barrel.ts")
+                .is_empty(),
+            "svc.ts's now-resolved need must stop being retried"
         );
     }
 
